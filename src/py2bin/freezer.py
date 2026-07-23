@@ -368,7 +368,7 @@ def _shell_launcher(path: Path, runtime: Path, environment: dict[str, str]) -> N
             f'exec "$ROOT/{runtime.as_posix()}" -s "$ROOT/py2bin_bootstrap.py" "$@"',
         ]
     )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     path.chmod(0o755)
 
 
@@ -736,7 +736,7 @@ def freeze(
             "compact": compact,
         }
         (stage / "py2bin-freeze.json").write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n"
         )
         (stage / "py2bin_bootstrap.py").write_text(
             "import json, os, runpy, sys, traceback\n"
@@ -777,6 +777,7 @@ def freeze(
             "    os._exit(status)\n"
             "if __name__ == '__main__': main()\n",
             encoding="utf-8",
+            newline="\n",
         )
         if bundle_target.startswith("windows-"):
             launcher = stage / f"{name}.exe"
@@ -793,10 +794,11 @@ def freeze(
                 *runtime_path_files,
                 launcher.with_suffix("._pth"),
             ):
-                path_file.write_text(isolated_path, encoding="utf-8")
+                path_file.write_text(isolated_path, encoding="utf-8", newline="\n")
             (stage / "sitecustomize.py").write_text(
                 "from py2bin_bootstrap import main\nmain(from_site=True)\n",
                 encoding="utf-8",
+                newline="\n",
             )
             if icon is not None and not onefile:
                 install_windows_icon(launcher, icon)

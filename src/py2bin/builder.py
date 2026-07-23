@@ -76,7 +76,7 @@ def _write_runtime(stage: Path, config: BuildConfig, analysis) -> Path:
     bootstrap_source = Path(__file__).with_name("bootstrap.py")
     shutil.copy2(bootstrap_source, runtime / "bootstrap.py")
     (stage / "__main__.py").write_text(
-        "from runtime.bootstrap import main\nmain()\n", encoding="utf-8"
+        "from runtime.bootstrap import main\nmain()\n", encoding="utf-8", newline="\n"
     )
     assert config.source_root is not None
     entry_relative = config.entry.relative_to(config.source_root)
@@ -91,7 +91,7 @@ def _write_runtime(stage: Path, config: BuildConfig, analysis) -> Path:
         "notes": analysis.hook_notes,
     }
     manifest_path = stage / "py2bin-manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     return manifest_path
 
 
@@ -101,6 +101,7 @@ def _launcher(path: Path, bundle: Path, python: str) -> None:
         "set -eu\n"
         f'exec {python} "$(dirname "$0")/{bundle.name}/runtime/bootstrap.py" "$@"\n',
         encoding="utf-8",
+        newline="\n",
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -125,6 +126,7 @@ def _make_app(
         f'ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../Resources/bundle" && pwd)"\n'
         f'exec {python} "$ROOT/runtime/bootstrap.py" "$@"\n',
         encoding="utf-8",
+        newline="\n",
     )
     executable.chmod(0o755)
     (app / "Contents" / "Info.plist").write_bytes(
