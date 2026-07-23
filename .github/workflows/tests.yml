@@ -1,0 +1,79 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run on the same ref.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 is the oldest supported Apple Silicon image and the one whose
+        # dyld is strictest about the hand-written Mach-O; macos-latest catches
+        # regressions on current macOS. Both matter for a format writer.
+        os: [ubuntu-latest, windows-latest, macos-14, macos-latest]
+        python: ["3.10", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Run unit tests
+        shell: bash
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+
+      # py2bin writes Mach-O bytes by hand, so a bad image shows up as a killed
+      # child process with no Python traceback to read. Dump what the loader saw:
+      # an invalid signature, a malformed load command, and a genuine code fault
+      # are three different bugs that otherwise surface as one identical failure.
+      - name: Diagnose generated macOS executable
+        if: failure() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set +e
+          printf "print('ci-diagnostic')\n" > "$RUNNER_TEMP/diagnostic.py"
+          PYTHONPATH=src python -m py2bin compile "$RUNNER_TEMP/diagnostic.py" \
+            -o "$RUNNER_TEMP/diagnostic" --os macos --arch "$(uname -m)"
+          echo "::group::file"
+          file "$RUNNER_TEMP/diagnostic"
+          echo "::endgroup::"
+          echo "::group::mach header and load commands"
+          otool -h -l "$RUNNER_TEMP/diagnostic"
+          echo "::endgroup::"
+          echo "::group::codesign"
+          codesign --verify --verbose=4 "$RUNNER_TEMP/diagnostic"
+          codesign --display --verbose=4 "$RUNNER_TEMP/diagnostic"
+          echo "::endgroup::"
+          echo "::group::disassembly"
+          otool -tv "$RUNNER_TEMP/diagnostic"
+          echo "::endgroup::"
+          echo "::group::run"
+          "$RUNNER_TEMP/diagnostic"
+          echo "exit status: $?"
+          echo "::endgroup::"
+          echo "::group::crash reports"
+          sleep 5
+          for f in "$HOME/Library/Logs/DiagnosticReports/"diagnostic*; do
+            [ -e "$f" ] || continue
+            echo "--- $f"
+            cat "$f"
+          done
+          echo "::endgroup::"
+          exit 0
+
+      - name: Build wheel
+        shell: bash
+        run: python -m pip wheel . --no-deps -w dist
