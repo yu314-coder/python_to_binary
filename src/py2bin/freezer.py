@@ -201,14 +201,37 @@ def _safe_wheel_member(name: str) -> Path | None:
     return Path(*parts)
 
 
-def extract_wheel(wheel: Path, destination: Path) -> int:
+def extract_wheel(
+    wheel: Path,
+    destination: Path,
+    *,
+    compact: bool = False,
+) -> int:
     """Install a wheel as data, without pip or executing package code."""
     count = 0
     with zipfile.ZipFile(wheel) as archive:
         for info in archive.infolist():
             relative = _safe_wheel_member(info.filename)
             unix_mode = (info.external_attr >> 16) & 0xFFFF
-            if relative is None or info.is_dir() or stat.S_ISLNK(unix_mode):
+            if (
+                relative is None
+                or info.is_dir()
+                or stat.S_ISLNK(unix_mode)
+                or (
+                    compact
+                    and any(
+                        part.lower()
+                        in {
+                            "__pycache__",
+                            ".pytest_cache",
+                            "pyobjctest",
+                            "test",
+                            "tests",
+                        }
+                        for part in relative.parts
+                    )
+                )
+            ):
                 continue
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -715,10 +738,18 @@ def freeze(
             for distribution in sorted(analysis.distributions, key=str.lower):
                 _copy_distribution(distribution, packages, compact=compact)
         for wheel in wheels:
-            extract_wheel(wheel.expanduser().resolve(), packages)
+            extract_wheel(
+                wheel.expanduser().resolve(),
+                packages,
+                compact=compact,
+            )
 
         if runtime_pack is not None:
-            installed_pack = install_runtime_pack(runtime_pack, stage)
+            installed_pack = install_runtime_pack(
+                runtime_pack,
+                stage,
+                compact=compact,
+            )
             runtime_executable = stage / installed_pack.executable
             runtime_environment = installed_pack.environment
         else:

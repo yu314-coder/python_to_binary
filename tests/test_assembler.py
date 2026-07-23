@@ -9,6 +9,7 @@ import unittest
 import zipfile
 
 from py2bin.assembler import assemble
+from py2bin.cli import _parser
 from py2bin.freezer import freeze, inspect_wheel
 from py2bin.native.formats.pe import write_pe_shell_launcher
 from py2bin.runtime_packs import MANIFEST_NAME, inspect_runtime_pack
@@ -22,6 +23,20 @@ from py2bin.windows_icon import (
 
 
 class AssemblerTests(unittest.TestCase):
+    def test_bundle_alias_and_optimize_size_select_compact_freeze(self):
+        arguments = _parser().parse_args(
+            [
+                "bundle",
+                "app.py",
+                "-o",
+                "App",
+                "--optimize-size",
+            ]
+        )
+        self.assertEqual(arguments.command, "bundle")
+        self.assertTrue(arguments.compact)
+        self.assertTrue(arguments.onefile)
+
     def _runtime_pack(
         self,
         root: Path,
@@ -120,6 +135,96 @@ class AssemblerTests(unittest.TestCase):
             self.assertTrue((result.bundle / "runtime" / "bin" / "python3").is_file())
             self.assertFalse((result.bundle / MANIFEST_NAME).exists())
             self.assertIn("demo", result.distributions)
+
+    def test_compact_freeze_prunes_supplied_runtime_pack_and_stdlib_zip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            entry = project / "main.py"
+            entry.write_text("print('hello')\n", encoding="utf-8")
+            pack = self._runtime_pack(root, target="windows-x86_64")
+            runtime_bin = pack / "runtime" / "bin"
+            (runtime_bin / "tests").mkdir()
+            (runtime_bin / "tests" / "test_runtime.py").write_text(
+                "assert True\n",
+                encoding="utf-8",
+            )
+            (runtime_bin / "python311.pdb").write_bytes(b"symbols")
+            (pack / "include").mkdir()
+            (pack / "include" / "Python.h").write_text(
+                "/* build header */\n",
+                encoding="utf-8",
+            )
+            with zipfile.ZipFile(
+                runtime_bin / "python311.zip",
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                archive.writestr("encodings/__init__.pyc", b"runtime")
+                archive.writestr("json/__init__.pyc", b"runtime")
+                archive.writestr("test/test_os.pyc", b"test")
+                archive.writestr("unittest/__init__.pyc", b"test")
+            result = freeze(
+                entry,
+                root / "bundle",
+                project,
+                dependency_mode="none",
+                runtime_pack=pack,
+                target="windows-x86_64",
+                compact=True,
+                onefile=False,
+            )
+            installed_runtime = result.bundle / "runtime" / "bin"
+            self.assertFalse((installed_runtime / "tests").exists())
+            self.assertFalse(
+                (installed_runtime / "python311.pdb").exists()
+            )
+            self.assertFalse((result.bundle / "include").exists())
+            with zipfile.ZipFile(
+                installed_runtime / "python311.zip"
+            ) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {
+                        "encodings/__init__.pyc",
+                        "json/__init__.pyc",
+                    },
+                )
+            pack_zip = root / "runtime-pack.zip"
+            with zipfile.ZipFile(pack_zip, "w") as archive:
+                for source_path in pack.rglob("*"):
+                    if source_path.is_file():
+                        archive.write(
+                            source_path,
+                            source_path.relative_to(pack).as_posix(),
+                        )
+            zipped_result = freeze(
+                entry,
+                root / "bundle-from-zip",
+                project,
+                dependency_mode="none",
+                runtime_pack=pack_zip,
+                target="windows-x86_64",
+                compact=True,
+                onefile=False,
+            )
+            zipped_runtime = zipped_result.bundle / "runtime" / "bin"
+            self.assertFalse((zipped_runtime / "tests").exists())
+            self.assertFalse(
+                (zipped_runtime / "python311.pdb").exists()
+            )
+            self.assertFalse((zipped_result.bundle / "include").exists())
+            with zipfile.ZipFile(
+                zipped_runtime / "python311.zip"
+            ) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {
+                        "encodings/__init__.pyc",
+                        "json/__init__.pyc",
+                    },
+                )
 
     def test_windows_app_is_windowed_onefile_with_stdlib_zip_and_icon(self):
         with tempfile.TemporaryDirectory() as directory:

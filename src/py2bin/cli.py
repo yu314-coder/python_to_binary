@@ -131,6 +131,7 @@ def _parser() -> argparse.ArgumentParser:
     c_plan_parser.add_argument("entry", type=Path)
     freeze_parser = commands.add_parser(
         "freeze",
+        aliases=["bundle"],
         help="bundle CPython and complete libraries so target Python is not required",
     )
     shared(freeze_parser)
@@ -151,8 +152,9 @@ def _parser() -> argparse.ArgumentParser:
     freeze_parser.add_argument("--icon", type=Path, help="app icon (.ico, .png, or .icns)")
     freeze_parser.add_argument(
         "--compact",
+        "--optimize-size",
         action="store_true",
-        help="omit package tests, build support, and bytecode caches",
+        help="omit tests, caches, and build/debug support from packages and runtime packs",
     )
     onefile_options(freeze_parser)
     freeze_parser.add_argument("--clean", action="store_true")
@@ -173,7 +175,12 @@ def _parser() -> argparse.ArgumentParser:
     assemble_parser.add_argument("--app", action="store_true")
     assemble_parser.add_argument("--name")
     assemble_parser.add_argument("--icon", type=Path)
-    assemble_parser.add_argument("--compact", action="store_true")
+    assemble_parser.add_argument(
+        "--compact",
+        "--optimize-size",
+        action="store_true",
+        help="omit tests, caches, and build/debug support from compatible bundles",
+    )
     onefile_options(assemble_parser)
     assemble_parser.add_argument("--clean", action="store_true")
     runtime_parser = commands.add_parser(
@@ -182,7 +189,11 @@ def _parser() -> argparse.ArgumentParser:
         help="snapshot the current CPython runtime for compatible cross-target assembly",
     )
     runtime_parser.add_argument("--output", "-o", required=True, type=Path)
-    runtime_parser.add_argument("--compact", action="store_true")
+    runtime_parser.add_argument(
+        "--compact",
+        "--optimize-size",
+        action="store_true",
+    )
     runtime_parser.add_argument("--clean", action="store_true")
     capability_parser = commands.add_parser(
         "capabilities",
@@ -499,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"reason: {result.reason}")
             return 0
-        if args.command == "freeze":
+        if args.command in {"freeze", "bundle"}:
             result = freeze(
                 entry,
                 args.output,

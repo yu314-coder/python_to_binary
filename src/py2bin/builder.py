@@ -55,7 +55,6 @@ def _copy_distribution(name: str, destination: Path, compact: bool = False) -> N
             continue
         if compact and (
             any(part in {"PyObjCTest", "test", "tests", "__pycache__"} for part in relative.parts)
-            or relative.name.endswith((".pyc", ".pyo"))
         ):
             continue
         source = Path(distribution.locate_file(item))

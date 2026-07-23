@@ -25,6 +25,23 @@ class FreezerTests(unittest.TestCase):
         self.assertIn("$env:PY2BIN_ONEFILE_COMMAND", script)
         self.assertNotIn("Get-CimInstance", script)
         self.assertNotIn("Win32_Process", script)
+        self.assertNotIn("Join-Path", script)
+        self.assertNotIn("Test-Path", script)
+        self.assertNotIn("Remove-Item", script)
+        self.assertNotIn("Move-Item", script)
+        self.assertNotIn("New-Object", script)
+        self.assertEqual(
+            script.count("if(![IO.File]::Exists($m))"),
+            2,
+        )
+        self.assertLess(
+            script.index("if(![IO.File]::Exists($m))"),
+            script.index("[Threading.Mutex]::new"),
+        )
+        self.assertIn(
+            "$si=[Diagnostics.ProcessStartInfo]::new()",
+            script,
+        )
 
     @unittest.skipUnless(
         platform.system() == "Darwin" and platform.machine() == "arm64",
@@ -123,6 +140,48 @@ class FreezerTests(unittest.TestCase):
             self.assertTrue((destination / "demo-1.0.dist-info" / "METADATA").exists())
             self.assertTrue((destination / "plugin.py").exists())
             self.assertFalse((root / "escape").exists())
+
+    def test_compact_wheel_keeps_runtime_payload_and_omits_tests_and_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "demo-1.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("demo/__init__.py", "value = 42\n")
+                archive.writestr("demo/data/schema.json", "{}")
+                archive.writestr("demo/native.pyd", b"native")
+                archive.writestr("demo/compiled_only.pyc", b"runtime")
+                archive.writestr("demo/tests/test_api.py", "assert True\n")
+                archive.writestr(
+                    "demo/__pycache__/module.pyc",
+                    b"bytecode",
+                )
+                archive.writestr(
+                    "demo-1.0.dist-info/METADATA",
+                    "Name: demo\nVersion: 1.0\n",
+                )
+            destination = root / "packages"
+            destination.mkdir()
+            count = extract_wheel(wheel, destination, compact=True)
+            self.assertEqual(count, 5)
+            self.assertTrue((destination / "demo" / "__init__.py").is_file())
+            self.assertTrue(
+                (destination / "demo" / "data" / "schema.json").is_file()
+            )
+            self.assertTrue((destination / "demo" / "native.pyd").is_file())
+            self.assertTrue(
+                (destination / "demo" / "compiled_only.pyc").is_file()
+            )
+            self.assertTrue(
+                (
+                    destination
+                    / "demo-1.0.dist-info"
+                    / "METADATA"
+                ).is_file()
+            )
+            self.assertFalse((destination / "demo" / "tests").exists())
+            self.assertFalse(
+                (destination / "demo" / "__pycache__").exists()
+            )
 
     def test_frozen_macos_app_wraps_payload_and_icon(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -335,11 +335,19 @@ Freeze an application and its current compatible CPython runtime into one
 self-extracting `.bin` by default:
 
 ```sh
-py2bin freeze app.py --source-root . -o dist/App \
-  --include webview --compact --clean
+py2bin bundle app.py --source-root . -o dist/App \
+  --include webview --optimize-size --clean
 
 # Output on macOS/Linux: dist/App.bin
 ```
+
+`bundle` is only a shorter alias for `freeze`; it does not select a different
+or less compatible backend. `--optimize-size` is an alias for `--compact`.
+On the build host, this command needs Python, py2bin, the application source,
+and the application's installed dependency closure. It invokes no separate
+bundler, compiler, assembler, or linker. Cross-target builds still require the
+matching runtime pack and target wheels because py2bin cannot manufacture
+missing target-native inputs.
 
 For Windows cross-packaging, supply a matching runtime pack, the complete wheel
 closure, and optionally an ICO:
@@ -408,6 +416,12 @@ Startup work is kept out of the Python layer where practical:
 - the handwritten outer PE passes its Unicode path and original command line
   through the child environment, avoiding WMI/CIM process queries;
 - the content-addressed cache prevents repeated payload extraction;
+- cached Windows launches perform a direct `System.IO.File.Exists` completion
+  check before allocating a mutex; the mutex and second cache check occur only
+  after a miss, preserving concurrent first-run safety without charging that
+  synchronization cost on every launch;
+- Windows path, delete, move, and process-start operations use direct .NET APIs
+  rather than PowerShell filesystem-provider cmdlets;
 - the generated bootstrap embeds the entrypoint and taskbar ID rather than
   reading and parsing the JSON manifest at startup;
 - `json` and `pathlib` are absent from the bootstrap path, and `traceback` is
@@ -459,10 +473,27 @@ For non-app outputs, `--onedir` disables self-extraction:
 py2bin freeze app.py --source-root . -o dist/App --onedir --clean
 ```
 
-`--compact` removes distribution test suites, bytecode caches, and CPython
-build/demo modules. Do not use it when the application intentionally imports
-`unittest`, `tkinter`, `lib2to3`, package tests, or CPython build configuration
-files.
+`--compact` / `--optimize-size` removes distribution test suites, loose
+bytecode caches, debug/import-library files, CPython build support, and the
+documented optional standard-library modules. The policy is applied to local
+installed distributions, supplied wheels, supplied runtime packs, and
+`python3XY.zip`. Executable `.pyc` modules inside the standard-library ZIP,
+encodings, package data, native `.pyd`/DLL payloads, and distribution metadata
+are preserved.
+
+Measured against the retained CPython 3.11.9 Windows x86-64 pack, compact
+installation saved 1,076,800 of 21,665,688 bytes (4.97%) while preserving 556
+standard-library ZIP members. Across the 72-wheel heavy reference closure, the
+new wheel filter identified 2,412 removable test/cache files totaling
+38,198,995 uncompressed bytes and 9,547,608 bytes in the source wheel
+archives. A minimal Windows GUI one-file build using that real runtime and the
+ManimStudio ICO decreased from 11,539,423 to 10,899,205 bytes: 640,218 bytes,
+or 5.55%. These are input-specific measurements, not a promise of an identical
+reduction for every EXE because the complete payload is recompressed.
+
+Do not use this policy when the application intentionally imports `unittest`,
+`tkinter`, `lib2to3`, package tests, CPython build configuration files, debug
+symbols, or import libraries at runtime.
 
 ## Dependencies and native libraries
 
