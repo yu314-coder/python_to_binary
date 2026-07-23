@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import __version__
 from .analyzer import analyze
 from .builder import build
 from .csource import CSourceError, compile_c_file, plan_c
@@ -25,7 +26,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="py2bin",
         description="Analyze and bundle Python applications using only the standard library.",
     )
-    parser.add_argument("--version", action="version", version="py2bin 0.1.0")
+    parser.add_argument("--version", action="version", version=f"py2bin {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
     def shared(command: argparse.ArgumentParser) -> None:

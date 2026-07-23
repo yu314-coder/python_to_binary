@@ -21,7 +21,7 @@ class BuildBackendTests(unittest.TestCase):
             sdist_name = build_sdist(directory)
             with tarfile.open(Path(directory) / sdist_name) as archive:
                 names = set(archive.getnames())
-            prefix = "python_to_binary-0.1.0"
+            prefix = "python_to_binary-0.1.1"
             self.assertIn(f"{prefix}/PKG-INFO", names)
             self.assertIn(f"{prefix}/docs/DETAILED_GUIDE.md", names)
             self.assertFalse(

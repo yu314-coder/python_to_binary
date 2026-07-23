@@ -19,10 +19,13 @@ def _adhoc_signature(
     exec_size: int,
     info_plist: bytes | None = None,
     code_resources: bytes | None = None,
+    page_size: int = 4096,
 ) -> bytes:
     """Create an Apple embedded ad-hoc SHA-256 code signature SuperBlob."""
     identifier = b"local.py2bin.native\0"
-    page_size = 4096
+    if page_size <= 0 or page_size & (page_size - 1):
+        raise ValueError("code-signature page size must be a power of two")
+    page_exponent = page_size.bit_length() - 1
     slots = (code_limit + page_size - 1) // page_size
     directory_header_size = 88
     identifier_offset = directory_header_size
@@ -53,7 +56,7 @@ def _adhoc_signature(
         32,
         2,
         0,
-        12,
+        page_exponent,
         0,
     )
     struct.pack_into(">II", directory, 44, 0, 0)
@@ -183,7 +186,13 @@ def write_macho_arm64(
     # contents. Build a placeholder once to size the __LINKEDIT segment.
     placeholder_image = bytes(signature_offset)
     placeholder_signature = _adhoc_signature(
-        placeholder_image, signature_offset, page, len(code), info_plist, code_resources
+        placeholder_image,
+        signature_offset,
+        page,
+        len(code),
+        info_plist,
+        code_resources,
+        page_size=page,
     )
     linkedit = struct.pack(
         "<II16sQQQQiiII",
@@ -230,7 +239,13 @@ def write_macho_arm64(
     image = header + commands + bytes(page - len(header) - len(commands)) + code
     image += bytes(signature_offset - len(image))
     signature = _adhoc_signature(
-        image, signature_offset, page, len(code), info_plist, code_resources
+        image,
+        signature_offset,
+        page,
+        len(code),
+        info_plist,
+        code_resources,
+        page_size=page,
     )
     if len(signature) != len(placeholder_signature):
         raise AssertionError("Mach-O signature sizing changed during finalization")

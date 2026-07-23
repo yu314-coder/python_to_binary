@@ -5,6 +5,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 from py2bin.freezer import _frozen_macos_app, _shell_launcher, extract_wheel
@@ -84,9 +85,12 @@ class FreezerTests(unittest.TestCase):
                 + png
             )
             app = root / "ManimStudio.app"
-            launcher = _frozen_macos_app(
-                payload, app, "ManimStudio", payload_launcher, icon
-            )
+            with mock.patch(
+                "py2bin.native.launcher.platform.machine", return_value="arm64"
+            ):
+                launcher = _frozen_macos_app(
+                    payload, app, "ManimStudio", payload_launcher, icon
+                )
             self.assertTrue(launcher.is_file())
             self.assertTrue(
                 (app / "Contents" / "Resources" / "bundle" / "ManimStudio.bin").is_file()

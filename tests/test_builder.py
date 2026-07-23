@@ -72,7 +72,7 @@ class BuilderTests(unittest.TestCase):
                     clean=True,
                 )
             )
-            self.assertEqual(result.artifact, stale)
+            self.assertTrue(result.artifact.samefile(stale))
             self.assertGreater(stale.stat().st_size, 5)
 
     def test_app_converts_png_backed_ico_and_declares_icon(self):

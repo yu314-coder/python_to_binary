@@ -11,6 +11,9 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+_VERSION = "0.1.1"
+_DISTRIBUTION = f"python_to_binary-{_VERSION}"
+
 
 def _metadata() -> str:
     root = Path(__file__).resolve().parents[2]
@@ -18,7 +21,7 @@ def _metadata() -> str:
     return (
         "Metadata-Version: 2.1\n"
         "Name: python-to-binary\n"
-        "Version: 0.1.0\n"
+        f"Version: {_VERSION}\n"
         "Summary: Pure-Python Python-to-C, native binary compiler, and CPython application bundler\n"
         "Requires-Python: >=3.10\n"
         "License: MIT\n"
@@ -34,9 +37,9 @@ def _metadata() -> str:
 def build_wheel(wheel_directory: str, config_settings=None, metadata_directory=None) -> str:
     del config_settings, metadata_directory
     root = Path(__file__).resolve().parents[2]
-    name = "python_to_binary-0.1.0-py3-none-any.whl"
+    name = f"{_DISTRIBUTION}-py3-none-any.whl"
     target = Path(wheel_directory) / name
-    dist_info = "python_to_binary-0.1.0.dist-info"
+    dist_info = f"{_DISTRIBUTION}.dist-info"
     rows: list[tuple[str, str, str]] = []
     files: dict[str, bytes] = {}
     source_root = root / "src"
@@ -65,9 +68,9 @@ def get_requires_for_build_wheel(config_settings=None) -> list[str]:
 def build_sdist(sdist_directory: str, config_settings=None) -> str:
     del config_settings
     root = Path(__file__).resolve().parents[2]
-    archive_name = "python_to_binary-0.1.0.tar.gz"
+    archive_name = f"{_DISTRIBUTION}.tar.gz"
     target = Path(sdist_directory) / archive_name
-    prefix = "python_to_binary-0.1.0"
+    prefix = _DISTRIBUTION
     included = [
         root / ".gitignore",
         root / "ARCHITECTURE.md",
@@ -113,7 +116,7 @@ def get_requires_for_build_sdist(config_settings=None) -> list[str]:
 
 def prepare_metadata_for_build_wheel(metadata_directory: str, config_settings=None) -> str:
     del config_settings
-    name = "python_to_binary-0.1.0.dist-info"
+    name = f"{_DISTRIBUTION}.dist-info"
     target = Path(metadata_directory) / name
     target.mkdir(parents=True, exist_ok=True)
     (target / "METADATA").write_text(_metadata(), encoding="utf-8")
