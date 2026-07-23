@@ -630,8 +630,10 @@ python3 -m twine check dist/*
 The repository preserves example GitHub Actions definitions under
 `.github/workflows-disabled/`. GitHub does not discover workflows there, and
 `.github/workflows/` is intentionally empty. Normal pushes, pull requests,
-manual dispatches, and releases therefore do not start GitHub Actions. Moving
-a definition back under `.github/workflows/` is an explicit re-enable action.
+manual dispatches, and releases therefore do not start GitHub Actions. The
+repository-level Actions permission is also disabled as a second guard.
+Moving a definition back under `.github/workflows/` or changing the repository
+permission is an explicit re-enable action and requires the owner's direction.
 Publishing to PyPI requires either a configured PyPI trusted publisher or a
 valid API token. Never commit tokens or `.pypirc`.
 

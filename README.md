@@ -679,6 +679,12 @@ TMPDIR=/path/on/your/data/disk \
   PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+GitHub Actions is disabled for this repository at two levels: active workflow
+files are absent from `.github/workflows/`, and the repository Actions
+permission is disabled. Reference definitions remain inert under
+`.github/workflows-disabled/`. Do not move them or re-enable repository Actions
+unless the owner explicitly changes this policy.
+
 This repository is standalone. It does not modify or depend on CodeBench or
 `python-ios-lib`; those projects can consume a future release as an ordinary
 package or copied source dependency when their platform integration is ready.
