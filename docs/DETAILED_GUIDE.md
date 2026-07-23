@@ -42,6 +42,12 @@ Python 3.10 or newer is required on the build host. Native compilation itself
 does not invoke a C compiler, assembler, linker, target SDK, Docker, or target
 Python runtime.
 
+The py2bin package has empty build and runtime dependency lists and imports
+only Python standard-library modules. It does not use Cython, Nuitka, mypyc,
+Rust, C, C++, PyInstaller, or PPCI. This statement describes py2bin itself,
+not third-party payloads: a bundled `bpy`, Torch, or NumPy wheel contains that
+project's own native implementation and still runs through embedded CPython.
+
 ## Choosing an output strategy
 
 | Program | Recommended command | Target Python required |
@@ -115,7 +121,8 @@ The current direct-machine-code frontend supports:
 
 - module docstrings;
 - constant assignments;
-- constant arithmetic and basic f-strings;
+- constant arithmetic, Boolean expressions, comparisons, conditional
+  expressions, constant `if` branches, and basic f-strings;
 - `print(...)`;
 - `SystemExit(...)` and `sys.exit(...)`.
 
@@ -273,7 +280,10 @@ python3 -m build
 python3 -m twine check dist/*
 ```
 
-The project includes GitHub Actions for tests and PyPI trusted publishing.
+The repository contains GitHub Actions definitions for tests and PyPI trusted
+publishing, but both workflows are currently disabled manually. Normal pushes,
+pull requests, manual dispatches, and releases must not start GitHub Actions
+unless the repository owner explicitly re-enables a workflow in GitHub first.
 Publishing to PyPI requires either a configured PyPI trusted publisher or a
 valid API token. Never commit tokens or `.pypirc`.
 

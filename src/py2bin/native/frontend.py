@@ -47,6 +47,10 @@ class Frontend:
             self.values[node.targets[0].id] = self.constant(node.value)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
             self.values[node.target.id] = self.constant(node.value)
+        elif isinstance(node, ast.If):
+            branch = node.body if bool(self.constant(node.test)) else node.orelse
+            for statement in branch:
+                self.statement(statement)
         elif isinstance(node, ast.Pass):
             return
         elif isinstance(node, ast.Import) and all(alias.name == "sys" for alias in node.names):
@@ -125,6 +129,65 @@ class Frontend:
                     return left**right
             except (TypeError, ValueError, ZeroDivisionError, OverflowError) as error:
                 raise NativeCompileError(self.path, node, f"constant expression failed: {error}") from error
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                result = self.constant(node.values[0])
+                for value in node.values[1:]:
+                    if not result:
+                        return result
+                    result = self.constant(value)
+                return result
+            if isinstance(node.op, ast.Or):
+                result = self.constant(node.values[0])
+                for value in node.values[1:]:
+                    if result:
+                        return result
+                    result = self.constant(value)
+                return result
+        if isinstance(node, ast.Compare):
+            left = self.constant(node.left)
+            for operator, comparator in zip(node.ops, node.comparators):
+                right = self.constant(comparator)
+                try:
+                    if isinstance(operator, ast.Eq):
+                        result = left == right
+                    elif isinstance(operator, ast.NotEq):
+                        result = left != right
+                    elif isinstance(operator, ast.Lt):
+                        result = left < right
+                    elif isinstance(operator, ast.LtE):
+                        result = left <= right
+                    elif isinstance(operator, ast.Gt):
+                        result = left > right
+                    elif isinstance(operator, ast.GtE):
+                        result = left >= right
+                    elif isinstance(operator, (ast.Is, ast.IsNot)):
+                        left_is_singleton = left is None or type(left) is bool
+                        right_is_singleton = right is None or type(right) is bool
+                        if not (left_is_singleton or right_is_singleton):
+                            raise NativeCompileError(
+                                self.path,
+                                node,
+                                "identity comparison is limited to None, True, or False",
+                            )
+                        result = left is right
+                        if isinstance(operator, ast.IsNot):
+                            result = not result
+                    else:
+                        raise NativeCompileError(
+                            self.path, node, "comparison is not in the native subset yet"
+                        )
+                except (TypeError, ValueError) as error:
+                    raise NativeCompileError(
+                        self.path, node, f"constant comparison failed: {error}"
+                    ) from error
+                if not result:
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.IfExp):
+            branch = node.body if bool(self.constant(node.test)) else node.orelse
+            return self.constant(branch)
         if isinstance(node, ast.JoinedStr):
             parts: list[str] = []
             for item in node.values:

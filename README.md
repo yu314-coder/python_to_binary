@@ -1,23 +1,41 @@
 # python-to-binary
 
-`py2bin` is a dependency-free compiler and application builder written in pure
-Python. It has three deliberately separate execution paths:
+`py2bin` is a self-contained compiler and application builder implemented with
+the Python standard library. The project itself has no runtime or build
+dependencies: no Cython, Nuitka, mypyc, Rust, C, C++, PyInstaller, PPCI, native
+bootloader, assembler, linker, or SDK.
 
-1. **Native compile:** Python AST → py2bin IR → machine-code bytes → ELF or
-   Mach-O. This invokes no assembler or linker, and the generated executable
-   needs no Python installation at runtime.
-2. **Compatible bundle:** full CPython projects become a `.pyz`, executable
-   `.bin`, directory bundle, or macOS `.app`, including installed package data
-   and native extensions used by Manim, PyTorch, Transformers, NumPy, or `bpy`.
-3. **Portable-C frontend:** a useful typed subset of Python becomes readable C
+It has four deliberately separate execution paths. They must not be confused:
+
+1. **Native compile:** Python AST → py2bin IR → py2bin optimizer → handwritten
+   x86-64/ARM64 instructions → ELF, PE, or Mach-O. This invokes no external
+   toolchain, and the generated program needs no Python runtime.
+2. **Runtime freeze:** arbitrary CPython projects and target-compatible packages
+   are collected with an embedded CPython runtime. This is compatibility
+   packaging, not native translation of the application.
+3. **Lightweight bundle:** `.pyz`, executable `.bin`, and directory formats
+   package project code and dependencies but use a compatible target Python.
+4. **Portable-C frontend:** a useful typed subset of Python becomes readable C
    source, or a checksummed `.py2cbin` C-source container. Imports automatically
    plan for the compatible CPython bundle instead of pretending native packages
    can be translated from Python source.
 
 ## What “pure Python” means
 
-The **compiler and builder** use only Python's standard library. They do not require a C/C++
-compiler, Rust, PyInstaller, Nuitka, Docker, or a native bootloader.
+The **py2bin implementation** imports only Python standard-library modules.
+Both `[build-system].requires` and runtime dependencies are empty. The test
+suite checks these invariants.
+
+This guarantee applies to py2bin itself. A user who asks py2bin to package
+Torch, `bpy`, Manim, NumPy, or another third-party project is explicitly asking
+to carry that project's code and native files as application payload. Those
+projects may have been implemented using C, C++, Rust, Cython, CUDA, or other
+tools; py2bin neither claims ownership of that code nor recompiles it.
+
+`py2bin compile` does not import or invoke Cython, Nuitka, mypyc, Rust, a C/C++
+compiler, PyInstaller, Docker, or a native bootloader. Supplying binary wheels
+to `freeze` also avoids local native builds, but it does not turn those wheels
+into py2bin-authored machine code.
 
 Native binaries are always target-specific—there is no single machine-code file
 that runs on every OS and CPU. `py2bin` can manufacture PE/ELF/Mach-O files in
@@ -76,24 +94,67 @@ See the [detailed compiler, bundling, target, and release guide](docs/DETAILED_G
 
 ## Formats
 
-| Format | Output | Native extensions | Python required on target |
-|---|---|---:|---:|
-| `bin` | Executable self-extracting zip application | Yes, after extraction | Yes |
-| `pyz` | Python zip application | Yes, after extraction | Yes |
-| `dir` | App + dependencies + launcher | Yes | Yes |
-| `app` | macOS application bundle | Yes | Yes |
+| Command/mode | Output | Application logic | Installed Python needed on target |
+|---|---|---|---:|
+| `compile` | ELF, PE, Mach-O, macOS `.app` | py2bin-generated machine code | No |
+| `emit-c` | `.c` or `.py2cbin` | C source, not yet an executable | N/A |
+| `build --format pyz` | Python zip application | CPython bytecode/source | Yes |
+| `build --format bin` | Self-extracting Python application | CPython bytecode/source | Yes |
+| `build --format dir` | Project, packages, and launcher | CPython bytecode/source | Yes |
+| `freeze` | Embedded-runtime directory or macOS `.app` | CPython bytecode/source | No |
+
+Every executable above is a valid OS binary or executable launcher, but only
+`compile` translates the supported application logic into py2bin-generated CPU
+instructions. `freeze` produces a real native launcher around embedded CPython;
+calling the contained Python application “natively compiled” would be
+incorrect.
+
+## Claims audit
+
+The following wording is intentionally strict. “No installed Python on the
+target” is not the same claim as “the application does not use CPython.”
+
+| Claim | Accurate? | Exact meaning |
+|---|---:|---|
+| No GCC, Clang, assembler, or linker is required | Yes | `compile` writes ELF, PE, and Mach-O bytes directly. `freeze` copies a compatible CPython runtime and installed package files. |
+| The target computer does not need Python installed | Yes, for `compile` and `freeze` | A `compile` artifact has no Python runtime. A `freeze` artifact carries its own CPython runtime. The lighter `build` formats still need compatible target Python. |
+| A complete frozen application does not use CPython | No | `freeze` embeds and starts CPython; only the supported `compile` subset replaces Python execution with generated machine code. |
+| Third-party packages do not need a Python runtime | No | NumPy, Torch, `bpy`, Manim, and similar packages are imported by the embedded CPython runtime in `freeze` mode. |
+| Arbitrary Python is translated completely to machine code | No | `compile` currently accepts the documented small, static subset and rejects unsupported syntax with a source location. |
+| py2bin itself has no third-party Python dependency | Yes | The package imports only Python standard-library modules, and its build/runtime dependency lists are empty. Tests enforce both properties. |
+| The build computer does not need Python | No | Building requires Python 3.10+ to run py2bin. No native compiler toolchain is required for the supported direct-binary path. |
 
 Native compile targets currently implemented are `linux-x86_64` (ELF),
 `linux-arm64` (ELF), `darwin-x86_64` and `darwin-arm64` (Mach-O), and
 `windows-x86_64` and `windows-arm64` (PE `.exe`).
 Run `py2bin targets` to list them. The first native
 frontend milestone supports module constants, constant arithmetic and
-f-strings, `print()`, and integer exit status. It rejects everything else with
-a source location rather than producing a subtly incorrect executable.
+comparisons, constant Boolean expressions and branches, f-strings, `print()`,
+and integer exit status. It rejects everything else with a source location
+rather than producing a subtly incorrect executable.
 
 The bundle-format `bin` uses Python; `py2bin compile` produces actual machine
 code. These writers encode executable headers, import tables, system calls, and
 instructions directly rather than shelling out to an assembler.
+
+## Self-written optimizer
+
+The native compiler has its own target-independent optimizer. It currently:
+
+- propagates assignment constants;
+- folds arithmetic, Boolean, comparison, conditional-expression, and f-string
+  constants;
+- selects only the reachable arm of a constant `if`;
+- removes assignments that have no runtime representation;
+- removes empty writes;
+- merges adjacent writes to reduce system calls;
+- removes operations after the first process exit;
+- inserts one canonical successful exit when required.
+
+These transformations are deterministic and covered by equivalence tests. No
+optimizer can truthfully be “fully optimal” for every Python program. py2bin
+therefore documents each safe optimization instead of claiming universal
+optimality, and unsupported dynamic semantics remain compilation errors.
 
 Select the OS and architecture independently:
 
@@ -251,6 +312,10 @@ off when the packaged program imports package test suites, `tkinter`,
 “Supports all libraries” means the collector is generic and does not maintain a
 hardcoded allowlist. It cannot guarantee that every third-party binary, driver,
 external executable, license, network model, or platform service is portable.
+It also cannot make mutually incompatible third-party requirements coexist in
+one Python environment. For example, some current Manim and `bpy` releases
+require incompatible NumPy major versions; use compatible releases or separate
+runtime sidecars rather than bypassing package constraints.
 
 Native compilation of those libraries is a different problem: Torch contains
 millions of lines of precompiled C++/CUDA code, `bpy` is coupled to Blender, and
@@ -260,6 +325,29 @@ cannot truthfully become one CPU-independent executable. The long-term native
 API is an adapter ABI: pure-Python modules compile through py2bin IR, while
 large native libraries link as target-specific prebuilt components.
 Until that adapter ABI is complete, `freeze` is the full-compatibility engine.
+
+## Comparison with dante-biase/py2bin
+
+This project is unrelated to
+[dante-biase/py2bin](https://github.com/dante-biase/py2bin). That repository
+describes itself as a streamlined PyInstaller interface, declares
+PyInstaller 3.6, Click 7.1.1, and py2x 1.0 as dependencies, and invokes
+PyInstaller's `--onefile` mode in a subprocess. Its README lists macOS as its
+compatibility target.
+
+| Capability | This project | dante-biase/py2bin |
+|---|---|---|
+| Implementation dependencies | Python standard library only | PyInstaller, Click, and py2x |
+| Actual Python-to-machine-code path | Yes, for the documented small static subset | No; it delegates packaging to PyInstaller |
+| Arbitrary-package compatibility path | Embedded-CPython `freeze` bundle | PyInstaller one-file bundle |
+| Direct binary writers | ELF, PE, and Mach-O; x86-64 and ARM64 | None in that wrapper |
+| Installed Python required on target | No for `compile` or `freeze` | No for the produced PyInstaller bundle |
+| Arbitrary Python becomes native machine code | No | No |
+
+The fair comparison is therefore `freeze` versus its PyInstaller wrapper for
+application compatibility, and `compile` versus a real compiler for native
+translation. Calling either project's compatibility bundle a complete native
+translation would be inaccurate.
 
 ## PPCI relationship
 
@@ -284,8 +372,14 @@ fingerprint; deleting the cache is safe when no bundled program is running.
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The implementation intentionally depends only on the standard library, and the
-tests never download packages or write outside their temporary directory.
+The implementation intentionally depends only on the standard library. The
+unit suite performs no package downloads and writes only inside its selected
+temporary directory:
+
+```sh
+TMPDIR=/path/on/your/data/disk \
+  PYTHONPATH=src python3 -m unittest discover -s tests -v
+```
 
 This repository is standalone. It does not modify or depend on CodeBench or
 `python-ios-lib`; those projects can consume a future release as an ordinary

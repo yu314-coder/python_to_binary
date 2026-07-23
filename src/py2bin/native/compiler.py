@@ -13,6 +13,7 @@ from .formats.elf import write_elf_arm64, write_elf_x86_64
 from .formats.macho import write_macho_arm64, write_macho_x86_64
 from .formats.pe import write_pe_arm64, write_pe_x86_64
 from .frontend import lower
+from .optimizer import optimize
 from .x86_64 import encode
 
 
@@ -140,7 +141,7 @@ def compile_native(
     if output.exists() and not clean:
         raise FileExistsError(f"output already exists: {output} (use --clean)")
     source = entry.read_text(encoding="utf-8")
-    module = lower(entry, source)
+    module, _optimization = optimize(lower(entry, source))
     info_plist, code_resources = _app_metadata(entry.stem) if app else (None, None)
     if target == "windows-x86_64":
         image = write_pe_x86_64(module)
