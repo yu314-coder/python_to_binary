@@ -452,8 +452,11 @@ tree unpacked for inspection and debugging. Cross-target compatibility builds
 require an explicit matching runtime pack and complete target-wheel closure.
 Dynamic imports still need `--include`.
 
-Windows one-file outputs accept an `.ico` directly. The outer PE resource
-section is written by py2bin; no resource compiler is invoked:
+Windows one-file outputs accept an `.ico` directly. py2bin writes the PE
+resources itself; no resource compiler is invoked. For `--app`, it replaces
+the inherited Python icon and version information on both the outer one-file
+launcher and the embedded app host. `--name` supplies the app/product
+identity, and `--icon` supplies the executable icon:
 
 ```sh
 py2bin freeze app.py -o dist/App --target windows-x86_64 \
@@ -461,13 +464,64 @@ py2bin freeze app.py -o dist/App --target windows-x86_64 \
   --wheel-dir wheels/windows-cp311 --icon icon.ico --app --clean
 ```
 
-For Windows, `--app` selects the GUI subsystem and suppresses console windows
-for the extractor and embedded CPython process. Omit `--app` for a console
-program. The generated isolated-runtime path includes the matching embedded
+### Windows GUI identity and startup
+
+For Windows, `--app` makes both executable layers GUI-subsystem PE files and
+uses the runtime pack's `pythonw.exe` as the inner app host. It suppresses
+console windows for the extractor and compatible CPython process. Omit `--app`
+for a console program.
+
+| What Windows sees | Implementation | Identity |
+|---|---|---|
+| Distributed `NAME.exe` | Handwritten py2bin PE launcher carrying the ZIP payload | `NAME`, app version resource, and `--icon` |
+| Cached/running `NAME.exe` | Renamed target `pythonw.exe` that loads the bundled CPython DLL | The same `NAME`, version resource, and `--icon`; inherited Python branding is removed |
+| Loaded `python3XY.dll` and native packages | Bundled CPython, `.pyd`, and dependency DLLs | Still visible to diagnostic tools because this is the compatibility path |
+
+Before application code creates a window, the bootstrap assigns an explicit
+`PythonToBinary.NAME` Windows AppUserModelID using the exact wide-string API
+signature. Microsoft documents that this ID identifies the process to the
+taskbar and should be set during initial startup before UI is shown:
+[AppUserModelIDs](https://learn.microsoft.com/en-us/windows/win32/shell/appids)
+and
+[`SetCurrentProcessExplicitAppUserModelID`](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-setcurrentprocessexplicitappusermodelid).
+
+A GUI toolkit can deliberately override its window icon. A previously pinned
+`.lnk` shortcut can also retain its own old icon or AppUserModelID; py2bin does
+not rewrite existing Windows shortcuts, so unpin and re-pin the rebuilt
+executable when checking a new identity build.
+
+These changes fix Windows presentation and grouping, not compilation mode. A
+frozen Manim/Torch/pywebview application still executes bundled CPython. Seeing
+`python3XY.dll` in a module list is therefore expected and is not equivalent to
+the taskbar incorrectly identifying the application as Python.
+
+The generated isolated-runtime path includes the matching embedded
 standard-library archive, such as `python312.zip`; target-compatible runtime
 packs must supply that archive or an equivalent `Lib` tree. py2bin rewrites
 both the executable-specific and versioned-DLL `_pth` files because Windows
 CPython can give the latter priority.
+
+For the fastest first launch of a large Windows GUI, use the unpacked app
+layout. It starts `pythonw.exe` directly and performs no one-file extraction:
+
+```sh
+py2bin freeze app.py -o dist/App --target windows-x86_64 \
+  --runtime-pack runtimes/windows-cp311-amd64 \
+  --wheel-dir wheels/windows-cp311 --app --onedir --compact --clean
+
+# Start dist/App/App.exe and distribute the complete dist/App directory.
+```
+
+This is a distribution tradeoff, not a different compilation mode. A one-file
+build must materialize native `.pyd` and `.dll` files before Windows can load
+them; packages such as Torch and `bpy` can therefore make the first launch
+substantially slower. The content-addressed one-file cache makes later launches
+reuse the extracted tree. The one-file launcher passes its path and original
+command line directly to its extraction process instead of querying WMI/CIM.
+The generated bootstrap embeds its entrypoint and AppUserModelID at build time,
+avoiding per-launch JSON and `pathlib` work; traceback support is imported only
+after an application error. ZIP level 6 is used as the default size/extraction
+balance.
 
 On macOS, `freeze --app` wraps the one-file payload in the directory structure
 required by the Apple `.app` format. The runtime archive is embedded in
@@ -599,10 +653,11 @@ fingerprint; deleting the cache is safe when no bundled program is running.
 “One file” describes distribution, not execution without extraction. The first
 launch atomically expands the embedded runtime; later launches reuse it.
 Windows launchers use the Windows PowerShell/.NET ZIP facilities included with
-normal Windows 10/11 installations. Linux and macOS launchers use `/bin/sh`
-plus `tail`, `head`, and `tar` from the base operating system. Extremely
-minimal Windows or Linux images that remove those OS facilities need
-`--onedir`.
+normal Windows 10/11 installations. The handwritten PE passes its own path and
+original Unicode command line through the child environment, avoiding WMI/CIM
+process queries. Linux and macOS launchers use `/bin/sh` plus `tail`, `head`,
+and `tar` from the base operating system. Extremely minimal Windows or Linux
+images that remove those OS facilities need `--onedir`.
 
 A macOS `.app` can never literally be one filesystem file because Apple defines
 it as a directory bundle. py2bin minimizes it to the native executable carrying

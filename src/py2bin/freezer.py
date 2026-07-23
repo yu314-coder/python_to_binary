@@ -28,7 +28,7 @@ from .runtime_packs import (
     inspect_runtime_pack,
     write_runtime_manifest,
 )
-from .windows_icon import install_windows_icon
+from .windows_icon import install_windows_icon, install_windows_identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +74,12 @@ def _required_suffix(path: Path, suffix: str) -> Path:
 
 def _canonical_distribution(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _windows_app_user_model_id(name: str) -> str:
+    parts = re.findall(r"[A-Za-z0-9]+", name)
+    product = "".join(part[:1].upper() + part[1:] for part in parts) or "App"
+    return f"PythonToBinary.{product}"[:128]
 
 
 def inspect_wheel(wheel: Path) -> WheelInfo:
@@ -652,11 +658,9 @@ def freeze(
             raise ValueError(
                 "--app currently requires a darwin-arm64 or Windows runtime"
             )
-        if windows_app and not onefile:
-            raise ValueError("Windows --app currently requires --onefile")
         if macos_app:
             output = _required_suffix(output, ".app")
-        elif windows_app:
+        elif windows_app and onefile:
             output = _required_suffix(output, ".exe")
     elif onefile:
         required_suffix = ".exe" if bundle_target.startswith("windows-") else ".bin"
@@ -726,6 +730,9 @@ def freeze(
             )
         runtime_relative = runtime_executable.relative_to(stage)
         entry_relative = entry.relative_to(source_root).as_posix()
+        windows_app_id = (
+            _windows_app_user_model_id(name) if windows_app else None
+        )
         manifest = {
             "schema": 1,
             "entry": entry_relative,
@@ -734,32 +741,47 @@ def freeze(
             "distributions": sorted(analysis.distributions, key=str.lower),
             "wheels": [path.name for path in wheels],
             "compact": compact,
+            "windows_app_user_model_id": windows_app_id,
         }
         (stage / "py2bin-freeze.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
+        bootstrap_entry = repr(entry_relative)
+        bootstrap_app_id = repr(windows_app_id)
         (stage / "py2bin_bootstrap.py").write_text(
-            "import json, os, runpy, sys, traceback\n"
-            "from pathlib import Path\n"
+            "import os, runpy, sys\n"
+            f"_ENTRY = {bootstrap_entry}\n"
+            f"_WINDOWS_APP_ID = {bootstrap_app_id}\n"
             "def main(from_site=False):\n"
-            "    root = Path(__file__).resolve().parent\n"
-            "    manifest = json.loads((root / 'py2bin-freeze.json').read_text())\n"
-            "    sys.path[:0] = [str(root / 'app'), str(root / 'site-packages')]\n"
-            "    entry = root / 'app' / manifest['entry']\n"
-            "    sys.argv[0] = str(entry)\n"
-            "    os.environ['PY2BIN_BUNDLE_ROOT'] = str(root)\n"
+            "    root = os.path.dirname(os.path.abspath(__file__))\n"
+            "    if _WINDOWS_APP_ID and sys.platform == 'win32':\n"
+            "        try:\n"
+            "            import ctypes\n"
+            "            setter = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID\n"
+            "            setter.argtypes = [ctypes.c_wchar_p]\n"
+            "            setter.restype = ctypes.c_long\n"
+            "            setter(_WINDOWS_APP_ID)\n"
+            "        except BaseException:\n"
+            "            pass\n"
+            "    app_root = os.path.join(root, 'app')\n"
+            "    sys.path[:0] = [app_root, os.path.join(root, 'site-packages')]\n"
+            "    entry = os.path.join(app_root, *_ENTRY.split('/'))\n"
+            "    sys.argv[0] = entry\n"
+            "    os.environ['PY2BIN_BUNDLE_ROOT'] = root\n"
             "    if not from_site:\n"
-            "        runpy.run_path(str(entry), run_name='__main__')\n"
+            "        runpy.run_path(entry, run_name='__main__')\n"
             "        return\n"
             "    status = 0\n"
             "    try:\n"
-            "        runpy.run_path(str(entry), run_name='__main__')\n"
+            "        runpy.run_path(entry, run_name='__main__')\n"
             "    except SystemExit as error:\n"
             "        status = error.code if isinstance(error.code, int) else 1\n"
             "    except BaseException:\n"
+            "        import traceback\n"
             "        report = traceback.format_exc()\n"
             "        try:\n"
-            "            (root / 'py2bin-error.log').write_text(report, encoding='utf-8')\n"
+            "            with open(os.path.join(root, 'py2bin-error.log'), 'w', encoding='utf-8') as stream:\n"
+            "                stream.write(report)\n"
             "        except BaseException:\n"
             "            pass\n"
             "        try:\n"
@@ -783,7 +805,15 @@ def freeze(
             runtime_path_files = tuple(
                 runtime_executable.parent.glob("python*._pth")
             )
-            runtime_executable.replace(launcher)
+            launcher_source = runtime_executable
+            if windows_app:
+                windowed_runtime = runtime_executable.with_name("pythonw.exe")
+                if not windowed_runtime.is_file():
+                    raise ValueError(
+                        "Windows --app requires pythonw.exe in the runtime pack"
+                    )
+                launcher_source = windowed_runtime
+            launcher_source.replace(launcher)
             major, minor = runtime_python_version.split(".")[:2]
             isolated_path = (
                 f"python{major}{minor}.zip\n"
@@ -798,7 +828,14 @@ def freeze(
                 "from py2bin_bootstrap import main\nmain(from_site=True)\n",
                 encoding="utf-8",
             )
-            if icon is not None and not onefile:
+            if windows_app:
+                install_windows_identity(
+                    launcher,
+                    name,
+                    version="1.0.0.0",
+                    icon=icon,
+                )
+            elif icon is not None:
                 install_windows_icon(launcher, icon)
         else:
             launcher = stage / f"{name}.bin"

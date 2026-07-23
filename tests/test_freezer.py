@@ -11,10 +11,21 @@ import zipfile
 
 from py2bin.freezer import _frozen_macos_app, _shell_launcher, extract_wheel
 from py2bin.native.launcher import macos_shell_launcher
-from py2bin.onefile import create_onefile
+from py2bin.onefile import _powershell_script, create_onefile
 
 
 class FreezerTests(unittest.TestCase):
+    def test_windows_onefile_script_uses_launcher_environment_without_wmi(self):
+        script = _powershell_script(
+            offset=1234,
+            digest="0" * 64,
+            launcher="Demo.exe",
+        )
+        self.assertIn("$env:PY2BIN_ONEFILE_SELF", script)
+        self.assertIn("$env:PY2BIN_ONEFILE_COMMAND", script)
+        self.assertNotIn("Get-CimInstance", script)
+        self.assertNotIn("Win32_Process", script)
+
     @unittest.skipUnless(
         platform.system() == "Darwin" and platform.machine() == "arm64",
         "self-extracting Mach-O runs only on Apple Silicon",

@@ -160,6 +160,9 @@ def _write_pe(module: Module, machine: int, arm64: bool) -> bytes:
 
 _LAUNCHER_IMPORTS = (
     "lstrcpyA",
+    "GetModuleFileNameW",
+    "GetCommandLineW",
+    "SetEnvironmentVariableW",
     "CreateProcessA",
     "WaitForSingleObject",
     "GetExitCodeProcess",
@@ -170,7 +173,7 @@ _LAUNCHER_IMPORTS = (
 
 def _launcher_rdata(
     command_prefix: bytes,
-) -> tuple[bytes, dict[str, int], int, int, int, int]:
+) -> tuple[bytes, dict[str, int], int, int, int, int, int, int, int]:
     image_base = 0x140000000
     rdata_rva = 0x2000
     raw, imports, iat_offset, iat_size = _imports_for(
@@ -186,8 +189,24 @@ def _launcher_rdata(
     buffer_offset = len(data)
     # CreateProcess may modify its command-line buffer in place.
     data.extend(b"\0" * (len(command_prefix) + 1))
+    while len(data) % 16:
+        data.append(0)
+    self_environment_offset = len(data)
+    data.extend("PY2BIN_ONEFILE_SELF".encode("utf-16-le") + b"\0\0")
+    command_environment_offset = len(data)
+    data.extend("PY2BIN_ONEFILE_COMMAND".encode("utf-16-le") + b"\0\0")
+    while len(data) % 16:
+        data.append(0)
+    module_path_offset = len(data)
+    # GetModuleFileNameW accepts the extended Windows path limit in WCHARs.
+    data.extend(b"\0" * (32768 * 2))
     prefix_address = image_base + rdata_rva + prefix_offset
     buffer_address = image_base + rdata_rva + buffer_offset
+    self_environment_address = image_base + rdata_rva + self_environment_offset
+    command_environment_address = (
+        image_base + rdata_rva + command_environment_offset
+    )
+    module_path_address = image_base + rdata_rva + module_path_offset
     return (
         bytes(data),
         imports,
@@ -195,6 +214,9 @@ def _launcher_rdata(
         iat_size,
         prefix_address,
         buffer_address,
+        self_environment_address,
+        command_environment_address,
+        module_path_address,
     )
 
 
@@ -203,6 +225,9 @@ def _x86_64_launcher_code(
     imports: dict[str, int],
     prefix_address: int,
     buffer_address: int,
+    self_environment_address: int,
+    command_environment_address: int,
+    module_path_address: int,
 ) -> bytes:
     code = bytearray()
     calls: list[tuple[int, str]] = []
@@ -223,6 +248,25 @@ def _x86_64_launcher_code(
 
     code.extend(b"\x48\x81\xec\xe8\0\0\0")  # sub rsp, 0xe8
     code.extend(b"\x31\xc0\x48\x8d\x7c\x24\x20\xb9\x19\0\0\0\xf3\x48\xab")
+    code.extend(b"\x31\xc9")
+    lea(b"\x48\x8d\x15", module_path_address)
+    code.extend(b"\x41\xb8\0\x80\0\0")
+    call("GetModuleFileNameW")
+    code.extend(b"\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
+    lea(b"\x48\x8d\x0d", self_environment_address)
+    lea(b"\x48\x8d\x15", module_path_address)
+    call("SetEnvironmentVariableW")
+    code.extend(b"\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
+    call("GetCommandLineW")
+    code.extend(b"\x48\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
+    code.extend(b"\x48\x89\xc2")
+    lea(b"\x48\x8d\x0d", command_environment_address)
+    call("SetEnvironmentVariableW")
+    code.extend(b"\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
     lea(b"\x48\x8d\x0d", buffer_address)
     lea(b"\x48\x8d\x15", prefix_address)
     call("lstrcpyA")
@@ -270,6 +314,9 @@ def _arm64_launcher_code(
     imports: dict[str, int],
     prefix_address: int,
     buffer_address: int,
+    self_environment_address: int,
+    command_environment_address: int,
+    module_path_address: int,
 ) -> bytes:
     words: list[int] = [_sub_sp(160)]
     calls: list[tuple[int, str]] = []
@@ -287,6 +334,23 @@ def _arm64_launcher_code(
 
     for offset in range(0, 160, 8):
         words.append(0xF90003FF | ((offset // 8) << 10))  # str xzr,[sp,#offset]
+    words.append(0xAA1F03E0)  # x0 = NULL
+    address(1, module_path_address)
+    words.extend(_mov(2, 32768))
+    call("GetModuleFileNameW")
+    failure_branches = [len(words)]
+    words.append(0)
+    address(0, self_environment_address)
+    address(1, module_path_address)
+    call("SetEnvironmentVariableW")
+    failure_branches.append(len(words))
+    words.append(0)
+    call("GetCommandLineW")
+    words.append(0xAA0003E1)  # x1 = returned command line
+    address(0, command_environment_address)
+    call("SetEnvironmentVariableW")
+    failure_branches.append(len(words))
+    words.append(0)
     address(0, buffer_address)
     address(1, prefix_address)
     call("lstrcpyA")
@@ -306,7 +370,7 @@ def _arm64_launcher_code(
         )
     )
     call("CreateProcessA")
-    failure_branch = len(words)
+    failure_branches.append(len(words))
     words.append(0)
     words.append(0xF94043E0)  # thread handle at process-info + 8
     call("CloseHandle")
@@ -325,10 +389,11 @@ def _arm64_launcher_code(
     words.extend(_mov(0, 111))
     words.append(0x910283FF)
     call("ExitProcess")
-    words[failure_branch] = (
-        0xB4000000
-        | (((failure_index - failure_branch) & 0x7FFFF) << 5)
-    )
+    for failure_branch in failure_branches:
+        words[failure_branch] = (
+            0x34000000
+            | (((failure_index - failure_branch) & 0x7FFFF) << 5)
+        )
 
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
     for index, register, target in addresses:
@@ -374,16 +439,31 @@ def write_pe_shell_launcher(
         iat_size,
         prefix_address,
         buffer_address,
+        self_environment_address,
+        command_environment_address,
+        module_path_address,
     ) = _launcher_rdata(command_prefix)
     code_address = 0x140001000
     if machine == "x86_64":
         code = _x86_64_launcher_code(
-            code_address, imports, prefix_address, buffer_address
+            code_address,
+            imports,
+            prefix_address,
+            buffer_address,
+            self_environment_address,
+            command_environment_address,
+            module_path_address,
         )
         machine_id = 0x8664
     elif machine == "arm64":
         code = _arm64_launcher_code(
-            code_address, imports, prefix_address, buffer_address
+            code_address,
+            imports,
+            prefix_address,
+            buffer_address,
+            self_environment_address,
+            command_environment_address,
+            module_path_address,
         )
         machine_id = 0xAA64
     else:

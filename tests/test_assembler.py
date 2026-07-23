@@ -2,13 +2,23 @@ from pathlib import Path
 import io
 import json
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
 
 from py2bin.assembler import assemble
 from py2bin.freezer import freeze, inspect_wheel
+from py2bin.native.formats.pe import write_pe_shell_launcher
 from py2bin.runtime_packs import MANIFEST_NAME, inspect_runtime_pack
+from py2bin.windows_icon import (
+    RT_GROUP_ICON,
+    RT_ICON,
+    RT_VERSION,
+    _existing_resources,
+    _pe_layout,
+)
 
 
 class AssemblerTests(unittest.TestCase):
@@ -24,9 +34,23 @@ class AssemblerTests(unittest.TestCase):
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         executable.chmod(0o755)
         if target.startswith("windows-"):
+            machine = "arm64" if target.endswith("arm64") else "x86_64"
+            executable.write_bytes(
+                write_pe_shell_launcher(
+                    b"cmd.exe /d /c exit 0 ",
+                    machine,
+                )
+            )
             (executable.parent / "python311._pth").write_text(
                 "python311.zip\n.\n#import site\n",
                 encoding="utf-8",
+            )
+            (executable.parent / "pythonw.exe").write_bytes(
+                write_pe_shell_launcher(
+                    b"cmd.exe /d /c exit 0 ",
+                    machine,
+                    windowed=True,
+                )
             )
         (pack / MANIFEST_NAME).write_text(
             json.dumps(
@@ -151,37 +175,160 @@ class AssemblerTests(unittest.TestCase):
                 dll_path = archive.read(
                     "runtime/bin/python311._pth"
                 ).decode("utf-8")
+                inner_image = archive.read("Demo-0.2.1.exe")
+                manifest = json.loads(
+                    archive.read("py2bin-freeze.json").decode("utf-8")
+                )
+                bootstrap = archive.read(
+                    "py2bin_bootstrap.py"
+                ).decode("utf-8")
+            outer_resources = _existing_resources(image, _pe_layout(image))
+            inner_layout = _pe_layout(inner_image)
+            inner_resources = _existing_resources(
+                inner_image,
+                inner_layout,
+            )
+            inner_optional = int(inner_layout["optional"])
+            inner_subsystem = struct.unpack_from(
+                "<H",
+                inner_image,
+                inner_optional + 68,
+            )[0]
+            version_key = (RT_VERSION, 1, 0x0409)
             self.assertTrue(result.onefile)
             self.assertEqual(result.bundle.suffix, ".exe")
             self.assertEqual(result.bundle.name, "Demo-0.2.1.exe")
             self.assertEqual(result.files, 1)
             self.assertEqual(image[:2], b"MZ")
             self.assertEqual(subsystem, 2)
+            self.assertEqual(inner_subsystem, 2)
             self.assertGreater(resource_rva, 0)
             self.assertIn(b"PY2BIN-ONEFILE-PAYLOAD-V1", image)
+            self.assertIn(b"GetModuleFileNameW", image)
+            self.assertIn(b"GetCommandLineW", image)
+            self.assertIn(b"SetEnvironmentVariableW", image)
+            self.assertIn(
+                "PY2BIN_ONEFILE_SELF".encode("utf-16-le"),
+                image,
+            )
             self.assertIn("python311.zip\n", python_path)
             self.assertIn("import site\n", python_path)
             self.assertEqual(dll_path, python_path)
+            self.assertIn(version_key, outer_resources)
+            self.assertIn(version_key, inner_resources)
+            self.assertIn(
+                "Demo-0.2.1".encode("utf-16-le"),
+                outer_resources[version_key].data,
+            )
+            self.assertIn(
+                "Demo-0.2.1".encode("utf-16-le"),
+                inner_resources[version_key].data,
+            )
+            for resources in (outer_resources, inner_resources):
+                self.assertIn((RT_GROUP_ICON, 1, 0x0409), resources)
+                self.assertTrue(
+                    any(key[0] == RT_ICON for key in resources)
+                )
+            self.assertEqual(
+                manifest["windows_app_user_model_id"],
+                "PythonToBinary.Demo021",
+            )
+            self.assertIn(
+                "SetCurrentProcessExplicitAppUserModelID",
+                bootstrap,
+            )
+            self.assertIn(
+                "setter.argtypes = [ctypes.c_wchar_p]",
+                bootstrap,
+            )
+            self.assertIn(
+                "setter.restype = ctypes.c_long",
+                bootstrap,
+            )
+            self.assertNotIn("import json", bootstrap)
+            self.assertNotIn("from pathlib import Path", bootstrap)
+            self.assertIn(
+                "except BaseException:\n        import traceback",
+                bootstrap,
+            )
+            compile(bootstrap, "py2bin_bootstrap.py", "exec")
+            bootstrap_root = root / "bootstrap-run"
+            bootstrap_app = bootstrap_root / "app"
+            bootstrap_app.mkdir(parents=True)
+            (bootstrap_root / "site-packages").mkdir()
+            (bootstrap_root / "py2bin_bootstrap.py").write_text(
+                bootstrap,
+                encoding="utf-8",
+            )
+            (bootstrap_app / "main.py").write_text(
+                "print('bootstrap-ok')\n",
+                encoding="utf-8",
+            )
+            bootstrap_run = subprocess.run(
+                [sys.executable, str(bootstrap_root / "py2bin_bootstrap.py")],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(bootstrap_run.stdout, "bootstrap-ok\n")
 
-    def test_windows_app_rejects_onedir(self):
+    def test_windows_app_onedir_uses_windowed_runtime_without_extraction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             entry = root / "main.py"
             entry.write_text("print('hello')\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "requires --onefile"):
-                freeze(
-                    entry,
-                    root / "Demo",
+            result = freeze(
+                entry,
+                root / "Demo",
+                root,
+                dependency_mode="none",
+                runtime_pack=self._runtime_pack(
                     root,
-                    dependency_mode="none",
-                    runtime_pack=self._runtime_pack(
-                        root,
-                        target="windows-x86_64",
-                    ),
                     target="windows-x86_64",
-                    app=True,
-                    onefile=False,
+                ),
+                target="windows-x86_64",
+                app=True,
+                onefile=False,
+            )
+            self.assertFalse(result.onefile)
+            self.assertTrue(result.bundle.is_dir())
+            launcher = result.bundle / "Demo.exe"
+            image = launcher.read_bytes()
+            layout = _pe_layout(image)
+            resources = _existing_resources(image, layout)
+            optional = int(layout["optional"])
+            subsystem = struct.unpack_from("<H", image, optional + 68)[0]
+            version_key = (RT_VERSION, 1, 0x0409)
+            self.assertEqual(
+                subsystem,
+                2,
+            )
+            self.assertIn(version_key, resources)
+            self.assertIn(
+                "Demo".encode("utf-16-le"),
+                resources[version_key].data,
+            )
+            self.assertFalse(
+                any(
+                    key[0] in {RT_ICON, RT_GROUP_ICON}
+                    for key in resources
                 )
+            )
+            manifest = json.loads(
+                (result.bundle / "py2bin-freeze.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["windows_app_user_model_id"],
+                "PythonToBinary.Demo",
+            )
+            self.assertIn(
+                "SetCurrentProcessExplicitAppUserModelID",
+                (
+                    result.bundle / "py2bin_bootstrap.py"
+                ).read_text(encoding="utf-8"),
+            )
 
     def test_cross_target_rejects_wrong_platform_wheel(self):
         with tempfile.TemporaryDirectory() as directory:

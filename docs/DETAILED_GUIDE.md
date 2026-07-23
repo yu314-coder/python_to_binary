@@ -353,12 +353,85 @@ py2bin freeze app.py --source-root . -o dist/App \
 # Output: dist/App.exe
 ```
 
+### Windows process and identity model
+
 On Windows, add `--app` for a windowed PE executable; omit it for a console
-program. Windowed one-file launchers suppress both the temporary PowerShell
-extractor console and the embedded CPython console. The isolated `_pth` file
-also names the runtime's versioned standard-library ZIP. Both the renamed
-executable's `_pth` file and CPython's versioned-DLL `_pth` file are updated;
-otherwise the DLL-level file can prevent `sitecustomize` from starting the app.
+program. Both the distributed launcher and the renamed inner `pythonw.exe`
+host use the GUI subsystem.
+
+```mermaid
+flowchart LR
+    outer["NAME.exe: handwritten PE and ZIP payload"]
+    extractor["PowerShell and .NET ZIP cache extractor"]
+    inner["Cached NAME.exe: renamed pythonw host"]
+    runtime["python3XY.dll, wheels, .pyd, and DLL files"]
+    ui["Application UI"]
+    outer --> extractor
+    extractor --> inner
+    inner --> runtime
+    inner --> ui
+```
+
+The extractor is used for cache checking as well as first-run extraction. An
+unpacked `--onedir` build starts the inner host directly and bypasses the first
+two one-file stages.
+
+The isolated `_pth` file names the runtime's versioned standard-library ZIP.
+Both the renamed executable's `_pth` file and CPython's versioned-DLL `_pth`
+file are updated; otherwise the DLL-level file can prevent `sitecustomize`
+from starting the app.
+
+For `--app`, py2bin replaces inherited Python icon/version resources on both
+the outer one-file PE and the embedded app host. `--name` becomes the
+file/product description and `--icon` supplies both executable icons. Before
+the entry script creates its UI, the bootstrap sets a stable
+`PythonToBinary.NAME` AppUserModelID for Windows taskbar grouping. The ctypes
+call declares the documented `PCWSTR` argument and `HRESULT` return types.
+Microsoft requires this process-level identity to be assigned during startup
+before UI is presented; see
+[Application User Model IDs](https://learn.microsoft.com/en-us/windows/win32/shell/appids)
+and
+[`SetCurrentProcessExplicitAppUserModelID`](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-setcurrentprocessexplicitappusermodelid).
+
+If no `--icon` is supplied, Python's icon is removed and Windows uses its
+normal fallback. An application or GUI toolkit can set a different window
+icon. An existing pinned shortcut can also carry its own icon and
+AppUserModelID, so it should be unpinned and re-pinned when validating a
+rebuilt executable. py2bin does not modify existing `.lnk` files.
+
+This changes Windows presentation and grouping only. The running app host
+still loads `python3XY.dll`; diagnostic tools can correctly show that module.
+The compatible path is not whole-program native AOT code.
+
+Startup work is kept out of the Python layer where practical:
+
+- the handwritten outer PE passes its Unicode path and original command line
+  through the child environment, avoiding WMI/CIM process queries;
+- the content-addressed cache prevents repeated payload extraction;
+- the generated bootstrap embeds the entrypoint and taskbar ID rather than
+  reading and parsing the JSON manifest at startup;
+- `json` and `pathlib` are absent from the bootstrap path, and `traceback` is
+  imported only after an application exception;
+- ZIP compression level 6 balances one-file size and extraction cost;
+- `--onedir` remains the fastest option for very large native packages because
+  it performs no one-file extraction or PowerShell startup.
+
+For the fastest startup, keep a Windows GUI bundle unpacked:
+
+```sh
+py2bin freeze app.py --source-root . -o dist/App \
+  --target windows-x86_64 \
+  --runtime-pack runtimes/windows-cp311-amd64 \
+  --wheel-dir wheels/windows-cp311 --app --onedir --compact --clean
+
+# Launch dist/App/App.exe and ship the entire dist/App directory.
+```
+
+This path uses the runtime pack's `pythonw.exe` and performs no extraction at
+startup. One-file mode instead optimizes distribution and repeat launches: the
+first run extracts to a content-addressed cache and subsequent runs reuse it.
+Native extension modules and DLLs cannot be imported directly from a ZIP, so a
+large Torch or `bpy` payload cannot have a zero-extraction first launch.
 
 On macOS, create a native `.app` entrypoint and convert an ICO to ICNS:
 
@@ -505,6 +578,41 @@ Inspect targets:
 ```sh
 py2bin targets
 ```
+
+Validate a rebuilt Windows GUI bundle on real Windows without installing an
+inspection tool:
+
+```powershell
+$outer = Get-Item .\App.exe
+$outer.VersionInfo |
+  Select-Object FileDescription, ProductName, OriginalFilename
+
+Start-Process .\App.exe
+
+$inner = Get-ChildItem "$env:LOCALAPPDATA\py2bin" -Filter App.exe -Recurse |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+$inner.VersionInfo |
+  Select-Object FileDescription, ProductName, OriginalFilename
+```
+
+For an `--app --icon icon.ico` build, both records should identify `App` rather
+than Python and Explorer should show the supplied icon. Also confirm:
+
+1. no console window appears;
+2. the application UI opens;
+3. the taskbar button uses the application icon;
+4. an old pinned shortcut has been unpinned and the rebuilt executable pinned
+   again;
+5. Task Manager shows the app-named executable, while loaded-module inspection
+   may still correctly show `python3XY.dll`;
+6. first-run and cached-run behavior both work; compare `--onedir` separately
+   when startup time is the priority.
+
+The automated suite structurally checks PE architecture, GUI subsystem,
+outer/inner icon groups, version strings, manifest preservation, bootstrap API
+signature, and the absence of inherited Python version identity. Those checks
+do not replace a real Windows UI test.
 
 For generated files, test on the actual destination operating system and CPU.
 Wine is useful for some PE checks but is not equivalent to real Windows

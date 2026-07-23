@@ -13,11 +13,12 @@ from pathlib import Path
 
 from .native.formats.pe import write_pe_shell_launcher
 from .native.launcher import linux_shell_launcher, macos_shell_launcher
-from .windows_icon import install_windows_icon
+from .windows_icon import install_windows_identity
 
 
 _MARKER_PREFIX = b"\nPY2BIN-ONEFILE-PAYLOAD-V1:"
 _OFFSET_WIDTH = 20
+_ZIP_COMPRESSLEVEL = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +40,16 @@ def _zip_payload(root: Path, destination: Path) -> None:
         destination,
         "w",
         compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
+        compresslevel=_ZIP_COMPRESSLEVEL,
         allowZip64=True,
     ) as archive:
         for path in _payload_files(root):
             relative = path.relative_to(root).as_posix()
             info = zipfile.ZipInfo.from_file(path, relative)
             info.compress_type = zipfile.ZIP_DEFLATED
+            # A manually supplied ZipInfo otherwise falls back to zlib's
+            # implicit level rather than the ZipFile-level setting.
+            info._compresslevel = _ZIP_COMPRESSLEVEL
             with path.open("rb") as source, archive.open(info, "w", force_zip64=True) as output:
                 while block := source.read(1024 * 1024):
                     output.write(block)
@@ -128,15 +132,16 @@ def _powershell_script(
 ) -> str:
     launcher_ps = launcher.replace("'", "''").replace("/", "\\")
     mutex = f"Local\\py2bin_{digest}"
-    # WMI exposes the outer launcher's original raw command line. Preserve its
-    # argument suffix through ProcessStartInfo rather than asking PowerShell to
-    # reinterpret application arguments.
+    # The handwritten launcher passes its Unicode path and original command
+    # line through its child environment. This avoids two WMI/CIM queries on
+    # every launch while preserving the argument suffix verbatim.
     return (
         _fixed_assignment("off", offset, powershell=True)
         + "$ErrorActionPreference='Stop';"
-        "$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$PID);"
-        "$pp=Get-CimInstance Win32_Process -Filter ('ProcessId='+$p.ParentProcessId);"
-        "$s=$pp.ExecutablePath;$c=$pp.CommandLine;$raw='';"
+        "$s=$env:PY2BIN_ONEFILE_SELF;$c=$env:PY2BIN_ONEFILE_COMMAND;"
+        "$env:PY2BIN_ONEFILE_SELF=$null;$env:PY2BIN_ONEFILE_COMMAND=$null;"
+        "if(!$s -or !$c){throw 'one-file launcher environment is missing'};"
+        "$raw='';"
         "if($c.StartsWith('\"')){$q=$c.IndexOf('\"',1);"
         "if($q -ge 0){$raw=$c.Substring($q+1).TrimStart()}}"
         "else{$q=$c.IndexOf(' ');if($q -lt 0){$q=$c.IndexOf(\"`t\")};"
@@ -186,6 +191,7 @@ def _windows_stub(
     command_prefix: bytes,
     *,
     machine: str,
+    name: str,
     icon: Path | None,
     temporary_root: Path,
     windowed: bool,
@@ -195,14 +201,17 @@ def _windows_stub(
         machine,
         windowed=windowed,
     )
-    if icon is None:
-        return image
     with tempfile.TemporaryDirectory(
         prefix="py2bin-icon-", dir=temporary_root
     ) as directory:
         executable = Path(directory) / "launcher.exe"
         executable.write_bytes(image)
-        install_windows_icon(executable, icon)
+        install_windows_identity(
+            executable,
+            name,
+            version="1.0.0.0",
+            icon=icon,
+        )
         return executable.read_bytes()
 
 
@@ -249,6 +258,7 @@ def create_onefile(
     payload_root = payload_root.resolve()
     output = output.resolve()
     relative_launcher = launcher.resolve().relative_to(payload_root).as_posix()
+    windows_name = Path(relative_launcher).stem
     windows = target.startswith("windows-")
     machine = target.rpartition("-")[2]
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -277,6 +287,7 @@ def create_onefile(
             stub = _windows_stub(
                 placeholder,
                 machine=machine,
+                name=windows_name,
                 icon=icon,
                 temporary_root=output.parent,
                 windowed=windows_windowed,
@@ -292,6 +303,7 @@ def create_onefile(
             final_stub = _windows_stub(
                 command,
                 machine=machine,
+                name=windows_name,
                 icon=icon,
                 temporary_root=output.parent,
                 windowed=windows_windowed,
