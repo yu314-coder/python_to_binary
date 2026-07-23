@@ -66,6 +66,28 @@ py2bin plan-c app.py
 It returns `c-source` for the implemented C subset and `cpython-bundle` when
 imports or unsupported Python semantics require compatibility mode.
 
+## Source-only versus compatible bundling
+
+The source-only contract applies only to the documented direct native subset.
+Given Python 3.10+, py2bin, and a supported source file, `compile` can write PE,
+ELF, or Mach-O on any build host. It does not use Wine, Rosetta, an assembler,
+a linker, or a target SDK.
+
+Arbitrary applications are different. Their source does not contain CPython or
+the implementations of packages named by import statements. `freeze` therefore
+needs a compatible CPython runtime and the actual target package files. Native
+extensions must already match the destination OS, architecture, and Python
+ABI; py2bin does not rewrite one platform's wheel into another platform's
+wheel.
+
+`manim_app` is a concrete example. Its repository imports pywebview but does
+not vendor pywebview, and its setup path installs Manim and other tools into a
+separate environment. The current py2bin native subset cannot compile that
+dynamic program from source alone. A working Windows package needs Windows
+CPython, pywebview's Windows components, and all other required package/native
+files. Without those inputs, py2bin must report an unsupported or missing-input
+error rather than label a non-working PE file as a successful build.
+
 ## Native target selection
 
 The implemented target matrix is:
@@ -299,6 +321,8 @@ Before a release:
 ## Current limitations
 
 - Direct native compilation implements a deliberately narrow Python subset.
+- Source plus py2bin alone cannot reproduce missing third-party packages or a
+  complete CPython runtime for dynamic applications such as `manim_app`.
 - Full-library freeze outputs are specific to the build runtime's platform and
   ABI.
 - Windows and Linux frozen-runtime packs are not yet cross-produced from

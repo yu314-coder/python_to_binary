@@ -124,6 +124,37 @@ target” is not the same claim as “the application does not use CPython.”
 | py2bin itself has no third-party Python dependency | Yes | The package imports only Python standard-library modules, and its build/runtime dependency lists are empty. Tests enforce both properties. |
 | The build computer does not need Python | No | Building requires Python 3.10+ to run py2bin. No native compiler toolchain is required for the supported direct-binary path. |
 
+## Source-only builds: exact boundary
+
+“Use only the application source and py2bin” has a precise, limited meaning:
+
+- For programs inside the documented static `compile` subset, it is enough to
+  have the source, Python 3.10+, and py2bin on the build computer. py2bin can
+  write Windows PE, Linux ELF, and macOS Mach-O files without Wine, Rosetta,
+  an assembler, a linker, a target SDK, or a target Python runtime.
+- For arbitrary Python, source files alone are not enough. Full Python
+  semantics require CPython or a future complete py2bin runtime.
+- An imported third-party package must also exist as target-compatible package
+  data. An import name does not contain that package's implementation.
+- `freeze` embeds the current compatible CPython runtime and copies compatible
+  installed packages or supplied wheels. It does not manufacture a missing
+  Windows runtime on macOS, translate a macOS native wheel into a Windows
+  wheel, or recreate a package whose files were never supplied.
+
+For example, the `manim_app` repository imports `webview`, but does not contain
+pywebview's implementation. It also installs Manim and related tools into a
+separate environment. A working Windows build therefore needs Windows CPython,
+pywebview and its Windows backend, plus every other required package and native
+file. With only the `manim_app` source and py2bin, the current compiler must
+reject the program. Producing a PE header that cannot start the application
+would be a broken artifact, not successful assembly.
+
+This limitation is not specific to pywebview or Manim. “Any Python program and
+every third-party package from source alone” would require py2bin to implement
+the complete Python language, standard library, extension ABI, GUI frameworks,
+and each missing third-party implementation. That work is not complete and is
+not claimed.
+
 Native compile targets currently implemented are `linux-x86_64` (ELF),
 `linux-arm64` (ELF), `darwin-x86_64` and `darwin-arm64` (Mach-O), and
 `windows-x86_64` and `windows-arm64` (PE `.exe`).
