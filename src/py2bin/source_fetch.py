@@ -403,6 +403,7 @@ def fetch_source(
             )
             + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         staged.replace(target)
     return FetchedSource(

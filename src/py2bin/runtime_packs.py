@@ -160,5 +160,5 @@ def write_runtime_manifest(
         "environment": environment,
     }
     manifest = destination / MANIFEST_NAME
-    manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
     return _validate_manifest(destination.resolve(), data)

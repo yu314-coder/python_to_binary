@@ -120,9 +120,10 @@ def prepare_metadata_for_build_wheel(metadata_directory: str, config_settings=No
     name = f"{_DISTRIBUTION}.dist-info"
     target = Path(metadata_directory) / name
     target.mkdir(parents=True, exist_ok=True)
-    (target / "METADATA").write_text(_metadata(), encoding="utf-8")
+    (target / "METADATA").write_text(_metadata(), encoding="utf-8", newline="\n")
     (target / "WHEEL").write_text(
         "Wheel-Version: 1.0\nGenerator: py2bin\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         encoding="utf-8",
+        newline="\n",
     )
     return name
