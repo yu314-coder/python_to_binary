@@ -27,6 +27,28 @@ class NativeCompilerTests(unittest.TestCase):
             self.assertEqual(by_target["linux-arm64"].read_bytes()[:4], b"\x7fELF")
             self.assertEqual(by_target["darwin-arm64"].read_bytes()[:4], b"\xcf\xfa\xed\xfe")
 
+    def test_runtime_integer_loops_cross_compile_for_every_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sum.py"
+            source.write_text(
+                "total = 0\n"
+                "for value in range(1, 11):\n"
+                "    total += value\n"
+                "raise SystemExit(total)\n",
+                encoding="utf-8",
+            )
+            results = compile_all(source, root / "dist")
+            self.assertEqual({result.target for result in results}, {
+                "linux-x86_64",
+                "linux-arm64",
+                "darwin-x86_64",
+                "darwin-arm64",
+                "windows-x86_64",
+                "windows-arm64",
+            })
+            self.assertTrue(all(result.operations > 2 for result in results))
+
     def test_native_cli_dispatches_without_bundle_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -140,7 +162,10 @@ class NativeCompilerTests(unittest.TestCase):
             with self.assertRaisesRegex(NativeCompileError, "native subset"):
                 compile_native(source, root / "bad", "linux-x86_64")
 
-    @unittest.skipUnless(platform.system() == "Darwin", "Mach-O runs only on macOS")
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and platform.machine() == "x86_64",
+        "x86-64 Mach-O execution requires a native x86-64 Mac",
+    )
     def test_generated_macho_runs_without_python(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -162,6 +187,29 @@ class NativeCompilerTests(unittest.TestCase):
             result = compile_native(source, root / "hello", "darwin-arm64")
             run = subprocess.run([str(result.artifact)], capture_output=True, text=True, check=True)
             self.assertEqual(run.stdout.strip(), "arm64-hardwritten-ok")
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and platform.machine() == "arm64",
+        "native arm64 Mach-O requires Apple Silicon",
+    )
+    def test_runtime_integer_control_flow_runs_as_machine_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "runtime_sum.py"
+            source.write_text(
+                "total = 0\n"
+                "value = 1\n"
+                "while value <= 10:\n"
+                "    total += value\n"
+                "    value += 1\n"
+                "if total == 55:\n"
+                "    raise SystemExit(total)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            result = compile_native(source, root / "runtime_sum", "darwin-arm64")
+            run = subprocess.run([str(result.artifact)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 55, run.stderr)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .ir import Exit, Module, Write
+from .ir import Exit, ExitValue, Jump, JumpIfFalse, Label, Module, Write
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +35,10 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
     merged_writes = 0
     removed_operations = 0
     terminated = False
+    has_control_flow = any(
+        isinstance(operation, (Label, Jump, JumpIfFalse))
+        for operation in module.operations
+    )
 
     for operation in module.operations:
         if terminated:
@@ -51,10 +55,10 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
                 removed_operations += 1
                 continue
         optimized.append(operation)
-        if isinstance(operation, Exit):
+        if isinstance(operation, (Exit, ExitValue)) and not has_control_flow:
             terminated = True
 
-    if not optimized or not isinstance(optimized[-1], Exit):
+    if not optimized or not isinstance(optimized[-1], (Exit, ExitValue)):
         optimized.append(Exit(0))
 
     report = OptimizationReport(
@@ -63,4 +67,4 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
         merged_writes=merged_writes,
         removed_operations=removed_operations,
     )
-    return Module(optimized), report
+    return Module(optimized, module.stack_slots), report

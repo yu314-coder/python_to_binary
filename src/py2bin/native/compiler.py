@@ -125,6 +125,7 @@ def compile_native(
     target: str | None = None,
     clean: bool = False,
     app: bool = False,
+    source_roots: tuple[Path, ...] = (),
 ) -> NativeResult:
     entry = entry.expanduser().resolve()
     output = output.expanduser().resolve()
@@ -141,7 +142,7 @@ def compile_native(
     if output.exists() and not clean:
         raise FileExistsError(f"output already exists: {output} (use --clean)")
     source = entry.read_text(encoding="utf-8")
-    module, _optimization = optimize(lower(entry, source))
+    module, _optimization = optimize(lower(entry, source, source_roots))
     info_plist, code_resources = _app_metadata(entry.stem) if app else (None, None)
     if target == "windows-x86_64":
         image = write_pe_x86_64(module)

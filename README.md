@@ -11,8 +11,9 @@ It has four deliberately separate execution paths. They must not be confused:
    x86-64/ARM64 instructions → ELF, PE, or Mach-O. This invokes no external
    toolchain, and the generated program needs no Python runtime.
 2. **Runtime freeze:** arbitrary CPython projects and target-compatible packages
-   are collected with an embedded CPython runtime. This is compatibility
-   packaging, not native translation of the application.
+   are collected with an embedded CPython runtime. The default output is one
+   self-extracting `.exe` or `.bin`; this is compatibility packaging, not
+   native translation of the application.
 3. **Lightweight bundle:** `.pyz`, executable `.bin`, and directory formats
    package project code and dependencies but use a compatible target Python.
 4. **Portable-C frontend:** a useful typed subset of Python becomes readable C
@@ -66,9 +67,29 @@ PYTHONPATH=src python3 -m py2bin emit-c examples/c_program.py \
 # Explain whether a program can use the C subset or needs CPython bundling.
 PYTHONPATH=src python3 -m py2bin plan-c app/main.py
 
+# List common-library support, or inspect one source file without importing it.
+PYTHONPATH=src python3 -m py2bin capabilities
+PYTHONPATH=src python3 -m py2bin capabilities app/main.py --json
+
+# Turn an installed/staged package tree into a standards-structured wheel.
+PYTHONPATH=src python3 -m py2bin wheel build/package-root \
+  --output-dir dist/wheels --name my-package --version 1.0
+
+# Fetch pinned imported source and attempt the real native compiler only.
+PYTHONPATH=src python3 -m py2bin compile app.py -o dist/app \
+  --source-lock py2bin-sources.lock.json \
+  --source-cache /Volumes/D/py2bin-source-cache
+
 # A native Apple Silicon application bundle:
 PYTHONPATH=src python3 -m py2bin compile examples/native_hello.py \
   --target darwin-arm64 --app --output dist/NativeHello --clean
+
+# Automatically choose native code when possible and otherwise emit one
+# self-extracting embedded-CPython file.
+PYTHONPATH=src python3 -m py2bin assemble examples/generic_app/main.py \
+  --source-root examples/generic_app --dependency-mode none \
+  --output dist/GenericApp --compact --clean
+./dist/GenericApp.bin hello
 
 PYTHONPATH=src python3 -m py2bin analyze examples/hello/main.py
 PYTHONPATH=src python3 -m py2bin build examples/hello/main.py \
@@ -99,9 +120,10 @@ See the [detailed compiler, bundling, target, and release guide](docs/DETAILED_G
 | `compile` | ELF, PE, Mach-O, macOS `.app` | py2bin-generated machine code | No |
 | `emit-c` | `.c` or `.py2cbin` | C source, not yet an executable | N/A |
 | `build --format pyz` | Python zip application | CPython bytecode/source | Yes |
-| `build --format bin` | Self-extracting Python application | CPython bytecode/source | Yes |
+| `build --format bin` | Executable Python zip application | CPython bytecode/source | Yes |
 | `build --format dir` | Project, packages, and launcher | CPython bytecode/source | Yes |
-| `freeze` | Embedded-runtime directory or macOS `.app` | CPython bytecode/source | No |
+| `freeze` (default) | One self-extracting PE/ELF/Mach-O file, or macOS `.app` with one embedded payload | CPython bytecode/source | No |
+| `freeze --onedir` | Unpacked embedded-runtime directory | CPython bytecode/source | No |
 
 Every executable above is a valid OS binary or executable launcher, but only
 `compile` translates the supported application logic into py2bin-generated CPU
@@ -149,20 +171,112 @@ file. With only the `manim_app` source and py2bin, the current compiler must
 reject the program. Producing a PE header that cannot start the application
 would be a broken artifact, not successful assembly.
 
+`manim_app` also imports `winpty`. Its full terminal mode therefore requires a
+matching `pywinpty` wheel; for CPython 3.12 on Windows x86-64 that wheel must
+carry the `cp312` and `win_amd64` tags. py2bin extracts its `.pyd`, DLL, agent,
+and console helper files as wheel data. Excluding `winpty` intentionally selects
+the application's simpler subprocess fallback instead.
+
 This limitation is not specific to pywebview or Manim. “Any Python program and
 every third-party package from source alone” would require py2bin to implement
 the complete Python language, standard library, extension ABI, GUI frameworks,
 and each missing third-party implementation. That work is not complete and is
 not claimed.
 
+## Pinned source download and native attempt
+
+`compile --source-lock` detects statically imported non-stdlib modules,
+downloads their locked source archives through Python's HTTPS client (no pip),
+verifies SHA-256, extracts them without running project code, and attempts the
+handwritten native frontend. A local archive path can be locked for offline
+builds.
+
+Example lock:
+
+```json
+{
+  "schema": 1,
+  "sources": {
+    "demo": {
+      "url": "https://github.com/owner/demo/archive/COMMIT.tar.gz",
+      "revision": "FULL_COMMIT_ID",
+      "sha256": "64_LOWERCASE_HEX_DIGITS",
+      "subdirectory": "src"
+    }
+  }
+}
+```
+
+Build:
+
+```sh
+py2bin compile app.py -o dist/app \
+  --source-root . \
+  --source-lock py2bin-sources.lock.json \
+  --source-cache /Volumes/D/py2bin-source-cache \
+  --target darwin-arm64
+```
+
+After the lock is supplied, source discovery and fetching are automatic.
+py2bin intentionally does not guess a Git repository from an import name:
+import names are not globally unique, repositories can be renamed or
+compromised, and an unpinned `main` branch is not a reproducible input.
+
+The fetcher:
+
+- accepts credential-free HTTPS URLs or explicit local archive paths;
+- requires an immutable revision label and exact SHA-256;
+- accepts ZIP or tar archives;
+- rejects traversal paths, links, special files, duplicate/case-colliding
+  members, excessive member counts, and configured download/expanded-size
+  limits;
+- records and rechecks a hash of the extracted source tree;
+- never imports the downloaded package or runs `setup.py`, build backends, or
+  shell commands.
+
+The current successful cross-package native form is deliberately narrow:
+`from MODULE import CONSTANT`, where the export is statically evaluable by the
+native frontend. The value is lowered into py2bin IR and handwritten
+x86-64/ARM64 instructions. Dynamic functions, classes, package initialization,
+Cython-generated C, C/C++/Rust/Fortran/CUDA sources, CPython extensions, and
+general library imports fail with a source location. This command has no
+CPython or PyInstaller fallback, so a failed native conversion cannot be
+mistaken for a native artifact.
+
+`fetch-sources` performs only the verified download/extraction phase:
+
+```sh
+py2bin fetch-sources app.py --source-root . \
+  --source-lock py2bin-sources.lock.json \
+  --source-cache /Volumes/D/py2bin-source-cache --json
+```
+
 Native compile targets currently implemented are `linux-x86_64` (ELF),
 `linux-arm64` (ELF), `darwin-x86_64` and `darwin-arm64` (Mach-O), and
 `windows-x86_64` and `windows-arm64` (PE `.exe`).
 Run `py2bin targets` to list them. The first native
-frontend milestone supports module constants, constant arithmetic and
-comparisons, constant Boolean expressions and branches, f-strings, `print()`,
-and integer exit status. It rejects everything else with a source location
-rather than producing a subtly incorrect executable.
+frontend supports module constants, static strings/f-strings, a signed 64-bit
+runtime for variables and arithmetic, comparisons, `if`, `while`,
+`for NAME in range(...)`, `break`, `continue`, `print()` of compile-time
+values, and integer-expression exit status. It rejects everything else with a
+source location rather than producing a subtly incorrect executable.
+
+The word “supports” is intentionally narrow:
+
+| Python feature | `compile` now | Exact behavior |
+|---|---:|---|
+| Literal `str`, `bytes`, `int`, `float`, `bool`, `None` | Yes | Represented while lowering the static program |
+| Single-name assignment and annotation | Yes | Static values are folded; runtime integer values use native stack slots |
+| Integer `+`, `-`, `*`, bitwise operations, shifts | Yes | Runtime signed 64-bit instructions; overflow wraps to 64 bits rather than creating Python big integers |
+| Integer comparisons and dynamic `if` | Yes | Runtime signed comparisons and native branches |
+| Constant arithmetic, Boolean and conditional expressions | Yes | Evaluated at build time when no runtime value is involved |
+| Constant `if` | Yes | Only the selected branch is emitted |
+| `while`, `for NAME in range(...)`, `break`, `continue` | Yes | Native branches; `range` step must be a nonzero integer constant |
+| Simple f-string | Yes | Every formatted value must be compile-time constant |
+| `print(...)` | Yes | Constant UTF-8 bytes are emitted through an OS write API/syscall |
+| `SystemExit(integer)` / `sys.exit(integer)` | Yes | Constant or runtime integer expression becomes the OS process-exit value |
+| Runtime input/arguments, dynamic printing, containers, functions, classes, general exceptions | No | Rejected by `compile`; compatible mode needs CPython |
+| Imports | Only restricted `sys` | `import sys` exists solely for `sys.exit`; imported libraries are not compiled |
 
 The bundle-format `bin` uses Python; `py2bin compile` produces actual machine
 code. These writers encode executable headers, import tables, system calls, and
@@ -181,6 +295,11 @@ The native compiler has its own target-independent optimizer. It currently:
 - merges adjacent writes to reduce system calls;
 - removes operations after the first process exit;
 - inserts one canonical successful exit when required.
+
+The compiler also lowers runtime integer variables and structured control flow
+to target-independent IR. The x86-64 and ARM64 backends encode stack loads and
+stores, arithmetic, comparisons, conditional/unconditional branches, and
+process exit directly. That runtime path is not described as constant folding.
 
 These transformations are deterministic and covered by equivalence tests. No
 optimizer can truthfully be “fully optimal” for every Python program. py2bin
@@ -260,6 +379,53 @@ Dependency modes are:
 Use `--exclude MODULE` for optional backends you do not ship. `analyze` returns
 exit status 1 when it sees an unresolved import.
 
+### Wheel and prebuilt-Cython pipeline
+
+`py2bin wheel` creates a wheel using only the standard library. The input is an
+already-staged tree in the layout that should be installed into
+`site-packages`. Python files, package data, and already-built Cython/native
+extensions are stored byte-for-byte. `METADATA`, `WHEEL`, `top_level.txt`, and
+the SHA-256 `RECORD` are generated by py2bin.
+
+Pure Python example:
+
+```sh
+py2bin wheel build/package-root -o dist/wheels \
+  --name example-package --version 1.0
+```
+
+Prebuilt Windows CPython 3.11 x86-64 Cython extension:
+
+```sh
+py2bin wheel build/windows-cp311 -o dist/wheels \
+  --name example-native --version 1.0 \
+  --python-tag cp311 --abi-tag cp311 --platform-tag win_amd64
+```
+
+Native payloads cannot use `py3-none-any`; exact interpreter, ABI, and platform
+tags are mandatory. A `.pyx` or `.pxd` file may be included as source data, but
+the command reports that it was not compiled. Supply the corresponding
+target-built `.pyd` or `.so` when runtime importability is required.
+
+Feed the created wheel directly into the compatible bundle:
+
+```sh
+py2bin freeze app/main.py --source-root app -o dist/App \
+  --runtime-pack runtimes/windows-cp311-amd64 \
+  --target windows-x86_64 \
+  --wheel dist/wheels/example_native-1.0-cp311-cp311-win_amd64.whl \
+  --icon icon.ico
+
+# Output: dist/App.exe
+```
+
+This pipeline does not invoke Cython, a C compiler, or a linker. If Cython is
+used, its output must be built before `py2bin wheel`, normally once per target.
+Implementing a machine-code backend for arbitrary Cython-generated C would
+require a complete C preprocessor/compiler, target ABI, object linker, CPython
+C API, and dynamic loader; the current handwritten backend does not claim
+those components.
+
 For arbitrary CPython packages, freeze the interpreter and complete package
 trees into a target-side bundle:
 
@@ -268,7 +434,7 @@ PYTHONPATH=src python3 -m py2bin freeze app/main.py \
   --source-root app --output dist/MyApp \
   --include torch --include transformers --clean
 
-./dist/MyApp/MyApp.bin
+./dist/MyApp.bin
 ```
 
 `freeze` carries the current compatible CPython runtime, standard library,
@@ -280,13 +446,33 @@ py2bin freeze app.py -o dist/App --wheel wheels/custom_backend.whl
 ```
 
 Frozen bundles are specific to the build runtime's OS, CPU, Python ABI, and
-accelerator variant. On Unix they contain a `.bin` launcher; on Windows they
-contain a copied `.exe` configured by an isolated `._pth` file. Build each
-target from a matching runtime or, in a future release, an explicit runtime
-pack. Dynamic imports still need `--include`.
+accelerator variant. By default, the unpacked runtime tree is compressed behind
+a handwritten native launcher in one `.bin` or `.exe`. `--onedir` keeps that
+tree unpacked for inspection and debugging. Cross-target compatibility builds
+require an explicit matching runtime pack and complete target-wheel closure.
+Dynamic imports still need `--include`.
 
-On macOS, `freeze --app` wraps that embedded runtime in a launchable application
-bundle. `--icon` accepts ICNS, a square PNG at a standard icon size, or a
+Windows one-file outputs accept an `.ico` directly. The outer PE resource
+section is written by py2bin; no resource compiler is invoked:
+
+```sh
+py2bin freeze app.py -o dist/App --target windows-x86_64 \
+  --runtime-pack runtimes/windows-cp311-amd64 \
+  --wheel-dir wheels/windows-cp311 --icon icon.ico --app --clean
+```
+
+For Windows, `--app` selects the GUI subsystem and suppresses console windows
+for the extractor and embedded CPython process. Omit `--app` for a console
+program. The generated isolated-runtime path includes the matching embedded
+standard-library archive, such as `python312.zip`; target-compatible runtime
+packs must supply that archive or an equivalent `Lib` tree. py2bin rewrites
+both the executable-specific and versioned-DLL `_pth` files because Windows
+CPython can give the latter priority.
+
+On macOS, `freeze --app` wraps the one-file payload in the directory structure
+required by the Apple `.app` format. The runtime archive is embedded in
+`Contents/MacOS/NAME`; there is no unpacked `Contents/Resources/bundle`.
+`--icon` accepts ICNS, a square PNG at a standard icon size, or a
 PNG-backed multi-resolution Windows ICO. ICO-to-ICNS conversion is implemented
 in pure Python and skips only ICO sizes, such as 48×48, that have no matching
 modern ICNS record:
@@ -327,18 +513,31 @@ off when the packaged program imports package test suites, `tkinter`,
 
 ## Heavy-library compatibility
 
-- **PyTorch:** bundle on the same OS, architecture, Python ABI, and accelerator
-  family as the destination. GPU drivers remain a target-system prerequisite.
-- **Transformers:** Python code is bundled; downloaded model weights must be
-  placed inside the source tree or made available in a target cache. Test true
-  offline mode before distribution.
-- **Manim:** Python packages and data can be bundled, while programs such as
-  ffmpeg and LaTeX plus required fonts remain external unless you ship them in
-  your project and configure Manim to use them.
-- **bpy:** build from Blender's matching Python or a compatible `bpy` wheel.
-  Blender's resources and licensing/distribution requirements are separate.
-- **Any other library:** static imports work automatically; use `--include` for
-  plugins, entry-point-loaded modules, optional backends, or runtime imports.
+Run `py2bin capabilities` for the catalog below, or
+`py2bin capabilities APP.py --json` to audit the imports and native-subset
+result of one entry file without importing or executing it.
+
+| Import/project | Fully translated by `compile`? | Can `freeze` carry it? | What is still required |
+|---|---:|---:|---|
+| NumPy / SciPy / pandas / scikit-learn | No | Conditional | Matching CPython ABI and complete target wheels/native libraries |
+| PyTorch / TorchVision | No | Conditional | Target wheels, C++ libraries, accelerator variant, and target GPU driver when used |
+| TensorFlow / JAX | No | Conditional | Supported target runtime wheels; JAX also needs matching `jaxlib` |
+| Transformers | No | Conditional | CPython, backend such as Torch, dependency closure, model/config/tokenizer files |
+| `tokenizers` | No | Conditional | Its Rust extension compiled for the target CPython ABI |
+| Manim | No | Conditional | CPython, target wheels, fonts/assets, and media tools such as FFmpeg; LaTeX when used |
+| Matplotlib | No | Conditional | Target wheels, NumPy, rendering backend, fonts, and package data |
+| Pillow / OpenCV | No | Conditional | Target extension wheels and their native image/media/GUI libraries |
+| Blender `bpy` | No | Conditional | Exactly compatible Blender/`bpy`, CPython ABI, resources, OS, and CPU |
+| pywebview (`webview`) | No | Conditional | CPython, target dependencies, and the OS webview framework/runtime |
+| Gradio / Streamlit | No | Conditional | CPython server packages and frontend assets plus a browser/webview |
+| Numba / llvmlite | No | Conditional | Mutually compatible target wheels, including the LLVM components |
+| Requests / Flask / Django / FastAPI | No | Conditional | CPython, dependencies, and application templates/static/configuration data |
+| Unknown third-party or local import | No by default | Conditional | Its real implementation and complete target-compatible dependency/data closure |
+
+“Conditional” means the necessary files can be collected when they are
+actually supplied and compatible. It does not mean every version exists for
+every OS, architecture, or CPython ABI, and it does not mean py2bin has
+translated the package into its own machine code.
 
 “Supports all libraries” means the collector is generic and does not maintain a
 hardcoded allowlist. It cannot guarantee that every third-party binary, driver,
@@ -396,6 +595,19 @@ Single-file artifacts extract into a content-addressed cache before execution.
 Set `PY2BIN_CACHE_DIR` to control its location. The app can read
 `PY2BIN_BUNDLE_ROOT` to locate bundled resources. Rebuilding changes the cache
 fingerprint; deleting the cache is safe when no bundled program is running.
+
+“One file” describes distribution, not execution without extraction. The first
+launch atomically expands the embedded runtime; later launches reuse it.
+Windows launchers use the Windows PowerShell/.NET ZIP facilities included with
+normal Windows 10/11 installations. Linux and macOS launchers use `/bin/sh`
+plus `tail`, `head`, and `tar` from the base operating system. Extremely
+minimal Windows or Linux images that remove those OS facilities need
+`--onedir`.
+
+A macOS `.app` can never literally be one filesystem file because Apple defines
+it as a directory bundle. py2bin minimizes it to the native executable carrying
+the compressed payload, `Info.plist`, the code-resource seal, and optional
+icon.
 
 ## Development
 

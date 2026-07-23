@@ -24,9 +24,22 @@ def _safe_remove(path: Path) -> None:
         path.unlink()
 
 
-def _copy_project(source: Path, destination: Path) -> None:
-    def ignored(_directory: str, names: list[str]) -> set[str]:
-        return {name for name in names if name in _IGNORED_PARTS or name.endswith((".pyc", ".pyo"))}
+def _copy_project(
+    source: Path,
+    destination: Path,
+    excluded_paths: tuple[Path, ...] = (),
+) -> None:
+    excluded = {path.resolve() for path in excluded_paths}
+
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        parent = Path(directory)
+        return {
+            name
+            for name in names
+            if name in _IGNORED_PARTS
+            or name.endswith((".pyc", ".pyo"))
+            or (parent / name).resolve() in excluded
+        }
 
     shutil.copytree(source, destination, ignore=ignored)
 

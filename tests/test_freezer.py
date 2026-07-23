@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import platform
 import plistlib
 import struct
@@ -10,9 +11,57 @@ import zipfile
 
 from py2bin.freezer import _frozen_macos_app, _shell_launcher, extract_wheel
 from py2bin.native.launcher import macos_shell_launcher
+from py2bin.onefile import create_onefile
 
 
 class FreezerTests(unittest.TestCase):
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and platform.machine() == "arm64",
+        "self-extracting Mach-O runs only on Apple Silicon",
+    )
+    def test_onefile_macho_extracts_once_and_forwards_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "payload"
+            payload.mkdir()
+            inner = payload / "inner.bin"
+            inner.write_text(
+                '#!/bin/sh\nprintf "onefile:%s" "$1"\n',
+                encoding="utf-8",
+            )
+            inner.chmod(0o755)
+            output = root / "Demo.bin"
+            result = create_onefile(
+                payload,
+                output,
+                target="darwin-arm64",
+                launcher=inner,
+            )
+            environment = os.environ.copy()
+            environment["PY2BIN_CACHE_DIR"] = str(root / "cache")
+            first = subprocess.run(
+                [str(output), "forwarded"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            second = subprocess.run(
+                [str(output), "cached"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(first.stdout, "onefile:forwarded")
+            self.assertEqual(second.stdout, "onefile:cached")
+            self.assertEqual(output.read_bytes()[:4], b"\xcf\xfa\xed\xfe")
+            self.assertGreater(result.archive_bytes, 0)
+            self.assertEqual(
+                len(list((root / "cache").rglob(".py2bin-complete"))),
+                1,
+            )
+
     def test_native_macos_launcher_is_a_macho(self):
         image = macos_shell_launcher("exit 0", machine="arm64")
         self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
@@ -89,7 +138,14 @@ class FreezerTests(unittest.TestCase):
                 "py2bin.native.launcher.platform.machine", return_value="arm64"
             ):
                 launcher = _frozen_macos_app(
-                    payload, app, "ManimStudio", payload_launcher, icon
+                    payload,
+                    app,
+                    "ManimStudio",
+                    payload_launcher,
+                    icon,
+                    Path("runtime/bin/python3"),
+                    {"PYTHONHOME": "runtime"},
+                    "darwin-arm64",
                 )
             self.assertTrue(launcher.is_file())
             self.assertTrue(

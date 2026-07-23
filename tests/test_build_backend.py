@@ -15,17 +15,22 @@ class BuildBackendTests(unittest.TestCase):
                 names = set(wheel.namelist())
             self.assertIn("py2bin/native/compiler.py", names)
             self.assertIn("py2bin/native/formats/pe.py", names)
+            self.assertIn("py2bin/onefile.py", names)
 
     def test_sdist_has_metadata_docs_and_no_bytecode(self):
         with tempfile.TemporaryDirectory() as directory:
             sdist_name = build_sdist(directory)
             with tarfile.open(Path(directory) / sdist_name) as archive:
-                names = set(archive.getnames())
-            prefix = "python_to_binary-0.1.1"
+                members = archive.getmembers()
+                names = {member.name for member in members}
+            prefix = sdist_name.removesuffix(".tar.gz")
             self.assertIn(f"{prefix}/PKG-INFO", names)
             self.assertIn(f"{prefix}/docs/DETAILED_GUIDE.md", names)
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in names)
+            )
+            self.assertTrue(
+                all(member.mtime >= 315532800 for member in members)
             )
 
 

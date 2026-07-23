@@ -11,8 +11,9 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-_VERSION = "0.1.1"
+_VERSION = "0.2.1"
 _DISTRIBUTION = f"python_to_binary-{_VERSION}"
+_ZIP_EPOCH = 315532800  # 1980-01-01 UTC, the oldest timestamp ZIP accepts.
 
 
 def _metadata() -> str:
@@ -89,7 +90,7 @@ def build_sdist(sdist_directory: str, config_settings=None) -> str:
             return None
         info.uid = info.gid = 0
         info.uname = info.gname = ""
-        info.mtime = 0
+        info.mtime = _ZIP_EPOCH
         return info
 
     with tarfile.open(target, "w:gz", format=tarfile.PAX_FORMAT) as archive:
