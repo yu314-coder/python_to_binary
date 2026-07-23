@@ -1,0 +1,37 @@
+[build-system]
+requires = []
+build-backend = "py2bin.build_backend"
+backend-path = ["src"]
+
+[project]
+name = "python-to-binary"
+version = "0.1.0"
+description = "Pure-Python Python-to-C, native binary compiler, and CPython application bundler"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "python-to-binary contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Software Development :: Compilers",
+]
+
+[project.urls]
+Homepage = "https://github.com/yu314-coder/python_to_binary"
+Repository = "https://github.com/yu314-coder/python_to_binary"
+Documentation = "https://github.com/yu314-coder/python_to_binary/blob/main/docs/DETAILED_GUIDE.md"
+Issues = "https://github.com/yu314-coder/python_to_binary/issues"
+
+[project.scripts]
+py2bin = "py2bin.cli:main"
+
+[tool.py2bin]
+format = "bin"
+dependency-mode = "closure"
