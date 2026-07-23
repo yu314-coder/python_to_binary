@@ -119,6 +119,7 @@ class NativeCompilerTests(unittest.TestCase):
             image = result.artifact.read_bytes()
             self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
             self.assertEqual(int.from_bytes(image[4:8], "little"), 0x0100000C)
+            self.assertIn((0x80000022).to_bytes(4, "little"), image[:0x4000])
 
     def test_writes_native_macos_app(self):
         with tempfile.TemporaryDirectory() as directory:

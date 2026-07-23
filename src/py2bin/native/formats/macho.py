@@ -177,6 +177,10 @@ def write_macho_arm64(
     build_version = struct.pack("<IIIIII", 0x32, 24, 1, 13 << 16, 0, 0)
     uuid_command = struct.pack("<II", 0x1B, 24) + hashlib.sha256(code).digest()[:16]
     main_command = struct.pack("<IIQQ", 0x80000028, 24, page, 0)
+    # Tell dyld explicitly that this image has no rebases, binds, or exports.
+    # Older dyld releases otherwise fall back to legacy relocation metadata
+    # that this intentionally minimal image does not contain.
+    dyld_info = struct.pack("<12I", 0x80000022, 48, *([0] * 10))
     dylib_name = b"/usr/lib/libSystem.B.dylib\0"
     load_dylib = (
         struct.pack("<IIIIII", 0xC, 56, 24, 2, 0x054C0000, 0x00010000)
@@ -216,6 +220,7 @@ def write_macho_arm64(
         + text_segment
         + text_section
         + linkedit
+        + dyld_info
         + dylinker
         + uuid_command
         + build_version
@@ -229,7 +234,7 @@ def write_macho_arm64(
         0x0100000C,
         0,
         2,
-        9,
+        10,
         len(commands),
         0x00200085,
         0,
