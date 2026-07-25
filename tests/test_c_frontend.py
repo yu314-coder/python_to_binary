@@ -596,6 +596,288 @@ int main(void) {
         )
 
 
+class FloatingPointTests(CProgramTestCase):
+    """C's floating types, checked against IEEE-754 arithmetic done by hand.
+
+    Every expectation is a value the standard pins down exactly. The programs
+    print integers scaled out of the doubles rather than printing the doubles,
+    because these tests are about the arithmetic; printf's own floating
+    conversions are exercised separately.
+    """
+
+    def test_arithmetic_on_doubles_is_exact_where_ieee_754_is_exact(self):
+        # Every value here is a sum of powers of two, so each result is exact
+        # and the scaled integers below are the only possible answers.
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    double a = 1.5;
+    double b = 0.25;
+    printf("%d\\n", (int)((a + b) * 100.0));
+    printf("%d\\n", (int)((a - b) * 100.0));
+    printf("%d\\n", (int)((a * b) * 1000.0));
+    printf("%d\\n", (int)((a / b) * 100.0));
+    printf("%d\\n", (int)(-a * 100.0));
+    printf("%d\\n", (int)(+a * 100.0));
+    return 0;
+}
+""",
+            stdout="175\n125\n375\n600\n-150\n150\n",
+        )
+
+    def test_conversions_between_integer_and_floating_types(self):
+        # C truncates toward zero converting to an integer, and 2**64-1 is not
+        # representable as a double so it converts to 2**64 exactly.
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%d %d\\n", (int)1.9, (int)-1.9);
+    printf("%d\\n", (int)(double)7);
+    unsigned long long big = 18446744073709551615ULL;
+    printf("%d\\n", (int)((double)big / 1e18));
+    double huge = 1e19;
+    printf("%llu\\n", (unsigned long long)huge);
+    long long signed_max = 9223372036854775807LL;
+    printf("%d\\n", (int)((double)signed_max / 1e18));
+    double d = 3;
+    printf("%d\\n", (int)(d * 100));
+    return 0;
+}
+""",
+            stdout="1 -1\n7\n18\n10000000000000000000\n9\n300\n",
+        )
+
+    def test_float_rounds_where_c_says_the_extra_precision_goes(self):
+        # 0.1 is not representable in either format. The nearest double times
+        # 1e9 truncates to 100000000; the nearest float is
+        # 0.100000001490116119384765625, whose product truncates to 100000001.
+        # An assignment, a cast, a parameter and a return must each round.
+        self.run_c(
+            _STDIO
+            + """
+float identity(float value) { return value; }
+int main(void) {
+    double exact = 0.1;
+    float rounded = 0.1;
+    printf("%d\\n", (int)(exact * 1000000000.0));
+    printf("%d\\n", (int)(rounded * 1000000000.0));
+    printf("%d\\n", (int)((double)(float)0.1 * 1000000000.0));
+    printf("%d\\n", (int)(identity(0.1) * 1000000000.0));
+    printf("%d\\n", (double)(float)0.1 == 0.1);
+    printf("%d %d\\n", (int)sizeof(float), (int)sizeof(double));
+    return 0;
+}
+""",
+            stdout="100000000\n100000001\n100000001\n100000001\n0\n4 8\n",
+        )
+
+    def test_a_float_object_really_occupies_four_bytes(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    float values[4];
+    int i;
+    for (i = 0; i < 4; i++) values[i] = (float)i / 4.0f;
+    printf("%d\\n", (int)((char *)&values[1] - (char *)&values[0]));
+    printf("%d %d %d %d\\n",
+           (int)(values[0] * 100), (int)(values[1] * 100),
+           (int)(values[2] * 100), (int)(values[3] * 100));
+    return 0;
+}
+""",
+            stdout="4\n0 25 50 75\n",
+        )
+
+    def test_the_usual_arithmetic_conversions_reach_the_floating_types(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    int i = 3;
+    printf("%d\\n", (int)((i / 2) * 100));
+    printf("%d\\n", (int)((i / 2.0) * 100));
+    printf("%d\\n", (int)((1 + 0.5f) * 100));
+    unsigned int u = 4000000000u;
+    printf("%d\\n", (int)(u / 1e9));
+    return 0;
+}
+""",
+            stdout="100\n150\n150\n4\n",
+        )
+
+    def test_every_ordering_is_false_when_an_operand_is_a_nan(self):
+        # C requires <, <=, > and >= to be false and != to be true for an
+        # unordered pair. This is the case the integer condition codes get
+        # wrong on both architectures.
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    double zero = 0.0;
+    double nan = zero / zero;
+    printf("%d %d %d %d %d %d\\n",
+           nan == nan, nan != nan, nan < 1.0, nan <= 1.0, nan > 1.0, nan >= 1.0);
+    printf("%d %d\\n", 1.5 < 2.0, -0.0 == 0.0);
+    double infinity = 1.0 / zero;
+    printf("%d %d\\n", infinity > 1e308, -infinity < -1e308);
+    return 0;
+}
+""",
+            stdout="0 1 0 0 0 0\n1 1\n1 1\n",
+        )
+
+    def test_a_double_controls_conditions_exactly_as_c_says(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    double c = 0.0;
+    int steps = 0;
+    while (c < 1.0) { c += 0.25; steps++; }
+    printf("%d %d\\n", steps, (int)(c * 100));
+    if (!0.0) printf("zero is false\\n");
+    if (-0.0) printf("unreachable\\n");
+    printf("%d %d\\n", 2.5 && 0.0, 0.0 || 0.5);
+    printf("%d\\n", (int)(_Bool)0.5);
+    for (c = 3.0; c > 0.0; c -= 1.0) printf("%d", (int)c);
+    printf("\\n");
+    return 0;
+}
+""",
+            stdout="4 100\nzero is false\n0 1\n1\n321\n",
+        )
+
+    def test_a_conditional_expression_may_mix_an_integer_and_a_double_arm(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%d\\n", (int)((1 ? 2.5 : 3) * 10));
+    printf("%d\\n", (int)((0 ? 2 : 3.5) * 10));
+    printf("%d\\n", (int)((1 ? 2 : 3) * 10));
+    return 0;
+}
+""",
+            stdout="25\n35\n20\n",
+        )
+
+    def test_a_conditional_evaluates_only_the_arm_it_selects(self):
+        # The arms' stores are rewritten in place once the common type is
+        # known; rewriting rather than re-lowering is what keeps each arm
+        # evaluated exactly once.
+        self.run_c(
+            _STDIO
+            + """
+int bump(int *n) { *n = *n + 1; return 1; }
+int main(void) {
+    int calls = 0;
+    double picked = bump(&calls) ? 2.5 : (double)bump(&calls);
+    printf("%d %d\\n", calls, (int)(picked * 10));
+    return 0;
+}
+""",
+            stdout="1 25\n",
+        )
+
+    def test_increment_and_compound_assignment_work_on_floating_objects(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    double d = 1.5;
+    printf("%d ", (int)(d++ * 10));
+    printf("%d ", (int)(d * 10));
+    printf("%d ", (int)(++d * 10));
+    d *= 2;
+    d -= 0.5;
+    d /= 2;
+    printf("%d\\n", (int)(d * 100));
+    float f = 1.0f;
+    f += 0.5f;
+    printf("%d\\n", (int)(f * 100));
+    return 0;
+}
+""",
+            stdout="15 25 35 325\n150\n",
+        )
+
+    def test_doubles_pass_through_calls_recursion_and_pointers(self):
+        self.run_c(
+            _STDIO
+            + """
+double power(double base, int exponent) {
+    if (exponent == 0) return 1.0;
+    return base * power(base, exponent - 1);
+}
+double total(double *values, int count) {
+    double sum = 0.0;
+    int i;
+    for (i = 0; i < count; i++) sum += values[i];
+    return sum;
+}
+void scale(double *value, double factor) { *value = *value * factor; }
+int main(void) {
+    printf("%d\\n", (int)power(1.5, 4));
+    double values[4];
+    values[0] = 1.5; values[1] = 2.25; values[2] = -0.75; values[3] = 8.0;
+    printf("%d\\n", (int)(total(values, 4) * 100));
+    double one = 0.5;
+    scale(&one, 3.0);
+    printf("%d\\n", (int)(one * 100));
+    return 0;
+}
+""",
+            # 1.5**4 == 5.0625 exactly, so the truncation is 5.
+            stdout="5\n1100\n150\n",
+        )
+
+    def test_a_struct_lays_out_and_copies_its_floating_members(self):
+        self.run_c(
+            _STDIO
+            + """
+struct sample { double x; float y; int tag; };
+int main(void) {
+    struct sample a;
+    a.x = 2.5; a.y = 1.25f; a.tag = 7;
+    struct sample b;
+    b = a;
+    b.x = b.x + 1.0;
+    printf("%d %d %d\\n", (int)(a.x * 10), (int)(a.y * 10), a.tag);
+    printf("%d %d %d\\n", (int)(b.x * 10), (int)(b.y * 10), b.tag);
+    printf("%d %d %d\\n",
+           (int)sizeof(struct sample),
+           (int)((char *)&a.y - (char *)&a.x),
+           (int)((char *)&a.tag - (char *)&a.x));
+    return 0;
+}
+""",
+            # double at 0, float at 8, int at 12; the whole thing is 8-aligned.
+            stdout="25 12 7\n35 12 7\n16 8 12\n",
+        )
+
+    def test_hexadecimal_and_subnormal_floating_constants(self):
+        # 0x1.8p3 is (1 + 1/2) * 8 == 12 exactly. The nearest float to 1e-40 is
+        # a subnormal, 9.99994610111476e-41, so the product truncates to 99999
+        # rather than the 100000 a normal value would give.
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%d\\n", (int)0x1.8p3);
+    printf("%d\\n", (int)(.5 * 100));
+    printf("%d\\n", (int)(1e2));
+    float small = 1e-40f;
+    printf("%d\\n", (int)(small * 1e45));
+    return 0;
+}
+""",
+            stdout="12\n50\n100\n99999\n",
+        )
+
+
 class EvaluatedOnceTests(CProgramTestCase):
     """The recurring defect here is a value written once, lowered twice.
 
@@ -841,9 +1123,54 @@ class RejectionTests(CProgramTestCase):
             "at most 8 arguments in registers",
         )
 
-    def test_floating_point_is_refused(self):
-        self.reject("int main(void) { double d; return 0; }\n", "floating point")
-        self.reject("int main(void) { return 1.5; }\n", "floating-point literal")
+    def test_long_double_is_refused(self):
+        self.reject(
+            "int main(void) { long double d = 1.0; return 0; }\n", "long double"
+        )
+        self.reject("int main(void) { return (int)1.0L; }\n", "long double")
+
+    def test_floating_operands_are_refused_where_c_needs_an_integer(self):
+        self.reject(
+            "int main(void) { double d = 1.0; return (int)(d % 2); }\n",
+            "needs integer operands",
+        )
+        self.reject("int main(void) { double d = 1.0; return ~d; }\n", "unary '~'")
+        self.reject(
+            "int main(void) { double d = 1.0; return d << 1; }\n",
+            "needs integer operands",
+        )
+        self.reject(
+            "int main(void) { double d = 1.0; switch (d) { case 1: break; } return 0; }\n",
+            "'switch' needs an integer",
+        )
+        self.reject(
+            "int main(void) { double a[2]; double d = 0.0; return (int)a[d]; }\n",
+            "offset by an integer",
+        )
+        self.reject(
+            "int main(void) { int a[1.5]; return 0; }\n",
+            "not an integer constant expression",
+        )
+
+    def test_a_pointer_never_converts_to_or_from_a_floating_type(self):
+        self.reject(
+            "int main(void) { double d = 1.0; int *p = (int *)d; return p == 0; }\n",
+            "no conversion between a floating type and a pointer",
+        )
+        self.reject(
+            "int main(void) { int i = 0; double d = (double)&i; return (int)d; }\n",
+            "no conversion between a pointer and a floating type",
+        )
+
+    def test_a_floating_constant_that_overflows_is_refused(self):
+        self.reject("int main(void) { double d = 1e400; return 0; }\n", "overflows")
+        self.reject("int main(void) { float f = 1e40f; return 0; }\n", "overflows")
+        self.reject(
+            "int main(void) { double d = 1.0e+; return 0; }\n", "exponent has no digits"
+        )
+        self.reject(
+            "int main(void) { double d = 0x1.8; return 0; }\n", "binary exponent"
+        )
 
     def test_undefined_enum_tag_is_refused(self):
         self.reject(
@@ -1549,6 +1876,97 @@ int main(void) {
         ):
             with self.subTest(mnemonic=mnemonic):
                 self.assertRegex(text, mnemonic)
+
+    _FLOAT_SOURCE = """
+double blend(double a, float b) { return a * 2.0 + (double)(b / 2.0f); }
+int main(void) {
+    double d = 1.5;
+    float f = 0.25f;
+    double values[2];
+    values[0] = blend(d, f);
+    values[1] = (double)(unsigned long long)(values[0] * 4.0);
+    if (values[0] == values[1]) { d = d + 100.0; }
+    if (values[0] < values[1]) { d = d + 1.0; }
+    return (int)(values[1] + d);
+}
+"""
+
+    def _disassemble_source(self, source: str, target: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "floats.c"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "floats.bin"
+            compile_c_native(entry, artifact, target=target, clean=True)
+            return subprocess.run(
+                ["otool", "-tvV", str(artifact)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin", "otool is a macOS developer tool"
+    )
+    def test_x86_64_emits_real_sse2_for_the_floating_types(self):
+        """x86-64 cannot be RUN here, so its float encoding is read instead."""
+
+        text = self._disassemble_source(self._FLOAT_SOURCE, "darwin-x86_64")
+        for mnemonic in (
+            r"\baddsd\b",
+            r"\bmulsd\b",
+            r"\bdivss\b|\bdivsd\b",
+            r"\bcvtsd2ss\b",  # rounding a double to a float object
+            r"\bcvtss2sd\b",  # widening a float object back
+            r"\bcvttsd2si\b",  # the C conversion to an integer
+            r"\bcvtsi2sd\b",  # and back
+            r"\bucomisd\b",
+            r"\bmovq\b",  # the bit-pattern moves between rax and xmm0
+            r"\bsetnp\b",  # the ordered half of an equality comparison
+        ):
+            with self.subTest(mnemonic=mnemonic):
+                self.assertRegex(text, mnemonic)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin", "otool is a macOS developer tool"
+    )
+    def test_arm64_emits_real_scalar_neon_for_the_floating_types(self):
+        text = self._disassemble_source(self._FLOAT_SOURCE, "darwin-arm64")
+        for mnemonic in (
+            r"\bfadd\t",
+            r"\bfmul\t",
+            r"\bfdiv\t",
+            r"\bfcvt\t",  # between binary32 and binary64
+            r"\bfcvtzs\t|\bfcvtzu\t",
+            r"\bucvtf\t|\bscvtf\t",
+            r"\bfcmp\t",
+            r"\bfmov\t",
+        ):
+            with self.subTest(mnemonic=mnemonic):
+                self.assertRegex(text, mnemonic)
+
+    def test_a_floating_program_builds_for_every_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "floats.c"
+            entry.write_text(self._FLOAT_SOURCE, encoding="utf-8")
+            for target in supported_targets():
+                with self.subTest(target=target):
+                    artifact = root / f"floats-{target}.bin"
+                    compile_c_native(entry, artifact, target=target, clean=True)
+                    self.assertGreater(artifact.stat().st_size, 0)
+        if _HOST_IS_DARWIN_ARM64:
+            # blend(1.5, 0.25f) is 3.0 + 0.125 == 3.125 exactly; times four is
+            # 12.5, whose unsigned conversion truncates to 12. 3.125 == 12.0 is
+            # false and 3.125 < 12.0 is true, so d becomes 2.5 and the result
+            # truncates from 14.5.
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entry = root / "floats.c"
+                entry.write_text(self._FLOAT_SOURCE, encoding="utf-8")
+                artifact = root / "floats.bin"
+                compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+                self.assertEqual(subprocess.run([str(artifact)]).returncode, 14)
 
     @unittest.skipUnless(
         _HOST_IS_DARWIN_ARM64, "native execution requires a darwin-arm64 host"

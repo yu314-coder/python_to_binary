@@ -19,6 +19,16 @@ What is implemented
   their unsigned forms, plus the ``<stdint.h>`` fixed-width names -- with C's
   integer promotions, usual arithmetic conversions, and exact truncation and
   sign/zero extension on every assignment, cast and narrow-typed operation;
+* ``float`` and ``double``: decimal and hexadecimal floating constants,
+  arithmetic, IEEE comparisons (including the unordered case NaN produces),
+  the usual arithmetic conversions between the integer and floating types, and
+  conversions in both directions -- with ``float`` objects really four bytes
+  wide. Every floating expression is EVALUATED in double precision and rounded
+  to ``float`` only where C requires the extra precision removed, which is
+  ``FLT_EVAL_METHOD == 1``. A floating argument or result crosses a call as its
+  IEEE bit pattern in an integer register; that ABI is py2bin's own and never
+  meets a platform C function. ``long double`` is rejected rather than quietly
+  aliased to ``double``;
 * real memory: local arrays (including multi-dimensional), ``&x``, ``*p``,
   pointer arithmetic, and ``a[i]``, all with loads and stores at the right
   width;
@@ -41,26 +51,36 @@ What is implemented
 
 What is rejected
 ----------------
-Floating point in C, ``struct``/``union``/``enum``/``typedef`` definitions,
-function pointers, variadic user functions, globals with static storage, the
-preprocessor beyond a handful of ignorable ``#include``s, more than eight
-arguments to a function (py2bin passes arguments only in registers), and
-recursion on the targets that have no call ABI yet.
+``long double``, function pointers, variadic user functions, globals with
+static storage, the preprocessor beyond a handful of ignorable ``#include``s,
+more than eight arguments to a function (py2bin passes arguments only in
+registers), and recursion on the targets that have no call ABI yet.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import re
+import struct
 
 from .native.frontend import _CABI_RESULT_WIDTH, _CABI_RESULTS, _CABI_SYMBOLS
 from .native.compiler import CALL_CAPABLE_TARGETS
 from .native.ir import (
+    BitsFloat,
     Call as IRCall,
     CStringConstant,
     Exit,
     ExitValue,
     ExternCall,
+    FloatBinary,
+    FloatBits,
+    FloatCompare,
+    FloatConstant,
+    FloatExpression,
+    FloatLoad,
+    FloatStore,
+    FloatToInt,
+    FloatUnary,
     Function as IRFunction,
     HeapLoad,
     HeapStore,
@@ -69,6 +89,7 @@ from .native.ir import (
     IntConstant,
     IntExpression,
     IntLoad,
+    IntToFloat,
     IntUnary,
     Jump,
     JumpIfFalse,
@@ -281,6 +302,78 @@ class Lexer:
             return value
         self.error(f"unsupported escape sequence \\{escaped} in a {quote} literal")
 
+    def digits(self, allowed: str) -> int:
+        """Consume a run of ``allowed`` characters and report how many."""
+
+        seen = 0
+        while self.index < len(self.source) and self.source[self.index] in allowed:
+            self.advance()
+            seen += 1
+        return seen
+
+    def floating(self, start: int, line: int, column: int, *, hexadecimal: bool) -> Token:
+        """Finish scanning a floating constant that began at ``start``.
+
+        C's grammar is followed exactly: a decimal constant needs either a
+        period or an exponent, a hexadecimal one always needs its ``p``
+        exponent, and the suffix selects the type. The value itself is produced
+        by Python's own correctly-rounded decimal-to-binary64 conversion, so a
+        literal is the nearest double to what was written rather than the
+        result of a hand-rolled parse.
+        """
+
+        allowed = "0123456789abcdefABCDEF" if hexadecimal else "0123456789"
+        if self.index < len(self.source) and self.source[self.index] == ".":
+            self.advance()
+            self.digits(allowed)
+        markers = "pP" if hexadecimal else "eE"
+        if self.index < len(self.source) and self.source[self.index] in markers:
+            self.advance()
+            if self.index < len(self.source) and self.source[self.index] in "+-":
+                self.advance()
+            if not self.digits("0123456789"):
+                self.error("this floating constant's exponent has no digits", line, column)
+        elif hexadecimal:
+            self.error(
+                "a hexadecimal floating constant needs a binary exponent, as in "
+                "0x1.8p3",
+                line,
+                column,
+            )
+        text = self.source[start : self.index]
+        suffix = ""
+        if self.index < len(self.source) and self.source[self.index] in "fFlL":
+            suffix = self.advance().lower()
+        if self.index < len(self.source) and (
+            self.source[self.index].isalnum() or self.source[self.index] == "_"
+        ):
+            self.error("unsupported floating literal suffix", line, column)
+        if suffix == "l":
+            self.error(
+                "'long double' is not implemented by py2bin's C compiler; it has "
+                "'float' and 'double', and would have to pretend a wider type was "
+                "wider than double to accept this",
+                line,
+                column,
+            )
+        try:
+            value = float.fromhex(text) if hexadecimal else float(text)
+        except (ValueError, OverflowError):
+            self.error(f"{text!r} is not a valid floating constant", line, column)
+        if suffix == "f":
+            try:
+                value = struct.unpack("<f", struct.pack("<f", value))[0]
+            except OverflowError:
+                value = float("inf")
+        if value in (float("inf"), float("-inf")):
+            self.error(
+                f"the floating constant {text!r} overflows the type it is written "
+                "with; C leaves that undefined, so py2bin refuses it",
+                line,
+                column,
+            )
+        return Token("float", value, line, column, suffix)
+
     def number(self) -> Token:
         line, column = self.line, self.column
         start = self.index
@@ -294,6 +387,8 @@ class Lexer:
                 "0123456789abcdefABCDEF"
             ):
                 self.advance()
+            if self.index < len(self.source) and self.source[self.index] in ".pP":
+                return self.floating(start, line, column, hexadecimal=True)
             if self.index == digits:
                 self.error("hexadecimal integer needs at least one digit", line, column)
             value = int(self.source[start : self.index], 16)
@@ -309,12 +404,7 @@ class Lexer:
                         or self.source[self.index + 1] in "+-"
                     )
                 ):
-                    self.error(
-                        "floating-point literals are not implemented by py2bin's "
-                        "C compiler; it compiles the integer and pointer subset",
-                        line,
-                        column,
-                    )
+                    return self.floating(start, line, column, hexadecimal=False)
             if text.startswith("0") and len(text) > 1:
                 radix = 8
                 if any(digit not in "01234567" for digit in text):
@@ -397,6 +487,14 @@ class Lexer:
             if character.isdigit():
                 result.append(self.number())
                 continue
+            if (
+                character == "."
+                and self.index + 1 < len(self.source)
+                and self.source[self.index + 1].isdigit()
+            ):
+                # C lets a floating constant start with its period, as in '.5'.
+                result.append(self.floating(self.index, line, column, hexadecimal=False))
+                continue
             if character == "'":
                 result.append(self.character())
                 continue
@@ -433,6 +531,27 @@ class IntegerType:
     name: str
     size: int
     signed: bool
+    rank: int
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FloatingType:
+    """``float`` or ``double``, both held in IEEE-754 binary64 registers.
+
+    py2bin's C evaluates every floating expression in double precision and
+    rounds to ``float`` only where C says the extra precision must be removed
+    -- assignment, cast, argument passing and return. That is exactly
+    ``FLT_EVAL_METHOD == 1``, which C11 6.3.1.8p2 explicitly permits, and it is
+    what lets one register file and one set of instructions serve both types.
+    ``size`` is still the real storage size, so a ``float`` object occupies four
+    bytes in memory and a ``float`` array indexes by four.
+    """
+
+    name: str
+    size: int
     rank: int
 
     def __str__(self) -> str:
@@ -495,7 +614,7 @@ class StructType:
 def align_of(ctype: "CType") -> int:
     """The alignment ``ctype`` requires, in bytes."""
 
-    if isinstance(ctype, IntegerType):
+    if isinstance(ctype, (IntegerType, FloatingType)):
         return ctype.size
     if isinstance(ctype, PointerType):
         return 8
@@ -546,7 +665,15 @@ class OpaqueType:
         return self.name
 
 
-CType = VoidType | IntegerType | PointerType | ArrayType | OpaqueType | StructType
+CType = (
+    VoidType
+    | IntegerType
+    | FloatingType
+    | PointerType
+    | ArrayType
+    | OpaqueType
+    | StructType
+)
 
 VOID = VoidType()
 CHAR = IntegerType("char", 1, True, 1)
@@ -561,6 +688,10 @@ ULONG = IntegerType("unsigned long", 8, False, 4)
 LLONG = IntegerType("long long", 8, True, 5)
 ULLONG = IntegerType("unsigned long long", 8, False, 5)
 BOOL = IntegerType("_Bool", 1, False, 0)
+# Floating ranks sit above every integer rank, which is what makes the usual
+# arithmetic conversions pick the floating type in a mixed expression.
+FLOAT = FloatingType("float", 4, 6)
+DOUBLE = FloatingType("double", 8, 7)
 
 # py2bin's C is LP64 on every target it emits, including Windows. The compiler
 # never shares a header or an ABI with a platform C library beyond the vetted
@@ -594,7 +725,18 @@ _OPAQUE_NAMES = frozenset(
 _UNSIGNED_COUNTERPART = {INT: UINT, LONG: ULONG, LLONG: ULLONG}
 
 _TYPE_KEYWORDS = frozenset(
-    {"void", "char", "short", "int", "long", "signed", "unsigned", "_Bool"}
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "signed",
+        "unsigned",
+        "_Bool",
+        "float",
+        "double",
+    }
 )
 # Qualifiers py2bin can honour by ignoring them. ``const`` and ``restrict``
 # constrain the program, not the generated code, and every C local here lives
@@ -634,13 +776,24 @@ _SPECIFIER_COMBINATIONS: dict[tuple[str, ...], CType] = {
     ("signed", "long", "long", "int"): LLONG,
     ("unsigned", "long", "long"): ULLONG,
     ("unsigned", "long", "long", "int"): ULLONG,
+    ("float",): FLOAT,
+    ("double",): DOUBLE,
+}
+
+#: Specifier lists that name a real C type py2bin will not pretend to have.
+#: ``long double`` is the whole list: accepting it would promise a precision
+#: wider than double that this backend does not compute in.
+_REJECTED_COMBINATIONS: dict[tuple[str, ...], str] = {
+    ("long", "double"): "'long double' is not implemented by py2bin's C compiler; "
+    "it evaluates floating expressions in double precision, and accepting the "
+    "name would promise a wider type than it computes with",
 }
 
 
 def size_of(ctype: CType) -> int | None:
     """The size in bytes of ``ctype``, or None when it is incomplete."""
 
-    if isinstance(ctype, IntegerType):
+    if isinstance(ctype, (IntegerType, FloatingType)):
         return ctype.size
     if isinstance(ctype, PointerType):
         return 8
@@ -658,12 +811,22 @@ def is_signed(ctype: CType) -> bool:
     return isinstance(ctype, IntegerType) and ctype.signed
 
 
-def is_arithmetic(ctype: CType) -> bool:
+def is_integer(ctype: CType) -> bool:
     return isinstance(ctype, IntegerType)
 
 
+def is_floating(ctype: CType) -> bool:
+    return isinstance(ctype, FloatingType)
+
+
+def is_arithmetic(ctype: CType) -> bool:
+    """C's arithmetic types: the integer types and the floating ones."""
+
+    return isinstance(ctype, (IntegerType, FloatingType))
+
+
 def is_scalar(ctype: CType) -> bool:
-    return isinstance(ctype, (IntegerType, PointerType))
+    return isinstance(ctype, (IntegerType, FloatingType, PointerType))
 
 
 def promote(ctype: CType) -> CType:
@@ -674,8 +837,23 @@ def promote(ctype: CType) -> CType:
     return ctype
 
 
+def arithmetic_conversions(left: CType, right: CType) -> CType:
+    """C11 6.3.1.8 with the floating types in front, as the standard orders it.
+
+    If either operand is floating, the common type is the wider of the two
+    floating types (or the one floating type when the other operand is an
+    integer); only when both are integers do the integer rules apply.
+    """
+
+    if is_floating(left) or is_floating(right):
+        if left == DOUBLE or right == DOUBLE:
+            return DOUBLE
+        return FLOAT
+    return usual_conversions(left, right)
+
+
 def usual_conversions(left: IntegerType, right: IntegerType) -> IntegerType:
-    """C11 6.3.1.8, the usual arithmetic conversions, in full."""
+    """C11 6.3.1.8 for two integer operands."""
 
     left = promote(left)
     right = promote(right)
@@ -714,6 +892,12 @@ class Node:
 @dataclasses.dataclass(slots=True)
 class IntLiteral(Node):
     value: int
+    ctype: CType
+
+
+@dataclasses.dataclass(slots=True)
+class FloatLiteral(Node):
+    value: float
     ctype: CType
 
 
@@ -957,8 +1141,6 @@ _RESERVED = frozenset(
 )
 
 _UNSUPPORTED_KEYWORDS = {
-    "float": "floating point is not implemented by py2bin's C compiler",
-    "double": "floating point is not implemented by py2bin's C compiler",
     "static": "static storage duration is not implemented; py2bin's C has no writable data segment",
     "register": "the 'register' storage class is not accepted",
     "auto": "the 'auto' storage class is not accepted",
@@ -1213,6 +1395,11 @@ class Parser:
             if base is not None:
                 self.error("conflicting type specifiers", start)
             key = tuple(words)
+            rejection = _REJECTED_COMBINATIONS.get(key) or _REJECTED_COMBINATIONS.get(
+                tuple(sorted(key))
+            )
+            if rejection is not None:
+                self.error(rejection, start)
             resolved = _SPECIFIER_COMBINATIONS.get(key)
             if resolved is None:
                 resolved = _SPECIFIER_COMBINATIONS.get(tuple(sorted(key)))
@@ -1388,6 +1575,13 @@ class Parser:
         if token.kind == "integer":
             self.take()
             return IntLiteral(token, int(token.value), _literal_type(token, self.filename))
+        if token.kind == "float":
+            self.take()
+            # An unsuffixed floating constant has type double; 'f' makes it a
+            # float, and the lexer already rounded its value to binary32.
+            return FloatLiteral(
+                token, float(token.value), FLOAT if token.suffix == "f" else DOUBLE
+            )
         if token.kind == "string":
             self.take()
             data = bytes(token.value)  # type: ignore[arg-type]
@@ -1848,6 +2042,12 @@ class ConstantEvaluator:
     def evaluate(self, node: Node) -> int:
         if isinstance(node, IntLiteral):
             return node.value
+        if isinstance(node, FloatLiteral):
+            self.error(
+                "a floating constant is not an integer constant expression; an "
+                "array length and a 'case' label must be integers",
+                node.token,
+            )
         if isinstance(node, SizeofType):
             size = size_of(node.ctype)
             if size is None:
@@ -2061,16 +2261,22 @@ def _contains_call(value: object) -> bool:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Value:
-    """A lowered C expression: its type and its canonical 64-bit IR value.
+    """A lowered C expression: its type and its canonical IR value.
 
     Every integer value is kept sign-extended (signed types) or zero-extended
     (unsigned types) into 64 bits, so one representation serves both the
     register file and memory of any width. ``null`` marks the null pointer
     constant, the one integer C lets stand in for a pointer.
+
+    A value whose type is floating carries a ``FloatExpression`` instead, always
+    in binary64 -- including one of type ``float``, whose extra precision C11
+    6.3.1.8p2 lets an implementation keep until an assignment, cast, argument
+    or return removes it. ``ctype`` is what says which of the two ``expr`` is,
+    so nothing has to guess.
     """
 
     ctype: CType
-    expr: IntExpression
+    expr: IntExpression | FloatExpression
     null: bool = False
 
 
@@ -2229,10 +2435,84 @@ class Lowerer:
             return _binary("rshift", _binary("lshift", expression, shift), shift)
         return _binary("and", expression, IntConstant((1 << bits) - 1))
 
+    # --- floating conversions ---
+    #
+    # Every floating value in flight is a binary64 double, whatever its C type.
+    # These four helpers are the only places that cross between the integer and
+    # floating worlds, so the rules live in one place instead of at each use.
+
+    def widen(self, value: Value) -> FloatExpression:
+        """The double a floating or integer arithmetic value stands for."""
+
+        if is_floating(value.ctype):
+            return value.expr
+        assert isinstance(value.ctype, IntegerType)
+        # A canonical unsigned value narrower than 64 bits is already a
+        # non-negative i64, so only the 64-bit unsigned types need the unsigned
+        # conversion -- but they really need it, or 2**64-1 converts to -1.0.
+        signed = value.ctype.signed or value.ctype.size < 8
+        return IntToFloat(self.fit(value.expr, value.ctype), signed=signed)
+
+    def narrow(self, expression: FloatExpression, target: FloatingType) -> FloatExpression:
+        """Remove the extra precision C requires a conversion to remove."""
+
+        if target.size == 4:
+            return BitsFloat(FloatBits(expression, 4), 4)
+        return expression
+
+    def to_integer(self, expression: FloatExpression, target: IntegerType) -> IntExpression:
+        """C's conversion of a floating value to an integer type: truncate."""
+
+        if target == BOOL:
+            return FloatCompare("ne", expression, FloatConstant(0.0))
+        # A destination whose range runs past 2**63-1 needs the unsigned
+        # instruction; everything narrower fits in a signed 64-bit result and is
+        # then reduced by fit() exactly as an integer conversion is.
+        signed = target.signed or target.size < 8
+        return self.fit(FloatToInt(expression, signed=signed), target)
+
+    def stored_bits(self, expression: object, ctype: CType) -> IntExpression:
+        """The integer image an object of ``ctype`` holds in memory.
+
+        A C floating object is its IEEE-754 bit pattern, four bytes wide for a
+        ``float`` and eight for a ``double``, so every store goes through the
+        same ``HeapStore`` every other C object uses.
+        """
+
+        if is_floating(ctype):
+            return FloatBits(expression, ctype.size)
+        return expression
+
+    def from_bits(self, expression: IntExpression, ctype: CType) -> object:
+        """Read back what :meth:`stored_bits` wrote."""
+
+        if is_floating(ctype):
+            return BitsFloat(expression, ctype.size)
+        return self.fit(expression, ctype)
+
+    def truth(self, value: Value) -> IntExpression:
+        """The 0/1 an ``if``, ``while`` or ``&&`` tests a scalar with."""
+
+        if is_floating(value.ctype):
+            return FloatCompare("ne", value.expr, FloatConstant(0.0))
+        return value.expr
+
     def assign_convert(
         self, value: Value, target: CType, token: Token, what: str
-    ) -> IntExpression:
+    ) -> IntExpression | FloatExpression:
+        if isinstance(target, FloatingType):
+            if is_arithmetic(value.ctype):
+                return self.narrow(self.widen(value), target)
+            if isinstance(value.ctype, PointerType):
+                self.error(
+                    f"{what} needs {target}, but this is a pointer; C has no "
+                    "conversion between a pointer and a floating type at all",
+                    token,
+                )
+            self.error(f"{what} needs {target}, but this is {value.ctype}", token)
         if isinstance(target, IntegerType):
+            if isinstance(value.ctype, FloatingType):
+                return self.to_integer(value.expr, target)
             if isinstance(value.ctype, IntegerType):
                 return self.fit(value.expr, target)
             if isinstance(value.ctype, PointerType):
@@ -2270,6 +2550,10 @@ class Lowerer:
         size = size_of(ctype)
         if size is None:
             raise AssertionError("incomplete lvalue reached the loader")
+        if isinstance(ctype, FloatingType):
+            # The object's bytes ARE its IEEE bit pattern, so an ordinary
+            # integer load reaches it and BitsFloat reinterprets the result.
+            return Value(ctype, BitsFloat(HeapLoad(address, size, False), size))
         return Value(ctype, HeapLoad(address, size, is_signed(ctype)))
 
     def lvalue(self, node: Node) -> tuple[CType, IntExpression]:
@@ -2362,6 +2646,27 @@ class Lowerer:
         self.emit(Store(slot, expression))
         return IntLoad(slot)
 
+    def materialize_float(self, expression: FloatExpression) -> FloatExpression:
+        """The floating counterpart of :meth:`materialize`.
+
+        The slot holds the full binary64 value, not the object's storage
+        format, so pinning a ``float`` expression here does not round it -- C
+        rounds at the assignment itself, which happens after this.
+        """
+
+        if isinstance(expression, (FloatConstant, FloatLoad)):
+            return expression
+        slot = self.new_temp()
+        self.emit(FloatStore(slot, expression))
+        return FloatLoad(slot)
+
+    def pin(self, value: Value) -> Value:
+        """Pin either flavour of value in a slot, keeping its C type."""
+
+        if is_floating(value.ctype):
+            return Value(value.ctype, self.materialize_float(value.expr))
+        return Value(value.ctype, self.materialize(value.expr), value.null)
+
     # --- expressions ---
 
     def rvalue(self, node: Node) -> Value:
@@ -2371,6 +2676,8 @@ class Lowerer:
                 _constant(node.value),
                 null=node.value == 0 and node.ctype in {INT, LONG, LLONG},
             )
+        if isinstance(node, FloatLiteral):
+            return Value(node.ctype, FloatConstant(node.value))
         if isinstance(node, StringLiteral):
             if self.target != "darwin-arm64":
                 self.error(
@@ -2476,6 +2783,8 @@ class Lowerer:
             return self.load(ctype, address)
         if node.operator == "!":
             value = self.scalar(node.operand, "the operand of '!'")
+            if is_floating(value.ctype):
+                return Value(INT, FloatCompare("eq", value.expr, FloatConstant(0.0)))
             return Value(INT, _compare("eq", value.expr, IntConstant(0)))
         value = self.rvalue(node.operand)
         if not is_arithmetic(value.ctype):
@@ -2484,6 +2793,15 @@ class Lowerer:
                 f"{value.ctype}",
                 node.token,
             )
+        if is_floating(value.ctype):
+            if node.operator == "~":
+                self.error(
+                    f"unary '~' needs an integer operand, not {value.ctype}",
+                    node.token,
+                )
+            if node.operator == "+":
+                return value
+            return Value(value.ctype, FloatUnary("neg", value.expr))
         ctype = promote(value.ctype)
         expression = self.fit(value.expr, ctype)
         if node.operator == "+":
@@ -2502,6 +2820,25 @@ class Lowerer:
             self.error("an array cannot be incremented", node.token)
         address = self.stabilize(address)
         step = 1
+        if isinstance(ctype, FloatingType):
+            # C's ++ adds 1 to a floating object too, and the result is rounded
+            # back into the object exactly as an assignment would round it.
+            old_slot = self.new_temp()
+            self.emit(FloatStore(old_slot, self.load(ctype, address).expr))
+            operator = "add" if node.operator == "++" else "sub"
+            updated = self.narrow(
+                FloatBinary(operator, FloatLoad(old_slot), FloatConstant(1.0)), ctype
+            )
+            new_slot = self.new_temp()
+            self.emit(FloatStore(new_slot, updated))
+            self.emit(
+                HeapStore(
+                    address,
+                    FloatBits(FloatLoad(new_slot), ctype.size),
+                    ctype.size,
+                )
+            )
+            return Value(ctype, FloatLoad(old_slot if not node.prefix else new_slot))
         if isinstance(ctype, PointerType):
             element = size_of(ctype.target)
             if element is None:
@@ -2540,6 +2877,22 @@ class Lowerer:
                 f"{operator!r} needs arithmetic operands, not {left.ctype} and "
                 f"{right.ctype}",
                 token,
+            )
+        if is_floating(left.ctype) or is_floating(right.ctype):
+            names = {"+": "add", "-": "sub", "*": "mul", "/": "div"}
+            if operator not in names:
+                self.error(
+                    f"{operator!r} needs integer operands; C does not define it for "
+                    f"{left.ctype} and {right.ctype}",
+                    token,
+                )
+            ctype = arithmetic_conversions(left.ctype, right.ctype)
+            # No rounding here: C11 6.3.1.8p2 lets an implementation keep the
+            # extra range and precision of a wider evaluation format, which is
+            # what py2bin does (FLT_EVAL_METHOD == 1). The rounding happens
+            # where C requires it -- assignment, cast, argument and return.
+            return Value(
+                ctype, FloatBinary(names[operator], self.widen(left), self.widen(right))
             )
         if operator in {"<<", ">>"}:
             ctype = promote(left.ctype)
@@ -2600,7 +2953,7 @@ class Lowerer:
             pointer, count = right, left
             if operator == "-":
                 self.error("an integer minus a pointer is not valid C", token)
-        if not is_arithmetic(count.ctype):
+        if not is_integer(count.ctype):
             self.error(
                 f"a pointer can only be offset by an integer, not {count.ctype}",
                 token,
@@ -2644,6 +2997,13 @@ class Lowerer:
             self.error(
                 f"cannot compare {left.ctype} with {right.ctype}", node.token
             )
+        if is_floating(left.ctype) or is_floating(right.ctype):
+            # An IEEE comparison has four outcomes, and the backends give the
+            # unordered one its own handling: every ordering below is false
+            # when either operand is a NaN, and only '!=' is true.
+            return Value(
+                INT, FloatCompare(name, self.widen(left), self.widen(right))
+            )
         ctype = usual_conversions(left.ctype, right.ctype)
         if not ctype.signed and ctype.size == 8 and name not in {"eq", "ne"}:
             # Only a 64-bit unsigned type needs the unsigned condition codes:
@@ -2660,19 +3020,19 @@ class Lowerer:
         left = self.scalar(node.left, f"the left operand of {node.operator!r}")
         if node.operator == "&&":
             self.emit(Store(slot, IntConstant(0)))
-            self.emit(JumpIfFalse(left.expr, end))
+            self.emit(JumpIfFalse(self.truth(left), end))
             right = self.scalar(node.right, "the right operand of '&&'")
-            self.emit(JumpIfFalse(right.expr, end))
+            self.emit(JumpIfFalse(self.truth(right), end))
             self.emit(Store(slot, IntConstant(1)))
         else:
             taken = self.new_label("logic_true")
             other = self.new_label("logic_right")
             self.emit(Store(slot, IntConstant(0)))
-            self.emit(JumpIfFalse(left.expr, other))
+            self.emit(JumpIfFalse(self.truth(left), other))
             self.emit(Jump(taken))
             self.emit(Label(other))
             right = self.scalar(node.right, "the right operand of '||'")
-            self.emit(JumpIfFalse(right.expr, end))
+            self.emit(JumpIfFalse(self.truth(right), end))
             self.emit(Label(taken))
             self.emit(Store(slot, IntConstant(1)))
         self.emit(Label(end))
@@ -2686,19 +3046,26 @@ class Lowerer:
         converting each arm separately -- the common type is never narrower
         than either arm -- and it means the arms can be lowered in the order C
         requires instead of both being evaluated to pick between them.
+
+        Whether the slot holds an integer or a double is only known once BOTH
+        arms have been lowered, so each arm's store is emitted as a placeholder
+        and rewritten in place afterwards. Rewriting rather than re-lowering is
+        what keeps each arm evaluated exactly once.
         """
 
         test = self.scalar(node.test, "the condition of '?:'")
         otherwise = self.new_label("select_else")
         end = self.new_label("select_end")
         slot = self.new_temp()
-        self.emit(JumpIfFalse(test.expr, otherwise))
+        self.emit(JumpIfFalse(self.truth(test), otherwise))
         body = self.rvalue(node.body)
-        self.emit(Store(slot, body.expr))
+        body_store = len(self.operations)
+        self.emit(Store(slot, IntConstant(0)))
         self.emit(Jump(end))
         self.emit(Label(otherwise))
         alternative = self.rvalue(node.alternative)
-        self.emit(Store(slot, alternative.expr))
+        alternative_store = len(self.operations)
+        self.emit(Store(slot, IntConstant(0)))
         self.emit(Label(end))
         if isinstance(body.ctype, VoidType) or isinstance(alternative.ctype, VoidType):
             if not (
@@ -2710,7 +3077,7 @@ class Lowerer:
                 )
             return Value(VOID, IntConstant(0))
         if is_arithmetic(body.ctype) and is_arithmetic(alternative.ctype):
-            result: CType = usual_conversions(body.ctype, alternative.ctype)
+            result: CType = arithmetic_conversions(body.ctype, alternative.ctype)
         elif isinstance(body.ctype, PointerType) and alternative.null:
             result = body.ctype
         elif isinstance(alternative.ctype, PointerType) and body.null:
@@ -2731,6 +3098,18 @@ class Lowerer:
                 f"{alternative.ctype}",
                 node.token,
             )
+        # Now that the common type is known, give each arm's placeholder store
+        # the form that type needs. A floating result keeps the full binary64
+        # value in the slot, so an integer arm is converted here and a 'float'
+        # arm is not rounded -- the extra precision is removed later, where C
+        # says it must be.
+        for index, arm in ((body_store, body), (alternative_store, alternative)):
+            if is_floating(result):
+                self.operations[index] = FloatStore(slot, self.widen(arm))
+            else:
+                self.operations[index] = Store(slot, arm.expr)
+        if is_floating(result):
+            return Value(result, FloatLoad(slot))
         return Value(result, self.fit(IntLoad(slot), result))
 
     def cast(self, node: Cast) -> Value:
@@ -2746,8 +3125,25 @@ class Lowerer:
             self.error(
                 f"cannot cast a value of type {value.ctype} to {target}", node.token
             )
+        if isinstance(target, FloatingType):
+            if not is_arithmetic(value.ctype):
+                self.error(
+                    f"cannot cast {value.ctype} to {target}; C has no conversion "
+                    "between a pointer and a floating type",
+                    node.token,
+                )
+            # A cast is one of the places C requires the extra precision to go.
+            return Value(target, self.narrow(self.widen(value), target))
         if isinstance(target, IntegerType):
+            if isinstance(value.ctype, FloatingType):
+                return Value(target, self.to_integer(value.expr, target))
             return Value(target, self.fit(value.expr, target))
+        if isinstance(value.ctype, FloatingType):
+            self.error(
+                f"cannot cast {value.ctype} to {target}; C has no conversion "
+                "between a floating type and a pointer",
+                node.token,
+            )
         return Value(target, value.expr, null=value.null)
 
     def copy_struct(
@@ -2816,8 +3212,11 @@ class Lowerer:
             )
         # The stored expression may read the very object about to be written, so
         # it has to be pinned before the store rather than recomputed after it.
-        stored = self.materialize(stored)
-        self.emit(HeapStore(address, stored, size_of(ctype)))
+        if is_floating(ctype):
+            stored = self.materialize_float(stored)
+        else:
+            stored = self.materialize(stored)
+        self.emit(HeapStore(address, self.stored_bits(stored, ctype), size_of(ctype)))
         return Value(ctype, stored)
 
     # --- calls ---
@@ -2908,7 +3307,7 @@ class Lowerer:
                         argument.token,
                     )
             else:
-                if not is_arithmetic(value.ctype):
+                if not is_integer(value.ctype):
                     self.error(
                         f"{what} needs an integer, not {value.ctype}", argument.token
                     )
@@ -2927,7 +3326,17 @@ class Lowerer:
     def prepare_arguments(
         self, function: Function, node: Call
     ) -> list[IntExpression]:
-        """Check the argument count and convert each argument to its parameter."""
+        """Check the argument count and convert each argument to its parameter.
+
+        Every argument comes back as an INTEGER expression, because py2bin's
+        internal call ABI passes a floating argument as the object's IEEE bit
+        pattern in an integer register. That ABI is py2bin's own -- a compiled C
+        function here is never called by anything but py2bin's own code -- and
+        it means a double argument needs no new register class in either
+        encoder while still delivering the exact value. Passing the bit pattern
+        of the PARAMETER's type is what makes a 'float' parameter arrive as the
+        four bytes its object holds.
+        """
 
         if len(node.arguments) != len(function.parameters):
             self.error(
@@ -2939,14 +3348,13 @@ class Lowerer:
         for position, (argument, (parameter_type, _name)) in enumerate(
             zip(node.arguments, function.parameters), 1
         ):
-            prepared.append(
-                self.assign_convert(
-                    self.rvalue(argument),
-                    parameter_type,
-                    argument.token,
-                    f"argument {position} of {function.name}()",
-                )
+            converted = self.assign_convert(
+                self.rvalue(argument),
+                parameter_type,
+                argument.token,
+                f"argument {position} of {function.name}()",
             )
+            prepared.append(self.stored_bits(converted, parameter_type))
         return prepared
 
     # --- real calls --------------------------------------------------------
@@ -2975,7 +3383,9 @@ class Lowerer:
         self.emit(Store(slot, call))
         if isinstance(function.result, VoidType):
             return Value(VOID, IntConstant(0))
-        return Value(function.result, self.fit(IntLoad(slot), function.result))
+        # A floating result came back as its bit pattern in the integer result
+        # register, the mirror image of how prepare_arguments passed one in.
+        return Value(function.result, self.from_bits(IntLoad(slot), function.result))
 
     def lower_callee(self, function: Function) -> None:
         """Lower ``function`` into its own IR body, once.
@@ -3095,7 +3505,7 @@ class Lowerer:
         self.scopes.pop()
         if result_slot is None:
             return Value(VOID, IntConstant(0))
-        return Value(function.result, IntLoad(result_slot))
+        return Value(function.result, self.from_bits(IntLoad(result_slot), function.result))
 
     def check_labels(self, context: FunctionContext) -> None:
         for name, token in context.pending:
@@ -3207,7 +3617,11 @@ class Lowerer:
                 value, ctype, node.token, f"the initializer for {name!r}"
             )
             self.emit(
-                HeapStore(SlotAddress(local.slot), stored, size_of(ctype))
+                HeapStore(
+                    SlotAddress(local.slot),
+                    self.stored_bits(stored, ctype),
+                    size_of(ctype),
+                )
             )
 
     def deduce_array(
@@ -3269,7 +3683,9 @@ class Lowerer:
             )
             self.emit(
                 HeapStore(
-                    _binary("add", base, IntConstant(position * size)), stored, size
+                    _binary("add", base, IntConstant(position * size)),
+                    self.stored_bits(stored, element),
+                    size,
                 )
             )
         # C zero-fills whatever the braces leave out.
@@ -3303,7 +3719,7 @@ class Lowerer:
     def if_statement(self, node: If) -> None:
         test = self.scalar(node.test, "an 'if' condition")
         otherwise = self.new_label("else")
-        self.emit(JumpIfFalse(test.expr, otherwise))
+        self.emit(JumpIfFalse(self.truth(test), otherwise))
         self.statement(node.body)
         if node.alternative is None:
             self.emit(Label(otherwise))
@@ -3319,7 +3735,7 @@ class Lowerer:
         end = self.new_label("while_end")
         self.emit(Label(top))
         test = self.scalar(node.test, "a 'while' condition")
-        self.emit(JumpIfFalse(test.expr, end))
+        self.emit(JumpIfFalse(self.truth(test), end))
         self.break_targets.append(end)
         self.continue_targets.append(top)
         self.statement(node.body)
@@ -3340,7 +3756,7 @@ class Lowerer:
         self.continue_targets.pop()
         self.emit(Label(again))
         test = self.scalar(node.test, "a 'do while' condition")
-        self.emit(JumpIfFalse(test.expr, end))
+        self.emit(JumpIfFalse(self.truth(test), end))
         self.emit(Jump(top))
         self.emit(Label(end))
 
@@ -3361,7 +3777,7 @@ class Lowerer:
         self.emit(Label(top))
         if node.test is not None:
             test = self.scalar(node.test, "a 'for' condition")
-            self.emit(JumpIfFalse(test.expr, end))
+            self.emit(JumpIfFalse(self.truth(test), end))
         self.break_targets.append(end)
         self.continue_targets.append(step)
         self.statement(node.body)
@@ -3376,7 +3792,7 @@ class Lowerer:
 
     def switch_statement(self, node: Switch) -> None:
         control = self.rvalue(node.control)
-        if not is_arithmetic(control.ctype):
+        if not is_integer(control.ctype):
             self.error(
                 f"a 'switch' needs an integer control expression, not "
                 f"{control.ctype}",
@@ -3454,12 +3870,15 @@ class Lowerer:
                 node.token,
             )
         value = self.rvalue(node.value)
-        stored = self.assign_convert(
-            value, context.function.result, node.token, "this 'return'"
-        )
+        result = context.function.result
+        stored = self.assign_convert(value, result, node.token, "this 'return'")
         if context.is_main:
             self.emit(ExitValue(stored))
             return
+        # A floating result travels back in the integer result register as the
+        # bit pattern of the declared result type, which is what direct_call
+        # and inline() both read it back as.
+        stored = self.stored_bits(stored, result)
         if context.call_body:
             self.emit(IRReturn(stored))
             return
@@ -3515,9 +3934,9 @@ class Lowerer:
             if style == "string":
                 held.append((style, value, argument))
                 continue
-            if not is_arithmetic(value.ctype):
+            if not is_integer(value.ctype):
                 self.error(
-                    f"a %{style} conversion needs an integer, not {value.ctype}",
+                    f"this conversion needs an integer, not {value.ctype}",
                     argument.token,
                 )
             # materialize() pins the value in a slot, so evaluating a later
