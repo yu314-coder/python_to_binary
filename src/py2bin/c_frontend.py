@@ -3124,15 +3124,42 @@ class Lowerer:
                 "no conversions works everywhere",
                 node.token,
             )
+        # C11 6.5.2.2p10 puts a sequence point after every argument is
+        # evaluated and before the call, so printf may produce no output until
+        # all of its arguments have been computed. Evaluating them while
+        # emitting the format text would let an argument that writes to stdout
+        # interleave with the literal parts. Evaluate everything first, hold
+        # each result in a slot, then emit the output.
+        prepared: list[object] = []
+        for position, argument in enumerate(arguments):
+            style, ctype = segments[
+                [i for i, (kind, _) in enumerate(segments) if kind != "text"][position]
+            ][1]
+            value = self.rvalue(argument)
+            prepared.append((style, ctype, value, argument))
+        held: list[object] = []
+        for style, ctype, value, argument in prepared:
+            if style == "string":
+                held.append((style, value, argument))
+                continue
+            if not is_arithmetic(value.ctype):
+                self.error(
+                    f"a %{style} conversion needs an integer, not {value.ctype}",
+                    argument.token,
+                )
+            # materialize() pins the value in a slot, so evaluating a later
+            # argument cannot change what this one reads.
+            held.append(
+                (style, self.materialize(self.fit(value.expr, ctype)), argument)
+            )
+
         index = 0
         for kind, payload in segments:
             if kind == "text":
                 self.emit(Write(payload))
                 continue
-            argument = arguments[index]
+            style, value, argument = held[index]
             index += 1
-            style, ctype = payload
-            value = self.rvalue(argument)
             if style == "string":
                 if value.null or not isinstance(value.ctype, PointerType):
                     self.error(
@@ -3146,12 +3173,7 @@ class Lowerer:
                     )
                 self.emit_string(value.expr)
                 continue
-            if not is_arithmetic(value.ctype):
-                self.error(
-                    f"a %{style} conversion needs an integer, not {value.ctype}",
-                    argument.token,
-                )
-            expression = self.fit(value.expr, ctype)
+            expression = value
             if style == "char":
                 self.emit_character(expression)
             elif style == "signed":

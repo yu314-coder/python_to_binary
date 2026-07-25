@@ -220,7 +220,9 @@ int main(void) {
     for (i = 0; i < 5; i++) { total += *(p + i); }
     q = &a[4];
     printf("%d %d %d\\n", total, a[3], p[3]);
-    printf("%ld %d\\n", q - p, *--q);
+    long d = q - p;
+    int last = *--q;
+    printf("%ld %d\\n", d, last);
     *q = 100;
     printf("%d\\n", a[3]);
     return 0;
@@ -412,7 +414,10 @@ int main(void) {
     printf("%d %d\\n", ++i, i);
     printf("%d %d\\n", i--, i);
     printf("%d %d\\n", --i, i);
-    printf("%d %d %d\\n", *p++, *p, *++p);
+    int v1 = *p++;
+    int v2 = *p;
+    int v3 = *++p;
+    printf("%d %d %d\\n", v1, v2, v3);
     a[j++] = 99;
     printf("%d %d %d\\n", a[0], a[1], j);
     return 0;
@@ -1863,3 +1868,39 @@ int main(void) {
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class PrintfSequencePointTests(CProgramTestCase):
+    """printf may produce no output until every argument is evaluated.
+
+    C11 6.5.2.2p10 places a sequence point after the arguments are evaluated
+    and before the call, so an argument that itself writes to stdout must be
+    seen before any of the format string.
+    """
+
+    def test_argument_side_effects_precede_all_output(self):
+        self.run_c(
+            _STDIO
+            + """
+long long side(long long n) { printf("[inner]\\n"); return n; }
+int main(void) {
+    printf("A=%lld end\\n", side(7));
+    return 0;
+}
+""",
+            stdout="[inner]\nA=7 end\n",
+        )
+
+    def test_every_argument_is_evaluated_before_output(self):
+        self.run_c(
+            _STDIO
+            + """
+long long a(void) { printf("[a]\\n"); return 1; }
+long long b(void) { printf("[b]\\n"); return 2; }
+int main(void) {
+    printf("x=%lld y=%lld\\n", a(), b());
+    return 0;
+}
+""",
+            stdout="[a]\n[b]\nx=1 y=2\n",
+        )
