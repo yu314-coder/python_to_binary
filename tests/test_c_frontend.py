@@ -1509,8 +1509,46 @@ class RejectionTests(CProgramTestCase):
             "no C preprocessor",
         )
 
-    def test_a_file_scope_variable_is_refused(self):
-        self.reject("int g = 1;\nint main(void) { return g; }\n", "file-scope")
+    def test_a_file_scope_initializer_must_be_a_constant_expression(self):
+        # C11 6.7.9p4: an object with static storage duration is initialized
+        # before the program starts, so nothing is running that could evaluate
+        # a variable read or a call.
+        self.reject(
+            "int a = 1;\nint b = a;\nint main(void) { return b; }\n",
+            "must be a constant expression",
+        )
+        self.reject(
+            "int f(void) { return 1; }\nint b = f();\n"
+            "int main(void) { return b; }\n",
+            "must be a constant expression",
+        )
+
+    def test_a_block_scope_static_is_refused(self):
+        self.reject(
+            "int main(void) { static int n = 1; return n; }\n",
+            "static object inside a block",
+        )
+
+    def test_a_file_scope_object_cannot_be_redeclared_incompatibly(self):
+        self.reject(
+            "int x = 1;\nint x = 2;\nint main(void) { return x; }\n",
+            "initialized twice",
+        )
+        self.reject(
+            "int x;\nlong x;\nint main(void) { return 0; }\n",
+            "was declared int and is now declared long",
+        )
+        self.reject(
+            "int main(void) { return 0; }\nint main = 3;\n",
+            "already declared as a function",
+        )
+        self.reject("void v;\nint main(void) { return 0; }\n", "cannot have type void")
+
+    def test_an_extern_object_is_refused_with_a_clear_message(self):
+        self.reject(
+            "extern int errno;\nint main(void) { return 0; }\n",
+            "no linker",
+        )
 
     def test_an_opaque_handle_cannot_be_dereferenced_or_offset(self):
         prototypes = "extern void Py_Initialize(void);\n"
@@ -3018,4 +3056,167 @@ int main(void) {
 }
 """,
             stdout="1\n",
+        )
+
+
+class FileScopeObjectTests(CProgramTestCase):
+    """Objects with static storage duration: C file-scope variables.
+
+    They live in one contiguous block established before the program's first
+    instruction, so the same object is the same object in ``main`` and in every
+    function ``main`` calls -- which a stack slot could never be.
+    """
+
+    def test_a_global_starts_at_zero_and_outlives_a_call(self):
+        # C11 6.7.9p10: an object with static storage duration and no
+        # initializer starts as if assigned 0.
+        self.run_c(
+            _STDIO
+            + """
+int counter;
+int bump(int by) { counter = counter + by; return counter; }
+int main(void) {
+    printf("%d\\n", counter);
+    bump(4);
+    bump(9);
+    printf("%d\\n", counter);
+    return 0;
+}
+""",
+            stdout="0\n13\n",
+        )
+
+    def test_constant_initializers_of_every_scalar_kind(self):
+        self.run_c(
+            _STDIO
+            + """
+int limit = 3 + 4 * 2;
+long total = 7;
+unsigned char small = 300;
+double ratio = 2.5;
+char letter = 'Z';
+int main(void) {
+    printf("%d %ld %u %g %c\\n", limit, total, small, ratio, letter);
+    return 0;
+}
+""",
+            # 3 + 4*2 == 11; 300 truncated into an unsigned char is 300-256==44.
+            stdout="11 7 44 2.5 Z\n",
+        )
+
+    def test_a_global_array_is_shared_by_every_function(self):
+        self.run_c(
+            _STDIO
+            + """
+int table[5] = {10, 20, 30, 40, 50};
+int sum(void) {
+    int i; int s;
+    s = 0;
+    for (i = 0; i < 5; i++) { s = s + table[i]; }
+    return s;
+}
+void poke(int at, int value) { table[at] = value; }
+int main(void) {
+    printf("%d\\n", sum());
+    poke(2, 99);
+    printf("%d\\n", sum());
+    return 0;
+}
+""",
+            # 10+20+30+40+50 == 150, then 150 - 30 + 99 == 219.
+            stdout="150\n219\n",
+        )
+
+    def test_a_partly_braced_global_array_is_zero_filled(self):
+        self.run_c(
+            _STDIO
+            + """
+int a[6] = {1, 2, 3};
+int deduced[] = {4, 5};
+int main(void) {
+    printf("%d %d %d %d\\n", a[2], a[3], a[5], (int)sizeof(deduced));
+    return 0;
+}
+""",
+            stdout="3 0 0 8\n",
+        )
+
+    def test_a_global_char_array_holds_its_string(self):
+        self.run_c(
+            _STDIO
+            + """
+char name[8] = "py2bin";
+int main(void) {
+    printf("%s %d %d\\n", name, (int)sizeof(name), name[6]);
+    return 0;
+}
+""",
+            stdout="py2bin 8 0\n",
+        )
+
+    def test_a_global_address_constant_initializer(self):
+        # C11 6.6p9 allows an address constant: the address of a static object,
+        # which is known before the program starts.
+        self.run_c(
+            _STDIO
+            + """
+int table[4] = {1, 2, 3, 4};
+int *cursor = table;
+int one = 1;
+int *at_one = &one;
+char *greeting = "hi";
+int main(void) {
+    printf("%d %d %s\\n", cursor[2], *at_one, greeting);
+    table[2] = 30;
+    printf("%d\\n", cursor[2]);
+    return 0;
+}
+""",
+            stdout="3 1 hi\n30\n",
+        )
+
+    def test_static_at_file_scope_is_accepted_and_a_local_shadows_a_global(self):
+        self.run_c(
+            _STDIO
+            + """
+static int shared = 5;
+int read_it(void) { return shared; }
+int main(void) {
+    int shared = 100;
+    printf("%d %d\\n", shared, read_it());
+    return 0;
+}
+""",
+            stdout="100 5\n",
+        )
+
+    def test_a_global_struct_is_shared_and_starts_zeroed(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { char c; int i; };
+struct P origin;
+void fill(void) { origin.c = 3; origin.i = 40; }
+int main(void) {
+    printf("%d %d\\n", origin.c, origin.i);
+    fill();
+    printf("%d %d\\n", origin.c, origin.i);
+    return 0;
+}
+""",
+            stdout="0 0\n3 40\n",
+        )
+
+    def test_several_objects_in_one_declaration(self):
+        self.run_c(
+            _STDIO
+            + """
+int a = 1, *p, b[3] = {7, 8, 9};
+int main(void) {
+    p = b;
+    printf("%d %d %d\\n", a, p[1], b[2]);
+    return 0;
+}
+""",
+            stdout="1 8 9\n",
         )

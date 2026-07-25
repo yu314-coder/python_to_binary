@@ -46,15 +46,26 @@ What is implemented
   deep, and mutual. On the remaining targets the call ABI is not implemented,
   so a call is still inlined at its site and recursion is rejected there rather
   than miscompiled;
+* file-scope objects -- objects with static storage duration -- on the targets
+  whose encoder establishes the static block (see ``STATIC_CAPABLE_TARGETS``).
+  They live in one contiguous zero-filled block that outlives every frame, so
+  the same object really is the same object in ``main`` and in everything
+  ``main`` calls. ``static`` at file scope is accepted (it limits a linkage a
+  single translation unit cannot escape). An initializer must be a constant
+  expression, which is what C requires of static storage: arithmetic constants
+  and address constants such as ``&x``, an array name, or a string literal;
 * ``printf`` with real runtime formatting, and the vetted ``extern`` adapter
   ABI that lets compiled C drive an embedded CPython.
 
 What is rejected
 ----------------
-``long double``, function pointers, variadic user functions, globals with
-static storage, the preprocessor beyond a handful of ignorable ``#include``s,
-more than eight arguments to a function (py2bin passes arguments only in
-registers), and recursion on the targets that have no call ABI yet.
+``long double``, function pointers, variadic user functions, ``static`` inside
+a block, ``extern`` objects (py2bin compiles one translation unit and has no
+linker), a braced initializer for a file-scope struct or union, the
+preprocessor beyond a handful of ignorable ``#include``s, more than eight
+arguments to a function (py2bin passes arguments only in registers), and
+recursion or file-scope objects on the targets that have no call ABI or static
+block yet.
 """
 
 from __future__ import annotations
@@ -82,8 +93,11 @@ from .native.ir import (
     FloatToInt,
     FloatUnary,
     Function as IRFunction,
+    FunctionAddress,
+    GlobalAddress,
     HeapLoad,
     HeapStore,
+    IndirectCall,
     IntBinary,
     IntCompare,
     IntConstant,
@@ -1084,10 +1098,27 @@ class Function:
 
 
 @dataclasses.dataclass(slots=True)
+class GlobalObject:
+    """A file-scope object: one with static storage duration.
+
+    C initializes such an object before the program starts and gives it zero
+    when no initializer is written, so ``initializer`` may only be a constant
+    expression -- there is nothing running yet that could evaluate anything
+    else.
+    """
+
+    name: str
+    ctype: CType
+    initializer: object
+    token: Token
+
+
+@dataclasses.dataclass(slots=True)
 class TranslationUnit:
     functions: dict[str, Function]
     externs: dict[str, CType]  # local name -> declared C result type
     enumerators: dict[str, int] = dataclasses.field(default_factory=dict)
+    globals: dict[str, GlobalObject] = dataclasses.field(default_factory=dict)
 
 
 # --- parser ------------------------------------------------------------------
@@ -1141,7 +1172,11 @@ _RESERVED = frozenset(
 )
 
 _UNSUPPORTED_KEYWORDS = {
-    "static": "static storage duration is not implemented; py2bin's C has no writable data segment",
+    "static": "'static' is accepted on a file-scope declaration, where all it "
+    "limits is a linkage py2bin's single translation unit has no way to escape. "
+    "A static object inside a block is not implemented, because a body that is "
+    "inlined rather than called would get one object per inlining instead of "
+    "the single object C promises",
     "register": "the 'register' storage class is not accepted",
     "auto": "the 'auto' storage class is not accepted",
     "_Complex": "complex types are not implemented",
@@ -1167,6 +1202,7 @@ class Parser:
         self.typedefs: dict[str, CType] = dict(_TYPEDEFS)
         self.enum_tags: dict[str, CType] = {}
         self.enumerators: dict[str, int] = {}
+        self.globals: dict[str, GlobalObject] = {}
 
     # --- token helpers ---
 
@@ -1441,6 +1477,15 @@ class Parser:
             self.error(
                 "function pointers and function declarators are not implemented"
             )
+        return self.array_suffix(base), name
+
+    def array_suffix(self, base: CType) -> CType:
+        """Apply a declarator's ``[N]`` suffixes, which nest left to right.
+
+        ``int a[2][3]`` is an array of 2 arrays of 3 ints, so the LAST bracket
+        binds tightest and the list is applied in reverse.
+        """
+
         dimensions: list[int | None] = []
         while self.accept("["):
             if self.accept("]"):
@@ -1450,7 +1495,7 @@ class Parser:
             self.take("]")
         for length in reversed(dimensions):
             base = ArrayType(base, length)
-        return base, name
+        return base
 
     def array_length(self) -> int:
         token = self.token
@@ -1784,8 +1829,10 @@ class Parser:
                 self.type_specifier()
                 self.take(";")
                 continue
-            self.function_definition()
-        return TranslationUnit(self.functions, self.externs, self.enumerators)
+            self.external_declaration()
+        return TranslationUnit(
+            self.functions, self.externs, self.enumerators, self.globals
+        )
 
     def declares_type_only(self) -> bool:
         """Whether a struct/union specifier is followed straight by ``;``.
@@ -1816,18 +1863,71 @@ class Parser:
                 index += 1
         return index < len(self.tokens) and self.tokens[index].value == ";"
 
-    def function_definition(self) -> None:
-        start = self.token
+    def external_declaration(self) -> None:
+        """One file-scope declaration: a function, or an object.
+
+        The two are told apart by what follows the declarator's name: a ``(``
+        begins a parameter list and anything else begins an object. ``static``
+        is accepted and ignored here -- it limits linkage, and a single
+        translation unit with no linker has no linkage to limit.
+        """
+
+        if self.token.kind == "identifier" and self.token.value == "static":
+            self.take()
         base = self.type_specifier()
-        result = self.pointer_suffix(base)
+        declared = self.pointer_suffix(base)
         name_token = self.identifier()
-        name = str(name_token.value)
-        if not self.at("("):
+        if self.at("("):
+            self.function_definition(declared, name_token)
+            return
+        self.object_declaration(base, declared, name_token)
+
+    def object_declaration(
+        self, base: CType, declared: CType, name_token: Token
+    ) -> None:
+        """``TYPE name[= init], *other, third[3];`` at file scope."""
+
+        while True:
+            ctype = self.array_suffix(declared)
+            initializer: object = None
+            if self.accept("="):
+                initializer = self.initializer()
+            self.declare_global(GlobalObject(
+                str(name_token.value), ctype, initializer, name_token
+            ))
+            if self.accept(";"):
+                return
+            self.take(",")
+            declared = self.pointer_suffix(base)
+            name_token = self.identifier()
+
+    def declare_global(self, entry: GlobalObject) -> None:
+        if entry.name in self.functions or entry.name in self.externs:
             self.error(
-                "py2bin's C compiler has no writable data segment, so a file-scope "
-                "variable cannot be defined; only functions may appear here",
-                start,
+                f"{entry.name!r} is already declared as a function", entry.token
             )
+        if entry.name in self.enumerators:
+            self.error(
+                f"{entry.name!r} is already an enumeration constant", entry.token
+            )
+        previous = self.globals.get(entry.name)
+        if previous is not None:
+            # C's tentative definitions: `int x; int x = 1;` is one object. Two
+            # initializers for it are not, and neither is a change of type.
+            if previous.ctype != entry.ctype:
+                self.error(
+                    f"{entry.name!r} was declared {previous.ctype} and is now "
+                    f"declared {entry.ctype}",
+                    entry.token,
+                )
+            if previous.initializer is not None and entry.initializer is not None:
+                self.error(f"{entry.name!r} is initialized twice", entry.token)
+            if entry.initializer is None:
+                return
+        self.globals[entry.name] = entry
+
+    def function_definition(self, result: CType, name_token: Token) -> None:
+        name = str(name_token.value)
         self.take("(")
         parameters: list[tuple[CType, str]] = []
         if not self.accept(")"):
@@ -1848,7 +1948,7 @@ class Parser:
                     if self.accept(")"):
                         break
                     self.take(",")
-        if name in self.externs:
+        if name in self.externs or name in self.globals:
             self.error(f"{name!r} is already declared", name_token)
         previous = self.functions.get(name)
         if previous is not None:
@@ -1921,6 +2021,15 @@ class Parser:
         result = self.pointer_suffix(self.type_specifier())
         name_token = self.identifier()
         name = str(name_token.value)
+        if not self.at("("):
+            self.error(
+                f"'extern {name}' declares an object defined in another "
+                "translation unit; py2bin compiles exactly one translation unit "
+                "and has no linker, so only 'extern' function prototypes bound "
+                "to the vetted adapter ABI are accepted. Drop the 'extern' to "
+                "define the object here.",
+                name_token,
+            )
         self.take("(")
         declared: list[CType] = []
         if not self.accept(")"):
@@ -2238,6 +2347,30 @@ def _compare(operator: str, left: IntExpression, right: IntExpression) -> IntExp
     return IntCompare(operator, left, right)
 
 
+def _is_link_constant(expression: object) -> bool:
+    """Whether ``expression`` is a value C may initialize static storage with.
+
+    C11 6.7.9p4: the initializer for an object with static storage duration is
+    an arithmetic constant expression, or an address constant -- the address of
+    an object or function, optionally offset by a constant. Everything here is
+    known before the first instruction runs, which is exactly why start-up can
+    place it without evaluating anything.
+    """
+
+    if isinstance(
+        expression,
+        (IntConstant, FloatConstant, CStringConstant, GlobalAddress, FunctionAddress),
+    ):
+        return True
+    if isinstance(expression, IntBinary) and expression.operator in {"add", "sub"}:
+        return _is_link_constant(expression.left) and _is_link_constant(
+            expression.right
+        )
+    if isinstance(expression, (FloatBits, BitsFloat)):
+        return _is_link_constant(expression.value)
+    return False
+
+
 def _contains_call(value: object) -> bool:
     """True when an IR expression embeds a call, so re-emitting it would repeat it.
 
@@ -2249,7 +2382,7 @@ def _contains_call(value: object) -> bool:
     is the defect this backend has produced most often.
     """
 
-    if isinstance(value, (ExternCall, IRCall)):
+    if isinstance(value, (ExternCall, IRCall, IndirectCall)):
         return True
     if isinstance(value, (tuple, list)):
         return any(_contains_call(item) for item in value)
@@ -2282,8 +2415,17 @@ class Value:
 
 @dataclasses.dataclass(slots=True)
 class Local:
+    """A named object and where it lives.
+
+    ``slot`` is a stack-slot index for an automatic object, and a byte offset
+    into the module's static storage block when ``static`` is set. The two are
+    deliberately different address spaces: a frame dies when its function
+    returns, and the static block does not.
+    """
+
     ctype: CType
     slot: int
+    static: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -2346,6 +2488,12 @@ _LENGTHS = {
 
 _MAXIMUM_SLOTS = 4000
 
+#: Bytes of static storage one translation unit may declare. The block is a
+#: single mapping obtained at start-up, so the limit is a sanity bound rather
+#: than an architectural one; it is stated because exceeding it must be a
+#: compile-time rejection and never a mapping that silently fails at run time.
+_MAXIMUM_STATIC_BYTES = 8 << 20
+
 #: py2bin's call ABI passes every argument in a register. AAPCS64 has eight
 #: integer parameter registers, and stack argument passing is not implemented,
 #: so a longer parameter list is rejected rather than silently truncated.
@@ -2386,6 +2534,11 @@ class Lowerer:
         self.calls_are_real = target in CALL_CAPABLE_TARGETS
         self.lowered: dict[str, IRFunction] = {}
         self.lowering: set[str] = set()
+        # File-scope objects. They live in the module's static storage block
+        # rather than any frame, which is what lets one object be the same
+        # object in the entry point and in every function body.
+        self.statics: dict[str, Local] = {}
+        self.static_bytes = 0
 
     # --- bookkeeping ---
 
@@ -2434,7 +2587,35 @@ class Lowerer:
         for scope in reversed(self.scopes):
             if name in scope:
                 return scope[name]
-        return None
+        # File scope is the outermost scope, so a local of the same name wins.
+        return self.statics.get(name)
+
+    def allocate_static(self, ctype: CType, token: Token) -> int:
+        """Reserve aligned space for one file-scope object and return its offset."""
+
+        size = size_of(ctype)
+        if size is None:
+            self.error(
+                f"a file-scope object cannot have the incomplete type {ctype}", token
+            )
+        alignment = align_of(ctype)
+        offset = (self.static_bytes + alignment - 1) & ~(alignment - 1)
+        self.static_bytes = offset + size
+        if self.static_bytes > _MAXIMUM_STATIC_BYTES:
+            self.error(
+                f"this translation unit declares more than "
+                f"{_MAXIMUM_STATIC_BYTES} bytes of file-scope objects, which is "
+                "more static storage than py2bin reserves",
+                token,
+            )
+        return offset
+
+    def address_of(self, local: Local) -> IntExpression:
+        """Where an object lives: a frame slot, or the static storage block."""
+
+        if local.static:
+            return GlobalAddress(local.slot)
+        return SlotAddress(local.slot)
 
     # --- conversions ---
 
@@ -2589,7 +2770,7 @@ class Lowerer:
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
-            return local.ctype, SlotAddress(local.slot)
+            return local.ctype, self.address_of(local)
         if isinstance(node, Unary) and node.operator == "*":
             pointer = self.rvalue(node.operand)
             if not isinstance(pointer.ctype, PointerType):
@@ -2653,7 +2834,7 @@ class Lowerer:
     def stabilize(self, expression: IntExpression) -> IntExpression:
         """Pin a value in a slot when re-emitting it would repeat a call."""
 
-        if isinstance(expression, (IntConstant, IntLoad, SlotAddress)):
+        if isinstance(expression, (IntConstant, IntLoad, SlotAddress, GlobalAddress)):
             return expression
         if not _contains_call(expression):
             return expression
@@ -2721,7 +2902,7 @@ class Lowerer:
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
-            return self.load(local.ctype, SlotAddress(local.slot))
+            return self.load(local.ctype, self.address_of(local))
         if isinstance(node, (Index, MemberAccess)):
             ctype, address = self.lvalue(node)
             return self.load(ctype, address)
@@ -3646,7 +3827,9 @@ class Lowerer:
             if initializer is None:
                 continue
             if isinstance(ctype, ArrayType):
-                self.array_initializer(local, ctype, initializer, node.token)
+                self.array_initializer(
+                    self.address_of(local), ctype, initializer, node.token
+                )
                 continue
             if isinstance(initializer, tuple):
                 token, items = initializer
@@ -3662,11 +3845,95 @@ class Lowerer:
             )
             self.emit(
                 HeapStore(
-                    SlotAddress(local.slot),
+                    self.address_of(local),
                     self.stored_bits(stored, ctype),
                     size_of(ctype),
                 )
             )
+
+    # --- file-scope objects ------------------------------------------------
+    #
+    # An object with static storage duration is initialized before the program
+    # starts, so its initializer has to be a constant expression: there is
+    # nothing running yet that could evaluate anything else. py2bin honours
+    # that literally -- it lowers the initializer, then requires the result to
+    # be a value the compiler already knows, and rejects anything else with a
+    # file:line:col error rather than quietly running it at start-up.
+
+    def declare_globals(self) -> None:
+        """Give every file-scope object its storage, then its initial value."""
+
+        entries = list(self.unit.globals.values())
+        for entry in entries:
+            ctype = entry.ctype
+            if isinstance(ctype, VoidType):
+                self.error(f"{entry.name!r} cannot have type void", entry.token)
+            if isinstance(ctype, ArrayType) and ctype.count is None:
+                ctype = self.deduce_array(ctype, entry.initializer, entry.token)
+                entry.ctype = ctype
+            self.statics[entry.name] = Local(
+                ctype, self.allocate_static(ctype, entry.token), static=True
+            )
+        # Every offset is fixed before any initializer is lowered, so one
+        # object's initializer may take the address of another.
+        for entry in entries:
+            self.initialize_global(entry)
+
+    def initialize_global(self, entry: GlobalObject) -> None:
+        local = self.statics[entry.name]
+        ctype = local.ctype
+        base = GlobalAddress(local.slot)
+        initializer = entry.initializer
+        if initializer is None:
+            # C gives a static object with no initializer the value zero, and
+            # the block already holds zero everywhere.
+            return
+        if isinstance(ctype, ArrayType):
+            self.array_initializer(base, ctype, initializer, entry.token, static=True)
+            return
+        if isinstance(ctype, StructType):
+            self.error(
+                "initializing a file-scope struct or union is not implemented; "
+                "declare it and assign its members in main()",
+                entry.token,
+            )
+        if isinstance(initializer, tuple):
+            token, items = initializer
+            if len(items) != 1 or isinstance(items[0], tuple):
+                self.error(
+                    "a braced initializer for a scalar needs exactly one value",
+                    token,
+                )
+            initializer = items[0]
+        stored = self.static_value(
+            initializer, ctype, entry.token, f"the initializer for {entry.name!r}"
+        )
+        bits = self.stored_bits(stored, ctype)
+        if bits == IntConstant(0):
+            return  # already zero
+        self.emit(HeapStore(base, bits, size_of(ctype)))
+
+    def static_value(
+        self, node: Node, ctype: CType, token: Token, what: str
+    ) -> IntExpression | FloatExpression:
+        """Lower a static-storage initializer and insist that it be constant."""
+
+        saved_operations = self.operations
+        self.operations = []
+        try:
+            value = self.rvalue(node)
+            converted = self.assign_convert(value, ctype, token, what)
+        finally:
+            emitted = self.operations
+            self.operations = saved_operations
+        if emitted or not _is_link_constant(converted):
+            self.error(
+                f"{what} must be a constant expression: it initializes an object "
+                "with static storage duration, which C gives its value before "
+                "the program starts running",
+                token,
+            )
+        return converted
 
     def deduce_array(
         self, ctype: ArrayType, initializer: object, token: Token
@@ -3682,7 +3949,13 @@ class Lowerer:
         )
 
     def array_initializer(
-        self, local: Local, ctype: ArrayType, initializer: object, token: Token
+        self,
+        base: IntExpression,
+        ctype: ArrayType,
+        initializer: object,
+        token: Token,
+        *,
+        static: bool = False,
     ) -> None:
         element = ctype.element
         size = size_of(element)
@@ -3692,7 +3965,6 @@ class Lowerer:
                 "assign the elements instead",
                 token,
             )
-        base = SlotAddress(local.slot)
         if isinstance(initializer, StringLiteral):
             if not _is_character(element):
                 self.error(
@@ -3705,7 +3977,12 @@ class Lowerer:
                     f"{ctype.count}",
                     token,
                 )
-            self.emit_bytes(base, 0, data + b"\0" * (ctype.count - len(data)))
+            self.emit_bytes(
+                base,
+                0,
+                data + b"\0" * (ctype.count - len(data)),
+                skip_zero=static,
+            )
             return
         if not isinstance(initializer, tuple):
             self.error(
@@ -3721,27 +3998,47 @@ class Lowerer:
         for position, item in enumerate(items):
             if isinstance(item, tuple):
                 self.error("nested braced initializers are not implemented", token)
-            value = self.rvalue(item)
-            stored = self.assign_convert(
-                value, element, token, f"initializer element {position}"
-            )
+            what = f"initializer element {position}"
+            if static:
+                stored = self.static_value(item, element, token, what)
+            else:
+                stored = self.assign_convert(
+                    self.rvalue(item), element, token, what
+                )
+            bits = self.stored_bits(stored, element)
+            if static and bits == IntConstant(0):
+                # The static block arrives zero-filled from the kernel.
+                continue
             self.emit(
                 HeapStore(
                     _binary("add", base, IntConstant(position * size)),
-                    self.stored_bits(stored, element),
+                    bits,
                     size,
                 )
             )
-        # C zero-fills whatever the braces leave out.
+        # C zero-fills whatever the braces leave out. A static object is
+        # already zero everywhere, so only an automatic one needs the fill.
         filled = len(items) * size
-        self.emit_bytes(base, filled, b"\0" * (ctype.count * size - filled))
+        if not static:
+            self.emit_bytes(base, filled, b"\0" * (ctype.count * size - filled))
 
-    def emit_bytes(self, base: IntExpression, offset: int, data: bytes) -> None:
+    def emit_bytes(
+        self,
+        base: IntExpression,
+        offset: int,
+        data: bytes,
+        *,
+        skip_zero: bool = False,
+    ) -> None:
         """Store a constant byte image, using the widest aligned store each time.
 
         A byte-at-a-time fill of ``char page[2048] = {0}`` would be two thousand
         instructions. Both architectures py2bin emits for are little-endian, so
         a chunk of the image packs into one store in source order.
+
+        ``skip_zero`` drops the stores that would write zero, which is what the
+        static storage block already holds; it must not be used for an
+        automatic object, whose bytes start out as whatever the frame held.
         """
 
         start = offset
@@ -3750,6 +4047,9 @@ class Lowerer:
             for width in (8, 4, 2, 1):
                 if offset % width == 0 and offset + width <= end:
                     chunk = data[offset - start : offset - start + width]
+                    if skip_zero and not any(chunk):
+                        offset += width
+                        break
                     self.emit(
                         HeapStore(
                             _binary("add", base, IntConstant(offset)),
@@ -5039,6 +5339,9 @@ class Lowerer:
                 main.token,
             )
         self.scopes.append({})
+        # Before main's first statement: C11 5.1.2p1 gives every object with
+        # static storage duration its initial value before the program starts.
+        self.declare_globals()
         context = FunctionContext(main, None, self.new_label("return_main"), True)
         self.functions.append(context)
         self.active.append("main")
@@ -5052,7 +5355,12 @@ class Lowerer:
         # After the exit, so nothing can fall into it.
         self.emit_float_dispatch()
         self.scopes.pop()
-        return Module(self.operations, self.stack_slots, list(self.lowered.values()))
+        return Module(
+            self.operations,
+            self.stack_slots,
+            list(self.lowered.values()),
+            static_bytes=self.static_bytes,
+        )
 
 
 def _is_character(ctype: CType) -> bool:
