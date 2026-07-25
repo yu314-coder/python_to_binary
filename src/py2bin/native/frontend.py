@@ -396,6 +396,12 @@ class Frontend:
         self.operations = []
         self.slots: dict[str, int] = {}
         self.runtime_names: set[str] = set()
+        # Names whose slot may never have been written on some path, so
+        # reading one would return whatever the stack happened to hold.
+        # CPython raises UnboundLocalError there, so a read is rejected.
+        self.possibly_unbound: set[str] = set()
+        # Names that have definitely been assigned at this point.
+        self.bound_names: set[str] = set()
         # Runtime name -> "int" | "float". A stack slot is 8 bytes and holds
         # either a signed 64-bit integer or an IEEE-754 double; this records
         # which, so the correct load/store and register file is used.
@@ -1915,6 +1921,8 @@ class Frontend:
         )
 
     def assignment(self, name: str, expression: ast.expr) -> None:
+        self.possibly_unbound.discard(name)
+        self.bound_names.add(name)
         if self.is_kernel_expression(expression):
             value = self.kernel_value(expression)
             if isinstance(value, StaticI64Tensor):
@@ -2329,6 +2337,10 @@ class Frontend:
                 )
             step = step_value
         name = node.target.id
+        # Capture binding state before the loop touches it: after a loop whose
+        # range can be empty, Python leaves the name exactly as it was, which
+        # means unbound if it was never assigned.
+        was_bound = name in self.bound_names
         self.values.pop(name, None)
         self.runtime_names.add(name)
         slot = self.slot(name)
@@ -2367,6 +2379,22 @@ class Frontend:
         )
         self.operations.append(Jump(start_label))
         self.operations.append(Label(end_label))
+        # If both bounds are compile-time constants the loop's emptiness is
+        # known now, so a provably non-empty range definitely binds the name.
+        definitely_runs = (
+            isinstance(start_expression, IntConstant)
+            and isinstance(stop_expression, IntConstant)
+            and (
+                start_expression.value < stop_expression.value
+                if step > 0
+                else start_expression.value > stop_expression.value
+            )
+        )
+        if was_bound or definitely_runs:
+            self.bound_names.add(name)
+        else:
+            # The body may never have run, so the name may still be unbound.
+            self.possibly_unbound.add(name)
 
     def expression_statement(self, node: ast.expr) -> None:
         if not isinstance(node, ast.Call):
@@ -3016,6 +3044,14 @@ class Frontend:
                     f"static tensor {node.id!r} requires indexing or a reduction",
                 )
             return value
+        if isinstance(node, ast.Name) and node.id in self.possibly_unbound:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{node.id!r} may be unbound here because its loop can run "
+                "zero times; CPython raises UnboundLocalError, and the "
+                "native slot would hold an unrelated value",
+            )
         if isinstance(node, ast.Name) and node.id in self.slots:
             kind = self.value_types.get(node.id)
             if kind == "float":
@@ -3204,10 +3240,18 @@ class Frontend:
                     right = self.integer(value, bindings, call_stack)
                 finally:
                     self.eager_depth -= 1
-                if isinstance(node.op, ast.And):
-                    result = self.select_integer(result, right, result)
-                elif isinstance(node.op, ast.Or):
-                    result = self.select_integer(result, result, right)
+                if isinstance(node.op, (ast.And, ast.Or)):
+                    # The left operand is both the condition and one of the
+                    # arms. Materialise it once, or the backends would re-emit
+                    # the whole expression and evaluate it twice.
+                    left_slot = self.new_temp()
+                    self.operations.append(Store(left_slot, result))
+                    left_value = IntLoad(left_slot)
+                    result = (
+                        self.select_integer(left_value, right, left_value)
+                        if isinstance(node.op, ast.And)
+                        else self.select_integer(left_value, left_value, right)
+                    )
                 else:
                     raise NativeCompileError(
                         self.path,

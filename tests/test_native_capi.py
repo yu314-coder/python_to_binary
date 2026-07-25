@@ -546,6 +546,82 @@ class NativeCapiExecutionTests(unittest.TestCase):
             native.stdout.splitlines(), ["2", "4", "6", "8", "[2, 4, 6, 8]"]
         )
 
+    def test_omitting_py_finalize_loses_buffered_output(self):
+        """A documented divergence, pinned so it cannot change silently.
+
+        ``sys.stdout`` is buffered inside the interpreter. Running the twin
+        ``.py`` under ``python3`` flushes it at interpreter shutdown, but a
+        compiled binary that returns from ``main`` without ``Py_Finalize``
+        exits first and prints nothing. A gcc-built embedding behaves the same
+        way, so this is not a miscompile -- but it is the one case where the
+        compiled and interpreted runs legitimately disagree on stdout, and
+        README/DETAILED_GUIDE both say so. The assertion below is what makes
+        that prose checkable.
+        """
+
+        body = (
+            "int main(void)\n"
+            "{\n"
+            "    Py_Initialize();\n"
+            '    PySys_WriteStdout("buffered\\n");\n'
+            "    return 0;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.c"
+            entry.write_text(_PROTOTYPES + body, encoding="utf-8")
+            artifact = root / "program.bin"
+            compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+
+            interpreted_entry = root / "program.py"
+            interpreted_entry.write_text(
+                c_to_python_source(entry.read_text(encoding="utf-8"), str(entry)),
+                encoding="utf-8",
+            )
+            native = subprocess.run([str(artifact)], capture_output=True, text=True)
+            interpreted = subprocess.run(
+                [sys.executable, str(interpreted_entry)],
+                capture_output=True,
+                text=True,
+                env={"PYTHONPATH": _REPO_SRC, "PATH": "/usr/bin:/bin"},
+            )
+            self.assertEqual(native.returncode, interpreted.returncode)
+            self.assertEqual(native.stdout, "", "output appeared without Py_Finalize")
+            self.assertEqual(interpreted.stdout, "buffered\n")
+
+        # ...and adding Py_Finalize makes the two runs agree again.
+        restored = self._build_and_compare(
+            "int main(void)\n"
+            "{\n"
+            "    Py_Initialize();\n"
+            '    PySys_WriteStdout("buffered\\n");\n'
+            "    Py_Finalize();\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        self.assertEqual(restored.stdout, "buffered\n")
+
+    def test_extern_call_in_a_loop_condition_runs_every_iteration(self):
+        """A hoisted condition would be a silent miscompile, so pin it."""
+
+        native = self._build_and_compare(
+            "int main(void)\n"
+            "{\n"
+            "    long long n;\n"
+            "    Py_Initialize();\n"
+            "    n = 0;\n"
+            "    while (PyLong_AsLongLong(PyLong_FromLongLong(n)) < 3) {\n"
+            '        PySys_WriteStdout("tick\\n");\n'
+            "        n += 1;\n"
+            "    }\n"
+            "    Py_Finalize();\n"
+            "    return n;\n"
+            "}\n"
+        )
+        self.assertEqual(native.stdout, "tick\ntick\ntick\n")
+        self.assertEqual(native.returncode, 3)
+
     def test_importing_a_module_and_calling_a_function(self):
         native = self._build_and_compare(
             "int main(void)\n"

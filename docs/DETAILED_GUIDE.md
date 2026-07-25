@@ -665,9 +665,12 @@ permanently out of reach of this tier.
 ### What this tier does not do
 
 - **It does not translate Python into C-API calls.** This is the largest gap
-  against Nuitka. `print("hi")`, a comprehension, a `dict`, iteration over a
-  list, `import json` — none of these become `PyObject` operations. The native
-  frontend's own subset still applies and rejects them.
+  against Nuitka. A comprehension, a `dict`, iteration over a list, and
+  `import json` are rejected outright by the native frontend's own subset, which
+  still applies here. Constructs already inside that subset — `print("hi")`,
+  integer and float arithmetic, `while`, a `class` — compile exactly as the
+  CPython-free tier compiles them: `print` lowers to a `write` syscall, not to
+  `PyObject_Print`. Nothing becomes a `PyObject` operation on your behalf.
 - **It does not manage reference counts.** py2bin emits exactly the
   `Py_IncRef`/`Py_DecRef` calls in the source and verifies no ownership, so a
   leak or double-free written by the programmer survives compilation.
@@ -677,10 +680,20 @@ permanently out of reach of this tier.
   `LC_LOAD_DYLIB` for the build host's CPython at an absolute path, visible in
   `otool -L` beside `libSystem`. On a machine without that exact interpreter at
   that exact path, dyld refuses to start it. Use `freeze` for distribution.
-- **One compiled/interpreted divergence.** `ctypes.pythonapi` turns a set error
-  indicator into a raised Python exception; a compiled binary merely receives
-  `NULL`. The two runs agree only while every C-API call succeeds.
-  `src/py2bin/cabi.py` documents this at the point it happens.
+- **Two compiled/interpreted divergences.** Neither is a code-generation bug;
+  both are inherent to embedding, and both are silent, so they are stated here
+  rather than left to be discovered.
+  1. *A failing call.* `ctypes.pythonapi` turns a set error indicator into a
+     raised Python exception; a compiled binary merely receives `NULL`. The two
+     runs agree only while every C-API call succeeds. `src/py2bin/cabi.py`
+     documents this at the point it happens.
+  2. *Output lost without `Py_Finalize`.* `sys.stdout` is buffered inside the
+     interpreter. The twin `.py` run under `python3` is flushed at interpreter
+     shutdown; a compiled binary that returns from `main` without calling
+     `Py_Finalize` exits first and emits nothing at all. A gcc-built embedding
+     behaves identically, but the practical effect is that a program verified
+     under `python3` can print nothing once compiled. Call `Py_Finalize` before
+     returning — every shipped example and test does.
 
 ## Full application freezing
 

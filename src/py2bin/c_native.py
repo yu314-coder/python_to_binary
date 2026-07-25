@@ -9,6 +9,7 @@ writers.  Unsupported C is rejected instead of being sent to a host compiler.
 from __future__ import annotations
 
 import ast
+import copy
 import dataclasses
 import re
 from pathlib import Path
@@ -52,6 +53,37 @@ _MULTI_OPERATORS = (
     "--",
 )
 _SINGLE_TOKENS = set("{}();,?:=+-*/%~!<>&|^")
+
+
+class _AdvanceOnContinue(ast.NodeTransformer):
+    """Run a C ``for`` loop's increment before each ``continue``.
+
+    The loop is lowered to a ``while`` whose increment sits at the end of the
+    body, but ``continue`` jumps straight back to the test and would skip it.
+    Nested loops are left alone: their ``continue`` belongs to them.
+    """
+
+    def __init__(self, advance: ast.stmt):
+        self.advance = advance
+
+    def visit_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        result: list[ast.stmt] = []
+        for statement in body:
+            visited = self.visit(statement)
+            if isinstance(visited, list):
+                result.extend(visited)
+            elif visited is not None:
+                result.append(visited)
+        return result
+
+    def visit_Continue(self, node: ast.Continue) -> list[ast.stmt]:
+        return [copy.deepcopy(self.advance), node]
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        return node
+
+    def visit_While(self, node: ast.While) -> ast.While:
+        return node
 
 
 class CNativeCompileError(ValueError):
@@ -614,7 +646,11 @@ class _Parser:
             if self.token.kind == "eof":
                 self.error("unterminated block")
             statement = self.statement()
-            if statement is not None:
+            if isinstance(statement, ast.Module):
+                # A construct that lowers to several statements, such as a C
+                # `for` loop expanded into an initializer plus a `while`.
+                result.extend(statement.body)
+            elif statement is not None:
                 result.append(statement)
         return result
 
@@ -874,16 +910,41 @@ class _Parser:
                 "for initializer, tests, and increment do not describe one canonical range",
                 name_token,
             )
-        iterator = ast.Call(
-            func=ast.Name(id="range", ctx=ast.Load()),
-            args=[start, positive_stop, increment],
-            keywords=[],
-        )
-        return ast.For(
+        # A C `for` is NOT a Python `for`. C evaluates the initializer even when
+        # the body never runs, leaves the counter at the first value that fails
+        # the test, and lets the body affect iteration. Python's
+        # `for x in range(...)` does none of those. Lowering C to a Python
+        # `for` would therefore miscompile all three cases, so emit the
+        # equivalent `while` instead, which has exactly C's semantics.
+        if not isinstance(increment, ast.Constant) or not isinstance(
+            increment.value, int
+        ):
+            self.error("for increment must be an integer constant", name_token)
+        step_value = int(increment.value)
+        if step_value == 0:
+            self.error("for increment must not be zero", name_token)
+        body = self.block() or [ast.Pass()]
+        advance = ast.AugAssign(
             target=ast.Name(id=name, ctx=ast.Store()),
-            iter=iterator,
-            body=self.block() or [ast.Pass()],
-            orelse=[],
+            op=ast.Add(),
+            value=ast.Constant(value=step_value),
+        )
+        # `continue` must still advance the counter, which a bare Python
+        # `while` would skip.
+        body = _AdvanceOnContinue(advance).visit_body(body)
+        test = ast.Compare(
+            left=ast.Name(id=name, ctx=ast.Load()),
+            ops=[ast.Lt() if step_value > 0 else ast.Gt()],
+            comparators=[positive_stop],
+        )
+        return ast.Module(
+            body=[
+                ast.Assign(
+                    targets=[ast.Name(id=name, ctx=ast.Store())], value=start
+                ),
+                ast.While(test=test, body=[*body, advance], orelse=[]),
+            ],
+            type_ignores=[],
         )
 
     def printf_statement(self) -> ast.Expr:

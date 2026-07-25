@@ -148,10 +148,14 @@ run the same program under CPython, require identical stdout and exit status.
 **What py2bin does not do for you, and will not pretend to.**
 
 - **No automatic translation of Python into C-API calls.** This is the largest
-  gap versus Nuitka. `print("hi")`, a list comprehension, a `dict`, a `for` over
-  a list, `import json` — none of these become `PyObject` operations. The
-  native frontend's own subset still applies, and rejects them. If you want a
-  Python object built, you call `PyLong_FromLongLong` yourself.
+  gap versus Nuitka. A list comprehension, a `dict`, a `for` over a list, and
+  `import json` are all rejected outright by the native frontend's own subset,
+  which still applies here. Constructs that *are* in that subset — `print("hi")`,
+  integer and float arithmetic, `while`, a `class` — compile the way tier (c)
+  compiles them, straight to instructions; `print` becomes a `write` syscall,
+  not `PyObject_Print`. Either way nothing becomes a `PyObject` operation on
+  your behalf. If you want a Python object built, you call
+  `PyLong_FromLongLong` yourself.
 - **No automatic reference counting.** You call `Py_IncRef`/`Py_DecRef`. py2bin
   emits exactly the calls you wrote and does not verify ownership, so a leak or
   a double-free in your program stays a leak or a double-free.
@@ -163,11 +167,21 @@ run the same program under CPython, require identical stdout and exit status.
   `libSystem`). Move the binary to a machine without that exact interpreter at
   that exact path and dyld will refuse to start it. Tier (a) is what produces a
   distributable artifact.
-- **One divergence between compiled and interpreted runs.** Under CPython the
-  shims go through `ctypes.pythonapi`, which converts a set error indicator
-  into a raised exception; a compiled binary just receives `NULL`. The two runs
-  therefore agree only while no C-API call fails. `py2bin/cabi.py` states this
-  in the source.
+- **Two divergences between compiled and interpreted runs.** Both are inherent
+  to embedding rather than bugs py2bin can fix, and both are silent, so they are
+  stated rather than hidden.
+  1. *A failing call.* Under CPython the shims go through `ctypes.pythonapi`,
+     which converts a set error indicator into a raised exception; a compiled
+     binary just receives `NULL`. The two runs therefore agree only while no
+     C-API call fails. `py2bin/cabi.py` states this in the source.
+  2. *Unflushed output when `Py_Finalize` is not called.* `sys.stdout` is
+     buffered inside the interpreter. Running the twin `.py` under `python3`
+     flushes it at interpreter shutdown, but a compiled binary that returns from
+     `main` without calling `Py_Finalize` exits before anything is flushed and
+     prints **nothing at all**. This is ordinary C-embedding behaviour — a
+     gcc-built program does the same — but it means a program that looks correct
+     under `python3` can produce empty output once compiled. Call `Py_Finalize`
+     before returning. Every shipped example and test does.
 
 ## What “pure Python” means
 

@@ -677,3 +677,38 @@ class ForLoopVariableSemanticsTests(unittest.TestCase):
         )
         self.assertEqual(native, reference)
         self.assertEqual(native, 4)
+
+
+class UnboundLoopVariableTests(unittest.TestCase):
+    """A loop variable may be unbound if the range can be empty.
+
+    CPython raises UnboundLocalError there. The native slot would hold an
+    unrelated value, so the read is rejected rather than miscompiled.
+    """
+
+    def _compile(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "loop.py"
+            entry.write_text(source, encoding="utf-8")
+            compile_native(entry, root / "loop.bin", "darwin-arm64", clean=True)
+
+    def test_possibly_unbound_read_is_rejected(self):
+        with self.assertRaises(NativeCompileError) as caught:
+            self._compile(
+                "for g in range(0, 0):\n    pass\nraise SystemExit(g)\n"
+            )
+        self.assertIn("unbound", str(caught.exception))
+
+    def test_provably_non_empty_range_binds_the_name(self):
+        self._compile("for i in range(1, 5):\n    pass\nraise SystemExit(i)\n")
+
+    def test_name_bound_before_the_loop_stays_readable(self):
+        self._compile(
+            "i = 99\nfor i in range(0, 0):\n    pass\nraise SystemExit(i)\n"
+        )
+
+    def test_loop_variable_is_usable_inside_the_body(self):
+        self._compile(
+            "t = 0\nfor i in range(1, 5):\n    t += i\nraise SystemExit(t)\n"
+        )

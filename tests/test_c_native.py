@@ -242,3 +242,67 @@ class CApiDialectTests(unittest.TestCase):
             run = subprocess.run([str(artifact)], capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn(b"embedded", run.stdout)
+
+
+class CForLoopSemanticsTests(unittest.TestCase):
+    """A C `for` is not a Python `for`, and must not share its lowering.
+
+    C evaluates the initializer even when the body never runs, leaves the
+    counter at the first value that fails the test, and lets the body affect
+    iteration. `for x in range(...)` does none of those.
+    """
+
+    def _exit(self, body: str) -> int:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "loop.c"
+            source.write_text(body, encoding="utf-8")
+            artifact = root / "loop.bin"
+            compile_c_native(source, artifact, target="darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return -1
+            return subprocess.run([str(artifact)], capture_output=True).returncode
+
+    def test_counter_stops_at_the_first_failing_value(self):
+        result = self._exit(
+            "int main(void)\n{\n"
+            "    long long i;\n"
+            "    for (i = 0; (1) >= 0 ? i < 5 : i > 5; i += 1) { }\n"
+            "    return i;\n}\n"
+        )
+        if result >= 0:
+            self.assertEqual(result, 5)  # C: 5, Python's range would give 4
+
+    def test_initializer_runs_even_for_an_empty_range(self):
+        result = self._exit(
+            "int main(void)\n{\n"
+            "    long long j = 9;\n"
+            "    for (j = 0; (1) >= 0 ? j < 0 : j > 0; j += 1) { }\n"
+            "    return j;\n}\n"
+        )
+        if result >= 0:
+            self.assertEqual(result, 0)  # C: 0, Python would leave 9
+
+    def test_body_may_advance_the_counter(self):
+        result = self._exit(
+            "int main(void)\n{\n"
+            "    long long i;\n    long long trips = 0;\n"
+            "    for (i = 0; (1) >= 0 ? i < 10 : i > 10; i += 1)"
+            " { trips += 1; i += 1; }\n"
+            "    return trips;\n}\n"
+        )
+        if result >= 0:
+            self.assertEqual(result, 5)  # C: 5, Python's range would give 10
+
+    def test_continue_still_advances_the_counter(self):
+        result = self._exit(
+            "int main(void)\n{\n"
+            "    long long i;\n    long long n = 0;\n"
+            "    for (i = 0; (1) >= 0 ? i < 6 : i > 6; i += 1)"
+            " { if (i == 2) { continue; } n += 1; }\n"
+            "    return n * 10 + i;\n}\n"
+        )
+        if result >= 0:
+            self.assertEqual(result, 56)
