@@ -462,8 +462,9 @@ class Preprocessor:
         if name in ("if", "ifdef", "ifndef"):
             if not active:
                 # A skipped group's conditions are not evaluated at all; only
-                # the nesting has to be tracked.
-                conditions.append(_Condition(False, True, False, False, name_token))
+                # the nesting has to be tracked. 'outer' being false is what
+                # keeps every branch of this group dark, whatever it says.
+                conditions.append(_Condition(False, False, False, False, name_token))
                 return
             value = self._condition(name, rest, name_token)
             conditions.append(_Condition(True, value, value, False, name_token))

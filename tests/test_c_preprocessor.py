@@ -470,6 +470,19 @@ class ConditionalTests(PreprocessorTestCase):
         self.assertEqual(
             expand("#if 1\n#if 0\na\n#else\nb\n#endif\n#endif\n"), "b"
         )
+        # A group inside one that was not taken stays dark whatever it says.
+        self.assertEqual(
+            expand("#if 0\n#if 1\na\n#else\nb\n#endif\n#endif\nz\n"), "z"
+        )
+        self.assertEqual(
+            expand("#if 0\n#if 0\na\n#elif 1\nb\n#else\nc\n#endif\n#endif\nz\n"), "z"
+        )
+        self.assertEqual(
+            expand("#if 0\na\n#elif 0\nb\n#elif 1\nc\n#else\nd\n#endif\n"), "c"
+        )
+        self.assertEqual(
+            expand("#if 1\na\n#elif 1\nb\n#else\nc\n#endif\n"), "a"
+        )
         self.assertEqual(expand("#define X\n#ifdef X\na\n#endif\n"), "a")
         self.assertEqual(expand("#ifndef X\na\n#endif\n"), "a")
         self.assertEqual(
