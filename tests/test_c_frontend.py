@@ -2113,6 +2113,88 @@ class FloatingDifferentialTests(CProgramTestCase):
         "%E", "%G",
     )
 
+    def test_random_expression_trees_match_ieee_754_arithmetic(self):
+        """Compiled double arithmetic against Python's, which is binary64 too.
+
+        Printing each result with %.17g pins down the full 53-bit significand,
+        so a single wrong rounding anywhere in a tree of up to sixteen
+        operations shows as a different string.
+        """
+
+        for seed in (3, 11, 77, 2026):
+            with self.subTest(seed=seed):
+                self._compare_arithmetic(seed)
+
+    def _compare_arithmetic(self, seed: int) -> None:
+        generator = random.Random(seed)
+        names = [f"v{index}" for index in range(6)]
+        values = []
+        declarations = []
+        for name in names:
+            value = generator.choice(
+                [
+                    generator.uniform(-1000, 1000),
+                    generator.uniform(-1, 1) * 10.0 ** generator.randrange(-30, 30),
+                    float(generator.randrange(-(10**9), 10**9)),
+                ]
+            )
+            values.append(value)
+            declarations.append(f"    double {name} = {float.hex(value)};")
+
+        def build(depth: int) -> tuple[str, float]:
+            if depth == 0 or generator.random() < 0.3:
+                index = generator.randrange(len(names))
+                return names[index], values[index]
+            left, left_value = build(depth - 1)
+            right, right_value = build(depth - 1)
+            operator = generator.choice("+-*/")
+            if operator == "/" and right_value == 0.0:
+                operator = "+"
+            try:
+                result = {
+                    "+": lambda: left_value + right_value,
+                    "-": lambda: left_value - right_value,
+                    "*": lambda: left_value * right_value,
+                    "/": lambda: left_value / right_value,
+                }[operator]()
+            except OverflowError as error:  # overflow to infinity is not compared
+                raise ValueError from error
+            if result != result or abs(result) == float("inf"):
+                raise ValueError
+            return f"(({left}) {operator} ({right}))", result
+
+        lines = []
+        expected = []
+        while len(lines) < 120:
+            try:
+                text, result = build(generator.randint(1, 4))
+            except ValueError:
+                continue
+            lines.append(f'    printf("%.17g\\n", {text});')
+            expected.append("%.17g" % result)
+        source = (
+            _STDIO
+            + "int main(void) {\n"
+            + "\n".join(declarations)
+            + "\n"
+            + "\n".join(lines)
+            + "\n    return 0;\n}\n"
+        )
+        artifact = self.build(source)
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        got = subprocess.run(
+            [str(artifact)], capture_output=True, text=True
+        ).stdout.splitlines()
+        self.assertEqual(len(got), len(expected))
+        for index, (actual, want) in enumerate(zip(got, expected)):
+            if actual != want:
+                self.fail(
+                    f"{lines[index].strip()}\n"
+                    f"  {' '.join(item.strip() for item in declarations)}\n"
+                    f"  got {actual}, IEEE-754 binary64 gives {want}"
+                )
+
     def _values(self) -> list[float]:
         chosen = [
             0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 2.5, 3.5, 0.1, 0.25, 100.0,
