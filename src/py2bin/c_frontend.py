@@ -1610,15 +1610,13 @@ class Parser:
 
         suffixes: list[tuple[str, object]] = []
         while True:
-            if self.at("["):
-                token = self.take("[")
+            if self.accept("["):
                 if self.accept("]"):
                     suffixes.append(("array", None))
                     continue
                 length = self.array_length()
                 self.take("]")
                 suffixes.append(("array", length))
-                del token
                 continue
             if self.at("("):
                 suffixes.append(("function", self.parameter_type_list()))

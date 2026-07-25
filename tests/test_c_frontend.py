@@ -3552,3 +3552,73 @@ class FunctionPointerRejectionTests(CProgramTestCase):
         with self.assertRaises(CCompileError) as caught:
             compile_c_to_ir(source, "reject.c", "darwin-x86_64")
         self.assertRegex(str(caught.exception), "call ABI is not implemented")
+
+
+class FunctionPointerDifferentialTests(CProgramTestCase):
+    """Random runtime dispatch, checked against expectations computed here.
+
+    Every callee is chosen at run time through a pointer, so nothing about the
+    result can come from constant folding, and the probe count proves the
+    expression that selected the callee ran exactly as many times as C says.
+    """
+
+    _OPS = {
+        "add": ("a + b", lambda a, b: a + b),
+        "sub": ("a - b", lambda a, b: a - b),
+        "mul": ("a * b", lambda a, b: a * b),
+        "andv": ("a & b", lambda a, b: a & b),
+        "orv": ("a | b", lambda a, b: a | b),
+        "xorv": ("a ^ b", lambda a, b: a ^ b),
+        "maxv": ("a > b ? a : b", lambda a, b: a if a > b else b),
+    }
+
+    @staticmethod
+    def _as_int(value: int) -> int:
+        """Reduce to the value a 32-bit signed C ``int`` would hold."""
+
+        value &= 0xFFFFFFFF
+        return value - (1 << 32) if value >= (1 << 31) else value
+
+    def test_random_dispatch_matches_the_operation_it_selected(self):
+        rng = random.Random(20260726)
+        names = list(self._OPS)
+        lines = [_STDIO.strip()]
+        for name in names:
+            body, _model = self._OPS[name]
+            lines.append(f"int {name}(int a, int b) {{ return {body}; }}")
+        lines.append("typedef int (*binop)(int, int);")
+        lines.append("int probes;")
+        lines.append(f"binop table[{len(names)}] = {{{', '.join(names)}}};")
+        lines.append("int probe(int k) { probes = probes + 1; return k; }")
+        lines.append("int main(void) {")
+        lines.append("    binop p;")
+        expected: list[str] = []
+        probes = 0
+        for _ in range(120):
+            index = rng.randrange(len(names))
+            name = names[index]
+            a = self._as_int(rng.randint(-(2**31), 2**31 - 1))
+            b = self._as_int(rng.randint(-(2**31), 2**31 - 1))
+            shape = rng.randrange(4)
+            if shape == 0:
+                # The callee is selected by a call with a side effect.
+                call = f"table[probe({index})]({a}, {b})"
+                probes += 1
+            elif shape == 1:
+                lines.append(f"    p = {name};")
+                call = f"p({a}, {b})"
+            elif shape == 2:
+                call = f"(*table[{index}])({a}, {b})"
+            else:
+                call = f"(probes >= 0 ? table[{index}] : table[0])({a}, {b})"
+            lines.append(f'    printf("%d\\n", {call});')
+            expected.append(str(self._as_int(self._OPS[name][1](a, b))))
+        lines.append('    printf("%d\\n", probes);')
+        expected.append(str(probes))
+        lines.append("    return 0;")
+        lines.append("}")
+        artifact = self.build("\n".join(lines) + "\n")
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        result = subprocess.run([str(artifact)], capture_output=True, text=True)
+        self.assertEqual(result.stdout.split(), expected)
