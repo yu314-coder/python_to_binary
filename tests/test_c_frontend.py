@@ -3426,6 +3426,37 @@ int main(void) {
             stdout="5 11\n",
         )
 
+    def test_a_narrow_result_comes_back_converted_to_its_type(self):
+        # The result register holds an unspecified value in its upper bits, so
+        # a signed char result must be sign-extended and an unsigned one
+        # zero-extended before it is used.
+        self.run_c(
+            _STDIO
+            + """
+signed char narrow(int n) { return (signed char)n; }
+unsigned char wide(int n) { return (unsigned char)n; }
+short middle(int n) { return (short)n; }
+int main(void) {
+    signed char (*p)(int) = narrow;
+    unsigned char (*q)(int) = wide;
+    short (*r)(int) = middle;
+    printf("%d %d %d\\n", p(200), q(200), r(70000));
+    printf("%d %d\\n", p(-1), q(-1));
+    return 0;
+}
+""",
+            # 200 into a signed char is 200-256; 70000 into a short is
+            # 70000-65536; -1 read back as an unsigned char is 255.
+            stdout="-56 200 4464\n-1 255\n",
+        )
+
+    def test_a_void_result_is_not_a_value(self):
+        self.reject(
+            "void nothing(int n) { }\n"
+            "int main(void) { void (*v)(int) = nothing; int x = v(1); return x; }\n",
+            "has no value",
+        )
+
     def test_a_cast_names_a_function_pointer_type(self):
         self.run_c(
             _STDIO
