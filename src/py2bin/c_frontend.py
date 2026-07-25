@@ -80,7 +80,6 @@ targets that have no call ABI or static block yet.
 from __future__ import annotations
 
 import dataclasses
-import re
 import struct
 
 from .native.frontend import _CABI_RESULT_WIDTH, _CABI_RESULTS, _CABI_SYMBOLS
@@ -152,21 +151,10 @@ class Token:
     # fits a signed one, but a plain decimal constant never gets one.
     suffix: str = ""
     radix: int = 10
+    # The file the token was really written in, which is not the file being
+    # compiled once #include has brought another one in.
+    origin: str = ""
 
-
-_HEADERS = frozenset(
-    {
-        "stdio.h",
-        "stdlib.h",
-        "string.h",
-        "stdint.h",
-        "stddef.h",
-        "limits.h",
-        "math.h",
-        "inttypes.h",
-    }
-)
-_INCLUDE = re.compile(r"#\s*include\s*<\s*([A-Za-z0-9_./]+)\s*>\s*\Z")
 
 _OPERATORS = (
     "<<=",
@@ -210,13 +198,19 @@ _SIMPLE_ESCAPES = {
 
 
 class Lexer:
+    """C's tokens, from text that the preprocessor has already been over.
+
+    ``line`` and ``column`` may be set before lexing starts, which is how the
+    preprocessor converts one preprocessing token at a time and still reports
+    the position it was written at.
+    """
+
     def __init__(self, source: str, filename: str):
         self.source = source
         self.filename = filename
         self.index = 0
         self.line = 1
         self.column = 1
-        self.line_is_blank = True
 
     def error(self, message: str, line: int | None = None, column: int | None = None):
         raise CCompileError(
@@ -232,11 +226,8 @@ class Lexer:
         if character == "\n":
             self.line += 1
             self.column = 1
-            self.line_is_blank = True
         else:
             self.column += 1
-            if not character.isspace():
-                self.line_is_blank = False
         return character
 
     def startswith(self, text: str) -> bool:
@@ -264,24 +255,12 @@ class Lexer:
                 self.advance()
                 continue
             if character == "#":
-                if not self.line_is_blank:
-                    self.error("preprocessor directives must begin a source line")
-                line, column = self.line, self.column
-                directive: list[str] = []
-                while self.index < len(self.source) and self.source[self.index] != "\n":
-                    directive.append(self.advance())
-                text = "".join(directive).strip()
-                match = _INCLUDE.fullmatch(text)
-                if match is None or match.group(1) not in _HEADERS:
-                    self.error(
-                        "py2bin has no C preprocessor; the only directive it "
-                        "accepts is #include of a standard header it can ignore "
-                        f"({', '.join(sorted(_HEADERS))}), and every declaration "
-                        "must be written out in the file",
-                        line,
-                        column,
-                    )
-                continue
+                # The preprocessor consumes every directive before this lexer
+                # runs, so a '#' that reaches here is one it left behind.
+                self.error(
+                    "'#' is a preprocessing operator and means nothing in C; it "
+                    "is only valid at the start of a directive or inside a #define"
+                )
             return
 
     def escape(self, quote: str) -> int:
@@ -1303,7 +1282,9 @@ class Parser:
 
     def error(self, message: str, token: Token | None = None):
         location = token or self.token
-        raise CCompileError(self.filename, location.line, location.column, message)
+        raise CCompileError(
+            location.origin or self.filename, location.line, location.column, message
+        )
 
     def at(self, value: str) -> bool:
         return self.token.value == value and self.token.kind in {"symbol", "identifier"}
@@ -2371,7 +2352,9 @@ class ConstantEvaluator:
         self.filename = filename
 
     def error(self, message: str, token: Token):
-        raise CCompileError(self.filename, token.line, token.column, message)
+        raise CCompileError(
+            token.origin or self.filename, token.line, token.column, message
+        )
 
     def value(self, node: Node) -> int:
         result = self.evaluate(node)
@@ -2772,7 +2755,9 @@ class Lowerer:
     # --- bookkeeping ---
 
     def error(self, message: str, token: Token):
-        raise CCompileError(self.filename, token.line, token.column, message)
+        raise CCompileError(
+            token.origin or self.filename, token.line, token.column, message
+        )
 
     def emit(self, operation: Operation) -> None:
         self.operations.append(operation)
@@ -5747,8 +5732,31 @@ def _is_character(ctype: CType) -> bool:
     return ctype in {CHAR, SCHAR, UCHAR}
 
 
-def compile_c_to_ir(source: str, filename: str, target: str) -> Module:
-    """Compile C source text to a py2bin native IR module."""
+def compile_c_to_ir(
+    source: str,
+    filename: str,
+    target: str,
+    *,
+    include_dirs: tuple[str, ...] = (),
+    defines: tuple[str, ...] = (),
+) -> Module:
+    """Compile C source text to a py2bin native IR module.
 
-    unit = Parser(Lexer(source, filename).tokens(), filename).translation_unit()
+    ``include_dirs`` is the ``-I`` search path the preprocessor uses, and
+    ``defines`` the ``-D`` macros (``NAME`` or ``NAME=value``) it starts with.
+    """
+
+    # Imported here rather than at the top because the preprocessor is written
+    # in terms of this module's tokens and lexer, and would otherwise close an
+    # import cycle.
+    from .c_preprocessor import preprocess
+
+    tokens = preprocess(
+        source,
+        filename,
+        target=target,
+        include_dirs=include_dirs,
+        defines=defines,
+    )
+    unit = Parser(tokens, filename).translation_unit()
     return Lowerer(unit, filename, target).compile()

@@ -192,6 +192,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     compile_c_parser.add_argument("entry", type=Path, help=".c source file")
     compile_c_parser.add_argument("--output", "-o", required=True, type=Path)
+    compile_c_parser.add_argument(
+        "--include-dir",
+        "-I",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="a directory the preprocessor searches for #include",
+    )
+    compile_c_parser.add_argument(
+        "--define",
+        "-D",
+        action="append",
+        default=[],
+        metavar="NAME[=VALUE]",
+        help="define a macro before the file is preprocessed",
+    )
     target_options(compile_c_parser)
     compile_c_parser.add_argument("--clean", action="store_true")
     c_plan_parser = commands.add_parser("plan-c", help="choose C or CPython bundle without running code")
@@ -749,6 +765,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.output,
                 target=_target_from_args(args),
                 clean=args.clean,
+                include_dirs=tuple(args.include_dir),
+                defines=tuple(args.define),
             )
             print(
                 f"compiled C to {result.target} machine code at "

@@ -1254,13 +1254,17 @@ def compile_c_native(
     *,
     target: str | None = None,
     clean: bool = False,
+    include_dirs: tuple[str, ...] = (),
+    defines: tuple[str, ...] = (),
 ) -> NativeResult:
     """Compile a C file to machine code with only py2bin's own implementation.
 
-    This is py2bin's C compiler proper: ``py2bin.c_frontend`` lexes and parses
-    the source, applies C's type rules, and emits native IR that the ARM64 and
-    x86-64 encoders turn into a binary. Nothing here shells out, and no host
-    compiler, assembler, or linker is consulted.
+    This is py2bin's C compiler proper: ``py2bin.c_preprocessor`` runs the
+    directives, ``py2bin.c_frontend`` lexes and parses the result, applies C's
+    type rules, and emits native IR that the ARM64 and x86-64 encoders turn into
+    a binary. Nothing here shells out, and no host compiler, assembler, or
+    linker is consulted. ``include_dirs`` is the ``-I`` search path and
+    ``defines`` the ``-D`` macros the preprocessor starts with.
     """
     entry = entry.expanduser().resolve()
     output = output.expanduser().resolve()
@@ -1268,7 +1272,15 @@ def compile_c_native(
         raise FileNotFoundError(f"C source does not exist: {entry}")
     resolved = target or host_target()
     source = entry.read_text(encoding="utf-8")
-    module, _report = optimize(compile_c_to_ir(source, str(entry), resolved))
+    module, _report = optimize(
+        compile_c_to_ir(
+            source,
+            str(entry),
+            resolved,
+            include_dirs=include_dirs,
+            defines=defines,
+        )
+    )
     return compile_native_module(
         entry,
         module,

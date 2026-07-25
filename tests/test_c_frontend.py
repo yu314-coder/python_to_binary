@@ -1500,13 +1500,12 @@ class RejectionTests(CProgramTestCase):
             "int main(void) { int n = 1; return n.a; }\n", "needs a struct"
         )
 
-    def test_the_preprocessor_is_refused_beyond_ignorable_includes(self):
-        self.reject(
-            "#define X 1\nint main(void) { return 0; }\n", "no C preprocessor"
-        )
+    def test_a_header_py2bin_cannot_find_is_refused(self):
+        # py2bin has no system include path: a real <sys/socket.h> is full of
+        # extensions this compiler does not have, so it says so.
         self.reject(
             "#include <sys/socket.h>\nint main(void) { return 0; }\n",
-            "no C preprocessor",
+            "cannot find the header",
         )
 
     def test_a_file_scope_initializer_must_be_a_constant_expression(self):
