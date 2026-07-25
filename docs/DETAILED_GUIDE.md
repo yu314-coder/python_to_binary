@@ -281,10 +281,10 @@ implementations. SVG/HTML/JavaScript output would be embedded asset data, not
 host CPU instructions.
 
 py2bin's C compiler is a separate frontend and does not accept the NumPy
-C-API, ATen, CUDA, or renderer implementations: those need the preprocessor,
-function pointers, and file-scope data, all of which it rejects rather than
-approximates. Compiling that C would still require a complete C implementation;
-py2bin's does not solve those compatibility layers.
+C-API, ATen, CUDA, or renderer implementations: those need the preprocessor and
+the rest of a hosted C library, which it rejects rather than approximates.
+Compiling that C would still require a complete C implementation; py2bin's does
+not solve those compatibility layers.
 
 The runnable `examples/native_library` sample demonstrates an imported helper
 calling another helper. `compile-all` emits all six target binaries, and the
@@ -356,11 +356,12 @@ conversions, local arrays, `&x`/`*p`/`a[i]` and pointer arithmetic, casts,
 `sizeof`, `++`/`--`, the comma operator, `/` and `%`, `do`/`while`,
 `switch`/`case` with fallthrough, `goto`, functions (called through a real
 AAPCS64 call ABI on the ARM64 targets, so recursion works; inlined elsewhere),
-`float`/`double` arithmetic with C's conversions, structs and unions, and
-`printf` with runtime formatting including the exact `%f`/`%e`/`%g`
-conversions. C needing `long double`, function pointers, more than eight
-arguments, or the preprocessor still requires a conventional compiler and
-linker; py2bin does not secretly invoke
+function pointers called through a real indirect branch, file-scope variables in
+real static storage, `float`/`double` arithmetic with C's conversions, structs
+and unions, and `printf` with runtime formatting including the exact
+`%f`/`%e`/`%g` conversions. C needing `long double`, variadic user functions,
+more than eight arguments, or the preprocessor still requires a conventional
+compiler and linker; py2bin does not secretly invoke
 GCC or Clang.
 
 Compatible bundles already preserve web content as files inside their

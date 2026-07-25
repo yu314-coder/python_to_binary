@@ -32,11 +32,13 @@ It has seven deliberately separate execution paths. They must not be confused:
    arithmetic, casts, `sizeof`, `++`/`--`, `?:`, the comma operator, division
    and remainder, `if`/`while`/`do`/`for`/`switch`/`goto`, functions called
    through a real machine call ABI on ARM64 (**recursion works** — direct,
-   deep, and mutual), and `printf`. It is not a general C, Cython-C, C++,
-   NumPy C-API, ATen, or CUDA compiler: `long double`, function pointers, more
-   than eight arguments, and the preprocessor are rejected with a
-   file:line:column error rather than approximated. `compile-via-c` is the
-   older, narrower bridge that round-trips py2bin's *own* generated C.
+   deep, and mutual), function pointers called through a genuine indirect
+   branch, file-scope variables in real static storage, and `printf`. It is not
+   a general C, Cython-C, C++, NumPy C-API, ATen, or CUDA compiler: `long
+   double`, variadic user functions, more than eight arguments, and the
+   preprocessor are rejected with a file:line:column error rather than
+   approximated. `compile-via-c` is the older, narrower bridge that
+   round-trips py2bin's *own* generated C.
 7. **CPython C-API embedding (`darwin-arm64` only):** the same handwritten C
    frontend also accepts calls to a fixed, vetted list of exported CPython
    entry points through opaque `PyObject *` handles, and the emitted Mach-O
@@ -742,12 +744,13 @@ integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
 py2bin's C is LP64 on all six targets and gives plain `char` the signed
 meaning Apple and x86 give it, so one source file produces the same values
 everywhere. It rejects — with a file:line:column error, never an
-approximation — `long double`, function
-pointers, variadic user functions, file-scope variables, functions with more
-than eight parameters (py2bin passes arguments only in registers), recursion on
-the targets with no call ABI, the preprocessor beyond a few ignorable
-`#include`s,
-arbitrary libc, Cython-generated C, the NumPy C-API, C++, ATen, and CUDA.
+approximation — `long double`, variadic user functions, a function type with
+C's unspecified `()` parameter list, `static` inside a block, `extern` objects
+(one translation unit, no linker), functions with more than eight parameters
+(py2bin passes arguments only in registers), recursion, function pointers or
+file-scope variables on the targets with no call ABI or static block, the
+preprocessor beyond a few ignorable `#include`s, arbitrary libc,
+Cython-generated C, the NumPy C-API, C++, ATen, and CUDA.
 The CPython C-API is accepted only as the fixed vetted symbol table
 described under [What the C-API path supports](#what-the-c-api-path-supports),
 not as a general C-API compiler: py2bin never reads `Python.h`, so anything
@@ -1081,10 +1084,9 @@ C source is an optional readable intermediate, not machine code. `emit-c`
 stops at C text. `compile-via-c` proves and compiles only the documented
 canonical integer intersection by parsing that text with py2bin itself;
 `compile-c` runs py2bin's own C compiler over the wider integer-and-pointer
-language described above. C that needs the preprocessor, function pointers, or
-file-scope variables still needs an external C implementation, which py2bin
-never invokes silently. Strict native compilation always ends in py2bin IR and
-handwritten target instructions.
+language described above. C that needs the preprocessor still needs an external
+C implementation, which py2bin never invokes silently. Strict native
+compilation always ends in py2bin IR and handwritten target instructions.
 
 HTML and CSS remain declarative data, and browser JavaScript remains code for a
 JavaScript/browser engine. Compatible one-file bundles copy, compress, and
