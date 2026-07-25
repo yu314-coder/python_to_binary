@@ -2336,16 +2336,22 @@ class Frontend:
         continue_label = self.new_label("for_continue")
         end_label = self.new_label("for_end")
         stop_slot = self.slot(f"<range-stop-{start_label}>")
-        self.operations.append(Store(slot, start_expression))
+        # Iterate on a private counter and copy it into the user's variable at
+        # the top of each iteration. Advancing the user's variable directly
+        # would leave it holding ``stop`` after the loop, and would clobber it
+        # even when the range is empty; Python does neither.
+        counter_slot = self.slot(f"<range-counter-{start_label}>")
+        self.operations.append(Store(counter_slot, start_expression))
         self.operations.append(Store(stop_slot, stop_expression))
         self.operations.append(Label(start_label))
         comparison = "lt" if step > 0 else "gt"
         self.operations.append(
             JumpIfFalse(
-                IntCompare(comparison, IntLoad(slot), IntLoad(stop_slot)),
+                IntCompare(comparison, IntLoad(counter_slot), IntLoad(stop_slot)),
                 end_label,
             )
         )
+        self.operations.append(Store(slot, IntLoad(counter_slot)))
         self.break_targets.append(end_label)
         self.continue_targets.append(continue_label)
         for statement in node.body:
@@ -2354,7 +2360,10 @@ class Frontend:
         self.break_targets.pop()
         self.operations.append(Label(continue_label))
         self.operations.append(
-            Store(slot, IntBinary("add", IntLoad(slot), IntConstant(step)))
+            Store(
+                counter_slot,
+                IntBinary("add", IntLoad(counter_slot), IntConstant(step)),
+            )
         )
         self.operations.append(Jump(start_label))
         self.operations.append(Label(end_label))
@@ -2500,14 +2509,20 @@ class Frontend:
             raise NativeCompileError(self.path, call, "exit status must be an integer")
         self.operations.append(Exit(status & 0xFF))
 
-    @staticmethod
     def select_integer(
+        self,
         condition: IntExpression,
         body: IntExpression,
         alternative: IntExpression,
     ) -> IntExpression:
+        # The mask is referenced twice below, and the backends re-emit an
+        # expression tree at every occurrence. Materialising it in a slot
+        # evaluates the condition exactly once; otherwise a condition
+        # containing a call would perform that call twice.
         truth = IntUnary("not", IntUnary("not", condition))
-        mask = IntUnary("neg", truth)
+        mask_slot = self.new_temp()
+        self.operations.append(Store(mask_slot, IntUnary("neg", truth)))
+        mask = IntLoad(mask_slot)
         return IntBinary(
             "or",
             IntBinary("and", body, mask),

@@ -1,6 +1,7 @@
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -618,3 +619,61 @@ class NativeCompilerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForLoopVariableSemanticsTests(unittest.TestCase):
+    """`for x in range(...)` must leave x exactly as CPython leaves it.
+
+    Advancing the user's variable directly would leave it holding `stop` after
+    the loop, and would clobber it even when the range is empty.
+    """
+
+    def _exit(self, source: str) -> tuple[int, int]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "loop.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "loop.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            ).returncode
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return reference, reference
+            native = subprocess.run([str(artifact)], capture_output=True).returncode
+            return reference, native
+
+    def test_counter_keeps_its_last_value(self):
+        reference, native = self._exit(
+            "for i in range(1, 5):\n    pass\nraise SystemExit(i)\n"
+        )
+        self.assertEqual(native, reference)
+        self.assertEqual(native, 4)
+
+    def test_empty_range_leaves_the_variable_untouched(self):
+        reference, native = self._exit(
+            "i = 99\nfor i in range(3, 3):\n    pass\nraise SystemExit(i)\n"
+        )
+        self.assertEqual(native, reference)
+        self.assertEqual(native, 99)
+
+    def test_step_and_negative_step_keep_the_last_value(self):
+        for source, expected in (
+            ("for i in range(0, 10, 3):\n    pass\nraise SystemExit(i)\n", 9),
+            ("for i in range(10, 0, -2):\n    pass\nraise SystemExit(i)\n", 2),
+        ):
+            reference, native = self._exit(source)
+            self.assertEqual(native, reference, source)
+            self.assertEqual(native, expected, source)
+
+    def test_break_keeps_the_value_at_the_break(self):
+        reference, native = self._exit(
+            "for i in range(0, 10):\n"
+            "    if i == 4:\n"
+            "        break\n"
+            "raise SystemExit(i)\n"
+        )
+        self.assertEqual(native, reference)
+        self.assertEqual(native, 4)
