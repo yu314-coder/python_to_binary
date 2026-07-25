@@ -4,12 +4,14 @@ import struct
 from dataclasses import dataclass, field
 
 from .ir import (
+    BitsFloat,
     Call,
     CStringConstant,
     Exit,
     ExitValue,
     ExternCall,
     FloatBinary,
+    FloatBits,
     FloatCompare,
     FloatConstant,
     FloatExpression,
@@ -177,6 +179,31 @@ def _condition_code(operator: str) -> int:
         return conditions[operator]
     except KeyError as error:
         raise ValueError(f"unknown ARM64 comparison {operator!r}") from error
+
+
+def _float_condition_code(operator: str) -> int:
+    """Condition codes for FCMP, where the integer ones are not interchangeable.
+
+    An IEEE comparison has four outcomes, not three: FCMP sets NZCV to 0011
+    when either operand is NaN, and C requires every relational operator to be
+    false in that case. The signed integer codes LT (N!=V) and LE (Z=1 or
+    N!=V) are both TRUE for that flag pattern, so ``x < y`` with a NaN operand
+    would answer yes. MI (N=1) and LS (C=0 or Z=1) are the ordered forms and
+    answer no, which is what C requires.
+    """
+
+    conditions = {
+        "eq": 0x0,  # eq  -- Z=1, and unordered clears Z
+        "ne": 0x1,  # ne
+        "lt": 0x4,  # mi  -- ordered less than
+        "le": 0x9,  # ls  -- ordered less than or equal
+        "gt": 0xC,  # gt
+        "ge": 0xA,  # ge
+    }
+    try:
+        return conditions[operator]
+    except KeyError as error:
+        raise ValueError(f"unknown ARM64 float comparison {operator!r}") from error
 
 
 @dataclass
@@ -358,7 +385,20 @@ def _expression(
         return
     if isinstance(expression, FloatToInt):
         _float_expression(words, expression.value, slot_base, refs)
-        words.append(0x9E780000)  # fcvtzs x0, d0 (truncate toward zero)
+        if expression.signed:
+            words.append(0x9E780000)  # fcvtzs x0, d0 (truncate toward zero)
+        else:
+            words.append(0x9E790000)  # fcvtzu x0, d0
+        return
+    if isinstance(expression, FloatBits):
+        _float_expression(words, expression.value, slot_base, refs)
+        if expression.size == 8:
+            words.append(0x9E660000)  # fmov x0, d0
+        elif expression.size == 4:
+            words.append(0x1E624000)  # fcvt s0, d0  (round to binary32)
+            words.append(0x1E260000)  # fmov w0, s0  (zero-extends into x0)
+        else:
+            raise ValueError(f"unsupported ARM64 float bit width {expression.size}")
         return
     if isinstance(expression, FloatCompare):
         _float_expression(words, expression.left, slot_base, refs)
@@ -366,7 +406,7 @@ def _expression(
         _float_expression(words, expression.right, slot_base, refs)
         words.extend((0x1E604001, 0xFD4003E0, 0x910043FF))  # fmov d1,d0; ldr d0,[sp]; add sp,#16
         words.append(0x1E612000)  # fcmp d0, d1
-        condition = _condition_code(expression.operator)
+        condition = _float_condition_code(expression.operator)
         words.append(0x9A9F07E0 | ((condition ^ 1) << 12))  # cset x0, cond
         return
     if isinstance(expression, HeapLoad):
@@ -400,7 +440,20 @@ def _float_expression(
         return
     if isinstance(expression, IntToFloat):
         _expression(words, expression.value, slot_base, refs)
-        words.append(0x9E620000)  # scvtf d0, x0
+        if expression.signed:
+            words.append(0x9E620000)  # scvtf d0, x0
+        else:
+            words.append(0x9E630000)  # ucvtf d0, x0
+        return
+    if isinstance(expression, BitsFloat):
+        _expression(words, expression.value, slot_base, refs)
+        if expression.size == 8:
+            words.append(0x9E670000)  # fmov d0, x0
+        elif expression.size == 4:
+            words.append(0x1E270000)  # fmov s0, w0
+            words.append(0x1E22C000)  # fcvt d0, s0  (exact widening)
+        else:
+            raise ValueError(f"unsupported ARM64 float bit width {expression.size}")
         return
     if isinstance(expression, FloatUnary):
         _float_expression(words, expression.operand, slot_base, refs)

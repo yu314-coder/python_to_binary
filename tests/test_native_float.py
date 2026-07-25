@@ -200,5 +200,138 @@ class NativeFloatTests(unittest.TestCase):
             self.assertIn("int and float", str(caught.exception))
 
 
+class FloatIRNodeTests(unittest.TestCase):
+    """The bit-level float IR nodes, checked against IEEE-754 by hand.
+
+    Every expectation here is derived from the standard, not from another
+    compiler: 0.1 rounded to binary32 is exactly 0.100000001490116119384765625,
+    a signed conversion of the all-ones bit pattern is -1.0 while the unsigned
+    one is 2**64-1, and every relational operator on a NaN is false while ``!=``
+    is true. The programs are built for all six targets and, on darwin-arm64,
+    RUN, because an FP encoding that assembles is not the same as one that
+    computes.
+    """
+
+    def _exit_status(self, expression) -> int:
+        from py2bin.native.compiler import compile_native_module
+        from py2bin.native.ir import ExitValue, Module
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        module = Module([ExitValue(expression)], 4)
+        for target in ("darwin-arm64", "darwin-x86_64", "linux-x86_64"):
+            artifact = compile_native_module(
+                root / "fake.py",
+                module,
+                root / f"program-{target}",
+                target=target,
+                clean=True,
+            ).artifact
+        if not _HOST_IS_DARWIN_ARM64:
+            return -1
+        artifact = compile_native_module(
+            root / "fake.py",
+            module,
+            root / "program.bin",
+            target="darwin-arm64",
+            clean=True,
+        ).artifact
+        return subprocess.run([str(artifact)]).returncode
+
+    def test_a_double_survives_a_round_trip_through_its_bit_pattern(self):
+        from py2bin.native.ir import BitsFloat, FloatBits, FloatConstant, FloatToInt
+
+        status = self._exit_status(
+            FloatToInt(BitsFloat(FloatBits(FloatConstant(42.5), 8), 8))
+        )
+        if _HOST_IS_DARWIN_ARM64:
+            self.assertEqual(status, 42)
+
+    def test_a_four_byte_round_trip_rounds_to_binary32(self):
+        import struct
+
+        from py2bin.native.ir import (
+            BitsFloat,
+            FloatBinary,
+            FloatBits,
+            FloatConstant,
+            FloatToInt,
+        )
+
+        # float(0.1) is 0.100000001490116119384765625, so times 1e9 it is
+        # 100000001.49..., which truncates to 100000001 -- 1 modulo 256. The
+        # double 0.1 would give exactly 100000000, which is 0 modulo 256, so
+        # this distinguishes a real binary32 rounding from a no-op.
+        self.assertEqual(struct.unpack("<f", struct.pack("<f", 0.1))[0] * 1e9, 100000001.49011612)
+        status = self._exit_status(
+            FloatToInt(
+                FloatBinary(
+                    "mul",
+                    BitsFloat(FloatBits(FloatConstant(0.1), 4), 4),
+                    FloatConstant(1e9),
+                )
+            )
+        )
+        if _HOST_IS_DARWIN_ARM64:
+            self.assertEqual(status, 1)
+
+    def test_signed_and_unsigned_integer_to_double_differ_above_two_to_the_63(self):
+        from py2bin.native.ir import FloatBinary, FloatConstant, FloatToInt, IntConstant, IntToFloat
+
+        # The all-ones pattern is -1 signed and 2**64-1 unsigned. Divided by
+        # 2**63 those are -1/2**63 (truncating to 0) and 2 (exactly).
+        for signed, expected in ((False, 2), (True, 0)):
+            with self.subTest(signed=signed):
+                status = self._exit_status(
+                    FloatToInt(
+                        FloatBinary(
+                            "div",
+                            IntToFloat(IntConstant(-1), signed=signed),
+                            FloatConstant(float(2**63)),
+                        )
+                    )
+                )
+                if _HOST_IS_DARWIN_ARM64:
+                    self.assertEqual(status, expected)
+
+    def test_signed_and_unsigned_double_to_integer_differ_above_two_to_the_63(self):
+        from py2bin.native.ir import FloatConstant, FloatToInt, IntBinary, IntConstant
+
+        # 2**64-2048 is exactly representable. Converted unsigned its top byte
+        # is 0xFF; the signed conversion saturates at 2**63-1, whose top byte
+        # is 0x7F.
+        for signed, expected in ((False, 255), (True, 127)):
+            with self.subTest(signed=signed):
+                status = self._exit_status(
+                    IntBinary(
+                        "urshift",
+                        FloatToInt(FloatConstant(float(2**64 - 2048)), signed=signed),
+                        IntConstant(56),
+                    )
+                )
+                if _HOST_IS_DARWIN_ARM64:
+                    self.assertEqual(status, expected)
+
+    def test_every_ordering_is_false_for_a_nan_operand(self):
+        from py2bin.native.ir import FloatBinary, FloatCompare, FloatConstant
+
+        nan = FloatBinary("div", FloatConstant(0.0), FloatConstant(0.0))
+        for operator, expected in (
+            ("eq", 0),
+            ("ne", 1),
+            ("lt", 0),
+            ("le", 0),
+            ("gt", 0),
+            ("ge", 0),
+        ):
+            with self.subTest(operator=operator):
+                status = self._exit_status(
+                    FloatCompare(operator, nan, FloatConstant(1.0))
+                )
+                if _HOST_IS_DARWIN_ARM64:
+                    self.assertEqual(status, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

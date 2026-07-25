@@ -3,9 +3,11 @@ from __future__ import annotations
 import struct
 
 from .ir import (
+    BitsFloat,
     Exit,
     ExitValue,
     FloatBinary,
+    FloatBits,
     FloatCompare,
     FloatConstant,
     FloatExpression,
@@ -151,7 +153,34 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         return
     if isinstance(expression, FloatToInt):
         _float_expression(code, expression.value, slot_base)
-        code.extend(b"\xf2\x48\x0f\x2c\xc0")  # cvttsd2si rax, xmm0 (truncate toward zero)
+        if expression.signed:
+            code.extend(b"\xf2\x48\x0f\x2c\xc0")  # cvttsd2si rax, xmm0 (toward zero)
+            return
+        # There is no unsigned convert on SSE2. Values below 2**63 go through
+        # the signed instruction unchanged; the rest have 2**63 subtracted
+        # first (exactly, since 2**63 is a power of two) and the sign bit put
+        # back afterwards. Skipping this makes every C conversion of a double
+        # above 2**63 to an unsigned 64-bit type saturate to 0x8000000000000000.
+        code.extend(b"\x48\xb8" + struct.pack("<Q", 0x43E0000000000000))  # mov rax, 2**63
+        code.extend(b"\x66\x48\x0f\x6e\xc8")  # movq xmm1, rax
+        code.extend(b"\x66\x0f\x2e\xc1")  # ucomisd xmm0, xmm1
+        code.extend(b"\x73\x07")  # jae +7 (past the small-value path)
+        code.extend(b"\xf2\x48\x0f\x2c\xc0")  # cvttsd2si rax, xmm0
+        code.extend(b"\xeb\x16")  # jmp +22 (past the large-value path)
+        code.extend(b"\xf2\x0f\x5c\xc1")  # subsd xmm0, xmm1
+        code.extend(b"\xf2\x48\x0f\x2c\xc0")  # cvttsd2si rax, xmm0
+        code.extend(b"\x48\xb9" + struct.pack("<Q", 0x8000000000000000))  # mov rcx, sign
+        code.extend(b"\x48\x31\xc8")  # xor rax, rcx
+        return
+    if isinstance(expression, FloatBits):
+        _float_expression(code, expression.value, slot_base)
+        if expression.size == 8:
+            code.extend(b"\x66\x48\x0f\x7e\xc0")  # movq rax, xmm0
+        elif expression.size == 4:
+            code.extend(b"\xf2\x0f\x5a\xc0")  # cvtsd2ss xmm0, xmm0
+            code.extend(b"\x66\x0f\x7e\xc0")  # movd eax, xmm0 (zero-extends)
+        else:
+            raise ValueError(f"unsupported x86-64 float bit width {expression.size}")
         return
     if isinstance(expression, FloatCompare):
         _float_expression(code, expression.left, slot_base)
@@ -159,21 +188,33 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         _float_expression(code, expression.right, slot_base)
         code.extend(b"\xf2\x0f\x10\xc8")  # movsd xmm1, xmm0  (right operand)
         code.extend(b"\xf2\x0f\x10\x04\x24\x48\x83\xc4\x10")  # movsd xmm0,[rsp]; add rsp,16
-        code.extend(b"\x66\x0f\x2e\xc1")  # ucomisd xmm0, xmm1
-        conditions = {
-            "eq": 0x94,  # sete   (ZF=1)
-            "ne": 0x95,  # setne  (ZF=0)
-            "lt": 0x92,  # setb   (CF=1)
-            "le": 0x96,  # setbe  (CF=1 or ZF=1)
-            "gt": 0x97,  # seta   (CF=0 and ZF=0)
-            "ge": 0x93,  # setae  (CF=0)
-        }
-        condition = conditions.get(expression.operator)
-        if condition is None:
+        # UCOMISD reports "unordered" (either operand NaN) as ZF=PF=CF=1, which
+        # is indistinguishable from equality on ZF and CF alone. C requires
+        # every relational operator to be false for an unordered pair, so the
+        # orderings are taken with the operands swapped -- SETA/SETAE are false
+        # when CF is set -- and equality also tests PF.
+        operator = expression.operator
+        if operator in {"lt", "le"}:
+            code.extend(b"\x66\x0f\x2e\xc8")  # ucomisd xmm1, xmm0
+        else:
+            code.extend(b"\x66\x0f\x2e\xc1")  # ucomisd xmm0, xmm1
+        if operator == "eq":
+            code.extend(b"\x0f\x94\xc0")  # sete  al   (ZF=1)
+            code.extend(b"\x0f\x9b\xc1")  # setnp cl   (ordered)
+            code.extend(b"\x20\xc8")  # and al, cl
+        elif operator == "ne":
+            code.extend(b"\x0f\x95\xc0")  # setne al  (ZF=0)
+            code.extend(b"\x0f\x9a\xc1")  # setp  cl  (unordered)
+            code.extend(b"\x08\xc8")  # or al, cl
+        elif operator in {"lt", "gt"}:
+            code.extend(b"\x0f\x97\xc0")  # seta  al  (CF=0 and ZF=0)
+        elif operator in {"le", "ge"}:
+            code.extend(b"\x0f\x93\xc0")  # setae al  (CF=0)
+        else:
             raise ValueError(
                 f"unknown x86-64 float comparison {expression.operator!r}"
             )
-        code.extend(b"\x0f" + bytes((condition,)) + b"\xc0\x48\x0f\xb6\xc0")  # setcc al; movzx rax, al
+        code.extend(b"\x48\x0f\xb6\xc0")  # movzx rax, al
         return
     if isinstance(expression, HeapLoad):
         _expression(code, expression.address, slot_base)  # rax = address
@@ -204,7 +245,33 @@ def _float_expression(
         return
     if isinstance(expression, IntToFloat):
         _expression(code, expression.value, slot_base)
+        if expression.signed:
+            code.extend(b"\xf2\x48\x0f\x2a\xc0")  # cvtsi2sd xmm0, rax
+            return
+        # SSE2 has no unsigned convert either. A non-negative value goes
+        # straight through; otherwise the value is halved (keeping the low bit
+        # as a sticky bit so round-to-nearest still sees it) and the result
+        # doubled, which is exact.
+        code.extend(b"\x48\x85\xc0")  # test rax, rax
+        code.extend(b"\x78\x07")  # js +7 (to the negative path)
         code.extend(b"\xf2\x48\x0f\x2a\xc0")  # cvtsi2sd xmm0, rax
+        code.extend(b"\xeb\x16")  # jmp +22 (past the negative path)
+        code.extend(b"\x48\x89\xc1")  # mov rcx, rax
+        code.extend(b"\x48\xd1\xe9")  # shr rcx, 1
+        code.extend(b"\x48\x83\xe0\x01")  # and rax, 1
+        code.extend(b"\x48\x09\xc1")  # or rcx, rax
+        code.extend(b"\xf2\x48\x0f\x2a\xc1")  # cvtsi2sd xmm0, rcx
+        code.extend(b"\xf2\x0f\x58\xc0")  # addsd xmm0, xmm0
+        return
+    if isinstance(expression, BitsFloat):
+        _expression(code, expression.value, slot_base)
+        if expression.size == 8:
+            code.extend(b"\x66\x48\x0f\x6e\xc0")  # movq xmm0, rax
+        elif expression.size == 4:
+            code.extend(b"\x66\x0f\x6e\xc0")  # movd xmm0, eax
+            code.extend(b"\xf3\x0f\x5a\xc0")  # cvtss2sd xmm0, xmm0 (exact)
+        else:
+            raise ValueError(f"unsupported x86-64 float bit width {expression.size}")
         return
     if isinstance(expression, FloatUnary):
         _float_expression(code, expression.operand, slot_base)

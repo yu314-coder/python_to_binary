@@ -95,20 +95,60 @@ class FloatBinary:
 
 @dataclass(frozen=True, slots=True)
 class IntToFloat:
-    """Widen a signed 64-bit integer expression to a double."""
+    """Widen a 64-bit integer expression to a double.
+
+    ``signed`` picks the signed conversion; the unsigned one is a different
+    instruction, and using the signed form for a value above 2**63-1 is exactly
+    how ``(double)18446744073709551615ULL`` would come out negative.
+    """
 
     value: "IntExpression"
+    signed: bool = True
 
 
-# These two consume a float but produce an integer, so they belong to the
-# integer expression union even though they read the FP register file.
+@dataclass(frozen=True, slots=True)
+class BitsFloat:
+    """Reinterpret an integer's low bits as a floating value, and widen it.
+
+    ``size`` 8 reads the 64 bits as binary64. ``size`` 4 reads the low 32 bits
+    as binary32 and widens the result to binary64, which is exact. This is what
+    lets a C ``double`` or ``float`` object live in ordinary addressable memory
+    and be loaded with the same integer loads every other C object uses.
+    """
+
+    value: "IntExpression"
+    size: int = 8
+
+
+# These consume a float but produce an integer, so they belong to the integer
+# expression union even though they read the FP register file.
 
 
 @dataclass(frozen=True, slots=True)
 class FloatToInt:
-    """Truncate a double toward zero into a signed 64-bit integer."""
+    """Truncate a double toward zero into a 64-bit integer.
+
+    ``signed`` selects the signed conversion. The unsigned one is needed for a
+    C conversion to a 64-bit unsigned type, whose range runs past 2**63-1 where
+    the signed instruction saturates instead.
+    """
 
     value: "FloatExpression"
+    signed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class FloatBits:
+    """The IEEE-754 bit pattern of a floating value, as an integer.
+
+    ``size`` 8 yields the 64 bits of the binary64 value. ``size`` 4 rounds the
+    value to binary32 first and yields those 32 bits, zero-extended -- which is
+    both how a C ``float`` object is stored and how a value is rounded to
+    ``float`` precision.
+    """
+
+    value: "FloatExpression"
+    size: int = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,13 +251,16 @@ IntExpression = (
     | IntBinary
     | IntCompare
     | FloatToInt
+    | FloatBits
     | FloatCompare
     | HeapLoad
     | CStringConstant
     | ExternCall
     | Call
 )
-FloatExpression = FloatConstant | FloatLoad | FloatUnary | FloatBinary | IntToFloat
+FloatExpression = (
+    FloatConstant | FloatLoad | FloatUnary | FloatBinary | IntToFloat | BitsFloat
+)
 
 
 # --- operations --------------------------------------------------------------
