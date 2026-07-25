@@ -51,9 +51,11 @@ prove `emit-c` output means what the Python meant, not to compile C in general.
 
 Because py2bin both generates and parses C, it never reads `Python.h` or any
 other system header. Every `PyObject *` is an opaque 64-bit handle: an
-incomplete type the compiler refuses to dereference or offset. That is what
-removes the need for a preprocessor, macros, and struct layouts, and it is what
-makes a handwritten C compiler tractable.
+incomplete type the compiler refuses to dereference or offset. py2bin has its
+own preprocessor (`c_preprocessor.py`) and could include a header it can parse,
+but a real system header is macros, `static inline` functions and struct
+layouts that this compiler does not implement; writing the `extern` prototypes
+out instead is what keeps a handwritten C compiler tractable.
 
 ## Pipeline
 

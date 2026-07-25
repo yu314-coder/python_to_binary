@@ -710,10 +710,12 @@ class _Parser:
     def extern_prototype(self) -> None:
         """Record ``extern TYPE name(TYPE, ...);`` as an external native symbol.
 
-        Declaring prototypes explicitly is what removes the need for a C
-        preprocessor and for parsing ``Python.h``: the generated C states the
-        exact ABI it uses, so this compiler never sees a macro or a struct
-        definition. Each recorded symbol is bound by the real dynamic linker.
+        Declaring prototypes explicitly is what removes the need to parse
+        ``Python.h``: the generated C states the exact ABI it uses, so this
+        bridge never sees a macro or a struct definition. (py2bin's C compiler
+        proper does have a preprocessor -- :mod:`py2bin.c_preprocessor` -- but
+        this narrower canonical-C path predates it and needs none.) Each
+        recorded symbol is bound by the real dynamic linker.
         """
 
         # 'extern' has already been consumed by the caller's accept().
@@ -1223,9 +1225,10 @@ class _Parser:
             name = str(self.take().value)
             if not self.accept("("):
                 if name == "NULL" and name not in self.locals:
-                    # The null pointer constant. Spelling it as a keyword of
-                    # this dialect is what keeps py2bin free of a preprocessor:
-                    # <stddef.h> is never read, and no macro is ever expanded.
+                    # The null pointer constant. This canonical-C bridge has no
+                    # preprocessor of its own, so NULL is a keyword of the
+                    # dialect: <stddef.h> is never read here, and no macro is
+                    # ever expanded.
                     return self.mark(ast.Constant(value=0), "ptr")
                 if name not in self.locals:
                     self.error(f"{name!r} is not a declared local or parameter", token)

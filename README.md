@@ -35,9 +35,11 @@ It has seven deliberately separate execution paths. They must not be confused:
    deep, and mutual), function pointers called through a genuine indirect
    branch, file-scope variables in real static storage, and `printf`. It is not
    a general C, Cython-C, C++, NumPy C-API, ATen, or CUDA compiler: `long
-   double`, variadic user functions, more than eight arguments, and the
-   preprocessor are rejected with a file:line:column error rather than
-   approximated. `compile-via-c` is the older, narrower bridge that
+   double`, variadic user functions, and more than eight arguments are rejected
+   with a file:line:column error rather than approximated. A real preprocessor
+   runs first — macros with `#` and `##`, conditionals, and `#include` of files
+   it can find — but a system header it cannot parse is refused, not guessed
+   at. `compile-via-c` is the older, narrower bridge that
    round-trips py2bin's *own* generated C.
 7. **CPython C-API embedding (`darwin-arm64` only):** the same handwritten C
    frontend also accepts calls to a fixed, vetted list of exported CPython
@@ -140,8 +142,10 @@ run the same program under CPython, require identical stdout and exit status.
 - Dereferencing a handle, pointer arithmetic on it, ordering comparisons
   (`<`, `>`) between handles, or mixing a handle with a `long long`. Handles
   are opaque 64-bit values and nothing else. This is why py2bin never needs to
-  read `Python.h`, and why there is no C preprocessor, no macro expansion, and
-  no struct layout knowledge anywhere in the compiler.
+  read `Python.h`: its preprocessor could include the file, but what is inside
+  is macros, `static inline` functions and struct layouts that this compiler
+  does not implement, so the vetted table of entry points is written out
+  instead.
 - Any prototype that disagrees with the vetted ABI (wrong argument count, or a
   non-`void` return for a `void` function).
 - Variadic C-API entry points such as `PyObject_CallFunctionObjArgs`. Apple's
@@ -739,7 +743,24 @@ integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
   approximate: every finite double is a finite decimal, and the emitted code
   builds that decimal digit by digit and then rounds the digits half to even,
   so `printf("%.0f", 1e300)` produces the whole 301-digit integer that double
-  equals. Flags and field widths are rejected by name rather than ignored.
+  equals. Flags and field widths are rejected by name rather than ignored;
+- a **real preprocessor** ([`src/py2bin/c_preprocessor.py`](src/py2bin/c_preprocessor.py)):
+  line splicing, comments, `#define` of object-like, function-like and
+  variadic macros with `#` and `##`, `#undef`, `#include` of files it finds on
+  the `-I` search path or beside the file that included them, `#if`/`#ifdef`/
+  `#ifndef`/`#elif`/`#else`/`#endif` with a real 64-bit constant-expression
+  evaluator and `defined`, `#error`, `#pragma once`, `-D` on the command line,
+  and the predefined `__FILE__`, `__LINE__`, `__STDC__`, `__STDC_VERSION__`,
+  `__STDC_HOSTED__` and `__py2bin*__` macros. Expansion follows the standard's
+  algorithm with hide sets, and reproduces the expansions C11 6.10.3.3 and
+  6.10.3.5 print, token for token. Arguments are substituted **textually**, so
+  an argument written once in a replacement list is evaluated once at run time
+  and one written twice is evaluated twice, exactly as C requires.
+  `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<stdint.h>`, `<stddef.h>`,
+  `<stdbool.h>`, `<limits.h>`, `<math.h>` and `<inttypes.h>` are served from
+  py2bin's own built-in copies, which carry the macros of those headers
+  (`INT_MAX`, `NULL`, `bool`, `PRId64`, ...) because the types and `printf`
+  they declare are built into the compiler.
 
 py2bin's C is LP64 on all six targets and gives plain `char` the signed
 meaning Apple and x86 give it, so one source file produces the same values
@@ -748,9 +769,11 @@ approximation — `long double`, variadic user functions, a function type with
 C's unspecified `()` parameter list, `static` inside a block, `extern` objects
 (one translation unit, no linker), functions with more than eight parameters
 (py2bin passes arguments only in registers), recursion, function pointers or
-file-scope variables on the targets with no call ABI or static block, the
-preprocessor beyond a few ignorable `#include`s, arbitrary libc,
-Cython-generated C, the NumPy C-API, C++, ATen, and CUDA.
+file-scope variables on the targets with no call ABI or static block, `#line`,
+`#warning`, any `#pragma` other than `once`, the GNU `, ## __VA_ARGS__`
+extension, a header it cannot find (there is no system include path, because a
+real system header uses extensions this compiler does not have), arbitrary
+libc, Cython-generated C, the NumPy C-API, C++, ATen, and CUDA.
 The CPython C-API is accepted only as the fixed vetted symbol table
 described under [What the C-API path supports](#what-the-c-api-path-supports),
 not as a general C-API compiler: py2bin never reads `Python.h`, so anything
@@ -1083,9 +1106,10 @@ pretending every file is the same language:
 C source is an optional readable intermediate, not machine code. `emit-c`
 stops at C text. `compile-via-c` proves and compiles only the documented
 canonical integer intersection by parsing that text with py2bin itself;
-`compile-c` runs py2bin's own C compiler over the wider integer-and-pointer
-language described above. C that needs the preprocessor still needs an external
-C implementation, which py2bin never invokes silently. Strict native
+`compile-c` runs py2bin's own C compiler — preprocessor included — over the
+wider integer-and-pointer language described above. C that needs a system
+header, or a language feature this compiler does not implement, still needs an
+external C implementation, which py2bin never invokes silently. Strict native
 compilation always ends in py2bin IR and handwritten target instructions.
 
 HTML and CSS remain declarative data, and browser JavaScript remains code for a

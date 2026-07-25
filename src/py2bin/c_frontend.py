@@ -3,8 +3,10 @@
 This module is a real (small) C compiler written in pure Python. It lexes and
 parses C, builds a typed syntax tree of its own, applies C's integer promotions
 and conversions, and emits py2bin's native IR -- which the handwritten ARM64 and
-x86-64 encoders turn into machine code. No external compiler, assembler, linker,
-preprocessor or toolchain is involved, and no process is ever started.
+x86-64 encoders turn into machine code. The directives are run first by
+:mod:`py2bin.c_preprocessor`, which is py2bin's own, so no external compiler,
+assembler, linker, preprocessor or toolchain is involved, and no process is
+ever started.
 
 It deliberately does NOT reuse Python's ``ast`` module. An earlier bridge did,
 and C's semantics kept leaking away: a C ``for`` acquired Python ``range``
@@ -62,7 +64,10 @@ What is implemented
   expression, which is what C requires of static storage: arithmetic constants
   and address constants such as ``&x``, an array name, or a string literal;
 * ``printf`` with real runtime formatting, and the vetted ``extern`` adapter
-  ABI that lets compiled C drive an embedded CPython.
+  ABI that lets compiled C drive an embedded CPython;
+* the directives, which :mod:`py2bin.c_preprocessor` has already run by the
+  time anything here sees a token: macros with ``#`` and ``##``, ``#include``,
+  and the conditional family. That module documents exactly what it accepts.
 
 What is rejected
 ----------------
@@ -71,10 +76,9 @@ function type with an unspecified ``()`` parameter list, a function whose own
 declarator is not the plain ``TYPE *... name(params)`` (write a typedef for the
 result type), ``static`` inside a block, ``extern`` objects (py2bin compiles one
 translation unit and has no linker), a braced initializer for a file-scope
-struct or union, the preprocessor beyond a handful of ignorable ``#include``s,
-more than eight arguments to a function (py2bin passes arguments only in
-registers), and recursion, function pointers or file-scope objects on the
-targets that have no call ABI or static block yet.
+struct or union, more than eight arguments to a function (py2bin passes
+arguments only in registers), and recursion, function pointers or file-scope
+objects on the targets that have no call ABI or static block yet.
 """
 
 from __future__ import annotations

@@ -281,8 +281,9 @@ implementations. SVG/HTML/JavaScript output would be embedded asset data, not
 host CPU instructions.
 
 py2bin's C compiler is a separate frontend and does not accept the NumPy
-C-API, ATen, CUDA, or renderer implementations: those need the preprocessor and
-the rest of a hosted C library, which it rejects rather than approximates.
+C-API, ATen, CUDA, or renderer implementations: it has a preprocessor of its
+own, but those need the system headers and the rest of a hosted C library,
+which it rejects rather than approximates.
 Compiling that C would still require a complete C implementation; py2bin's does
 not solve those compatibility layers.
 
@@ -359,10 +360,11 @@ AAPCS64 call ABI on the ARM64 targets, so recursion works; inlined elsewhere),
 function pointers called through a real indirect branch, file-scope variables in
 real static storage, `float`/`double` arithmetic with C's conversions, structs
 and unions, and `printf` with runtime formatting including the exact
-`%f`/`%e`/`%g` conversions. C needing `long double`, variadic user functions,
-more than eight arguments, or the preprocessor still requires a conventional
-compiler and linker; py2bin does not secretly invoke
-GCC or Clang.
+`%f`/`%e`/`%g` conversions, and a real preprocessor -- macros with `#` and
+`##`, the conditional directives, and `#include` of files it can find. C
+needing `long double`, variadic user functions, more than eight arguments, or a
+system header still requires a conventional compiler and linker; py2bin does
+not secretly invoke GCC or Clang.
 
 Compatible bundles already preserve web content as files inside their
 compressed one-file payload. The freeze manifest now catalogs `.html`, `.htm`,
@@ -629,9 +631,10 @@ CPython.
 
 py2bin generates and parses the C, so it emits explicit `extern` prototypes
 instead of including a system header. Every `PyObject *` is an opaque 64-bit
-handle. This is not a stylistic choice — it is what removes the need for a C
-preprocessor, macro expansion, and struct-layout knowledge, and therefore what
-makes a handwritten C compiler feasible at all. It also fixes the ceiling:
+handle. This is not a stylistic choice — py2bin's preprocessor could read a
+header it can parse, but `Python.h` is macros, `static inline` functions and
+struct layouts, and writing the prototypes out is what makes a handwritten C
+compiler feasible at all. It also fixes the ceiling:
 anything that is a macro, a `static inline`, a struct field, or variadic is
 permanently out of reach of this tier.
 
