@@ -751,7 +751,9 @@ integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
   `#ifndef`/`#elif`/`#else`/`#endif` with a real 64-bit constant-expression
   evaluator and `defined`, `#error`, `#pragma once`, `-D` on the command line,
   and the predefined `__FILE__`, `__LINE__`, `__STDC__`, `__STDC_VERSION__`,
-  `__STDC_HOSTED__` and `__py2bin*__` macros. Expansion follows the standard's
+  `__STDC_HOSTED__` and `__py2bin*__` macros. `__DATE__` and `__TIME__` are the
+  fixed `"Jan  1 1970"` and `"00:00:00"` that C11 6.10.8.1 permits when the date
+  of translation is unavailable, so a build stays reproducible. Expansion follows the standard's
   algorithm with hide sets, and reproduces the expansions C11 6.10.3.3 and
   6.10.3.5 print, token for token. Arguments are substituted **textually**, so
   an argument written once in a replacement list is evaluated once at run time

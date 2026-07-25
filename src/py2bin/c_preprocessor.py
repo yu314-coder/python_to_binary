@@ -43,6 +43,10 @@ What is accepted
   ``__py2bin__``, ``__py2bin_target__``, and one each of
   ``__py2bin_arm64__``/``__py2bin_x86_64__`` and
   ``__py2bin_darwin__``/``__py2bin_linux__``/``__py2bin_windows__``.
+  ``__DATE__`` and ``__TIME__`` are the fixed ``"Jan  1 1970"`` and
+  ``"00:00:00"``: C11 6.10.8.1 allows an implementation-defined constant when
+  the date of translation is not available, and py2bin would rather compile the
+  same source to the same bytes than read the clock.
 
 What is rejected
 ----------------
@@ -54,6 +58,9 @@ how a compiler silently changes an ABI, so py2bin refuses instead -- the GNU
 into the output, a ``##`` that pastes two tokens into something that is not one
 token, and any header that cannot be found. Real system headers use extensions
 this compiler does not have; py2bin will say so rather than guess.
+
+Trigraphs (``??=``) and digraphs (``%:``, ``<:``) are not recognised, which is
+what every C compiler does by default; spell the punctuation the normal way.
 """
 
 from __future__ import annotations
@@ -361,6 +368,8 @@ _PREDEFINED = frozenset(
     {
         "__FILE__",
         "__LINE__",
+        "__DATE__",
+        "__TIME__",
         "__STDC__",
         "__STDC_VERSION__",
         "__STDC_HOSTED__",
@@ -403,6 +412,12 @@ class Preprocessor:
             "#define __STDC_VERSION__ 201112L",
             "#define __STDC_HOSTED__ 0",
             "#define __py2bin__ 1",
+            # C11 6.10.8.1 lets an implementation supply a fixed date and time
+            # when the real ones are not available, and py2bin says they are
+            # not: a compiler that read the clock would give a different binary
+            # every time it ran, and this one is reproducible on purpose.
+            '#define __DATE__ "Jan  1 1970"',
+            '#define __TIME__ "00:00:00"',
         ]
         if target:
             text.append(f'#define __py2bin_target__ "{target}"')

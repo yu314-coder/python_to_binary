@@ -747,6 +747,12 @@ class PredefinedTests(PreprocessorTestCase):
             "a",
         )
 
+    def test_the_date_and_time_are_fixed_so_a_build_is_reproducible(self):
+        # C11 6.10.8.1 allows an implementation-defined constant when the date
+        # of translation is not available, and py2bin declares it is not: the
+        # same source has to compile to the same bytes.
+        self.assertEqual(expand("__DATE__ __TIME__\n"), '"Jan  1 1970" "00:00:00"')
+
     def test_line_is_where_the_macro_was_used(self):
         self.assertEqual(expand("#define HERE __LINE__\n\n\nHERE\n"), "4")
 
