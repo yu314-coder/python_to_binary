@@ -1473,6 +1473,21 @@ class Parser:
                     )
                 if isinstance(ctype, VoidType):
                     self.error(f"member {member_name!r} cannot be void", member_start)
+                if isinstance(ctype, FunctionType):
+                    # C has no member of function type. Without this the member
+                    # would be laid out with a size of zero and silently alias
+                    # whatever followed it.
+                    self.error(
+                        f"member {member_name!r} has function type {ctype}; C has "
+                        f"no such member. Write '{ctype.result} (*{member_name})"
+                        "(...)' for a pointer to a function",
+                        member_start,
+                    )
+                if isinstance(ctype, ArrayType) and size_of(ctype) is None:
+                    self.error(
+                        f"member {member_name!r} has the incomplete type {ctype}",
+                        member_start,
+                    )
                 seen.add(member_name)
                 members.append((member_name, ctype))
                 if not self.accept(","):

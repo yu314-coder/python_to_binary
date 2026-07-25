@@ -3622,3 +3622,46 @@ class FunctionPointerDifferentialTests(CProgramTestCase):
             return
         result = subprocess.run([str(artifact)], capture_output=True, text=True)
         self.assertEqual(result.stdout.split(), expected)
+
+
+class IncompleteMemberTests(CProgramTestCase):
+    """A struct member has to have a size, or the layout is a lie."""
+
+    def test_a_member_of_function_type_is_refused(self):
+        self.reject(
+            "struct S { int f(void); };\nint main(void) { return 0; }\n",
+            "has function type",
+        )
+
+    def test_a_member_with_no_array_length_is_refused(self):
+        # `int a[];` is not a member C has here: a flexible array member must
+        # be last and cannot be the only member. py2bin used to lay it out with
+        # a size of zero, which put the NEXT member at the same offset -- so
+        # this exact program printed 3 where C requires the compiler to
+        # diagnose it.
+        self.reject(
+            "struct S { int a[]; int b; };\n"
+            "int main(void) { struct S s; s.b = 7; s.a[0] = 3; return s.b; }\n",
+            "incomplete type",
+        )
+
+
+class TypedefFunctionTypeTests(CProgramTestCase):
+    """``typedef int T(void);`` names a function type; ``T *`` points at one."""
+
+    def test_a_typedef_function_type_declares_pointers(self):
+        self.run_c(
+            _STDIO
+            + """
+typedef int T(void);
+int one(void) { return 1; }
+int two(void) { return 2; }
+T *global_hook = one;
+int main(void) {
+    T *local_hook = two;
+    printf("%d %d\\n", global_hook(), local_hook());
+    return 0;
+}
+""",
+            stdout="1 2\n",
+        )
