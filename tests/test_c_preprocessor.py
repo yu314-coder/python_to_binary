@@ -174,6 +174,30 @@ int main(void) {
             expand("#define A(x) A(x)\nA(A(1))\n"), "A ( A ( 1 ) )"
         )
 
+    def test_a_token_that_came_out_of_a_macro_stays_out_of_it(self):
+        # The classic 'painted blue' case: the argument 'foo' is expanded on
+        # its own, where it is a function-like name with no '(' after it, so it
+        # survives -- and it must not be invoked by the '(2)' that follows the
+        # expansion either, because it carries foo's own name in its hide set.
+        self.assertEqual(
+            expand("#define foo(x) bar x\nfoo(foo) (2)\n"), "bar foo ( 2 )"
+        )
+        self.assertEqual(expand("#define X X + 1\nX\n"), "X + 1")
+        self.assertEqual(
+            expand("#define F(x) G(x)\n#define G(x) F(x)\nF(1)\n"), "F ( 1 )"
+        )
+        # A chain of macros that does terminate still expands the whole way.
+        self.assertEqual(
+            expand("#define f(x) x\n#define g f\n#define h g(2)\nh\n"), "2"
+        )
+
+    def test_a_function_like_name_is_examined_before_what_follows_it(self):
+        # Q is not called here: the token after it is P, not '('. Expanding P
+        # first and then letting Q take the parenthesis would be wrong.
+        self.assertEqual(
+            expand("#define P (1+2)\n#define Q(x) x\nQ P\n"), "Q ( 1 + 2 )"
+        )
+
     def test_a_function_like_macro_without_a_call_is_left_alone(self):
         self.assertEqual(expand("#define f(x) x + 1\nf\n"), "f")
         self.assertEqual(expand("#define f(x) x + 1\nf (2)\n"), "2 + 1")
@@ -342,6 +366,65 @@ int main(void) {
         )
         self.assertEqual(expand("#define X 1\n#undef X\n#define X 2\nX\n"), "2")
         self.assertEqual(expand("#define X 1\n#undef X\nX\n"), "X")
+
+
+class TableTests(PreprocessorTestCase):
+    """One table expanded several ways: what macros are really used for."""
+
+    def test_an_x_macro_table_builds_functions_names_and_a_sum(self):
+        # The X-macro idiom leans on almost everything at once: a multi-line
+        # continued list, a macro redefined after #undef, stringification, and
+        # adjacent string literals joining afterwards. 1 + 2 + 4 = 7.
+        self.run_c(
+            """
+#include <stdio.h>
+#define COLORS      \\
+    X(red,   1)     \\
+    X(green, 2)     \\
+    X(blue,  4)
+
+#define X(name, value) static int name(void) { return value; }
+COLORS
+#undef X
+
+#define X(name, value) + name()
+static int total(void) { return 0 COLORS; }
+#undef X
+
+#define X(name, value) #name ","
+static const char *names = COLORS "";
+#undef X
+
+int main(void) {
+    printf("%d %s\\n", total(), names);
+    return 0;
+}
+""",
+            stdout="7 red,green,blue,\n",
+        )
+
+    def test_the_same_program_preprocesses_the_same_way_for_every_target(self):
+        # Nothing in the preprocessor is target-specific except the __py2bin
+        # macros, so the six encoders must all see the same 30.
+        source = """
+#define A 5
+#define B 6
+#define MUL(x, y) ((x) * (y))
+#if MUL(A, B) == 30
+#define RESULT MUL(A, B)
+#else
+#define RESULT 0
+#endif
+int main(void) { return RESULT; }
+"""
+        for target in ("linux-x86_64", "linux-arm64", "darwin-x86_64",
+                       "darwin-arm64", "windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                artifact = self.build(source, target=target)
+                self.assertTrue(artifact.is_file())
+        if _HOST_IS_DARWIN_ARM64:
+            artifact = self.build(source)
+            self.assertEqual(subprocess.run([str(artifact)]).returncode, 30)
 
 
 class LayoutTests(PreprocessorTestCase):
