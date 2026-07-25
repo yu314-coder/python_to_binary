@@ -835,6 +835,34 @@ int main(void) {
             stdout="5\n1100\n150\n",
         )
 
+    def test_a_floating_target_read_and_written_in_one_expression(self):
+        # The value stored may read the very object about to be written, so it
+        # has to be pinned in a slot before the store rather than recomputed
+        # after it. Each of these would answer differently if it were not.
+        self.run_c(
+            _STDIO
+            + """
+double twice(int *n, double v) { *n = *n + 1; return v * 2.0; }
+int main(void) {
+    int calls = 0;
+    double d = 1.0;
+    d = d + d;
+    printf("%g\\n", d);
+    double e = 1.0;
+    e += twice(&calls, 3.0);
+    printf("%g %d\\n", e, calls);
+    double *p = &d;
+    (*p)++;
+    printf("%g %g\\n", d, *p);
+    float f = 2.0f;
+    f = f * f;
+    printf("%g\\n", (double)f);
+    return 0;
+}
+""",
+            stdout="2\n7 1\n3 3\n4\n",
+        )
+
     def test_a_struct_lays_out_and_copies_its_floating_members(self):
         self.run_c(
             _STDIO
@@ -2300,6 +2328,47 @@ int main(void) {
                 artifact = root / "floats.bin"
                 compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
                 self.assertEqual(subprocess.run([str(artifact)]).returncode, 14)
+
+    @unittest.skipUnless(
+        _HOST_IS_DARWIN_ARM64, "native execution requires a darwin-arm64 host"
+    )
+    def test_a_call_in_a_floating_position_is_emitted_once(self):
+        """The recurring defect: one written call lowered into the IR twice.
+
+        A printf floating argument and a '?:' arm are both positions where the
+        lowering reuses a value, so this counts the branch instructions in the
+        image as well as the side effects at run time. Three written calls must
+        be three `bl` sites, not six.
+        """
+
+        source = """
+#include <stdio.h>
+double tick(int *n) { *n = *n + 1; return 1.5; }
+int main(void) {
+    int calls = 0;
+    printf("%.1f %.1f\\n", tick(&calls), tick(&calls));
+    double picked = (calls == 0) ? tick(&calls) : 2.5;
+    printf("%d %g\\n", calls, picked);
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "once.c"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "once.bin"
+            compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+            text = subprocess.run(
+                ["otool", "-tvV", str(artifact)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(len(re.findall(r"\tbl\t", text)), 3)
+            run = subprocess.run([str(artifact)], capture_output=True, text=True)
+            # Both printf arguments ran, so `calls` is 2 and the '?:' takes its
+            # second arm without calling again.
+            self.assertEqual(run.stdout, "1.5 1.5\n2 2.5\n")
 
     @unittest.skipUnless(
         _HOST_IS_DARWIN_ARM64, "native execution requires a darwin-arm64 host"
