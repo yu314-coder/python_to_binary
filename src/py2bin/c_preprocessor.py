@@ -631,6 +631,16 @@ class Preprocessor:
         at: PPToken,
     ) -> None:
         for position, token in enumerate(body):
+            if (
+                token.kind == "identifier"
+                and token.spelling == "__VA_ARGS__"
+                and (parameters is None or "__VA_ARGS__" not in parameters)
+            ):
+                self.error(
+                    "__VA_ARGS__ means something only in the replacement list of a "
+                    "macro whose parameter list ends with '...'",
+                    token,
+                )
             if token.kind != "punctuator":
                 continue
             if token.spelling == "##":
@@ -943,20 +953,22 @@ class Preprocessor:
             if token.spelling in values and token.kind == "identifier":
                 argument = values[token.spelling]
                 if following is not None and following.spelling == "##":
-                    result.extend(
-                        argument if argument else [self._at(_placemarker(token), at)]
-                    )
+                    substituted = list(argument) or [self._at(_placemarker(token), at)]
                 else:
                     # Everywhere but next to # or ##, an argument is macro
                     # expanded first, and then substituted.
-                    result.extend(self.expand(list(argument)))
+                    substituted = self.expand(list(argument))
+                result.extend(_spaced_like(substituted, token))
                 index += 1
                 continue
             result.append(self._at(token, at))
             index += 1
+        # What replaces the macro sits where the macro name sat, whitespace
+        # included: that is what makes the standard's own 'join' example
+        # stringify as "x ## y" rather than "x## y".
         return [
             dataclasses.replace(item, hides=item.hides | hides)
-            for item in result
+            for item in _spaced_like(result, at)
             if item.kind != _PLACEMARKER
         ]
 
@@ -1008,6 +1020,14 @@ class Preprocessor:
             line, column, origin = last.line, last.column + len(last.spelling), last.origin
         result.append(Token("eof", "", line, column, origin=origin))
         return result
+
+
+def _spaced_like(tokens: list[PPToken], at: PPToken) -> list[PPToken]:
+    """Give a replacement the whitespace of the token it replaces."""
+
+    if not tokens or tokens[0].spaced == at.spaced:
+        return tokens
+    return [dataclasses.replace(tokens[0], spaced=at.spaced)] + tokens[1:]
 
 
 def _placemarker(token: PPToken) -> PPToken:
