@@ -1943,6 +1943,21 @@ class Frontend:
                 self.values[name] = self.constant(expression)
                 return
             except NativeCompileError:
+                # The name is becoming a runtime value. If it currently holds a
+                # compile-time constant, write that into its slot first: the
+                # new right-hand side may read the name (``x = x + f()``), and
+                # the slot has never been written.
+                previous_value = self.values.get(name)
+                if isinstance(previous_value, (bool, int)):
+                    self.operations.append(
+                        Store(self.slot(name), IntConstant(int(previous_value)))
+                    )
+                    self.value_types.setdefault(name, "int")
+                elif isinstance(previous_value, float):
+                    self.operations.append(
+                        FloatStore(self.slot(name), FloatConstant(previous_value))
+                    )
+                    self.value_types.setdefault(name, "float")
                 self.runtime_names.add(name)
         self.values.pop(name, None)
         kind = self.expression_type(expression)
@@ -3272,9 +3287,33 @@ class Frontend:
                 ast.Gt: "gt",
                 ast.GtE: "ge",
             }
-            left = node.left
+            # A chain such as `a < b < c` names b once but compares it twice.
+            # Lower every operand exactly once and, when a value is reused as
+            # the next comparison's left side, hold it in a slot: the backends
+            # re-emit an expression tree at each occurrence, so reusing the
+            # tree would evaluate the operand twice.
+            def lower_operand(
+                item: ast.expr, as_float: bool
+            ) -> IntExpression | FloatExpression:
+                if as_float:
+                    return self.float_expression(item, bindings, call_stack)
+                return self.integer(item, bindings, call_stack)
+
+            operand_is_float = [
+                self.expression_type(item, bindings) == "float"
+                for item in (node.left, *node.comparators)
+            ]
+            # A comparison is a float comparison when either side is a float.
+            pair_is_float = [
+                operand_is_float[index] or operand_is_float[index + 1]
+                for index in range(len(node.ops))
+            ]
             result: IntExpression | None = None
-            for operator_node, right in zip(node.ops, node.comparators):
+            carried: IntExpression | FloatExpression | None = None
+            carried_is_float = False
+            for index, (operator_node, right) in enumerate(
+                zip(node.ops, node.comparators)
+            ):
                 operator = operators.get(type(operator_node))
                 if operator is None:
                     raise NativeCompileError(
@@ -3282,27 +3321,43 @@ class Frontend:
                         node,
                         "unsupported native integer comparison",
                     )
-                if (
-                    self.expression_type(left, bindings) == "float"
-                    or self.expression_type(right, bindings) == "float"
-                ):
-                    comparison = FloatCompare(
-                        operator,
-                        self.float_expression(left, bindings, call_stack),
-                        self.float_expression(right, bindings, call_stack),
-                    )
+                as_float = pair_is_float[index]
+                if index == 0:
+                    left_value = lower_operand(node.left, as_float)
+                elif as_float and not carried_is_float:
+                    left_value = IntToFloat(carried)
                 else:
-                    comparison = IntCompare(
-                        operator,
-                        self.integer(left, bindings, call_stack),
-                        self.integer(right, bindings, call_stack),
-                    )
+                    left_value = carried
+                # Python evaluates the rest of a chain only if the comparisons
+                # so far were true. This lowering is branchless, so anything
+                # that could trap or have an effect must be rejected there.
+                if index:
+                    self.eager_depth += 1
+                try:
+                    right_value = lower_operand(right, as_float)
+                finally:
+                    if index:
+                        self.eager_depth -= 1
+                if index + 1 < len(node.ops):
+                    # Reused as the next left operand: evaluate it once.
+                    slot = self.new_temp()
+                    if as_float:
+                        self.operations.append(FloatStore(slot, right_value))
+                        right_value = FloatLoad(slot)
+                    else:
+                        self.operations.append(Store(slot, right_value))
+                        right_value = IntLoad(slot)
+                    carried, carried_is_float = right_value, as_float
+                comparison = (
+                    FloatCompare(operator, left_value, right_value)
+                    if as_float
+                    else IntCompare(operator, left_value, right_value)
+                )
                 result = (
                     comparison
                     if result is None
                     else IntBinary("and", result, comparison)
                 )
-                left = right
             assert result is not None
             return result
         if isinstance(node, ast.IfExp):

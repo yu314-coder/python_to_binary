@@ -712,3 +712,52 @@ class UnboundLoopVariableTests(unittest.TestCase):
         self._compile(
             "t = 0\nfor i in range(1, 5):\n    t += i\nraise SystemExit(t)\n"
         )
+
+
+class OperandEvaluatedOnceTests(unittest.TestCase):
+    """An operand named once in the source must be evaluated once.
+
+    The backends re-emit an expression tree at every occurrence, so any value
+    reused by a lowering has to be held in a slot instead.
+    """
+
+    def _run(self, source: str, expected: int) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "p.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "p.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            ).returncode
+            self.assertEqual(reference, expected, "test expectation is wrong")
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            native = subprocess.run([str(artifact)], capture_output=True).returncode
+            self.assertEqual(native, reference)
+
+    def test_chained_comparison_matches_cpython(self):
+        for source, expected in (
+            ("n = 0\nfor k in range(1, 4):\n    n += k\n"
+             "raise SystemExit(1 if 0 <= n < 10 else 2)\n", 1),
+            ("n = 0\nfor k in range(1, 20):\n    n += k\n"
+             "raise SystemExit(1 if 0 <= n < 10 else 2)\n", 2),
+            ("a = 0\nfor k in range(1, 3):\n    a += k\n"
+             "raise SystemExit(1 if 0 < a < 5 < 100 else 2)\n", 1),
+        ):
+            self._run(source, expected)
+
+    def test_self_referential_assignment_keeps_the_previous_value(self):
+        # Promoting a constant name to a runtime value must write the old
+        # constant into its slot first: the right-hand side reads the name.
+        self._run("x = 5\nfor k in range(1, 3):\n    x = x + k\nraise SystemExit(x)\n", 8)
+
+    def test_self_referential_float_assignment(self):
+        self._run(
+            "y = 1.5\nfor k in range(1, 3):\n    y = y + 0.5\n"
+            "raise SystemExit(int(y * 10))\n",
+            25,
+        )
