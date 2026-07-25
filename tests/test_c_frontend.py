@@ -812,10 +812,28 @@ int main(void) {
 class RejectionTests(CProgramTestCase):
     """What py2bin's C compiler refuses, with a location, instead of guessing."""
 
-    def test_recursion_is_refused_because_there_is_no_call_instruction(self):
+    def test_recursion_is_refused_on_a_target_with_no_call_abi(self):
+        """The ARM64 encoder has a call ABI; the others still inline, so there
+        recursion is rejected with a location rather than miscompiled."""
+
+        source = (
+            "int f(int n) { return n ? f(n - 1) : 0; }\n"
+            "int main(void) { return f(3); }\n"
+        )
+        for target in ("windows-arm64", "windows-x86_64", "linux-x86_64"):
+            with self.subTest(target=target):
+                with self.assertRaises(CCompileError) as caught:
+                    compile_c_to_ir(source, "reject.c", target)
+                self.assertRegex(str(caught.exception), "recursive call")
+                self.assertRegex(str(caught.exception), r"reject\.c:1:27")
+
+    def test_more_than_eight_arguments_is_refused(self):
+        parameters = ", ".join(f"int a{index}" for index in range(9))
+        arguments = ", ".join(str(index) for index in range(9))
         self.reject(
-            "int f(int n) { return n ? f(n - 1) : 0; }\nint main(void) { return f(3); }\n",
-            "recursive call",
+            f"int wide({parameters}) {{ return a0; }}\n"
+            f"int main(void) {{ return wide({arguments}); }}\n",
+            "at most 8 arguments in registers",
         )
 
     def test_floating_point_is_refused(self):
@@ -862,7 +880,11 @@ class RejectionTests(CProgramTestCase):
     def test_an_undefined_label_or_name_is_refused(self):
         self.reject("int main(void) { goto nowhere; }\n", "no label")
         self.reject("int main(void) { return zzz; }\n", "not a declared")
-        self.reject("int main(void) { return f(); }\n", "not a function defined")
+        self.reject("int main(void) { return f(); }\n", "not a function declared")
+        self.reject(
+            "int f(int n);\nint main(void) { return f(1); }\n",
+            "declared but never defined",
+        )
 
     def test_misplaced_control_flow_is_refused(self):
         self.reject("int main(void) { break; }\n", "not inside a loop")
@@ -1595,6 +1617,248 @@ int main(void) {
                 [str(root / "every-darwin-arm64.bin")], capture_output=True
             )
             self.assertEqual(run.returncode, 56)
+
+
+class RecursionTests(CProgramTestCase):
+    """Real calls: a frame per call, a saved link register, and recursion.
+
+    Every expected value below is derived by hand from the C standard.
+    """
+
+    def test_factorial_and_fibonacci(self):
+        # 10! == 3628800 and fib(20) == 6765 with fib(0) == 0, fib(1) == 1.
+        self.run_c(
+            _STDIO
+            + """
+long long factorial(long long n) {
+    if (n <= 1) { return 1; }
+    return n * factorial(n - 1);
+}
+long long fib(long long n) {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+int main(void) {
+    printf("%lld %lld\\n", factorial(10), fib(20));
+    return factorial(5) == 120 && fib(10) == 55;
+}
+""",
+            stdout="3628800 6765\n",
+            status=1,
+        )
+
+    def test_a_deep_recursion_really_saves_and_restores_its_frame(self):
+        # Each frame owns a four-element array it rewrites before and checks
+        # after the recursive call, so a frame that was NOT preserved shows up
+        # as a negative sentinel rather than as a merely different total.
+        self.run_c(
+            _STDIO
+            + """
+long long depth(long long n) {
+    long long scratch[4];
+    scratch[0] = n;
+    scratch[1] = n * 2;
+    scratch[2] = 0;
+    scratch[3] = 7;
+    if (n == 0) { return 0; }
+    scratch[2] = depth(n - 1);
+    if (scratch[3] != 7) { return -1; }
+    if (scratch[1] != n * 2) { return -2; }
+    if (scratch[0] != n) { return -3; }
+    return scratch[2] + 1;
+}
+int main(void) {
+    printf("%lld\\n", depth(5000));
+    return 0;
+}
+""",
+            stdout="5000\n",
+            status=0,
+        )
+
+    def test_mutual_recursion_through_forward_declarations(self):
+        self.run_c(
+            _STDIO
+            + """
+int is_even(long long n);
+int is_odd(long long n);
+
+int is_even(long long n) { if (n == 0) { return 1; } return is_odd(n - 1); }
+int is_odd(long long n) { if (n == 0) { return 0; } return is_even(n - 1); }
+
+int main(void) {
+    printf("%d %d %d %d\\n",
+           is_even(1000), is_odd(1000), is_even(1001), is_odd(1001));
+    return 0;
+}
+""",
+            stdout="1 0 0 1\n",
+            status=0,
+        )
+
+    def test_mutual_recursion_computes_a_real_result(self):
+        # Ackermann(2, 3) == 9, expanded by hand from A(m,n).
+        self.run_c(
+            _STDIO
+            + """
+long long ack(long long m, long long n) {
+    if (m == 0) { return n + 1; }
+    if (n == 0) { return ack(m - 1, 1); }
+    return ack(m - 1, ack(m, n - 1));
+}
+int main(void) {
+    printf("%lld %lld %lld\\n", ack(0, 0), ack(1, 3), ack(2, 3));
+    return 0;
+}
+""",
+            stdout="1 5 9\n",
+            status=0,
+        )
+
+    def test_eight_arguments_reach_the_callee_in_order(self):
+        # 1*1 + 2*2 + ... + 8*8 == 204, and the subtraction chain pins the
+        # ORDER: a swapped pair would change the sign of the difference.
+        self.run_c(
+            _STDIO
+            + """
+long long weigh(long long a, long long b, long long c, long long d,
+                long long e, long long f, long long g, long long h) {
+    return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8;
+}
+long long order(int a, short b, char c, long long d,
+                unsigned e, int f, int g, int h) {
+    return ((((((a - b) * 10 + c) * 10 + (int)d) * 10 + (int)e) * 10 + f)
+            * 10 + g) * 10 + h;
+}
+int main(void) {
+    printf("%lld\\n", weigh(1, 2, 3, 4, 5, 6, 7, 8));
+    printf("%lld\\n", order(1, 2, 3, 4, 5, 6, 7, 8));
+    return 0;
+}
+""",
+            # order: ((((((1-2)*10+3)*10+4)*10+5)*10+6)*10+7)*10+8
+            #      = (-1*10+3)=-7; -7*10+4=-66; -66*10+5=-655;
+            #        -655*10+6=-6544; -6544*10+7=-65433; -65433*10+8=-654322
+            stdout="204\n-654322\n",
+            status=0,
+        )
+
+    def test_a_call_in_a_reused_position_happens_exactly_once(self):
+        """The recurring defect in this backend is a value lowered twice.
+
+        Each expression below re-reads its operand -- a ternary condition, a
+        short-circuit operand, an index that is both an address and a
+        read-modify-write target -- so a duplicated call shows up as a counter
+        that advanced twice.
+        """
+
+        self.run_c(
+            _STDIO
+            + """
+int bump(int *counter) {
+    *counter = *counter + 1;
+    return *counter;
+}
+int main(void) {
+    int c = 0;
+    int a[8];
+    int i;
+    int x;
+    for (i = 0; i < 8; i++) { a[i] = 0; }
+    x = bump(&c) ? 100 : 200;
+    printf("%d %d\\n", x, c);
+    x = bump(&c) && 1;
+    printf("%d %d\\n", x, c);
+    x = bump(&c) || 1;
+    printf("%d %d\\n", x, c);
+    a[bump(&c)] = 55;
+    printf("%d %d %d\\n", a[4], c, a[3]);
+    a[bump(&c)] += 7;
+    printf("%d %d %d\\n", a[5], c, a[6]);
+    x = 10;
+    x += bump(&c);
+    printf("%d %d\\n", x, c);
+    x = (bump(&c) > 0) ? bump(&c) : bump(&c);
+    printf("%d %d\\n", x, c);
+    return 0;
+}
+""",
+            stdout=(
+                "100 1\n"  # the condition called once
+                "1 2\n"  # && evaluated its left operand once
+                "1 3\n"  # || short-circuited after one call
+                "55 4 0\n"  # the index was computed once, a[3] untouched
+                "7 5 0\n"  # the read-modify-write index was computed once
+                "16 6\n"  # 10 + 6
+                "8 8\n"  # condition, then ONLY the taken arm
+            ),
+            status=0,
+        )
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin", "otool is a macOS developer tool"
+    )
+    def test_each_call_site_emits_exactly_one_branch_and_link(self):
+        source = (
+            _STDIO
+            + """
+int bump(int *counter) { *counter = *counter + 1; return *counter; }
+int main(void) {
+    int c = 0;
+    int a[4];
+    int x;
+    a[0] = 0; a[1] = 0; a[2] = 0; a[3] = 0;
+    x = bump(&c) ? 1 : 2;
+    a[bump(&c)] += 1;
+    x += bump(&c);
+    return x + c;
+}
+"""
+        )
+        artifact = self.build(source)
+        text = subprocess.run(
+            ["otool", "-tvV", str(artifact)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        # Three textual calls, three bl instructions: no call is duplicated,
+        # and none is inlined away into a second copy of the body.
+        self.assertEqual(len(re.findall(r"\bbl\t", text)), 3)
+        # A real AAPCS64 frame: the link register is saved and restored, and
+        # the callee returns rather than falling through.
+        self.assertRegex(text, r"stp\tx29, x30, \[sp\]")
+        self.assertRegex(text, r"ldp\tx29, x30, \[sp\]")
+        self.assertRegex(text, r"\bret\b")
+
+    def test_a_recursive_function_may_print_and_use_a_switch(self):
+        # Everything a function body can contain has to keep working when the
+        # body becomes a real callee with its own frame and its own labels.
+        self.run_c(
+            _STDIO
+            + """
+int classify(int v) {
+    int out;
+    switch (v % 3) {
+        case 0: out = 100; break;
+        case 1: out = 200; break;
+        default: out = 300;
+    }
+    return out;
+}
+void countdown(int n) {
+    if (n == 0) { printf("go\\n"); return; }
+    printf("%d %d\\n", n, classify(n));
+    countdown(n - 1);
+}
+int main(void) {
+    countdown(4);
+    return 0;
+}
+""",
+            stdout="4 200\n3 100\n2 300\n1 200\ngo\n",
+            status=0,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

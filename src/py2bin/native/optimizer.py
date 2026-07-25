@@ -73,4 +73,7 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
         merged_writes=merged_writes,
         removed_operations=removed_operations,
     )
-    return Module(optimized, module.stack_slots), report
+    # Callable bodies are carried through untouched: they have their own
+    # control flow and their own terminator (Return), so none of the rules
+    # above -- which all reason about the entry point's single exit -- apply.
+    return Module(optimized, module.stack_slots, module.functions), report

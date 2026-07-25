@@ -30,8 +30,12 @@ What is implemented
 * statements: ``if``/``else``, ``while``, ``do``/``while``, ``for``,
   ``switch``/``case``/``default`` with fallthrough, ``break``, ``continue``,
   ``goto`` with labels, and ``return``;
-* functions, which are inlined at each call site (the IR has no call
-  instruction, so recursion is rejected rather than miscompiled);
+* functions, called through a real machine call ABI on the targets whose
+  encoder implements one (see ``CALL_CAPABLE_TARGETS``): each call gets its own
+  stack frame with a saved link register, so **recursion works** -- direct,
+  deep, and mutual. On the remaining targets the call ABI is not implemented,
+  so a call is still inlined at its site and recursion is rejected there rather
+  than miscompiled;
 * ``printf`` with real runtime formatting, and the vetted ``extern`` adapter
   ABI that lets compiled C drive an embedded CPython.
 
@@ -39,7 +43,9 @@ What is rejected
 ----------------
 Floating point in C, ``struct``/``union``/``enum``/``typedef`` definitions,
 function pointers, variadic user functions, globals with static storage, the
-preprocessor beyond a handful of ignorable ``#include``s, and recursion.
+preprocessor beyond a handful of ignorable ``#include``s, more than eight
+arguments to a function (py2bin passes arguments only in registers), and
+recursion on the targets that have no call ABI yet.
 """
 
 from __future__ import annotations
@@ -48,11 +54,14 @@ import dataclasses
 import re
 
 from .native.frontend import _CABI_RESULT_WIDTH, _CABI_RESULTS, _CABI_SYMBOLS
+from .native.compiler import CALL_CAPABLE_TARGETS
 from .native.ir import (
+    Call as IRCall,
     CStringConstant,
     Exit,
     ExitValue,
     ExternCall,
+    Function as IRFunction,
     HeapLoad,
     HeapStore,
     IntBinary,
@@ -66,6 +75,7 @@ from .native.ir import (
     Label,
     Module,
     Operation,
+    Return as IRReturn,
     SlotAddress,
     Store,
     Write,
@@ -799,7 +809,10 @@ class Function:
     name: str
     result: CType
     parameters: list[tuple[CType, str]]
-    body: Compound
+    #: ``None`` while only a prototype has been seen. py2bin has no linker, so a
+    #: prototype that never acquires a body cannot be called -- but declaring
+    #: one is still the ordinary way to write mutual recursion in C.
+    body: Compound | None
     token: Token
 
 
@@ -872,7 +885,8 @@ _UNSUPPORTED_KEYWORDS = {
     "_Complex": "complex types are not implemented",
     "_Atomic": "atomic types are not implemented; py2bin emits no atomic instructions",
     "_Thread_local": "thread-local storage is not implemented",
-    "inline": "the 'inline' specifier is not accepted; every function is inlined",
+    "inline": "the 'inline' specifier is not accepted; py2bin decides for itself "
+    "whether a call is a real call or an inlined body",
 }
 
 
@@ -996,8 +1010,14 @@ class Parser:
                 continue
             return base
 
-    def declarator(self, base: CType, *, abstract: bool = False) -> tuple[CType, str]:
-        """Parse ``*name[N]...`` and return the full type plus the name."""
+    def declarator(
+        self, base: CType, *, abstract: bool = False, optional: bool = False
+    ) -> tuple[CType, str]:
+        """Parse ``*name[N]...`` and return the full type plus the name.
+
+        ``optional`` accepts either form, which is what a prototype's parameter
+        list needs: ``int f(int, int *);`` names nothing, ``int f(int a);`` does.
+        """
 
         base = self.pointer_suffix(base)
         if self.at("("):
@@ -1006,7 +1026,7 @@ class Parser:
                 "implemented; py2bin's native IR has no indirect call"
             )
         name = ""
-        if not abstract:
+        if not abstract and not (optional and self.token.kind != "identifier"):
             name = str(self.identifier().value)
         if self.at("("):
             self.error(
@@ -1343,7 +1363,7 @@ class Parser:
                     if self.at("..."):
                         self.error("variadic user functions are not implemented")
                     parameter_type, parameter_name = self.declarator(
-                        self.type_specifier()
+                        self.type_specifier(), optional=True
                     )
                     if isinstance(parameter_type, ArrayType):
                         # A parameter of array type is adjusted to a pointer.
@@ -1352,14 +1372,21 @@ class Parser:
                     if self.accept(")"):
                         break
                     self.take(",")
-        if self.accept(";"):
-            self.error(
-                f"a forward declaration of {name!r} has no body; py2bin inlines "
-                "every call, so each function must be defined before it is used",
-                name_token,
-            )
-        if name in self.functions or name in self.externs:
+        if name in self.externs:
             self.error(f"{name!r} is already declared", name_token)
+        previous = self.functions.get(name)
+        if previous is not None:
+            self.check_redeclaration(previous, result, parameters, name_token)
+        if self.accept(";"):
+            # A prototype. It carries no body, and repeating it is legal C as
+            # long as the signature agrees, which check_redeclaration enforced.
+            if previous is None:
+                self.functions[name] = Function(
+                    name, result, parameters, None, name_token
+                )
+            return
+        if previous is not None and previous.body is not None:
+            self.error(f"{name!r} is already defined", name_token)
         seen: set[str] = set()
         for parameter_type, parameter_name in parameters:
             if not parameter_name:
@@ -1369,8 +1396,43 @@ class Parser:
             seen.add(parameter_name)
             if isinstance(parameter_type, VoidType):
                 self.error("a parameter cannot have type void", name_token)
+        # The signature is registered before the body is parsed so that the
+        # function's own name -- and any name a prototype introduced -- resolves
+        # inside it. That is what makes direct and mutual recursion parseable.
+        self.functions[name] = Function(name, result, parameters, None, name_token)
         body = self.compound_statement()
         self.functions[name] = Function(name, result, parameters, body, name_token)
+
+    def check_redeclaration(
+        self,
+        previous: Function,
+        result: CType,
+        parameters: list[tuple[CType, str]],
+        name_token: Token,
+    ) -> None:
+        """C requires a redeclaration to agree with what came before."""
+
+        if previous.result != result:
+            self.error(
+                f"{previous.name!r} was declared to return {previous.result} and is "
+                f"now declared to return {result}",
+                name_token,
+            )
+        if len(previous.parameters) != len(parameters):
+            self.error(
+                f"{previous.name!r} was declared with {len(previous.parameters)} "
+                f"parameter(s) and is now declared with {len(parameters)}",
+                name_token,
+            )
+        for position, ((old, _old_name), (new, _new_name)) in enumerate(
+            zip(previous.parameters, parameters), 1
+        ):
+            if old != new:
+                self.error(
+                    f"parameter {position} of {previous.name!r} was declared "
+                    f"{old} and is now declared {new}",
+                    name_token,
+                )
 
     def extern_prototype(self) -> None:
         """``extern TYPE name(TYPE, ...);`` bound to py2bin's vetted adapter ABI.
@@ -1697,15 +1759,15 @@ def _compare(operator: str, left: IntExpression, right: IntExpression) -> IntExp
 def _contains_call(value: object) -> bool:
     """True when an IR expression embeds a call, so re-emitting it would repeat it.
 
-    ``Lowerer.extern_call`` pins every call in a slot as soon as it is lowered,
-    so nothing this compiler builds should ever trip this check. It stays as the
-    guard on the two places that reuse an expression -- the address of a
-    read-modify-write target -- because the failure it prevents (a call happening
-    twice because its value appeared twice in a tree) is the defect this backend
-    has produced most often.
+    ``Lowerer.extern_call`` and ``Lowerer.direct_call`` pin every call in a slot
+    as soon as it is lowered, so nothing this compiler builds should ever trip
+    this check. It stays as the guard on the two places that reuse an expression
+    -- the address of a read-modify-write target -- because the failure it
+    prevents (a call happening twice because its value appeared twice in a tree)
+    is the defect this backend has produced most often.
     """
 
-    if isinstance(value, ExternCall):
+    if isinstance(value, (ExternCall, IRCall)):
         return True
     if isinstance(value, (tuple, list)):
         return any(_contains_call(item) for item in value)
@@ -1742,6 +1804,9 @@ class FunctionContext:
     result_slot: int | None
     return_label: str
     is_main: bool
+    #: True while lowering a body that will become a real IR ``Function``, so a
+    #: ``return`` becomes a machine return instead of a store-and-jump.
+    call_body: bool = False
     labels: dict[str, str] = dataclasses.field(default_factory=dict)
     defined: set[str] = dataclasses.field(default_factory=set)
     pending: list[tuple[str, Token]] = dataclasses.field(default_factory=list)
@@ -1778,6 +1843,11 @@ _LENGTHS = {
 
 _MAXIMUM_SLOTS = 4000
 
+#: py2bin's call ABI passes every argument in a register. AAPCS64 has eight
+#: integer parameter registers, and stack argument passing is not implemented,
+#: so a longer parameter list is rejected rather than silently truncated.
+_MAXIMUM_ARGUMENTS = 8
+
 
 class Lowerer:
     """Lowers a parsed translation unit to py2bin's native IR."""
@@ -1796,6 +1866,13 @@ class Lowerer:
         self.functions: list[FunctionContext] = []
         self.active: list[str] = []
         self.buffer_slot: int | None = None
+        # Real calls: every function reached from main, lowered once into its
+        # own IR body, plus the set currently being lowered so a call that
+        # arrives while its own body is still open (that is, recursion) emits a
+        # call rather than trying to lower the body a second time.
+        self.calls_are_real = target in CALL_CAPABLE_TARGETS
+        self.lowered: dict[str, IRFunction] = {}
+        self.lowering: set[str] = set()
 
     # --- bookkeeping ---
 
@@ -2383,10 +2460,25 @@ class Lowerer:
         function = self.unit.functions.get(node.name)
         if function is None:
             self.error(
-                f"call to {node.name!r}, which is not a function defined above this "
-                "point or a declared extern",
+                f"call to {node.name!r}, which is not a function declared in this "
+                "translation unit or a declared extern",
                 node.token,
             )
+        if function.body is None:
+            self.error(
+                f"call to {node.name!r}, which is declared but never defined; "
+                "py2bin has no linker, so the body of every function a program "
+                "calls has to be in this translation unit",
+                node.token,
+            )
+        if function.name == "main":
+            self.error(
+                "py2bin's C compiler does not support calling main(): it is the "
+                "process entry point, and its 'return' exits the process",
+                node.token,
+            )
+        if self.calls_are_real:
+            return self.direct_call(function, node)
         return self.inline(function, node)
 
     def extern_call(self, node: Call, *, discarded: bool) -> Value:
@@ -2459,14 +2551,11 @@ class Lowerer:
         declared = self.unit.externs[name]
         return Value(declared, self.fit(IntLoad(slot), declared))
 
-    def inline(self, function: Function, node: Call) -> Value:
-        if function.name in self.active:
-            self.error(
-                f"recursive call to {function.name}(): py2bin's native IR has no "
-                "call instruction, so every function is inlined and recursion "
-                "cannot be expressed",
-                node.token,
-            )
+    def prepare_arguments(
+        self, function: Function, node: Call
+    ) -> list[IntExpression]:
+        """Check the argument count and convert each argument to its parameter."""
+
         if len(node.arguments) != len(function.parameters):
             self.error(
                 f"{function.name}() takes {len(function.parameters)} argument(s), "
@@ -2477,13 +2566,132 @@ class Lowerer:
         for position, (argument, (parameter_type, _name)) in enumerate(
             zip(node.arguments, function.parameters), 1
         ):
-            expression = self.assign_convert(
-                self.rvalue(argument),
-                parameter_type,
-                argument.token,
-                f"argument {position} of {function.name}()",
+            prepared.append(
+                self.assign_convert(
+                    self.rvalue(argument),
+                    parameter_type,
+                    argument.token,
+                    f"argument {position} of {function.name}()",
+                )
             )
-            prepared.append(expression)
+        return prepared
+
+    # --- real calls --------------------------------------------------------
+    #
+    # On a target whose encoder implements the call ABI, a call is a call: the
+    # callee is lowered once into its own IR Function with its own frame, and
+    # the call site branches to it. Recursion then costs nothing special -- the
+    # body being lowered simply refers to itself by name.
+
+    def direct_call(self, function: Function, node: Call) -> Value:
+        if len(function.parameters) > _MAXIMUM_ARGUMENTS:
+            self.error(
+                f"{function.name}() takes {len(function.parameters)} parameters; "
+                f"py2bin's call ABI passes at most {_MAXIMUM_ARGUMENTS} arguments "
+                "in registers and does not implement stack arguments",
+                node.token,
+            )
+        prepared = self.prepare_arguments(function, node)
+        self.lower_callee(function)
+        call = IRCall(function.name, tuple(prepared))
+        # Pin the result in a slot at once. Everything downstream may re-read a
+        # value any number of times, and re-emitting a call expression would
+        # make the call happen again -- the defect this backend has produced
+        # more often than any other.
+        slot = self.new_temp()
+        self.emit(Store(slot, call))
+        if isinstance(function.result, VoidType):
+            return Value(VOID, IntConstant(0))
+        return Value(function.result, self.fit(IntLoad(slot), function.result))
+
+    def lower_callee(self, function: Function) -> None:
+        """Lower ``function`` into its own IR body, once.
+
+        A call that arrives while the callee's own body is still being lowered
+        is exactly what recursion is; the name is already reserved, so it just
+        returns and the call site emits its branch.
+        """
+
+        if function.name in self.lowered or function.name in self.lowering:
+            return
+        assert function.body is not None
+        self.lowering.add(function.name)
+        saved = (
+            self.operations,
+            self.stack_slots,
+            self.scopes,
+            self.buffer_slot,
+            self.break_targets,
+            self.continue_targets,
+            self.switches,
+            self.functions,
+        )
+        self.operations = []
+        self.stack_slots = 0
+        self.scopes = [{}]
+        self.buffer_slot = None
+        self.break_targets = []
+        self.continue_targets = []
+        self.switches = []
+        self.functions = []
+        try:
+            for parameter_type, name in function.parameters:
+                local = self.declare(name, parameter_type, function.token)
+                if local.slot != self.stack_slots - 1:
+                    raise AssertionError(
+                        "a parameter must occupy exactly one stack slot"
+                    )
+            if self.stack_slots != len(function.parameters):
+                raise AssertionError("parameter slots must be slots 0..n-1")
+            context = FunctionContext(
+                function,
+                None,
+                self.new_label(f"return_{function.name}"),
+                False,
+                call_body=True,
+            )
+            self.functions.append(context)
+            self.block(function.body)
+            self.functions.pop()
+            self.check_labels(context)
+            # Falling off the end of a non-void function is undefined in C.
+            # Returning a defined 0 is the one choice that cannot surprise:
+            # nothing is left to run off the end of the body into.
+            self.emit(
+                IRReturn(
+                    None if isinstance(function.result, VoidType) else IntConstant(0)
+                )
+            )
+            body = IRFunction(
+                function.name,
+                len(function.parameters),
+                self.stack_slots,
+                self.operations,
+            )
+        finally:
+            (
+                self.operations,
+                self.stack_slots,
+                self.scopes,
+                self.buffer_slot,
+                self.break_targets,
+                self.continue_targets,
+                self.switches,
+                self.functions,
+            ) = saved
+            self.lowering.discard(function.name)
+        self.lowered[function.name] = body
+
+    def inline(self, function: Function, node: Call) -> Value:
+        if function.name in self.active:
+            self.error(
+                f"recursive call to {function.name}(): py2bin's call ABI is not "
+                f"implemented for target {self.target!r}, so every function is "
+                "inlined there and recursion cannot be expressed; the targets "
+                f"that do support it are {', '.join(sorted(CALL_CAPABLE_TARGETS))}",
+                node.token,
+            )
+        prepared = self.prepare_arguments(function, node)
         self.scopes.append({})
         for (parameter_type, name), expression in zip(function.parameters, prepared):
             local = self.declare(name, parameter_type, node.token)
@@ -2862,6 +3070,9 @@ class Lowerer:
                     f"{context.function.result}, so 'return' needs a value",
                     node.token,
                 )
+            if context.call_body:
+                self.emit(IRReturn(None))
+                return
             self.emit(Jump(context.return_label))
             return
         if isinstance(context.function.result, VoidType):
@@ -2875,6 +3086,9 @@ class Lowerer:
         )
         if context.is_main:
             self.emit(ExitValue(stored))
+            return
+        if context.call_body:
+            self.emit(IRReturn(stored))
             return
         assert context.result_slot is not None
         self.emit(Store(context.result_slot, stored))
@@ -3135,6 +3349,11 @@ class Lowerer:
             self.error(
                 "the entry point must have the exact form int main(void)", main.token
             )
+        if main.body is None:
+            self.error(
+                "main() is declared but never defined in this translation unit",
+                main.token,
+            )
         self.scopes.append({})
         context = FunctionContext(main, None, self.new_label("return_main"), True)
         self.functions.append(context)
@@ -3147,7 +3366,7 @@ class Lowerer:
         # C99: falling off the end of main returns 0.
         self.emit(Exit(0))
         self.scopes.pop()
-        return Module(self.operations, self.stack_slots)
+        return Module(self.operations, self.stack_slots, list(self.lowered.values()))
 
 
 def _is_character(ctype: CType) -> bool:

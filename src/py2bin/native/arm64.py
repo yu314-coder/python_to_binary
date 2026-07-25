@@ -4,6 +4,7 @@ import struct
 from dataclasses import dataclass, field
 
 from .ir import (
+    Call,
     CStringConstant,
     Exit,
     ExitValue,
@@ -16,6 +17,7 @@ from .ir import (
     FloatStore,
     FloatToInt,
     FloatUnary,
+    Function,
     HeapAlloc,
     HeapInit,
     HeapLoad,
@@ -31,6 +33,7 @@ from .ir import (
     JumpIfFalse,
     Label,
     Module,
+    Return,
     SlotAddress,
     Store,
     Write,
@@ -108,6 +111,23 @@ def _frame_sub(amount: int) -> list[int]:
     return words
 
 
+def _frame_add(amount: int) -> list[int]:
+    """Lower ``add sp, sp, #amount``, the mirror image of :func:`_frame_sub`."""
+
+    if amount == 0:
+        return []
+    if amount < 0 or amount > 0xFFF + (0xFFF << 12):
+        raise ValueError("ARM64 native stack frame exceeds immediate range")
+    words: list[int] = []
+    high = amount >> 12
+    if high:
+        words.append(0x914003FF | (high << 10))  # add sp, sp, #high, lsl #12
+    low = amount & 0xFFF
+    if low:
+        words.append(0x910003FF | (low << 10))  # add sp, sp, #low
+    return words
+
+
 def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> int:
     offset = slot_base + slot * 8
     if offset < 0 or offset > 0x7FF8 or offset & 7:
@@ -166,11 +186,14 @@ class _Refs:
     ``strings`` records ``(word_index, data, register)`` for ADR loads of
     embedded constant byte blobs; ``externs`` records ``(word_index, symbol)``
     for each ``adrp x16``/``ldr x16``/``blr x16`` GOT call site so the Mach-O
-    writer can point it at the bound symbol pointer.
+    writer can point it at the bound symbol pointer. ``calls`` records
+    ``(word_index, function name)`` for each internal ``bl``, patched with the
+    real displacement once every body's offset in ``.text`` is known.
     """
 
     strings: list[tuple[int, bytes, int]] = field(default_factory=list)
     externs: list[tuple[int, str]] = field(default_factory=list)
+    calls: list[tuple[int, str]] = field(default_factory=list)
 
 
 def _external_call(
@@ -203,6 +226,50 @@ def _external_call(
         words.append(0x2A0003E0)  # mov w0, w0 (zero-extends into x0)
 
 
+#: The maximum number of arguments an internal call passes. AAPCS64 gives eight
+#: integer parameter registers; anything past that has to be passed on the
+#: stack, which this backend does not implement and therefore rejects.
+ARM64_ARGUMENT_REGISTERS = 8
+
+#: Label name reserved for a function's epilogue. Every ``Return`` branches
+#: here rather than duplicating the teardown. The character is not producible
+#: by any frontend label, so it cannot collide with an IR label.
+_EPILOGUE = "\0epilogue"
+
+
+def _internal_call(
+    words: list[int], expression: "Call", slot_base: int, refs: "_Refs | None"
+) -> None:
+    """Emit an AAPCS64 call to another function in this image.
+
+    Each argument is evaluated into X0 and immediately spilled to a 16-byte
+    stack cell, because evaluating the next one would otherwise clobber it (the
+    expression encoder owns X0-X2 outright). The cells are then popped into
+    X0-X7 in reverse, which both keeps SP 16-byte aligned throughout and leaves
+    SP exactly where it started before the ``bl``.
+    """
+
+    if refs is None:
+        raise ValueError(
+            "ARM64 internal calls are not supported by this encoder; the "
+            "call-capable encoders are encode_darwin/encode_darwin_extern and "
+            "encode_linux"
+        )
+    if len(expression.arguments) > ARM64_ARGUMENT_REGISTERS:
+        raise ValueError(
+            f"ARM64 internal calls pass at most {ARM64_ARGUMENT_REGISTERS} "
+            "arguments in registers"
+        )
+    for argument in expression.arguments:
+        _expression(words, argument, slot_base, refs)  # arg -> x0
+        words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+    for index in reversed(range(len(expression.arguments))):
+        words.append(0xF94003E0 | index)  # ldr x{index}, [sp]
+        words.append(0x910043FF)  # add sp, sp, #16
+    refs.calls.append((len(words), expression.name))
+    words.append(0)  # bl <function> (patched once every body offset is known)
+
+
 def _expression(
     words: list[int],
     expression: IntExpression,
@@ -231,6 +298,9 @@ def _expression(
         return
     if isinstance(expression, ExternCall):
         _external_call(words, expression, slot_base, refs)
+        return
+    if isinstance(expression, Call):
+        _internal_call(words, expression, slot_base, refs)
         return
     if isinstance(expression, IntUnary):
         _expression(words, expression.operand, slot_base, refs)
@@ -430,6 +500,10 @@ def encode_darwin_extern(
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
     """Encode calls through a Windows ARM64 import-address table."""
+    if module.functions:
+        raise ValueError(
+            "internal function calls are not supported for windows-arm64 yet"
+        )
     slot_base = 16
     words: list[int] = [
         *_frame_sub(_frame_bytes(module.stack_slots, slot_base)),
@@ -446,6 +520,10 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         function_references.append((index, symbol))
 
     for operation in module.operations:
+        if isinstance(operation, Return):
+            raise ValueError(
+                "internal function calls are not supported for windows-arm64 yet"
+            )
         if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
             raise ValueError(
                 "runtime heap lists/strings are not supported for windows-arm64 yet"
@@ -524,6 +602,170 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
     return bytes(image)
 
 
+@dataclass(frozen=True, slots=True)
+class _Syscalls:
+    """The three kernel entry points the syscall encoders need."""
+
+    write_number: int
+    exit_number: int
+    mmap_number: int
+    mmap_flags: int
+    svc: int
+
+    @property
+    def register(self) -> int:
+        """The register the kernel reads the syscall number from."""
+
+        return 8 if self.svc == 0xD4000001 else 16
+
+
+def _emit_operations(
+    words: list[int],
+    operations: list,
+    slot_base: int,
+    refs: _Refs,
+    system: _Syscalls,
+    *,
+    in_function: bool,
+) -> None:
+    """Encode one straight-line operation list into ``words``.
+
+    ``slot_base`` is the byte offset of stack slot 0 from X29, which differs
+    between the entry point (0) and a called function (16, because the saved
+    frame pointer and link register sit at the bottom of its frame).
+    """
+
+    syscall_register = system.register
+    labels: dict[str, int] = {}
+    branches: list[tuple[int, str, bool]] = []
+    for operation in operations:
+        if isinstance(operation, HeapInit):
+            # x0=addr=0, x1=len, x2=prot RW=3, x3=flags, x4=fd=-1, x5=off=0
+            words.extend(_mov(0, 0))
+            words.extend(_mov(1, operation.size))
+            words.extend(_mov(2, 3))
+            words.extend(_mov(3, system.mmap_flags))
+            words.extend(_mov(4, (-1) & 0xFFFFFFFFFFFFFFFF))
+            words.extend(_mov(5, 0))
+            words.extend(_mov(syscall_register, system.mmap_number))
+            words.append(system.svc)
+            words.append(_slot_instruction(False, operation.slot, slot_base))
+            continue
+        if isinstance(operation, HeapAlloc):
+            _expression(words, operation.size, slot_base, refs)  # x0 = size
+            words.append(_slot_instruction(True, operation.bump_slot, slot_base, rt=1))
+            words.append(_slot_instruction(False, operation.dest_slot, slot_base, rt=1))
+            words.append(0x8B000020)  # add x0, x1, x0  (new bump)
+            words.append(_slot_instruction(False, operation.bump_slot, slot_base))
+            continue
+        if isinstance(operation, HeapStore):
+            _expression(words, operation.address, slot_base, refs)  # x0 = address
+            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+            _expression(words, operation.value, slot_base, refs)  # x0 = value
+            words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16
+            instruction = _ARM64_STORES.get(operation.size)
+            if instruction is None:
+                raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
+            words.append(instruction)
+            continue
+        if isinstance(operation, WriteRuntime):
+            _expression(words, operation.length, slot_base, refs)  # x0 = length
+            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+            _expression(words, operation.address, slot_base, refs)  # x0 = address
+            words.append(0xAA0003E1)  # mov x1, x0  (buf)
+            words.extend((0xF94003E2, 0x910043FF))  # ldr x2,[sp]; add sp,#16
+            words.extend(_mov(0, 1))  # fd = stdout
+            words.extend(_mov(syscall_register, system.write_number))
+            words.append(system.svc)
+            continue
+        if isinstance(operation, Write):
+            words.extend(_mov(0, operation.fd))
+            adr_index = len(words)
+            words.append(0)
+            refs.strings.append((adr_index, operation.data, 1))
+            words.extend(_mov(2, len(operation.data)))
+            words.extend(_mov(syscall_register, system.write_number))
+            words.append(system.svc)
+        elif isinstance(operation, Store):
+            _expression(words, operation.value, slot_base, refs)
+            words.append(_slot_instruction(False, operation.slot, slot_base))
+        elif isinstance(operation, FloatStore):
+            _float_expression(words, operation.value, slot_base, refs)
+            words.append(_float_slot_instruction(False, operation.slot, slot_base))
+        elif isinstance(operation, Label):
+            labels[operation.name] = len(words)
+        elif isinstance(operation, Jump):
+            branches.append((len(words), operation.target, False))
+            words.append(0)
+        elif isinstance(operation, JumpIfFalse):
+            _expression(words, operation.condition, slot_base, refs)
+            branches.append((len(words), operation.target, True))
+            words.append(0)
+        elif isinstance(operation, Exit):
+            words.extend(_mov(0, operation.status))
+            words.extend(_mov(syscall_register, system.exit_number))
+            words.append(system.svc)
+        elif isinstance(operation, ExitValue):
+            _expression(words, operation.value, slot_base, refs)
+            words.extend(_mov(syscall_register, system.exit_number))
+            words.append(system.svc)
+        elif isinstance(operation, Return):
+            if not in_function:
+                raise ValueError(
+                    "a native IR Return is only legal inside a Function body"
+                )
+            if operation.value is not None:
+                _expression(words, operation.value, slot_base, refs)  # x0 = result
+            branches.append((len(words), _EPILOGUE, False))
+            words.append(0)
+        else:
+            raise TypeError(f"unknown ARM64 operation {type(operation).__name__}")
+    if in_function:
+        labels[_EPILOGUE] = len(words)
+    _patch_branches(words, labels, branches)
+
+
+def _emit_function(
+    words: list[int], function: Function, refs: _Refs, system: _Syscalls
+) -> None:
+    """Encode one callable body with a real AAPCS64 frame.
+
+    The frame is a single fixed allocation holding the saved ``x29``/``x30``
+    pair at its base and the function's stack slots above them, so slot 0 lives
+    at ``[x29, #16]``. Building the frame with one ``sub sp`` and saving the
+    pair at offset 0 (rather than the more familiar pre-indexed ``stp``) keeps
+    the layout identical for a two-slot frame and a 32 KiB one: the pre-indexed
+    form's 7-bit immediate cannot reach past 504 bytes, and a C function with a
+    local array routinely needs more than that.
+    """
+
+    if function.parameters > ARM64_ARGUMENT_REGISTERS:
+        raise ValueError(
+            f"ARM64 function {function.name!r} declares {function.parameters} "
+            f"parameters; at most {ARM64_ARGUMENT_REGISTERS} are passed in registers"
+        )
+    if function.parameters > function.stack_slots:
+        raise ValueError(
+            f"ARM64 function {function.name!r} has fewer stack slots than parameters"
+        )
+    frame = _frame_bytes(function.stack_slots, 16)
+    words.extend(_frame_sub(frame))
+    words.append(0xA9007BFD)  # stp x29, x30, [sp]   (save the CALLER's frame)
+    words.append(0x910003FD)  # mov x29, sp
+    for index in range(function.parameters):
+        # Spill the incoming argument registers into the slots the body reads.
+        words.append(_slot_instruction(False, index, 16, rt=index))
+    _emit_operations(
+        words, function.operations, 16, refs, system, in_function=True
+    )
+    # Epilogue. SP is restored from X29 rather than adjusted, so the frame is
+    # sound even though the expression encoder pushes and pops SP freely.
+    words.append(0x910003BF)  # mov sp, x29
+    words.append(0xA9407BFD)  # ldp x29, x30, [sp]
+    words.extend(_frame_add(frame))
+    words.append(0xD65F03C0)  # ret
+
+
 def _encode(
     module: Module,
     code_address: int,
@@ -539,91 +781,27 @@ def _encode(
     ``(byte_offset_in_text, symbol)`` pairs (empty unless the module contains
     ``ExternCall`` operations, which only the darwin dynamic path allows).
     """
-    syscall_register = 8 if svc == 0xD4000001 else 16
+    system = _Syscalls(write_number, exit_number, mmap_number, mmap_flags, svc)
     words: list[int] = list(_frame_sub(_frame_bytes(module.stack_slots)))
     words.append(0x910003FD)  # mov x29, sp
     refs = _Refs()
-    string_references = refs.strings
-    labels: dict[str, int] = {}
-    branches: list[tuple[int, str, bool]] = []
-    for operation in module.operations:
-        if isinstance(operation, HeapInit):
-            # x0=addr=0, x1=len, x2=prot RW=3, x3=flags, x4=fd=-1, x5=off=0
-            words.extend(_mov(0, 0))
-            words.extend(_mov(1, operation.size))
-            words.extend(_mov(2, 3))
-            words.extend(_mov(3, mmap_flags))
-            words.extend(_mov(4, (-1) & 0xFFFFFFFFFFFFFFFF))
-            words.extend(_mov(5, 0))
-            words.extend(_mov(syscall_register, mmap_number))
-            words.append(svc)
-            words.append(_slot_instruction(False, operation.slot, 0))  # str x0,[x29,#slot]
-            continue
-        if isinstance(operation, HeapAlloc):
-            _expression(words, operation.size, 0, refs)  # x0 = size (already 8-aligned)
-            words.append(_slot_instruction(True, operation.bump_slot, 0, rt=1))  # x1=bump
-            words.append(_slot_instruction(False, operation.dest_slot, 0, rt=1))  # dest=bump
-            words.append(0x8B000020)  # add x0, x1, x0  (new bump)
-            words.append(_slot_instruction(False, operation.bump_slot, 0))  # bump=x0
-            continue
-        if isinstance(operation, HeapStore):
-            _expression(words, operation.address, 0, refs)  # x0 = address
-            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-            _expression(words, operation.value, 0, refs)  # x0 = value
-            words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16 (x1=address)
-            instruction = _ARM64_STORES.get(operation.size)
-            if instruction is None:
-                raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
-            words.append(instruction)
-            continue
-        if isinstance(operation, WriteRuntime):
-            _expression(words, operation.length, 0, refs)  # x0 = length
-            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-            _expression(words, operation.address, 0, refs)  # x0 = address
-            words.append(0xAA0003E1)  # mov x1, x0  (buf)
-            words.extend((0xF94003E2, 0x910043FF))  # ldr x2,[sp]; add sp,#16 (x2=length)
-            words.extend(_mov(0, 1))  # fd = stdout
-            words.extend(_mov(syscall_register, write_number))
-            words.append(svc)
-            continue
-        if isinstance(operation, Write):
-            words.extend(_mov(0, operation.fd))
-            adr_index = len(words)
-            words.append(0)
-            string_references.append((adr_index, operation.data, 1))
-            words.extend(_mov(2, len(operation.data)))
-            syscall_register = 8 if svc == 0xD4000001 else 16
-            words.extend(_mov(syscall_register, write_number))
-            words.append(svc)
-        elif isinstance(operation, Store):
-            _expression(words, operation.value, 0, refs)
-            words.append(_slot_instruction(False, operation.slot, 0))
-        elif isinstance(operation, FloatStore):
-            _float_expression(words, operation.value, 0, refs)
-            words.append(_float_slot_instruction(False, operation.slot, 0))
-        elif isinstance(operation, Label):
-            labels[operation.name] = len(words)
-        elif isinstance(operation, Jump):
-            branches.append((len(words), operation.target, False))
-            words.append(0)
-        elif isinstance(operation, JumpIfFalse):
-            _expression(words, operation.condition, 0, refs)
-            branches.append((len(words), operation.target, True))
-            words.append(0)
-        elif isinstance(operation, Exit):
-            words.extend(_mov(0, operation.status))
-            syscall_register = 8 if svc == 0xD4000001 else 16
-            words.extend(_mov(syscall_register, exit_number))
-            words.append(svc)
-        elif isinstance(operation, ExitValue):
-            _expression(words, operation.value, 0, refs)
-            syscall_register = 8 if svc == 0xD4000001 else 16
-            words.extend(_mov(syscall_register, exit_number))
-            words.append(svc)
-    _patch_branches(words, labels, branches)
+    _emit_operations(words, module.operations, 0, refs, system, in_function=False)
+    offsets: dict[str, int] = {}
+    for function in module.functions:
+        if function.name in offsets:
+            raise ValueError(f"duplicate native IR function {function.name!r}")
+        offsets[function.name] = len(words)
+        _emit_function(words, function, refs, system)
+    for instruction_index, name in refs.calls:
+        if name not in offsets:
+            raise ValueError(f"call to undefined native IR function {name!r}")
+        distance = offsets[name] - instruction_index
+        if not -(1 << 25) <= distance < (1 << 25):
+            raise ValueError("ARM64 call is outside branch range")
+        words[instruction_index] = 0x94000000 | (distance & 0x3FFFFFF)
     externs = [(index * 4, symbol) for index, symbol in refs.externs]
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
-    for instruction_index, data, register in string_references:
+    for instruction_index, data, register in refs.strings:
         instruction_address = code_address + instruction_index * 4
         data_address = code_address + len(image)
         struct.pack_into(

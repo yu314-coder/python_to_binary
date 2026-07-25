@@ -116,6 +116,14 @@ def _bytes_literal(data: bytes) -> str:
 def emit_ir_c(module: Module) -> str:
     """Serialize a complete optimized native module as deterministic C."""
 
+    if module.functions:
+        # The canonical form is one ``main``; it has no syntax for a callable
+        # body yet. Dropping the bodies silently would emit C that compiles and
+        # then behaves differently from the module it claims to represent.
+        raise ValueError(
+            "the canonical IR C form cannot represent a module with callable "
+            "functions yet"
+        )
     lines = [
         "/* py2bin canonical native IR C v1 */",
         "#include <stdio.h>",

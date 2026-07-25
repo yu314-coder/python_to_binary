@@ -228,7 +228,20 @@ def _contains_extern(value: object) -> bool:
 
 
 def _module_uses_extern(module: Module) -> bool:
-    return any(_contains_extern(operation) for operation in module.operations)
+    if any(_contains_extern(operation) for operation in module.operations):
+        return True
+    return any(
+        _contains_extern(operation)
+        for function in module.functions
+        for operation in function.operations
+    )
+
+
+#: Targets whose encoder implements the internal call ABI (a real frame with a
+#: saved link register, arguments in the platform argument registers, and a
+#: direct branch-and-link). Everything else must reject a module that contains
+#: a ``Function`` rather than emit a binary that cannot make the call.
+CALL_CAPABLE_TARGETS = frozenset({"darwin-arm64", "linux-arm64"})
 
 
 def _emit_native_module(
@@ -238,6 +251,18 @@ def _emit_native_module(
     target: str,
     app: bool,
 ) -> NativeResult:
+    if module.functions and target not in CALL_CAPABLE_TARGETS:
+        # The call ABI (frame with a saved link register, arguments in the
+        # platform argument registers, direct branch-and-link) is implemented
+        # by the ARM64 encoder only. Emitting anything for the other targets
+        # would produce a binary that cannot perform the call at all.
+        raise NativeCompileError(
+            entry,
+            ast.parse("pass").body[0],
+            f"function calls (and therefore recursion) are only supported for "
+            f"targets {', '.join(sorted(CALL_CAPABLE_TARGETS))} so far, not "
+            f"{target!r}",
+        )
     if target != "darwin-arm64" and _module_uses_extern(module):
         # Extern (adapter-ABI) symbol calls are only wired through real dyld
         # binding on darwin-arm64 so far. Rather than emit a binary that would

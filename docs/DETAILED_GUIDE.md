@@ -354,10 +354,12 @@ py2bin IR and handwritten x86-64/ARM64 instructions. `compile-c` runs py2bin's
 own C compiler, which accepts considerably more: the integer type zoo with C's
 conversions, local arrays, `&x`/`*p`/`a[i]` and pointer arithmetic, casts,
 `sizeof`, `++`/`--`, the comma operator, `/` and `%`, `do`/`while`,
-`switch`/`case` with fallthrough, `goto`, inlined functions, and `printf` with
-runtime formatting. C needing floating point, aggregates, function pointers,
-recursion, or the preprocessor still requires a conventional compiler and
-linker; py2bin does not secretly invoke GCC or Clang.
+`switch`/`case` with fallthrough, `goto`, functions (called through a real
+AAPCS64 call ABI on the ARM64 targets, so recursion works; inlined elsewhere),
+and `printf` with runtime formatting. C needing floating point, aggregates,
+function pointers, more than eight arguments, or the preprocessor still
+requires a conventional compiler and linker; py2bin does not secretly invoke
+GCC or Clang.
 
 Compatible bundles already preserve web content as files inside their
 compressed one-file payload. The freeze manifest now catalogs `.html`, `.htm`,
@@ -641,7 +643,7 @@ permanently out of reach of this tier.
   every one of them.
 - Opaque handles in locals, parameters, and return values; `== NULL` and
   `!= NULL` checks; `long long` arithmetic and control flow alongside them;
-  calls to your own functions, which are inlined.
+  calls to your own functions, including recursive ones.
 - Whatever the real interpreter does: importing `math`, calling a module
   function, building a `list`, taking `str()` of an object.
 - `PyImport_ImportModule` reaches any module already importable by that

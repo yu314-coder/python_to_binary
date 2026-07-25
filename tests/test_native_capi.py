@@ -447,6 +447,41 @@ class NativeCapiExecutionTests(unittest.TestCase):
             )
             return native
 
+    def test_a_recursive_helper_drives_cpython_from_its_own_frame(self):
+        """Recursion and the adapter ABI in one body.
+
+        Each frame makes GOT-indirect calls, which clobber the argument
+        registers and the link register, and then reads its own locals back --
+        so a frame that was not saved and restored shows up as a wrong sum.
+        1 + 2 + ... + 10 == 55.
+        """
+
+        native = self._build_and_compare(
+            """
+long long sum_via_python(long long n) {
+    PyObject *a;
+    PyObject *b;
+    PyObject *s;
+    long long r;
+    if (n == 0) { return 0; }
+    a = PyLong_FromLongLong(n);
+    b = PyLong_FromLongLong(sum_via_python(n - 1));
+    s = PyNumber_Add(a, b);
+    r = PyLong_AsLongLong(s);
+    Py_DecRef(a); Py_DecRef(b); Py_DecRef(s);
+    return r;
+}
+int main(void) {
+    long long r;
+    Py_Initialize();
+    r = sum_via_python(10);
+    Py_Finalize();
+    return r;
+}
+"""
+        )
+        self.assertEqual(native.returncode, 55)
+
     def test_building_adding_and_printing_python_objects(self):
         native = self._build_and_compare(
             "int main(void)\n"

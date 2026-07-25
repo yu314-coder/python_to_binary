@@ -5,7 +5,12 @@ import sys
 import tempfile
 import unittest
 
+import struct
+
 from py2bin.native import NativeCompileError, compile_all, compile_native, resolve_target
+from py2bin.native.arm64 import encode_darwin as encode_darwin_arm64
+from py2bin.native.compiler import compile_native_module
+from py2bin.native.ir import IntConstant, Module
 from py2bin.cli import main
 
 
@@ -761,3 +766,112 @@ class OperandEvaluatedOnceTests(unittest.TestCase):
             "raise SystemExit(int(y * 10))\n",
             25,
         )
+
+
+class Arm64CallAbiTests(unittest.TestCase):
+    """The call ABI at the encoder level, independent of any front end."""
+
+    @staticmethod
+    def _module(argument_count: int, callee_slots: int = 1):
+        from py2bin.native.ir import (
+            Call,
+            ExitValue,
+            Function,
+            IntConstant,
+            IntLoad,
+            Return,
+            Store,
+        )
+
+        call = Call(
+            "callee", tuple(IntConstant(index + 1) for index in range(argument_count))
+        )
+        return Module(
+            [Store(0, call), ExitValue(IntLoad(0))],
+            1,
+            [
+                Function(
+                    "callee",
+                    argument_count,
+                    max(callee_slots, argument_count),
+                    [Return(IntConstant(7))],
+                )
+            ],
+        )
+
+    def _words(self, code: bytes) -> list[int]:
+        return list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
+
+    def test_arguments_land_in_x0_through_x7(self):
+        words = self._words(encode_darwin_arm64(self._module(8), 0x100004000))
+        loads = [word for word in words if word & 0xFFFFFFF8 == 0xF94003E0]
+        self.assertEqual([word & 7 for word in loads[:8]], [7, 6, 5, 4, 3, 2, 1, 0])
+
+    def test_more_arguments_than_registers_is_refused_not_truncated(self):
+        with self.assertRaisesRegex(ValueError, "at most 8"):
+            encode_darwin_arm64(self._module(9), 0x100004000)
+
+    def test_the_branch_targets_the_callee_and_the_stack_is_aligned(self):
+        words = self._words(encode_darwin_arm64(self._module(3), 0x100004000))
+        branches = [
+            (index, word)
+            for index, word in enumerate(words)
+            if word & 0xFC000000 == 0x94000000
+        ]
+        self.assertEqual(len(branches), 1)
+        index, word = branches[0]
+        offset = word & 0x03FFFFFF
+        if offset & 0x02000000:
+            offset -= 1 << 26
+        target = index + offset
+        # The callee starts with its prologue: a frame, then the saved pair.
+        self.assertEqual(words[target + 1], 0xA9007BFD)  # stp x29, x30, [sp]
+        self.assertEqual(words[target + 2], 0x910003FD)  # mov x29, sp
+        # SP must be a multiple of 16 at the branch: every adjustment before it
+        # is a push or pop of one 16-byte cell.
+        depth = 0
+        for word in words[2:index]:  # words[0:2] are the entry point's own frame
+            if word & 0xFFC003FF == 0xD10003FF:  # sub sp, sp, #imm
+                depth -= (word >> 10) & 0xFFF
+            elif word & 0xFFC003FF == 0x910003FF:  # add sp, sp, #imm
+                depth += (word >> 10) & 0xFFF
+        self.assertEqual(depth % 16, 0)
+        self.assertEqual(depth, 0, "the argument spills must be popped before the call")
+
+    def test_the_callee_saves_and_restores_the_frame_and_returns(self):
+        module = self._module(1, callee_slots=4)
+        words = self._words(encode_darwin_arm64(module, 0x100004000))
+        self.assertEqual(words[-1], 0xD65F03C0)  # ret
+        self.assertEqual(words[-2], 0x910003FF | (48 << 10))  # add sp, sp, #48
+        self.assertEqual(words[-3], 0xA9407BFD)  # ldp x29, x30, [sp]
+        self.assertEqual(words[-4], 0x910003BF)  # mov sp, x29
+
+    def test_a_call_to_an_undefined_function_is_refused(self):
+        from py2bin.native.ir import Call, ExitValue, Store
+
+        module = Module([Store(0, Call("missing")), ExitValue(IntConstant(0))], 1)
+        with self.assertRaisesRegex(ValueError, "undefined native IR function"):
+            encode_darwin_arm64(module, 0x100004000)
+
+    def test_a_return_outside_a_function_body_is_refused(self):
+        from py2bin.native.ir import Return
+
+        module = Module([Return(IntConstant(1))], 0)
+        with self.assertRaisesRegex(ValueError, "only legal inside a Function"):
+            encode_darwin_arm64(module, 0x100004000)
+
+    def test_targets_without_a_call_abi_reject_the_module(self):
+        for target in ("windows-arm64", "windows-x86_64", "linux-x86_64", "darwin-x86_64"):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    with self.assertRaisesRegex(
+                        NativeCompileError, "function calls .*are only supported"
+                    ):
+                        compile_native_module(
+                            Path("call.py"),
+                            self._module(1),
+                            root / "call.bin",
+                            target=target,
+                            clean=True,
+                        )

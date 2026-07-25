@@ -253,6 +253,11 @@ def _patch_branches(
 
 def encode(module: Module, platform: str, code_address: int) -> bytes:
     """Encode native syscalls directly; no text assembly is produced."""
+    if module.functions:
+        raise ValueError(
+            "internal function calls (and therefore recursion) are not "
+            "implemented for x86-64 yet; the ARM64 backend implements them"
+        )
     if platform == "linux":
         write_number, exit_number = 1, 60
         mmap_number, mmap_flags = 9, 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
@@ -355,6 +360,11 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
     """Encode calls through a Windows x64 import-address table."""
+    if module.functions:
+        raise ValueError(
+            "internal function calls (and therefore recursion) are not "
+            "implemented for x86-64 yet; the ARM64 backend implements them"
+        )
     variable_base = 0x38
     code = bytearray(_sub_stack(_frame_bytes(module.stack_slots, variable_base)))
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp

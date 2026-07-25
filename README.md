@@ -30,11 +30,12 @@ It has seven deliberately separate execution paths. They must not be confused:
    implements the integer and pointer language: the whole integer type zoo with
    exact truncation and extension, local arrays, `&x`, `*p`, pointer
    arithmetic, casts, `sizeof`, `++`/`--`, `?:`, the comma operator, division
-   and remainder, `if`/`while`/`do`/`for`/`switch`/`goto`, functions (inlined),
-   and `printf`. It is not a general C, Cython-C, C++, NumPy C-API, ATen, or
-   CUDA compiler: floating point, structs, unions, enums, typedefs, function
-   pointers, recursion, and the preprocessor are rejected with a
-   file:line:column error rather than approximated. `compile-via-c` is the
+   and remainder, `if`/`while`/`do`/`for`/`switch`/`goto`, functions called
+   through a real machine call ABI on ARM64 (**recursion works** — direct,
+   deep, and mutual), and `printf`. It is not a general C, Cython-C, C++,
+   NumPy C-API, ATen, or CUDA compiler: floating point, structs, unions, enums,
+   typedefs, function pointers, more than eight arguments, and the preprocessor
+   are rejected with a file:line:column error rather than approximated. `compile-via-c` is the
    older, narrower bridge that round-trips py2bin's *own* generated C.
 7. **CPython C-API embedding (`darwin-arm64` only):** the same handwritten C
    frontend also accepts calls to a fixed, vetted list of exported CPython
@@ -712,15 +713,23 @@ integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
   operator, compound assignment, and signed/unsigned `/` and `%`;
 - `if`/`else`, `while`, `do`/`while`, `for`, `switch`/`case`/`default` with
   fallthrough, `break`, `continue`, `goto` with labels, and `return`;
-- functions, which are **inlined** at every call site, and `printf` with real
-  runtime formatting (`%d %i %u %x %X %c %s %%` with `h`/`hh`/`l`/`ll`/`z`).
+- functions. On `darwin-arm64` and `linux-arm64` a call is a **real machine
+  call**: an AAPCS64 frame with a saved link register, arguments in `x0`-`x7`,
+  and a direct `bl`, so **recursion works** — direct, deep (thousands of
+  frames), and mutual. On the targets whose encoder has no call ABI yet
+  (both x86-64 targets and `windows-arm64`) a call is still **inlined** at its
+  site and recursion is rejected there with a file:line:column error;
+- `printf` with real runtime formatting (`%d %i %u %x %X %c %s %%` with
+  `h`/`hh`/`l`/`ll`/`z`).
 
 py2bin's C is LP64 on all six targets and gives plain `char` the signed
 meaning Apple and x86 give it, so one source file produces the same values
 everywhere. It rejects — with a file:line:column error, never an
 approximation — floating point, `struct`, `union`, `enum`, `typedef`, function
-pointers, variadic user functions, file-scope variables, recursion (py2bin's IR
-has no call instruction), the preprocessor beyond a few ignorable `#include`s,
+pointers, variadic user functions, file-scope variables, functions with more
+than eight parameters (py2bin passes arguments only in registers), recursion on
+the targets with no call ABI, the preprocessor beyond a few ignorable
+`#include`s,
 arbitrary libc, Cython-generated C, the NumPy C-API, C++, ATen, and CUDA.
 The CPython C-API is accepted only as the fixed vetted symbol table
 described under [What the C-API path supports](#what-the-c-api-path-supports),

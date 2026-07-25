@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # --- signed 64-bit integer expressions ---------------------------------------
@@ -181,6 +181,28 @@ class ExternCall:
     result: str = "i64"
 
 
+# --- internal (same-image) calls ---------------------------------------------
+#
+# A ``Call`` names a ``Function`` defined in the same module and is lowered to a
+# genuine machine call: the arguments go in the platform's integer argument
+# registers, a link-register/return-address branch transfers control, and the
+# callee runs on its OWN stack frame. That last part is the whole point -- it is
+# what makes recursion expressible, which inlining never can be.
+
+
+@dataclass(frozen=True, slots=True)
+class Call:
+    """Call module-level function ``name``; the value is its i64 return.
+
+    ``arguments`` are i64/pointer values passed positionally. A backend that
+    cannot honour the call ABI must reject this node rather than approximate
+    it; there is no fallback to inlining at this level.
+    """
+
+    name: str
+    arguments: tuple["IntExpression", ...] = ()
+
+
 IntExpression = (
     IntConstant
     | IntLoad
@@ -193,6 +215,7 @@ IntExpression = (
     | HeapLoad
     | CStringConstant
     | ExternCall
+    | Call
 )
 FloatExpression = FloatConstant | FloatLoad | FloatUnary | FloatBinary | IntToFloat
 
@@ -294,6 +317,18 @@ class WriteRuntime:
     length: IntExpression
 
 
+@dataclass(frozen=True, slots=True)
+class Return:
+    """Return from the enclosing ``Function`` with ``value`` in the result register.
+
+    Only legal inside a ``Function`` body. ``value`` is ``None`` for a function
+    whose result is never read, in which case the result register holds an
+    unspecified value and the caller must not use it.
+    """
+
+    value: IntExpression | None = None
+
+
 Operation = (
     Write
     | Store
@@ -307,10 +342,31 @@ Operation = (
     | HeapAlloc
     | HeapStore
     | WriteRuntime
+    | Return
 )
+
+
+@dataclass(slots=True)
+class Function:
+    """A callable body with its own stack frame.
+
+    ``parameters`` incoming i64 arguments are delivered in the platform's
+    integer argument registers and stored, in order, into stack slots
+    ``0 .. parameters - 1`` of this function's frame before the body runs, so
+    the body reads them exactly like any other local. ``stack_slots`` counts
+    those parameter slots as well.
+    """
+
+    name: str
+    parameters: int
+    stack_slots: int
+    operations: list[Operation]
 
 
 @dataclass(slots=True)
 class Module:
     operations: list[Operation]
     stack_slots: int = 0
+    # Callable bodies referenced by ``Call``. The module's own ``operations``
+    # remain the entry point; these are laid out after it in the same section.
+    functions: list[Function] = field(default_factory=list)
