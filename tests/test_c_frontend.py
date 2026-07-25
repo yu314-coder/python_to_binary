@@ -1043,6 +1043,51 @@ int main(void) {
             stdout="0.100000001\n0.100000000\n",
         )
 
+    def test_many_conversions_share_one_formatter_and_return_to_their_sites(self):
+        # The formatter is a subroutine built out of the jumps the IR has, so
+        # the risk is a site returning to the WRONG place. Mixing shapes and
+        # cases in one statement, in a loop, and inside a called function
+        # exercises the return dispatch from every direction.
+        self.run_c(
+            _STDIO
+            + """
+void show(double value) { printf("[%g|%e]", value, value); }
+int main(void) {
+    int i;
+    printf("%f %e %g %F %E %G\\n", 1.5, 1.5, 1.5, 1.5, 1.5, 1.5);
+    for (i = 1; i <= 3; i++) { printf("%.1f,", (double)i / 2.0); }
+    printf("\\n");
+    show(0.5);
+    show(1500000.0);
+    printf("\\n");
+    return 0;
+}
+""",
+            stdout=(
+                "1.500000 1.500000e+00 1.5 1.500000 1.500000E+00 1.5\n"
+                "0.5,1.0,1.5,\n"
+                "[0.5|5.000000e-01][1.5e+06|1.500000e+06]\n"
+            ),
+        )
+
+    def test_the_formatter_is_emitted_once_per_body_not_once_per_conversion(self):
+        one = compile_c_to_ir(
+            _STDIO + 'int main(void) { printf("%f", 1.0); return 0; }\n',
+            "one.c",
+            "darwin-arm64",
+        )
+        many = compile_c_to_ir(
+            _STDIO
+            + "int main(void) {\n"
+            + "".join(f'    printf("%f", {index}.0);\n' for index in range(40))
+            + "    return 0;\n}\n",
+            "many.c",
+            "darwin-arm64",
+        )
+        # Forty conversions must cost forty short call sites, not forty copies
+        # of a formatter that is hundreds of operations long.
+        self.assertLess(len(many.operations), len(one.operations) + 40 * 20)
+
     def test_a_floating_conversion_evaluates_its_argument_once(self):
         self.run_c(
             _STDIO
@@ -2015,10 +2060,6 @@ class FloatingDifferentialTests(CProgramTestCase):
     not the algorithm here -- so agreeing with it on hundreds of cases,
     including random bit patterns, both extremes and the smallest subnormal, is
     real evidence rather than a restatement of this compiler's own arithmetic.
-
-    Each batch is its own program because the formatter is emitted once per
-    conversion, and a single translation unit with hundreds of them outgrows
-    the ARM64 literal-addressing range.
     """
 
     _FORMATS = (
@@ -2047,38 +2088,33 @@ class FloatingDifferentialTests(CProgramTestCase):
         return chosen
 
     def test_every_conversion_matches_a_correctly_rounded_reference(self):
-        values = self._values()
-        for start in range(0, len(values), 2):
-            batch = values[start : start + 2]
-            lines = []
-            expected = []
-            for value in batch:
-                # float.hex() is exact, so the C source names the same double
-                # the reference formatted -- no decimal round trip in between.
-                for form in self._FORMATS:
-                    lines.append(f'    printf("{form}\\n", {float.hex(value)});')
-                    expected.append(form % value)
-            source = (
-                _STDIO
-                + "int main(void) {\n"
-                + "\n".join(lines)
-                + "\n    return 0;\n}\n"
-            )
-            with self.subTest(values=[float.hex(value) for value in batch]):
-                artifact = self.build(source)
-                if not _HOST_IS_DARWIN_ARM64:
-                    continue
-                got = subprocess.run(
-                    [str(artifact)], capture_output=True, text=True
-                ).stdout.splitlines()
-                self.assertEqual(len(got), len(expected))
-                for index, (actual, want) in enumerate(zip(got, expected)):
-                    if actual != want:
-                        self.fail(
-                            f"{lines[index].strip()}\n"
-                            f"  got {actual!r}, a correctly rounded C printf "
-                            f"gives {want!r}"
-                        )
+        lines = []
+        expected = []
+        for value in self._values():
+            # float.hex() is exact, so the C source names the same double the
+            # reference formatted -- no decimal round trip in between.
+            for form in self._FORMATS:
+                lines.append(f'    printf("{form}\\n", {float.hex(value)});')
+                expected.append(form % value)
+        source = (
+            _STDIO + "int main(void) {\n" + "\n".join(lines) + "\n    return 0;\n}\n"
+        )
+        # All of it is one program, which also shows the formatter is emitted
+        # once per body rather than once per conversion.
+        artifact = self.build(source)
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        got = subprocess.run(
+            [str(artifact)], capture_output=True, text=True
+        ).stdout.splitlines()
+        self.assertEqual(len(got), len(expected))
+        for index, (actual, want) in enumerate(zip(got, expected)):
+            if actual != want:
+                self.fail(
+                    f"{lines[index].strip()}\n"
+                    f"  got {actual!r}, a correctly rounded C printf "
+                    f"gives {want!r}"
+                )
 
 
 class EncoderTests(unittest.TestCase):

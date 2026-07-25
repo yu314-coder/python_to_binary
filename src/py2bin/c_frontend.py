@@ -2373,6 +2373,12 @@ class Lowerer:
         self.digit_slot: int | None = None
         self.text_slot: int | None = None
         self.float_scratch: dict[str, int] = {}
+        # The shared floating formatter of the body being lowered: its entry
+        # label, the label its dispatch chain lives at, and every site that
+        # jumped into it and must be returned to.
+        self.float_entry: str | None = None
+        self.float_dispatch: str | None = None
+        self.float_returns: list[tuple[int, str]] = []
         # Real calls: every function reached from main, lowered once into its
         # own IR body, plus the set currently being lowered so a call that
         # arrives while its own body is still open (that is, recursion) emits a
@@ -3425,6 +3431,9 @@ class Lowerer:
             self.digit_slot,
             self.text_slot,
             self.float_scratch,
+            self.float_entry,
+            self.float_dispatch,
+            self.float_returns,
             self.break_targets,
             self.continue_targets,
             self.switches,
@@ -3437,6 +3446,9 @@ class Lowerer:
         self.digit_slot = None
         self.text_slot = None
         self.float_scratch = {}
+        self.float_entry = None
+        self.float_dispatch = None
+        self.float_returns = []
         self.break_targets = []
         self.continue_targets = []
         self.switches = []
@@ -3469,6 +3481,8 @@ class Lowerer:
                     None if isinstance(function.result, VoidType) else IntConstant(0)
                 )
             )
+            # After the return, so nothing can fall into it.
+            self.emit_float_dispatch()
             body = IRFunction(
                 function.name,
                 len(function.parameters),
@@ -3484,6 +3498,9 @@ class Lowerer:
                 self.digit_slot,
                 self.text_slot,
                 self.float_scratch,
+                self.float_entry,
+                self.float_dispatch,
+                self.float_returns,
                 self.break_targets,
                 self.continue_targets,
                 self.switches,
@@ -4137,6 +4154,12 @@ class Lowerer:
     #: live only inside the formatter's own straight-line code, and a program
     #: printing a dozen doubles would otherwise need a dozen copies of them.
     _FLOAT_SCRATCH = (
+        "argument",
+        "mode",
+        "given",
+        "figures_asked",
+        "upper",
+        "back",
         "bits",
         "sign",
         "exponent",
@@ -4181,7 +4204,80 @@ class Lowerer:
     def emit_floating(
         self, value: FloatExpression, style: str, precision: int
     ) -> None:
-        """Format one double for %f/%e/%g and write it, with no library at all.
+        """Format one double for %f/%e/%g and write it.
+
+        The formatter itself is emitted ONCE per function body and reached by a
+        jump, because it is some hundreds of IR operations and a program that
+        prints a table of numbers would otherwise carry a copy of it per
+        conversion. The shape, precision and case are passed in slots, and a
+        return identifier picks the site to jump back to -- a subroutine call
+        built out of the jumps the IR has, since it has no indirect branch.
+        """
+
+        _digits, _text, scratch = self.float_buffers()
+        if self.float_entry is None:
+            self.emit_float_formatter()
+        assert self.float_entry is not None
+        kind = style.lower()
+        self.emit(Store(scratch["argument"], FloatBits(value, 8)))
+        self.emit(
+            Store(scratch["mode"], IntConstant({"f": 0, "e": 1, "g": 2}[kind]))
+        )
+        self.emit(Store(scratch["given"], IntConstant(precision)))
+        # C reads a %g precision of zero as one significant digit.
+        self.emit(
+            Store(scratch["figures_asked"], IntConstant(max(1, precision)))
+        )
+        self.emit(
+            Store(
+                scratch["upper"],
+                IntConstant(1 if style in {"F", "E", "G"} else 0),
+            )
+        )
+        identifier = len(self.float_returns)
+        back = self.new_label("fp_back")
+        self.emit(Store(scratch["back"], IntConstant(identifier)))
+        self.emit(Jump(self.float_entry))
+        self.emit(Label(back))
+        self.float_returns.append((identifier, back))
+
+    def emit_float_dispatch(self) -> None:
+        """Close a body's shared formatter by returning to each of its sites.
+
+        This goes after the body's own exit or return, so nothing falls into
+        it, and every path into the formatter set ``back`` to one of the
+        identifiers below.
+        """
+
+        if self.float_entry is None or not self.float_returns:
+            return
+        assert self.float_dispatch is not None
+        back = self.float_scratch["back"]
+        self.emit(Label(self.float_dispatch))
+        for identifier, target in self.float_returns:
+            self.emit(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(back), IntConstant(identifier)),
+                    target,
+                )
+            )
+        # Unreachable: every site above stored one of those identifiers.
+        self.emit(Jump(self.float_returns[-1][1]))
+
+    def emit_float_formatter(self) -> None:
+        """Emit the shared formatter, jumped over so it is only ever entered."""
+
+        skip = self.new_label("fp_skip")
+        self.emit(Jump(skip))
+        self.float_entry = self.new_label("fp_formatter")
+        self.float_dispatch = self.new_label("fp_dispatch")
+        self.emit(Label(self.float_entry))
+        self.float_formatter()
+        self.emit(Jump(self.float_dispatch))
+        self.emit(Label(skip))
+
+    def float_formatter(self) -> None:
+        """Format the double in the ``argument`` slot, with no library at all.
 
         The conversion is EXACT, not approximate. Every finite double is
         ``M * 2**E`` with M below 2**53, and every such number has a finite
@@ -4202,14 +4298,15 @@ class Lowerer:
         where a program actually prints a floating value.
         """
 
-        upper = style in {"F", "E", "G"}
-        kind = style.lower()
-        # C reads a %g precision of zero as one significant digit.
-        significant = max(1, precision) if kind == "g" else 0
         digit_slot, text_slot, scratch = self.float_buffers()
         digits = SlotAddress(digit_slot)
         text = SlotAddress(text_slot)
 
+        argument = scratch["argument"]
+        mode = scratch["mode"]
+        given = scratch["given"]
+        significant = scratch["figures_asked"]
+        uppercase = scratch["upper"]
         bits = scratch["bits"]
         sign = scratch["sign"]
         exponent = scratch["exponent"]
@@ -4257,9 +4354,20 @@ class Lowerer:
             )
             store(written, _binary("add", IntLoad(written), IntConstant(1)))
 
-        def put_bytes(data: bytes) -> None:
+        def put_word(data: bytes) -> None:
+            """Append a word, lower-cased unless the conversion was uppercase.
+
+            ASCII sets bit 5 on the lower-case letters, so one runtime OR turns
+            the same constants into "inf"/"INF" and "nan"/"NAN".
+            """
+
+            fold = IntBinary(
+                "mul",
+                IntCompare("eq", IntLoad(uppercase), IntConstant(0)),
+                IntConstant(0x20),
+            )
             for byte in data:
-                put(IntConstant(byte))
+                put(_binary("or", IntConstant(byte), fold))
 
         def unless(condition: IntExpression, target: str) -> None:
             """Jump to ``target`` when ``condition`` is false."""
@@ -4270,7 +4378,7 @@ class Lowerer:
             return HeapLoad(where, 1, False)
 
         # --- take the value apart --------------------------------------
-        store(bits, FloatBits(value, 8))
+        store(bits, IntLoad(argument))
         store(sign, IntBinary("urshift", IntLoad(bits), IntConstant(63)))
         store(
             exponent,
@@ -4296,10 +4404,10 @@ class Lowerer:
         unless(IntCompare("eq", IntLoad(exponent), IntConstant(0x7FF)), finite)
         not_a_number = label("nan")
         unless(IntCompare("eq", IntLoad(mantissa), IntConstant(0)), not_a_number)
-        put_bytes(b"INF" if upper else b"inf")
+        put_word(b"INF")
         self.emit(Jump(emit_text))
         self.emit(Label(not_a_number))
-        put_bytes(b"NAN" if upper else b"nan")
+        put_word(b"NAN")
         self.emit(Jump(emit_text))
         self.emit(Label(finite))
 
@@ -4420,12 +4528,27 @@ class Lowerer:
         # 'cut' is how many of the least significant digits are dropped. %f
         # keeps a fixed number of them after the point; %e and %g keep a fixed
         # number of significant digits.
-        if kind == "f":
-            store(cut, _binary("sub", IntLoad(scale), IntConstant(precision)))
-        elif kind == "e":
-            store(cut, _binary("sub", IntLoad(length), IntConstant(precision + 1)))
-        else:
-            store(cut, _binary("sub", IntLoad(length), IntConstant(significant)))
+        fixed_cut = label("fixed_cut")
+        exponent_cut = label("exponent_cut")
+        chose_cut = label("chose_cut")
+        unless(IntCompare("eq", IntLoad(mode), IntConstant(0)), exponent_cut)
+        self.emit(Label(fixed_cut))
+        store(cut, _binary("sub", IntLoad(scale), IntLoad(given)))
+        self.emit(Jump(chose_cut))
+        self.emit(Label(exponent_cut))
+        unless(IntCompare("eq", IntLoad(mode), IntConstant(1)), general_cut := label("general_cut"))
+        store(
+            cut,
+            _binary(
+                "sub",
+                _binary("sub", IntLoad(length), IntLoad(given)),
+                IntConstant(1),
+            ),
+        )
+        self.emit(Jump(chose_cut))
+        self.emit(Label(general_cut))
+        store(cut, _binary("sub", IntLoad(length), IntLoad(significant)))
+        self.emit(Label(chose_cut))
         exact = label("exact")
         unless(IntCompare("gt", IntLoad(cut), IntConstant(0)), exact)
 
@@ -4578,41 +4701,39 @@ class Lowerer:
                 IntLoad(scale),
             ),
         )
-        if kind == "f":
-            store(form, IntConstant(0))
-            store(figures, IntConstant(precision))
-        elif kind == "e":
-            store(form, IntConstant(1))
-            store(figures, IntConstant(precision))
-        else:
-            # C11 7.21.6.1p8: %g uses %e when the exponent is below -4 or at
-            # least the precision, and %f otherwise, then drops trailing zeros.
-            fixed_form = label("fixed_form")
-            chosen = label("chosen")
-            unless(
-                IntBinary(
-                    "or",
-                    IntCompare("lt", IntLoad(decimal_exponent), IntConstant(-4)),
-                    IntCompare(
-                        "ge", IntLoad(decimal_exponent), IntConstant(significant)
-                    ),
-                ),
-                fixed_form,
-            )
-            store(form, IntConstant(1))
-            store(figures, IntConstant(significant - 1))
-            self.emit(Jump(chosen))
-            self.emit(Label(fixed_form))
-            store(form, IntConstant(0))
-            store(
-                figures,
-                _binary(
-                    "sub",
-                    IntConstant(significant - 1),
-                    IntLoad(decimal_exponent),
-                ),
-            )
-            self.emit(Label(chosen))
+        chosen = label("chosen")
+        general = label("general")
+        unless(IntCompare("ne", IntLoad(mode), IntConstant(2)), general)
+        # %f and %e keep the shape and precision they were written with.
+        store(form, IntLoad(mode))
+        store(figures, IntLoad(given))
+        self.emit(Jump(chosen))
+        self.emit(Label(general))
+        # C11 7.21.6.1p8: %g uses %e when the exponent is below -4 or at least
+        # the precision, and %f otherwise, then drops trailing zeros.
+        fixed_form = label("fixed_form")
+        unless(
+            IntBinary(
+                "or",
+                IntCompare("lt", IntLoad(decimal_exponent), IntConstant(-4)),
+                IntCompare("ge", IntLoad(decimal_exponent), IntLoad(significant)),
+            ),
+            fixed_form,
+        )
+        store(form, IntConstant(1))
+        store(figures, _binary("sub", IntLoad(significant), IntConstant(1)))
+        self.emit(Jump(chosen))
+        self.emit(Label(fixed_form))
+        store(form, IntConstant(0))
+        store(
+            figures,
+            _binary(
+                "sub",
+                _binary("sub", IntLoad(significant), IntConstant(1)),
+                IntLoad(decimal_exponent),
+            ),
+        )
+        self.emit(Label(chosen))
 
         def fraction(index_of: object) -> None:
             """Emit '.' and the fraction digits, reading 0 outside the array."""
@@ -4692,51 +4813,51 @@ class Lowerer:
         )
         self.emit(Label(after))
 
-        if kind == "g":
-            # Drop the trailing zeros, and the point when nothing follows it.
-            # There is always a digit before the point, so this cannot run off
-            # the front of the buffer.
-            kept = label("kept")
-            unless(IntCompare("gt", IntLoad(figures), IntConstant(0)), kept)
-            zeros = at("zeros")
-            zeros_end = label("zeros_end")
-            unless(
-                IntCompare(
-                    "eq",
-                    byte_at(
-                        _binary(
-                            "add", text, _binary("sub", IntLoad(written), IntConstant(1))
-                        )
-                    ),
-                    IntConstant(48),
+        # %g drops the trailing zeros, and the point when nothing follows
+        # it. There is always a digit before the point, so this cannot run
+        # off the front of the buffer.
+        kept = label("kept")
+        unless(IntCompare("eq", IntLoad(mode), IntConstant(2)), kept)
+        unless(IntCompare("gt", IntLoad(figures), IntConstant(0)), kept)
+        zeros = at("zeros")
+        zeros_end = label("zeros_end")
+        unless(
+            IntCompare(
+                "eq",
+                byte_at(
+                    _binary(
+                        "add", text, _binary("sub", IntLoad(written), IntConstant(1))
+                    )
                 ),
-                zeros_end,
-            )
-            store(written, _binary("sub", IntLoad(written), IntConstant(1)))
-            self.emit(Jump(zeros))
-            self.emit(Label(zeros_end))
-            point = label("point")
-            unless(
-                IntCompare(
-                    "eq",
-                    byte_at(
-                        _binary(
-                            "add", text, _binary("sub", IntLoad(written), IntConstant(1))
-                        )
-                    ),
-                    IntConstant(0x2E),
+                IntConstant(48),
+            ),
+            zeros_end,
+        )
+        store(written, _binary("sub", IntLoad(written), IntConstant(1)))
+        self.emit(Jump(zeros))
+        self.emit(Label(zeros_end))
+        point = label("point")
+        unless(
+            IntCompare(
+                "eq",
+                byte_at(
+                    _binary(
+                        "add", text, _binary("sub", IntLoad(written), IntConstant(1))
+                    )
                 ),
-                point,
-            )
-            store(written, _binary("sub", IntLoad(written), IntConstant(1)))
-            self.emit(Label(point))
-            self.emit(Label(kept))
+                IntConstant(0x2E),
+            ),
+            point,
+        )
+        store(written, _binary("sub", IntLoad(written), IntConstant(1)))
+        self.emit(Label(point))
+        self.emit(Label(kept))
 
         # The exponent suffix, on the exponential form only. C requires at
         # least two digits, and a double never needs more than three.
         plain = label("plain")
         unless(IntLoad(form), plain)
-        put(IntConstant(0x45 if upper else 0x65))  # 'E' / 'e'
+        put_word(b"E")  # 'E' or 'e', by the conversion's case
         above = label("above")
         signed_done = label("exponent_signed")
         unless(
@@ -4928,6 +5049,8 @@ class Lowerer:
         self.emit(Label(context.return_label))
         # C99: falling off the end of main returns 0.
         self.emit(Exit(0))
+        # After the exit, so nothing can fall into it.
+        self.emit_float_dispatch()
         self.scopes.pop()
         return Module(self.operations, self.stack_slots, list(self.lowered.values()))
 
