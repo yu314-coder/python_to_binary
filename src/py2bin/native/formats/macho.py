@@ -148,6 +148,295 @@ def write_macho_x86_64(code: bytes) -> bytes:
     return header + commands + bytes(page - len(header) - len(commands)) + code
 
 
+def _uleb(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def write_macho_arm64_dynamic(
+    code: bytes,
+    externs: list[tuple[int, str]],
+    info_plist: bytes | None = None,
+    code_resources: bytes | None = None,
+    libraries: tuple[str, ...] = ("/usr/lib/libSystem.B.dylib",),
+    symbol_libraries: dict[str, str] | None = None,
+) -> bytes:
+    """Return an arm64 Mach-O that binds external symbols through dyld.
+
+    ``code`` is the ``.text`` produced by ``encode_darwin_extern`` and mapped at
+    ``base + page``. ``externs`` lists ``(byte_offset_in_code, symbol)`` GOT call
+    sites, where each site is ``adrp x16 / ldr x16,[x16,#off] / blr x16``. Every
+    unique symbol gets one 8-byte ``__got`` slot in a writable ``__DATA``
+    segment; classic ``LC_DYLD_INFO_ONLY`` bind opcodes tell dyld to store the
+    resolved libSystem address there before the entry point runs. This is real
+    dynamic linking, not a translation of the callee's source.
+    """
+    page = 0x4000
+    base = 0x100000000
+    code_fileoff = page
+    code_vmaddr = base + code_fileoff
+
+    # Order symbols by first reference so GOT slot indices are deterministic.
+    symbols: list[str] = []
+    for _, symbol in externs:
+        if symbol not in symbols:
+            symbols.append(symbol)
+    slot_of = {symbol: index for index, symbol in enumerate(symbols)}
+
+    # Two-level namespace: every undefined symbol names the library that
+    # provides it. Ordinals are 1-based in the order of LC_LOAD_DYLIB.
+    symbol_libraries = symbol_libraries or {}
+    ordinal_of_library = {name: index + 1 for index, name in enumerate(libraries)}
+    default_ordinal = 1
+
+    def ordinal(symbol: str) -> int:
+        library = symbol_libraries.get(symbol)
+        if library is None:
+            return default_ordinal
+        try:
+            return ordinal_of_library[library]
+        except KeyError as error:
+            raise ValueError(
+                f"symbol {symbol!r} names library {library!r}, which is not loaded"
+            ) from error
+
+    code = bytearray(code)
+    text_end = code_fileoff + len(code)
+    text_filesize = _align(text_end, page)
+
+    data_fileoff = text_filesize
+    data_vmaddr = base + data_fileoff
+    got_size = len(symbols) * 8
+    data_filesize = _align(got_size, page) if got_size else page
+
+    # Patch each GOT call site now that the GOT address is fixed.
+    for byte_offset, symbol in externs:
+        instruction_addr = code_vmaddr + byte_offset
+        target = data_vmaddr + slot_of[symbol] * 8
+        page_delta = (target & ~0xFFF) - (instruction_addr & ~0xFFF)
+        pages = page_delta >> 12
+        if not -(1 << 20) <= pages < (1 << 20):
+            raise ValueError("arm64 __got reference is outside ADRP range")
+        encoded = pages & 0x1FFFFF
+        adrp = 0x90000010 | ((encoded & 3) << 29) | (((encoded >> 2) & 0x7FFFF) << 5)
+        offset = target & 0xFFF
+        if offset & 7:
+            raise ValueError("arm64 __got slot is not 8-byte aligned")
+        ldr = 0xF9400210 | ((offset // 8) << 10)
+        struct.pack_into("<II", code, byte_offset, adrp, ldr)
+
+    linkedit_fileoff = data_fileoff + data_filesize
+
+    # __DATA is segment index 2 (PAGEZERO=0, TEXT=1, DATA=2, LINKEDIT=3).
+    bind = bytearray()
+    for index, symbol in enumerate(symbols):
+        bind.append(0x10 | (ordinal(symbol) & 0x0F))  # SET_DYLIB_ORDINAL_IMM
+        bind.append(0x40)  # SET_SYMBOL_TRAILING_FLAGS_IMM, flags 0
+        bind += b"_" + symbol.encode("ascii") + b"\0"
+        bind.append(0x50 | 1)  # SET_TYPE_IMM, BIND_TYPE_POINTER
+        bind.append(0x70 | 2)  # SET_SEGMENT_AND_OFFSET_ULEB, __DATA
+        bind += _uleb(index * 8)
+        bind.append(0x90)  # DO_BIND
+    bind.append(0x00)  # DONE
+    while len(bind) % 8:
+        bind.append(0x00)
+    bind_off = linkedit_fileoff
+    bind_size = len(bind)
+
+    string_table = bytearray(b"\0")
+    symbol_table = bytearray()
+    for symbol in symbols:
+        name_offset = len(string_table)
+        string_table += b"_" + symbol.encode("ascii") + b"\0"
+        # nlist_64: undefined external; n_desc carries the library ordinal in
+        # its high byte for the two-level namespace.
+        symbol_table += struct.pack(
+            "<IBBHQ", name_offset, 0x01, 0, (ordinal(symbol) & 0xFF) << 8, 0
+        )
+    while len(string_table) % 8:
+        string_table.append(0)
+    symbol_table_off = bind_off + bind_size
+    indirect_off = symbol_table_off + len(symbol_table)
+    indirect = b"".join(struct.pack("<I", index) for index in range(len(symbols)))
+    string_table_off = indirect_off + len(indirect)
+    linkedit_used = bind_size + len(symbol_table) + len(indirect) + len(string_table)
+    signature_offset = _align(linkedit_fileoff + linkedit_used, 16)
+
+    def sign(image: bytes) -> bytes:
+        return _adhoc_signature(
+            image,
+            signature_offset,
+            code_fileoff,
+            len(code),
+            info_plist,
+            code_resources,
+            page_size=page,
+        )
+
+    placeholder = sign(bytes(signature_offset))
+    linkedit_filesize = (signature_offset - linkedit_fileoff) + len(placeholder)
+    linkedit_vmsize = _align(linkedit_filesize, page)
+
+    def segment(name, vmaddr, vmsize, fileoff, filesize, maxp, initp, nsects, flags):
+        return struct.pack(
+            "<II16sQQQQiiII",
+            0x19,
+            72 + nsects * 80,
+            _name(name),
+            vmaddr,
+            vmsize,
+            fileoff,
+            filesize,
+            maxp,
+            initp,
+            nsects,
+            flags,
+        )
+
+    def section(sname, segn, addr, size, offset, align_pow2, flags, reserved1):
+        return struct.pack(
+            "<16s16sQQIIIIIIII",
+            _name(sname),
+            _name(segn),
+            addr,
+            size,
+            offset,
+            align_pow2,
+            0,
+            0,
+            flags,
+            reserved1,
+            0,
+            0,
+        )
+
+    pagezero = segment("__PAGEZERO", 0, base, 0, 0, 0, 0, 0, 0)
+    text_segment = segment(
+        "__TEXT", base, text_filesize, 0, text_filesize, 5, 5, 1, 0
+    ) + section(
+        "__text", "__TEXT", code_vmaddr, len(code), code_fileoff, 2, 0x80000400, 0
+    )
+    data_segment = segment(
+        "__DATA", data_vmaddr, data_filesize, data_fileoff, data_filesize, 3, 3, 1, 0
+    ) + section(
+        # S_NON_LAZY_SYMBOL_POINTERS, reserved1 = indirect symbol table index.
+        "__got", "__DATA", data_vmaddr, got_size, data_fileoff, 3, 0x00000006, 0
+    )
+    linkedit_segment = segment(
+        "__LINKEDIT",
+        base + linkedit_fileoff,
+        linkedit_vmsize,
+        linkedit_fileoff,
+        linkedit_filesize,
+        1,
+        1,
+        0,
+        0,
+    )
+    dyld_info = struct.pack(
+        "<12I", 0x80000022, 48, 0, 0, bind_off, bind_size, 0, 0, 0, 0, 0, 0
+    )
+    symtab = struct.pack(
+        "<IIIIII", 0x2, 24, symbol_table_off, len(symbols), string_table_off, len(string_table)
+    )
+    dysymtab = struct.pack(
+        "<20I",
+        0xB,
+        80,
+        0,
+        0,  # local
+        0,
+        0,  # external defined
+        0,
+        len(symbols),  # undefined
+        0,
+        0,  # toc
+        0,
+        0,  # module table
+        0,
+        0,  # external reference symbols
+        indirect_off,
+        len(symbols),  # indirect symbols
+        0,
+        0,
+        0,
+        0,
+    )
+    dylinker = struct.pack("<III", 0xE, 32, 12) + b"/usr/lib/dyld\0".ljust(20, b"\0")
+    build_version = struct.pack("<IIIIII", 0x32, 24, 1, 13 << 16, 0, 0)
+    uuid_command = struct.pack("<II", 0x1B, 24) + hashlib.sha256(code).digest()[:16]
+    main_command = struct.pack("<IIQQ", 0x80000028, 24, code_fileoff, 0)
+
+    def _load_dylib(path: str) -> bytes:
+        # LC_LOAD_DYLIB: fixed 24-byte header then the NUL-terminated path,
+        # padded so the whole command is 8-byte aligned.
+        raw = path.encode("utf-8") + b"\0"
+        size = _align(24 + len(raw), 8)
+        return (
+            struct.pack("<IIIIII", 0xC, size, 24, 2, 0x054C0000, 0x00010000)
+            + raw.ljust(size - 24, b"\0")
+        )
+
+    load_dylib = b"".join(_load_dylib(path) for path in libraries)
+    signature_command = struct.pack(
+        "<IIII", 0x1D, 16, signature_offset, len(placeholder)
+    )
+    commands = (
+        pagezero
+        + text_segment
+        + data_segment
+        + linkedit_segment
+        + dyld_info
+        + symtab
+        + dysymtab
+        + dylinker
+        + uuid_command
+        + build_version
+        + main_command
+        + load_dylib
+        + signature_command
+    )
+    # MH_DYLDLINK | MH_TWOLEVEL | MH_PIE. NOT MH_NOUNDEFS: the image imports.
+    # Twelve fixed commands plus one LC_LOAD_DYLIB per loaded library.
+    command_count = 12 + len(libraries)
+    header = struct.pack(
+        "<IIIIIIII",
+        0xFEEDFACF,
+        0x0100000C,
+        0,
+        2,
+        command_count,
+        len(commands),
+        0x00200084,
+        0,
+    )
+    if len(header) + len(commands) > page:
+        raise ValueError("Mach-O load commands exceed header page")
+
+    image = bytearray(header + commands)
+    image += bytes(code_fileoff - len(image))
+    image += code
+    image += bytes(data_fileoff - len(image))
+    image += bytes(got_size)
+    image += bytes(linkedit_fileoff - len(image))
+    image += bind
+    image += symbol_table
+    image += indirect
+    image += string_table
+    image += bytes(signature_offset - len(image))
+    signature = sign(bytes(image))
+    if len(signature) != len(placeholder):
+        raise AssertionError("Mach-O signature sizing changed during finalization")
+    return bytes(image + signature)
+
+
 def write_macho_arm64(
     code: bytes,
     info_plist: bytes | None = None,

@@ -48,9 +48,15 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
             if not operation.data:
                 removed_operations += 1
                 continue
-            if optimized and isinstance(optimized[-1], Write):
+            if (
+                optimized
+                and isinstance(optimized[-1], Write)
+                and optimized[-1].fd == operation.fd
+            ):
+                # Only merge writes going to the same file descriptor; stdout
+                # and stderr must stay separate streams.
                 previous = optimized[-1]
-                optimized[-1] = Write(previous.data + operation.data)
+                optimized[-1] = Write(previous.data + operation.data, operation.fd)
                 merged_writes += 1
                 removed_operations += 1
                 continue

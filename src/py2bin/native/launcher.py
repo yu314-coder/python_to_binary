@@ -114,19 +114,21 @@ def _x86_64_shell_launcher(
 ) -> bytes:
     code = bytearray()
     if platform_name == "linux":
-        # Linux _start receives argc/argv/envp on the initial stack.
-        code += b"\x49\x89\xe5"  # mov r13, rsp
-        code += b"\x4d\x8b\x65\x00"  # mov r12, [r13] (argc)
-        code += b"\x4d\x8d\x75\x08"  # lea r14, [r13+8] (argv)
-        code += b"\x4f\x8d\x7c\xe5\x10"  # lea r15, [r13+r12*8+16] (envp)
         exec_number, exit_number = 59, 60
     elif platform_name == "darwin":
-        code += b"\x49\x89\xfc"  # mov r12, rdi (argc)
-        code += b"\x49\x89\xf6"  # mov r14, rsi (argv)
-        code += b"\x49\x89\xd7"  # mov r15, rdx (envp)
         exec_number, exit_number = 0x0200003B, 0x02000001
     else:
         raise ValueError(f"unsupported x86-64 shell platform: {platform_name}")
+
+    # Both platforms hand the entry point the initial process stack rather than
+    # registers: Linux starts at _start, and the x86-64 Mach-O writer uses
+    # LC_UNIXTHREAD, which starts at the raw entry point the same way. (Only the
+    # arm64 Mach-O uses LC_MAIN, where argc/argv/envp really do arrive in
+    # x0/x1/x2.) Reading rdi/rsi/rdx here would read uninitialised registers.
+    code += b"\x49\x89\xe5"  # mov r13, rsp
+    code += b"\x4d\x8b\x65\x00"  # mov r12, [r13] (argc)
+    code += b"\x4d\x8d\x75\x08"  # lea r14, [r13+8] (argv)
+    code += b"\x4f\x8d\x7c\xe5\x10"  # lea r15, [r13+r12*8+16] (envp)
 
     code += b"\x49\x83\xfc\x40"  # cmp r12, 64
     high_branch = len(code)
@@ -195,8 +197,14 @@ def macos_shell_launcher(
             extra_data,
         )
     if machine in {"x86_64", "AMD64"}:
-        if info_plist is not None or code_resources is not None:
-            raise ValueError("signed x86-64 app launchers are not implemented yet")
+        # ``info_plist``/``code_resources`` are accepted but not embedded. On
+        # arm64 macOS every executable must carry a code signature, so the
+        # arm64 launcher embeds an ad-hoc signature sealing those two
+        # documents. Intel macOS still loads unsigned executables, so the
+        # x86-64 launcher is emitted unsigned; the bundle's Info.plist and
+        # _CodeSignature/CodeResources are written as ordinary files by the
+        # caller either way. Such an app runs locally but is not notarized,
+        # and Gatekeeper will quarantine it if it is downloaded.
         return _x86_64_shell_launcher(command, extra_data)
     raise ValueError(f"native macOS launcher is not implemented for {machine}")
 

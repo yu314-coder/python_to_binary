@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+# --- signed 64-bit integer expressions ---------------------------------------
+
+
 @dataclass(frozen=True, slots=True)
 class IntConstant:
     value: int
@@ -33,18 +36,159 @@ class IntCompare:
     right: "IntExpression"
 
 
-IntExpression = IntConstant | IntLoad | IntUnary | IntBinary | IntCompare
+# --- IEEE-754 binary64 (double) expressions ----------------------------------
+#
+# Floating-point values live in their own expression tree so the backends can
+# keep them in dedicated SIMD/FP registers (XMM0 on x86-64, D0 on ARM64). The
+# only bridges between the two worlds are the explicit conversion nodes below,
+# which keeps the existing integer lowering byte-for-byte unchanged.
+
+
+@dataclass(frozen=True, slots=True)
+class FloatConstant:
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
+class FloatLoad:
+    slot: int
+
+
+@dataclass(frozen=True, slots=True)
+class FloatUnary:
+    operator: str
+    operand: "FloatExpression"
+
+
+@dataclass(frozen=True, slots=True)
+class FloatBinary:
+    operator: str
+    left: "FloatExpression"
+    right: "FloatExpression"
+
+
+@dataclass(frozen=True, slots=True)
+class IntToFloat:
+    """Widen a signed 64-bit integer expression to a double."""
+
+    value: "IntExpression"
+
+
+# These two consume a float but produce an integer, so they belong to the
+# integer expression union even though they read the FP register file.
+
+
+@dataclass(frozen=True, slots=True)
+class FloatToInt:
+    """Truncate a double toward zero into a signed 64-bit integer."""
+
+    value: "FloatExpression"
+
+
+@dataclass(frozen=True, slots=True)
+class FloatCompare:
+    operator: str
+    left: "FloatExpression"
+    right: "FloatExpression"
+
+
+# --- runtime heap access -----------------------------------------------------
+#
+# Slice 2 adds a runtime bump-pointer arena (see HeapInit/HeapAlloc below).
+# ``HeapLoad`` reads ``size`` bytes (1 or 8) from a runtime address expression
+# and produces a signed 64-bit integer, so it joins the integer expression
+# union. The address is itself an integer expression, which lets the frontend
+# build element/character offsets out of the existing integer IR.
+
+
+@dataclass(frozen=True, slots=True)
+class HeapLoad:
+    """Load ``size`` bytes (1 or 8) from a runtime address into an i64."""
+
+    address: "IntExpression"
+    size: int = 8
+
+
+# --- external (adapter-ABI) native calls -------------------------------------
+#
+# Slice 4 adds the ONLY honest "library" path: declaring and calling a genuine
+# external native symbol resolved by the platform dynamic linker. These nodes
+# do NOT translate C/C++/CUDA source; they bind to an already-compiled symbol
+# (currently a vetted libSystem subset on darwin-arm64) through real dyld
+# binding. ``ExternCall`` produces the callee's signed 64-bit return value in
+# the integer register file, so it joins the integer expression union.
+# ``CStringConstant`` materializes a pointer to a NUL-terminated byte blob so a
+# constant string can be handed to a C function (e.g. ``strlen``).
+
+
+@dataclass(frozen=True, slots=True)
+class CStringConstant:
+    """A pointer to an embedded NUL-terminated constant byte string."""
+
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ExternCall:
+    """Call external ``symbol`` with ``arguments`` (i64/pointer values).
+
+    The symbol is resolved through the platform dynamic linker (dyld on Darwin)
+    and bound before the entry point runs. Arguments are passed in the
+    platform integer argument registers; the result is the callee's i64 return.
+    ``symbol`` is the bare C name (no leading underscore); the Mach-O writer
+    applies the platform's symbol decoration.
+    """
+
+    symbol: str
+    arguments: tuple["IntExpression", ...] = ()
+    # Width and signedness of the callee's C result. AAPCS64 leaves bits 32-63
+    # of the return register UNSPECIFIED for a 32-bit result, so a C ``int``
+    # must be sign-extended (and ``unsigned int`` zero-extended) before it is
+    # used as a signed 64-bit value. Without this, CPython's -1 error return
+    # reads as 4294967295 and every ``if (rc < 0)`` check silently fails.
+    result: str = "i64"
+
+
+IntExpression = (
+    IntConstant
+    | IntLoad
+    | IntUnary
+    | IntBinary
+    | IntCompare
+    | FloatToInt
+    | FloatCompare
+    | HeapLoad
+    | CStringConstant
+    | ExternCall
+)
+FloatExpression = FloatConstant | FloatLoad | FloatUnary | FloatBinary | IntToFloat
+
+
+# --- operations --------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class Write:
+    """Write constant ``data`` to file descriptor ``fd`` (1 stdout, 2 stderr).
+
+    Runtime diagnostics (for example the ``IndexError`` a failed list bounds
+    check reports) use fd 2 so they never corrupt the program's stdout.
+    """
+
     data: bytes
+    fd: int = 1
 
 
 @dataclass(frozen=True, slots=True)
 class Store:
     slot: int
     value: IntExpression
+
+
+@dataclass(frozen=True, slots=True)
+class FloatStore:
+    slot: int
+    value: FloatExpression
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +217,64 @@ class ExitValue:
     value: IntExpression
 
 
-Operation = Write | Store | Label | Jump | JumpIfFalse | Exit | ExitValue
+# --- runtime heap operations -------------------------------------------------
+#
+# The arena is a single fixed reservation obtained once at process start with
+# an anonymous mmap (POSIX) or VirtualAlloc (Windows). A dedicated stack slot
+# holds the bump pointer; there is no per-object reclamation. This is an honest
+# arena: it never frees, which is documented, not hidden.
+
+
+@dataclass(frozen=True, slots=True)
+class HeapInit:
+    """Reserve ``size`` bytes of RW arena and store its base in ``slot``."""
+
+    slot: int
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeapAlloc:
+    """Bump-allocate ``size`` bytes: store the old bump pointer in ``dest_slot``
+    and advance the bump pointer in ``bump_slot``. ``size`` must already be a
+    multiple of 8 so the arena stays 8-byte aligned."""
+
+    dest_slot: int
+    size: IntExpression
+    bump_slot: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeapStore:
+    """Store the low ``size`` bytes (1 or 8) of ``value`` at ``address``."""
+
+    address: IntExpression
+    value: IntExpression
+    size: int = 8
+
+
+@dataclass(frozen=True, slots=True)
+class WriteRuntime:
+    """Write ``length`` runtime bytes starting at ``address`` to stdout."""
+
+    address: IntExpression
+    length: IntExpression
+
+
+Operation = (
+    Write
+    | Store
+    | FloatStore
+    | Label
+    | Jump
+    | JumpIfFalse
+    | Exit
+    | ExitValue
+    | HeapInit
+    | HeapAlloc
+    | HeapStore
+    | WriteRuntime
+)
 
 
 @dataclass(slots=True)

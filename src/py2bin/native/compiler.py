@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import platform
 import plistlib
 import shutil
@@ -8,11 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .arm64 import encode_darwin as encode_darwin_arm64
+from .arm64 import encode_darwin_extern as encode_darwin_extern_arm64
 from .arm64 import encode_linux as encode_linux_arm64
 from .formats.elf import write_elf_arm64, write_elf_x86_64
-from .formats.macho import write_macho_arm64, write_macho_x86_64
+from .formats.macho import (
+    write_macho_arm64,
+    write_macho_arm64_dynamic,
+    write_macho_x86_64,
+)
 from .formats.pe import write_pe_arm64, write_pe_x86_64
-from .frontend import lower
+from .frontend import NativeCompileError, lower
+from .ir import CStringConstant, ExternCall, HeapInit, Module
 from .optimizer import optimize
 from .x86_64 import encode
 
@@ -126,14 +133,44 @@ def compile_native(
     clean: bool = False,
     app: bool = False,
     source_roots: tuple[Path, ...] = (),
+    experimental_kernels: bool = False,
 ) -> NativeResult:
+    entry = entry.expanduser().resolve()
+    if not entry.is_file():
+        raise FileNotFoundError(f"entry script does not exist: {entry}")
+    return compile_native_source(
+        entry,
+        entry.read_text(encoding="utf-8"),
+        output,
+        target=target,
+        clean=clean,
+        app=app,
+        source_roots=source_roots,
+        experimental_kernels=experimental_kernels,
+    )
+
+
+def compile_native_source(
+    entry: Path,
+    source: str,
+    output: Path,
+    target: str | None = None,
+    clean: bool = False,
+    app: bool = False,
+    source_roots: tuple[Path, ...] = (),
+    experimental_kernels: bool = False,
+) -> NativeResult:
+    """Compile in-memory Python source with py2bin's handwritten backends.
+
+    ``entry`` supplies diagnostics and the executable name. It does not need to
+    exist, which lets other handwritten frontends feed verified source into the
+    same IR and PE/ELF/Mach-O writers without a temporary file.
+    """
     entry = entry.expanduser().resolve()
     output = output.expanduser().resolve()
     target = target or host_target()
     if target not in TARGETS:
         raise ValueError(f"unknown target {target!r}; supported: {', '.join(TARGETS)}")
-    if not entry.is_file():
-        raise FileNotFoundError(f"entry script does not exist: {entry}")
     if app:
         if target != "darwin-arm64":
             raise ValueError("--app currently requires target darwin-arm64")
@@ -141,8 +178,92 @@ def compile_native(
             output = output.with_suffix(".app")
     if output.exists() and not clean:
         raise FileExistsError(f"output already exists: {output} (use --clean)")
-    source = entry.read_text(encoding="utf-8")
-    module, _optimization = optimize(lower(entry, source, source_roots))
+    module, _optimization = optimize(
+        lower(
+            entry,
+            source,
+            source_roots,
+            experimental_kernels=experimental_kernels,
+        )
+    )
+    return _emit_native_module(entry, module, output, target, app)
+
+
+def compile_native_module(
+    entry: Path,
+    module: Module,
+    output: Path,
+    target: str | None = None,
+    clean: bool = False,
+    app: bool = False,
+) -> NativeResult:
+    """Write a verified py2bin IR module with the handwritten binary backends."""
+
+    entry = entry.expanduser().resolve()
+    output = output.expanduser().resolve()
+    target = target or host_target()
+    if target not in TARGETS:
+        raise ValueError(f"unknown target {target!r}; supported: {', '.join(TARGETS)}")
+    if app:
+        if target != "darwin-arm64":
+            raise ValueError("--app currently requires target darwin-arm64")
+        if output.suffix != ".app":
+            output = output.with_suffix(".app")
+    if output.exists() and not clean:
+        raise FileExistsError(f"output already exists: {output} (use --clean)")
+    return _emit_native_module(entry, module, output, target, app)
+
+
+def _contains_extern(value: object) -> bool:
+    """Recursively detect any ``ExternCall``/``CStringConstant`` in the IR."""
+
+    if isinstance(value, (ExternCall, CStringConstant)):
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_contains_extern(item) for item in value)
+    slots = getattr(type(value), "__slots__", None)
+    if slots:
+        return any(_contains_extern(getattr(value, name)) for name in slots)
+    return False
+
+
+def _module_uses_extern(module: Module) -> bool:
+    return any(_contains_extern(operation) for operation in module.operations)
+
+
+def _emit_native_module(
+    entry: Path,
+    module: Module,
+    output: Path,
+    target: str,
+    app: bool,
+) -> NativeResult:
+    if target != "darwin-arm64" and _module_uses_extern(module):
+        # Extern (adapter-ABI) symbol calls are only wired through real dyld
+        # binding on darwin-arm64 so far. Rather than emit a binary that would
+        # not link its imports, reject with an exact message. The remaining
+        # per-platform link design is documented in docs/NATIVE_EXTERN_ABI.md.
+        raise NativeCompileError(
+            entry,
+            ast.parse("pass").body[0],
+            f"external native symbol calls (py2bin.cabi) are only supported for "
+            f"target 'darwin-arm64' so far, not {target!r}; the dynamic-link "
+            "adapter for this platform is design-only",
+        )
+    if target.startswith("windows-") and any(
+        isinstance(operation, HeapInit) for operation in module.operations
+    ):
+        # The runtime arena is obtained with an anonymous mmap on POSIX. The
+        # equivalent Windows path (VirtualAlloc wired into the PE import table)
+        # is not implemented yet, so runtime lists/strings are rejected here
+        # rather than emitting a PE that would run incorrectly.
+        raise NativeCompileError(
+            entry,
+            ast.parse("pass").body[0],
+            f"runtime heap lists/strings are not supported for target {target!r} "
+            "yet (needs VirtualAlloc in the PE import table); POSIX targets are "
+            "supported",
+        )
     info_plist, code_resources = _app_metadata(entry.stem) if app else (None, None)
     if target == "windows-x86_64":
         image = write_pe_x86_64(module)
@@ -152,8 +273,34 @@ def compile_native(
         code = encode_linux_arm64(module, 0x401000)
         image = write_elf_arm64(code)
     elif target == "darwin-arm64":
-        code = encode_darwin_arm64(module, 0x100004000)
-        image = write_macho_arm64(code, info_plist, code_resources)
+        code, externs = encode_darwin_extern_arm64(module, 0x100004000)
+        if externs:
+            # Each extern names the library that provides it. libSystem is
+            # always loaded; any other library (for example the CPython
+            # runtime) is added as a further LC_LOAD_DYLIB with its own
+            # two-level namespace ordinal.
+            from ..cabi import symbol_library
+
+            symbol_libraries = {}
+            for _offset, symbol in externs:
+                library = symbol_library(symbol)
+                if library is not None:
+                    symbol_libraries[symbol] = library
+            libraries = ("/usr/lib/libSystem.B.dylib", *dict.fromkeys(
+                library
+                for library in symbol_libraries.values()
+                if library != "/usr/lib/libSystem.B.dylib"
+            ))
+            image = write_macho_arm64_dynamic(
+                code,
+                externs,
+                info_plist,
+                code_resources,
+                libraries=libraries,
+                symbol_libraries=symbol_libraries,
+            )
+        else:
+            image = write_macho_arm64(code, info_plist, code_resources)
     else:
         code_address = 0x401000 if target == "linux-x86_64" else 0x100001000
         platform_name = target.partition("-")[0]
@@ -190,6 +337,8 @@ def compile_all(
     mac_app: bool = False,
     os_name: str | None = None,
     architecture: str | None = None,
+    source_roots: tuple[Path, ...] = (),
+    experimental_kernels: bool = False,
 ) -> tuple[NativeResult, ...]:
     """Cross-compile every backend using only this Python process.
 
@@ -210,12 +359,29 @@ def compile_all(
     for target in selected:
         extension = ".exe" if target.startswith("windows-") else ".bin"
         output = output_directory / f"{entry.stem}-{target}{extension}"
-        results.append(compile_native(entry, output, target, clean=clean))
+        results.append(
+            compile_native(
+                entry,
+                output,
+                target,
+                clean=clean,
+                source_roots=source_roots,
+                experimental_kernels=experimental_kernels,
+            )
+        )
     if mac_app:
         if selected != TARGETS and "darwin-arm64" not in selected:
             raise ValueError("--mac-app requires the darwin-arm64 selection")
         output = output_directory / f"{entry.stem}-darwin-arm64.app"
         results.append(
-            compile_native(entry, output, "darwin-arm64", clean=clean, app=True)
+            compile_native(
+                entry,
+                output,
+                "darwin-arm64",
+                clean=clean,
+                app=True,
+                source_roots=source_roots,
+                experimental_kernels=experimental_kernels,
+            )
         )
     return tuple(results)

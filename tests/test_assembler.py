@@ -136,6 +136,88 @@ class AssemblerTests(unittest.TestCase):
             self.assertFalse((result.bundle / MANIFEST_NAME).exists())
             self.assertIn("demo", result.distributions)
 
+    def test_web_assets_are_hashed_and_embedded_in_onefile_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            web = project / "web"
+            web.mkdir(parents=True)
+            entry = project / "main.py"
+            entry.write_text(
+                "import webdemo\n"
+                "print('web assets')\n",
+                encoding="utf-8",
+            )
+            (web / "index.html").write_text(
+                "<main>embedded</main>\n",
+                encoding="utf-8",
+            )
+            (web / "app.css").write_text(
+                "main { color: #123; }\n",
+                encoding="utf-8",
+            )
+            (web / "app.js").write_text(
+                "document.body.dataset.ready = 'yes';\n",
+                encoding="utf-8",
+            )
+            wheel = root / "webdemo-1.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("webdemo/__init__.py", "name = 'webdemo'\n")
+                archive.writestr(
+                    "webdemo/static/widget.js",
+                    "export const ready = true;\n",
+                )
+                archive.writestr(
+                    "webdemo-1.0.dist-info/top_level.txt",
+                    "webdemo\n",
+                )
+                archive.writestr(
+                    "webdemo-1.0.dist-info/METADATA",
+                    "Metadata-Version: 2.1\n"
+                    "Name: webdemo\n"
+                    "Version: 1.0\n\n",
+                )
+            result = freeze(
+                entry,
+                root / "WebAssets",
+                project,
+                dependency_mode="none",
+                wheels=(wheel,),
+                runtime_pack=self._runtime_pack(
+                    root,
+                    target="windows-x86_64",
+                ),
+                target="windows-x86_64",
+            )
+            image = result.bundle.read_bytes()
+            marker = b"\nPY2BIN-ONEFILE-PAYLOAD-V1:"
+            marker_at = image.index(marker)
+            payload_at = image.index(b"\n", marker_at + len(marker)) + 1
+            with zipfile.ZipFile(io.BytesIO(image[payload_at:])) as archive:
+                names = set(archive.namelist())
+                manifest = json.loads(
+                    archive.read("py2bin-freeze.json").decode("utf-8")
+                )
+            self.assertIn("app/web/index.html", names)
+            self.assertIn("app/web/app.css", names)
+            self.assertIn("app/web/app.js", names)
+            self.assertIn(
+                "site-packages/webdemo/static/widget.js",
+                names,
+            )
+            assets = {
+                item["path"]: item
+                for item in manifest["web_assets"]
+            }
+            self.assertEqual(assets["app/web/index.html"]["kind"], "html")
+            self.assertEqual(assets["app/web/app.css"]["kind"], "css")
+            self.assertEqual(assets["app/web/app.js"]["kind"], "javascript")
+            self.assertEqual(len(assets["app/web/app.js"]["sha256"]), 64)
+            self.assertEqual(
+                assets["site-packages/webdemo/static/widget.js"]["kind"],
+                "javascript",
+            )
+
     def test_compact_freeze_prunes_supplied_runtime_pack_and_stdlib_zip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -523,12 +605,22 @@ class AssemblerTests(unittest.TestCase):
     def test_assemble_uses_native_then_compatible_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "native_helper.py").write_text(
+                "def answer() -> int:\n"
+                "    return 42\n",
+                encoding="utf-8",
+            )
             native_source = root / "native.py"
-            native_source.write_text("print('native')\n", encoding="utf-8")
+            native_source.write_text(
+                "from native_helper import answer\n"
+                "raise SystemExit(answer())\n",
+                encoding="utf-8",
+            )
             native = assemble(
                 native_source,
                 root / "native.bin",
                 target="linux-x86_64",
+                source_root=root,
             )
             self.assertEqual(native.backend, "native")
             self.assertEqual(native.artifact.read_bytes()[:4], b"\x7fELF")

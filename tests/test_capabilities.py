@@ -82,6 +82,26 @@ class CapabilityTests(unittest.TestCase):
             result = assess_entry(entry)
             self.assertTrue(result.native_compile)
 
+    def test_entry_report_accepts_restricted_local_function_aot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "helper.py").write_text(
+                "def triple(value: int) -> int:\n"
+                "    return value * 3\n",
+                encoding="utf-8",
+            )
+            entry = root / "native_library.py"
+            entry.write_text(
+                "from helper import triple\n"
+                "raise SystemExit(triple(7))\n",
+                encoding="utf-8",
+            )
+            result = assess_entry(entry)
+            self.assertTrue(result.native_compile)
+            self.assertEqual(result.imports, ("helper",))
+            self.assertEqual(result.libraries[0].native_aot, "restricted")
+            self.assertIn("inlined", result.libraries[0].payload)
+
     def test_capabilities_cli_emits_machine_readable_report(self):
         with tempfile.TemporaryDirectory() as directory:
             entry = Path(directory) / "app.py"
@@ -101,6 +121,23 @@ class CapabilityTests(unittest.TestCase):
             with redirect_stdout(StringIO()):
                 status = main(["capabilities", str(entry), "--strict"])
             self.assertEqual(status, 1)
+
+    def test_numpy_torch_are_reported_unsupported_even_with_kernel_flag(self):
+        # The former experimental static-kernel substitution reimplemented a
+        # NumPy/Torch integer subset from scratch, but the resulting binary's
+        # observable result did not match CPython (a reduction is np.int64 /
+        # a 0-d tensor, not a plain int). The flag is now inert: numpy/torch
+        # must be reported as unsupported, never as native-compilable.
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "kernel.py"
+            entry.write_text(
+                "import numpy as np\n"
+                "raise SystemExit(np.sum(np.array([1, 2, 3])))\n",
+                encoding="utf-8",
+            )
+            result = assess_entry(entry, experimental_kernels=True)
+            self.assertFalse(result.native_compile)
+            self.assertIn("not in the native subset", result.native_reason)
 
 
 if __name__ == "__main__":

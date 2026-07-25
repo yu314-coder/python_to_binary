@@ -168,41 +168,45 @@ class LockedSourceTests(unittest.TestCase):
                     root / "cache",
                 )
 
-    def test_downloaded_dynamic_python_is_not_mislabeled_native(self):
+    def test_downloaded_pure_integer_function_compiles_as_machine_code(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive, digest = self._archive(
                 root,
-                "def run():\n    return 42\n",
+                "def run():\n"
+                "    answer = 6 * 7\n"
+                "    return answer\n",
             )
             lock = self._lock(root, archive, digest)
             application, entry = self._application(
                 root,
                 "from demo import run\nraise SystemExit(run())\n",
             )
-            with self.assertRaisesRegex(
-                NativeCompileError, "is not a compile-time constant"
-            ):
-                compile_locked_sources(
-                    entry,
-                    root / "bad",
-                    source_lock=lock,
-                    source_cache=root / "cache",
-                    source_root=application,
-                    target="darwin-arm64",
-                )
+            result = compile_locked_sources(
+                entry,
+                root / "answer",
+                source_lock=lock,
+                source_cache=root / "cache",
+                source_root=application,
+                target="darwin-arm64",
+            )
+            self.assertEqual(result.native.artifact.read_bytes()[:4], b"\xcf\xfa\xed\xfe")
+            if platform.system() == "Darwin" and platform.machine() == "arm64":
+                run = subprocess.run([str(result.native.artifact)])
+                self.assertEqual(run.returncode, 42)
 
     def test_cli_never_falls_back_to_compatible_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive, digest = self._archive(
                 root,
-                "def run():\n    return 42\n",
+                "def run(value):\n"
+                "    return [value]\n",
             )
             lock = self._lock(root, archive, digest)
             application, entry = self._application(
                 root,
-                "from demo import run\nrun()\n",
+                "from demo import run\nraise SystemExit(run(1))\n",
             )
             error = StringIO()
             with redirect_stderr(error):
@@ -223,7 +227,7 @@ class LockedSourceTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(status, 2)
-            self.assertIn("not a compile-time constant", error.getvalue())
+            self.assertIn("signed 64-bit native integer subset", error.getvalue())
             self.assertFalse((root / "bad").exists())
 
     def test_normal_compile_command_auto_fetches_when_lock_is_supplied(self):

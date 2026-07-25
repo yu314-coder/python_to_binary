@@ -5,21 +5,169 @@ the Python standard library. The project itself has no runtime or build
 dependencies: no Cython, Nuitka, mypyc, Rust, C, C++, PyInstaller, PPCI, native
 bootloader, assembler, linker, or SDK.
 
-It has four deliberately separate execution paths. They must not be confused:
+It has seven deliberately separate execution paths. They must not be confused:
 
-1. **Native compile:** Python AST → py2bin IR → py2bin optimizer → handwritten
+1. **Strict whole-application AOT:** `aot-plan` walks the closed local source
+   graph; `aot-build` emits an artifact only if every reached operation has a
+   CPython-free route. It never falls back, embeds source/bytecode, or creates a
+   self-extracting Python payload.
+2. **Native compile:** Python AST → py2bin IR → py2bin optimizer → handwritten
    x86-64/ARM64 instructions → ELF, PE, or Mach-O. This invokes no external
    toolchain, and the generated program needs no Python runtime.
-2. **Runtime freeze:** arbitrary CPython projects and target-compatible packages
+3. **Runtime freeze:** arbitrary CPython projects and target-compatible packages
    are collected with an embedded CPython runtime. The default output is one
    self-extracting `.exe` or `.bin`; this is compatibility packaging, not
    native translation of the application.
-3. **Lightweight bundle:** `.pyz`, executable `.bin`, and directory formats
+4. **Lightweight bundle:** `.pyz`, executable `.bin`, and directory formats
    package project code and dependencies but use a compatible target Python.
-4. **Portable-C frontend:** a useful typed subset of Python becomes readable C
+5. **Portable-C frontend:** a useful typed subset of Python becomes readable C
    source, or a checksummed `.py2cbin` C-source container. Imports automatically
    plan for the compatible CPython bundle instead of pretending native packages
    can be translated from Python source.
+6. **Canonical-C native bridge:** the smaller signed-64-bit intersection can
+   run Python → generated C → py2bin's handwritten C parser → py2bin IR →
+   handwritten machine code. `compile-c` accepts that same canonical C
+   directly. This is a real no-toolchain C-to-binary path, not a general C,
+   Cython-C, C++, NumPy C-API, ATen, or CUDA compiler.
+7. **CPython C-API embedding (`darwin-arm64` only):** the same handwritten C
+   frontend also accepts calls to a fixed, vetted list of exported CPython
+   entry points through opaque `PyObject *` handles, and the emitted Mach-O
+   binds the interpreter's shared library with real dyld binding. The program's
+   own logic becomes machine code; Python *object* semantics stay in libpython.
+   py2bin does **not** translate ordinary Python into those calls — you write
+   them, either as canonical C or as Python importing `py2bin.cabi`.
+
+## The three tiers, stated plainly
+
+Three different things in this repository all end in "a file you can run". They
+give very different guarantees, and the difference matters more than the
+similarity.
+
+| | (a) `freeze` / `bundle` | (b) CPython C-API path | (c) `compile` native |
+|---|---|---|---|
+| Shape of the idea | PyInstaller-shaped | Nuitka-shaped | a small AOT compiler |
+| What executes your logic | CPython, interpreting your source/bytecode | machine code py2bin wrote | machine code py2bin wrote |
+| Is CPython present? | Yes, bundled inside the artifact | Yes, linked as an external shared library | No |
+| Accepts arbitrary Python? | Yes, in practice | No — a small explicit subset | No — a small explicit subset |
+| Third-party packages | Yes, carried as payload | Only whatever the linked interpreter can already import | No |
+| Targets | all implemented targets, given a runtime pack and target wheels | `darwin-arm64` only | all implemented targets |
+| Artifact runs standalone? | Yes | **No** — needs that exact CPython installed | Yes |
+
+**(a) Freeze** is compatibility packaging. Your program is not translated; it
+is shipped next to an interpreter that runs it. This is the tier that handles
+real applications with NumPy, Torch, or a GUI.
+
+**(b) The CPython C-API path** is the Nuitka-shaped tier, with Nuitka's
+essential dependency removed: Nuitka hands its generated C to gcc, and py2bin
+compiles the C itself. What survives that constraint is genuinely narrower than
+Nuitka. See [What the C-API path supports](#what-the-c-api-path-supports).
+
+**(c) Native compile** removes CPython entirely. Nothing is interpreted and
+nothing is linked; the ELF/PE/Mach-O contains only instructions py2bin encoded.
+The price is the smallest subset of the three.
+
+None of these tiers invokes gcc, clang, `as`, `ld`, Xcode, or an SDK. py2bin
+cannot: the library does not import `subprocess` and never starts a process, and
+the test suite fails if that changes.
+
+## What the C-API path supports
+
+This is the honest boundary of tier (b). It is deliberately unflattering.
+
+**How you reach it.** Two entry points, both producing the same IR:
+
+```sh
+# 1. Python that imports vetted C-API names from py2bin.cabi.
+PYTHONPATH=src python3 -m py2bin compile program.py \
+  --target darwin-arm64 -o program.bin
+
+# 2. Canonical C that declares the same functions with `extern` prototypes.
+PYTHONPATH=src python3 -m py2bin compile-c program.c \
+  --target darwin-arm64 -o program.bin
+```
+
+The two are interconvertible: py2bin's C frontend parses the C into a Python
+AST, so the same program can be run under `python3` (where `py2bin.cabi` makes
+the identical calls through `ctypes.pythonapi`) and diffed against the compiled
+binary. Every C-API feature below is verified that way — build, run natively,
+run the same program under CPython, require identical stdout and exit status.
+
+**What goes through.**
+
+- A fixed table of 31 exported CPython entry points: `Py_Initialize`,
+  `Py_Finalize`, `Py_IsInitialized`, `PyRun_SimpleString`,
+  `PyLong_FromLongLong`, `PyLong_AsLongLong`, `PyUnicode_FromString`,
+  `PyNumber_Add`/`Subtract`/`Multiply`/`TrueDivide`, `PyObject_RichCompare`,
+  `PyObject_IsTrue`, `PyObject_Str`, `PyObject_Repr`, `PyObject_Size`,
+  `PyObject_GetAttrString`, `PyObject_CallNoArgs`, `PyObject_CallOneArg`,
+  `PyImport_ImportModule`, `PyList_New`, `PyList_Append`, `PySys_GetObject`,
+  `PySys_WriteStdout`, `PyFile_WriteObject`, `PyFile_WriteString`, `Py_IncRef`,
+  `Py_DecRef`, `PyErr_Occurred`, `PyErr_Print`, `PyErr_Clear`. Every one is a
+  real exported function — not a macro or a `static inline` — with a fixed
+  count of word-sized arguments. A test asserts each is exported by the running
+  interpreter's dylib.
+- Opaque `PyObject *` handles in locals, parameters, and return values.
+- `long long` locals, arithmetic, comparisons, `if`, `while`, and calls to
+  your own functions, which are inlined.
+- `NULL` checks: `handle == NULL` and `handle != NULL`.
+- Compile-time string literals as `const char *` arguments.
+- Because the interpreter is real, so is everything it does: importing `math`,
+  calling `math.isqrt`, building a `list` and printing `[2, 4, 6, 8]`, and
+  `str()` of a Python `int` all work, because CPython performs them.
+- `PyImport_ImportModule` reaches anything that interpreter can already import,
+  including third-party packages on its `sys.path`. Note what that does and
+  does not mean: py2bin neither translates nor packages those modules, and the
+  binary does not carry them. The same applies to `PyRun_SimpleString`, which
+  really does execute arbitrary Python — *interpreted from a string at runtime*.
+  Wrapping a program in `PyRun_SimpleString` would produce a launcher for
+  interpreted source, not compiled code, and this project does not count that
+  as compiling anything.
+
+**What is rejected, with a `file:line:col` error.**
+
+- Every target except `darwin-arm64`. There is no C-API path on Linux, on
+  Windows, or on x86-64 macOS.
+- Dereferencing a handle, pointer arithmetic on it, ordering comparisons
+  (`<`, `>`) between handles, or mixing a handle with a `long long`. Handles
+  are opaque 64-bit values and nothing else. This is why py2bin never needs to
+  read `Python.h`, and why there is no C preprocessor, no macro expansion, and
+  no struct layout knowledge anywhere in the compiler.
+- Any prototype that disagrees with the vetted ABI (wrong argument count, or a
+  non-`void` return for a `void` function).
+- Variadic C-API entry points such as `PyObject_CallFunctionObjArgs`. Apple's
+  arm64 ABI passes variadic arguments on the stack and this backend has no
+  stack-argument path, so they are absent from the table rather than
+  miscompiled. `PySys_WriteStdout` is allowed only with a literal containing
+  no `%`.
+- More than eight arguments — the AAPCS64 register budget. Refused, not
+  truncated.
+- An extern call inside `A ? B : C` or a short-circuited `&&`/`||`. Both arms
+  are lowered eagerly, so the call in the untaken arm would still run.
+- Using the result of a `void` function as a value.
+
+**What py2bin does not do for you, and will not pretend to.**
+
+- **No automatic translation of Python into C-API calls.** This is the largest
+  gap versus Nuitka. `print("hi")`, a list comprehension, a `dict`, a `for` over
+  a list, `import json` — none of these become `PyObject` operations. The
+  native frontend's own subset still applies, and rejects them. If you want a
+  Python object built, you call `PyLong_FromLongLong` yourself.
+- **No automatic reference counting.** You call `Py_IncRef`/`Py_DecRef`. py2bin
+  emits exactly the calls you wrote and does not verify ownership, so a leak or
+  a double-free in your program stays a leak or a double-free.
+- **No exception propagation.** A failing C-API call returns `NULL` and the
+  error stays pending. py2bin inserts no checks and generates no unwinding;
+  checking `PyErr_Occurred` is your program's job.
+- **The artifact is not standalone.** The Mach-O carries an `LC_LOAD_DYLIB` for
+  the *build host's* CPython at its absolute path (`otool -L` shows it next to
+  `libSystem`). Move the binary to a machine without that exact interpreter at
+  that exact path and dyld will refuse to start it. Tier (a) is what produces a
+  distributable artifact.
+- **One divergence between compiled and interpreted runs.** Under CPython the
+  shims go through `ctypes.pythonapi`, which converts a set error indicator
+  into a raised exception; a compiled binary just receives `NULL`. The two runs
+  therefore agree only while no C-API call fails. `py2bin/cabi.py` states this
+  in the source.
 
 ## What “pure Python” means
 
@@ -60,9 +208,65 @@ PYTHONPATH=src python3 -m py2bin compile examples/native_hello.py \
   --output dist/native-hello --clean
 ./dist/native-hello
 
+# Prove the entire reachable app can use only the direct-native backend.
+PYTHONPATH=src python3 -m py2bin aot-plan \
+  examples/native_library/main.py \
+  --source-root examples/native_library --json --strict
+
+# Build or fail before writing anything. The proof records the target, raw
+# artifact SHA-256, byte count, and no-CPython/no-payload/no-extraction result.
+PYTHONPATH=src python3 -m py2bin aot-build \
+  examples/native_library/main.py \
+  --source-root examples/native_library \
+  --via-c --c-output dist/NativeLibrary.c \
+  --target windows-x86_64 --output dist/NativeLibrary.exe \
+  --attestation dist/NativeLibrary.aot.json --clean
+
+# Inline supported pure-Python library functions into every native target.
+PYTHONPATH=src python3 -m py2bin compile-all \
+  examples/native_library/main.py \
+  --source-root examples/native_library \
+  --strict-library-root examples/native_library/native_math \
+  --output-dir dist/native-library --clean
+
+# Audit every top-level function in a library without importing or running it.
+PYTHONPATH=src python3 -m py2bin audit-library app/purelib \
+  --source-root app --json --strict
+
+# Make a native build fail if any function in the selected library needs
+# CPython. Supported unused functions are validated and dead-code removed.
+PYTHONPATH=src python3 -m py2bin compile app/main.py \
+  --source-root app --strict-library-root app/purelib \
+  --target windows-x86_64 --output dist/App.exe --clean
+
+# Strict whole-source gate: fail instead of falling back to bundled CPython.
+PYTHONPATH=src python3 -m py2bin assemble \
+  examples/native_library/main.py \
+  --source-root examples/native_library --mode native \
+  --output dist/NativeLibrary --clean
+
 # Translate supported Python to portable C without invoking a C compiler.
 PYTHONPATH=src python3 -m py2bin emit-c examples/c_program.py \
   --output dist/c_program.c --clean
+
+# For the smaller integer intersection, retain and then really parse the C
+# before py2bin writes target machine code. No external C toolchain is used.
+PYTHONPATH=src python3 -m py2bin compile-via-c app/integer_program.py \
+  --c-output dist/integer_program.c \
+  --target windows-x86_64 --output dist/integer_program.exe --clean
+
+# Compile a canonical py2bin C file through the same handwritten frontend.
+PYTHONPATH=src python3 -m py2bin compile-c dist/integer_program.c \
+  --target linux-arm64 --output dist/integer_program-arm64 --clean
+
+# Nuitka-shaped tier, without Nuitka's gcc: C that calls the CPython C-API,
+# compiled to machine code by py2bin itself. darwin-arm64 only, and the result
+# dyld-links this machine's CPython rather than being standalone.
+PYTHONPATH=src python3 -m py2bin compile-c examples/capi_embedding.c \
+  --target darwin-arm64 --output dist/capi_embedding --clean
+./dist/capi_embedding
+# The same program as Python, for a stdout/exit-status diff against the binary.
+PYTHONPATH=src python3 examples/capi_embedding.py
 
 # Explain whether a program can use the C subset or needs CPython bundling.
 PYTHONPATH=src python3 -m py2bin plan-c app/main.py
@@ -115,13 +319,17 @@ python3 -m pip install \
   "git+https://github.com/yu314-coder/python_to_binary.git"
 ```
 
-See the [detailed compiler, bundling, target, and release guide](docs/DETAILED_GUIDE.md).
+See the [CPython-free whole-application architecture](docs/NATIVE_AOT_ARCHITECTURE.md)
+and the [detailed compiler, bundling, target, and release guide](docs/DETAILED_GUIDE.md).
 
 ## Formats
 
 | Command/mode | Output | Application logic | Installed Python needed on target |
 |---|---|---|---:|
+| `aot-build` | ELF, PE, Mach-O, macOS `.app` | closed-world, attested py2bin-generated machine code or no artifact | No |
+| `aot-build --via-c` | canonical whole-program `.c`, then ELF/PE/Mach-O | local functions are lowered/inlined, emitted as C, reparsed to identical IR, then encoded | No |
 | `compile` | ELF, PE, Mach-O, macOS `.app` | py2bin-generated machine code | No |
+| `compile-via-c` / `compile-c` | ELF, PE, or Mach-O | canonical C parsed by py2bin, then py2bin-generated machine code | No |
 | `emit-c` | `.c` or `.py2cbin` | C source, not yet an executable | N/A |
 | `build --format pyz` | Python zip application | CPython bytecode/source | Yes |
 | `build --format bin` | Executable Python zip application | CPython bytecode/source | Yes |
@@ -130,10 +338,39 @@ See the [detailed compiler, bundling, target, and release guide](docs/DETAILED_G
 | `freeze --onedir` / `bundle --onedir` | Unpacked embedded-runtime directory | CPython bytecode/source | No |
 
 Every executable above is a valid OS binary or executable launcher, but only
-`compile` translates the supported application logic into py2bin-generated CPU
-instructions. `freeze` produces a real native launcher around embedded CPython;
-calling the contained Python application “natively compiled” would be
-incorrect.
+`aot-build`, `compile`, `compile-via-c`, and `compile-c` translate the
+supported application logic into py2bin-generated CPU instructions.
+`aot-build` is the strongest contract because it audits the reachable local
+source graph and writes a proof record without permitting another backend.
+With `--via-c`, the optimized whole-program IR—including supported local
+library functions—is serialized as deterministic C containing explicit native
+slots, labels, branches, byte writes, and returns. py2bin's handwritten parser
+must reconstruct the exact IR before the binary writers run. The retained C is
+not passed to GCC, Clang, or another compiler.
+`freeze` produces a real native launcher around embedded CPython; calling the
+contained Python application “natively compiled” would be incorrect.
+
+## Why NumPy/Torch imports are rejected, not reimplemented
+
+`import numpy` and `import torch` are rejected by `compile` with a
+source-located error. py2bin does not silently reimplement a third-party
+numerical library, because a from-scratch integer reimplementation does not
+match the real package's runtime object semantics, and shipping a binary whose
+observable result differs from CPython would violate the compiler's honesty
+contract.
+
+Concretely, a NumPy/Torch reduction is not a plain `int`: `numpy.sum(...)`
+returns an `numpy.int64` and `torch.sum(...)` returns a 0-dimensional
+`Tensor`. Under CPython, `raise SystemExit(numpy.sum(...))` therefore prints
+the value's repr and exits `1`, and mixing a NumPy result with a Torch tensor,
+or calling `torch.relu` on a NumPy array, raises. A native integer kernel that
+returned `int` would diverge from every one of these behaviors, so the import
+is refused rather than approximated. (An earlier `--experimental-kernels`
+option attempted this substitution and was removed for exactly this reason.)
+
+If a program genuinely needs the real NumPy or PyTorch, use `freeze`/`bundle`,
+which carries the real packages and the embedded CPython runtime that executes
+them. That is compatibility packaging, not native translation.
 
 ## Claims audit
 
@@ -142,11 +379,14 @@ target” is not the same claim as “the application does not use CPython.”
 
 | Claim | Accurate? | Exact meaning |
 |---|---:|---|
-| No GCC, Clang, assembler, or linker is required | Yes | `compile` writes ELF, PE, and Mach-O bytes directly. `freeze` copies a compatible CPython runtime and installed package files. |
-| The target computer does not need Python installed | Yes, for `compile` and `freeze` | A `compile` artifact has no Python runtime. A `freeze` artifact carries its own CPython runtime. The lighter `build` formats still need compatible target Python. |
-| A complete frozen application does not use CPython | No | `freeze` embeds and starts CPython; only the supported `compile` subset replaces Python execution with generated machine code. |
+| No GCC, Clang, assembler, or linker is required | Yes | `compile`, `compile-via-c`, and `compile-c` write ELF, PE, and Mach-O bytes directly. `freeze` copies a compatible CPython runtime and installed package files. |
+| The target computer does not need Python installed | Yes, for native compile modes and `freeze` | A native compile artifact has no Python runtime. A `freeze` artifact carries its own CPython runtime. The lighter `build` formats still need compatible target Python. |
+| A complete frozen application does not use CPython | No | `freeze` embeds and starts CPython; only the documented native subsets replace Python execution with generated machine code. |
 | Third-party packages do not need a Python runtime | No | NumPy, Torch, `bpy`, Manim, and similar packages are imported by the embedded CPython runtime in `freeze` mode. |
-| Arbitrary Python is translated completely to machine code | No | `compile` currently accepts the documented small, static subset and rejects unsupported syntax with a source location. |
+| Arbitrary Python is translated completely to machine code | No | `compile` accepts the documented static subset and rejects everything else with a source location. Third-party numerical packages such as NumPy/Torch are rejected outright, never reimplemented. |
+| py2bin compiles C that calls the CPython C-API, without gcc | Yes, for a vetted subset on `darwin-arm64` | py2bin's own C parser and ARM64 encoder produce a Mach-O that dyld-binds the interpreter and calls 31 vetted entry points. Verified by running the binary and diffing stdout and exit status against the same program under CPython. |
+| py2bin is a Nuitka replacement | No | Nuitka translates ordinary Python into C-API calls. py2bin does not generate those calls at all — you write them. Tier (b) is an embedding surface, not an automatic compiler for the Python language. |
+| A C-API artifact runs on a machine without Python | No | It records an `LC_LOAD_DYLIB` for the build host's CPython at an absolute path. Only tier (c) `compile` output and `freeze` output are standalone. |
 | py2bin itself has no third-party Python dependency | Yes | The package imports only Python standard-library modules, and its build/runtime dependency lists are empty. Tests enforce both properties. |
 | The build computer does not need Python | No | Building requires Python 3.10+ to run py2bin. No native compiler toolchain is required for the supported direct-binary path. |
 
@@ -238,14 +478,45 @@ The fetcher:
 - never imports the downloaded package or runs `setup.py`, build backends, or
   shell commands.
 
-The current successful cross-package native form is deliberately narrow:
-`from MODULE import CONSTANT`, where the export is statically evaluable by the
-native frontend. The value is lowered into py2bin IR and handwritten
-x86-64/ARM64 instructions. Dynamic functions, classes, package initialization,
-Cython-generated C, C/C++/Rust/Fortran/CUDA sources, CPython extensions, and
-general library imports fail with a source location. This command has no
-CPython or PyInstaller fallback, so a failed native conversion cannot be
-mistaken for a native artifact.
+The current successful cross-package native forms are deliberately narrow:
+
+- `from MODULE import CONSTANT`, when the export is statically evaluable; and
+- `from MODULE import FUNCTION`, when the function has only positional
+  parameters with optional static integer defaults, no decorators/variadics,
+  and consists of supported
+  integer assignments, Boolean/chained-comparison logic, native `if`/`while`/
+  `for range` control flow, and integer returns on every fall-through path.
+  Procedures returning `None` may use the same native control flow, bare
+  returns, constant output, and calls to other supported procedures. Static
+  annotation expressions are erased when the supported closed program does not
+  otherwise request annotation reflection; they do not add runtime type
+  implementations.
+
+Supported functions can call other supported non-recursive functions. Calls
+use expression inlining for simple functions and imperative IR inlining with
+private stack slots/labels for loops, early returns, and mutable branches. The
+expanded IR is encoded by the handwritten x86-64/ARM64 backends. There is no
+Python call, bytecode, CPython runtime, or hidden fallback in the result.
+Absolute and relative local modules—including nested local imports—are
+confined to `--source-root`; pinned modules use verified source-lock roots.
+The regression suite compares simple imported helpers with manually inlined
+equivalents and separately executes an imperative function-loop sample.
+
+When a function is imported, its provider module may contain constants,
+function definitions, statically resolvable local `from` imports, docstrings,
+`__future__` imports, and `pass`, but not executable top-level initialization
+whose omission would change Python semantics. Recursion, classes, mutable
+containers, dynamic calls/imports, Cython-generated C, C/C++/Rust/Fortran/CUDA
+sources, and CPython extensions still fail with a source location. A failed
+native conversion cannot be mistaken for a native artifact.
+
+`audit-library` walks a source tree without importing it, lowers every
+top-level function through the real native frontend, and separately lists
+prebuilt native payloads and browser assets. `compile`/`compile-all`
+`--strict-library-root` applies that audit as a build gate. Passing the gate
+means every inspected function is accepted by the current AOT semantics; it
+does not claim that `.so`/`.pyd` ABI bindings or HTML/CSS/JavaScript became
+py2bin-authored CPU instructions.
 
 `fetch-sources` performs only the verified download/extraction phase:
 
@@ -258,12 +529,47 @@ py2bin fetch-sources app.py --source-root . \
 Native compile targets currently implemented are `linux-x86_64` (ELF),
 `linux-arm64` (ELF), `darwin-x86_64` and `darwin-arm64` (Mach-O), and
 `windows-x86_64` and `windows-arm64` (PE `.exe`).
-Run `py2bin targets` to list them. The first native
+Run `py2bin targets` to list them. The native
 frontend supports module constants, static strings/f-strings, a signed 64-bit
-runtime for variables and arithmetic, comparisons, `if`, `while`,
-`for NAME in range(...)`, `break`, `continue`, `print()` of compile-time
-values, and integer-expression exit status. It rejects everything else with a
-source location rather than producing a subtly incorrect executable.
+runtime for variables and arithmetic, an IEEE-754 binary64 (`float`) runtime
+for variables, arithmetic, comparisons, and `int`/`float` conversion,
+comparisons, `if`, `while`, `for NAME in range(...)`, `break`, `continue`,
+`print()` of compile-time values, pure integer function inlining across
+local/pinned modules, and integer-expression exit status. On POSIX targets it
+additionally supports runtime integer lists, runtime ASCII strings, and
+user-defined classes over a bump-arena (anonymous `mmap`); on `darwin-arm64` it
+can call vetted libc symbols and vetted CPython C-API entry points through the
+`py2bin.cabi` adapter ABI. It rejects everything else with a source location
+rather than producing a subtly incorrect executable.
+
+A class instance is a plain heap block whose layout is fixed at build time:
+attribute *i* lives at `pointer + i * 8`. Because the class of every instance is
+statically known, there is no object header, type pointer, or vtable, and a
+method call resolves directly to one body that is inlined like any other native
+call. That is what makes classes compile without an interpreter — and it is also
+why inheritance, dynamic attributes, and duck-typed dispatch are rejected rather
+than approximated.
+
+Verification status is deliberately explicit. The compiler host for this
+project is `darwin-arm64`, so every native feature above is verified by
+building a `darwin-arm64` Mach-O, running it, and comparing its exit code and
+stdout against the same source under CPython. The other targets are verified by
+building a structurally valid image (correct ELF/PE/Mach-O header) and, for
+x86-64, disassembling the emitted `.text` with `otool -tvV`; they are not
+executed on this host, and no claim is made beyond "builds and disassembles to
+the intended instructions." The heap and adapter-ABI features are intentionally
+narrower than the integer/float core for this reason.
+
+Runtime doubles are lowered to real hardware floating point: the x86-64 backend
+emits SSE2 (`movsd`, `addsd`/`subsd`/`mulsd`/`divsd`, `ucomisd`,
+`cvtsi2sd`/`cvttsd2si`) and the ARM64 backend emits scalar NEON/FP
+(`fadd`/`fsub`/`fmul`/`fdiv`, `fcmp`, `scvtf`/`fcvtzs`). No soft-float library,
+external compiler, or Python runtime is involved. Runtime `float` division is
+accepted only with a nonzero numeric constant divisor, because a runtime
+divisor can be zero and Python raises `ZeroDivisionError` there; honoring that
+exception needs the object runtime, so it is rejected rather than silently
+emitting IEEE infinity/NaN. Formatting a runtime double back to text (`print`
+of a computed `float`) also needs that runtime and is not yet supported.
 
 The word “supports” is intentionally narrow:
 
@@ -272,15 +578,25 @@ The word “supports” is intentionally narrow:
 | Literal `str`, `bytes`, `int`, `float`, `bool`, `None` | Yes | Represented while lowering the static program |
 | Single-name assignment and annotation | Yes | Static values are folded; runtime integer values use native stack slots |
 | Integer `+`, `-`, `*`, bitwise operations, shifts | Yes | Runtime signed 64-bit instructions; overflow wraps to 64 bits rather than creating Python big integers |
+| Runtime `float` `+`, `-`, `*`, unary `-` | Yes | IEEE-754 binary64 in hardware SSE2/NEON registers; mixed `int`/`float` promotes the integer operand |
+| Runtime `float` `/` | Restricted | Only with a nonzero numeric constant divisor; a runtime divisor is rejected because Python's divide-by-zero exception needs the object runtime |
+| `float`/`int` conversion and `float` comparisons | Yes | `float(x)` widens with `cvtsi2sd`/`scvtf`; `int(x)` truncates toward zero with `cvttsd2si`/`fcvtzs`; comparisons use `ucomisd`/`fcmp` |
 | Integer comparisons and dynamic `if` | Yes | Runtime signed comparisons and native branches |
 | Constant arithmetic, Boolean and conditional expressions | Yes | Evaluated at build time when no runtime value is involved |
 | Constant `if` | Yes | Only the selected branch is emitted |
 | `while`, `for NAME in range(...)`, `break`, `continue` | Yes | Native branches; `range` step must be a nonzero integer constant |
 | Simple f-string | Yes | Every formatted value must be compile-time constant |
-| `print(...)` | Yes | Constant UTF-8 bytes are emitted through an OS write API/syscall |
+| Integer functions and procedures | Restricted | Positional and undecorated; static integer defaults and named calls; assignments, Boolean/chained comparisons, integer control flow, loops, value or bare returns, constant side effects, and acyclic calls are inlined into native IR |
+| Runtime `list` of `int` | Restricted, POSIX only | Literal build, constant/runtime index load and store, and `len()` over a bump-arena (anonymous `mmap`) of signed-64-bit elements. Negative indices count from the end as in Python. A constant index is range-checked at build time; a runtime index is range-checked by emitted instructions that report `IndexError` on stderr and exit 1, exactly like CPython, instead of reading or writing outside the list. Float elements and bare list use are rejected. Rejected for the two Windows targets, which lack the wired allocator |
+| Runtime list index inside `A if C else B` or `and`/`or` | No | Both arms are lowered eagerly, so a bounds check would run even when Python would not evaluate that branch; rejected with a source location. Use an `if` statement, which is supported |
+| Runtime ASCII `str` | Restricted, POSIX only | `""` seed, `+` concatenation, `len()`, and `print()` of a genuinely runtime string via the same arena; non-ASCII literals are rejected because byte length would disagree with CPython's code-point `len()`. Rejected for Windows targets |
+| User-defined `class` | Restricted, POSIX only | Construction, integer attributes, attribute load/store, and methods (including a method calling another method) over the same bump arena. Every attribute must be assigned unconditionally in `__init__`, which fixes the layout and guarantees no read hits a slot Python would treat as unset. Dispatch is static, so calls inline. Inheritance, class attributes, decorated methods (`property`, `staticmethod`, `classmethod`), special methods, float attributes, recursion, attributes created outside `__init__`, and rebinding a variable to another class are rejected. Rejected for the two Windows targets |
+| Adapter-ABI extern call | Restricted, `darwin-arm64` only | `from py2bin.cabi import NAME` binds a vetted libc symbol (e.g. `abs`, `strlen`, `getpid`) through real dyld; integer and compile-time-constant C-string arguments only. Rejected for every non-`darwin-arm64` target and for unknown symbols |
+| CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI also exposes 31 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You write the calls; py2bin never generates them from ordinary Python, never manages reference counts, and never propagates a C-API error. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
+| `print(...)` | Yes | Constant UTF-8 bytes, or (POSIX only) a runtime ASCII string, emitted through an OS write API/syscall |
 | `SystemExit(integer)` / `sys.exit(integer)` | Yes | Constant or runtime integer expression becomes the OS process-exit value |
-| Runtime input/arguments, dynamic printing, containers, functions, classes, general exceptions | No | Rejected by `compile`; compatible mode needs CPython |
-| Imports | Only restricted `sys` | `import sys` exists solely for `sys.exit`; imported libraries are not compiled |
+| Runtime input/arguments, dynamic printing, general containers (dicts, sets, nested/float lists), general exceptions, inheritance and dynamic attribute access | No | Rejected by `compile` with a source location; compatible mode needs CPython. Only the integer-list, ASCII-string, and static-layout class cases above are supported |
+| Imports | Restricted local/pinned source plus `sys` | Static constants and supported functions can cross nested local module boundaries; native extensions and dynamic modules are not translated |
 
 The bundle-format `bin` uses Python; `py2bin compile` produces actual machine
 code. These writers encode executable headers, import tables, system calls, and
@@ -333,13 +649,44 @@ constants, local variables, arithmetic, comparisons, Boolean expressions,
 py2bin emit-c program.py -o program.c
 py2bin emit-c program.py -o program.py2cbin --container
 py2bin plan-c program.py
+
+# Smaller integer subset: the generated C is parsed again, then lowered to
+# py2bin IR and handwritten target instructions.
+py2bin compile-via-c program.py --c-output program.c \
+  --target windows-x86_64 -o program.exe
+
+# Direct input uses the same canonical C parser.
+py2bin compile-c program.c --target linux-arm64 -o program-arm64
 ```
 
 A `.py2cbin` file is a versioned, checksummed container holding generated C; it
-is not an executable. Turning C into machine code normally requires a C
-compiler. The toolchain's `compile` command bypasses that requirement for its
-supported native Python subset by writing ELF, Mach-O, or PE bytes directly.
-This project never silently invokes a system assembler, linker, or C compiler.
+is not an executable. `compile-via-c` is a literal zero-toolchain bridge for
+the signed-64-bit intersection: it emits the C text, lexes and parses that text
+with py2bin's standard-library-only implementation, reconstructs verified
+integer semantics, and then uses the same IR and PE/ELF/Mach-O writers as
+`compile`. `compile-c` begins at the C parsing step. Neither command calls a
+system assembler, linker, or C compiler.
+
+The accepted canonical C is deliberately small: `long long` functions and
+locals, `int main(void)`, integer `+`, `-`, `*`, bitwise operations,
+constant-count shifts, comparisons, conditional expressions, assignments,
+structured `if`/`while`, py2bin's canonical `for range` form, function calls,
+returns, and newline-terminated `printf` with literal text or compile-time
+integer `%lld` values. It also accepts `extern` prototypes for the vetted
+adapter ABI and *opaque* pointer handles (`PyObject *`, `char *`, `void *`)
+that are passed and compared against `NULL` but never dereferenced. It rejects
+dereferenceable pointers, pointer arithmetic, arrays, structs, floating point,
+division/modulo, macros other than the known emitted includes, runtime
+formatting, arbitrary libc, Cython-generated C, the NumPy C-API, C++, ATen,
+and CUDA. The CPython C-API is accepted only as the fixed vetted symbol table
+described under [What the C-API path supports](#what-the-c-api-path-supports),
+not as a general C-API compiler: py2bin never reads `Python.h`, so anything
+that is a macro, a `static inline`, a struct field, or variadic is out of
+reach. The broader `emit-c` frontend can still emit constructs that require a
+conventional C implementation; acceptance by `emit-c` alone does not promise
+acceptance by `compile-via-c`. `emit-c`, `compile-via-c`, and `plan-c` are the
+CPython-free portable-C route and reject any program that imports
+`py2bin.cabi`; the C-API path is reached through `compile` or `compile-c`.
 
 `plan-c` returns `c-source` when direct C translation is safe and
 `cpython-bundle` when imports or unsupported Python semantics require the
@@ -362,6 +709,53 @@ supplied to py2bin. Native libraries such as Torch and `bpy` contain
 target-specific compiled code; future standalone framework mode will consume
 provided wheels/runtime archives directly without installing them into the
 build environment.
+
+## Fetching a target runtime and target wheels
+
+A cross-target compatible bundle needs two things a foreign build machine does
+not have: the target's CPython runtime and target-compatible wheels. Both are
+published, so `freeze --auto-fetch` retrieves them instead of failing:
+
+```sh
+# Build a Windows x86-64 app from macOS or Linux. No Wine, no Windows machine,
+# no pip: py2bin downloads python.org's embeddable CPython and the PyPI wheels.
+py2bin freeze app/main.py --source-root app \
+  --target windows-x86_64 --auto-fetch \
+  --fetch-map webview=pywebview --fetch-map PIL=pillow \
+  --fetch-lock py2bin-fetch.lock.json \
+  --app --name MyApp --icon icon.ico -o dist/MyApp --clean
+```
+
+Downloads use `urllib.request` and `zipfile` from the standard library. pip,
+setuptools, and virtualenv are never invoked, so the dependency-free guarantee
+is unchanged. Every download is credential-free HTTPS, may not redirect off
+HTTPS, is size-capped, is verified against the SHA-256 that PyPI or python.org
+publishes for it, and is cached content-addressed so a rebuild re-uses bytes it
+already verified. Archives are extracted with the traversal, link, and
+special-file rejection the source fetcher already uses.
+
+`--fetch-lock` records the URL and digest of every fetched file. When the lock
+exists it becomes authoritative: a changed artifact is an error, not a silent
+upgrade. State the integrity model exactly — the first fetch trusts the digest
+the index serves over HTTPS, and the lock makes every later build reproducible
+and auditable.
+
+py2bin never guesses a PyPI project from an import name. `import webview` comes
+from `pywebview` and `import PIL` from `pillow`; import names and project names
+are different namespaces, and a wrong guess would install an unrelated or
+hostile package. A bare import with no wheel therefore stops the build until
+`--fetch-map IMPORT=PROJECT` names the project explicitly.
+
+Two cases still require a supplied wheel, and both say so precisely:
+
+- a project that publishes only a source distribution, because py2bin does not
+  execute `setup.py` or a build backend; and
+- a project with no wheel for the requested interpreter, ABI, or platform.
+
+`--auto-fetch` currently retrieves Windows runtimes, because python.org
+publishes the embeddable distribution for `windows-x86_64` and
+`windows-arm64`. Other targets still need `--runtime-pack`; wheel fetching
+works for every target.
 
 ## Dependency collection
 
@@ -535,6 +929,15 @@ balance.
 On macOS, `freeze --app` wraps the one-file payload in the directory structure
 required by the Apple `.app` format. The runtime archive is embedded in
 `Contents/MacOS/NAME`; there is no unpacked `Contents/Resources/bundle`.
+Both `darwin-arm64` and `darwin-x86_64` are supported, and an Intel app can be
+cross-built from Apple Silicon (or the reverse) with a matching
+`--runtime-pack` and target wheels — py2bin writes the launcher bytes itself
+and never runs Rosetta, Wine, or an emulator. The two differ in signing:
+arm64 macOS refuses to load an unsigned executable, so the arm64 launcher
+embeds an ad-hoc signature sealing `Info.plist` and the resource hashes.
+Intel macOS still loads unsigned executables, so the x86-64 launcher is emitted
+unsigned. It runs locally, but it is neither signed nor notarized, so Gatekeeper
+will quarantine it if it is downloaded rather than built on the machine.
 `--icon` accepts ICNS, a square PNG at a standard icon size, or a
 PNG-backed multi-resolution Windows ICO. ICO-to-ICNS conversion is implemented
 in pure Python and skips only ICO sizes, such as 48×48, that have no matching
@@ -588,6 +991,49 @@ Leave size optimization off when the packaged program imports package test
 suites, `tkinter`, `unittest`, `lib2to3`, or CPython build configuration files
 at runtime.
 
+### Whole-library AOT boundary
+
+The intended native pipeline classifies dependency content instead of
+pretending every file is the same language:
+
+- supported pure-Python functions become py2bin IR and handwritten target
+  instructions;
+- existing `.pyd`, `.so`, `.dll`, `.dylib`, C/C++/Rust/CUDA engines remain
+  target-native binaries and need a future non-CPython adapter ABI when they
+  currently expose only the CPython extension API;
+- HTML, CSS, JavaScript, shaders, fonts, models, templates, and other data stay
+  assets because converting data to CPU instructions would be meaningless;
+- unsupported dynamic Python is rejected by strict native mode. Compatible
+  `bundle` mode still carries CPython and must not be described as complete
+  AOT.
+
+C source is an optional readable intermediate, not machine code. `emit-c`
+stops at C text. `compile-via-c` proves and compiles only the documented
+canonical integer intersection by parsing that text with py2bin itself;
+`compile-c` accepts the same restricted language directly. General emitted C
+still needs an external C implementation, which py2bin never invokes
+silently. Strict native compilation always ends in py2bin IR and handwritten
+target instructions.
+
+HTML and CSS remain declarative data, and browser JavaScript remains code for a
+JavaScript/browser engine. Compatible one-file bundles copy, compress, and
+embed `.html`, `.css`, `.js`, `.mjs`, `.cjs`, and `.wasm` files inside the
+executable payload. `py2bin-freeze.json` records their relative paths, kinds,
+sizes, and SHA-256 hashes. This makes them integrity-checked binary payload
+data; it does not mislabel HTML/CSS/JS as CPU instructions.
+
+Consequently there is not yet a truthful switch that converts an arbitrary
+Torch/Transformers/Manim/`bpy`/pywebview application and its entire dependency
+closure into CPython-free py2bin machine code. The restricted function
+inlining above is real progress toward compiling pure-Python glue, while the
+adapter ABI and a substantially broader Python object runtime remain future
+work.
+
+Use `assemble --mode native --source-root PROJECT` as the strict gate when an
+artifact must contain only py2bin-generated application instructions. It
+fails on the first unsupported dependency construct and never falls back to
+the CPython-compatible bundle.
+
 ## Heavy-library compatibility
 
 Run `py2bin capabilities` for the catalog below, or
@@ -610,6 +1056,10 @@ result of one entry file without importing or executing it.
 | Numba / llvmlite | No | Conditional | Mutually compatible target wheels, including the LLVM components |
 | Requests / Flask / Django / FastAPI | No | Conditional | CPython, dependencies, and application templates/static/configuration data |
 | Unknown third-party or local import | No by default | Conditional | Its real implementation and complete target-compatible dependency/data closure |
+
+The NumPy and PyTorch rows describe the real packages. `compile` rejects those
+imports outright rather than reimplementing them, so neither row is ever “Yes”
+for native compilation; they are collected only through `freeze`/`bundle`.
 
 “Conditional” means the necessary files can be collected when they are
 actually supplied and compatible. It does not mean every version exists for

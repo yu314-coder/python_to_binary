@@ -94,6 +94,39 @@ class FreezerTests(unittest.TestCase):
         image = macos_shell_launcher("exit 0", machine="arm64")
         self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
 
+    def test_x86_64_macos_launcher_reads_the_initial_stack(self):
+        # The x86-64 Mach-O writer uses LC_UNIXTHREAD, which starts execution
+        # at the raw entry point with argc/argv on the initial process stack.
+        # Only the arm64 image uses LC_MAIN, where they arrive in registers.
+        # Reading rdi/rsi/rdx here would read uninitialised registers, and the
+        # launcher would exit 64 instead of running the program.
+        image = macos_shell_launcher("exit 0", machine="x86_64")
+        prologue = (
+            b"\x49\x89\xe5"  # mov r13, rsp
+            b"\x4d\x8b\x65\x00"  # mov r12, [r13]  (argc)
+            b"\x4d\x8d\x75\x08"  # lea r14, [r13+8] (argv)
+        )
+        self.assertIn(prologue, image)
+        # The LC_MAIN register convention must not be used for this target.
+        self.assertNotIn(b"\x49\x89\xfc\x49\x89\xf6\x49\x89\xd7", image)
+
+    def test_x86_64_app_launcher_is_emitted_unsigned(self):
+        # arm64 macOS requires a code signature, so that launcher embeds an
+        # ad-hoc one sealing Info.plist/CodeResources. Intel macOS still loads
+        # unsigned executables, so the same request must produce a valid
+        # x86-64 Mach-O rather than being refused.
+        image = macos_shell_launcher(
+            "exit 0",
+            machine="x86_64",
+            info_plist=b"<plist/>",
+            code_resources=b"<plist/>",
+        )
+        self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
+        # cputype in the Mach-O header: CPU_TYPE_X86_64 is 0x01000007.
+        self.assertEqual(
+            int.from_bytes(image[4:8], "little"), 0x01000007
+        )
+
     @unittest.skipUnless(
         platform.system() == "Darwin" and platform.machine() == "arm64",
         "native launcher execution requires Apple Silicon",

@@ -26,6 +26,7 @@ def compile_locked_sources(
     target: str | None = None,
     clean: bool = False,
     app: bool = False,
+    experimental_kernels: bool = False,
 ) -> SourceNativeResult:
     """Fetch pinned source imports and attempt only real native compilation.
 
@@ -48,6 +49,7 @@ def compile_locked_sources(
         target=target,
         clean=clean,
         app=app,
-        source_roots=fetched.roots,
+        source_roots=(source_root, *fetched.roots),
+        experimental_kernels=experimental_kernels,
     )
     return SourceNativeResult(native, fetched.fetched, fetched.imports)

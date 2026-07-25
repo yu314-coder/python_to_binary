@@ -361,8 +361,53 @@ def _imports(tree: ast.AST) -> tuple[str, ...]:
     return tuple(sorted(result, key=str.lower))
 
 
-def assess_entry(entry: Path) -> EntryCapability:
-    """Inspect an entry file without executing it or importing its packages."""
+def _local_source_capability(entry: Path, module: str) -> LibraryCapability | None:
+    if module == "<relative>":
+        return LibraryCapability(
+            module=module,
+            project="relative local pure-Python source",
+            native_aot="restricted",
+            compatible_bundle="yes",
+            payload="supported pure integer functions are inlined into native IR",
+            requirement=(
+                "the resolved relative module must remain inside the source root "
+                "and satisfy the restricted native function rules"
+            ),
+        )
+    parts = module.split(".")
+    candidates = (
+        entry.parent.joinpath(*parts).with_suffix(".py"),
+        entry.parent.joinpath(*parts, "__init__.py"),
+    )
+    if not any(candidate.is_file() for candidate in candidates):
+        return None
+    return LibraryCapability(
+        module=module,
+        project="local pure-Python source",
+        native_aot="restricted",
+        compatible_bundle="yes",
+        payload="supported pure integer functions are inlined into native IR",
+        requirement=(
+            "imported functions must use positional parameters with optional "
+            "static integer defaults, supported integer assignments/control "
+            "flow, and value returns on every path; executable module top-level "
+            "code is rejected"
+        ),
+    )
+
+
+def assess_entry(
+    entry: Path,
+    *,
+    experimental_kernels: bool = False,
+) -> EntryCapability:
+    """Inspect an entry file without executing it or importing its packages.
+
+    ``experimental_kernels`` is accepted for call-signature stability but is
+    inert: py2bin no longer reimplements a NumPy/Torch integer subset, because
+    such a reimplementation does not match the real packages' runtime object
+    semantics. NumPy/Torch imports are reported as unsupported.
+    """
 
     entry = entry.expanduser().resolve()
     if not entry.is_file():
@@ -371,7 +416,11 @@ def assess_entry(entry: Path) -> EntryCapability:
     tree = ast.parse(source, filename=str(entry))
     imports = _imports(tree)
     try:
-        lower(entry, source)
+        lower(
+            entry,
+            source,
+            (entry.parent,),
+        )
     except (NativeCompileError, ValueError) as error:
         native_compile = False
         native_reason = str(error)
@@ -379,14 +428,19 @@ def assess_entry(entry: Path) -> EntryCapability:
         native_compile = True
         native_reason = (
             "accepted by the current static native subset; no CPython runtime "
-            "or third-party library payload is used"
+            "or third-party library payload is used; supported pure-Python "
+            "functions are inlined into native IR"
         )
     return EntryCapability(
         entry=entry,
         native_compile=native_compile,
         native_reason=native_reason,
         imports=imports,
-        libraries=tuple(library_capability(module) for module in imports),
+        libraries=tuple(
+            _local_source_capability(entry, module)
+            or library_capability(module)
+            for module in imports
+        ),
     )
 
 

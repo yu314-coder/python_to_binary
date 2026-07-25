@@ -122,6 +122,7 @@ class _CWriter:
         self.depth = 0
         self.scope: dict[str, str] = {}
         self.returns: dict[str, str] = {}
+        self.in_main = False
 
     def compile(self, tree: ast.Module) -> str:
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
@@ -138,10 +139,12 @@ class _CWriter:
         self.line("int main(void) {")
         self.depth += 1
         self.scope = {}
+        self.in_main = True
         self.predeclare(body)
         for statement in body:
             self.statement(statement)
         self.line("return 0;")
+        self.in_main = False
         self.depth -= 1
         self.line("}")
         return "\n".join(self.lines) + "\n"
@@ -239,6 +242,22 @@ class _CWriter:
             self.line(f"while ({self.expr(node.test)}) {{"); self.block(node.body)
         elif isinstance(node, ast.For): self.for_loop(node)
         elif isinstance(node, ast.Return): self.line("return;" if node.value is None else f"return {self.expr(node.value)};")
+        elif isinstance(node, ast.Raise):
+            if (
+                not self.in_main
+                or node.cause is not None
+                or not isinstance(node.exc, ast.Call)
+                or not isinstance(node.exc.func, ast.Name)
+                or node.exc.func.id != "SystemExit"
+                or node.exc.keywords
+                or len(node.exc.args) > 1
+            ):
+                raise CSourceError(
+                    "only top-level raise SystemExit([integer]) is supported",
+                    node,
+                )
+            status = self.expr(node.exc.args[0]) if node.exc.args else "0"
+            self.line(f"return {status};")
         elif isinstance(node, ast.Break): self.line("break;")
         elif isinstance(node, ast.Continue): self.line("continue;")
         else: raise CSourceError(f"unsupported statement {type(node).__name__}", node)
