@@ -845,9 +845,16 @@ class RejectionTests(CProgramTestCase):
         self.reject("int main(void) { double d; return 0; }\n", "floating point")
         self.reject("int main(void) { return 1.5; }\n", "floating-point literal")
 
-    def test_enums_and_typedefs_are_refused(self):
-        self.reject("enum E { A };\nint main(void) { return 0; }\n", "enum")
-        self.reject("typedef int myint;\nint main(void) { return 0; }\n", "typedef")
+    def test_undefined_enum_tag_is_refused(self):
+        self.reject(
+            "int main(void) { enum Missing e; return 0; }\n", "has not been defined"
+        )
+
+    def test_conflicting_typedef_is_refused(self):
+        self.reject(
+            "typedef int t;\ntypedef char t;\nint main(void) { return 0; }\n",
+            "already a different type",
+        )
 
     def test_incomplete_struct_use_is_refused(self):
         # A tag with no body may only be pointed at; its layout is unknown.
@@ -2059,4 +2066,54 @@ int main(void) {
 }
 """,
             stdout="15\n",
+        )
+
+
+class EnumAndTypedefTests(CProgramTestCase):
+    """enum constants and typedef names."""
+
+    def test_enumerators_count_from_zero_and_continue(self):
+        self.run_c(
+            _STDIO
+            + """
+enum Plain { A, B, C };
+enum Explicit { X = 5, Y, Z = 10 };
+int main(void) {
+    printf("%d %d\\n", A + B + C, X + Y + Z);
+    return 0;
+}
+""",
+            stdout="3 21\n",
+        )
+
+    def test_typedef_names_a_type_including_a_struct(self):
+        self.run_c(
+            _STDIO
+            + """
+typedef int myint;
+typedef struct P { int x; int y; } Point;
+long long total(Point *p) { return p->x + p->y; }
+int main(void) {
+    myint n = 7;
+    Point p;
+    p.x = 20; p.y = 2;
+    printf("%d %lld\\n", n, total(&p));
+    return 0;
+}
+""",
+            stdout="7 22\n",
+        )
+
+    def test_a_local_shadows_an_enumerator(self):
+        self.run_c(
+            _STDIO
+            + """
+enum E { VALUE = 9 };
+int main(void) {
+    int VALUE = 1;
+    printf("%d\\n", VALUE);
+    return 0;
+}
+""",
+            stdout="1\n",
         )

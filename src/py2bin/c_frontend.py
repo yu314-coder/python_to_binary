@@ -903,6 +903,7 @@ class Function:
 class TranslationUnit:
     functions: dict[str, Function]
     externs: dict[str, CType]  # local name -> declared C result type
+    enumerators: dict[str, int] = dataclasses.field(default_factory=dict)
 
 
 # --- parser ------------------------------------------------------------------
@@ -956,8 +957,6 @@ _RESERVED = frozenset(
 )
 
 _UNSUPPORTED_KEYWORDS = {
-    "enum": "enum types are not implemented",
-    "typedef": "typedef declarations are not implemented",
     "float": "floating point is not implemented by py2bin's C compiler",
     "double": "floating point is not implemented by py2bin's C compiler",
     "static": "static storage duration is not implemented; py2bin's C has no writable data segment",
@@ -981,6 +980,11 @@ class Parser:
         # struct/union tags are shared across the translation unit, so a
         # tag mentioned inside its own body refers to the same type.
         self.struct_tags: dict[str, StructType] = {}
+        # Copied per parse: a typedef in one translation unit must not
+        # leak into the next compilation in the same process.
+        self.typedefs: dict[str, CType] = dict(_TYPEDEFS)
+        self.enum_tags: dict[str, CType] = {}
+        self.enumerators: dict[str, int] = {}
 
     # --- token helpers ---
 
@@ -1037,15 +1041,77 @@ class Parser:
         name = str(token.value)
         if name in _UNSUPPORTED_KEYWORDS:
             return True
-        if name in _TYPE_KEYWORDS or name in _QUALIFIERS or name in _TYPEDEFS:
+        if name in _TYPE_KEYWORDS or name in _QUALIFIERS or name in self.typedefs:
             return True
-        if name in {"struct", "union"}:
+        if name in {"struct", "union", "enum", "typedef"}:
             return True
         if name in _OPAQUE_NAMES:
             # 'PyObject x' is not something py2bin can lay out, but 'PyObject *x'
             # is a handle. Only the pointer form is a type here.
             return self.peek().value == "*"
         return False
+
+    def enum_specifier(self) -> CType:
+        """Parse ``enum`` with an optional tag and optional enumerator list.
+
+        C makes each enumerator an ``int`` constant in the ordinary namespace,
+        and an unadorned enumeration compatible with ``int``, so the type here
+        is simply ``int``. Values continue from the previous enumerator unless
+        one is given explicitly.
+        """
+
+        keyword = self.take()  # 'enum'
+        tag: str | None = None
+        if self.token.kind == "identifier" and self.token.value not in _RESERVED:
+            tag = str(self.take().value)
+        if not self.at("{"):
+            if tag is None:
+                self.error("an anonymous enum needs a body", keyword)
+            if tag not in self.enum_tags:
+                self.error(f"enum {tag} has not been defined", keyword)
+            return self.enum_tags[tag]
+        self.take("{")
+        next_value = 0
+        while not self.accept("}"):
+            if self.token.kind == "eof":
+                self.error("unterminated enum body", keyword)
+            name_token = self.identifier()
+            name = str(name_token.value)
+            if name in self.enumerators:
+                self.error(f"duplicate enumerator {name!r}", name_token)
+            if self.accept("="):
+                value_token = self.token
+                next_value = ConstantEvaluator(self.filename).value(
+                    self.assignment_expression()
+                )
+                if not -(1 << 31) <= next_value < (1 << 31):
+                    self.error("an enumerator must fit in an int", value_token)
+            self.enumerators[name] = next_value
+            next_value += 1
+            if not self.accept(","):
+                self.take("}")
+                break
+        if tag is not None:
+            self.enum_tags[tag] = INT
+        return INT
+
+    def typedef_declaration(self) -> None:
+        """Record ``typedef <type> <name>;`` for the rest of this unit."""
+
+        keyword = self.take()  # 'typedef'
+        base = self.type_specifier()
+        while True:
+            name_token = self.token
+            ctype, name = self.declarator(base)
+            if not name:
+                self.error("a typedef needs a name", keyword)
+            existing = self.typedefs.get(name)
+            if existing is not None and existing != ctype:
+                self.error(f"{name!r} is already a different type", name_token)
+            self.typedefs[name] = ctype
+            if not self.accept(","):
+                break
+        self.take(";")
 
     def struct_specifier(self, is_union: bool) -> "StructType":
         """Parse ``struct``/``union`` with an optional tag and optional body.
@@ -1122,6 +1188,9 @@ class Parser:
             if name in {"struct", "union"} and base is None and not words:
                 base = self.struct_specifier(name == "union")
                 continue
+            if name == "enum" and base is None and not words:
+                base = self.enum_specifier()
+                continue
             if name in _UNSUPPORTED_KEYWORDS:
                 self.error(_UNSUPPORTED_KEYWORDS[name])
             if name in _QUALIFIERS:
@@ -1131,8 +1200,8 @@ class Parser:
                 words.append(name)
                 self.index += 1
                 continue
-            if base is None and not words and name in _TYPEDEFS:
-                base = _TYPEDEFS[name]
+            if base is None and not words and name in self.typedefs:
+                base = self.typedefs[name]
                 self.index += 1
                 continue
             if base is None and not words and name in _OPAQUE_NAMES:
@@ -1362,6 +1431,17 @@ class Parser:
         token = self.token
         if self.at("{"):
             return self.compound_statement()
+        if token.kind == "identifier" and token.value == "typedef":
+            self.typedef_declaration()
+            return Declaration(token, [])
+        if (
+            token.kind == "identifier"
+            and token.value in {"struct", "union", "enum"}
+            and self.declares_type_only()
+        ):
+            self.type_specifier()
+            self.take(";")
+            return Declaration(token, [])
         if self.at_type():
             return self.declaration_statement()
         if token.kind == "identifier":
@@ -1499,16 +1579,19 @@ class Parser:
                 continue
             # A struct or union definition with no declarator introduces a type
             # and nothing else: `struct P { int x; };`
+            if self.token.kind == "identifier" and self.token.value == "typedef":
+                self.typedef_declaration()
+                continue
             if (
                 self.token.kind == "identifier"
-                and self.token.value in {"struct", "union"}
+                and self.token.value in {"struct", "union", "enum"}
                 and self.declares_type_only()
             ):
                 self.type_specifier()
                 self.take(";")
                 continue
             self.function_definition()
-        return TranslationUnit(self.functions, self.externs)
+        return TranslationUnit(self.functions, self.externs, self.enumerators)
 
     def declares_type_only(self) -> bool:
         """Whether a struct/union specifier is followed straight by ``;``.
@@ -2052,6 +2135,7 @@ class Lowerer:
     """Lowers a parsed translation unit to py2bin's native IR."""
 
     def __init__(self, unit: TranslationUnit, filename: str, target: str):
+        self.enumerators = dict(getattr(unit, "enumerators", {}) or {})
         self.unit = unit
         self.filename = filename
         self.target = target
@@ -2301,6 +2385,8 @@ class Lowerer:
             if local is None:
                 if node.name == "NULL":
                     return Value(PointerType(VOID), IntConstant(0), null=True)
+                if node.name in self.enumerators:
+                    return Value(INT, IntConstant(self.enumerators[node.name]))
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
