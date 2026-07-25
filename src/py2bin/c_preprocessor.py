@@ -1045,7 +1045,22 @@ def _stringify(argument: list[PPToken], at: PPToken) -> PPToken:
             pieces.append(token.spelling.replace("\\", "\\\\").replace('"', '\\"'))
         else:
             pieces.append(token.spelling)
-    return PPToken("string", '"' + "".join(pieces) + '"', at.line, at.column, at.origin, at.spaced)
+    spelling = '"' + "".join(pieces) + '"'
+    try:
+        lines = _scan(spelling, at.origin)
+    except CCompileError:
+        lines = []
+    if len(lines) != 1 or len(lines[0]) != 1 or lines[0][0].kind != "string":
+        # C11 6.10.3.2p2 leaves this undefined: a lone backslash, say, would
+        # make a string literal that does not end.
+        raise CCompileError(
+            at.origin,
+            at.line,
+            at.column,
+            "stringifying this argument with '#' does not make a valid string "
+            f"literal ({spelling})",
+        )
+    return PPToken("string", spelling, at.line, at.column, at.origin, at.spaced)
 
 
 def _convert(token: PPToken, error) -> Token:
@@ -1185,27 +1200,50 @@ class _Number:
     unsigned: bool
 
 
-_LEVELS = (
-    ("||",),
-    ("&&",),
-    ("|",),
-    ("^",),
-    ("&",),
-    ("==", "!="),
-    ("<", ">", "<=", ">="),
-    ("<<", ">>"),
-    ("+", "-"),
-    ("*", "/", "%"),
-)
+#: C's binary operators, tightest last. ``?:`` and the unary operators are
+#: parsed on their own; assignment and the comma are not constant expressions.
+_PRECEDENCE = {
+    "||": 1,
+    "&&": 2,
+    "|": 3,
+    "^": 4,
+    "&": 5,
+    "==": 6,
+    "!=": 6,
+    "<": 7,
+    ">": 7,
+    "<=": 7,
+    ">=": 7,
+    "<<": 8,
+    ">>": 8,
+    "+": 9,
+    "-": 9,
+    "*": 10,
+    "/": 10,
+    "%": 10,
+}
 
 
 class _Evaluator:
     """A C constant expression as ``#if`` sees it: 64-bit, integers only."""
 
+    #: C11 5.2.4.1 asks a compiler to manage 63 levels of parenthesised
+    #: expression; beyond this one py2bin says so rather than exhausting the
+    #: Python stack it is written on.
+    MAXIMUM_NESTING = 200
+
     def __init__(self, tokens: list[PPToken], at: PPToken):
         self.tokens = tokens
         self.index = 0
         self.at = at
+        self.depth = 0
+
+    def deeper(self) -> None:
+        self.depth += 1
+        if self.depth > self.MAXIMUM_NESTING:
+            self.error(
+                f"this #if expression nests more than {self.MAXIMUM_NESTING} deep"
+            )
 
     def error(self, message: str, token: PPToken | None = None):
         located = token or (self.tokens[self.index] if self.index < len(self.tokens) else self.at)
@@ -1226,6 +1264,13 @@ class _Evaluator:
         return value.value
 
     def conditional(self, evaluate: bool) -> _Number:
+        self.deeper()
+        try:
+            return self._conditional(evaluate)
+        finally:
+            self.depth -= 1
+
+    def _conditional(self, evaluate: bool) -> _Number:
         condition = self.binary(0, evaluate)
         if self.spelling() != "?":
             return condition
@@ -1239,26 +1284,34 @@ class _Evaluator:
         chosen = left if taken else right
         return _Number(chosen.value, left.unsigned or right.unsigned)
 
-    def binary(self, level: int, evaluate: bool) -> _Number:
-        if level == len(_LEVELS):
-            return self.unary(evaluate)
-        left = self.binary(level + 1, evaluate)
-        while self.spelling() in _LEVELS[level] and self.token is not None and (
-            self.token.kind == "punctuator"
-        ):
-            operator = self.spelling()
+    def binary(self, minimum: int, evaluate: bool) -> _Number:
+        """Every binary operator, by precedence climbing.
+
+        One function rather than one per level, so that a parenthesised
+        expression costs a handful of Python frames instead of a dozen. All of
+        C's binary operators here are left-associative, so the right operand is
+        parsed at the next precedence up.
+        """
+
+        left = self.unary(evaluate)
+        while True:
             token = self.token
+            if token is None or token.kind != "punctuator":
+                break
+            precedence = _PRECEDENCE.get(token.spelling)
+            if precedence is None or precedence < minimum:
+                break
             self.index += 1
-            if operator == "&&":
-                right = self.binary(level + 1, evaluate and left.value != 0)
+            if token.spelling == "&&":
+                right = self.binary(precedence + 1, evaluate and left.value != 0)
                 left = _Number(int(left.value != 0 and right.value != 0), False)
                 continue
-            if operator == "||":
-                right = self.binary(level + 1, evaluate and left.value == 0)
+            if token.spelling == "||":
+                right = self.binary(precedence + 1, evaluate and left.value == 0)
                 left = _Number(int(left.value != 0 or right.value != 0), False)
                 continue
-            right = self.binary(level + 1, evaluate)
-            left = self.apply(operator, left, right, evaluate, token)
+            right = self.binary(precedence + 1, evaluate)
+            left = self.apply(token.spelling, left, right, evaluate, token)
         return left
 
     def apply(
@@ -1320,6 +1373,13 @@ class _Evaluator:
         return (value & _MASK) if unsigned else _signed(value)
 
     def unary(self, evaluate: bool) -> _Number:
+        self.deeper()
+        try:
+            return self._unary(evaluate)
+        finally:
+            self.depth -= 1
+
+    def _unary(self, evaluate: bool) -> _Number:
         token = self.token
         if token is None:
             self.error("a #if expression ends too early")

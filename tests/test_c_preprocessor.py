@@ -733,6 +733,23 @@ class RejectionTests(PreprocessorTestCase):
             "came out of a macro expansion",
         )
 
+    def test_an_if_expression_it_cannot_nest_far_enough_to_evaluate(self):
+        # C11 5.2.4.1 asks a compiler to manage 63 levels of parentheses;
+        # py2bin manages more than that and then says what happened rather than
+        # dying of recursion.
+        deep = "(" * 90 + "1" + ")" * 90
+        self.assertEqual(expand(f"#if {deep}\nyes\n#endif\n"), "yes")
+        self.reject(
+            "#if " + "(" * 500 + "1" + ")" * 500 + "\n#endif\nint main(void){return 0;}\n",
+            "nests more than",
+        )
+
+    def test_a_stringify_that_would_not_be_a_string_literal(self):
+        self.reject(
+            "#define S(x) #x\nchar *s = S(\\);\nint main(void) { return 0; }\n",
+            "does not make a valid string literal",
+        )
+
     def test_bad_macro_definitions(self):
         self.reject("#define\nint main(void) { return 0; }\n", "needs a macro name")
         self.reject(
