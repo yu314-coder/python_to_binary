@@ -751,6 +751,8 @@ class Preprocessor:
     def _read(self, path: Path, at: PPToken) -> None:
         resolved = str(path.resolve())
         if resolved in self.once:
+            # _enter would notice too; catching it here means a header that
+            # said '#pragma once' is not even read a second time.
             return
         try:
             source = path.read_text(encoding="utf-8")

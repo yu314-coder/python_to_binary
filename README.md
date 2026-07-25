@@ -684,8 +684,13 @@ py2bin plan-c program.py
 py2bin compile-via-c program.py --c-output program.c \
   --target windows-x86_64 -o program.exe
 
-# Direct C input goes through py2bin's own C compiler.
+# Direct C input goes through py2bin's own C compiler, preprocessor first.
 py2bin compile-c program.c --target linux-arm64 -o program-arm64
+
+# -I adds a directory the preprocessor searches for #include; -D defines a
+# macro before the file is read, exactly as any other C compiler does.
+py2bin compile-c program.c -I include -D LEVEL=2 -D NDEBUG \
+  --target darwin-arm64 -o program
 ```
 
 A `.py2cbin` file is a versioned, checksummed container holding generated C; it
