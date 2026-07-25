@@ -845,11 +845,31 @@ class RejectionTests(CProgramTestCase):
         self.reject("int main(void) { double d; return 0; }\n", "floating point")
         self.reject("int main(void) { return 1.5; }\n", "floating-point literal")
 
-    def test_aggregates_and_typedefs_are_refused(self):
-        self.reject("struct S { int a; };\nint main(void) { return 0; }\n", "struct")
-        self.reject("union U { int a; };\nint main(void) { return 0; }\n", "union")
+    def test_enums_and_typedefs_are_refused(self):
         self.reject("enum E { A };\nint main(void) { return 0; }\n", "enum")
         self.reject("typedef int myint;\nint main(void) { return 0; }\n", "typedef")
+
+    def test_incomplete_struct_use_is_refused(self):
+        # A tag with no body may only be pointed at; its layout is unknown.
+        self.reject(
+            "struct S;\nint main(void) { struct S s; return 0; }\n", "incomplete"
+        )
+        self.reject(
+            "struct S;\nint main(void) { struct S *p; return p->x; }\n",
+            "incomplete",
+        )
+
+    def test_unknown_member_is_refused(self):
+        self.reject(
+            "struct S { int a; };\n"
+            "int main(void) { struct S s; return s.b; }\n",
+            "no member",
+        )
+
+    def test_member_access_needs_an_aggregate(self):
+        self.reject(
+            "int main(void) { int n = 1; return n.a; }\n", "needs a struct"
+        )
 
     def test_the_preprocessor_is_refused_beyond_ignorable_includes(self):
         self.reject(
@@ -1903,4 +1923,140 @@ int main(void) {
 }
 """,
             stdout="[a]\n[b]\nx=1 y=2\n",
+        )
+
+
+class StructTests(CProgramTestCase):
+    """struct and union, laid out by C's alignment and padding rules."""
+
+    def test_members_are_read_and_written(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { int x; int y; };
+int main(void) {
+    struct P p;
+    p.x = 3; p.y = 4;
+    printf("%d\\n", p.x + p.y);
+    return 0;
+}
+""",
+            stdout="7\n",
+        )
+
+    def test_layout_follows_c_alignment_and_padding(self):
+        # char at 0, int padded to 4, char at 8, tail padding to 12.
+        self.run_c(
+            _STDIO
+            + """
+struct P { char c; int i; char d; };
+union U { int i; char c; };
+int main(void) {
+    printf("%zu %zu %zu\\n", sizeof(struct P), sizeof(union U), sizeof(char));
+    return 0;
+}
+""",
+            stdout="12 4 1\n",
+        )
+
+    def test_a_union_overlays_its_members(self):
+        self.run_c(
+            _STDIO
+            + """
+union U { int i; char c; };
+int main(void) {
+    union U u;
+    u.i = 0;
+    u.c = 1;
+    printf("%d\\n", u.i);
+    return 0;
+}
+""",
+            stdout="1\n",
+        )
+
+    def test_writing_one_member_leaves_the_others_alone(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { char c; int i; short s; };
+int main(void) {
+    struct P p;
+    p.c = 1; p.i = 70000; p.s = 3;
+    printf("%d %d %d\\n", p.c, p.i, p.s);
+    return 0;
+}
+""",
+            stdout="1 70000 3\n",
+        )
+
+    def test_arrow_through_a_pointer(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { int x; int y; };
+int main(void) {
+    struct P p; struct P *q = &p;
+    q->x = 9; q->y = 1;
+    printf("%d\\n", q->x + p.y);
+    return 0;
+}
+""",
+            stdout="10\n",
+        )
+
+    def test_nested_structs_and_arrays_of_structs(self):
+        self.run_c(
+            _STDIO
+            + """
+struct Inner { int a; int b; };
+struct Outer { struct Inner in; int c; };
+int main(void) {
+    struct Outer o;
+    o.in.a = 10; o.in.b = 20; o.c = 5;
+    struct Outer many[2];
+    int i;
+    for (i = 0; i < 2; i++) { many[i].in.a = i; many[i].c = i * 100; }
+    printf("%d %d %d\\n", o.in.a + o.in.b, o.c, many[1].c + many[1].in.a);
+    return 0;
+}
+""",
+            stdout="30 5 101\n",
+        )
+
+    def test_struct_assignment_copies_by_value(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { char c; int i; short s; };
+int main(void) {
+    struct P a; struct P b;
+    a.c = 1; a.i = 2; a.s = 3;
+    b = a;
+    a.c = 9; a.i = 9; a.s = 9;
+    printf("%d %d %d\\n", b.c, b.i, b.s);
+    return 0;
+}
+""",
+            stdout="1 2 3\n",
+        )
+
+    def test_struct_pointer_argument_and_recursion(self):
+        self.run_c(
+            _STDIO
+            + """
+struct N { int v; };
+long long sum(struct N *a, long long i, long long n) {
+    if (i >= n) { return 0; }
+    return a[i].v + sum(a, i + 1, n);
+}
+int main(void) {
+    struct N a[5];
+    int i;
+    for (i = 0; i < 5; i++) { a[i].v = i + 1; }
+    printf("%lld\\n", sum(a, 0, 5));
+    return 0;
+}
+""",
+            stdout="15\n",
         )

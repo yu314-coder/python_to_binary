@@ -457,6 +457,80 @@ class ArrayType:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class Member:
+    name: str
+    ctype: "CType"
+    offset: int
+
+
+@dataclasses.dataclass(slots=True)
+class StructType:
+    """A struct or union, laid out by C's alignment and padding rules.
+
+    Each member starts at the next offset satisfying its own alignment, and the
+    whole object is padded to a multiple of the strictest member alignment so
+    that arrays of it stay aligned. A union puts every member at offset 0 and
+    takes the size of its largest. ``members`` is None until the body is seen,
+    which is what makes a forward-declared ``struct T;`` an incomplete type
+    that only a pointer may refer to.
+    """
+
+    name: str | None
+    is_union: bool = False
+    members: tuple[Member, ...] | None = None
+    size: int = 0
+    alignment: int = 1
+
+    def member(self, name: str) -> Member | None:
+        for item in self.members or ():
+            if item.name == name:
+                return item
+        return None
+
+    def __str__(self) -> str:
+        keyword = "union" if self.is_union else "struct"
+        return f"{keyword} {self.name}" if self.name else keyword
+
+
+def align_of(ctype: "CType") -> int:
+    """The alignment ``ctype`` requires, in bytes."""
+
+    if isinstance(ctype, IntegerType):
+        return ctype.size
+    if isinstance(ctype, PointerType):
+        return 8
+    if isinstance(ctype, ArrayType):
+        return align_of(ctype.element)
+    if isinstance(ctype, StructType):
+        return ctype.alignment
+    return 1
+
+
+def lay_out(struct: StructType, members: list[tuple[str, "CType"]]) -> None:
+    """Assign member offsets and set the struct's size and alignment."""
+
+    placed: list[Member] = []
+    offset = 0
+    alignment = 1
+    for name, ctype in members:
+        member_alignment = align_of(ctype)
+        member_size = size_of(ctype) or 0
+        alignment = max(alignment, member_alignment)
+        if struct.is_union:
+            placed.append(Member(name, ctype, 0))
+            offset = max(offset, member_size)
+            continue
+        # Pad forward to this member's own alignment.
+        offset = (offset + member_alignment - 1) & ~(member_alignment - 1)
+        placed.append(Member(name, ctype, offset))
+        offset += member_size
+    # Tail padding keeps an array of this type aligned.
+    struct.members = tuple(placed)
+    struct.alignment = alignment
+    struct.size = (offset + alignment - 1) & ~(alignment - 1)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class OpaqueType:
     """A named type py2bin knows only as something a pointer can point at.
 
@@ -472,7 +546,7 @@ class OpaqueType:
         return self.name
 
 
-CType = VoidType | IntegerType | PointerType | ArrayType | OpaqueType
+CType = VoidType | IntegerType | PointerType | ArrayType | OpaqueType | StructType
 
 VOID = VoidType()
 CHAR = IntegerType("char", 1, True, 1)
@@ -575,6 +649,8 @@ def size_of(ctype: CType) -> int | None:
         if element is None or ctype.count is None:
             return None
         return element * ctype.count
+    if isinstance(ctype, StructType):
+        return ctype.size if ctype.members is not None else None
     return None
 
 
@@ -702,6 +778,13 @@ class Comma(Node):
 class Call(Node):
     name: str
     arguments: list[Node]
+
+
+@dataclasses.dataclass(slots=True)
+class MemberAccess(Node):
+    base: Node
+    name: str
+    through_pointer: bool
 
 
 @dataclasses.dataclass(slots=True)
@@ -873,8 +956,6 @@ _RESERVED = frozenset(
 )
 
 _UNSUPPORTED_KEYWORDS = {
-    "struct": "struct types are not implemented",
-    "union": "union types are not implemented",
     "enum": "enum types are not implemented",
     "typedef": "typedef declarations are not implemented",
     "float": "floating point is not implemented by py2bin's C compiler",
@@ -897,6 +978,9 @@ class Parser:
         self.index = 0
         self.functions: dict[str, Function] = {}
         self.externs: dict[str, CType] = {}
+        # struct/union tags are shared across the translation unit, so a
+        # tag mentioned inside its own body refers to the same type.
+        self.struct_tags: dict[str, StructType] = {}
 
     # --- token helpers ---
 
@@ -955,11 +1039,77 @@ class Parser:
             return True
         if name in _TYPE_KEYWORDS or name in _QUALIFIERS or name in _TYPEDEFS:
             return True
+        if name in {"struct", "union"}:
+            return True
         if name in _OPAQUE_NAMES:
             # 'PyObject x' is not something py2bin can lay out, but 'PyObject *x'
             # is a handle. Only the pointer form is a type here.
             return self.peek().value == "*"
         return False
+
+    def struct_specifier(self, is_union: bool) -> "StructType":
+        """Parse ``struct``/``union`` with an optional tag and optional body.
+
+        A tag names one type for the whole translation unit, so ``struct T *``
+        inside ``struct T`` refers to the same object being defined. A tag with
+        no body is a forward declaration: the type stays incomplete, which is
+        what lets a pointer to it exist while ``sizeof`` and member access are
+        still rejected.
+        """
+
+        keyword = self.take()  # 'struct' or 'union'
+        tag: str | None = None
+        if self.token.kind == "identifier" and self.token.value not in _RESERVED:
+            tag = str(self.take().value)
+        if tag is not None and tag in self.struct_tags:
+            struct = self.struct_tags[tag]
+            if struct.is_union != is_union:
+                self.error(
+                    f"{tag!r} was declared as a "
+                    f"{'union' if struct.is_union else 'struct'}",
+                    keyword,
+                )
+        else:
+            struct = StructType(tag, is_union)
+            if tag is not None:
+                self.struct_tags[tag] = struct
+        if not self.at("{"):
+            if tag is None:
+                self.error("an anonymous struct needs a body", keyword)
+            return struct
+        if struct.members is not None:
+            self.error(f"{struct} is defined twice", keyword)
+        self.take("{")
+        members: list[tuple[str, CType]] = []
+        seen: set[str] = set()
+        while not self.accept("}"):
+            if self.token.kind == "eof":
+                self.error("unterminated struct body", keyword)
+            member_start = self.token
+            base = self.type_specifier()
+            while True:
+                name_token = self.token
+                ctype, member_name = self.declarator(base)
+                if member_name in seen:
+                    self.error(
+                        f"duplicate member {member_name!r}", name_token
+                    )
+                if isinstance(ctype, StructType) and ctype.members is None:
+                    self.error(
+                        f"member {member_name!r} has incomplete type {ctype}",
+                        member_start,
+                    )
+                if isinstance(ctype, VoidType):
+                    self.error(f"member {member_name!r} cannot be void", member_start)
+                seen.add(member_name)
+                members.append((member_name, ctype))
+                if not self.accept(","):
+                    break
+            self.take(";")
+        if not members:
+            self.error("an empty struct has no size in C", keyword)
+        lay_out(struct, members)
+        return struct
 
     def type_specifier(self) -> CType:
         """Parse a declaration specifier list into one type."""
@@ -969,6 +1119,9 @@ class Parser:
         base: CType | None = None
         while self.token.kind == "identifier":
             name = str(self.token.value)
+            if name in {"struct", "union"} and base is None and not words:
+                base = self.struct_specifier(name == "union")
+                continue
             if name in _UNSUPPORTED_KEYWORDS:
                 self.error(_UNSUPPORTED_KEYWORDS[name])
             if name in _QUALIFIERS:
@@ -1148,6 +1301,13 @@ class Parser:
                 node = IncDec(token, str(token.value), node, False)
                 continue
             if token.kind == "symbol" and token.value in {".", "->"}:
+                self.take()
+                member_token = self.identifier()
+                node = MemberAccess(
+                    token, node, str(member_token.value), token.value == "->"
+                )
+                continue
+            if False:
                 self.error(
                     "struct and union member access is not implemented; py2bin's "
                     "C compiler models no aggregate layouts"
@@ -1337,8 +1497,47 @@ class Parser:
             if self.accept("extern"):
                 self.extern_prototype()
                 continue
+            # A struct or union definition with no declarator introduces a type
+            # and nothing else: `struct P { int x; };`
+            if (
+                self.token.kind == "identifier"
+                and self.token.value in {"struct", "union"}
+                and self.declares_type_only()
+            ):
+                self.type_specifier()
+                self.take(";")
+                continue
             self.function_definition()
         return TranslationUnit(self.functions, self.externs)
+
+    def declares_type_only(self) -> bool:
+        """Whether a struct/union specifier is followed straight by ``;``.
+
+        Scans ahead without consuming: `struct P { ... };` declares a type,
+        while `struct P p;` and `struct P f(void)` declare an object or a
+        function and must go through the normal path.
+        """
+
+        index = self.index + 1
+        if (
+            index < len(self.tokens)
+            and self.tokens[index].kind == "identifier"
+            and self.tokens[index].value not in _RESERVED
+        ):
+            index += 1
+        if index < len(self.tokens) and self.tokens[index].value == "{":
+            depth = 0
+            while index < len(self.tokens):
+                value = self.tokens[index].value
+                if value == "{":
+                    depth += 1
+                elif value == "}":
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+        return index < len(self.tokens) and self.tokens[index].value == ";"
 
     def function_definition(self) -> None:
         start = self.token
@@ -1979,6 +2178,11 @@ class Lowerer:
         if isinstance(ctype, ArrayType):
             # An array used as a value decays to a pointer to its first element.
             return Value(PointerType(ctype.element), address)
+        if isinstance(ctype, StructType):
+            # A struct value is carried as the address of the object. Only
+            # assignment, member access and & consume one, and each of those
+            # wants the address rather than a word-sized load.
+            return Value(ctype, address)
         size = size_of(ctype)
         if size is None:
             raise AssertionError("incomplete lvalue reached the loader")
@@ -2015,6 +2219,42 @@ class Lowerer:
                     "*",
                     Binary(node.token, "+", node.base, node.offset),
                 )
+            )
+        if isinstance(node, MemberAccess):
+            # `a.m` needs the address of a, and `p->m` the value of p. Both
+            # then add the member's constant offset.
+            if node.through_pointer:
+                pointer = self.rvalue(node.base)
+                if not isinstance(pointer.ctype, PointerType):
+                    self.error(
+                        f"'->' needs a pointer to a struct or union, not "
+                        f"{pointer.ctype}",
+                        node.token,
+                    )
+                owner = pointer.ctype.target
+                address = pointer.expr
+            else:
+                owner, address = self.lvalue(node.base)
+            if not isinstance(owner, StructType):
+                self.error(
+                    f"{'->' if node.through_pointer else '.'} needs a struct or "
+                    f"union, not {owner}",
+                    node.token,
+                )
+            if owner.members is None:
+                self.error(
+                    f"{owner} is incomplete here, so its members are unknown",
+                    node.token,
+                )
+            member = owner.member(node.name)
+            if member is None:
+                self.error(
+                    f"{owner} has no member named {node.name!r}", node.token
+                )
+            if member.offset == 0:
+                return member.ctype, address
+            return member.ctype, IntBinary(
+                "add", address, IntConstant(member.offset)
             )
         self.error("this expression is not an lvalue", node.token)
 
@@ -2065,7 +2305,7 @@ class Lowerer:
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
             return self.load(local.ctype, SlotAddress(local.slot))
-        if isinstance(node, Index):
+        if isinstance(node, (Index, MemberAccess)):
             ctype, address = self.lvalue(node)
             return self.load(ctype, address)
         if isinstance(node, Unary):
@@ -2127,7 +2367,7 @@ class Lowerer:
         saved_slots = self.stack_slots
         self.operations = []
         try:
-            if isinstance(node, Index) or (
+            if isinstance(node, (Index, MemberAccess)) or (
                 isinstance(node, Unary) and node.operator == "*"
             ):
                 ctype, _address = self.lvalue(node)
@@ -2424,11 +2664,58 @@ class Lowerer:
             return Value(target, self.fit(value.expr, target))
         return Value(target, value.expr, null=value.null)
 
+    def copy_struct(
+        self, ctype: "StructType", address: IntExpression, node: Assignment
+    ) -> Value:
+        """Copy a whole struct or union, one aligned word at a time.
+
+        C assigns aggregates by value. The source and destination are distinct
+        objects here (C leaves overlapping assignment through pointers to
+        memmove), so a straight forward copy is correct. Both are aligned to
+        the type's own alignment, so the copy uses the widest unit that
+        alignment allows and finishes any remainder with narrower stores.
+        """
+
+        source = self.rvalue(node.value)
+        if not isinstance(source.ctype, StructType) or source.ctype is not ctype:
+            self.error(
+                f"this assignment needs {ctype}, but this is {source.ctype}",
+                node.token,
+            )
+        destination = self.stabilize(address)
+        origin = self.stabilize(source.expr)
+        remaining = ctype.size
+        offset = 0
+        while remaining:
+            unit = 8 if remaining >= 8 and ctype.alignment >= 8 else (
+                4 if remaining >= 4 and ctype.alignment >= 4 else (
+                    2 if remaining >= 2 and ctype.alignment >= 2 else 1
+                )
+            )
+            self.emit(
+                HeapStore(
+                    IntBinary("add", destination, IntConstant(offset)),
+                    HeapLoad(
+                        IntBinary("add", origin, IntConstant(offset)), unit, False
+                    ),
+                    unit,
+                )
+            )
+            offset += unit
+            remaining -= unit
+        return Value(ctype, destination)
+
     def assignment(self, node: Assignment) -> Value:
         ctype, address = self.lvalue(node.target)
         if isinstance(ctype, ArrayType):
             self.error("an array is not assignable", node.token)
         address = self.stabilize(address)
+        if isinstance(ctype, StructType):
+            if node.operator != "=":
+                self.error(
+                    f"{node.operator} is not defined for {ctype}", node.token
+                )
+            return self.copy_struct(ctype, address, node)
         if node.operator == "=":
             value = self.rvalue(node.value)
             stored = self.assign_convert(
