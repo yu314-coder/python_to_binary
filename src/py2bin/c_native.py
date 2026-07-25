@@ -1,9 +1,16 @@
-"""Handwritten canonical-C frontend for py2bin's native integer backend.
+"""The two C entry points, and the canonical-C round trip between them.
 
-This is intentionally not a general ISO C compiler.  It accepts the small,
-documented C language emitted for py2bin's signed-64-bit Python subset, rebuilds
-an equivalent syntax tree, and feeds that tree to py2bin's own IR and binary
-writers.  Unsupported C is rejected instead of being sent to a host compiler.
+``compile_c_native`` (the ``compile-c`` command) is py2bin's C compiler: see
+:mod:`py2bin.c_frontend`, which lexes and parses C, applies C's type rules, and
+lowers straight to native IR.
+
+The rest of this module is the older, narrower canonical-C bridge that
+``compile_python_via_c`` (the ``compile-via-c`` command) uses. It parses the C
+py2bin's *own* generator emits back into a Python syntax tree and hands that to
+the Python native frontend, which is what makes ``emit-c`` output checkable
+against the Python it came from. It is deliberately not a general C compiler --
+it accepts only the shape the generator produces -- and it is not the path a
+hand-written .c file takes.
 """
 
 from __future__ import annotations
@@ -14,8 +21,11 @@ import dataclasses
 import re
 from pathlib import Path
 
+from .c_frontend import CCompileError, compile_c_to_ir
 from .csource import compile_to_c
 from .native import NativeResult, compile_native_source
+from .native.compiler import compile_native_module, host_target
+from .native.optimizer import optimize
 
 
 # Symbols the generated C may declare via an extern prototype. Kept in sync
@@ -1245,17 +1255,25 @@ def compile_c_native(
     target: str | None = None,
     clean: bool = False,
 ) -> NativeResult:
-    """Compile a canonical C file with only py2bin's Python implementation."""
+    """Compile a C file to machine code with only py2bin's own implementation.
+
+    This is py2bin's C compiler proper: ``py2bin.c_frontend`` lexes and parses
+    the source, applies C's type rules, and emits native IR that the ARM64 and
+    x86-64 encoders turn into a binary. Nothing here shells out, and no host
+    compiler, assembler, or linker is consulted.
+    """
     entry = entry.expanduser().resolve()
+    output = output.expanduser().resolve()
     if not entry.is_file():
         raise FileNotFoundError(f"C source does not exist: {entry}")
+    resolved = target or host_target()
     source = entry.read_text(encoding="utf-8")
-    reconstructed = c_to_python_source(source, str(entry))
-    return compile_native_source(
+    module, _report = optimize(compile_c_to_ir(source, str(entry), resolved))
+    return compile_native_module(
         entry,
-        reconstructed,
+        module,
         output,
-        target=target,
+        target=resolved,
         clean=clean,
     )
 
@@ -1295,6 +1313,7 @@ def compile_python_via_c(
 
 __all__ = [
     "CBridgeResult",
+    "CCompileError",
     "CNativeCompileError",
     "c_to_python_source",
     "compile_c_native",

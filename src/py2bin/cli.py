@@ -188,9 +188,9 @@ def _parser() -> argparse.ArgumentParser:
     via_c_parser.add_argument("--clean", action="store_true")
     compile_c_parser = commands.add_parser(
         "compile-c",
-        help="compile py2bin's canonical signed-64-bit C subset directly",
+        help="compile C to machine code with py2bin's own C compiler",
     )
-    compile_c_parser.add_argument("entry", type=Path, help="canonical .c source file")
+    compile_c_parser.add_argument("entry", type=Path, help=".c source file")
     compile_c_parser.add_argument("--output", "-o", required=True, type=Path)
     target_options(compile_c_parser)
     compile_c_parser.add_argument("--clean", action="store_true")
@@ -751,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                 clean=args.clean,
             )
             print(
-                f"compiled canonical C to {result.target} machine code at "
+                f"compiled C to {result.target} machine code at "
                 f"{result.artifact} ({result.bytes} bytes, "
                 f"{result.operations} IR operations)"
             )

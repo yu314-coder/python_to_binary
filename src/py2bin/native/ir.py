@@ -17,6 +17,19 @@ class IntLoad:
 
 
 @dataclass(frozen=True, slots=True)
+class SlotAddress:
+    """The runtime address of stack slot ``slot``.
+
+    Stack slots are ordinary 8-byte cells in the frame, so taking their address
+    is what lets a C ``&x``, a local array, or a dereferenceable pointer work
+    without a heap. The value is a full 64-bit address in the frame that
+    ``IntLoad``/``Store`` already address by index.
+    """
+
+    slot: int
+
+
+@dataclass(frozen=True, slots=True)
 class IntUnary:
     operator: str
     operand: "IntExpression"
@@ -24,6 +37,16 @@ class IntUnary:
 
 @dataclass(frozen=True, slots=True)
 class IntBinary:
+    """A two-operand integer operation on signed 64-bit registers.
+
+    ``add``/``sub``/``mul``/``and``/``or``/``xor``/``lshift`` are
+    signedness-agnostic bit operations. The rest are not, and each has an
+    explicit signed and unsigned form so a frontend can never pick the wrong
+    one by accident: ``rshift`` is arithmetic and ``urshift`` logical;
+    ``sdiv``/``smod`` truncate toward zero as C requires, while ``udiv``/
+    ``umod`` treat both operands as unsigned 64-bit values.
+    """
+
     operator: str
     left: "IntExpression"
     right: "IntExpression"
@@ -31,6 +54,9 @@ class IntBinary:
 
 @dataclass(frozen=True, slots=True)
 class IntCompare:
+    """``eq``/``ne`` plus the signed (``lt``/``le``/``gt``/``ge``) and unsigned
+    (``ult``/``ule``/``ugt``/``uge``) orderings, producing 1 or 0."""
+
     operator: str
     left: "IntExpression"
     right: "IntExpression"
@@ -103,10 +129,16 @@ class FloatCompare:
 
 @dataclass(frozen=True, slots=True)
 class HeapLoad:
-    """Load ``size`` bytes (1 or 8) from a runtime address into an i64."""
+    """Load ``size`` bytes (1, 2, 4 or 8) from a runtime address into an i64.
+
+    ``signed`` selects sign extension over zero extension for the narrow
+    widths, which is what makes a C ``signed char`` holding -1 read back as -1
+    instead of 255. It is ignored when ``size`` is 8.
+    """
 
     address: "IntExpression"
     size: int = 8
+    signed: bool = False
 
 
 # --- external (adapter-ABI) native calls -------------------------------------
@@ -152,6 +184,7 @@ class ExternCall:
 IntExpression = (
     IntConstant
     | IntLoad
+    | SlotAddress
     | IntUnary
     | IntBinary
     | IntCompare
@@ -246,7 +279,7 @@ class HeapAlloc:
 
 @dataclass(frozen=True, slots=True)
 class HeapStore:
-    """Store the low ``size`` bytes (1 or 8) of ``value`` at ``address``."""
+    """Store the low ``size`` bytes (1, 2, 4 or 8) of ``value`` at ``address``."""
 
     address: IntExpression
     value: IntExpression

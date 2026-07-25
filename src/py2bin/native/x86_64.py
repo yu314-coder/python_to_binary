@@ -28,10 +28,31 @@ from .ir import (
     JumpIfFalse,
     Label,
     Module,
+    SlotAddress,
     Store,
     Write,
     WriteRuntime,
 )
+
+
+# Loads widen into RAX exactly as the C integer conversions require; stores
+# touch only the low bytes of the destination object.
+_X86_LOADS = {
+    (8, False): b"\x48\x8b\x00",  # mov   rax, [rax]
+    (8, True): b"\x48\x8b\x00",
+    (4, False): b"\x8b\x00",  # mov   eax, [rax]   (zero-extends)
+    (4, True): b"\x48\x63\x00",  # movsxd rax, dword [rax]
+    (2, False): b"\x0f\xb7\x00",  # movzx eax, word [rax]
+    (2, True): b"\x48\x0f\xbf\x00",  # movsx rax, word [rax]
+    (1, False): b"\x0f\xb6\x00",  # movzx eax, byte [rax]
+    (1, True): b"\x48\x0f\xbe\x00",  # movsx rax, byte [rax]
+}
+_X86_STORES = {
+    8: b"\x48\x89\x01",  # mov [rcx], rax
+    4: b"\x89\x01",  # mov [rcx], eax
+    2: b"\x66\x89\x01",  # mov [rcx], ax
+    1: b"\x88\x01",  # mov [rcx], al
+}
 
 
 def _mov_imm32(register_opcode: bytes, value: int) -> bytes:
@@ -61,6 +82,10 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         displacement = slot_base + expression.slot * 8
         code.extend(b"\x48\x8b\x85" + struct.pack("<i", displacement))
         return
+    if isinstance(expression, SlotAddress):
+        displacement = slot_base + expression.slot * 8
+        code.extend(b"\x48\x8d\x85" + struct.pack("<i", displacement))  # lea rax,[rbp+d]
+        return
     if isinstance(expression, IntUnary):
         _expression(code, expression.operand, slot_base)
         if expression.operator == "pos":
@@ -88,8 +113,15 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
                 "and": b"\x48\x21\xc8",
                 "or": b"\x48\x09\xc8",
                 "xor": b"\x48\x31\xc8",
-                "lshift": b"\x48\xd3\xe0",
-                "rshift": b"\x48\xd3\xf8",
+                "lshift": b"\x48\xd3\xe0",  # shl rax, cl
+                "rshift": b"\x48\xd3\xf8",  # sar rax, cl (arithmetic)
+                "urshift": b"\x48\xd3\xe8",  # shr rax, cl (logical)
+                # cqo/xor sets up the 128-bit dividend; the quotient lands in
+                # rax and the remainder in rdx, so % is one extra move.
+                "sdiv": b"\x48\x99\x48\xf7\xf9",  # cqo; idiv rcx
+                "udiv": b"\x48\x31\xd2\x48\xf7\xf1",  # xor rdx,rdx; div rcx
+                "smod": b"\x48\x99\x48\xf7\xf9\x48\x89\xd0",  # ...; mov rax, rdx
+                "umod": b"\x48\x31\xd2\x48\xf7\xf1\x48\x89\xd0",
             }
             instruction = instructions.get(expression.operator)
             if instruction is None:
@@ -99,12 +131,16 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
             code.extend(instruction)
             return
         conditions = {
-            "eq": 0x94,
-            "ne": 0x95,
-            "lt": 0x9C,
-            "le": 0x9E,
-            "gt": 0x9F,
-            "ge": 0x9D,
+            "eq": 0x94,  # sete
+            "ne": 0x95,  # setne
+            "lt": 0x9C,  # setl
+            "le": 0x9E,  # setle
+            "gt": 0x9F,  # setg
+            "ge": 0x9D,  # setge
+            "ult": 0x92,  # setb
+            "ule": 0x96,  # setbe
+            "ugt": 0x97,  # seta
+            "uge": 0x93,  # setae
         }
         condition = conditions.get(expression.operator)
         if condition is None:
@@ -141,12 +177,10 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         return
     if isinstance(expression, HeapLoad):
         _expression(code, expression.address, slot_base)  # rax = address
-        if expression.size == 8:
-            code.extend(b"\x48\x8b\x00")  # mov rax, [rax]
-        elif expression.size == 1:
-            code.extend(b"\x0f\xb6\x00")  # movzx eax, byte [rax]
-        else:
+        instruction = _X86_LOADS.get((expression.size, bool(expression.signed)))
+        if instruction is None:
             raise ValueError(f"unsupported x86-64 heap load size {expression.size}")
+        code.extend(instruction)
         return
     raise TypeError(f"unknown x86-64 integer expression {type(expression).__name__}")
 
@@ -257,12 +291,10 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
             code.extend(b"\x50")  # push rax
             _expression(code, operation.value, 0)  # rax = value
             code.extend(b"\x59")  # pop rcx (rcx = address)
-            if operation.size == 8:
-                code.extend(b"\x48\x89\x01")  # mov [rcx], rax
-            elif operation.size == 1:
-                code.extend(b"\x88\x01")  # mov [rcx], al
-            else:
+            instruction = _X86_STORES.get(operation.size)
+            if instruction is None:
                 raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
+            code.extend(instruction)
         elif isinstance(operation, WriteRuntime):
             _expression(code, operation.length, 0)  # rax = length
             code.extend(b"\x50")  # push rax
@@ -337,10 +369,22 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         address_patches.append((instruction + 2, imports[symbol]))
 
     for operation in module.operations:
-        if isinstance(operation, (HeapInit, HeapAlloc, HeapStore, WriteRuntime)):
+        if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
             raise ValueError(
                 "runtime heap lists/strings are not supported for windows-x86_64 yet"
             )
+        if isinstance(operation, HeapStore):
+            # Plain memory, not the arena: a C store through a pointer needs no
+            # mmap, so it works on Windows exactly as it does on POSIX.
+            _expression(code, operation.address, variable_base)
+            code.extend(b"\x50")  # push rax
+            _expression(code, operation.value, variable_base)
+            code.extend(b"\x59")  # pop rcx (rcx = address)
+            instruction = _X86_STORES.get(operation.size)
+            if instruction is None:
+                raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
+            code.extend(instruction)
+            continue
         if isinstance(operation, Write):
             # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
             handle = -11 if operation.fd == 1 else -12

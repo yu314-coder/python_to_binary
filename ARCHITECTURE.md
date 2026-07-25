@@ -37,32 +37,45 @@ checksummed `.py2cbin` container. The container is an interchange artifact, not
 machine code. This keeps C generation usable on hosts with only Python while
 leaving final C compilation to an explicitly supplied platform toolchain.
 
-A fourth path closes that loop for a restricted dialect: `c_native.py` parses
-canonical C into a Python AST and reuses the native frontend, so py2bin itself
-performs the C-to-machine-code step. Because py2bin both generates and parses
-this C, it never reads `Python.h` or any other system header. Extending the
-dialect is therefore the last resort; changing the generator to avoid an
-awkward construct is the first. Every `PyObject *` is an opaque 64-bit handle
-for exactly this reason — it removes the need for a preprocessor, macros, and
-struct layouts, and it is what makes a handwritten C compiler tractable.
+A fourth path closes that loop: `c_frontend.py` is py2bin's own C compiler. It
+lexes and parses C into a C syntax tree, applies C's type rules, and lowers the
+result straight to native IR. It deliberately does not reuse Python's `ast`:
+C and Python are different languages, and the earlier bridge that reused the
+Python tree miscompiled a C `for` by giving it `range` semantics. Nothing in a
+Python tree can express a narrow integer type, the address of a local, or
+`goto`, so C gets its own front end and its own lowering.
+
+`c_native.py` keeps the older canonical-C bridge, which round-trips the C that
+py2bin's *own* generator emits back into a Python AST. That path exists to
+prove `emit-c` output means what the Python meant, not to compile C in general.
+
+Because py2bin both generates and parses C, it never reads `Python.h` or any
+other system header. Every `PyObject *` is an opaque 64-bit handle: an
+incomplete type the compiler refuses to dereference or offset. That is what
+removes the need for a preprocessor, macros, and struct layouts, and it is what
+makes a handwritten C compiler tractable.
 
 ## Pipeline
 
 ```text
-Python source                       canonical C source
+Python source                       C source
     |                                     |
-    |                          c_native.py lexer/parser
+    |                        c_frontend.py lexer/parser
     |                                     |
-    +--------------- Python AST ----------+
-    |
+    |                            C syntax tree + C types
+    |                                     |
+    |                        C-specific lowering (no Python AST)
+    |                                     |
+Python AST                                |
+    |                                     |
     +-- AST validation, planning, and type/constant discovery
-    |      |
+    |      |                              |
     |      +-- portable C source / .py2cbin
     |      +-- CPython freeze plan for imports or unsupported semantics
-    |
-    +-- py2bin portable IR
-    |      Int*/Float*/Heap*/ExternCall/CStringConstant/Write/WriteRuntime/
-    |      Store/FloatStore/Label/Jump/JumpIfFalse/Exit/ExitValue
+    |                                     |
+    +-- py2bin portable IR <--------------+
+    |      Int*/Float*/Heap*/SlotAddress/ExternCall/CStringConstant/Write/
+    |      WriteRuntime/Store/FloatStore/Label/Jump/JumpIfFalse/Exit/ExitValue
     |
     +-- target-independent optimizer
     |

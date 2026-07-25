@@ -31,10 +31,32 @@ from .ir import (
     JumpIfFalse,
     Label,
     Module,
+    SlotAddress,
     Store,
     Write,
     WriteRuntime,
 )
+
+
+# Load/store encodings keyed by (bytes, signed). The load column widens the
+# value into X0 exactly as C's integer conversions require; the store column
+# writes only the low bytes and leaves the rest of the object alone.
+_ARM64_LOADS = {
+    (8, False): 0xF9400000,  # ldr   x0, [x0]
+    (8, True): 0xF9400000,
+    (4, False): 0xB9400000,  # ldr   w0, [x0]   (zero-extends into x0)
+    (4, True): 0xB9800000,  # ldrsw x0, [x0]
+    (2, False): 0x79400000,  # ldrh  w0, [x0]
+    (2, True): 0x79800000,  # ldrsh x0, [x0]
+    (1, False): 0x39400000,  # ldrb  w0, [x0]
+    (1, True): 0x39800000,  # ldrsb x0, [x0]
+}
+_ARM64_STORES = {
+    8: 0xF9000020,  # str  x0, [x1]
+    4: 0xB9000020,  # str  w0, [x1]
+    2: 0x79000020,  # strh w0, [x1]
+    1: 0x39000020,  # strb w0, [x1]
+}
 
 
 def _mov(register: int, value: int) -> list[int]:
@@ -64,6 +86,28 @@ def _sub_sp(amount: int) -> int:
     return 0xD10003FF | (amount << 10)
 
 
+def _frame_sub(amount: int) -> list[int]:
+    """Lower ``sub sp, sp, #amount`` for a frame of any supported size.
+
+    SUB (immediate) carries a 12-bit immediate with an optional 12-bit left
+    shift, so a frame larger than 4095 bytes needs the shifted form as well.
+    C local arrays make that a routine size, not an exotic one.
+    """
+
+    if amount == 0:
+        return []
+    if amount < 0 or amount > 0xFFF + (0xFFF << 12):
+        raise ValueError("ARM64 native stack frame exceeds immediate range")
+    words: list[int] = []
+    high = amount >> 12
+    if high:
+        words.append(0xD14003FF | (high << 10))  # sub sp, sp, #high, lsl #12
+    low = amount & 0xFFF
+    if low:
+        words.append(_sub_sp(low))
+    return words
+
+
 def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> int:
     offset = slot_base + slot * 8
     if offset < 0 or offset > 0x7FF8 or offset & 7:
@@ -71,6 +115,17 @@ def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> int
     # ldr/str x<rt>, [x29, #offset]. Rn=x29 (0x1D) is encoded in bits [9:5].
     base = 0xF9400000 if load else 0xF9000000
     return base | ((offset // 8) << 10) | (29 << 5) | rt
+
+
+def _slot_address(slot: int, slot_base: int) -> list[int]:
+    """Place the address of stack slot ``slot`` in X0."""
+
+    offset = slot_base + slot * 8
+    if offset < 0:
+        raise ValueError("ARM64 native variable is outside stack-slot range")
+    if offset <= 0xFFF:
+        return [0x91000000 | (offset << 10) | (29 << 5)]  # add x0, x29, #offset
+    return [*_mov(0, offset), 0x8B0003A0]  # mov x0, #offset; add x0, x29, x0
 
 
 def _float_slot_instruction(load: bool, slot: int, slot_base: int) -> int:
@@ -90,6 +145,13 @@ def _condition_code(operator: str) -> int:
         "lt": 0xB,
         "gt": 0xC,
         "le": 0xD,
+        # Unsigned orderings. C compares two unsigned 64-bit values with these,
+        # and using the signed forms instead is exactly how 0xFFFFFFFFFFFFFFFF
+        # would compare as less than 1.
+        "uge": 0x2,  # hs / cs
+        "ult": 0x3,  # lo / cc
+        "ugt": 0x8,  # hi
+        "ule": 0x9,  # ls
     }
     try:
         return conditions[operator]
@@ -155,6 +217,9 @@ def _expression(
     if isinstance(expression, IntLoad):
         words.append(_slot_instruction(True, expression.slot, slot_base))
         return
+    if isinstance(expression, SlotAddress):
+        words.extend(_slot_address(expression.slot, slot_base))
+        return
     if isinstance(expression, CStringConstant):
         if refs is None:
             raise TypeError(
@@ -194,9 +259,22 @@ def _expression(
                 "and": 0x8A010000,
                 "or": 0xAA010000,
                 "xor": 0xCA010000,
-                "lshift": 0x9AC12000,
-                "rshift": 0x9AC12800,
+                "lshift": 0x9AC12000,  # lslv x0, x0, x1
+                "rshift": 0x9AC12800,  # asrv x0, x0, x1 (arithmetic)
+                "urshift": 0x9AC12400,  # lsrv x0, x0, x1 (logical)
+                "sdiv": 0x9AC10C00,  # sdiv x0, x0, x1
+                "udiv": 0x9AC10800,  # udiv x0, x0, x1
             }
+            remainders = {
+                # x2 = x0 / x1, then x0 = x0 - x2 * x1. C's % truncates toward
+                # zero and keeps the dividend's sign, which is exactly what
+                # sdiv/msub compute.
+                "smod": (0x9AC10C02, 0x9B018040),  # sdiv x2,x0,x1; msub x0,x2,x1,x0
+                "umod": (0x9AC10802, 0x9B018040),  # udiv x2,x0,x1; msub x0,x2,x1,x0
+            }
+            if expression.operator in remainders:
+                words.extend(remainders[expression.operator])
+                return
             try:
                 words.append(instructions[expression.operator])
             except KeyError as error:
@@ -223,12 +301,10 @@ def _expression(
         return
     if isinstance(expression, HeapLoad):
         _expression(words, expression.address, slot_base, refs)  # x0 = address
-        if expression.size == 8:
-            words.append(0xF9400000)  # ldr x0, [x0]
-        elif expression.size == 1:
-            words.append(0x39400000)  # ldrb w0, [x0]
-        else:
+        instruction = _ARM64_LOADS.get((expression.size, bool(expression.signed)))
+        if instruction is None:
             raise ValueError(f"unsupported ARM64 heap load size {expression.size}")
+        words.append(instruction)
         return
     raise TypeError(f"unknown ARM64 integer expression {type(expression).__name__}")
 
@@ -356,7 +432,7 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
     """Encode calls through a Windows ARM64 import-address table."""
     slot_base = 16
     words: list[int] = [
-        _sub_sp(_frame_bytes(module.stack_slots, slot_base)),
+        *_frame_sub(_frame_bytes(module.stack_slots, slot_base)),
         0x910003FD,  # mov x29, sp; stable variable base
     ]
     function_references: list[tuple[int, str]] = []
@@ -370,10 +446,22 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         function_references.append((index, symbol))
 
     for operation in module.operations:
-        if isinstance(operation, (HeapInit, HeapAlloc, HeapStore, WriteRuntime)):
+        if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
             raise ValueError(
                 "runtime heap lists/strings are not supported for windows-arm64 yet"
             )
+        if isinstance(operation, HeapStore):
+            # Plain memory, not the arena: a C store through a pointer needs no
+            # mmap, so it works on Windows exactly as it does on POSIX.
+            _expression(words, operation.address, slot_base)
+            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+            _expression(words, operation.value, slot_base)
+            words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16
+            instruction = _ARM64_STORES.get(operation.size)
+            if instruction is None:
+                raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
+            words.append(instruction)
+            continue
         if isinstance(operation, Write):
             # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
             words.extend(_mov(0, -11 if operation.fd == 1 else -12))
@@ -452,10 +540,7 @@ def _encode(
     ``ExternCall`` operations, which only the darwin dynamic path allows).
     """
     syscall_register = 8 if svc == 0xD4000001 else 16
-    words: list[int] = []
-    frame = _frame_bytes(module.stack_slots)
-    if frame:
-        words.append(_sub_sp(frame))
+    words: list[int] = list(_frame_sub(_frame_bytes(module.stack_slots)))
     words.append(0x910003FD)  # mov x29, sp
     refs = _Refs()
     string_references = refs.strings
@@ -486,12 +571,10 @@ def _encode(
             words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
             _expression(words, operation.value, 0, refs)  # x0 = value
             words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16 (x1=address)
-            if operation.size == 8:
-                words.append(0xF9000020)  # str x0, [x1]
-            elif operation.size == 1:
-                words.append(0x39000020)  # strb w0, [x1]
-            else:
+            instruction = _ARM64_STORES.get(operation.size)
+            if instruction is None:
                 raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
+            words.append(instruction)
             continue
         if isinstance(operation, WriteRuntime):
             _expression(words, operation.length, 0, refs)  # x0 = length

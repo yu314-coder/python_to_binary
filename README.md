@@ -24,11 +24,18 @@ It has seven deliberately separate execution paths. They must not be confused:
    source, or a checksummed `.py2cbin` C-source container. Imports automatically
    plan for the compatible CPython bundle instead of pretending native packages
    can be translated from Python source.
-6. **Canonical-C native bridge:** the smaller signed-64-bit intersection can
-   run Python → generated C → py2bin's handwritten C parser → py2bin IR →
-   handwritten machine code. `compile-c` accepts that same canonical C
-   directly. This is a real no-toolchain C-to-binary path, not a general C,
-   Cython-C, C++, NumPy C-API, ATen, or CUDA compiler.
+6. **C compiler:** `compile-c` is py2bin's own C compiler, written in Python.
+   It lexes and parses C, applies C's integer promotions and conversions, and
+   emits py2bin IR that the handwritten encoders turn into machine code. It
+   implements the integer and pointer language: the whole integer type zoo with
+   exact truncation and extension, local arrays, `&x`, `*p`, pointer
+   arithmetic, casts, `sizeof`, `++`/`--`, `?:`, the comma operator, division
+   and remainder, `if`/`while`/`do`/`for`/`switch`/`goto`, functions (inlined),
+   and `printf`. It is not a general C, Cython-C, C++, NumPy C-API, ATen, or
+   CUDA compiler: floating point, structs, unions, enums, typedefs, function
+   pointers, recursion, and the preprocessor are rejected with a
+   file:line:column error rather than approximated. `compile-via-c` is the
+   older, narrower bridge that round-trips py2bin's *own* generated C.
 7. **CPython C-API embedding (`darwin-arm64` only):** the same handwritten C
    frontend also accepts calls to a fixed, vetted list of exported CPython
    entry points through opaque `PyObject *` handles, and the emitted Mach-O
@@ -343,7 +350,8 @@ and the [detailed compiler, bundling, target, and release guide](docs/DETAILED_G
 | `aot-build` | ELF, PE, Mach-O, macOS `.app` | closed-world, attested py2bin-generated machine code or no artifact | No |
 | `aot-build --via-c` | canonical whole-program `.c`, then ELF/PE/Mach-O | local functions are lowered/inlined, emitted as C, reparsed to identical IR, then encoded | No |
 | `compile` | ELF, PE, Mach-O, macOS `.app` | py2bin-generated machine code | No |
-| `compile-via-c` / `compile-c` | ELF, PE, or Mach-O | canonical C parsed by py2bin, then py2bin-generated machine code | No |
+| `compile-via-c` | ELF, PE, or Mach-O | canonical C parsed by py2bin, then py2bin-generated machine code | No |
+| `compile-c` | ELF, PE, or Mach-O | C compiled by py2bin's own C compiler into py2bin-generated machine code | No |
 | `emit-c` | `.c` or `.py2cbin` | C source, not yet an executable | N/A |
 | `build --format pyz` | Python zip application | CPython bytecode/source | Yes |
 | `build --format bin` | Executable Python zip application | CPython bytecode/source | Yes |
@@ -669,7 +677,7 @@ py2bin plan-c program.py
 py2bin compile-via-c program.py --c-output program.c \
   --target windows-x86_64 -o program.exe
 
-# Direct input uses the same canonical C parser.
+# Direct C input goes through py2bin's own C compiler.
 py2bin compile-c program.c --target linux-arm64 -o program-arm64
 ```
 
@@ -678,21 +686,43 @@ is not an executable. `compile-via-c` is a literal zero-toolchain bridge for
 the signed-64-bit intersection: it emits the C text, lexes and parses that text
 with py2bin's standard-library-only implementation, reconstructs verified
 integer semantics, and then uses the same IR and PE/ELF/Mach-O writers as
-`compile`. `compile-c` begins at the C parsing step. Neither command calls a
-system assembler, linker, or C compiler.
+`compile`. Neither command calls a system assembler, linker, or C compiler.
 
-The accepted canonical C is deliberately small: `long long` functions and
+The canonical C that `compile-via-c` round-trips is deliberately small: it is
+exactly the shape py2bin's own generator emits — `long long` functions and
 locals, `int main(void)`, integer `+`, `-`, `*`, bitwise operations,
 constant-count shifts, comparisons, conditional expressions, assignments,
 structured `if`/`while`, py2bin's canonical `for range` form, function calls,
 returns, and newline-terminated `printf` with literal text or compile-time
-integer `%lld` values. It also accepts `extern` prototypes for the vetted
-adapter ABI and *opaque* pointer handles (`PyObject *`, `char *`, `void *`)
-that are passed and compared against `NULL` but never dereferenced. It rejects
-dereferenceable pointers, pointer arithmetic, arrays, structs, floating point,
-division/modulo, macros other than the known emitted includes, runtime
-formatting, arbitrary libc, Cython-generated C, the NumPy C-API, C++, ATen,
-and CUDA. The CPython C-API is accepted only as the fixed vetted symbol table
+integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
+*opaque* pointer handles that are never dereferenced.
+
+`compile-c` is the real C compiler and accepts considerably more (see
+[`src/py2bin/c_frontend.py`](src/py2bin/c_frontend.py)):
+
+- every integer type — `char`, `short`, `int`, `long`, `long long`, their
+  `unsigned` forms and the `<stdint.h>` fixed-width names — with C's integer
+  promotions, usual arithmetic conversions, and exact truncation and
+  sign/zero extension on assignment, cast, and narrow-typed arithmetic;
+- local arrays (including multi-dimensional), `&x`, `*p`, `a[i]`, pointer
+  arithmetic and pointer difference, with loads and stores at the real widths;
+- casts between integer types, between pointer types, and across the two, and
+  `sizeof` for every complete type;
+- `++`/`--` (prefix and postfix), `?:`, short-circuit `&&`/`||`, the comma
+  operator, compound assignment, and signed/unsigned `/` and `%`;
+- `if`/`else`, `while`, `do`/`while`, `for`, `switch`/`case`/`default` with
+  fallthrough, `break`, `continue`, `goto` with labels, and `return`;
+- functions, which are **inlined** at every call site, and `printf` with real
+  runtime formatting (`%d %i %u %x %X %c %s %%` with `h`/`hh`/`l`/`ll`/`z`).
+
+py2bin's C is LP64 on all six targets and gives plain `char` the signed
+meaning Apple and x86 give it, so one source file produces the same values
+everywhere. It rejects — with a file:line:column error, never an
+approximation — floating point, `struct`, `union`, `enum`, `typedef`, function
+pointers, variadic user functions, file-scope variables, recursion (py2bin's IR
+has no call instruction), the preprocessor beyond a few ignorable `#include`s,
+arbitrary libc, Cython-generated C, the NumPy C-API, C++, ATen, and CUDA.
+The CPython C-API is accepted only as the fixed vetted symbol table
 described under [What the C-API path supports](#what-the-c-api-path-supports),
 not as a general C-API compiler: py2bin never reads `Python.h`, so anything
 that is a macro, a `static inline`, a struct field, or variadic is out of
@@ -1024,10 +1054,11 @@ pretending every file is the same language:
 C source is an optional readable intermediate, not machine code. `emit-c`
 stops at C text. `compile-via-c` proves and compiles only the documented
 canonical integer intersection by parsing that text with py2bin itself;
-`compile-c` accepts the same restricted language directly. General emitted C
-still needs an external C implementation, which py2bin never invokes
-silently. Strict native compilation always ends in py2bin IR and handwritten
-target instructions.
+`compile-c` runs py2bin's own C compiler over the wider integer-and-pointer
+language described above. C that needs floating point, aggregates, or the
+preprocessor still needs an external C implementation, which py2bin never
+invokes silently. Strict native compilation always ends in py2bin IR and
+handwritten target instructions.
 
 HTML and CSS remain declarative data, and browser JavaScript remains code for a
 JavaScript/browser engine. Compatible one-file bundles copy, compress, and

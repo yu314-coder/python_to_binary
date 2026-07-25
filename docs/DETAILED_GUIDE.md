@@ -6,8 +6,9 @@ separate jobs:
 1. Prove that a closed application has no CPython/fallback requirement and
    either build an attested direct-native artifact or write no artifact.
 2. Translate a supported Python subset into portable C source.
-3. Parse a canonical signed-64-bit C subset and translate it into machine code
-   using no external C compiler, assembler, or linker.
+3. Compile C -- the integer and pointer language, with the whole integer type
+   zoo, real memory, casts, `sizeof`, and the full statement set -- into
+   machine code using no external C compiler, assembler, or linker.
 4. Translate a smaller static Python subset directly into ELF, PE, or Mach-O
    machine-code files without an assembler or linker.
 5. Compile canonical C that calls a vetted set of CPython C-API entry points,
@@ -81,7 +82,7 @@ project's own native implementation and still runs through embedded CPython.
 |---|---|---:|
 | Closed program that must never fall back to CPython | `aot-plan`, then `aot-build` | No |
 | Static constants, printing, integer exit | `compile` | No |
-| Canonical signed-64-bit C | `compile-c` | No |
+| C in py2bin's integer/pointer language | `compile-c` | No |
 | C, or `py2bin.cabi` Python, calling the vetted CPython C-API | `compile-c` or `compile`, `--target darwin-arm64` | Yes — the artifact dyld-links the build host's CPython |
 | Supported integer Python with an inspectable C intermediate | `compile-via-c` | No |
 | Supported typed Python subset | `emit-c` | C source only |
@@ -279,10 +280,11 @@ model, renderer, fonts, codecs, and GUI/backend integration need separate
 implementations. SVG/HTML/JavaScript output would be embedded asset data, not
 host CPU instructions.
 
-The canonical-C bridge is a separate signed-64-bit frontend and does not accept
-the NumPy C-API, ATen, CUDA, or renderer implementations. Using general emitted
-C would still require a complete C compiler and linker; the small bridge does
-not solve those compatibility layers.
+py2bin's C compiler is a separate frontend and does not accept the NumPy
+C-API, ATen, CUDA, or renderer implementations: those need floating point,
+struct layouts, and the preprocessor, all of which it rejects rather than
+approximates. Compiling that C would still require a complete C implementation;
+py2bin's does not solve those compatibility layers.
 
 The runnable `examples/native_library` sample demonstrates an imported helper
 calling another helper. `compile-all` emits all six target binaries, and the
@@ -348,9 +350,14 @@ unimplemented Python semantics.
 C source is not an executable format. `emit-c` intentionally stops at readable
 C text. For its smaller signed-64-bit intersection, `compile-via-c` really
 lexes and parses that generated C and then lowers the verified result into
-py2bin IR and handwritten x86-64/ARM64 instructions. `compile-c` accepts the
-same canonical C directly. General C still requires a conventional compiler
-and linker; py2bin does not secretly invoke GCC or Clang.
+py2bin IR and handwritten x86-64/ARM64 instructions. `compile-c` runs py2bin's
+own C compiler, which accepts considerably more: the integer type zoo with C's
+conversions, local arrays, `&x`/`*p`/`a[i]` and pointer arithmetic, casts,
+`sizeof`, `++`/`--`, the comma operator, `/` and `%`, `do`/`while`,
+`switch`/`case` with fallthrough, `goto`, inlined functions, and `printf` with
+runtime formatting. C needing floating point, aggregates, function pointers,
+recursion, or the preprocessor still requires a conventional compiler and
+linker; py2bin does not secretly invoke GCC or Clang.
 
 Compatible bundles already preserve web content as files inside their
 compressed one-file payload. The freeze manifest now catalogs `.html`, `.htm`,
