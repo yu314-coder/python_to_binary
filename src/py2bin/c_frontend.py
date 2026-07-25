@@ -2319,6 +2319,21 @@ _CONVERSIONS = {
     "c": ("char", INT),
     "s": ("string", PointerType(CHAR)),
 }
+#: printf's floating conversions. py2bin emits the whole formatter itself, so
+#: each one is a compile-time choice of shape plus a runtime precision.
+_FLOAT_CONVERSIONS = frozenset({"f", "F", "e", "E", "g", "G"})
+
+#: A conversion's precision bounds the output, and the output goes into a fixed
+#: frame buffer. 120 leaves room for the 309 integer digits the largest double
+#: needs in %f, with the sign and the point, inside _TEXT_BYTES.
+_MAXIMUM_PRECISION = 120
+
+#: Bytes of frame the floating formatter needs. The digit array holds the EXACT
+#: decimal expansion of a double: 767 digits for the smallest subnormal (its
+#: mantissa times 5**1074), plus one the final rounding carry can add.
+_DIGIT_BYTES = 1024
+_TEXT_BYTES = 512
+
 _LENGTHS = {
     "": {},
     "hh": {"d": SCHAR, "i": SCHAR, "u": UCHAR, "x": UCHAR, "X": UCHAR},
@@ -2355,6 +2370,9 @@ class Lowerer:
         self.functions: list[FunctionContext] = []
         self.active: list[str] = []
         self.buffer_slot: int | None = None
+        self.digit_slot: int | None = None
+        self.text_slot: int | None = None
+        self.float_scratch: dict[str, int] = {}
         # Real calls: every function reached from main, lowered once into its
         # own IR body, plus the set currently being lowered so a call that
         # arrives while its own body is still open (that is, recursion) emits a
@@ -3404,6 +3422,9 @@ class Lowerer:
             self.stack_slots,
             self.scopes,
             self.buffer_slot,
+            self.digit_slot,
+            self.text_slot,
+            self.float_scratch,
             self.break_targets,
             self.continue_targets,
             self.switches,
@@ -3413,6 +3434,9 @@ class Lowerer:
         self.stack_slots = 0
         self.scopes = [{}]
         self.buffer_slot = None
+        self.digit_slot = None
+        self.text_slot = None
+        self.float_scratch = {}
         self.break_targets = []
         self.continue_targets = []
         self.switches = []
@@ -3457,6 +3481,9 @@ class Lowerer:
                 self.stack_slots,
                 self.scopes,
                 self.buffer_slot,
+                self.digit_slot,
+                self.text_slot,
+                self.float_scratch,
                 self.break_targets,
                 self.continue_targets,
                 self.switches,
@@ -3924,15 +3951,31 @@ class Lowerer:
         # each result in a slot, then emit the output.
         prepared: list[object] = []
         for position, argument in enumerate(arguments):
-            style, ctype = segments[
+            style, ctype, precision = segments[
                 [i for i, (kind, _) in enumerate(segments) if kind != "text"][position]
             ][1]
             value = self.rvalue(argument)
-            prepared.append((style, ctype, value, argument))
+            prepared.append((style, ctype, precision, value, argument))
         held: list[object] = []
-        for style, ctype, value, argument in prepared:
+        for style, ctype, precision, value, argument in prepared:
             if style == "string":
-                held.append((style, value, argument))
+                held.append((style, precision, value, argument))
+                continue
+            if style in _FLOAT_CONVERSIONS:
+                if not is_floating(value.ctype):
+                    self.error(
+                        f"a %{style} conversion needs a floating value, not "
+                        f"{value.ctype}; C's printf reads a double here, and an "
+                        "integer argument is undefined -- write a cast if that is "
+                        "what you meant",
+                        argument.token,
+                    )
+                # materialize_float() pins the double in a slot for the same
+                # reason the integer path pins its value: a later argument must
+                # not be able to change what this one formats.
+                held.append(
+                    (style, precision, self.materialize_float(value.expr), argument)
+                )
                 continue
             if not is_integer(value.ctype):
                 self.error(
@@ -3942,7 +3985,7 @@ class Lowerer:
             # materialize() pins the value in a slot, so evaluating a later
             # argument cannot change what this one reads.
             held.append(
-                (style, self.materialize(self.fit(value.expr, ctype)), argument)
+                (style, precision, self.materialize(self.fit(value.expr, ctype)), argument)
             )
 
         index = 0
@@ -3950,8 +3993,11 @@ class Lowerer:
             if kind == "text":
                 self.emit(Write(payload))
                 continue
-            style, value, argument = held[index]
+            style, precision, value, argument = held[index]
             index += 1
+            if style in _FLOAT_CONVERSIONS:
+                self.emit_floating(value, style, precision)
+                continue
             if style == "string":
                 if value.null or not isinstance(value.ctype, PointerType):
                     self.error(
@@ -3993,21 +4039,77 @@ class Lowerer:
                 text.append(0x25)
                 position += 1
                 continue
+            if position < len(data) and (
+                chr(data[position]) in "-+ #" or chr(data[position]).isdigit()
+            ):
+                self.error(
+                    "printf flags and field widths are not implemented; py2bin "
+                    "emits the formatting itself and pads nothing",
+                    literal.token,
+                )
+            precision: int | None = None
+            if position < len(data) and data[position] == 0x2E:  # '.'
+                position += 1
+                figures = ""
+                while position < len(data) and chr(data[position]).isdigit():
+                    figures += chr(data[position])
+                    position += 1
+                # C reads an omitted precision after the period as zero.
+                precision = int(figures) if figures else 0
             length = ""
-            while position < len(data) and chr(data[position]) in "hlzjt":
+            while position < len(data) and chr(data[position]) in "hlzjtL":
                 length += chr(data[position])
                 position += 1
             if position >= len(data):
                 self.error("printf format ends inside a conversion", literal.token)
             specifier = chr(data[position])
             position += 1
+            if specifier in _FLOAT_CONVERSIONS:
+                if length == "L":
+                    self.error(
+                        f"printf conversion %L{specifier} names a long double, "
+                        "which py2bin's C compiler does not implement",
+                        literal.token,
+                    )
+                if length not in {"", "l"}:
+                    # C11 7.21.6.1: 'l' before a floating conversion has no
+                    # effect, because the argument is a double either way.
+                    self.error(
+                        f"printf conversion %{length}{specifier} is not valid",
+                        literal.token,
+                    )
+                if precision is None:
+                    precision = 6
+                if precision > _MAXIMUM_PRECISION:
+                    self.error(
+                        f"printf precision {precision} is beyond the "
+                        f"{_MAXIMUM_PRECISION} py2bin implements; the formatter "
+                        "writes into a fixed frame buffer",
+                        literal.token,
+                    )
+                if text:
+                    segments.append(("text", bytes(text)))
+                    text.clear()
+                segments.append(("conversion", (specifier, DOUBLE, precision)))
+                continue
             if specifier not in _CONVERSIONS:
                 self.error(
                     f"printf conversion %{length}{specifier} is not implemented; "
                     "py2bin emits the formatting itself and supports "
-                    "%d %i %u %x %X %c %s and %% with the h/hh/l/ll/z length "
-                    "modifiers (no flags, width, or precision)",
+                    "%d %i %u %x %X %c %s %f %F %e %E %g %G and %% with the "
+                    "h/hh/l/ll/z length modifiers, and a precision on the "
+                    "floating conversions (no flags or field widths)",
                     literal.token,
+                )
+            if precision is not None:
+                self.error(
+                    f"a precision on %{specifier} is not implemented; py2bin "
+                    "implements one only on the floating conversions",
+                    literal.token,
+                )
+            if length == "L":
+                self.error(
+                    f"printf conversion %L{specifier} is not valid", literal.token
                 )
             style, default = _CONVERSIONS[specifier]
             table = _LENGTHS.get(length)
@@ -4025,10 +4127,657 @@ class Lowerer:
             if text:
                 segments.append(("text", bytes(text)))
                 text.clear()
-            segments.append(("conversion", (style, ctype)))
+            segments.append(("conversion", (style, ctype, None)))
         if text:
             segments.append(("text", bytes(text)))
         return segments
+
+    #: The working variables the floating formatter needs. They are allocated
+    #: once per function body and REUSED by every conversion in it: each one is
+    #: live only inside the formatter's own straight-line code, and a program
+    #: printing a dozen doubles would otherwise need a dozen copies of them.
+    _FLOAT_SCRATCH = (
+        "bits",
+        "sign",
+        "exponent",
+        "mantissa",
+        "significand",
+        "scale",
+        "power",
+        "length",
+        "index",
+        "carry",
+        "term",
+        "repeats",
+        "step",
+        "cut",
+        "guard",
+        "sticky",
+        "keep",
+        "roundup",
+        "surviving",
+        "written",
+        "decimal_exponent",
+        "count",
+        "position",
+        "digit",
+        "form",
+        "figures",
+        "zero",
+    )
+
+    def float_buffers(self) -> tuple[int, int, dict[str, int]]:
+        """The frame the floating formatter works in, allocated once."""
+
+        if self.digit_slot is None:
+            self.digit_slot = self.allocate(_DIGIT_BYTES)
+            self.text_slot = self.allocate(_TEXT_BYTES)
+            self.float_scratch = {
+                name: self.new_temp() for name in self._FLOAT_SCRATCH
+            }
+        assert self.text_slot is not None
+        return self.digit_slot, self.text_slot, self.float_scratch
+
+    def emit_floating(
+        self, value: FloatExpression, style: str, precision: int
+    ) -> None:
+        """Format one double for %f/%e/%g and write it, with no library at all.
+
+        The conversion is EXACT, not approximate. Every finite double is
+        ``M * 2**E`` with M below 2**53, and every such number has a finite
+        decimal expansion: for E >= 0 it is the integer ``M * 2**E``, and for
+        E < 0 it is ``M * 5**-E`` scaled by ``10**E``. So the emitted code
+        builds that expansion digit by digit in a base-10 array -- doubling it E
+        times, or multiplying it by five -E times -- and then rounds the decimal
+        digits themselves. No logarithm, no repeated division of the double, and
+        no accumulated error: the digits printed are the digits the value has.
+
+        The rounding is round-half-to-even ON THE EXACT VALUE, which is what
+        C11 7.21.6.1p13 recommends and what makes %.0f of 0.5 print 0, of 1.5
+        print 2, and of 2.5 print 2 again.
+
+        The cost is a loop of up to 1074 multiplications over up to 767 digits
+        for the smallest subnormals; a value near 1 needs a few dozen. That is
+        the price of being exact without a bignum library, and it is paid only
+        where a program actually prints a floating value.
+        """
+
+        upper = style in {"F", "E", "G"}
+        kind = style.lower()
+        # C reads a %g precision of zero as one significant digit.
+        significant = max(1, precision) if kind == "g" else 0
+        digit_slot, text_slot, scratch = self.float_buffers()
+        digits = SlotAddress(digit_slot)
+        text = SlotAddress(text_slot)
+
+        bits = scratch["bits"]
+        sign = scratch["sign"]
+        exponent = scratch["exponent"]
+        mantissa = scratch["mantissa"]
+        significand = scratch["significand"]
+        scale = scratch["scale"]
+        power = scratch["power"]
+        length = scratch["length"]
+        index = scratch["index"]
+        carry = scratch["carry"]
+        term = scratch["term"]
+        repeats = scratch["repeats"]
+        step = scratch["step"]
+        cut = scratch["cut"]
+        guard = scratch["guard"]
+        sticky = scratch["sticky"]
+        keep = scratch["keep"]
+        roundup = scratch["roundup"]
+        surviving = scratch["surviving"]
+        written = scratch["written"]
+        decimal_exponent = scratch["decimal_exponent"]
+        count = scratch["count"]
+        position = scratch["position"]
+        digit = scratch["digit"]
+        form = scratch["form"]
+        figures = scratch["figures"]
+        zero = scratch["zero"]
+
+        def store(slot: int, expression: IntExpression) -> None:
+            self.emit(Store(slot, expression))
+
+        def label(name: str) -> str:
+            return self.new_label(f"fp_{name}")
+
+        def at(name: str) -> str:
+            target = label(name)
+            self.emit(Label(target))
+            return target
+
+        def put(character: IntExpression) -> None:
+            """Append one byte to the output buffer."""
+
+            self.emit(
+                HeapStore(_binary("add", text, IntLoad(written)), character, 1)
+            )
+            store(written, _binary("add", IntLoad(written), IntConstant(1)))
+
+        def put_bytes(data: bytes) -> None:
+            for byte in data:
+                put(IntConstant(byte))
+
+        def unless(condition: IntExpression, target: str) -> None:
+            """Jump to ``target`` when ``condition`` is false."""
+
+            self.emit(JumpIfFalse(condition, target))
+
+        def byte_at(where: IntExpression) -> IntExpression:
+            return HeapLoad(where, 1, False)
+
+        # --- take the value apart --------------------------------------
+        store(bits, FloatBits(value, 8))
+        store(sign, IntBinary("urshift", IntLoad(bits), IntConstant(63)))
+        store(
+            exponent,
+            IntBinary(
+                "and",
+                IntBinary("urshift", IntLoad(bits), IntConstant(52)),
+                IntConstant(0x7FF),
+            ),
+        )
+        store(
+            mantissa,
+            IntBinary("and", IntLoad(bits), IntConstant((1 << 52) - 1)),
+        )
+        store(written, IntConstant(0))
+        positive = label("positive")
+        unless(IntLoad(sign), positive)
+        put(IntConstant(0x2D))  # '-'
+        self.emit(Label(positive))
+
+        # Infinities and NaNs have no digits; C prints them as words.
+        finite = label("finite")
+        emit_text = label("emit")
+        unless(IntCompare("eq", IntLoad(exponent), IntConstant(0x7FF)), finite)
+        not_a_number = label("nan")
+        unless(IntCompare("eq", IntLoad(mantissa), IntConstant(0)), not_a_number)
+        put_bytes(b"INF" if upper else b"inf")
+        self.emit(Jump(emit_text))
+        self.emit(Label(not_a_number))
+        put_bytes(b"NAN" if upper else b"nan")
+        self.emit(Jump(emit_text))
+        self.emit(Label(finite))
+
+        # value == significand * 2**power, exactly.
+        subnormal = label("subnormal")
+        ready = label("ready")
+        unless(IntLoad(exponent), subnormal)
+        store(
+            significand,
+            IntBinary("add", IntLoad(mantissa), IntConstant(1 << 52)),
+        )
+        store(power, IntBinary("sub", IntLoad(exponent), IntConstant(1075)))
+        self.emit(Jump(ready))
+        self.emit(Label(subnormal))
+        store(significand, IntLoad(mantissa))
+        store(power, IntConstant(-1074))
+        self.emit(Label(ready))
+
+        # --- the exact decimal expansion -------------------------------
+        # digits[0] is the LEAST significant digit, and the value is
+        # sum(digits[i] * 10**i) * 10**-scale.
+        store(zero, IntCompare("eq", IntLoad(significand), IntConstant(0)))
+        store(length, IntConstant(0))
+        split = at("split")
+        split_end = label("split_end")
+        unless(IntLoad(significand), split_end)
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(length)),
+                IntBinary("umod", IntLoad(significand), IntConstant(10)),
+                1,
+            )
+        )
+        store(length, _binary("add", IntLoad(length), IntConstant(1)))
+        store(
+            significand, IntBinary("udiv", IntLoad(significand), IntConstant(10))
+        )
+        self.emit(Jump(split))
+        self.emit(Label(split_end))
+        nonzero = label("nonzero")
+        unless(IntCompare("eq", IntLoad(length), IntConstant(0)), nonzero)
+        self.emit(HeapStore(digits, IntConstant(0), 1))
+        store(length, IntConstant(1))
+        self.emit(Label(nonzero))
+
+        # A positive binary exponent doubles the integer; a negative one turns
+        # 2**-n into 5**n over 10**n, which is where the scale comes from.
+        nonnegative = label("nonnegative")
+        scaled = label("scaled")
+        # A zero has an exact expansion of 0 * 10**1074, but C gives it the
+        # decimal exponent 0, so it takes no scaling at all -- which is also
+        # what stops %e from printing "0.000000e-1074".
+        store(scale, IntConstant(0))
+        store(repeats, IntConstant(0))
+        store(step, IntConstant(2))
+        unless(IntCompare("eq", IntLoad(zero), IntConstant(0)), scaled)
+        unless(IntCompare("lt", IntLoad(power), IntConstant(0)), nonnegative)
+        store(step, IntConstant(5))
+        store(repeats, IntUnary("neg", IntLoad(power)))
+        store(scale, IntUnary("neg", IntLoad(power)))
+        self.emit(Jump(scaled))
+        self.emit(Label(nonnegative))
+        store(step, IntConstant(2))
+        store(repeats, IntLoad(power))
+        store(scale, IntConstant(0))
+        self.emit(Label(scaled))
+
+        outer = at("scale")
+        outer_end = label("scale_end")
+        unless(IntLoad(repeats), outer_end)
+        store(carry, IntConstant(0))
+        store(index, IntConstant(0))
+        inner = at("multiply")
+        inner_end = label("multiply_end")
+        unless(IntCompare("lt", IntLoad(index), IntLoad(length)), inner_end)
+        store(
+            term,
+            IntBinary(
+                "add",
+                IntBinary(
+                    "mul",
+                    byte_at(_binary("add", digits, IntLoad(index))),
+                    IntLoad(step),
+                ),
+                IntLoad(carry),
+            ),
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(index)),
+                IntBinary("umod", IntLoad(term), IntConstant(10)),
+                1,
+            )
+        )
+        store(carry, IntBinary("udiv", IntLoad(term), IntConstant(10)))
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(inner))
+        self.emit(Label(inner_end))
+        spill = at("spill")
+        spill_end = label("spill_end")
+        unless(IntLoad(carry), spill_end)
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(length)),
+                IntBinary("umod", IntLoad(carry), IntConstant(10)),
+                1,
+            )
+        )
+        store(length, _binary("add", IntLoad(length), IntConstant(1)))
+        store(carry, IntBinary("udiv", IntLoad(carry), IntConstant(10)))
+        self.emit(Jump(spill))
+        self.emit(Label(spill_end))
+        store(repeats, _binary("sub", IntLoad(repeats), IntConstant(1)))
+        self.emit(Jump(outer))
+        self.emit(Label(outer_end))
+
+        # --- round the decimal digits ----------------------------------
+        # 'cut' is how many of the least significant digits are dropped. %f
+        # keeps a fixed number of them after the point; %e and %g keep a fixed
+        # number of significant digits.
+        if kind == "f":
+            store(cut, _binary("sub", IntLoad(scale), IntConstant(precision)))
+        elif kind == "e":
+            store(cut, _binary("sub", IntLoad(length), IntConstant(precision + 1)))
+        else:
+            store(cut, _binary("sub", IntLoad(length), IntConstant(significant)))
+        exact = label("exact")
+        unless(IntCompare("gt", IntLoad(cut), IntConstant(0)), exact)
+
+        store(guard, IntConstant(0))
+        have_guard = label("have_guard")
+        unless(
+            IntCompare(
+                "lt", _binary("sub", IntLoad(cut), IntConstant(1)), IntLoad(length)
+            ),
+            have_guard,
+        )
+        store(
+            guard,
+            byte_at(
+                _binary(
+                    "add", digits, _binary("sub", IntLoad(cut), IntConstant(1))
+                )
+            ),
+        )
+        self.emit(Label(have_guard))
+
+        # 'sticky' says whether anything below the guard digit was nonzero,
+        # which is what separates an exact tie from a value just above one.
+        store(sticky, IntConstant(0))
+        store(index, IntConstant(0))
+        tail = at("tail")
+        tail_end = label("tail_end")
+        unless(
+            IntCompare(
+                "lt", IntLoad(index), _binary("sub", IntLoad(cut), IntConstant(1))
+            ),
+            tail_end,
+        )
+        unless(IntCompare("lt", IntLoad(index), IntLoad(length)), tail_end)
+        store(
+            sticky,
+            IntBinary(
+                "or",
+                IntLoad(sticky),
+                IntCompare(
+                    "ne",
+                    byte_at(_binary("add", digits, IntLoad(index))),
+                    IntConstant(0),
+                ),
+            ),
+        )
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(tail))
+        self.emit(Label(tail_end))
+
+        store(keep, IntConstant(0))
+        have_keep = label("have_keep")
+        unless(IntCompare("lt", IntLoad(cut), IntLoad(length)), have_keep)
+        store(keep, byte_at(_binary("add", digits, IntLoad(cut))))
+        self.emit(Label(have_keep))
+        # Round half to even: up when the guard is above five, and on an exact
+        # five only when something below it was set or the surviving digit is
+        # odd.
+        store(
+            roundup,
+            IntBinary(
+                "or",
+                IntCompare("gt", IntLoad(guard), IntConstant(5)),
+                IntBinary(
+                    "and",
+                    IntCompare("eq", IntLoad(guard), IntConstant(5)),
+                    IntBinary(
+                        "or",
+                        IntCompare("ne", IntLoad(sticky), IntConstant(0)),
+                        IntBinary("and", IntLoad(keep), IntConstant(1)),
+                    ),
+                ),
+            ),
+        )
+
+        store(surviving, _binary("sub", IntLoad(length), IntLoad(cut)))
+        nonempty = label("nonempty")
+        unless(IntCompare("lt", IntLoad(surviving), IntConstant(0)), nonempty)
+        store(surviving, IntConstant(0))
+        self.emit(Label(nonempty))
+        store(index, IntConstant(0))
+        shift = at("shift")
+        shift_end = label("shift_end")
+        unless(IntCompare("lt", IntLoad(index), IntLoad(surviving)), shift_end)
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(index)),
+                byte_at(
+                    _binary(
+                        "add", digits, _binary("add", IntLoad(index), IntLoad(cut))
+                    )
+                ),
+                1,
+            )
+        )
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(shift))
+        self.emit(Label(shift_end))
+        store(scale, _binary("sub", IntLoad(scale), IntLoad(cut)))
+        store(length, IntLoad(surviving))
+        survived = label("survived")
+        unless(IntCompare("eq", IntLoad(length), IntConstant(0)), survived)
+        self.emit(HeapStore(digits, IntConstant(0), 1))
+        store(length, IntConstant(1))
+        self.emit(Label(survived))
+
+        rounded = label("rounded")
+        unless(IntLoad(roundup), rounded)
+        store(carry, IntConstant(1))
+        store(index, IntConstant(0))
+        bump = at("bump")
+        bump_end = label("bump_end")
+        unless(IntCompare("lt", IntLoad(index), IntLoad(length)), bump_end)
+        unless(IntLoad(carry), bump_end)
+        store(
+            term,
+            IntBinary(
+                "add",
+                byte_at(_binary("add", digits, IntLoad(index))),
+                IntLoad(carry),
+            ),
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(index)),
+                IntBinary("umod", IntLoad(term), IntConstant(10)),
+                1,
+            )
+        )
+        store(carry, IntBinary("udiv", IntLoad(term), IntConstant(10)))
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(bump))
+        self.emit(Label(bump_end))
+        settled = label("settled")
+        unless(IntLoad(carry), settled)
+        self.emit(
+            HeapStore(_binary("add", digits, IntLoad(length)), IntLoad(carry), 1)
+        )
+        store(length, _binary("add", IntLoad(length), IntConstant(1)))
+        self.emit(Label(settled))
+        self.emit(Label(rounded))
+        self.emit(Label(exact))
+
+        # --- pick the shape and the number of fraction digits ----------
+        store(
+            decimal_exponent,
+            _binary(
+                "sub",
+                _binary("sub", IntLoad(length), IntConstant(1)),
+                IntLoad(scale),
+            ),
+        )
+        if kind == "f":
+            store(form, IntConstant(0))
+            store(figures, IntConstant(precision))
+        elif kind == "e":
+            store(form, IntConstant(1))
+            store(figures, IntConstant(precision))
+        else:
+            # C11 7.21.6.1p8: %g uses %e when the exponent is below -4 or at
+            # least the precision, and %f otherwise, then drops trailing zeros.
+            fixed_form = label("fixed_form")
+            chosen = label("chosen")
+            unless(
+                IntBinary(
+                    "or",
+                    IntCompare("lt", IntLoad(decimal_exponent), IntConstant(-4)),
+                    IntCompare(
+                        "ge", IntLoad(decimal_exponent), IntConstant(significant)
+                    ),
+                ),
+                fixed_form,
+            )
+            store(form, IntConstant(1))
+            store(figures, IntConstant(significant - 1))
+            self.emit(Jump(chosen))
+            self.emit(Label(fixed_form))
+            store(form, IntConstant(0))
+            store(
+                figures,
+                _binary(
+                    "sub",
+                    IntConstant(significant - 1),
+                    IntLoad(decimal_exponent),
+                ),
+            )
+            self.emit(Label(chosen))
+
+        def fraction(index_of: object) -> None:
+            """Emit '.' and the fraction digits, reading 0 outside the array."""
+
+            done = label("fraction_done")
+            unless(IntCompare("gt", IntLoad(figures), IntConstant(0)), done)
+            put(IntConstant(0x2E))  # '.'
+            store(count, IntConstant(1))
+            top = at("fraction")
+            stop = label("fraction_end")
+            unless(IntCompare("le", IntLoad(count), IntLoad(figures)), stop)
+            store(position, index_of())
+            store(digit, IntConstant(0))
+            outside = label("outside")
+            unless(IntCompare("ge", IntLoad(position), IntConstant(0)), outside)
+            unless(IntCompare("lt", IntLoad(position), IntLoad(length)), outside)
+            store(digit, byte_at(_binary("add", digits, IntLoad(position))))
+            self.emit(Label(outside))
+            put(_binary("add", IntLoad(digit), IntConstant(48)))
+            store(count, _binary("add", IntLoad(count), IntConstant(1)))
+            self.emit(Jump(top))
+            self.emit(Label(stop))
+            self.emit(Label(done))
+
+        exponential = label("exponential")
+        after = label("after_mantissa")
+        unless(IntCompare("eq", IntLoad(form), IntConstant(0)), exponential)
+        # Fixed form: digits at or above the point, then the fraction.
+        empty = label("no_integer")
+        integer_done = label("integer_done")
+        unless(
+            IntCompare(
+                "ge",
+                _binary("sub", IntLoad(length), IntConstant(1)),
+                IntLoad(scale),
+            ),
+            empty,
+        )
+        store(index, _binary("sub", IntLoad(length), IntConstant(1)))
+        walk = at("integer")
+        walk_end = label("integer_end")
+        unless(IntCompare("ge", IntLoad(index), IntLoad(scale)), walk_end)
+        put(
+            _binary(
+                "add",
+                byte_at(_binary("add", digits, IntLoad(index))),
+                IntConstant(48),
+            )
+        )
+        store(index, _binary("sub", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(walk))
+        self.emit(Label(walk_end))
+        self.emit(Jump(integer_done))
+        self.emit(Label(empty))
+        put(IntConstant(48))  # a value below one still shows its leading '0'
+        self.emit(Label(integer_done))
+        fraction(lambda: _binary("sub", IntLoad(scale), IntLoad(count)))
+        self.emit(Jump(after))
+        self.emit(Label(exponential))
+        put(
+            _binary(
+                "add",
+                byte_at(
+                    _binary(
+                        "add", digits, _binary("sub", IntLoad(length), IntConstant(1))
+                    )
+                ),
+                IntConstant(48),
+            )
+        )
+        fraction(
+            lambda: _binary(
+                "sub",
+                _binary("sub", IntLoad(length), IntConstant(1)),
+                IntLoad(count),
+            )
+        )
+        self.emit(Label(after))
+
+        if kind == "g":
+            # Drop the trailing zeros, and the point when nothing follows it.
+            # There is always a digit before the point, so this cannot run off
+            # the front of the buffer.
+            kept = label("kept")
+            unless(IntCompare("gt", IntLoad(figures), IntConstant(0)), kept)
+            zeros = at("zeros")
+            zeros_end = label("zeros_end")
+            unless(
+                IntCompare(
+                    "eq",
+                    byte_at(
+                        _binary(
+                            "add", text, _binary("sub", IntLoad(written), IntConstant(1))
+                        )
+                    ),
+                    IntConstant(48),
+                ),
+                zeros_end,
+            )
+            store(written, _binary("sub", IntLoad(written), IntConstant(1)))
+            self.emit(Jump(zeros))
+            self.emit(Label(zeros_end))
+            point = label("point")
+            unless(
+                IntCompare(
+                    "eq",
+                    byte_at(
+                        _binary(
+                            "add", text, _binary("sub", IntLoad(written), IntConstant(1))
+                        )
+                    ),
+                    IntConstant(0x2E),
+                ),
+                point,
+            )
+            store(written, _binary("sub", IntLoad(written), IntConstant(1)))
+            self.emit(Label(point))
+            self.emit(Label(kept))
+
+        # The exponent suffix, on the exponential form only. C requires at
+        # least two digits, and a double never needs more than three.
+        plain = label("plain")
+        unless(IntLoad(form), plain)
+        put(IntConstant(0x45 if upper else 0x65))  # 'E' / 'e'
+        above = label("above")
+        signed_done = label("exponent_signed")
+        unless(
+            IntCompare("lt", IntLoad(decimal_exponent), IntConstant(0)), above
+        )
+        put(IntConstant(0x2D))  # '-'
+        store(count, IntUnary("neg", IntLoad(decimal_exponent)))
+        self.emit(Jump(signed_done))
+        self.emit(Label(above))
+        put(IntConstant(0x2B))  # '+'
+        store(count, IntLoad(decimal_exponent))
+        self.emit(Label(signed_done))
+        two_digits = label("two_digits")
+        unless(IntCompare("ge", IntLoad(count), IntConstant(100)), two_digits)
+        put(
+            _binary(
+                "add",
+                IntBinary("udiv", IntLoad(count), IntConstant(100)),
+                IntConstant(48),
+            )
+        )
+        store(count, IntBinary("umod", IntLoad(count), IntConstant(100)))
+        self.emit(Label(two_digits))
+        put(
+            _binary(
+                "add",
+                IntBinary("udiv", IntLoad(count), IntConstant(10)),
+                IntConstant(48),
+            )
+        )
+        put(
+            _binary(
+                "add",
+                IntBinary("umod", IntLoad(count), IntConstant(10)),
+                IntConstant(48),
+            )
+        )
+        self.emit(Label(plain))
+
+        self.emit(Label(emit_text))
+        self.emit(WriteRuntime(text, IntLoad(written)))
 
     def emit_character(self, expression: IntExpression) -> None:
         base = SlotAddress(self.print_buffer())

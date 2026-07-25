@@ -12,6 +12,7 @@ from __future__ import annotations
 import platform
 import random
 import re
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -878,6 +879,211 @@ int main(void) {
         )
 
 
+class FloatingPrintfTests(CProgramTestCase):
+    """%f, %e and %g, whose formatter py2bin emits itself.
+
+    The conversion is exact: every finite double is a finite decimal, and the
+    emitted code builds that decimal digit by digit rather than estimating it.
+    The expectations below are what C requires, and the widest of them --
+    printing 1e300 with no fraction -- is the 301-digit integer that double
+    exactly equals, which no approximate method could produce.
+    """
+
+    def test_the_default_fixed_conversion(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%f\\n", 1.5);
+    printf("%f\\n", 0.0);
+    printf("%f\\n", -0.0);
+    printf("%f\\n", -2.25);
+    printf("%f\\n", 100.0);
+    printf("%f\\n", 0.0001220703125);
+    return 0;
+}
+""",
+            stdout=(
+                "1.500000\n0.000000\n-0.000000\n-2.250000\n100.000000\n0.000122\n"
+            ),
+        )
+
+    def test_rounding_is_half_to_even_on_the_exact_value(self):
+        # 0.5, 1.5, 2.5 and 3.5 are all exact, so each is a genuine tie and the
+        # even neighbour wins. 0.05 is NOT exact -- the double is just above
+        # the tie -- so it rounds up, which an implementation that looked only
+        # at the printed digits would get wrong.
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%.0f %.0f %.0f %.0f\\n", 0.5, 1.5, 2.5, 3.5);
+    printf("%.0f %.0f\\n", -0.5, -1.5);
+    printf("%.1f %.1f\\n", 0.25, 0.75);
+    printf("%.1f\\n", 0.05);
+    printf("%.2f\\n", 3.14159);
+    return 0;
+}
+""",
+            stdout="0 2 2 4\n-0 -2\n0.2 0.8\n0.1\n3.14\n",
+        )
+
+    def test_the_digits_printed_are_the_digits_the_double_has(self):
+        # 0.1 is 0.1000000000000000055511151231257827021181583404541015625, and
+        # 1e300 is an integer of 301 digits. These are the exact values, so a
+        # correct formatter prints exactly this and nothing else can.
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%.20f\\n", 0.1);
+    printf("%.17g\\n", 0.1);
+    printf("%f\\n", 1e20);
+    printf("%.0f\\n", 1e300);
+    return 0;
+}
+""",
+            stdout=(
+                "0.10000000000000000555\n"
+                "0.10000000000000001\n"
+                "100000000000000000000.000000\n"
+                "1000000000000000052504760255204420248704468581108159154915854115"
+                "5118024579889081957863713750804478640437044438328838781769425232"
+                "3536043057564479218478670698284838720092657580373783023379478809"
+                "0059368953234970799945081119038967640880074652742780142494579258"
+                "788820056842838115669472196386865459400540160\n"
+            ),
+        )
+
+    def test_the_exponential_conversion(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%e\\n", 1.5);
+    printf("%e\\n", 0.0);
+    printf("%E\\n", 0.000123);
+    printf("%.3e\\n", 1234.5678);
+    printf("%.0e\\n", 9.5);
+    printf("%.1e\\n", 9.95);
+    printf("%e\\n", 1e300);
+    printf("%e\\n", 5e-324);
+    return 0;
+}
+""",
+            # 9.5 with one significant digit is a tie that rounds to the even
+            # 10, so the exponent grows. 9.95 is not exactly 9.95: the double
+            # is just below it, so two significant digits give 9.9, not 10.
+            stdout=(
+                "1.500000e+00\n"
+                "0.000000e+00\n"
+                "1.230000E-04\n"
+                "1.235e+03\n"
+                "1e+01\n"
+                "9.9e+00\n"
+                "1.000000e+300\n"
+                "4.940656e-324\n"
+            ),
+        )
+
+    def test_the_general_conversion_picks_a_shape_and_trims(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    printf("%g\\n", 100000.0);
+    printf("%g\\n", 1000000.0);
+    printf("%g\\n", 0.0001);
+    printf("%g\\n", 0.00001);
+    printf("%g\\n", 1.5);
+    printf("%g\\n", 0.0);
+    printf("%g\\n", 123456.0);
+    printf("%g\\n", 1234567.0);
+    printf("%.3g\\n", 1234.0);
+    printf("%.1g\\n", 0.0);
+    printf("%G\\n", 0.000001);
+    return 0;
+}
+""",
+            stdout=(
+                "100000\n1e+06\n0.0001\n1e-05\n1.5\n0\n123456\n1.23457e+06\n"
+                "1.23e+03\n0\n1E-06\n"
+            ),
+        )
+
+    def test_infinities_and_nans_print_as_words(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    double zero = 0.0;
+    printf("%f %f\\n", 1.0 / zero, -1.0 / zero);
+    printf("%e %g\\n", 1.0 / zero, 1.0 / zero);
+    printf("%f\\n", zero / zero);
+    printf("%E %G %F\\n", 1.0 / zero, 1.0 / zero, zero / zero);
+    return 0;
+}
+""",
+            stdout="inf -inf\ninf inf\nnan\nINF INF NAN\n",
+        )
+
+    def test_a_float_argument_is_widened_to_the_double_printf_reads(self):
+        self.run_c(
+            _STDIO
+            + """
+int main(void) {
+    float f = 0.1f;
+    printf("%.9f\\n", f);
+    printf("%.9f\\n", 0.1);
+    return 0;
+}
+""",
+            # The float holds 0.100000001490116119384765625; the double holds
+            # 0.1000000000000000055511151231257827.
+            stdout="0.100000001\n0.100000000\n",
+        )
+
+    def test_a_floating_conversion_evaluates_its_argument_once(self):
+        self.run_c(
+            _STDIO
+            + """
+double tick(int *n) { *n = *n + 1; return 1.5; }
+int main(void) {
+    int calls = 0;
+    printf("%f %f\\n", tick(&calls), tick(&calls));
+    printf("%d\\n", calls);
+    return 0;
+}
+""",
+            stdout="1.500000 1.500000\n2\n",
+        )
+
+    def test_what_printf_still_refuses(self):
+        self.reject(
+            'int main(void) { printf("%5.2f", 1.0); return 0; }\n',
+            "flags and field widths",
+        )
+        self.reject(
+            'int main(void) { printf("%.200f", 1.0); return 0; }\n',
+            "beyond the 120",
+        )
+        self.reject(
+            'int main(void) { printf("%Lf", 1.0); return 0; }\n', "long double"
+        )
+        self.reject(
+            'int main(void) { printf("%.3d", 1); return 0; }\n',
+            "precision on %d is not implemented",
+        )
+        self.reject(
+            'int main(void) { printf("%f", 1); return 0; }\n',
+            "needs a floating value",
+        )
+        self.reject(
+            'int main(void) { double d = 1.0; printf("%d", d); return 0; }\n',
+            "needs an integer",
+        )
+
+
 class EvaluatedOnceTests(CProgramTestCase):
     """The recurring defect here is a value written once, lowered twice.
 
@@ -1083,12 +1289,12 @@ int main(void) {
 
     def test_unimplemented_conversions_are_named_not_guessed(self):
         self.reject(
-            _STDIO + 'int main(void) { printf("%f\\n", 1); return 0; }\n',
+            _STDIO + 'int main(void) { printf("%a\\n", 1.0); return 0; }\n',
             "is not implemented",
         )
         self.reject(
             _STDIO + 'int main(void) { printf("%5d\\n", 1); return 0; }\n',
-            "is not implemented",
+            "field widths are not implemented",
         )
         self.reject(
             _STDIO + 'int main(void) { printf("%d %d\\n", 1); return 0; }\n',
@@ -1798,6 +2004,81 @@ class DifferentialTests(CProgramTestCase):
                     f"  {' '.join(declaration.strip() for declaration in declarations)}\n"
                     f"  got {actual}, C requires {want}"
                 )
+
+
+class FloatingDifferentialTests(CProgramTestCase):
+    """py2bin's floating formatter against a second correctly-rounded one.
+
+    CPython formats a double by computing its exact decimal value and rounding
+    half to even, which is what C11 7.21.6.1p13 recommends and what py2bin
+    emits code to do. It is an INDEPENDENT implementation -- David Gay's dtoa,
+    not the algorithm here -- so agreeing with it on hundreds of cases,
+    including random bit patterns, both extremes and the smallest subnormal, is
+    real evidence rather than a restatement of this compiler's own arithmetic.
+
+    Each batch is its own program because the formatter is emitted once per
+    conversion, and a single translation unit with hundreds of them outgrows
+    the ARM64 literal-addressing range.
+    """
+
+    _FORMATS = (
+        "%f", "%.0f", "%.1f", "%.3f", "%.15f",
+        "%e", "%.0e", "%.3e", "%.15e",
+        "%g", "%.1g", "%.3g", "%.10g", "%.17g",
+        "%E", "%G",
+    )
+
+    def _values(self) -> list[float]:
+        chosen = [
+            0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 2.5, 3.5, 0.1, 0.25, 100.0,
+            1e-5, 1e-4, 123456.0, 1234567.0, 9.5, 9.95, 0.0001220703125,
+            3.141592653589793, 1e20, 1e-20, 1e300, 1e-300, 0.000123456,
+            1023.9999999999999, -12345.678, 1e16, 0.5 ** 52, 1234.5678,
+            5e-324,  # the smallest subnormal: 751 digits of exact expansion
+            1.7976931348623157e308,  # the largest finite double
+            2.2250738585072014e-308,  # the smallest normal
+        ]
+        generator = random.Random(20260726)
+        for _ in range(12):
+            pattern = generator.getrandbits(64)
+            value = struct.unpack("<d", struct.pack("<Q", pattern))[0]
+            if value == value and abs(value) != float("inf"):
+                chosen.append(value)
+        return chosen
+
+    def test_every_conversion_matches_a_correctly_rounded_reference(self):
+        values = self._values()
+        for start in range(0, len(values), 2):
+            batch = values[start : start + 2]
+            lines = []
+            expected = []
+            for value in batch:
+                # float.hex() is exact, so the C source names the same double
+                # the reference formatted -- no decimal round trip in between.
+                for form in self._FORMATS:
+                    lines.append(f'    printf("{form}\\n", {float.hex(value)});')
+                    expected.append(form % value)
+            source = (
+                _STDIO
+                + "int main(void) {\n"
+                + "\n".join(lines)
+                + "\n    return 0;\n}\n"
+            )
+            with self.subTest(values=[float.hex(value) for value in batch]):
+                artifact = self.build(source)
+                if not _HOST_IS_DARWIN_ARM64:
+                    continue
+                got = subprocess.run(
+                    [str(artifact)], capture_output=True, text=True
+                ).stdout.splitlines()
+                self.assertEqual(len(got), len(expected))
+                for index, (actual, want) in enumerate(zip(got, expected)):
+                    if actual != want:
+                        self.fail(
+                            f"{lines[index].strip()}\n"
+                            f"  got {actual!r}, a correctly rounded C printf "
+                            f"gives {want!r}"
+                        )
 
 
 class EncoderTests(unittest.TestCase):
