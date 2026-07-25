@@ -1070,6 +1070,22 @@ int main(void) {
             ),
         )
 
+    def test_the_widest_output_still_fits_the_frame_buffer(self):
+        # The largest finite double with the largest precision py2bin accepts:
+        # 309 integer digits, a sign, a point and 120 fraction digits. This is
+        # what sizes the output buffer, so it is the case that would overrun.
+        widest = float.hex(1.7976931348623157e308)
+        self.run_c(
+            _STDIO
+            + "int main(void) {\n"
+            + f'    printf("%.120f\\n", -{widest});\n'
+            + '    printf("%.120f\\n", 0x0.0000000000001p-1022);\n'
+            + "    return 0;\n}\n",
+            stdout=(
+                "%.120f\n" % -1.7976931348623157e308 + "%.120f\n" % 5e-324
+            ),
+        )
+
     def test_the_formatter_is_emitted_once_per_body_not_once_per_conversion(self):
         one = compile_c_to_ir(
             _STDIO + 'int main(void) { printf("%f", 1.0); return 0; }\n',

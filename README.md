@@ -33,9 +33,9 @@ It has seven deliberately separate execution paths. They must not be confused:
    and remainder, `if`/`while`/`do`/`for`/`switch`/`goto`, functions called
    through a real machine call ABI on ARM64 (**recursion works** — direct,
    deep, and mutual), and `printf`. It is not a general C, Cython-C, C++,
-   NumPy C-API, ATen, or CUDA compiler: floating point, structs, unions, enums,
-   typedefs, function pointers, more than eight arguments, and the preprocessor
-   are rejected with a file:line:column error rather than approximated. `compile-via-c` is the
+   NumPy C-API, ATen, or CUDA compiler: `long double`, function pointers, more
+   than eight arguments, and the preprocessor are rejected with a
+   file:line:column error rather than approximated. `compile-via-c` is the
    older, narrower bridge that round-trips py2bin's *own* generated C.
 7. **CPython C-API embedding (`darwin-arm64` only):** the same handwritten C
    frontend also accepts calls to a fixed, vetted list of exported CPython
@@ -707,6 +707,18 @@ integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
   sign/zero extension on assignment, cast, and narrow-typed arithmetic;
 - local arrays (including multi-dimensional), `&x`, `*p`, `a[i]`, pointer
   arithmetic and pointer difference, with loads and stores at the real widths;
+- `float` and `double`: decimal and hexadecimal floating constants,
+  arithmetic, IEEE comparisons (every ordering is false when an operand is a
+  NaN), the usual arithmetic conversions across the integer/floating boundary,
+  and conversions and casts in both directions. A `float` object really
+  occupies four bytes, so `sizeof`, array striding, and struct offsets are what
+  C requires. Every floating expression is **evaluated** in double precision
+  and rounded to `float` only where C says the extra precision must go —
+  assignment, cast, argument passing, and return — which is
+  `FLT_EVAL_METHOD == 1` (C11 6.3.1.8p2). A floating argument or result crosses
+  a call as its IEEE bit pattern in an integer register; that calling
+  convention is py2bin's own and never meets a platform C function.
+  `long double` is rejected rather than quietly aliased to `double`;
 - casts between integer types, between pointer types, and across the two, and
   `sizeof` for every complete type;
 - `++`/`--` (prefix and postfix), `?:`, short-circuit `&&`/`||`, the comma
@@ -719,13 +731,18 @@ integer `%lld` values, plus `extern` prototypes for the vetted adapter ABI and
   frames), and mutual. On the targets whose encoder has no call ABI yet
   (both x86-64 targets and `windows-arm64`) a call is still **inlined** at its
   site and recursion is rejected there with a file:line:column error;
-- `printf` with real runtime formatting (`%d %i %u %x %X %c %s %%` with
-  `h`/`hh`/`l`/`ll`/`z`).
+- `printf` with real runtime formatting (`%d %i %u %x %X %c %s %f %F %e %E
+  %g %G %%` with `h`/`hh`/`l`/`ll`/`z`, and a precision up to 120 on the
+  floating conversions). The floating conversions are **exact**, not
+  approximate: every finite double is a finite decimal, and the emitted code
+  builds that decimal digit by digit and then rounds the digits half to even,
+  so `printf("%.0f", 1e300)` produces the whole 301-digit integer that double
+  equals. Flags and field widths are rejected by name rather than ignored.
 
 py2bin's C is LP64 on all six targets and gives plain `char` the signed
 meaning Apple and x86 give it, so one source file produces the same values
 everywhere. It rejects — with a file:line:column error, never an
-approximation — floating point, `struct`, `union`, `enum`, `typedef`, function
+approximation — `long double`, function
 pointers, variadic user functions, file-scope variables, functions with more
 than eight parameters (py2bin passes arguments only in registers), recursion on
 the targets with no call ABI, the preprocessor beyond a few ignorable
@@ -1064,9 +1081,9 @@ C source is an optional readable intermediate, not machine code. `emit-c`
 stops at C text. `compile-via-c` proves and compiles only the documented
 canonical integer intersection by parsing that text with py2bin itself;
 `compile-c` runs py2bin's own C compiler over the wider integer-and-pointer
-language described above. C that needs floating point, aggregates, or the
-preprocessor still needs an external C implementation, which py2bin never
-invokes silently. Strict native compilation always ends in py2bin IR and
+language described above. C that needs the preprocessor, function pointers, or
+file-scope variables still needs an external C implementation, which py2bin
+never invokes silently. Strict native compilation always ends in py2bin IR and
 handwritten target instructions.
 
 HTML and CSS remain declarative data, and browser JavaScript remains code for a

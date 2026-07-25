@@ -82,7 +82,7 @@ project's own native implementation and still runs through embedded CPython.
 |---|---|---:|
 | Closed program that must never fall back to CPython | `aot-plan`, then `aot-build` | No |
 | Static constants, printing, integer exit | `compile` | No |
-| C in py2bin's integer/pointer language | `compile-c` | No |
+| C in py2bin's integer, floating-point and pointer language | `compile-c` | No |
 | C, or `py2bin.cabi` Python, calling the vetted CPython C-API | `compile-c` or `compile`, `--target darwin-arm64` | Yes — the artifact dyld-links the build host's CPython |
 | Supported integer Python with an inspectable C intermediate | `compile-via-c` | No |
 | Supported typed Python subset | `emit-c` | C source only |
@@ -281,8 +281,8 @@ implementations. SVG/HTML/JavaScript output would be embedded asset data, not
 host CPU instructions.
 
 py2bin's C compiler is a separate frontend and does not accept the NumPy
-C-API, ATen, CUDA, or renderer implementations: those need floating point,
-struct layouts, and the preprocessor, all of which it rejects rather than
+C-API, ATen, CUDA, or renderer implementations: those need the preprocessor,
+function pointers, and file-scope data, all of which it rejects rather than
 approximates. Compiling that C would still require a complete C implementation;
 py2bin's does not solve those compatibility layers.
 
@@ -356,9 +356,11 @@ conversions, local arrays, `&x`/`*p`/`a[i]` and pointer arithmetic, casts,
 `sizeof`, `++`/`--`, the comma operator, `/` and `%`, `do`/`while`,
 `switch`/`case` with fallthrough, `goto`, functions (called through a real
 AAPCS64 call ABI on the ARM64 targets, so recursion works; inlined elsewhere),
-and `printf` with runtime formatting. C needing floating point, aggregates,
-function pointers, more than eight arguments, or the preprocessor still
-requires a conventional compiler and linker; py2bin does not secretly invoke
+`float`/`double` arithmetic with C's conversions, structs and unions, and
+`printf` with runtime formatting including the exact `%f`/`%e`/`%g`
+conversions. C needing `long double`, function pointers, more than eight
+arguments, or the preprocessor still requires a conventional compiler and
+linker; py2bin does not secretly invoke
 GCC or Clang.
 
 Compatible bundles already preserve web content as files inside their
