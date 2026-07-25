@@ -243,6 +243,12 @@ def _module_uses_extern(module: Module) -> bool:
 #: a ``Function`` rather than emit a binary that cannot make the call.
 CALL_CAPABLE_TARGETS = frozenset({"darwin-arm64", "linux-arm64"})
 
+#: Targets whose encoder establishes the module's static storage block (see
+#: ``Module.static_bytes``). It is a kernel-supplied anonymous mapping whose
+#: base lives in a reserved callee-saved register for the whole run, and only
+#: the ARM64 syscall encoders set that register up.
+STATIC_CAPABLE_TARGETS = frozenset({"darwin-arm64", "linux-arm64"})
+
 
 def _emit_native_module(
     entry: Path,
@@ -261,6 +267,14 @@ def _emit_native_module(
             ast.parse("pass").body[0],
             f"function calls (and therefore recursion) are only supported for "
             f"targets {', '.join(sorted(CALL_CAPABLE_TARGETS))} so far, not "
+            f"{target!r}",
+        )
+    if module.static_bytes and target not in STATIC_CAPABLE_TARGETS:
+        raise NativeCompileError(
+            entry,
+            ast.parse("pass").body[0],
+            f"static storage (C file-scope variables) is only supported for "
+            f"targets {', '.join(sorted(STATIC_CAPABLE_TARGETS))} so far, not "
             f"{target!r}",
         )
     if target != "darwin-arm64" and _module_uses_extern(module):

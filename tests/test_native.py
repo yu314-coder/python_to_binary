@@ -875,3 +875,126 @@ class Arm64CallAbiTests(unittest.TestCase):
                             target=target,
                             clean=True,
                         )
+
+
+class Arm64StaticStorageTests(unittest.TestCase):
+    """``Module.static_bytes`` and ``GlobalAddress`` at the encoder level.
+
+    Static storage is what a C file-scope variable needs: one object that
+    outlives every stack frame and that the entry point and every ``Function``
+    body reach identically. The block is an anonymous mapping whose base sits
+    in X28 for the whole run.
+    """
+
+    @staticmethod
+    def _module():
+        from py2bin.native.ir import (
+            Call,
+            ExitValue,
+            Function,
+            FunctionAddress,
+            GlobalAddress,
+            HeapLoad,
+            HeapStore,
+            IndirectCall,
+            IntBinary,
+            IntLoad,
+            Return,
+            Store,
+        )
+
+        bump = Function(
+            "bump",
+            0,
+            1,
+            [
+                HeapStore(
+                    GlobalAddress(0),
+                    IntBinary(
+                        "add", HeapLoad(GlobalAddress(0), 8, True), IntConstant(100)
+                    ),
+                    8,
+                ),
+                Return(IntConstant(0)),
+            ],
+        )
+        return Module(
+            [
+                HeapStore(GlobalAddress(0), IntConstant(23), 8),
+                Store(0, Call("bump", ())),
+                Store(1, FunctionAddress("bump")),
+                Store(2, IndirectCall(IntLoad(1), ())),
+                ExitValue(HeapLoad(GlobalAddress(0), 8, True)),
+            ],
+            4,
+            [bump],
+            static_bytes=4096,
+        )
+
+    def test_the_entry_prologue_maps_the_block_and_keeps_it_in_x28(self):
+        code = encode_darwin_arm64(self._module(), 0x100004000)
+        words = list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
+        # mov x28, x0 establishes the base exactly once, in the entry prologue.
+        self.assertEqual(words.count(0xAA0003FC), 1)
+        # add x0, x28, #0 is how a GlobalAddress(0) is materialized.
+        self.assertIn(0x91000380, words)
+        # Nothing else ever writes X28, so the base survives every call.
+        for word in words:
+            destination = word & 0x1F
+            if destination == 28:
+                self.assertEqual(word, 0xAA0003FC)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and platform.machine() == "arm64",
+        "runs the produced arm64 Mach-O natively",
+    )
+    def test_the_entry_point_and_a_function_share_one_static_object(self):
+        from py2bin.native.formats.macho import write_macho_arm64
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "static.bin"
+            artifact.write_bytes(
+                write_macho_arm64(encode_darwin_arm64(self._module(), 0x100004000))
+            )
+            artifact.chmod(0o755)
+            # 23, then +100 through a direct call, then +100 through a call made
+            # via the function's address held in a stack slot.
+            self.assertEqual(subprocess.run([str(artifact)]).returncode, 223)
+
+    def test_targets_without_a_static_base_reject_the_module(self):
+        for target in (
+            "windows-arm64",
+            "windows-x86_64",
+            "linux-x86_64",
+            "darwin-x86_64",
+        ):
+            with self.subTest(target=target):
+                from py2bin.native.ir import ExitValue, GlobalAddress, HeapLoad
+
+                # No Function, so this reaches the static-storage check rather
+                # than the call-ABI one that precedes it.
+                module = Module(
+                    [ExitValue(HeapLoad(GlobalAddress(0), 8, True))],
+                    0,
+                    static_bytes=4096,
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaisesRegex(
+                        NativeCompileError, "static storage .*only supported"
+                    ):
+                        compile_native_module(
+                            Path("static.py"),
+                            module,
+                            Path(directory) / "static.bin",
+                            target=target,
+                            clean=True,
+                        )
+
+    def test_the_address_of_an_undefined_function_is_refused(self):
+        from py2bin.native.ir import ExitValue, FunctionAddress, Store
+
+        module = Module(
+            [Store(0, FunctionAddress("missing")), ExitValue(IntConstant(0))], 1
+        )
+        with self.assertRaisesRegex(ValueError, "undefined native IR function"):
+            encode_darwin_arm64(module, 0x100004000)

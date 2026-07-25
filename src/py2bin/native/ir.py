@@ -30,6 +30,21 @@ class SlotAddress:
 
 
 @dataclass(frozen=True, slots=True)
+class GlobalAddress:
+    """The runtime address of byte ``offset`` of the module's static storage.
+
+    ``Module.static_bytes`` reserves one contiguous, zero-filled, readable and
+    writable block that outlives every stack frame, which is exactly what an
+    object with static storage duration -- a C file-scope variable -- needs. It
+    is addressed relative to a base register the entry point establishes once,
+    so a ``Function`` reaches the same object as the entry point does even
+    though the two run on different frames.
+    """
+
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
 class IntUnary:
     operator: str
     operand: "IntExpression"
@@ -243,10 +258,39 @@ class Call:
     arguments: tuple["IntExpression", ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class FunctionAddress:
+    """The runtime entry address of module-level function ``name``.
+
+    This is what a C function designator decays to. The value is genuinely
+    position-independent: a backend computes it relative to the program counter
+    so the image may still be slid by the loader.
+    """
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IndirectCall:
+    """Call whatever ``target`` evaluates to; the value is its i64 return.
+
+    ``target`` is an ordinary integer expression holding a code address --
+    normally a ``FunctionAddress`` that has been through memory. The ABI is the
+    same one ``Call`` uses, which is what makes the two interchangeable at a
+    call site. The target is evaluated BEFORE the arguments and pinned, so a
+    target expression with a side effect happens exactly once.
+    """
+
+    target: "IntExpression"
+    arguments: tuple["IntExpression", ...] = ()
+
+
 IntExpression = (
     IntConstant
     | IntLoad
     | SlotAddress
+    | GlobalAddress
+    | FunctionAddress
     | IntUnary
     | IntBinary
     | IntCompare
@@ -257,6 +301,7 @@ IntExpression = (
     | CStringConstant
     | ExternCall
     | Call
+    | IndirectCall
 )
 FloatExpression = (
     FloatConstant | FloatLoad | FloatUnary | FloatBinary | IntToFloat | BitsFloat
@@ -413,3 +458,7 @@ class Module:
     # Callable bodies referenced by ``Call``. The module's own ``operations``
     # remain the entry point; these are laid out after it in the same section.
     functions: list[Function] = field(default_factory=list)
+    # Bytes of static storage the module needs. The block is established once,
+    # before the first operation runs, and starts out entirely zero; every
+    # reference to it is a ``GlobalAddress``. Zero means the module has none.
+    static_bytes: int = 0

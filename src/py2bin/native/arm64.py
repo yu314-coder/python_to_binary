@@ -20,6 +20,8 @@ from .ir import (
     FloatToInt,
     FloatUnary,
     Function,
+    FunctionAddress,
+    GlobalAddress,
     HeapAlloc,
     HeapInit,
     HeapLoad,
@@ -27,6 +29,7 @@ from .ir import (
     IntBinary,
     IntCompare,
     IntConstant,
+    IndirectCall,
     IntExpression,
     IntLoad,
     IntToFloat,
@@ -130,6 +133,27 @@ def _frame_add(amount: int) -> list[int]:
     return words
 
 
+#: The register that holds the base of the module's static storage block for
+#: the whole run. X28 is callee-saved in AAPCS64 and this backend never writes
+#: it anywhere else, so a value established once in the entry prologue is still
+#: there inside every function body and after every external (libSystem) call.
+#: That is what lets a C file-scope variable be one object shared by the entry
+#: point and every function, none of which share a stack frame.
+_STATIC_BASE = 28
+
+
+def _static_address(offset: int) -> list[int]:
+    """Place the address of static byte ``offset`` in X0."""
+
+    if offset < 0:
+        raise ValueError("a static-storage offset cannot be negative")
+    if offset <= 0xFFF:
+        # add x0, x28, #offset
+        return [0x91000000 | (offset << 10) | (_STATIC_BASE << 5)]
+    # mov x0, #offset; add x0, x28, x0
+    return [*_mov(0, offset), 0x8B000000 | (_STATIC_BASE << 5)]
+
+
 def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> int:
     offset = slot_base + slot * 8
     if offset < 0 or offset > 0x7FF8 or offset & 7:
@@ -215,12 +239,15 @@ class _Refs:
     for each ``adrp x16``/``ldr x16``/``blr x16`` GOT call site so the Mach-O
     writer can point it at the bound symbol pointer. ``calls`` records
     ``(word_index, function name)`` for each internal ``bl``, patched with the
-    real displacement once every body's offset in ``.text`` is known.
+    real displacement once every body's offset in ``.text`` is known; and
+    ``addresses`` records ``(word_index, function name)`` for each ``adr x0``
+    that materializes a function's entry address, patched the same way.
     """
 
     strings: list[tuple[int, bytes, int]] = field(default_factory=list)
     externs: list[tuple[int, str]] = field(default_factory=list)
     calls: list[tuple[int, str]] = field(default_factory=list)
+    addresses: list[tuple[int, str]] = field(default_factory=list)
 
 
 def _external_call(
@@ -297,6 +324,43 @@ def _internal_call(
     words.append(0)  # bl <function> (patched once every body offset is known)
 
 
+def _indirect_call(
+    words: list[int], expression: "IndirectCall", slot_base: int, refs: "_Refs | None"
+) -> None:
+    """Emit an AAPCS64 call through a computed address.
+
+    The only difference from :func:`_internal_call` is where the target comes
+    from. It is evaluated FIRST and spilled below the arguments, so a target
+    expression is evaluated exactly once and before them, and so nothing an
+    argument computes can clobber it. It is then popped into X16 (the
+    intra-procedure scratch register, which no argument occupies) immediately
+    before the ``blr``.
+    """
+
+    if refs is None:
+        raise ValueError(
+            "ARM64 indirect calls are not supported by this encoder; the "
+            "call-capable encoders are encode_darwin/encode_darwin_extern and "
+            "encode_linux"
+        )
+    if len(expression.arguments) > ARM64_ARGUMENT_REGISTERS:
+        raise ValueError(
+            f"ARM64 indirect calls pass at most {ARM64_ARGUMENT_REGISTERS} "
+            "arguments in registers"
+        )
+    _expression(words, expression.target, slot_base, refs)  # target -> x0
+    words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+    for argument in expression.arguments:
+        _expression(words, argument, slot_base, refs)  # arg -> x0
+        words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+    for index in reversed(range(len(expression.arguments))):
+        words.append(0xF94003E0 | index)  # ldr x{index}, [sp]
+        words.append(0x910043FF)  # add sp, sp, #16
+    words.append(0xF94003F0)  # ldr x16, [sp]
+    words.append(0x910043FF)  # add sp, sp, #16
+    words.append(0xD63F0200)  # blr x16
+
+
 def _expression(
     words: list[int],
     expression: IntExpression,
@@ -314,6 +378,28 @@ def _expression(
     if isinstance(expression, SlotAddress):
         words.extend(_slot_address(expression.slot, slot_base))
         return
+    if isinstance(expression, GlobalAddress):
+        if refs is None:
+            # Only the encoders that run _emit_static_block establish X28, and
+            # addressing static storage through a register nothing set would
+            # store through whatever the loader happened to leave there.
+            raise ValueError(
+                "ARM64 static storage is not supported by this encoder; the "
+                "encoders that establish the static base are encode_darwin/"
+                "encode_darwin_extern and encode_linux"
+            )
+        words.extend(_static_address(expression.offset))
+        return
+    if isinstance(expression, FunctionAddress):
+        if refs is None:
+            raise ValueError(
+                "ARM64 function addresses are not supported by this encoder; the "
+                "call-capable encoders are encode_darwin/encode_darwin_extern "
+                "and encode_linux"
+            )
+        refs.addresses.append((len(words), expression.name))
+        words.append(0)  # adr x0, <function> (patched with the body's offset)
+        return
     if isinstance(expression, CStringConstant):
         if refs is None:
             raise TypeError(
@@ -328,6 +414,9 @@ def _expression(
         return
     if isinstance(expression, Call):
         _internal_call(words, expression, slot_base, refs)
+        return
+    if isinstance(expression, IndirectCall):
+        _indirect_call(words, expression, slot_base, refs)
         return
     if isinstance(expression, IntUnary):
         _expression(words, expression.operand, slot_base, refs)
@@ -556,6 +645,11 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
     if module.functions:
         raise ValueError(
             "internal function calls are not supported for windows-arm64 yet"
+        )
+    if module.static_bytes:
+        raise ValueError(
+            "static storage (C file-scope variables) is not supported for "
+            "windows-arm64 yet; it needs VirtualAlloc in the PE import table"
         )
     slot_base = 16
     words: list[int] = [
@@ -819,6 +913,45 @@ def _emit_function(
     words.append(0xD65F03C0)  # ret
 
 
+def _emit_static_block(words: list[int], size: int, system: _Syscalls) -> None:
+    """Establish the module's static storage block in X28, or exit.
+
+    The block is a single anonymous read-write mapping, so it is zero-filled by
+    the kernel -- which is exactly the initial value C gives an object with
+    static storage duration and no initializer -- and it outlives every stack
+    frame. Its address goes in X28 and stays there for the whole run.
+
+    The mapping is checked rather than assumed. A failed ``mmap`` returns a
+    small errno on Darwin and a negative ``-errno`` on Linux, and both readings
+    are rejected here: writing a global through a base of 12 would be a wild
+    store, and this compiler exits instead of running on wrongly.
+    """
+
+    if size <= 0:
+        return
+    words.extend(_mov(0, 0))  # addr: let the kernel choose
+    words.extend(_mov(1, size))  # length
+    words.extend(_mov(2, 3))  # PROT_READ | PROT_WRITE
+    words.extend(_mov(3, system.mmap_flags))
+    words.extend(_mov(4, (-1) & 0xFFFFFFFFFFFFFFFF))  # fd
+    words.extend(_mov(5, 0))  # offset
+    words.extend(_mov(system.register, system.mmap_number))
+    words.append(system.svc)
+    failure = [
+        *_mov(0, 71),  # EX_OSERR: the mapping this image needs was refused
+        *_mov(system.register, system.exit_number),
+        system.svc,
+    ]
+    # cmp x0, #0 / b.le failure -- catches Linux's negative -errno.
+    words.append(0xF100001F)
+    words.append(0x5400000D | ((3 & 0x7FFFF) << 5))  # b.le +3 words
+    # cmp x0, #1, lsl #12 / b.hs ok -- catches Darwin's small positive errno.
+    words.append(0xF140041F)
+    words.append(0x54000002 | (((len(failure) + 1) & 0x7FFFF) << 5))  # b.hs ok
+    words.extend(failure)
+    words.append(0xAA0003E0 | _STATIC_BASE)  # mov x28, x0
+
+
 def _encode(
     module: Module,
     code_address: int,
@@ -837,6 +970,7 @@ def _encode(
     system = _Syscalls(write_number, exit_number, mmap_number, mmap_flags, svc)
     words: list[int] = list(_frame_sub(_frame_bytes(module.stack_slots)))
     words.append(0x910003FD)  # mov x29, sp
+    _emit_static_block(words, module.static_bytes, system)
     refs = _Refs()
     _emit_operations(words, module.operations, 0, refs, system, in_function=False)
     offsets: dict[str, int] = {}
@@ -852,6 +986,15 @@ def _encode(
         if not -(1 << 25) <= distance < (1 << 25):
             raise ValueError("ARM64 call is outside branch range")
         words[instruction_index] = 0x94000000 | (distance & 0x3FFFFFF)
+    for instruction_index, name in refs.addresses:
+        if name not in offsets:
+            raise ValueError(
+                f"address taken of undefined native IR function {name!r}"
+            )
+        # ADR is PC-relative in BYTES, so the image may still be slid.
+        words[instruction_index] = _adr(
+            0, (offsets[name] - instruction_index) * 4
+        )
     externs = [(index * 4, symbol) for index, symbol in refs.externs]
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
     for instruction_index, data, register in refs.strings:

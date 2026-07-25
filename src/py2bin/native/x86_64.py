@@ -325,6 +325,11 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
             "internal function calls (and therefore recursion) are not "
             "implemented for x86-64 yet; the ARM64 backend implements them"
         )
+    if module.static_bytes:
+        raise ValueError(
+            "static storage (C file-scope variables) is not implemented for "
+            "x86-64 yet; the ARM64 backend implements it"
+        )
     if platform == "linux":
         write_number, exit_number = 1, 60
         mmap_number, mmap_flags = 9, 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
@@ -431,6 +436,11 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         raise ValueError(
             "internal function calls (and therefore recursion) are not "
             "implemented for x86-64 yet; the ARM64 backend implements them"
+        )
+    if module.static_bytes:
+        raise ValueError(
+            "static storage (C file-scope variables) is not implemented for "
+            "x86-64 yet; the ARM64 backend implements it"
         )
     variable_base = 0x38
     code = bytearray(_sub_stack(_frame_bytes(module.stack_slots, variable_base)))
