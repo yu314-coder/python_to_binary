@@ -1610,13 +1610,13 @@ class RejectionTests(CProgramTestCase):
         self.reject("int f(void) { return 1; }\n", "no int main")
         self.reject("void main(void) { }\n", "int main\\(void\\)")
 
-    def test_function_pointers_and_variadic_definitions_are_refused(self):
-        self.reject(
-            "int main(void) { int (*f)(void); return 0; }\n", "function pointer"
-        )
+    def test_variadic_definitions_are_refused(self):
         self.reject(
             "int f(int a, ...) { return a; }\nint main(void) { return f(1); }\n",
             "variadic",
+        )
+        self.reject(
+            "int main(void) { int (*f)(int, ...); return 0; }\n", "variadic"
         )
 
     def test_a_frame_larger_than_the_native_one_is_refused(self):
@@ -3220,3 +3220,335 @@ int main(void) {
 """,
             stdout="1 8 9\n",
         )
+
+
+class FunctionPointerTests(CProgramTestCase):
+    """C function designators, function-pointer types, and indirect calls.
+
+    Every expectation is derived from the standard by hand. The programs that
+    matter most are the ones where the CALLEE is chosen by an expression with a
+    side effect: C evaluates the called expression exactly once, and a backend
+    that re-emitted it would call twice.
+    """
+
+    def test_a_pointer_calls_the_function_it_was_given(self):
+        self.run_c(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int main(void) {
+    int (*p)(int, int);
+    p = add;
+    printf("%d\\n", p(3, 4));
+    p = sub;
+    printf("%d\\n", p(3, 4));
+    return 0;
+}
+""",
+            stdout="7\n-1\n",
+        )
+
+    def test_a_designator_and_its_address_are_the_same_pointer(self):
+        # C11 6.3.2.1p4: a function designator decays to a pointer, and 6.5.3.2
+        # makes &f that same pointer. *fp is the function again, which decays
+        # straight back -- so all of these are one call.
+        self.run_c(
+            _STDIO
+            + """
+int twice(int n) { return n + n; }
+int main(void) {
+    int (*a)(int) = twice;
+    int (*b)(int) = &twice;
+    printf("%d %d %d %d %d\\n", a(1), b(2), (*a)(3), (**a)(4), (****b)(5));
+    printf("%d\\n", a == b);
+    return 0;
+}
+""",
+            stdout="2 4 6 8 10\n1\n",
+        )
+
+    def test_a_function_pointer_is_a_parameter_like_any_other(self):
+        self.run_c(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
+int apply(int (*op)(int, int), int a, int b) { return op(a, b); }
+int main(void) {
+    printf("%d %d\\n", apply(add, 6, 7), apply(mul, 6, 7));
+    return 0;
+}
+""",
+            stdout="13 42\n",
+        )
+
+    def test_a_table_of_function_pointers_in_static_storage(self):
+        self.run_c(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int mul(int a, int b) { return a * b; }
+typedef int (*binop)(int, int);
+binop table[3] = {add, sub, mul};
+int main(void) {
+    int i;
+    for (i = 0; i < 3; i++) { printf("%d ", table[i](8, 2)); }
+    printf("\\n%d\\n", (int)sizeof(table));
+    return 0;
+}
+""",
+            stdout="10 6 16 \n24\n",
+        )
+
+    def test_the_called_expression_is_evaluated_exactly_once(self):
+        # This is the defect class this backend has produced most often: a value
+        # written once being lowered twice. Here the side effect is counted.
+        self.run_c(
+            _STDIO
+            + """
+int probes;
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+typedef int (*binop)(int, int);
+binop table[2] = {add, sub};
+int probe(void) { probes = probes + 1; return 1; }
+binop fetch(void) { probes = probes + 10; return add; }
+int main(void) {
+    printf("%d %d\\n", table[probe()](50, 8), probes);
+    printf("%d %d\\n", fetch()(3, 4), probes);
+    return 0;
+}
+""",
+            stdout="42 1\n7 11\n",
+        )
+
+    def test_exactly_one_indirect_branch_is_emitted_per_call_site(self):
+        # Counting side effects catches a repeated call; counting the branches
+        # in the machine code catches a repeated call the test happened not to
+        # observe. Three source-level indirect calls, three `blr`s.
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("needs a darwin-arm64 host to disassemble")
+        artifact = self.build(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+int spin(int n) { return n; }
+typedef int (*binop)(int, int);
+binop table[1] = {add};
+int chase(int n) { if (n <= 0) { return 0; } return 1 + table[0](0, spin(n - 1)); }
+int main(void) {
+    int (*p)(int, int) = add;
+    printf("%d %d\\n", p(1, 2), table[0](3, 4));
+    printf("%d\\n", chase(2));
+    return 0;
+}
+"""
+        )
+        listing = subprocess.run(
+            ["otool", "-tvV", str(artifact)], capture_output=True, text=True
+        ).stdout
+        self.assertEqual(len(re.findall(r"\bblr\b", listing)), 3)
+
+    def test_a_function_pointer_member_and_a_void_result(self):
+        self.run_c(
+            _STDIO
+            + """
+int total;
+struct ops { int (*op)(int, int); char tag; };
+int add(int a, int b) { return a + b; }
+void bump(int n) { total = total + n; }
+int main(void) {
+    struct ops o;
+    void (*v)(int);
+    o.op = add;
+    o.tag = 'A';
+    printf("%d %c %d\\n", o.op(4, 5), o.tag, (int)sizeof(o));
+    v = bump;
+    v(7);
+    v(3);
+    printf("%d\\n", total);
+    return 0;
+}
+""",
+            # struct ops is a pointer (8, alignment 8) then a char, padded to 16.
+            stdout="9 A 16\n10\n",
+        )
+
+    def test_recursion_through_a_function_pointer(self):
+        self.run_c(
+            _STDIO
+            + """
+typedef int (*counter)(int);
+counter self;
+int countdown(int n) {
+    if (n <= 0) { return 0; }
+    return 1 + self(n - 1);
+}
+int main(void) {
+    self = countdown;
+    printf("%d\\n", self(7));
+    return 0;
+}
+""",
+            stdout="7\n",
+        )
+
+    def test_a_function_pointer_carries_floating_arguments_and_results(self):
+        self.run_c(
+            _STDIO
+            + """
+double scale(double x, float k) { return x * k; }
+int main(void) {
+    double (*f)(double, float);
+    f = scale;
+    printf("%g\\n", f(2.5, 4.0f));
+    return 0;
+}
+""",
+            stdout="10\n",
+        )
+
+    def test_a_function_returning_a_function_pointer(self):
+        self.run_c(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+typedef int (*binop)(int, int);
+binop chooser(int k) { return add; }
+int main(void) {
+    binop (*maker)(int) = chooser;
+    printf("%d %d\\n", maker(0)(2, 3), chooser(1)(10, 1));
+    return 0;
+}
+""",
+            stdout="5 11\n",
+        )
+
+    def test_a_cast_names_a_function_pointer_type(self):
+        self.run_c(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+int main(void) {
+    printf("%d\\n", ((int (*)(int, int))add)(9, 9));
+    return 0;
+}
+""",
+            stdout="18\n",
+        )
+
+    def test_a_declarator_nests_as_c_says_it_does(self):
+        # int *(*f)(char *) is a pointer to a function returning int *, and
+        # int (*ops[2])(void) is an array of 2 pointers to functions.
+        self.run_c(
+            _STDIO
+            + """
+int cell = 41;
+int *bump(char *ignored) { cell = cell + 1; return &cell; }
+int one(void) { return 1; }
+int two(void) { return 2; }
+int main(void) {
+    int *(*f)(char *) = bump;
+    int (*ops[2])(void);
+    ops[0] = one;
+    ops[1] = two;
+    printf("%d %d %d\\n", *f(0), ops[0]() + ops[1](), (int)sizeof(ops));
+    return 0;
+}
+""",
+            stdout="42 3 16\n",
+        )
+
+
+class FunctionPointerRejectionTests(CProgramTestCase):
+    """What py2bin refuses about function pointers, and why."""
+
+    def test_an_incompatible_function_pointer_needs_a_cast(self):
+        self.reject(
+            "int add(int a, int b) { return a + b; }\n"
+            "int main(void) { int (*p)(int) = add; return 0; }\n",
+            "explicit cast between incompatible pointer types",
+        )
+        # C11 6.3.2.3 converts void * to and from a pointer to an OBJECT only.
+        self.reject(
+            "int add(int a, int b) { return a + b; }\n"
+            "int main(void) { void *v = add; return 0; }\n",
+            "explicit cast between incompatible pointer types",
+        )
+
+    def test_the_argument_count_of_the_pointers_prototype_is_checked(self):
+        self.reject(
+            "int add(int a, int b) { return a + b; }\n"
+            "int main(void) { int (*p)(int, int) = add; return p(1); }\n",
+            r"takes 2 argument\(s\), got 1",
+        )
+
+    def test_only_a_function_or_a_pointer_to_one_can_be_called(self):
+        self.reject(
+            "int main(void) { int n = 1; return n(1); }\n",
+            "needs a function or a pointer to one",
+        )
+
+    def test_an_unprototyped_function_type_is_refused(self):
+        # C's empty () means the parameters are UNSPECIFIED, so a call through
+        # such a pointer cannot be checked at all.
+        self.reject(
+            "int add(int a, int b) { return a + b; }\n"
+            "int main(void) { int (*p)() = add; return 0; }\n",
+            "must state its parameter types",
+        )
+
+    def test_sizeof_a_function_is_refused(self):
+        self.reject(
+            "int f(void) { return 1; }\n"
+            "int main(void) { return (int)sizeof(f); }\n",
+            "sizeof to a function",
+        )
+
+    def test_the_address_of_main_is_refused(self):
+        self.reject(
+            "int main(void) { int (*p)(void) = main; return 0; }\n",
+            "process entry point",
+        )
+
+    def test_a_function_declared_but_never_defined_has_no_address(self):
+        self.reject(
+            "int later(void);\n"
+            "int main(void) { int (*p)(void) = later; return 0; }\n",
+            "declared but never defined",
+        )
+
+    def test_a_function_declaration_inside_a_block_is_refused(self):
+        self.reject(
+            "int main(void) { int f(void); return f(); }\n",
+            "function inside a block",
+        )
+
+    def test_a_nested_function_declarator_is_refused(self):
+        self.reject(
+            "int add(int a, int b) { return a + b; }\n"
+            "int (*chooser(int k))(int, int) { return add; }\n"
+            "int main(void) { return 0; }\n",
+            "plain declarator form",
+        )
+
+    def test_types_c_does_not_have_are_refused(self):
+        self.reject(
+            "int table[2](void);\nint main(void) { return 0; }\n",
+            "an array of int .void. is not a type C has",
+        )
+        self.reject(
+            "int (*f(void))[3];\nint main(void) { return 0; }\n",
+            "plain declarator form|cannot return",
+        )
+
+    def test_a_function_pointer_needs_a_target_with_a_real_call_abi(self):
+        source = (
+            "int add(int a, int b) { return a + b; }\n"
+            "int main(void) { int (*p)(int, int) = add; return p(1, 2); }\n"
+        )
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(source, "reject.c", "darwin-x86_64")
+        self.assertRegex(str(caught.exception), "call ABI is not implemented")

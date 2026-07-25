@@ -46,6 +46,13 @@ What is implemented
   deep, and mutual. On the remaining targets the call ABI is not implemented,
   so a call is still inlined at its site and recursion is rejected there rather
   than miscompiled;
+* function pointers, on the same targets: C's real declarator grammar, so
+  ``int (*p)(int)``, ``int (*ops[3])(void)`` and ``int *(*f)(char *)`` all read
+  the way C says they do; a function designator decaying to a pointer; ``&f``;
+  ``(*p)(x)``; casts naming a function-pointer type; and a genuine indirect
+  machine call. The called expression is evaluated exactly once and BEFORE the
+  arguments. A function type must state its parameters -- C's empty ``()``
+  leaves them unspecified, and py2bin will not emit a call it cannot check;
 * file-scope objects -- objects with static storage duration -- on the targets
   whose encoder establishes the static block (see ``STATIC_CAPABLE_TARGETS``).
   They live in one contiguous zero-filled block that outlives every frame, so
@@ -59,13 +66,15 @@ What is implemented
 
 What is rejected
 ----------------
-``long double``, function pointers, variadic user functions, ``static`` inside
-a block, ``extern`` objects (py2bin compiles one translation unit and has no
-linker), a braced initializer for a file-scope struct or union, the
-preprocessor beyond a handful of ignorable ``#include``s, more than eight
-arguments to a function (py2bin passes arguments only in registers), and
-recursion or file-scope objects on the targets that have no call ABI or static
-block yet.
+``long double``, variadic user functions and variadic function types, a
+function type with an unspecified ``()`` parameter list, a function whose own
+declarator is not the plain ``TYPE *... name(params)`` (write a typedef for the
+result type), ``static`` inside a block, ``extern`` objects (py2bin compiles one
+translation unit and has no linker), a braced initializer for a file-scope
+struct or union, the preprocessor beyond a handful of ignorable ``#include``s,
+more than eight arguments to a function (py2bin passes arguments only in
+registers), and recursion, function pointers or file-scope objects on the
+targets that have no call ABI or static block yet.
 """
 
 from __future__ import annotations
@@ -577,6 +586,12 @@ class PointerType:
     target: "CType"
 
     def __str__(self) -> str:
+        if isinstance(self.target, FunctionType):
+            # C writes a pointer to a function with the star inside the
+            # parentheses, and a diagnostic that says 'int (*)(int)' is one a
+            # reader can paste straight back into the program.
+            inside = ", ".join(str(item) for item in self.target.parameters) or "void"
+            return f"{self.target.result} (*)({inside})"
         return f"{self.target} *"
 
 
@@ -587,6 +602,25 @@ class ArrayType:
 
     def __str__(self) -> str:
         return f"{self.element}[{'' if self.count is None else self.count}]"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FunctionType:
+    """A function type: what ``f`` names, and what a function pointer points at.
+
+    C never lets a value have this type -- a function designator immediately
+    becomes a pointer to the function everywhere but ``sizeof`` and ``&`` -- so
+    it has no size and no alignment here either. ``parameters`` is the full
+    prototype: py2bin does not accept the unprototyped ``()`` form in a function
+    type, because the calls it would then have to emit could not be checked.
+    """
+
+    result: "CType"
+    parameters: tuple["CType", ...]
+
+    def __str__(self) -> str:
+        inside = ", ".join(str(item) for item in self.parameters) or "void"
+        return f"{self.result} ({inside})"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -623,6 +657,35 @@ class StructType:
     def __str__(self) -> str:
         keyword = "union" if self.is_union else "struct"
         return f"{keyword} {self.name}" if self.name else keyword
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Hole:
+    """A placeholder for the type an enclosing declarator has not built yet.
+
+    ``int (*p)(void)`` is parsed inside-out: ``*p`` is read first, against a
+    hole, and the ``(void)`` that follows the closing parenthesis is then
+    substituted into it by :func:`_fill`. ``key`` keeps nested holes distinct.
+    """
+
+    key: int
+
+    def __str__(self) -> str:  # pragma: no cover - only reachable on a bug
+        return "?"
+
+
+def _fill(ctype: "CType", hole: _Hole, actual: "CType") -> "CType":
+    """Replace ``hole`` inside ``ctype`` with ``actual``."""
+
+    if ctype == hole:
+        return actual
+    if isinstance(ctype, PointerType):
+        return PointerType(_fill(ctype.target, hole, actual))
+    if isinstance(ctype, ArrayType):
+        return ArrayType(_fill(ctype.element, hole, actual), ctype.count)
+    if isinstance(ctype, FunctionType):
+        return FunctionType(_fill(ctype.result, hole, actual), ctype.parameters)
+    return ctype
 
 
 def align_of(ctype: "CType") -> int:
@@ -685,6 +748,7 @@ CType = (
     | FloatingType
     | PointerType
     | ArrayType
+    | FunctionType
     | OpaqueType
     | StructType
 )
@@ -889,6 +953,13 @@ def compatible(left: CType, right: CType) -> bool:
     if left == right:
         return True
     if isinstance(left, PointerType) and isinstance(right, PointerType):
+        # C11 6.3.2.3 converts between void * and a pointer to an OBJECT only.
+        # A pointer to a function is not one, and the standard gives no
+        # conversion at all in either direction, so it needs an explicit cast.
+        if isinstance(left.target, FunctionType) or isinstance(
+            right.target, FunctionType
+        ):
+            return False
         if isinstance(left.target, VoidType) or isinstance(right.target, VoidType):
             return True
         return left.target == right.target
@@ -975,6 +1046,19 @@ class Comma(Node):
 @dataclasses.dataclass(slots=True)
 class Call(Node):
     name: str
+    arguments: list[Node]
+
+
+@dataclasses.dataclass(slots=True)
+class CallThrough(Node):
+    """``EXPR(args)`` where ``EXPR`` is not a bare name.
+
+    ``(*p)(1)``, ``ops[i](1)`` and ``s.op(1)`` all land here. A call written as
+    a bare name is a :class:`Call`, whose name may still turn out to name an
+    object of function-pointer type rather than a function.
+    """
+
+    target: Node
     arguments: list[Node]
 
 
@@ -1203,6 +1287,10 @@ class Parser:
         self.enum_tags: dict[str, CType] = {}
         self.enumerators: dict[str, int] = {}
         self.globals: dict[str, GlobalObject] = {}
+        # Set by declarator() to the token its name came from, so a caller that
+        # needs to point an error at the name does not have to guess.
+        self.declared_token: Token = self.tokens[0]
+        self.holes = 0
 
     # --- token helpers ---
 
@@ -1458,44 +1546,134 @@ class Parser:
     def declarator(
         self, base: CType, *, abstract: bool = False, optional: bool = False
     ) -> tuple[CType, str]:
-        """Parse ``*name[N]...`` and return the full type plus the name.
+        """Parse a full C declarator and return the type it builds, plus its name.
+
+        This is C's real declarator grammar, so ``int (*p)(int)``, ``int
+        (*ops[3])(void)`` and ``int *(*f)(char *)`` all read correctly: the
+        prefix ``*``s bind loosest, the postfix ``[]`` and ``()`` bind tighter
+        and apply left to right, and parentheses regroup. The inner declarator
+        is parsed against a hole and the outer type is substituted into it,
+        which is exactly what "declaration mirrors use" means.
 
         ``optional`` accepts either form, which is what a prototype's parameter
         list needs: ``int f(int, int *);`` names nothing, ``int f(int a);`` does.
+        ``self.declared_token`` is left holding the token the name came from, so
+        a caller can point an error at it.
         """
 
+        self.declared_token = self.token
         base = self.pointer_suffix(base)
-        if self.at("("):
-            self.error(
-                "function pointers and parenthesized declarators are not "
-                "implemented; py2bin's native IR has no indirect call"
-            )
+        if self.at("(") and self.at_nested_declarator():
+            self.take("(")
+            hole = _Hole(self.next_hole())
+            inner, name = self.declarator(hole, abstract=abstract, optional=optional)
+            self.take(")")
+            return _fill(inner, hole, self.declarator_suffix(base)), name
         name = ""
         if not abstract and not (optional and self.token.kind != "identifier"):
+            self.declared_token = self.token
             name = str(self.identifier().value)
-        if self.at("("):
-            self.error(
-                "function pointers and function declarators are not implemented"
-            )
-        return self.array_suffix(base), name
+        return self.declarator_suffix(base), name
 
-    def array_suffix(self, base: CType) -> CType:
-        """Apply a declarator's ``[N]`` suffixes, which nest left to right.
+    def next_hole(self) -> int:
+        self.holes += 1
+        return self.holes
 
-        ``int a[2][3]`` is an array of 2 arrays of 3 ints, so the LAST bracket
-        binds tightest and the list is applied in reverse.
+    def at_nested_declarator(self) -> bool:
+        """Whether the ``(`` here regroups a declarator rather than starting a
+        parameter list.
+
+        ``int (*p)(void)`` regroups; ``int (void)`` and ``int (int, char *)``
+        are parameter lists. The two are told apart by what follows the ``(``:
+        a ``*``, another ``(``, or a name that is not a type name can only
+        begin a declarator.
         """
 
-        dimensions: list[int | None] = []
-        while self.accept("["):
-            if self.accept("]"):
-                dimensions.append(None)
+        saved = self.index
+        self.index += 1
+        try:
+            if self.at("*") or self.at("("):
+                return True
+            if self.token.kind != "identifier" or self.token.value in _RESERVED:
+                return False
+            return not self.at_type()
+        finally:
+            self.index = saved
+
+    def declarator_suffix(self, base: CType) -> CType:
+        """Apply a declarator's postfix ``[N]`` and ``(params)`` groups.
+
+        They bind tighter than the prefix ``*``s and apply left to right, so
+        ``int a[2][3]`` is an array of 2 arrays of 3 ints and the list is
+        applied in reverse.
+        """
+
+        suffixes: list[tuple[str, object]] = []
+        while True:
+            if self.at("["):
+                token = self.take("[")
+                if self.accept("]"):
+                    suffixes.append(("array", None))
+                    continue
+                length = self.array_length()
+                self.take("]")
+                suffixes.append(("array", length))
+                del token
                 continue
-            dimensions.append(self.array_length())
-            self.take("]")
-        for length in reversed(dimensions):
-            base = ArrayType(base, length)
+            if self.at("("):
+                suffixes.append(("function", self.parameter_type_list()))
+                continue
+            break
+        for kind, payload in reversed(suffixes):
+            if kind == "array":
+                if isinstance(base, FunctionType):
+                    self.error(f"an array of {base} is not a type C has")
+                base = ArrayType(base, payload)  # type: ignore[arg-type]
+            else:
+                if isinstance(base, (ArrayType, FunctionType)):
+                    self.error(f"a function cannot return {base}")
+                base = FunctionType(base, payload)  # type: ignore[arg-type]
         return base
+
+    def parameter_type_list(self) -> tuple[CType, ...]:
+        """``(void)`` or ``(TYPE, TYPE, ...)`` in a function declarator."""
+
+        token = self.take("(")
+        if self.accept(")"):
+            self.error(
+                "a function type must state its parameter types; write '(void)' "
+                "for a function that takes none. C's empty '()' means the "
+                "parameters are UNSPECIFIED, and py2bin will not emit a call it "
+                "cannot check",
+                token,
+            )
+        if self.at("void") and self.peek().value == ")":
+            self.take("void")
+            self.take(")")
+            return ()
+        parameters: list[CType] = []
+        while True:
+            if self.at("..."):
+                self.error("a variadic function type is not implemented")
+            parameter, _name = self.declarator(self.type_specifier(), optional=True)
+            if isinstance(parameter, ArrayType):
+                # A parameter of array type is adjusted to a pointer, and one of
+                # function type to a pointer to the function (C11 6.7.6.3p7-8).
+                parameter = PointerType(parameter.element)
+            elif isinstance(parameter, FunctionType):
+                parameter = PointerType(parameter)
+            if isinstance(parameter, VoidType):
+                self.error("a parameter cannot have type void", token)
+            parameters.append(parameter)
+            if self.accept(")"):
+                break
+            self.take(",")
+        return tuple(parameters)
+
+    def array_suffix(self, base: CType) -> CType:
+        """The ``[N]`` part of a declarator whose name has already been taken."""
+
+        return self.declarator_suffix(base)
 
     def array_length(self) -> int:
         token = self.token
@@ -1505,15 +1683,15 @@ class Parser:
         return value
 
     def type_name(self) -> CType:
-        """A type in a cast or ``sizeof``: specifiers plus an abstract declarator."""
+        """A type in a cast or ``sizeof``: specifiers plus an abstract declarator.
 
-        base = self.type_specifier()
-        base = self.pointer_suffix(base)
-        while self.accept("["):
-            length = self.array_length()
-            self.take("]")
-            base = ArrayType(base, length)
-        return base
+        The abstract declarator is the ordinary one with the name left out, so
+        ``int (*)(int)`` -- the type a cast to a function pointer names -- reads
+        through exactly the same code that reads ``int (*p)(int)``.
+        """
+
+        ctype, _name = self.declarator(self.type_specifier(), abstract=True)
+        return ctype
 
     # --- expressions ---
 
@@ -1608,11 +1786,17 @@ class Parser:
                     token, node, str(member_token.value), token.value == "->"
                 )
                 continue
-            if False:
-                self.error(
-                    "struct and union member access is not implemented; py2bin's "
-                    "C compiler models no aggregate layouts"
-                )
+            if self.at("("):
+                self.take("(")
+                arguments: list[Node] = []
+                if not self.accept(")"):
+                    while True:
+                        arguments.append(self.assignment_expression())
+                        if self.accept(")"):
+                            break
+                        self.take(",")
+                node = CallThrough(token, node, arguments)
+                continue
             return node
 
     def primary_expression(self) -> Node:
@@ -1866,40 +2050,72 @@ class Parser:
     def external_declaration(self) -> None:
         """One file-scope declaration: a function, or an object.
 
-        The two are told apart by what follows the declarator's name: a ``(``
-        begins a parameter list and anything else begins an object. ``static``
-        is accepted and ignored here -- it limits linkage, and a single
-        translation unit with no linker has no linkage to limit.
+        A plain ``TYPE *... name (`` is a function declaration or definition and
+        keeps its own path, because that path also needs the parameter NAMES.
+        Everything else -- including ``int (*handler)(int);``, whose declarator
+        also contains a parameter list -- is an object. ``static`` is accepted
+        and ignored here: it limits linkage, and a single translation unit with
+        no linker has no linkage to limit.
         """
 
         if self.token.kind == "identifier" and self.token.value == "static":
             self.take()
         base = self.type_specifier()
-        declared = self.pointer_suffix(base)
-        name_token = self.identifier()
-        if self.at("("):
+        if self.at_function_declarator():
+            declared = self.pointer_suffix(base)
+            name_token = self.identifier()
             self.function_definition(declared, name_token)
             return
-        self.object_declaration(base, declared, name_token)
+        self.object_declaration(base)
 
-    def object_declaration(
-        self, base: CType, declared: CType, name_token: Token
-    ) -> None:
+    def at_function_declarator(self) -> bool:
+        """Whether what follows is ``*``... ``name`` ``(`` -- a function, not an
+        object. ``int (*p)(void)`` fails this test at its very first token."""
+
+        index = self.index
+        while index < len(self.tokens):
+            token = self.tokens[index]
+            if token.value == "*" or (
+                token.kind == "identifier" and token.value in _QUALIFIERS
+            ):
+                index += 1
+                continue
+            break
+        if index + 1 >= len(self.tokens):
+            return False
+        name = self.tokens[index]
+        if name.kind != "identifier" or name.value in _RESERVED:
+            return False
+        return self.tokens[index + 1].value == "("
+
+    def object_declaration(self, base: CType) -> None:
         """``TYPE name[= init], *other, third[3];`` at file scope."""
 
         while True:
-            ctype = self.array_suffix(declared)
+            ctype, name = self.declarator(base)
+            name_token = self.declared_token
+            if not name:
+                self.error("a file-scope declaration needs a name", name_token)
+            if isinstance(ctype, FunctionType):
+                # `int (*f(int))(int)` -- a function whose own declarator is not
+                # simply `TYPE *... name(params)`. The parameter NAMES are what
+                # a definition needs, and this shape does not deliver them here.
+                self.error(
+                    f"{name!r} is declared as a function here, and py2bin only "
+                    "implements the plain declarator form 'TYPE *... name"
+                    "(params)'. Give the result type a typedef and write "
+                    f"'<typedef> {name}(params)'",
+                    name_token,
+                )
             initializer: object = None
             if self.accept("="):
                 initializer = self.initializer()
-            self.declare_global(GlobalObject(
-                str(name_token.value), ctype, initializer, name_token
-            ))
+            self.declare_global(
+                GlobalObject(name, ctype, initializer, name_token)
+            )
             if self.accept(";"):
                 return
             self.take(",")
-            declared = self.pointer_suffix(base)
-            name_token = self.identifier()
 
     def declare_global(self, entry: GlobalObject) -> None:
         if entry.name in self.functions or entry.name in self.externs:
@@ -2574,6 +2790,13 @@ class Lowerer:
         scope = self.scopes[-1]
         if name in scope:
             self.error(f"{name!r} is already declared in this scope", token)
+        if isinstance(ctype, FunctionType):
+            self.error(
+                f"{name!r} is declared as a function inside a block; py2bin "
+                "accepts a function declaration only at file scope. Write "
+                f"'{ctype.result} (*{name})(...)' for a pointer to a function",
+                token,
+            )
         size = size_of(ctype)
         if size is None:
             self.error(
@@ -2747,6 +2970,10 @@ class Lowerer:
         if isinstance(ctype, ArrayType):
             # An array used as a value decays to a pointer to its first element.
             return Value(PointerType(ctype.element), address)
+        if isinstance(ctype, FunctionType):
+            # A function designator used as a value decays to a pointer to the
+            # function (C11 6.3.2.1p4); its "address" already IS that pointer.
+            return Value(PointerType(ctype), address)
         if isinstance(ctype, StructType):
             # A struct value is carried as the address of the object. Only
             # assignment, member access and & consume one, and each of those
@@ -2767,6 +2994,11 @@ class Lowerer:
             if local is None:
                 if node.name == "NULL":
                     self.error("the null pointer constant is not an lvalue", node.token)
+                if node.name in self.unit.functions:
+                    # A function designator. It is not an lvalue in C either,
+                    # but '&' and a call both want exactly this pair, and every
+                    # other use goes through load(), which decays it.
+                    return self.function_designator(node.name, node.token)
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
@@ -2778,6 +3010,11 @@ class Lowerer:
                     f"cannot dereference a value of type {pointer.ctype}", node.token
                 )
             target = pointer.ctype.target
+            if isinstance(target, FunctionType):
+                # *fp is the function itself, which decays straight back to the
+                # pointer -- which is why (*fp)(x) and fp(x) are the same call,
+                # and why **fp is still legal C.
+                return target, pointer.expr
             if size_of(target) is None:
                 self.error(
                     f"cannot dereference {pointer.ctype}: {target} is an incomplete "
@@ -2899,6 +3136,9 @@ class Lowerer:
                     return Value(PointerType(VOID), IntConstant(0), null=True)
                 if node.name in self.enumerators:
                     return Value(INT, IntConstant(self.enumerators[node.name]))
+                if node.name in self.unit.functions:
+                    ctype, address = self.function_designator(node.name, node.token)
+                    return self.load(ctype, address)
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
@@ -2934,6 +3174,8 @@ class Lowerer:
             return Value(ULONG, IntConstant(self.sizeof_expression(node.operand)))
         if isinstance(node, Call):
             return self.call(node)
+        if isinstance(node, CallThrough):
+            return self.call_through(node.target, node.arguments, node.token)
         self.error("unsupported expression", node.token)
 
     def discard(self, node: Node) -> None:
@@ -2961,6 +3203,15 @@ class Lowerer:
                         f"sizeof({node.name}) needs a complete type", node.token
                     )
                 return size
+            if node.name in self.unit.functions:
+                # C11 6.5.3.4p1: sizeof may not be applied to a function type.
+                # Without this the designator would decay and quietly answer 8.
+                self.error(
+                    f"sizeof({node.name}) applies sizeof to a function, which C "
+                    f"does not define; write sizeof(&{node.name}) for the size "
+                    "of a pointer to it",
+                    node.token,
+                )
         saved_operations = self.operations
         saved_slots = self.stack_slots
         self.operations = []
@@ -3426,11 +3677,62 @@ class Lowerer:
 
     # --- calls ---
 
+    def function_designator(
+        self, name: str, token: Token
+    ) -> tuple[CType, IntExpression]:
+        """The type and the runtime entry address of the function ``name``.
+
+        Naming a function without calling it is what makes a function pointer,
+        so this is also where the body is lowered: nothing else would have
+        pulled it into the module, and the address of a body that was never
+        emitted would point at whatever followed it.
+        """
+
+        function = self.unit.functions[name]
+        if not self.calls_are_real:
+            self.error(
+                f"taking the address of {name!r} needs a real machine call, and "
+                f"the call ABI is not implemented for target {self.target!r}; "
+                "the compiler inlines calls there instead",
+                token,
+            )
+        if function.body is None:
+            self.error(
+                f"{name!r} is declared but never defined, so it has no address; "
+                "py2bin has no linker, and every function a program uses has to "
+                "be defined in this translation unit",
+                token,
+            )
+        if name == "main":
+            self.error(
+                "main() is the process entry point and its 'return' exits the "
+                "process, so py2bin does not let a program take its address",
+                token,
+            )
+        if len(function.parameters) > _MAXIMUM_ARGUMENTS:
+            self.error(
+                f"{name}() takes {len(function.parameters)} parameters; py2bin's "
+                f"call ABI passes at most {_MAXIMUM_ARGUMENTS} arguments in "
+                "registers and does not implement stack arguments",
+                token,
+            )
+        self.lower_callee(function)
+        ctype = FunctionType(
+            function.result, tuple(item for item, _name in function.parameters)
+        )
+        return ctype, FunctionAddress(name)
+
     def call(self, node: Call) -> Value:
         if node.name == "printf":
             self.error(
                 "printf's return value is not implemented; call it as a statement",
                 node.token,
+            )
+        if self.lookup(node.name) is not None:
+            # An object of function-pointer type shadows any function of the
+            # same name, exactly as C's scoping says it does.
+            return self.call_through(
+                Identifier(node.token, node.name), node.arguments, node.token
             )
         if node.name in self.unit.externs:
             return self.extern_call(node, discarded=False)
@@ -3457,6 +3759,71 @@ class Lowerer:
         if self.calls_are_real:
             return self.direct_call(function, node)
         return self.inline(function, node)
+
+    # --- calls through a pointer -------------------------------------------
+    #
+    # The callee is not known until the program runs, so there is nothing to
+    # inline and nothing to check at the call site beyond the POINTER's own
+    # prototype -- which is precisely why C makes the prototype part of the
+    # type. A target that is not a pointer to a function is rejected here.
+
+    def call_through(
+        self, target: Node, arguments: list[Node], token: Token
+    ) -> Value:
+        pointer = self.rvalue(target)
+        ctype = pointer.ctype
+        if not (
+            isinstance(ctype, PointerType) and isinstance(ctype.target, FunctionType)
+        ):
+            self.error(
+                f"this call needs a function or a pointer to one, not {ctype}",
+                token,
+            )
+        signature = ctype.target
+        if not self.calls_are_real:
+            self.error(
+                "a call through a function pointer needs a real machine call, "
+                f"and the call ABI is not implemented for target {self.target!r}",
+                token,
+            )
+        if len(signature.parameters) > _MAXIMUM_ARGUMENTS:
+            self.error(
+                f"{signature} takes {len(signature.parameters)} parameters; "
+                f"py2bin's call ABI passes at most {_MAXIMUM_ARGUMENTS} arguments "
+                "in registers and does not implement stack arguments",
+                token,
+            )
+        if len(arguments) != len(signature.parameters):
+            self.error(
+                f"a call through {ctype} takes {len(signature.parameters)} "
+                f"argument(s), got {len(arguments)}",
+                token,
+            )
+        # The pointer is evaluated first and pinned. Lowering an argument may
+        # emit stores, and re-emitting the target expression after them would
+        # both repeat any call inside it and let it read the wrong memory.
+        address = self.materialize(pointer.expr)
+        prepared = [
+            self.stored_bits(
+                self.assign_convert(
+                    self.rvalue(argument),
+                    parameter,
+                    argument.token,
+                    f"argument {position} of a call through {ctype}",
+                ),
+                parameter,
+            )
+            for position, (argument, parameter) in enumerate(
+                zip(arguments, signature.parameters), 1
+            )
+        ]
+        slot = self.new_temp()
+        self.emit(Store(slot, IndirectCall(address, tuple(prepared))))
+        if isinstance(signature.result, VoidType):
+            return Value(VOID, IntConstant(0))
+        return Value(
+            signature.result, self.from_bits(IntLoad(slot), signature.result)
+        )
 
     def extern_call(self, node: Call, *, discarded: bool) -> Value:
         name = node.name
