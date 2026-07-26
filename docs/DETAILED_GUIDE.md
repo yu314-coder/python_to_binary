@@ -184,6 +184,27 @@ runtime:
   because float rendering hands back scratch the next float would overwrite.
   Conversions (`!r`, `!s`, `!a`) and format specifiers are rejected; a width or
   precision needs a formatter beyond `str()`;
+- a slice of a runtime list or string (`xs[a:b]`, `s[a:b]`) builds a new one.
+  Bounds clamp rather than raise, negative bounds count from the end, and a
+  start past the stop yields nothing - Python's rules, which is why slicing and
+  indexing are separate operations here rather than one with a flag. String
+  bounds count code points, so they are resolved to byte offsets before
+  anything is copied. A step other than one is rejected;
+- `for name in <list>:` walks a runtime list by index, and a list
+  comprehension (`[expr for name in it]`, optionally with one `if`) builds one,
+  over a range or another list. The result is sized from the source rather than
+  from how many items survive the condition, and the real count is written into
+  the header at the end: over-reserving costs arena space that is never
+  reclaimed anyway, and counting first would mean running the source twice. The
+  comprehension's name is private, as Python 3's own scope makes it, so an
+  outer variable of the same name keeps both its value and its slot;
+- a list whose length is not known at build time - a slice or a comprehension -
+  gets a run-time bounds check even for a constant index, since there is
+  nothing to prove the index against at build time;
+- on `arm64`, a function has room for 4095 stack slots (the reach of a
+  frame-pointer load). Each pinned value takes one and a slice takes a dozen or
+  more, so a function with hundreds of slices is refused with a message saying
+  so, rather than miscompiled;
 - a `bool` prints as `True` or `False`. It lives in an integer slot, which is
   right for arithmetic and wrong for printing, and nothing tells the two apart
   at run time - so which names hold one is tracked from the source, and a name

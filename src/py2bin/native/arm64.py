@@ -157,7 +157,14 @@ def _static_address(offset: int) -> list[int]:
 def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> int:
     offset = slot_base + slot * 8
     if offset < 0 or offset > 0x7FF8 or offset & 7:
-        raise ValueError("ARM64 native variable is outside stack-slot range")
+        # LDR/STR reach 32760 bytes from the frame pointer, so a function has
+        # room for 4095 slots. Every expression that has to be pinned takes
+        # one, and slices and comprehensions take a dozen or more each.
+        raise ValueError(
+            f"ARM64 stack slot at offset {offset} is beyond the {0x7FF8}-byte "
+            "reach of a frame-pointer load; this function needs more than the "
+            "4095 slots the encoding allows, so split it into smaller ones"
+        )
     # ldr/str x<rt>, [x29, #offset]. Rn=x29 (0x1D) is encoded in bits [9:5].
     base = 0xF9400000 if load else 0xF9000000
     return base | ((offset // 8) << 10) | (29 << 5) | rt

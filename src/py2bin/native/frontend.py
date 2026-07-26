@@ -2277,13 +2277,253 @@ class Frontend:
             )
         return self.list_tag(annotation.slice.id)
 
+    # --- slicing ------------------------------------------------------------
+    #
+    # Python slices never raise: a bound past either end is pulled back to it,
+    # a negative one counts from the end, and a start past the stop yields
+    # nothing. So the arithmetic below clamps rather than checks, which is what
+    # makes indexing (which does raise) and slicing (which does not) different
+    # operations here rather than one with a flag.
+
+    def slice_bound(
+        self,
+        value: ast.expr | None,
+        length: IntExpression,
+        default: IntExpression,
+    ) -> IntExpression:
+        if value is None:
+            return default
+        bound = self.materialize_int(self.integer(value))
+        adjusted = self.materialize_int(
+            self.select_integer(
+                IntCompare("lt", bound, IntConstant(0)),
+                IntBinary("add", bound, length),
+                bound,
+            )
+        )
+        return self.materialize_int(
+            self.select_integer(
+                IntCompare("lt", adjusted, IntConstant(0)),
+                IntConstant(0),
+                self.select_integer(
+                    IntCompare("gt", adjusted, length), length, adjusted
+                ),
+            )
+        )
+
+    def slice_bounds(
+        self, node: ast.Slice, length: IntExpression
+    ) -> tuple[IntExpression, IntExpression]:
+        if node.step is not None:
+            try:
+                step = self.constant(node.step)
+            except NativeCompileError:
+                step = None
+            if step != 1:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a native slice steps by one; another step would have to "
+                    "walk the source backwards or skip through it",
+                )
+        lower = self.slice_bound(node.lower, length, IntConstant(0))
+        upper = self.slice_bound(node.upper, length, length)
+        # A start past the stop is an empty slice, not a negative length.
+        upper = self.materialize_int(
+            self.select_integer(IntCompare("lt", upper, lower), lower, upper)
+        )
+        return lower, upper
+
+    def emit_list_slice(
+        self, source: IntExpression, node: ast.Slice
+    ) -> IntExpression:
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, source))
+        origin = IntLoad(source_slot)
+        length = self.materialize_int(HeapLoad(origin, 8))
+        lower, upper = self.slice_bounds(node, length)
+        count_slot = self.new_temp()
+        self.operations.append(
+            Store(count_slot, IntBinary("sub", upper, lower))
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                result_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(8),
+                    IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, IntLoad(count_slot), 8))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("slice_copy")
+        end = self.new_label("slice_copy_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(count_slot)), end
+            )
+        )
+        offset = IntBinary("mul", IntLoad(index_slot), IntConstant(8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntBinary("add", result, IntConstant(8)), offset),
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        IntBinary("add", origin, IntConstant(8)),
+                        IntBinary(
+                            "add",
+                            IntBinary("mul", lower, IntConstant(8)),
+                            offset,
+                        ),
+                    ),
+                    8,
+                ),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return result
+
+    def emit_codepoint_offset(
+        self, pointer: IntExpression, count: IntExpression
+    ) -> IntExpression:
+        """The byte offset of the ``count``-th code point of a UTF-8 block."""
+
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, pointer))
+        base = IntLoad(pointer_slot)
+        bytes_slot = self.new_temp()
+        self.operations.append(Store(bytes_slot, HeapLoad(base, 8)))
+        wanted_slot = self.new_temp()
+        self.operations.append(Store(wanted_slot, count))
+        offset_slot = self.new_temp()
+        self.operations.append(Store(offset_slot, IntConstant(0)))
+        seen_slot = self.new_temp()
+        self.operations.append(Store(seen_slot, IntConstant(0)))
+        start = self.new_label("cp_walk")
+        end = self.new_label("cp_walk_end")
+        inner = self.new_label("cp_tail")
+        inner_end = self.new_label("cp_tail_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(seen_slot), IntLoad(wanted_slot)), end
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(offset_slot), IntLoad(bytes_slot)), end
+            )
+        )
+        self.operations.append(
+            Store(offset_slot, IntBinary("add", IntLoad(offset_slot), IntConstant(1)))
+        )
+        # Continuation bytes belong to the code point just stepped over.
+        self.operations.append(Label(inner))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(offset_slot), IntLoad(bytes_slot)), inner_end
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    IntBinary(
+                        "and",
+                        HeapLoad(
+                            IntBinary(
+                                "add",
+                                IntBinary("add", base, IntConstant(8)),
+                                IntLoad(offset_slot),
+                            ),
+                            1,
+                        ),
+                        IntConstant(0xC0),
+                    ),
+                    IntConstant(0x80),
+                ),
+                inner_end,
+            )
+        )
+        self.operations.append(
+            Store(offset_slot, IntBinary("add", IntLoad(offset_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(inner))
+        self.operations.append(Label(inner_end))
+        self.operations.append(
+            Store(seen_slot, IntBinary("add", IntLoad(seen_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return IntLoad(offset_slot)
+
+    def emit_string_slice(
+        self, source: IntExpression, node: ast.Slice
+    ) -> IntExpression:
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, source))
+        origin = IntLoad(source_slot)
+        # Slice bounds count code points, as CPython does, so they have to be
+        # turned into byte offsets before anything is copied.
+        length = self.materialize_int(self.emit_code_point_count(origin))
+        lower, upper = self.slice_bounds(node, length)
+        first = self.materialize_int(self.emit_codepoint_offset(origin, lower))
+        last = self.materialize_int(self.emit_codepoint_offset(origin, upper))
+        span_slot = self.new_temp()
+        self.operations.append(Store(span_slot, IntBinary("sub", last, first)))
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(span_slot)), bump)
+        )
+        result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, IntLoad(span_slot), 8))
+        self.emit_byte_copy(
+            IntBinary("add", result, IntConstant(8)),
+            IntBinary("add", IntBinary("add", origin, IntConstant(8)), first),
+            IntLoad(span_slot),
+        )
+        return result
+
+    def list_pointer(self, node: ast.expr) -> IntExpression:
+        """A pointer to a runtime list block, building one if needed."""
+
+        if isinstance(node, ast.Name) and self.list_kind_of(node.id) is not None:
+            return IntLoad(self.slots[node.id])
+        if isinstance(node, ast.ListComp):
+            return self.list_comprehension(node)
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self.emit_list_slice(
+                self.list_pointer(node.value), node.slice
+            )
+        raise NativeCompileError(
+            self.path, node, "expression is not a native runtime list"
+        )
+
     def list_assignment(
         self, name: str, node: ast.expr, element_kind: str
     ) -> None:
         if not isinstance(node, ast.List):
-            raise NativeCompileError(
-                self.path, node, "native list variables require a list literal"
-            )
+            # Not a literal, but perhaps a list-valued expression such as a
+            # slice; that block is already built, so just bind the name to it.
+            pointer = self.list_pointer(node)
+            self.runtime_names.add(name)
+            self.operations.append(Store(self.slot(name), pointer))
+            return
         elements = node.elts
         for element in elements:
             if element_kind == "float":
@@ -2320,27 +2560,50 @@ class Frontend:
 
     def list_element_address(self, node: ast.Subscript) -> IntExpression:
         target = node.value
-        if not isinstance(target, ast.Name) or self.list_kind_of(target.id) is None:
+        if isinstance(target, ast.Name) and self.list_kind_of(target.id) is not None:
+            pointer = IntLoad(self.slots[target.id])
+        elif self.list_kind(self.expression_type(target)) is not None:
+            # A slice or a comprehension is a list too; index the block it
+            # built rather than insisting on a name.
+            pointer = self.materialize_int(self.list_pointer(target))
+        else:
             raise NativeCompileError(
-                self.path, node, "native indexing requires a runtime list variable"
+                self.path, node, "native indexing requires a runtime list"
             )
-        pointer = IntLoad(self.slots[target.id])
         index_node = node.slice
         try:
             folded = self.constant(index_node)
         except NativeCompileError:
             folded = None
-        if isinstance(folded, int) and not isinstance(folded, bool):
-            length = self.list_lengths.get(target.id)
+        # Only a named list has a length known at build time; a slice or a
+        # comprehension is measured at run time by the check further down, and
+        # a negative constant index needs that length to resolve at all.
+        length = (
+            self.list_lengths.get(target.id) if isinstance(target, ast.Name) else None
+        )
+        # The constant path proves the index in range at build time, which it
+        # can only do when the length is known then. A slice or a comprehension
+        # is measured at run time, so even a constant index goes through the
+        # run-time check below rather than skipping it.
+        if (
+            isinstance(folded, int)
+            and not isinstance(folded, bool)
+            and length is not None
+        ):
             resolved = folded
-            if resolved < 0 and length is not None:
+            if resolved < 0:
                 # Python counts a negative index from the end.
                 resolved += length
             if resolved < 0 or (length is not None and resolved >= length):
                 raise NativeCompileError(
                     self.path,
                     node,
-                    f"native list index {folded} is out of range for {target.id!r}"
+                    f"native list index {folded} is out of range"
+                    + (
+                        f" for {target.id!r}"
+                        if isinstance(target, ast.Name)
+                        else ""
+                    )
                     + (f" (length {length})" if length is not None else ""),
                 )
             return IntBinary("add", pointer, IntConstant(8 + resolved * 8))
@@ -3227,6 +3490,10 @@ class Frontend:
             folded = None
         if isinstance(folded, str):
             return self.materialize_string_constant(folded.encode("utf-8"))
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self.emit_string_slice(
+                self.string_pointer(node.value), node.slice
+            )
         if isinstance(node, ast.JoinedStr):
             return self.joined_string(node)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -3462,7 +3729,326 @@ class Frontend:
         self.operations.append(Jump(start))
         self.operations.append(Label(end))
 
+    def iterable_element_kind(self, node: ast.expr) -> str | None:
+        """The kind each item of ``node`` has, if it is something to iterate."""
+
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "range"
+            and node.func.id not in self.functions
+        ):
+            return "int"
+        try:
+            kind = self.expression_type(node)
+        except NativeCompileError:
+            return None
+        return self.list_kind(kind)
+
+    def emit_list_iteration(
+        self, node: ast.expr, target: str
+    ) -> tuple[int, int, str]:
+        """Set up a walk over a runtime list.
+
+        Returns the index slot, the pointer slot, and the element kind. The
+        caller drives the loop; this only prepares what the loop reads.
+        """
+
+        element_kind = self.list_kind(self.expression_type(node))
+        assert element_kind is not None
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, self.list_pointer(node)))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        return index_slot, pointer_slot, element_kind
+
+    def bind_list_element(
+        self, target: str, index_slot: int, pointer_slot: int, element_kind: str
+    ) -> None:
+        address = IntBinary(
+            "add",
+            IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        )
+        self.values.pop(target, None)
+        self.runtime_names.add(target)
+        self.boolean_names.discard(target)
+        if element_kind == "float":
+            self.operations.append(
+                FloatStore(self.slot(target), BitsFloat(HeapLoad(address, 8)))
+            )
+        else:
+            self.operations.append(Store(self.slot(target), HeapLoad(address, 8)))
+        self.value_types[target] = element_kind
+
+    def for_over_list(self, node: ast.For) -> None:
+        """`for name in <list>:` - walk by index, since there is no iterator."""
+
+        assert isinstance(node.target, ast.Name)
+        name = node.target.id
+        was_bound = name in self.bound_names
+        index_slot, pointer_slot, element_kind = self.emit_list_iteration(
+            node.iter, name
+        )
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        start = self.new_label("for_list")
+        continue_label = self.new_label("for_list_continue")
+        end = self.new_label("for_list_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
+            )
+        )
+        self.bind_list_element(name, index_slot, pointer_slot, element_kind)
+        self.break_targets.append(end)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        if was_bound:
+            self.bound_names.add(name)
+        else:
+            # The list may be empty, and then Python leaves the name unbound.
+            self.possibly_unbound.add(name)
+
+    def comprehension_parts(self, node: ast.ListComp):
+        """The comprehension's pieces with its target renamed out of the way.
+
+        Python 3 gives a comprehension its own scope, so `[k for k in ...]`
+        must not disturb an outer `k` - not its value and not its slot. The
+        name is private and derived from this node, so asking for the element
+        kind and emitting the loop agree on it.
+        """
+
+        generator = node.generators[0]
+        target = generator.target.id
+        private = f"<comp-{id(node):x}:{target}>"
+
+        class _Rename(ast.NodeTransformer):
+            def visit_Name(self, inner: ast.Name):
+                if inner.id == target:
+                    return ast.copy_location(
+                        ast.Name(id=private, ctx=inner.ctx), inner
+                    )
+                return inner
+
+        element = _Rename().visit(copy.deepcopy(node.elt))
+        conditions = [
+            _Rename().visit(copy.deepcopy(test)) for test in generator.ifs
+        ]
+        ast.fix_missing_locations(
+            ast.Module(body=[ast.Expr(value=element)], type_ignores=[])
+        )
+        for test in conditions:
+            ast.fix_missing_locations(
+                ast.Module(body=[ast.Expr(value=test)], type_ignores=[])
+            )
+        return private, element, conditions, generator.iter
+
+    def comprehension_element_kind(self, node: ast.ListComp) -> str:
+        """The kind `[expr for t in it]` produces, without emitting anything."""
+
+        if len(node.generators) != 1 or not isinstance(
+            node.generators[0].target, ast.Name
+        ):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native list comprehension has one `for` binding one name",
+            )
+        target, element, _tests, iterable = self.comprehension_parts(node)
+        item_kind = self.iterable_element_kind(iterable)
+        previous = self.value_types.get(target)
+        previously_bound = target in self.bound_names
+        self.value_types[target] = item_kind or "int"
+        self.bound_names.add(target)
+        try:
+            kind = self.expression_type(element)
+        finally:
+            if previous is None:
+                self.value_types.pop(target, None)
+            else:
+                self.value_types[target] = previous
+            if not previously_bound:
+                self.bound_names.discard(target)
+        if kind not in {"int", "float"}:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native list comprehension builds integers or floats",
+            )
+        return kind
+
+    def list_comprehension(self, node: ast.ListComp) -> IntExpression:
+        """`[expr for t in it]`, optionally with `if`.
+
+        The result is sized from the source, not from how many items survive
+        the condition, and the real count is written into the header at the
+        end. Over-reserving costs arena space that is never reclaimed anyway;
+        counting first would mean running the source twice.
+        """
+
+        if len(node.generators) != 1:
+            raise NativeCompileError(
+                self.path, node, "a native list comprehension has one `for`"
+            )
+        generator = node.generators[0]
+        if generator.is_async or not isinstance(generator.target, ast.Name):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native list comprehension binds a single name and is not async",
+            )
+        if len(generator.ifs) > 1:
+            raise NativeCompileError(
+                self.path, node, "a native list comprehension has at most one `if`"
+            )
+        element_kind = self.comprehension_element_kind(node)
+        bump = self.ensure_heap()
+        target, element, conditions, _iterable = self.comprehension_parts(node)
+
+        over_range = (
+            isinstance(generator.iter, ast.Call)
+            and isinstance(generator.iter.func, ast.Name)
+            and generator.iter.func.id == "range"
+            and generator.iter.func.id not in self.functions
+        )
+        index_slot = self.new_temp()
+        limit_slot = self.new_temp()
+        pointer_slot = None
+        if over_range:
+            arguments = generator.iter.args
+            if not 1 <= len(arguments) <= 2 or generator.iter.keywords:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a native comprehension over range takes one or two "
+                    "arguments and steps by one",
+                )
+            if len(arguments) == 1:
+                start = IntConstant(0)
+                stop = self.materialize_int(self.integer(arguments[0]))
+            else:
+                start = self.materialize_int(self.integer(arguments[0]))
+                stop = self.materialize_int(self.integer(arguments[1]))
+            self.operations.append(Store(index_slot, start))
+            self.operations.append(Store(limit_slot, stop))
+            reserve = IntBinary("sub", IntLoad(limit_slot), IntLoad(index_slot))
+        else:
+            item_kind = self.list_kind(self.expression_type(generator.iter))
+            if item_kind is None:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a native comprehension iterates a range or a runtime list",
+                )
+            pointer_slot = self.new_temp()
+            self.operations.append(
+                Store(pointer_slot, self.list_pointer(generator.iter))
+            )
+            self.operations.append(Store(index_slot, IntConstant(0)))
+            self.operations.append(
+                Store(limit_slot, HeapLoad(IntLoad(pointer_slot), 8))
+            )
+            reserve = IntLoad(limit_slot)
+        # An empty range gives a negative span; reserve nothing rather than
+        # asking the arena for a negative number of bytes.
+        reserve_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                reserve_slot,
+                self.select_integer(
+                    IntCompare("gt", reserve, IntConstant(0)),
+                    reserve,
+                    IntConstant(0),
+                ),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                result_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(8),
+                    IntBinary("mul", IntLoad(reserve_slot), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        result = IntLoad(result_slot)
+        count_slot = self.new_temp()
+        self.operations.append(Store(count_slot, IntConstant(0)))
+
+        start_label = self.new_label("comp")
+        end_label = self.new_label("comp_end")
+        step_label = self.new_label("comp_next")
+        self.operations.append(Label(start_label))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(limit_slot)),
+                end_label,
+            )
+        )
+        if over_range:
+            self.values.pop(target, None)
+            self.runtime_names.add(target)
+            self.boolean_names.discard(target)
+            self.operations.append(Store(self.slot(target), IntLoad(index_slot)))
+            self.value_types[target] = "int"
+        else:
+            self.bind_list_element(
+                target,
+                index_slot,
+                pointer_slot,
+                self.list_kind(self.expression_type(generator.iter)),
+            )
+        if conditions:
+            self.operations.append(
+                JumpIfFalse(self.integer(conditions[0]), step_label)
+            )
+        address = IntBinary(
+            "add",
+            IntBinary("add", result, IntConstant(8)),
+            IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
+        )
+        stored = (
+            FloatBits(self.float_expression(element))
+            if element_kind == "float"
+            else self.integer(element)
+        )
+        self.operations.append(HeapStore(address, stored, 8))
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Label(step_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start_label))
+        self.operations.append(Label(end_label))
+        self.operations.append(HeapStore(result, IntLoad(count_slot), 8))
+        return result
+
     def for_statement(self, node: ast.For) -> None:
+        if (
+            not node.orelse
+            and isinstance(node.target, ast.Name)
+            and self.list_kind(self.expression_type(node.iter)) is not None
+        ):
+            self.for_over_list(node)
+            return
         if (
             node.orelse
             or not isinstance(node.target, ast.Name)
@@ -5624,6 +6210,10 @@ class Frontend:
             if isinstance(value, str):
                 return "str"
             return "float" if isinstance(value, float) else "int"
+        if isinstance(node, ast.ListComp):
+            return self.list_tag(self.comprehension_element_kind(node))
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self.expression_type(node.value, bindings)
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
@@ -6119,6 +6709,10 @@ class Frontend:
                 and self.list_kind_of(argument.id) is not None
             ):
                 return HeapLoad(IntLoad(self.slots[argument.id]), 8)
+            if isinstance(argument, ast.Subscript) and isinstance(
+                argument.slice, ast.Slice
+            ):
+                return HeapLoad(self.list_pointer(argument), 8)
             if isinstance(argument, ast.Name) and self.dict_kinds_of(argument.id):
                 # The live count is the second i64 of the table header.
                 return HeapLoad(
