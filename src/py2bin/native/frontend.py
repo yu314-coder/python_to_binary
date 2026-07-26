@@ -504,6 +504,12 @@ class Frontend:
         self._prologue: list[object] = []
         self._bool_text_slot: int | None = None
         self.boolean_names: set[str] = set()
+        # Whether a container's elements are bools. A container has no place to
+        # keep that at run time - the slot holds a number either way - so it is
+        # a property of the variable, decided by everything stored into it.
+        # None means nothing has been stored yet.
+        self.container_bool: dict[str, bool | None] = {}
+        self._bool_query: set[int] = set()
         # A parameter substituted into a single-expression body is just a
         # value, and a string's value is a pointer - indistinguishable from an
         # integer. This records which of them are strings.
@@ -2861,6 +2867,30 @@ class Frontend:
         self.operations.append(Label(done))
         return found_slot
 
+    def note_stored_bool(self, name: str, node: ast.expr, where: str) -> None:
+        """Record whether ``name``'s elements are bools, and refuse a mix.
+
+        A container keeps one answer for all of its elements, because there is
+        nowhere at run time to keep a different one per slot. Storing a bool
+        beside a number would make one of them print wrongly, so a mix is
+        refused rather than guessed at.
+        """
+
+        stored = self.renders_as_bool(node)
+        current = self.container_bool.get(name)
+        if current is None:
+            self.container_bool[name] = stored
+            return
+        if current != stored:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{where} holds {'bools' if current else 'numbers'} already, and "
+                f"this is a {'bool' if stored else 'number'}. One slot cannot "
+                "print both ways, so a mixed container is refused; wrap the "
+                "bool in int() to store the number instead",
+            )
+
     def refuse_stored_bool(self, node: ast.expr, where: str) -> None:
         """Refuse to store a bool where its kind would be forgotten.
 
@@ -3030,7 +3060,7 @@ class Frontend:
                 raise NativeCompileError(
                     self.path, argument, "this list holds signed 64-bit integers"
                 )
-            self.refuse_stored_bool(argument, "a list")
+            self.note_stored_bool(name, argument, "this list")
             value = self.integer(argument)
         # A literal's length stops being a build-time fact once it can grow.
         self.list_lengths.pop(name, None)
@@ -3076,7 +3106,7 @@ class Frontend:
                     "this list holds signed 64-bit integers",
                 )
             else:
-                self.refuse_stored_bool(element, "a list")
+                self.note_stored_bool(name, element, "this list")
         bump = self.ensure_heap()
         self.runtime_names.add(name)
         pointer_slot = self.slot(name)
@@ -3335,7 +3365,7 @@ class Frontend:
                     self.path, value, "this dict has signed 64-bit integer values"
                 )
             else:
-                self.refuse_stored_bool(value, "a dict")
+                self.note_stored_bool(target.value.id, value, "this dict")
             self.dict_store(
                 self.slot(target.value.id),
                 self.dict_key(target.slice, key_kind),
@@ -3365,7 +3395,8 @@ class Frontend:
             raise NativeCompileError(
                 self.path, value, "this list holds signed 64-bit integers"
             )
-        self.refuse_stored_bool(value, "a list")
+        if isinstance(target.value, ast.Name):
+            self.note_stored_bool(target.value.id, value, "this list")
         address = self.list_element_address(target)
         self.operations.append(HeapStore(address, self.integer(value), 8))
 
@@ -3464,7 +3495,7 @@ class Frontend:
                     self.path, value, "this dict has signed 64-bit integer values"
                 )
             else:
-                self.refuse_stored_bool(value, "a dict")
+                self.note_stored_bool(name, value, "this dict")
         capacity = self.dict_capacity(len(node.keys))
         bump = self.ensure_heap()
         self.runtime_names.add(name)
@@ -6601,6 +6632,107 @@ class Frontend:
             return all(self.renders_as_bool(value) for value in node.values)
         if isinstance(node, ast.Name):
             return node.id in self.boolean_names
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            # An element is a bool when everything stored in the container was.
+            return self.container_bool.get(node.value.id) is True
+        if isinstance(node, ast.IfExp):
+            # Both arms land in the same slot, so they have to agree. A
+            # branching function body is normalised into one of these, which is
+            # where a mixed return shows up.
+            taken = self.renders_as_bool(node.body)
+            other = self.renders_as_bool(node.orelse)
+            if taken != other:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "one arm of this is a bool and the other is a number; they "
+                    "share a slot, and one slot cannot print both ways, so wrap "
+                    "the bool in int() or make both arms the same kind",
+                )
+            return taken
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return self.call_returns_bool(node)
+        return False
+
+    def call_returns_bool(self, node: ast.Call) -> bool:
+        """Whether a call to a native function yields a bool.
+
+        The answer depends on the arguments - `def same(a, b): return a == b`
+        always yields one, `def pick(a, b): return a` yields one only when `a`
+        does - so the parameters are given the bool-ness of the arguments and
+        the body is asked under that.
+        """
+
+        function = self.functions.get(node.func.id)
+        if (
+            function is None
+            or node.keywords
+            or len(node.args) != len(function.parameters)
+            or id(function) in self._bool_query
+        ):
+            return False
+        previous = set(self.boolean_names)
+        self._bool_query.add(id(function))
+        try:
+            self.boolean_names.difference_update(function.parameters)
+            self.boolean_names.update(
+                parameter
+                for parameter, argument in zip(function.parameters, node.args)
+                if self.renders_as_bool(argument)
+            )
+            if function.expression is not None:
+                return self.renders_as_bool(function.expression)
+            return self.body_returns_bool(function.body, node)
+        finally:
+            self._bool_query.discard(id(function))
+            self.boolean_names.clear()
+            self.boolean_names.update(previous)
+
+    def body_returns_bool(self, body, location: ast.AST) -> bool:
+        """Whether every value a statement body returns is a bool.
+
+        A local assigned from a bool carries it forward, so the statements are
+        walked in order. A body that returns a bool on one path and a number on
+        another cannot be represented - one slot cannot print both ways - so it
+        is refused rather than resolved arbitrarily.
+        """
+
+        answers: list[bool] = []
+
+        def walk(statements) -> None:
+            for statement in statements:
+                if isinstance(statement, ast.Assign) and len(
+                    statement.targets
+                ) == 1 and isinstance(statement.targets[0], ast.Name):
+                    name = statement.targets[0].id
+                    if self.renders_as_bool(statement.value):
+                        self.boolean_names.add(name)
+                    else:
+                        self.boolean_names.discard(name)
+                elif isinstance(statement, ast.AugAssign) and isinstance(
+                    statement.target, ast.Name
+                ):
+                    self.boolean_names.discard(statement.target.id)
+                elif isinstance(statement, ast.Return) and statement.value:
+                    answers.append(self.renders_as_bool(statement.value))
+                for field in ("body", "orelse", "finalbody"):
+                    nested = getattr(statement, field, None)
+                    if nested:
+                        walk(nested)
+                for handler in getattr(statement, "handlers", ()):
+                    walk(handler.body)
+
+        walk(list(body))
+        if answers and all(answers):
+            return True
+        if any(answers) and not all(answers):
+            raise NativeCompileError(
+                self.path,
+                location,
+                "this function returns a bool on one path and a number on "
+                "another; one slot cannot print both ways, so wrap the bool in "
+                "int() or return one kind throughout",
+            )
         return False
 
     def emit_bool_to_string(self, value: IntExpression) -> IntExpression:

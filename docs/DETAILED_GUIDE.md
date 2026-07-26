@@ -236,14 +236,15 @@ runtime:
   frame-pointer load). Each pinned value takes one and a slice takes a dozen or
   more, so a function with hundreds of slices is refused with a message saying
   so, rather than miscompiled;
-- storing a `bool` in a list or a dict is refused. Which slots hold one is
-  tracked from the source, and a container loses that: the value would read
-  back as `1` rather than `True`, which is a wrong answer rather than a
-  refusal. Wrap it in `int()` when the number is what is wanted. Passing one as
-  an argument is **not** refused, because a function that never renders its
-  parameter is unaffected and refusing every call would reject working
-  programs - but a bool parameter that is printed does still come out as `1`,
-  and that is a known divergence rather than a fixed one;
+- a `bool` keeps its identity through a list, a dict, a function parameter, a
+  return value, and a conditional expression. Nothing at run time tells `True`
+  from `1` - the slot holds a number either way - so the answer is carried
+  where it can be: a container's elements are all bools or none (a variable
+  holds that answer, and a mix is refused, because one slot cannot print two
+  ways), a parameter takes the bool-ness of its argument, and a function's
+  result is decided by asking its body under those arguments. A function that
+  returns a bool on one path and a number on another is refused for the same
+  reason a mixed container is;
 - a `bool` prints as `True` or `False`. It lives in an integer slot, which is
   right for arithmetic and wrong for printing, and nothing tells the two apart
   at run time - so which names hold one is tracked from the source, and a name
