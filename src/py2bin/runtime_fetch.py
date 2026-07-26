@@ -53,14 +53,25 @@ _PROJECT_NAME = re.compile(r"[A-Za-z0-9._-]+")
 # python.org publishes the Windows embeddable distribution per architecture.
 _EMBED_ARCH = {"windows-x86_64": "amd64", "windows-arm64": "arm64"}
 
-# Wheel platform tags accepted for each target.
-_PLATFORM_TAGS = {
-    "windows-x86_64": ("win_amd64", "any"),
-    "windows-arm64": ("win_arm64", "any"),
-    "linux-x86_64": ("manylinux", "musllinux", "linux_x86_64", "any"),
-    "linux-arm64": ("manylinux", "musllinux", "linux_aarch64", "any"),
-    "darwin-x86_64": ("macosx", "any"),
-    "darwin-arm64": ("macosx", "any"),
+# A wheel's platform tag names an architecture as well as an OS, and matching
+# only the OS part is how an x86-64 wheel ends up installed for arm64. Each
+# target therefore lists the architecture suffixes it accepts, plus the
+# portable tags that carry no native code at all.
+_PLATFORM_RULES = {
+    "windows-x86_64": ("win_amd64",),
+    "windows-arm64": ("win_arm64",),
+    "linux-x86_64": ("_x86_64",),
+    "linux-arm64": ("_aarch64", "_arm64"),
+    "darwin-x86_64": ("_x86_64", "_universal2", "_intel", "_fat64"),
+    "darwin-arm64": ("_arm64", "_universal2"),
+}
+_PLATFORM_OS = {
+    "windows-x86_64": ("win",),
+    "windows-arm64": ("win",),
+    "linux-x86_64": ("manylinux", "musllinux", "linux"),
+    "linux-arm64": ("manylinux", "musllinux", "linux"),
+    "darwin-x86_64": ("macosx",),
+    "darwin-arm64": ("macosx",),
 }
 
 
@@ -366,11 +377,18 @@ def wheel_is_compatible(filename: str, target: str, python_version: str) -> bool
 
     if not any(python_tag_ok(tag) for tag in python_tags):
         return False
-    prefixes = _PLATFORM_TAGS.get(target, ("any",))
-    return any(
-        tag == "any" or any(tag.startswith(prefix) for prefix in prefixes)
-        for tag in platform_tags
-    )
+    families = _PLATFORM_OS.get(target, ())
+    suffixes = _PLATFORM_RULES.get(target, ())
+
+    def platform_ok(tag: str) -> bool:
+        if tag == "any":
+            return True  # no native code, so any machine can run it
+        if not any(tag.startswith(family) for family in families):
+            return False
+        # The OS matches; now the architecture must too.
+        return any(tag.endswith(suffix) or tag == suffix for suffix in suffixes)
+
+    return any(platform_ok(tag) for tag in platform_tags)
 
 
 def _abi_rank(filename: str, python_version: str) -> tuple[int, int]:

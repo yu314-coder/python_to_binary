@@ -3025,6 +3025,68 @@ class Frontend:
             _CABI_RESULT_WIDTH.get(symbol, "i64"),
         )
 
+
+    def floor_divide(
+        self,
+        node: ast.BinOp,
+        bindings,
+        call_stack,
+        remainder: bool,
+    ) -> IntExpression:
+        """Lower Python's ``//`` or ``%`` for runtime integers.
+
+        The hardware divide truncates toward zero, but Python floors toward
+        negative infinity: -7 // 2 is -4, not -3, and -7 % 2 is 1, not -1. The
+        two agree unless the remainder is non-zero and its sign differs from
+        the divisor's, so the correction is computed branchlessly from exactly
+        that condition. Division by zero raises in Python, so the emitted code
+        reports it and exits 1 rather than trapping or returning nonsense.
+        """
+
+        left = self.materialize_int(self.integer(node.left, bindings, call_stack))
+        right = self.materialize_int(self.integer(node.right, bindings, call_stack))
+
+        ok_label = self.new_label("divide_ok")
+        bad_label = self.new_label("divide_by_zero")
+        self.operations.append(
+            JumpIfFalse(IntCompare("eq", right, IntConstant(0)), ok_label)
+        )
+        self.operations.append(Label(bad_label))
+        self.operations.append(
+            Write(
+                b"ZeroDivisionError: integer division or modulo by zero\n", 2
+            )
+        )
+        self.operations.append(Exit(1))
+        self.operations.append(Label(ok_label))
+
+        truncated = self.materialize_int(IntBinary("sdiv", left, right))
+        rest = self.materialize_int(IntBinary("smod", left, right))
+        # The quotient is one too high exactly when the remainder is non-zero
+        # and its sign differs from the divisor's; -(cond) is 0 or -1.
+        differs = IntCompare("lt", IntBinary("xor", rest, right), IntConstant(0))
+        nonzero = IntCompare("ne", rest, IntConstant(0))
+        correction = self.materialize_int(
+            IntBinary("and", differs, nonzero)
+        )
+        if remainder:
+            # Add the divisor back on exactly those cases.
+            return IntBinary(
+                "add",
+                rest,
+                IntBinary("and", right, IntUnary("neg", correction)),
+            )
+        return IntBinary("sub", truncated, correction)
+
+    def materialize_int(self, expression: IntExpression) -> IntExpression:
+        """Pin a value in a slot so re-reading it cannot re-evaluate it."""
+
+        if isinstance(expression, (IntConstant, IntLoad)):
+            return expression
+        slot = self.new_temp()
+        self.operations.append(Store(slot, expression))
+        return IntLoad(slot)
+
     def integer(
         self,
         node: ast.expr,
@@ -3217,6 +3279,19 @@ class Frontend:
                 ast.BitOr: "or",
                 ast.BitXor: "xor",
             }
+            if isinstance(node.op, (ast.FloorDiv, ast.Mod)):
+                if self.eager_depth:
+                    raise NativeCompileError(
+                        self.path,
+                        node,
+                        "// and % can raise ZeroDivisionError, so they cannot "
+                        "appear in a conditional expression or a "
+                        "short-circuited operand, whose arms are both "
+                        "evaluated here; use an if statement",
+                    )
+                return self.floor_divide(
+                    node, bindings, call_stack, isinstance(node.op, ast.Mod)
+                )
             operator = operators.get(type(node.op))
             if operator is not None:
                 right = self.integer(node.right, bindings, call_stack)

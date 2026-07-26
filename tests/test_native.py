@@ -1056,3 +1056,68 @@ class WindowsArm64CallAbiTests(unittest.TestCase):
             self.assertEqual(image[:2], b"MZ")
             offset = struct.unpack("<I", image[0x3C:0x40])[0]
             self.assertEqual(struct.unpack("<H", image[offset + 4 : offset + 6])[0], 0xAA64)
+
+
+class FloorDivisionTests(unittest.TestCase):
+    """Python's // and % floor; the hardware divide truncates.
+
+    -7 // 2 is -4 in Python and -3 in C, and -7 % 2 is 1 rather than -1. The
+    two agree only when the remainder is zero or its sign matches the
+    divisor's, so every sign combination is checked against CPython.
+    """
+
+    def _matches(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "d.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "d.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_every_sign_combination_floors_like_python(self):
+        for a, b in ((17, 5), (-17, 5), (17, -5), (-17, -5)):
+            with self.subTest(a=a, b=b):
+                self._matches(
+                    "a = 0\n"
+                    "for i in range(1, 2):\n"
+                    f"    a = {a}\n"
+                    f"b = {b}\n"
+                    "raise SystemExit((a // b + 20) * 10 + (a % b + 10))\n"
+                )
+
+    def test_division_by_zero_reports_and_exits_one(self):
+        self._matches(
+            "a = 0\n"
+            "for i in range(1, 2):\n"
+            "    a = 5\n"
+            "b = 0\n"
+            "raise SystemExit(a // b)\n"
+        )
+
+    def test_division_is_rejected_in_an_eagerly_evaluated_arm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "d.py"
+            # b must be a runtime value, or the condition folds away and the
+            # division is never lowered at all.
+            entry.write_text(
+                "a = 0\n"
+                "b = 0\n"
+                "for i in range(1, 2):\n"
+                "    a = 5\n"
+                "    b = i - 1\n"
+                "raise SystemExit(a // b if b != 0 else 7)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "d.bin", "darwin-arm64", clean=True)
+            self.assertIn("ZeroDivisionError", str(caught.exception))
