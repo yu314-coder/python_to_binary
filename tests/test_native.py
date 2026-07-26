@@ -1121,3 +1121,108 @@ class FloorDivisionTests(unittest.TestCase):
             with self.assertRaises(NativeCompileError) as caught:
                 compile_native(entry, root / "d.bin", "darwin-arm64", clean=True)
             self.assertIn("ZeroDivisionError", str(caught.exception))
+
+
+class NativeDictionaryTests(unittest.TestCase):
+    """Integer-keyed dicts lowered to an open-addressing table.
+
+    The table is a header of [capacity][count] followed by capacity entries of
+    [state][key][value]. Every case here compares the compiled binary against
+    CPython rather than against a hand-computed number, so a wrong expectation
+    cannot hide a wrong answer.
+    """
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "d.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "d.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            ).returncode
+            native = subprocess.run([str(artifact)], capture_output=True).returncode
+            self.assertEqual(native, reference)
+
+    def test_literal_insert_and_lookup(self):
+        self._run("d = {1: 10, 2: 20}\nd[3] = 30\nraise SystemExit(d[1] + d[2] + d[3])\n")
+
+    def test_keys_that_share_a_home_slot(self):
+        # 1, 9 and 17 are congruent modulo the initial capacity of 8, so each
+        # one has to be found by probing past the others.
+        self._run(
+            "d = {1: 10, 9: 90, 17: 170}\n"
+            "raise SystemExit(d[1] + d[9] // 10 + d[17] // 10)\n"
+        )
+
+    def test_assigning_an_existing_key_replaces_it(self):
+        self._run("d = {5: 1}\nd[5] = 99\nd[6] = 1\nraise SystemExit(d[5] + d[6])\n")
+
+    def test_negative_keys(self):
+        self._run("d = {}\nd[-1] = 7\nd[-9] = 11\nraise SystemExit(d[-1] + d[-9])\n")
+
+    def test_the_table_grows_instead_of_filling_up(self):
+        # More entries than any fixed capacity: every one must survive the
+        # rehash and still be reachable afterwards.
+        self._run(
+            "d = {}\ni = 0\n"
+            "while i < 200:\n    d[i * 8] = i\n    i += 1\n"
+            "total = 0\nj = 0\n"
+            "while j < 200:\n    total += d[j * 8]\n    j += 1\n"
+            "raise SystemExit(total % 251)\n"
+        )
+
+    def test_growth_does_not_double_count_replaced_keys(self):
+        self._run(
+            "d = {}\ni = 0\nwhile i < 50:\n    d[i] = 1\n    i += 1\n"
+            "i = 0\nwhile i < 50:\n    d[i] = 2\n    i += 1\n"
+            "raise SystemExit(len(d) + d[7])\n"
+        )
+
+    def test_a_missing_key_fails_like_cpython(self):
+        self._run("d = {1: 10}\nraise SystemExit(d[2])\n")
+
+    def test_length_counts_distinct_keys(self):
+        self._run(
+            "d = {}\ni = 0\nwhile i < 37:\n    d[i * 5] = i\n    i += 1\n"
+            "d[0] = 99\nraise SystemExit(len(d))\n"
+        )
+
+    def test_membership(self):
+        self._run(
+            "d = {3: 1, 11: 1}\ntotal = 0\n"
+            "if 3 in d:\n    total += 1\n"
+            "if 4 in d:\n    total += 10\n"
+            "if 7 not in d:\n    total += 100\n"
+            "raise SystemExit(total + len(d))\n"
+        )
+
+    def test_membership_guards_a_lookup(self):
+        self._run(
+            "d = {}\ni = 0\nwhile i < 30:\n    d[i * 2] = i\n    i += 1\n"
+            "hits = 0\nk = 0\n"
+            "while k < 60:\n"
+            "    if k in d:\n        hits += d[k]\n"
+            "    k += 1\n"
+            "raise SystemExit(hits % 251)\n"
+        )
+
+    def test_a_lookup_is_rejected_where_both_arms_are_evaluated(self):
+        # select_integer lowers both arms, so a lookup that can raise KeyError
+        # must not be placed in one: the failing arm would run regardless.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "d.py"
+            entry.write_text(
+                "d = {1: 10}\nn = 0\nfor k in range(1, 3):\n    n += k\n"
+                "raise SystemExit(d[1] if n > 0 else d[2])\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "d.bin", "darwin-arm64", clean=True)
+            self.assertIn("KeyError", str(caught.exception))

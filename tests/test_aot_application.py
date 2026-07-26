@@ -19,7 +19,9 @@ from py2bin.native import (
 class AOTApplicationTests(unittest.TestCase):
     def test_closed_world_local_program_is_buildable(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             (root / "maths.py").write_text(
                 "def twice(value: int) -> int:\n"
                 "    return value * 2\n",
@@ -43,7 +45,9 @@ class AOTApplicationTests(unittest.TestCase):
 
     def test_build_writes_pe_with_raw_hash_and_no_python_payload(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             entry = root / "main.py"
             entry.write_text("print('native')\n", encoding="utf-8")
             output = root / "native.exe"
@@ -73,7 +77,9 @@ class AOTApplicationTests(unittest.TestCase):
 
     def test_dynamic_code_and_unported_package_fail_before_writing(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             entry = root / "main.py"
             entry.write_text(
                 "import webview\n"
@@ -94,7 +100,9 @@ class AOTApplicationTests(unittest.TestCase):
 
     def test_web_assets_are_catalogued_but_not_embedded(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             entry = root / "main.py"
             entry.write_text("print('logic')\n", encoding="utf-8")
             web = root / "web"
@@ -125,7 +133,9 @@ class AOTApplicationTests(unittest.TestCase):
 
     def test_cli_strict_plan_and_build_never_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             blocked = root / "blocked.py"
             blocked.write_text("import requests\nprint('no')\n", encoding="utf-8")
             blocked_output = root / "blocked.exe"
@@ -159,7 +169,9 @@ class AOTApplicationTests(unittest.TestCase):
 
     def test_attestation_cannot_overwrite_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             entry = root / "main.py"
             entry.write_text("print('safe')\n", encoding="utf-8")
             output = root / "native"

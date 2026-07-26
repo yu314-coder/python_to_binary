@@ -75,7 +75,9 @@ class CanonicalWholeProgramCTests(unittest.TestCase):
 
     def test_local_library_round_trips_through_c_for_every_target(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             library = root / "native_math.py"
             library.write_text(
                 "def transform(value: int) -> int:\n"
@@ -136,7 +138,9 @@ class CanonicalWholeProgramCTests(unittest.TestCase):
 
     def test_blocked_library_writes_neither_c_nor_binary(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # /var is a symlink to /private/var on macOS and py2bin
+            # reports resolved paths, so compare against resolved ones.
+            root = Path(directory).resolve()
             entry = root / "main.py"
             entry.write_text(
                 "import requests\n"

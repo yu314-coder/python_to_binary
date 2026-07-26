@@ -50,7 +50,9 @@ class PreprocessorTestCase(unittest.TestCase):
     ) -> Path:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        root = Path(directory.name)
+        # /var is a symlink to /private/var on macOS and py2bin reports
+        # resolved paths, so compare against resolved ones.
+        root = Path(directory.name).resolve()
         for name, text in (headers or {}).items():
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,7 +648,9 @@ int main(void) {
     def test_a_diagnostic_names_the_header_the_mistake_is_in(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        root = Path(directory.name)
+        # /var is a symlink to /private/var on macOS and py2bin reports
+        # resolved paths, so compare against resolved ones.
+        root = Path(directory.name).resolve()
         (root / "bad.h").write_text(
             "static int bad(void) { return nowhere; }\n", encoding="utf-8"
         )

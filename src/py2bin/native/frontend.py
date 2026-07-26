@@ -1976,6 +1976,8 @@ class Frontend:
         self.value_types[name] = kind
         if kind == "object":
             self.object_assignment(name, expression)
+        elif kind == "dict-i64":
+            self.dict_assignment(name, expression)
         elif kind == "list-i64":
             self.list_assignment(name, expression)
         elif kind == "str":
@@ -2097,12 +2099,425 @@ class Frontend:
         return IntBinary("add", pointer, offset)
 
     def subscript_assignment(self, target: ast.Subscript, value: ast.expr) -> None:
+        if (
+            isinstance(target.value, ast.Name)
+            and self.value_types.get(target.value.id) == "dict-i64"
+        ):
+            if self.expression_type(value) != "int":
+                raise NativeCompileError(
+                    self.path, value, "native dict values are signed 64-bit integers"
+                )
+            self.dict_store(
+                self.slot(target.value.id),
+                self.integer(target.slice),
+                self.integer(value),
+                target,
+            )
+            return
         if self.expression_type(value) != "int":
             raise NativeCompileError(
                 self.path, value, "native list elements are signed 64-bit integers"
             )
         address = self.list_element_address(target)
         self.operations.append(HeapStore(address, self.integer(value), 8))
+
+
+    # --- runtime integer-keyed dictionaries ---------------------------------
+    #
+    # Layout: [capacity][count] then `capacity` slots of [state][key][value],
+    # 24 bytes each, state 0 meaning empty. Collisions are resolved by linear
+    # probing, and the capacity is fixed when the dict is created: growing a
+    # hash table means rehashing every entry, which needs a second loop and a
+    # second allocation, so instead the table is sized generously and a full
+    # table is a reported error rather than a silent overwrite.
+
+    DICT_SLOT_BYTES = 24
+    DICT_HEADER_BYTES = 16
+
+    def dict_capacity(self, entries: int) -> int:
+        """A power-of-two capacity with room to spare, so probing terminates."""
+
+        capacity = 8
+        while capacity < (entries + 1) * 4:
+            capacity *= 2
+        return capacity
+
+    def dict_assignment(self, name: str, node: ast.expr) -> None:
+        if not isinstance(node, ast.Dict):
+            raise NativeCompileError(
+                self.path, node, "native dict variables require a dict literal"
+            )
+        for key, value in zip(node.keys, node.values):
+            if key is None:
+                raise NativeCompileError(
+                    self.path, node, "native dicts do not support ** unpacking"
+                )
+            if self.expression_type(key) != "int":
+                raise NativeCompileError(
+                    self.path, key, "native dict keys are signed 64-bit integers"
+                )
+            if self.expression_type(value) != "int":
+                raise NativeCompileError(
+                    self.path, value, "native dict values are signed 64-bit integers"
+                )
+        capacity = self.dict_capacity(len(node.keys))
+        bump = self.ensure_heap()
+        self.runtime_names.add(name)
+        pointer_slot = self.slot(name)
+        size = self.DICT_HEADER_BYTES + capacity * self.DICT_SLOT_BYTES
+        self.operations.append(HeapAlloc(pointer_slot, IntConstant(size), bump))
+        pointer = IntLoad(pointer_slot)
+        self.operations.append(HeapStore(pointer, IntConstant(capacity), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(8)), IntConstant(0), 8
+            )
+        )
+        # HeapAlloc hands back fresh arena memory, which the kernel zero-filled,
+        # so every state field already reads as empty.
+        for key, value in zip(node.keys, node.values):
+            self.dict_store(
+                pointer_slot,
+                self.integer(key),
+                self.integer(value),
+                node,
+            )
+
+    def dict_probe(
+        self, pointer_slot: int, key: IntExpression
+    ) -> tuple[int, int, int]:
+        """Emit a probe loop; return (slot holding the entry address, found flag).
+
+        The address is where the entry belongs whether or not it is present, so
+        one probe serves lookup, membership and insertion.
+        """
+
+        pointer = IntLoad(pointer_slot)
+        key_slot = self.new_temp()
+        self.operations.append(Store(key_slot, key))
+        mask_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                mask_slot,
+                IntBinary("sub", HeapLoad(pointer, 8), IntConstant(1)),
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                index_slot,
+                IntBinary("and", IntLoad(key_slot), IntLoad(mask_slot)),
+            )
+        )
+        address_slot = self.new_temp()
+        found_slot = self.new_temp()
+        self.operations.append(Store(found_slot, IntConstant(0)))
+
+        start = self.new_label("dict_probe")
+        done = self.new_label("dict_probe_done")
+        empty = self.new_label("dict_probe_empty")
+        self.operations.append(Label(start))
+        self.operations.append(
+            Store(
+                address_slot,
+                IntBinary(
+                    "add",
+                    pointer,
+                    IntBinary(
+                        "add",
+                        IntConstant(self.DICT_HEADER_BYTES),
+                        IntBinary(
+                            "mul",
+                            IntLoad(index_slot),
+                            IntConstant(self.DICT_SLOT_BYTES),
+                        ),
+                    ),
+                ),
+            )
+        )
+        state = HeapLoad(IntLoad(address_slot), 8)
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", state, IntConstant(0)), empty)
+        )
+        stored_key = HeapLoad(
+            IntBinary("add", IntLoad(address_slot), IntConstant(8)), 8
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", stored_key, IntLoad(key_slot)), start + "_next"
+            )
+        )
+        self.operations.append(Store(found_slot, IntConstant(1)))
+        self.operations.append(Jump(done))
+        self.operations.append(Label(start + "_next"))
+        self.operations.append(
+            Store(
+                index_slot,
+                IntBinary(
+                    "and",
+                    IntBinary("add", IntLoad(index_slot), IntConstant(1)),
+                    IntLoad(mask_slot),
+                ),
+            )
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(empty))
+        self.operations.append(Label(done))
+        return address_slot, found_slot, key_slot
+
+
+    def dict_grow(self, pointer_slot: int) -> None:
+        """Double the table and rehash into it.
+
+        A hash table cannot simply be extended: every entry's home slot depends
+        on the capacity, so growth means allocating a new table and probing each
+        live entry into it. The old table is left in the arena, which never
+        reclaims, and that is the documented cost of an arena.
+        """
+
+        bump = self.ensure_heap()
+        old_slot = self.new_temp()
+        self.operations.append(Store(old_slot, IntLoad(pointer_slot)))
+        old = IntLoad(old_slot)
+        old_capacity_slot = self.new_temp()
+        self.operations.append(Store(old_capacity_slot, HeapLoad(old, 8)))
+        new_capacity_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                new_capacity_slot,
+                IntBinary("mul", IntLoad(old_capacity_slot), IntConstant(2)),
+            )
+        )
+        new_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                new_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.DICT_HEADER_BYTES),
+                    IntBinary(
+                        "mul",
+                        IntLoad(new_capacity_slot),
+                        IntConstant(self.DICT_SLOT_BYTES),
+                    ),
+                ),
+                bump,
+            )
+        )
+        new = IntLoad(new_slot)
+        self.operations.append(HeapStore(new, IntLoad(new_capacity_slot), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", new, IntConstant(8)),
+                HeapLoad(IntBinary("add", old, IntConstant(8)), 8),
+                8,
+            )
+        )
+        mask_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                mask_slot,
+                IntBinary("sub", IntLoad(new_capacity_slot), IntConstant(1)),
+            )
+        )
+
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        scan = self.new_label("dict_rehash")
+        after = self.new_label("dict_rehash_done")
+        step = self.new_label("dict_rehash_next")
+        self.operations.append(Label(scan))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(old_capacity_slot)),
+                after,
+            )
+        )
+        entry_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                entry_slot,
+                IntBinary(
+                    "add",
+                    old,
+                    IntBinary(
+                        "add",
+                        IntConstant(self.DICT_HEADER_BYTES),
+                        IntBinary(
+                            "mul",
+                            IntLoad(index_slot),
+                            IntConstant(self.DICT_SLOT_BYTES),
+                        ),
+                    ),
+                ),
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", HeapLoad(IntLoad(entry_slot), 8), IntConstant(0)),
+                step,
+            )
+        )
+        key_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                key_slot,
+                HeapLoad(
+                    IntBinary("add", IntLoad(entry_slot), IntConstant(8)), 8
+                ),
+            )
+        )
+        target_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                target_slot,
+                IntBinary("and", IntLoad(key_slot), IntLoad(mask_slot)),
+            )
+        )
+        place = self.new_label("dict_place")
+        placed = self.new_label("dict_placed")
+        address_slot = self.new_temp()
+        self.operations.append(Label(place))
+        self.operations.append(
+            Store(
+                address_slot,
+                IntBinary(
+                    "add",
+                    new,
+                    IntBinary(
+                        "add",
+                        IntConstant(self.DICT_HEADER_BYTES),
+                        IntBinary(
+                            "mul",
+                            IntLoad(target_slot),
+                            IntConstant(self.DICT_SLOT_BYTES),
+                        ),
+                    ),
+                ),
+            )
+        )
+        # Keys were unique in the old table, so the first empty slot is ours.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", HeapLoad(IntLoad(address_slot), 8), IntConstant(0)),
+                placed,
+            )
+        )
+        self.operations.append(
+            Store(
+                target_slot,
+                IntBinary(
+                    "and",
+                    IntBinary("add", IntLoad(target_slot), IntConstant(1)),
+                    IntLoad(mask_slot),
+                ),
+            )
+        )
+        self.operations.append(Jump(place))
+        self.operations.append(Label(placed))
+        self.operations.append(
+            HeapStore(IntLoad(address_slot), IntConstant(1), 8)
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(address_slot), IntConstant(8)),
+                IntLoad(key_slot),
+                8,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(address_slot), IntConstant(16)),
+                HeapLoad(
+                    IntBinary("add", IntLoad(entry_slot), IntConstant(16)), 8
+                ),
+                8,
+            )
+        )
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(
+                index_slot,
+                IntBinary("add", IntLoad(index_slot), IntConstant(1)),
+            )
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(after))
+        self.operations.append(Store(pointer_slot, IntLoad(new_slot)))
+
+    def dict_store(
+        self,
+        pointer_slot: int,
+        key: IntExpression,
+        value: IntExpression,
+        node: ast.AST,
+    ) -> None:
+        value_slot = self.new_temp()
+        self.operations.append(Store(value_slot, value))
+        address_slot, found_slot, key_slot = self.dict_probe(pointer_slot, key)
+        pointer = IntLoad(pointer_slot)
+        existing = self.new_label("dict_existing")
+        end = self.new_label("dict_store_end")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(found_slot), IntConstant(0)), existing
+            )
+        )
+        # A new entry: refuse to overfill rather than probe forever.
+        count = HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8)
+        capacity = HeapLoad(pointer, 8)
+        room = self.new_label("dict_has_room")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntBinary("mul", count, IntConstant(2)),
+                    capacity,
+                ),
+                room + "_full",
+            )
+        )
+        self.operations.append(Jump(room))
+        self.operations.append(Label(room + "_full"))
+        self.dict_grow(pointer_slot)
+        # Growth moved the table, so the address the first probe produced points
+        # into the abandoned one. Probe again for where this key belongs now.
+        regrown_address, _found, _key = self.dict_probe(
+            pointer_slot, IntLoad(key_slot)
+        )
+        self.operations.append(Store(address_slot, IntLoad(regrown_address)))
+        self.operations.append(Label(room))
+        self.operations.append(
+            HeapStore(IntLoad(address_slot), IntConstant(1), 8)
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(address_slot), IntConstant(8)),
+                IntLoad(key_slot),
+                8,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(8)),
+                IntBinary(
+                    "add",
+                    HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8),
+                    IntConstant(1),
+                ),
+                8,
+            )
+        )
+        self.operations.append(Label(existing))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(address_slot), IntConstant(16)),
+                IntLoad(value_slot),
+                8,
+            )
+        )
+        self.operations.append(Label(end))
+
 
     # --- runtime strings ----------------------------------------------------
 
@@ -2777,6 +3192,8 @@ class Frontend:
             if isinstance(value, str):
                 return "str"
             return "float" if isinstance(value, float) else "int"
+        if isinstance(node, ast.Dict):
+            return "dict-i64"
         if isinstance(node, ast.List):
             return "list-i64"
         if isinstance(node, ast.UnaryOp):
@@ -3193,10 +3610,50 @@ class Frontend:
                 and self.value_types.get(argument.id) == "list-i64"
             ):
                 return HeapLoad(IntLoad(self.slots[argument.id]), 8)
+            if (
+                isinstance(argument, ast.Name)
+                and self.value_types.get(argument.id) == "dict-i64"
+            ):
+                # The live count is the second i64 of the table header.
+                return HeapLoad(
+                    IntBinary("add", IntLoad(self.slots[argument.id]), IntConstant(8)),
+                    8,
+                )
             raise NativeCompileError(
                 self.path,
                 node,
                 "native len() supports runtime strings and integer lists",
+            )
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and self.value_types.get(node.value.id) == "dict-i64"
+        ):
+            if self.eager_depth:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a dict lookup can raise KeyError, so it cannot appear in a "
+                    "conditional expression or a short-circuited operand, whose "
+                    "arms are both evaluated here; use an if statement",
+                )
+            address_slot, found_slot, _key = self.dict_probe(
+                self.slot(node.value.id), self.integer(node.slice)
+            )
+            present = self.new_label("dict_present")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+                    present + "_missing",
+                )
+            )
+            self.operations.append(Jump(present))
+            self.operations.append(Label(present + "_missing"))
+            self.operations.append(Write(b"KeyError\n", 2))
+            self.operations.append(Exit(1))
+            self.operations.append(Label(present))
+            return HeapLoad(
+                IntBinary("add", IntLoad(address_slot), IntConstant(16)), 8
             )
         if isinstance(node, ast.Subscript):
             return HeapLoad(self.list_element_address(node), 8)
@@ -3349,6 +3806,23 @@ class Frontend:
                         "unsupported native Boolean operator",
                     )
             return result
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.In, ast.NotIn))
+            and isinstance(node.comparators[0], ast.Name)
+            and self.value_types.get(node.comparators[0].id) == "dict-i64"
+        ):
+            # Membership only probes, so unlike a lookup it cannot raise and is
+            # safe in an eagerly evaluated arm.
+            _address, found_slot, _key = self.dict_probe(
+                self.slot(node.comparators[0].id),
+                self.integer(node.left, bindings, call_stack),
+            )
+            present = isinstance(node.ops[0], ast.In)
+            return IntCompare(
+                "ne" if present else "eq", IntLoad(found_slot), IntConstant(0)
+            )
         if (
             isinstance(node, ast.Compare)
             and len(node.ops) == len(node.comparators)

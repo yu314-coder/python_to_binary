@@ -207,6 +207,15 @@ runtime:
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a
   bump-arena backed by anonymous `mmap`; the two Windows targets reject these,
   and non-ASCII string literals and float/nested lists are rejected;
+- on the same POSIX targets, a runtime `dict` with signed 64-bit keys and
+  values is lowered to an open-addressing table in that arena: `{}` and
+  `{k: v}` literals, `d[k]` load and store, `len(d)`, and `k in d` / `k not in
+  d`. The table doubles and rehashes when it passes half full, so the arena
+  holds the abandoned tables as well - an arena never reclaims. A `d[k]` whose
+  key is absent writes `KeyError` to standard error and exits 1, and because
+  the conditional lowering evaluates both arms, a lookup is rejected inside a
+  conditional expression or a short-circuited operand rather than being allowed
+  to raise from the arm that was not taken. Only integer keys are supported;
 - on `darwin-arm64` only, `from py2bin.cabi import NAME` binds a vetted libc
   symbol, or a vetted CPython C-API entry point, through real dyld and calls it
   with integer, opaque-handle, or compile-time-constant C-string arguments;
