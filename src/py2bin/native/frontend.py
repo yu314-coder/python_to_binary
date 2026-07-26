@@ -364,6 +364,17 @@ class NativeFunction:
     extern_functions: dict[str, str]
 
 
+# The float-valued IR nodes, so an inlined argument can be recognised as one.
+FLOAT_EXPRESSIONS = (
+    FloatConstant,
+    FloatLoad,
+    FloatUnary,
+    FloatBinary,
+    IntToFloat,
+    BitsFloat,
+)
+
+
 @dataclass(slots=True)
 class NativeClass:
     """One user-defined class with a statically known heap layout.
@@ -822,6 +833,16 @@ class Frontend:
                     self.path,
                     node,
                     "native procedure cannot return a value",
+                )
+            if self.expression_type(node.value) == "float":
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a native function cannot return a float yet: the call site "
+                    "has to choose an integer or float lowering before the body "
+                    "is inlined, and the returned kind is only known afterwards; "
+                    "pass a float in and assign the result to an attribute or "
+                    "list element instead",
                 )
             self.operations.append(Store(result_slot, self.integer(node.value)))
             self.operations.append(Jump(return_label))
@@ -4044,7 +4065,19 @@ class Frontend:
         for parameter, argument in zip(function.parameters, arguments):
             private_parameter = private_names[parameter]
             self.runtime_names.add(private_parameter)
-            self.operations.append(Store(self.slot(private_parameter), argument))
+            # A parameter is just a local: store the argument in its slot and
+            # the body reads it through the ordinary variable path. Recording
+            # the kind is what makes that path pick float or integer loads.
+            if isinstance(argument, FLOAT_EXPRESSIONS):
+                self.operations.append(
+                    FloatStore(self.slot(private_parameter), argument)
+                )
+                self.value_types[private_parameter] = "float"
+            else:
+                self.operations.append(
+                    Store(self.slot(private_parameter), argument)
+                )
+                self.value_types.pop(private_parameter, None)
             # An object parameter (a method's ``self``) carries its class into
             # the inlined body so attribute access there resolves statically.
             class_name = (parameter_classes or {}).get(parameter)
@@ -4108,11 +4141,12 @@ class Frontend:
             )
         bound: list[KernelValue | None] = [None for _ in parameters]
         for index, argument in enumerate(node.args):
-            bound[index] = (
-                self.kernel_operand(argument, bindings, call_stack)
-                if self.experimental_kernels
-                else self.integer(argument, bindings, call_stack)
-            )
+            if self.experimental_kernels:
+                bound[index] = self.kernel_operand(argument, bindings, call_stack)
+            elif self.expression_type(argument, bindings) == "float":
+                bound[index] = self.float_expression(argument, bindings, call_stack)
+            else:
+                bound[index] = self.integer(argument, bindings, call_stack)
         for keyword in node.keywords:
             if keyword.arg is None:
                 raise NativeCompileError(
@@ -4164,6 +4198,46 @@ class Frontend:
             )
         return tuple(value for value in bound if value is not None)
 
+    def expression_function_kind(
+        self, node: ast.expr, bindings: dict[str, KernelValue] | None = None
+    ) -> str | None:
+        """The kind a `return <expression>` function yields, or None.
+
+        Such a function is inlined by substituting its arguments into the one
+        expression, so its result kind is that expression's kind under the
+        argument kinds - no body to walk, and nothing lowered to find out.
+        """
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id in {"int", "len", "print"}
+        ):
+            return None
+        function = self.functions.get(node.func.id)
+        if function is None:
+            return None
+        if function.expression is None:
+            # A statement body is inlined, and its result kind is only known
+            # once it has been. Say integer so the caller takes the integer
+            # path, where a float return is caught and reported precisely.
+            return "int"
+        if len(node.args) != len(function.parameters) or node.keywords:
+            return None  # defaults and keywords: let the ordinary path decide
+        # Stand-ins of the right kind, so nothing is emitted just to ask.
+        stand_ins: dict[str, KernelValue] = {}
+        for parameter, argument in zip(function.parameters, node.args):
+            if self.expression_type(argument, bindings) == "float":
+                stand_ins[parameter] = FloatConstant(0.0)
+            else:
+                stand_ins[parameter] = IntConstant(0)
+        previous_functions, previous_values = self.functions, self.values
+        self.functions, self.values = function.functions, function.values
+        try:
+            return self.expression_type(function.expression, stand_ins)
+        finally:
+            self.functions, self.values = previous_functions, previous_values
+
     def expression_type(
         self,
         node: ast.expr,
@@ -4183,7 +4257,11 @@ class Frontend:
             return "float" if isinstance(node.value, float) else "int"
         if isinstance(node, ast.Name):
             if node.id in bindings:
-                return "int"
+                return (
+                    "float"
+                    if isinstance(bindings[node.id], FLOAT_EXPRESSIONS)
+                    else "int"
+                )
             if node.id in self.object_classes:
                 return "object"
             if node.id in self.value_types:
@@ -4206,6 +4284,9 @@ class Frontend:
             return self.list_kind_of(node.value.id)
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
             return self.attribute_kind(node)
+        kind = self.expression_function_kind(node, bindings)
+        if kind is not None:
+            return kind
         if isinstance(node, ast.Dict):
             return self.dict_literal_tag(node, bindings)
         if isinstance(node, ast.List):
@@ -4309,6 +4390,29 @@ class Frontend:
             and self.attribute_kind(node) == "float"
         ):
             return BitsFloat(HeapLoad(self.attribute_address(node), 8))
+        if isinstance(node, ast.Name) and node.id in bindings:
+            bound = bindings[node.id]
+            if isinstance(bound, FLOAT_EXPRESSIONS):
+                return bound
+        if self.expression_function_kind(node, bindings) == "float":
+            assert isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            function = self.functions[node.func.id]
+            arguments = self.bind_native_arguments(
+                node.func.id, function, node, bindings, call_stack
+            )
+            previous_path, previous_values = self.path, self.values
+            previous_functions = self.functions
+            self.path, self.values = function.path, function.values
+            self.functions = function.functions
+            try:
+                return self.float_expression(
+                    function.expression,
+                    dict(zip(function.parameters, arguments)),
+                    (*call_stack, id(function)),
+                )
+            finally:
+                self.path, self.values = previous_path, previous_values
+                self.functions = previous_functions
         if isinstance(node, ast.Name):
             if node.id in self.slots and self.value_types.get(node.id) == "float":
                 return FloatLoad(self.slots[node.id])
@@ -4562,6 +4666,13 @@ class Frontend:
             return IntConstant(int(node.value))
         if isinstance(node, ast.Name) and node.id in bindings:
             value = bindings[node.id]
+            if isinstance(value, FLOAT_EXPRESSIONS):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{node.id!r} was passed a float, so it cannot be used where "
+                    "an integer is required; wrap it in int() to truncate",
+                )
             if isinstance(value, StaticI64Tensor):
                 raise NativeCompileError(
                     self.path,

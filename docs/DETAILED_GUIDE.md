@@ -199,6 +199,12 @@ runtime:
   tuples, string annotations, and `T | None` are accepted as erasable metadata
   within the current non-reflective subset; accepting an annotation does not
   implement its named runtime type;
+- a native function may take `float` parameters and return a `float` when its
+  body is one expression or a straight-line sequence; a `float` crossing into a
+  position that requires an integer, and a `float` returned from a branching
+  body, are rejected rather than truncated or guessed at (the call site has to
+  choose a lowering before the body is inlined, and a branching body's result
+  kind is not known then);
 - runtime `float` (IEEE-754 binary64) variables, `+`/`-`/`*`/unary-`-`,
   comparisons, augmented assignment (`+=`, `-=`, `*=`, `/=`), and `int`/`float`
   conversion lower to real SSE2/NEON; runtime `float` division is accepted only
@@ -208,7 +214,13 @@ runtime:
   constant/runtime index load and store, `len()`) and a runtime ASCII `str`
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a
   bump-arena backed by anonymous `mmap`; the two Windows targets reject these,
-  and non-ASCII string literals and float/nested lists are rejected;
+  and non-ASCII string literals and nested lists are rejected. A list holds
+  signed 64-bit integers or floats, decided by its first element or by a
+  `xs: list[float] = []` annotation; a float element lives in its eight-byte
+  slot as a bit pattern, the same way a float dict value does. Object
+  attributes work the same way, except that the layout learns which fields are
+  floats from an annotation in `__init__` (`self.x: float = ...`), because the
+  type of what is stored there depends on the arguments at each call site;
 - on the same POSIX targets, a runtime `dict` is lowered to an open-addressing
   table in that arena: `{}` and `{k: v}` literals, `d[k]` load and store,
   `len(d)`, and `k in d` / `k not in d`. Keys are signed 64-bit integers or

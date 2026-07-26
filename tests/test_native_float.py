@@ -398,3 +398,124 @@ class FloatAugmentedAssignmentTests(unittest.TestCase):
             with self.assertRaises(NativeCompileError) as caught:
                 compile_native(entry, root / "f.bin", "darwin-arm64", clean=True)
             self.assertIn("nonzero numeric constant divisor", str(caught.exception))
+
+
+class FloatParameterTests(unittest.TestCase):
+    """Floats crossing a native function boundary.
+
+    Functions are inlined, so a parameter is just a private local: the argument
+    is stored into its slot and the body reads it through the ordinary variable
+    path. Recording the kind is what makes that path pick float loads.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "f.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(
+                reference.stdout, expected_stdout, "test expectation is wrong"
+            )
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_a_float_argument_to_a_procedure(self):
+        self._run(
+            "xs: list[float] = [0.0, 0.0]\n\n"
+            "def record(slot, value):\n    xs[slot] = value * 2.0\n\n"
+            "record(0, 1.25)\nrecord(1, 0.5)\n"
+            "print(int((xs[0] + xs[1]) * 4))\n",
+            b"14\n",
+        )
+
+    def test_a_float_argument_to_a_constructor(self):
+        self._run(
+            "class Point:\n    def __init__(self, x, y):\n"
+            "        self.x: float = x\n        self.y: float = y\n"
+            "        self.tag = 7\n\n"
+            "p = Point(1.5, 2.25)\np.x = 0.75\n"
+            "print(int((p.x + p.y) * 4), p.tag)\n",
+            b"12 7\n",
+        )
+
+    def test_a_single_expression_function_returns_a_float(self):
+        # Such a function is inlined by substituting its arguments into the one
+        # expression, so its result kind is that expression's kind - knowable
+        # without lowering anything.
+        self._run("def scale(v):\n    return v * 2.0\n\nprint(int(scale(1.5)))\n", b"3\n")
+
+    def test_float_returns_compose(self):
+        self._run(
+            "def area(r):\n    return 3.140625 * r * r\n\n"
+            "def total(a, b):\n    return area(a) + area(b)\n\n"
+            "print(int(total(2.0, 1.0) * 16))\n",
+            b"251\n",
+        )
+
+    def test_a_float_argument_with_an_integer_result(self):
+        self._run(
+            "def bucket(v):\n    return int(v * 10.0)\n\n"
+            "print(bucket(2.35), bucket(0.5))\n",
+            b"23 5\n",
+        )
+
+    def test_a_float_return_survives_a_runtime_argument(self):
+        # Constant folding would hide a truncation bug, so the argument is
+        # accumulated in a loop and the result is fractional: an integer slot
+        # anywhere on this path would turn 2.5 into 2 and print 8, not 10.
+        self._run(
+            "seed = 0.0\nfor i in range(0, 5):\n    seed += 0.25\n\n"
+            "def grow(v):\n    return v * 2.0\n\n"
+            "y = grow(seed)\nprint(int(y * 4))\n",
+            b"10\n",
+        )
+
+    def test_a_float_return_from_a_statement_body(self):
+        self._run(
+            "seed = 0.0\nfor i in range(0, 5):\n    seed += 0.25\n\n"
+            "def grow(v):\n    t = v * 2.0\n    return t\n\n"
+            "y = grow(seed)\nprint(int(y * 4))\n",
+            b"10\n",
+        )
+
+    def _reject(self, source: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "f.bin", "darwin-arm64", clean=True)
+            return str(caught.exception)
+
+    def test_a_float_where_an_integer_is_required_is_rejected(self):
+        # Not a miscompile: refused at build time rather than truncated.
+        self.assertIn(
+            "not in the signed 64-bit native integer subset",
+            self._reject(
+                "xs = [10, 20, 30]\n\ndef pick(v):\n    return xs[v]\n\n"
+                "print(pick(1.0))\n"
+            ),
+        )
+
+    def test_a_float_returned_from_a_branching_body_is_rejected(self):
+        # The call site chooses an integer or float lowering before the body is
+        # inlined, and a branching body's result kind is not knowable then.
+        # Rejected rather than guessed at.
+        self.assertIn(
+            "not in the native float subset",
+            self._reject(
+                "seed = 0.0\nfor i in range(0, 5):\n    seed += 0.25\n\n"
+                "def grow(v):\n    t = v * 2.0\n    if t > 0.0:\n"
+                "        return t\n    return t\n\nprint(int(grow(seed)))\n"
+            ),
+        )
