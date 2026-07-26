@@ -216,6 +216,21 @@ runtime:
   the conditional lowering evaluates both arms, a lookup is rejected inside a
   conditional expression or a short-circuited operand rather than being allowed
   to raise from the arm that was not taken. Only integer keys are supported;
+- `raise` and `try` / `except` / `else` / `finally` are lowered without any
+  runtime type object, traceback, or frame stack. Native functions are inlined,
+  so an active handler is a label in the same instruction stream and
+  propagation is a jump to it; a live exception is a small integer saying which
+  raise produced it. Whether a clause catches it is decided at build time from
+  the builtin class hierarchy, so `except ArithmeticError` catches a raised
+  `ZeroDivisionError` and `except Exception` does not catch `SystemExit`. A
+  failed list bounds check and a missing dict key raise real catchable
+  `IndexError` and `KeyError`. Uncaught, the class name goes to standard error
+  and the process exits 1 - the status CPython would exit with, but without
+  CPython's traceback. Only the builtin exception classes are supported;
+  `except X as e` is rejected because there is no exception object to bind, and
+  a `break`, `continue`, or `return` that would leave a `try` with a `finally`
+  is rejected because the finally body is emitted on each path out and a jump
+  out has no path to emit it on;
 - on `darwin-arm64` only, `from py2bin.cabi import NAME` binds a vetted libc
   symbol, or a vetted CPython C-API entry point, through real dyld and calls it
   with integer, opaque-handle, or compile-time-constant C-string arguments;

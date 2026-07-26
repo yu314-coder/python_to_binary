@@ -123,6 +123,57 @@ _KERNEL_EXPORTS = {
 # Only symbols whose ABI is exactly one of these shapes are listed, so the
 # compiler can never emit a call with a mismatched signature.
 _CABI_MODULE = "py2bin.cabi"
+# The builtin exception hierarchy, as much of it as the native subset names.
+# Matching an ``except`` clause against a raise is a compile-time question -
+# both class names are literal in the source - so this table is all the type
+# information the generated code needs. Nothing about a class survives into the
+# binary; a live exception is a small integer identifying which raise produced
+# it.
+_EXCEPTION_BASES: dict[str, str | None] = {
+    "BaseException": None,
+    "Exception": "BaseException",
+    "SystemExit": "BaseException",
+    "KeyboardInterrupt": "BaseException",
+    "ArithmeticError": "Exception",
+    "ZeroDivisionError": "ArithmeticError",
+    "OverflowError": "ArithmeticError",
+    "AssertionError": "Exception",
+    "AttributeError": "Exception",
+    "BufferError": "Exception",
+    "EOFError": "Exception",
+    "ImportError": "Exception",
+    "ModuleNotFoundError": "ImportError",
+    "LookupError": "Exception",
+    "IndexError": "LookupError",
+    "KeyError": "LookupError",
+    "MemoryError": "Exception",
+    "NameError": "Exception",
+    "UnboundLocalError": "NameError",
+    "OSError": "Exception",
+    "FileNotFoundError": "OSError",
+    "PermissionError": "OSError",
+    "NotImplementedError": "RuntimeError",
+    "RecursionError": "RuntimeError",
+    "RuntimeError": "Exception",
+    "StopIteration": "Exception",
+    "TypeError": "Exception",
+    "ValueError": "Exception",
+    "UnicodeError": "ValueError",
+    "ZeroDivisionError": "ArithmeticError",
+}
+
+
+def exception_ancestry(name: str) -> tuple[str, ...]:
+    """``name`` and every builtin exception class it inherits from."""
+
+    chain: list[str] = []
+    current: str | None = name
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = _EXCEPTION_BASES.get(current)
+    return tuple(chain)
+
+
 _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "getpid": ("getpid", ()),
     "getppid": ("getppid", ()),
@@ -425,6 +476,14 @@ class Frontend:
         self.eager_depth = 0
         self.label_number = 0
         self.break_targets: list[str] = []
+        # Exception state. Functions are inlined, so there are no runtime
+        # frames to unwind: an active handler is a label in the same emitted
+        # instruction stream, and propagation is a jump to it.
+        self.handler_stack: list[str] = []
+        self.exception_slot: int | None = None
+        self.exception_value_slot: int | None = None
+        self.exception_ids: dict[str, int] = {}
+        self.finally_depth = 0
         self.continue_targets: list[str] = []
         self.return_targets: list[tuple[int | None, str]] = []
         self.active_functions: list[tuple[int, str]] = []
@@ -686,14 +745,36 @@ class Frontend:
         elif isinstance(node, ast.Break):
             if not self.break_targets:
                 raise NativeCompileError(self.path, node, "break is outside a native loop")
+            if self.finally_depth:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native break cannot leave a try that has a finally: the "
+                    "finally body is emitted on each path out, and this one has "
+                    "no path to emit it on",
+                )
             self.operations.append(Jump(self.break_targets[-1]))
         elif isinstance(node, ast.Continue):
             if not self.continue_targets:
                 raise NativeCompileError(self.path, node, "continue is outside a native loop")
+            if self.finally_depth:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native continue cannot leave a try that has a finally: the "
+                    "finally body is emitted on each path out, and this one has "
+                    "no path to emit it on",
+                )
             self.operations.append(Jump(self.continue_targets[-1]))
         elif isinstance(node, ast.Return):
             if not self.return_targets:
                 raise NativeCompileError(self.path, node, "return is outside a native function")
+            if self.finally_depth:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native return cannot leave a try that has a finally",
+                )
             result_slot, return_label = self.return_targets[-1]
             if node.value is None:
                 if result_slot is not None:
@@ -720,8 +801,14 @@ class Frontend:
             self.import_from(node)
         elif isinstance(node, ast.Import):
             self.import_statement(node)
-        elif isinstance(node, ast.Raise) and node.exc:
-            self.system_exit(node.exc, node)
+        elif isinstance(node, ast.Raise):
+            self.raise_statement(node)
+        elif isinstance(node, (ast.Try, ast.TryStar)):
+            if isinstance(node, ast.TryStar):
+                raise NativeCompileError(
+                    self.path, node, "native try does not support exception groups"
+                )
+            self.try_statement(node)
         else:
             raise NativeCompileError(
                 self.path,
@@ -2087,11 +2174,11 @@ class Frontend:
         self.operations.append(JumpIfFalse(in_range, bad_label))
         self.operations.append(Jump(ok_label))
         self.operations.append(Label(bad_label))
-        # CPython prints the traceback to stderr and exits 1; match both.
-        self.operations.append(
-            Write(b"IndexError: list index out of range\n", 2)
+        # Uncaught, this prints to stderr and exits 1 as CPython does; inside a
+        # try it goes to the handler, so `except IndexError` works on it.
+        self.raise_exception(
+            "IndexError", b"IndexError: list index out of range\n"
         )
-        self.operations.append(Exit(1))
         self.operations.append(Label(ok_label))
         offset = IntBinary(
             "add", IntConstant(8), IntBinary("mul", IntLoad(index_slot), IntConstant(8))
@@ -2951,6 +3038,272 @@ class Frontend:
             and node.func.attr == "exit"
         )
 
+    # --- exceptions ---------------------------------------------------------
+    #
+    # There is no runtime type object and no traceback. A raise records which
+    # class it names as a small integer and jumps to the innermost enclosing
+    # handler; the handler decides whether it matches by comparing that integer
+    # against the ids of the classes the clause catches, a set computed at
+    # build time from the static hierarchy. When no handler matches anywhere,
+    # the class name goes to standard error and the process exits 1, which is
+    # what CPython's exit status would be.
+
+    def exception_slots(self) -> tuple[int, int]:
+        if self.exception_slot is None:
+            self.exception_slot = self.new_temp()
+            self.exception_value_slot = self.new_temp()
+        assert self.exception_value_slot is not None
+        return self.exception_slot, self.exception_value_slot
+
+    def exception_id(self, name: str) -> int:
+        if name not in self.exception_ids:
+            self.exception_ids[name] = len(self.exception_ids) + 1
+        return self.exception_ids[name]
+
+    def emit_uncaught(self) -> None:
+        """Report whichever exception is live and exit, CPython's way."""
+
+        identifier_slot, value_slot = self.exception_slots()
+        for name, identifier in self.exception_ids.items():
+            skip = self.new_label("not_" + name.lower())
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "eq", IntLoad(identifier_slot), IntConstant(identifier)
+                    ),
+                    skip,
+                )
+            )
+            if name == "SystemExit":
+                self.operations.append(ExitValue(IntLoad(value_slot)))
+            else:
+                self.operations.append(Write(name.encode("ascii") + b"\n", 2))
+                self.operations.append(Exit(1))
+            self.operations.append(Label(skip))
+        self.operations.append(Exit(1))
+
+    def raise_exception(
+        self,
+        name: str,
+        message: bytes,
+        value: IntExpression | None = None,
+    ) -> None:
+        """Raise ``name``, either into the innermost handler or out of the program."""
+
+        if not self.handler_stack:
+            # Nothing can catch it, so report it where it happens: the message
+            # is known here and would be lost by going through the dispatch.
+            if name == "SystemExit":
+                self.operations.append(
+                    ExitValue(value if value is not None else IntConstant(0))
+                )
+                return
+            self.operations.append(Write(message, 2))
+            self.operations.append(Exit(1))
+            return
+        identifier_slot, value_slot = self.exception_slots()
+        self.operations.append(
+            Store(identifier_slot, IntConstant(self.exception_id(name)))
+        )
+        self.operations.append(
+            Store(value_slot, value if value is not None else IntConstant(0))
+        )
+        self.operations.append(Jump(self.handler_stack[-1]))
+
+    def propagate(self) -> None:
+        """Send the live exception outward, to a handler or out of the program."""
+
+        if self.handler_stack:
+            self.operations.append(Jump(self.handler_stack[-1]))
+        else:
+            self.emit_uncaught()
+
+    def raise_statement(self, node: ast.Raise) -> None:
+        if node.cause is not None:
+            raise NativeCompileError(
+                self.path, node, "native raise does not support 'from'"
+            )
+        if node.exc is None:
+            if not self.exception_ids:
+                raise NativeCompileError(
+                    self.path, node, "bare raise is outside an except clause"
+                )
+            self.propagate()
+            return
+        exception = node.exc
+        if isinstance(exception, ast.Call):
+            if exception.keywords:
+                raise NativeCompileError(
+                    self.path, node, "native raise does not take keyword arguments"
+                )
+            callee, arguments = exception.func, exception.args
+        elif isinstance(exception, ast.Name):
+            callee, arguments = exception, []
+        else:
+            raise NativeCompileError(
+                self.path, node, "native raise expects an exception class"
+            )
+        if (
+            isinstance(exception, ast.Call)
+            and self.is_exit_call(exception)
+            and not self.handler_stack
+        ):
+            # Outside any try, the existing lowering folds a constant status.
+            self.system_exit(exception, node)
+            return
+        if not isinstance(callee, ast.Name) or callee.id not in _EXCEPTION_BASES:
+            name = getattr(callee, "id", None) or ast.dump(callee)
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native raise supports the builtin exception classes; {name} is "
+                "not one of them",
+            )
+        name = callee.id
+        if len(arguments) > 1:
+            raise NativeCompileError(
+                self.path, node, "native exceptions take at most one argument"
+            )
+        if name == "SystemExit":
+            status = IntConstant(0)
+            if arguments:
+                status = self.integer(arguments[0])
+            self.raise_exception(name, b"SystemExit\n", status)
+            return
+        detail = ""
+        if arguments:
+            try:
+                text = self.constant(arguments[0])
+            except NativeCompileError:
+                text = None
+            if isinstance(text, str):
+                detail = ": " + text
+            elif isinstance(text, (int, bool)):
+                detail = ": " + str(int(text))
+        message = (name + detail).encode("utf-8", "replace") + b"\n"
+        self.raise_exception(name, message)
+
+    def clause_matches(self, clause: ast.ExceptHandler) -> IntExpression | None:
+        """The test for ``clause``, or None when it catches everything."""
+
+        if clause.type is None:
+            return None
+        if isinstance(clause.type, ast.Tuple):
+            caught = list(clause.type.elts)
+        else:
+            caught = [clause.type]
+        names: list[str] = []
+        for item in caught:
+            if not isinstance(item, ast.Name) or item.id not in _EXCEPTION_BASES:
+                raise NativeCompileError(
+                    self.path,
+                    clause,
+                    "native except clauses name builtin exception classes",
+                )
+            names.append(item.id)
+        if "BaseException" in names:
+            return None
+        # The clause matches a raise when the raised class inherits from one of
+        # the named ones. Every raise that can reach here has been lowered
+        # already, so the set of ids is complete.
+        matching = [
+            identifier
+            for raised, identifier in self.exception_ids.items()
+            if any(name in exception_ancestry(raised) for name in names)
+        ]
+        if not matching:
+            return IntConstant(0)  # nothing reaching here can match
+        identifier_slot, _value = self.exception_slots()
+        test: IntExpression | None = None
+        for identifier in matching:
+            comparison = IntCompare(
+                "eq", IntLoad(identifier_slot), IntConstant(identifier)
+            )
+            test = comparison if test is None else IntBinary("or", test, comparison)
+        assert test is not None
+        return test
+
+    def try_statement(self, node: ast.Try) -> None:
+        for clause in node.handlers:
+            if clause.name is not None:
+                raise NativeCompileError(
+                    self.path,
+                    clause,
+                    "native except clauses cannot bind the exception to a name: "
+                    "there is no exception object at runtime, only which class "
+                    "was raised",
+                )
+        # Control reaches the end of a try by several paths, so a name written
+        # on one of them can no longer be a build-time constant: pin every name
+        # the statement assigns into a runtime slot first, exactly as a runtime
+        # `if` does.
+        assigned = list(node.body)
+        for clause in node.handlers:
+            assigned.extend(clause.body)
+        assigned.extend(node.orelse)
+        assigned.extend(node.finalbody)
+        self.materialize_runtime_names(self.assigned_names(assigned))
+        dispatch = self.new_label("except")
+        end = self.new_label("try_end")
+
+        def emit_finally() -> None:
+            # The body is emitted on each path out rather than jumped to, since
+            # there is no return address to come back on.
+            for statement in node.finalbody:
+                self.statement(statement)
+
+        if node.finalbody:
+            self.finally_depth += 1
+        self.handler_stack.append(dispatch)
+        for statement in node.body:
+            self.statement(statement)
+        self.handler_stack.pop()
+
+        # An exception raised by an except clause, or by the else body, belongs
+        # to the enclosing try - but this try's finally still has to run first.
+        escape = self.new_label("finally_escape") if node.finalbody else None
+        if escape is not None:
+            self.handler_stack.append(escape)
+
+        for statement in node.orelse:
+            self.statement(statement)
+        emit_finally()
+        self.operations.append(Jump(end))
+
+        self.operations.append(Label(dispatch))
+        exhausted = True
+        for clause in node.handlers:
+            test = self.clause_matches(clause)
+            skip = self.new_label("clause")
+            if test is not None:
+                self.operations.append(JumpIfFalse(test, skip))
+            for statement in clause.body:
+                self.statement(statement)
+            emit_finally()
+            self.operations.append(Jump(end))
+            if test is None:
+                exhausted = False  # a bare or BaseException clause catches all
+                break
+            self.operations.append(Label(skip))
+        if exhausted:
+            # No clause matched: run the finally and keep going outward.
+            if escape is not None:
+                self.handler_stack.pop()
+            emit_finally()
+            self.propagate()
+            if escape is not None:
+                self.handler_stack.append(escape)
+
+        if escape is not None:
+            self.handler_stack.pop()
+            self.operations.append(Jump(end))
+            self.operations.append(Label(escape))
+            emit_finally()
+            self.propagate()
+        if node.finalbody:
+            self.finally_depth -= 1
+        self.operations.append(Label(end))
+
     def system_exit(self, expression: ast.expr, location: ast.AST) -> None:
         call = expression if isinstance(expression, ast.Call) else None
         if not call or not self.is_exit_call(call) or len(call.args) > 1 or call.keywords:
@@ -3649,8 +4002,9 @@ class Frontend:
             )
             self.operations.append(Jump(present))
             self.operations.append(Label(present + "_missing"))
-            self.operations.append(Write(b"KeyError\n", 2))
-            self.operations.append(Exit(1))
+            self.raise_exception(
+                "KeyError", b"KeyError: key not in native dict\n"
+            )
             self.operations.append(Label(present))
             return HeapLoad(
                 IntBinary("add", IntLoad(address_slot), IntConstant(16)), 8

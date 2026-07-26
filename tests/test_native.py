@@ -1226,3 +1226,181 @@ class NativeDictionaryTests(unittest.TestCase):
             with self.assertRaises(NativeCompileError) as caught:
                 compile_native(entry, root / "d.bin", "darwin-arm64", clean=True)
             self.assertIn("KeyError", str(caught.exception))
+
+
+class NativeExceptionTests(unittest.TestCase):
+    """try/except/else/finally and raise, without runtime type objects.
+
+    Functions are inlined, so there is no frame stack to unwind: an active
+    handler is a label in the same instruction stream. Which class was raised
+    is a small integer, and whether a clause catches it is decided at build
+    time from the static builtin hierarchy.
+    """
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "e.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "e.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.returncode, reference.returncode)
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def _reject(self, source: str, expected: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "e.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "e.bin", "darwin-arm64", clean=True)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_a_matching_clause_catches(self):
+        self._run(
+            'try:\n    raise ValueError("boom")\nexcept ValueError:\n'
+            "    raise SystemExit(7)\nraise SystemExit(1)\n"
+        )
+
+    def test_a_body_that_does_not_raise_skips_the_clause(self):
+        # The two assignments are both build-time constants, so the value has
+        # to be pinned in a slot before the branch or the clause's write wins.
+        self._run("try:\n    x = 5\nexcept ValueError:\n    x = 9\nraise SystemExit(x)\n")
+
+    def test_a_clause_catches_a_subclass(self):
+        self._run(
+            'try:\n    raise ZeroDivisionError("d")\nexcept ArithmeticError:\n'
+            "    raise SystemExit(11)\nraise SystemExit(1)\n"
+        )
+
+    def test_a_clause_does_not_catch_a_superclass(self):
+        self._run(
+            'try:\n    raise SystemExit(3)\nexcept Exception:\n'
+            "    raise SystemExit(99)\n"
+        )
+
+    def test_an_unmatched_exception_keeps_going_outward(self):
+        self._run(
+            'try:\n    try:\n        raise KeyError("k")\n    except TypeError:\n'
+            "        raise SystemExit(2)\nexcept LookupError:\n"
+            "    raise SystemExit(21)\nraise SystemExit(1)\n"
+        )
+
+    def test_an_escaping_system_exit_keeps_its_status(self):
+        self._run(
+            "try:\n    raise SystemExit(23)\nexcept ValueError:\n"
+            "    raise SystemExit(1)\n"
+        )
+
+    def test_a_bare_clause_catches_anything(self):
+        self._run('try:\n    raise RuntimeError("r")\nexcept:\n    raise SystemExit(31)\n')
+
+    def test_a_tuple_of_classes(self):
+        self._run(
+            'try:\n    raise KeyError("k")\nexcept (TypeError, LookupError):\n'
+            "    raise SystemExit(43)\n"
+        )
+
+    def test_the_first_matching_clause_wins(self):
+        self._run(
+            'try:\n    raise ZeroDivisionError("z")\nexcept ArithmeticError:\n'
+            "    raise SystemExit(51)\nexcept ZeroDivisionError:\n"
+            "    raise SystemExit(52)\n"
+        )
+
+    def test_else_runs_only_when_the_body_did_not_raise(self):
+        self._run(
+            "total = 0\ntry:\n    total += 1\nexcept ValueError:\n    total += 10\n"
+            "else:\n    total += 100\nraise SystemExit(total)\n"
+        )
+
+    def test_the_else_body_is_not_covered_by_this_try(self):
+        self._run(
+            'try:\n    x = 1\nexcept ValueError:\n    x = 2\nelse:\n'
+            '    raise ValueError("v")\nraise SystemExit(3)\n'
+        )
+
+    def test_finally_runs_on_every_path(self):
+        for source in (
+            "x = 0\ntry:\n    x = 1\nfinally:\n    x = x + 6\nraise SystemExit(x)\n",
+            'x = 0\ntry:\n    raise ValueError("v")\nexcept ValueError:\n'
+            "    x = 1\nfinally:\n    x = x + 10\nraise SystemExit(x)\n",
+            'try:\n    try:\n        raise ValueError("v")\n    finally:\n'
+            '        print("cleanup")\nexcept ValueError:\n    raise SystemExit(41)\n',
+        ):
+            self._run(source)
+
+    def test_finally_runs_when_a_clause_itself_raises(self):
+        self._run(
+            'x = 0\ntry:\n    try:\n        raise ValueError("v")\n'
+            '    except ValueError:\n        raise KeyError("k")\n'
+            "    finally:\n        x = 5\nexcept KeyError:\n"
+            "    raise SystemExit(x + 30)\n"
+        )
+
+    def test_bare_raise_re_raises(self):
+        self._run(
+            'try:\n    try:\n        raise ValueError("v")\n    except ValueError:\n'
+            "        raise\nexcept ValueError:\n    raise SystemExit(37)\n"
+        )
+
+    def test_output_order_across_body_clause_and_finally(self):
+        self._run(
+            'try:\n    print("body")\n    raise ValueError("v")\n'
+            'except ValueError:\n    print("handler")\nfinally:\n'
+            '    print("finally")\nprint("after")\n'
+        )
+
+    def test_a_try_inside_a_loop_runs_once_per_iteration(self):
+        self._run(
+            "for i in range(0, 3):\n    try:\n        if i == 1:\n"
+            '            raise ValueError("v")\n        print("ok")\n'
+            '    except ValueError:\n        print("caught")\n'
+            '    finally:\n        print("done")\n'
+        )
+
+    def test_a_failed_bounds_check_is_catchable(self):
+        self._run(
+            "xs = [1, 2, 3]\ni = 0\nwhile i < 3:\n    i += 1\n"
+            "try:\n    v = xs[i]\nexcept IndexError:\n    v = 55\n"
+            "raise SystemExit(v)\n"
+        )
+
+    def test_a_missing_dict_key_is_catchable(self):
+        self._run(
+            "d = {1: 10}\ntry:\n    v = d[2]\nexcept KeyError:\n    v = 44\n"
+            "raise SystemExit(v)\n"
+        )
+
+    def test_binding_the_exception_to_a_name_is_rejected(self):
+        self._reject(
+            'try:\n    raise ValueError("v")\nexcept ValueError as e:\n'
+            "    raise SystemExit(1)\n",
+            "cannot bind the exception to a name",
+        )
+
+    def test_leaving_a_finally_by_break_is_rejected(self):
+        # The finally body is emitted on each path out; a break has no path to
+        # emit it on, so refuse rather than skip the cleanup.
+        self._reject(
+            "i = 0\nwhile i < 3:\n    try:\n        break\n    finally:\n"
+            "        i += 1\nraise SystemExit(i)\n",
+            "cannot leave a try that has a finally",
+        )
+
+    def test_a_class_outside_the_builtin_hierarchy_is_rejected(self):
+        # Matching a clause is a build-time question about class names, so a
+        # name the hierarchy does not know cannot be answered.
+        self._reject("raise Boom()\n", "builtin exception classes")
+        self._reject(
+            'try:\n    raise ValueError("v")\nexcept Boom:\n    pass\n',
+            "builtin exception classes",
+        )
