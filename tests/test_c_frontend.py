@@ -9,6 +9,8 @@ all six targets so the encoders still see them.
 
 from __future__ import annotations
 
+import math
+import sys
 import platform
 import random
 import re
@@ -3861,3 +3863,89 @@ int main(void) {
 """,
             stdout="20\n",
         )
+
+
+class TranscendentalTests(CProgramTestCase):
+    """exp, log, the trig functions and pow, supplied as C and compiled.
+
+    py2bin has no linker, so <math.h> carries the implementations as source in
+    the same C the compiler already accepts. Each reduces its argument to a
+    small interval and evaluates a polynomial there. Accuracy is checked
+    against the platform's own libm through Python's math module, which is the
+    only independent implementation available here.
+    """
+
+    def _values(self, calls: list[str]) -> list[float]:
+        body = "".join(
+            f'    printf("%.17e\\n", {call});\n' for call in calls
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "m.c"
+            entry.write_text(
+                "#include <stdio.h>\n#include <math.h>\n"
+                "int main(void)\n{\n" + body + "    return 0;\n}\n",
+                encoding="utf-8",
+            )
+            artifact = root / "m.bin"
+            compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return []
+            output = subprocess.run(
+                [str(artifact)], capture_output=True, text=True, check=True
+            ).stdout
+            return [float(line) for line in output.split()]
+
+    def _assert_close(self, calls, expected, ulps=2.0):
+        got = self._values(calls)
+        if not got:
+            return
+        for call, actual, want in zip(calls, got, expected):
+            error = abs(actual - want) / (abs(want) * sys.float_info.epsilon)
+            self.assertLessEqual(error, ulps, f"{call}: {error:.2f} ulp")
+
+    def test_exp_and_log_are_within_two_ulp(self):
+        self._assert_close(
+            ["exp(1.0)", "exp(-3.25)", "exp(20.0)", "log(2.0)", "log(1000.0)",
+             "log(0.001)"],
+            [math.exp(1.0), math.exp(-3.25), math.exp(20.0), math.log(2.0),
+             math.log(1000.0), math.log(0.001)],
+        )
+
+    def test_the_trig_functions_are_within_two_ulp(self):
+        self._assert_close(
+            ["sin(1.0)", "cos(1.0)", "sin(0.5)", "cos(3.0)", "tan(0.5)"],
+            [math.sin(1.0), math.cos(1.0), math.sin(0.5), math.cos(3.0),
+             math.tan(0.5)],
+        )
+
+    def test_trig_survives_argument_reduction(self):
+        # A large argument is where a careless reduction loses every bit: the
+        # subtraction x - k*(pi/2) cancels unless pi/2 is split so that the
+        # product is exact.
+        self._assert_close(
+            ["sin(100.0)", "cos(-7.5)", "sin(1000.0)", "cos(12345.0)",
+             "sin(-34.0216)"],
+            [math.sin(100.0), math.cos(-7.5), math.sin(1000.0),
+             math.cos(12345.0), math.sin(-34.0216)],
+        )
+
+    def test_pow_is_exact_for_an_integral_exponent(self):
+        got = self._values(["pow(2.0, 10.0)", "pow(-2.0, 3.0)", "pow(3.0, 4.0)"])
+        if got:
+            self.assertEqual(got, [1024.0, -8.0, 81.0])
+
+    def test_pow_of_a_fractional_exponent(self):
+        self._assert_close(
+            ["pow(1.5, 0.25)", "pow(2.0, 0.5)"],
+            [1.5 ** 0.25, 2.0 ** 0.5],
+        )
+
+    def test_the_hardware_functions_still_win_over_the_library(self):
+        # sqrt and friends remain single instructions rather than C source.
+        got = self._values(["sqrt(2.0)", "floor(-2.5)", "ceil(-2.5)"])
+        if got:
+            self.assertEqual(got[0], math.sqrt(2.0))
+            self.assertEqual(got[1:], [-3.0, -2.0])

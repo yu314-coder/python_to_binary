@@ -65,6 +65,8 @@ what every C compiler does by default; spell the punctuation the normal way.
 
 from __future__ import annotations
 
+import pathlib
+
 import collections
 import dataclasses
 from pathlib import Path
@@ -1109,6 +1111,10 @@ def _convert(token: PPToken, error) -> Token:
 
 #: py2bin's C compiler has the fixed-width types, ``size_t``, ``printf`` and the
 #: rest built in, so these copies carry only what a header can really give a
+_MATH_H = (
+    pathlib.Path(__file__).with_name("libm.c").read_text(encoding="utf-8")
+)
+
 #: program that has no library behind it: the macros.
 _BUILTIN_HEADERS = {
     "stdio.h": "#define EOF (-1)\n#define NULL ((void *)0)\n",
@@ -1118,7 +1124,12 @@ _BUILTIN_HEADERS = {
     "stddef.h": "#define NULL ((void *)0)\n",
     "stdbool.h": "#define bool _Bool\n#define true 1\n#define false 0\n"
     "#define __bool_true_false_are_defined 1\n",
-    "math.h": "",
+    # <math.h> supplies its functions as C source that py2bin then
+    # compiles. Nothing is linked: the transcendentals are argument
+    # reduction plus a polynomial, written in the same C the compiler
+    # already accepts, while sqrt/fabs/floor/ceil/trunc remain single
+    # hardware instructions.
+    "math.h": _MATH_H,
     "limits.h": """
 #define CHAR_BIT 8
 #define SCHAR_MIN (-128)
