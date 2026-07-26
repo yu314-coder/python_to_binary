@@ -521,6 +521,13 @@ class Frontend:
         except SyntaxError as error:
             raise ValueError(f"{self.path}:{error.lineno}:{error.offset}: {error.msg}") from error
         self.runtime_names.update(self.loop_mutated_names(tree))
+        # A name a function declares global has to live in a slot. Inlining
+        # swaps the build-time constant map for the function's own, so a
+        # constant written inside the body would be dropped when the module's
+        # map came back.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                self.runtime_names.update(node.names)
         for statement in tree.body:
             self.statement(statement)
         if not self.operations or not isinstance(self.operations[-1], (Exit, ExitValue)):
@@ -701,6 +708,13 @@ class Frontend:
         names: set[str] = set()
         names.update(parameters)
         names.update(cls.assigned_names(list(body)))
+        # A name declared global is the module's, so it must not be renamed
+        # into a private local when the body is inlined - that renaming is what
+        # makes every other assignment in a function local.
+        for statement in body:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Global):
+                    names.difference_update(node.names)
         return names
 
     def new_label(self, prefix: str) -> str:
@@ -902,6 +916,9 @@ class Frontend:
                 )
             self.operations.append(Store(result_slot, self.integer(node.value)))
             self.operations.append(Jump(return_label))
+        elif isinstance(node, ast.Global):
+            # Handled where a function's locals are chosen; nothing to emit.
+            return
         elif isinstance(node, ast.Pass):
             return
         elif isinstance(node, ast.FunctionDef):
@@ -1295,6 +1312,7 @@ class Frontend:
     ) -> IntExpression | None:
         """Inline a method body with ``self`` bound to ``instance``."""
 
+        argument_kinds: list[str] = []
         arguments = self.bind_native_arguments(
             f"{native_class.name}.{method_name}",
             method,
@@ -1302,6 +1320,7 @@ class Frontend:
             {},
             call_stack,
             skip_parameters=1,
+            kinds=argument_kinds,
         )
         return self.inline_imperative_function(
             f"{native_class.name}.{method_name}",
@@ -1310,6 +1329,9 @@ class Frontend:
             node,
             call_stack,
             parameter_classes={"self": native_class.name},
+            # `self` is the leading argument the caller supplied, so the kinds
+            # the binding produced line up one position later.
+            argument_kinds=("object", *argument_kinds),
         )
 
     def contains_extern_call(self, expression: ast.AST) -> bool:
@@ -2674,6 +2696,166 @@ class Frontend:
         self.operations.append(Jump(start))
         self.operations.append(Label(end))
         return IntLoad(result_slot)
+
+    def membership_container_kind(self, node: ast.expr) -> str | None:
+        """What `x in node` would search: a dict, a string, or a list's kind."""
+
+        if isinstance(node, ast.Name) and self.dict_kinds_of(node.id):
+            return "dict"
+        try:
+            kind = self.expression_type(node)
+        except NativeCompileError:
+            return None
+        if kind == "str":
+            return "str"
+        return self.list_kind(kind)
+
+    def emit_list_membership(
+        self, node: ast.expr, container: ast.expr, element_kind: str
+    ) -> int:
+        """Return a 0/1 slot saying whether ``node`` is in the list."""
+
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, self.list_pointer(container)))
+        pointer = IntLoad(pointer_slot)
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8))
+        )
+        found_slot = self.new_temp()
+        self.operations.append(Store(found_slot, IntConstant(0)))
+        wanted_slot = self.new_temp()
+        if element_kind == "float":
+            self.operations.append(
+                FloatStore(wanted_slot, self.float_expression(node))
+            )
+        else:
+            self.operations.append(Store(wanted_slot, self.integer(node)))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("member")
+        end = self.new_label("member_end")
+        step = self.new_label("member_next")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
+            )
+        )
+        item = HeapLoad(
+            IntBinary(
+                "add",
+                IntBinary("add", pointer, IntConstant(self.LIST_HEADER_BYTES)),
+                IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+            ),
+            8,
+        )
+        if element_kind == "float":
+            # Compare as floats, not as bits: 0.0 equals -0.0 and a NaN equals
+            # nothing, and the bit patterns say otherwise on both counts.
+            same = FloatCompare("eq", BitsFloat(item), FloatLoad(wanted_slot))
+        else:
+            same = IntCompare("eq", item, IntLoad(wanted_slot))
+        self.operations.append(JumpIfFalse(same, step))
+        self.operations.append(Store(found_slot, IntConstant(1)))
+        self.operations.append(Jump(end))
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return found_slot
+
+    def emit_substring_search(self, needle: ast.expr, haystack: ast.expr) -> int:
+        """Return a 0/1 slot saying whether one string contains the other.
+
+        A plain scan: for every starting byte, compare forward. UTF-8 makes
+        that safe without decoding, because a multi-byte character can never
+        match part of another one - lead and continuation bytes come from
+        disjoint ranges.
+        """
+
+        outer_slot = self.new_temp()
+        inner_slot = self.new_temp()
+        self.operations.append(Store(outer_slot, self.string_pointer(haystack)))
+        self.operations.append(Store(inner_slot, self.string_pointer(needle)))
+        outer = IntBinary("add", IntLoad(outer_slot), IntConstant(8))
+        inner = IntBinary("add", IntLoad(inner_slot), IntConstant(8))
+        outer_length = self.new_temp()
+        inner_length = self.new_temp()
+        self.operations.append(
+            Store(outer_length, HeapLoad(IntLoad(outer_slot), 8))
+        )
+        self.operations.append(
+            Store(inner_length, HeapLoad(IntLoad(inner_slot), 8))
+        )
+        found_slot = self.new_temp()
+        self.operations.append(Store(found_slot, IntConstant(0)))
+        start_slot = self.new_temp()
+        self.operations.append(Store(start_slot, IntConstant(0)))
+        scan = self.new_label("find")
+        done = self.new_label("find_done")
+        next_start = self.new_label("find_next")
+        self.operations.append(Label(scan))
+        # Stop once the remainder is shorter than what is being looked for;
+        # this also makes the empty needle match at once, as Python does.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "le",
+                    IntBinary("add", IntLoad(start_slot), IntLoad(inner_length)),
+                    IntLoad(outer_length),
+                ),
+                done,
+            )
+        )
+        cursor_slot = self.new_temp()
+        self.operations.append(Store(cursor_slot, IntConstant(0)))
+        compare = self.new_label("find_compare")
+        matched = self.new_label("find_matched")
+        self.operations.append(Label(compare))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(cursor_slot), IntLoad(inner_length)),
+                matched,
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            outer,
+                            IntBinary(
+                                "add", IntLoad(start_slot), IntLoad(cursor_slot)
+                            ),
+                        ),
+                        1,
+                    ),
+                    HeapLoad(
+                        IntBinary("add", inner, IntLoad(cursor_slot)), 1
+                    ),
+                ),
+                next_start,
+            )
+        )
+        self.operations.append(
+            Store(cursor_slot, IntBinary("add", IntLoad(cursor_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(compare))
+        self.operations.append(Label(matched))
+        self.operations.append(Store(found_slot, IntConstant(1)))
+        self.operations.append(Jump(done))
+        self.operations.append(Label(next_start))
+        self.operations.append(
+            Store(start_slot, IntBinary("add", IntLoad(start_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(done))
+        return found_slot
 
     def emit_list_append(
         self, pointer_slot: int, value: IntExpression
@@ -4132,6 +4314,99 @@ class Frontend:
             self.operations.append(Store(self.slot(target), HeapLoad(address, 8)))
         self.value_types[target] = element_kind
 
+    def enumerate_source(self, node: ast.expr):
+        """The list and start `enumerate(...)` names, or None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id != "enumerate"
+            or node.func.id in self.functions
+            or node.keywords
+            or not 1 <= len(node.args) <= 2
+        ):
+            return None
+        if self.list_kind(self.expression_type(node.args[0])) is None:
+            return None
+        return node.args[0], node.args[1] if len(node.args) == 2 else None
+
+    def for_over_enumerate(self, node: ast.For) -> None:
+        """`for i, v in enumerate(xs):` - the index and the item together."""
+
+        source, start = self.enumerate_source(node.iter)
+        if (
+            not isinstance(node.target, (ast.Tuple, ast.List))
+            or len(node.target.elts) != 2
+            or not all(isinstance(item, ast.Name) for item in node.target.elts)
+        ):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native enumerate() loop binds two names, the index and the "
+                "item",
+            )
+        counter_name = node.target.elts[0].id
+        item_name = node.target.elts[1].id
+        was_bound = {
+            name: name in self.bound_names for name in (counter_name, item_name)
+        }
+        index_slot, pointer_slot, element_kind = self.emit_list_iteration(
+            source, item_name
+        )
+        offset_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                offset_slot,
+                self.integer(start) if start is not None else IntConstant(0),
+            )
+        )
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                length_slot,
+                HeapLoad(IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8),
+            )
+        )
+        start_label = self.new_label("for_enum")
+        continue_label = self.new_label("for_enum_continue")
+        end_label = self.new_label("for_enum_end")
+        self.operations.append(Label(start_label))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)),
+                end_label,
+            )
+        )
+        self.values.pop(counter_name, None)
+        self.runtime_names.add(counter_name)
+        self.boolean_names.discard(counter_name)
+        self.operations.append(
+            Store(
+                self.slot(counter_name),
+                IntBinary("add", IntLoad(index_slot), IntLoad(offset_slot)),
+            )
+        )
+        self.value_types[counter_name] = "int"
+        self.bind_list_element(item_name, index_slot, pointer_slot, element_kind)
+        self.break_targets.append(end_label)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start_label))
+        self.operations.append(Label(end_label))
+        for name in (counter_name, item_name):
+            if was_bound[name]:
+                self.bound_names.add(name)
+            else:
+                # The list may be empty, and then Python binds neither name.
+                self.possibly_unbound.add(name)
+
     def for_over_list(self, node: ast.For) -> None:
         """`for name in <list>:` - walk by index, since there is no iterator."""
 
@@ -4415,6 +4690,9 @@ class Frontend:
         ):
             self.for_over_list(node)
             return
+        if not node.orelse and self.enumerate_source(node.iter) is not None:
+            self.for_over_enumerate(node)
+            return
         if (
             node.orelse
             or not isinstance(node.target, ast.Name)
@@ -4424,8 +4702,22 @@ class Frontend:
             or node.iter.keywords
             or not 1 <= len(node.iter.args) <= 3
         ):
+            hint = ""
+            if (
+                isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "enumerate"
+            ):
+                hint = "; native enumerate() walks a runtime list"
+            elif isinstance(node.iter, ast.Name) and self.value_types.get(
+                node.iter.id
+            ) in {"str", "dict:int:int"}:
+                hint = "; only ranges and runtime lists are iterable here"
             raise NativeCompileError(
-                self.path, node, "native for supports only NAME in range(1-3 arguments)"
+                self.path,
+                node,
+                "native for supports NAME in range(1-3 arguments), NAME in a "
+                "runtime list, or two names in enumerate(list)" + hint,
             )
         arguments = node.iter.args
         if len(arguments) == 1:
@@ -6328,6 +6620,7 @@ class Frontend:
         location: ast.AST,
         call_stack: tuple[int, ...],
         parameter_classes: dict[str, str] | None = None,
+        argument_kinds: tuple[str, ...] = (),
     ) -> IntExpression | None:
         """Inline a function body as labels, jumps, stores, and integer IR.
 
@@ -6370,9 +6663,12 @@ class Frontend:
         )
         return_label = self.new_label("function_return")
 
-        for parameter, argument in zip(function.parameters, arguments):
+        for index, (parameter, argument) in enumerate(
+            zip(function.parameters, arguments)
+        ):
             private_parameter = private_names[parameter]
             self.runtime_names.add(private_parameter)
+            kind = argument_kinds[index] if index < len(argument_kinds) else None
             # A parameter is just a local: store the argument in its slot and
             # the body reads it through the ordinary variable path. Recording
             # the kind is what makes that path pick float or integer loads.
@@ -6385,7 +6681,10 @@ class Frontend:
                 self.operations.append(
                     Store(self.slot(private_parameter), argument)
                 )
-                self.value_types.pop(private_parameter, None)
+                if kind == "str":
+                    self.value_types[private_parameter] = "str"
+                else:
+                    self.value_types.pop(private_parameter, None)
             # An object parameter (a method's ``self``) carries its class into
             # the inlined body so attribute access there resolves statically.
             class_name = (parameter_classes or {}).get(parameter)
@@ -6434,6 +6733,7 @@ class Frontend:
         bindings: dict[str, KernelValue],
         call_stack: tuple[int, ...],
         skip_parameters: int = 0,
+        kinds: list[str] | None = None,
     ) -> tuple[KernelValue, ...]:
         # ``skip_parameters`` hides leading parameters the caller supplies
         # itself, which is how a method's ``self`` is bound to the instance
@@ -6448,11 +6748,19 @@ class Frontend:
                 f"{len(parameters)} positional arguments",
             )
         bound: list[KernelValue | None] = [None for _ in parameters]
+        bound_kinds: list[str] = ["int" for _ in parameters]
         for index, argument in enumerate(node.args):
+            kind = self.expression_type(argument, bindings)
             if self.experimental_kernels:
                 bound[index] = self.kernel_operand(argument, bindings, call_stack)
-            elif self.expression_type(argument, bindings) == "float":
+            elif kind == "float":
                 bound[index] = self.float_expression(argument, bindings, call_stack)
+                bound_kinds[index] = "float"
+            elif kind == "str":
+                # A string is its block pointer, so passing one is passing an
+                # integer; only the parameter's recorded kind differs.
+                bound[index] = self.string_pointer(argument)
+                bound_kinds[index] = "str"
             else:
                 bound[index] = self.integer(argument, bindings, call_stack)
         for keyword in node.keywords:
@@ -6504,6 +6812,8 @@ class Frontend:
                 f"native function {function_name}() is missing required "
                 f"argument(s): {', '.join(missing)}",
             )
+        if kinds is not None:
+            kinds[:] = bound_kinds
         return tuple(value for value in bound if value is not None)
 
     def expression_function_kind(
@@ -7299,23 +7609,52 @@ class Frontend:
         if (
             isinstance(node, ast.Compare)
             and len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
+            and self.expression_type(node.left, bindings) == "str"
+            and self.expression_type(node.comparators[0], bindings) == "str"
+        ):
+            # Equal text is equal bytes, so this is the same comparison a
+            # string-keyed dict already makes when it probes.
+            same = self.emit_string_equal(
+                self.string_pointer(node.left),
+                self.string_pointer(node.comparators[0]),
+            )
+            return IntCompare(
+                "ne" if isinstance(node.ops[0], ast.Eq) else "eq",
+                IntLoad(same),
+                IntConstant(0),
+            )
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
             and isinstance(node.ops[0], (ast.In, ast.NotIn))
-            and isinstance(node.comparators[0], ast.Name)
-            and self.dict_kinds_of(node.comparators[0].id)
+            and self.membership_container_kind(node.comparators[0]) is not None
         ):
             # Membership only probes, so unlike a lookup it cannot raise and is
             # safe in an eagerly evaluated arm.
-            key_kind, _value_kind = self.dict_kinds_of(node.comparators[0].id)
+            container = node.comparators[0]
+            shape = self.membership_container_kind(container)
+            present = isinstance(node.ops[0], ast.In)
+            if shape != "dict":
+                if shape == "str":
+                    found = self.emit_substring_search(node.left, container)
+                else:
+                    found = self.emit_list_membership(node.left, container, shape)
+                return IntCompare(
+                    "ne" if present else "eq",
+                    IntLoad(found),
+                    IntConstant(0),
+                )
+            key_kind, _value_kind = self.dict_kinds_of(container.id)
             if self.expression_type(node.left, bindings) != key_kind:
                 raise NativeCompileError(
                     self.path, node.left, f"this dict has {key_kind} keys"
                 )
             _address, found_slot, _key, _state = self.dict_probe(
-                self.slot(node.comparators[0].id),
+                self.slot(container.id),
                 self.dict_key(node.left, key_kind),
                 key_kind,
             )
-            present = isinstance(node.ops[0], ast.In)
             return IntCompare(
                 "ne" if present else "eq", IntLoad(found_slot), IntConstant(0)
             )
@@ -7441,12 +7780,14 @@ class Frontend:
                     node,
                     "native function inline depth exceeds 64 calls",
                 )
+            argument_kinds: list[str] = []
             arguments = self.bind_native_arguments(
                 node.func.id,
                 function,
                 node,
                 bindings,
                 call_stack,
+                kinds=argument_kinds,
             )
             if function.expression is None or _repeats_extern_argument(
                 function, arguments
@@ -7472,6 +7813,7 @@ class Frontend:
                     ),
                     node,
                     call_stack,
+                    argument_kinds=tuple(argument_kinds),
                 )
             previous_path = self.path
             previous_values = self.values

@@ -191,6 +191,18 @@ runtime:
   stands. The abandoned block stays in the arena, which never reclaims, so
   appending is amortised rather than free. `[]` is a list, and `xs: list[float]
   = []` is a float one;
+- `x in xs` / `not in` over a runtime list (comparing floats as floats, so
+  `0.0` finds `-0.0` and a NaN finds nothing), and `sub in s` over a runtime
+  string, which scans forward from every byte - safe without decoding, because
+  a UTF-8 lead byte and a continuation byte come from disjoint ranges and
+  cannot match each other;
+- `==` and `!=` between runtime strings, comparing length then bytes: the same
+  comparison a string-keyed dict already makes when it probes;
+- `for index, item in enumerate(xs)` and `enumerate(xs, start)`;
+- `global` inside a native function names the module's variable rather than a
+  local. Such a name is kept in a slot rather than folded, because inlining
+  swaps the build-time constant map and a constant written inside the body
+  would be dropped when the module's map came back;
 - `sum()`, `min()`, `max()` over a runtime integer list, and `abs()`. `min()`
   and `max()` of an empty list raise a catchable `ValueError`, as CPython does;
 - parallel assignment (`a, b = b, a`) reads every right-hand side into a
