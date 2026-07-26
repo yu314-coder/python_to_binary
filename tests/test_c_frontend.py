@@ -1395,14 +1395,15 @@ class RejectionTests(CProgramTestCase):
     """What py2bin's C compiler refuses, with a location, instead of guessing."""
 
     def test_recursion_is_refused_on_a_target_with_no_call_abi(self):
-        """The ARM64 encoder has a call ABI; the others still inline, so there
-        recursion is rejected with a location rather than miscompiled."""
+        """The ARM64 and System V encoders have a call ABI; the Windows ones
+        still inline, so there recursion is rejected with a location rather
+        than miscompiled."""
 
         source = (
             "int f(int n) { return n ? f(n - 1) : 0; }\n"
             "int main(void) { return f(3); }\n"
         )
-        for target in ("windows-arm64", "windows-x86_64", "linux-x86_64"):
+        for target in ("windows-arm64", "windows-x86_64"):
             with self.subTest(target=target):
                 with self.assertRaises(CCompileError) as caught:
                     compile_c_to_ir(source, "reject.c", target)
@@ -3580,7 +3581,7 @@ class FunctionPointerRejectionTests(CProgramTestCase):
             "int main(void) { int (*p)(int, int) = add; return p(1, 2); }\n"
         )
         with self.assertRaises(CCompileError) as caught:
-            compile_c_to_ir(source, "reject.c", "darwin-x86_64")
+            compile_c_to_ir(source, "reject.c", "windows-x86_64")
         self.assertRegex(str(caught.exception), "call ABI is not implemented")
 
 
@@ -3695,3 +3696,66 @@ int main(void) {
 """,
             stdout="1 2\n",
         )
+
+
+class SystemVCallAbiTests(unittest.TestCase):
+    """The x86-64 call ABI, verified by disassembly only.
+
+    This host is darwin-arm64 and there is no Rosetta or emulation here, so no
+    x86-64 binary is ever executed. These assertions check the encoding, not
+    the behaviour, and say so.
+    """
+
+    def _text(self, source: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "p.c"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "p.bin"
+            compile_c_native(entry, artifact, target="darwin-x86_64", clean=True)
+            self.assertEqual(artifact.read_bytes()[:4], b"\xcf\xfa\xed\xfe")
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return ""
+            return subprocess.run(
+                ["otool", "-tvV", str(artifact)], capture_output=True, text=True
+            ).stdout
+
+    _RECURSIVE = (
+        "long long f(long long n) { return n <= 1 ? 1 : n * f(n - 1); }\n"
+        "int main(void) { return f(5); }\n"
+    )
+
+    def test_recursion_now_compiles_for_x86_64(self):
+        # It was rejected outright before the System V encoder existed.
+        text = self._text(self._RECURSIVE)
+        if not text:
+            return
+        self.assertIn("callq", text)
+
+    def test_the_frame_follows_system_v(self):
+        text = self._text(self._RECURSIVE)
+        if not text:
+            return
+        self.assertIn("pushq\t%rbp", text)
+        self.assertIn("movq\t%rsp, %rbp", text)
+        self.assertIn("popq\t%rbp", text)
+        self.assertIn("retq", text)
+
+    def test_the_first_parameter_arrives_in_rdi(self):
+        text = self._text(self._RECURSIVE)
+        if not text:
+            return
+        self.assertRegex(text, r"movq\t%rdi, -0x[0-9a-f]+\(%rbp\)")
+
+    def test_every_stack_adjustment_keeps_rsp_16_byte_aligned(self):
+        # System V requires rsp % 16 == 0 immediately before a call, so every
+        # frame and every spill must move rsp by a multiple of 16.
+        text = self._text(self._RECURSIVE)
+        if not text:
+            return
+        amounts = re.findall(r"(?:sub|add)q\t\$0x([0-9a-f]+), %rsp", text)
+        self.assertTrue(amounts)
+        for amount in amounts:
+            self.assertEqual(int(amount, 16) % 16, 0, f"0x{amount} misaligns rsp")

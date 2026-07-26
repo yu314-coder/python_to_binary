@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
 import struct
 
 from .ir import (
     BitsFloat,
+    Call,
+    Function,
+    FunctionAddress,
+    GlobalAddress,
+    IndirectCall,
+    Return,
     Exit,
     ExitValue,
     FloatBinary,
@@ -57,6 +64,18 @@ _X86_STORES = {
 }
 
 
+@dataclasses.dataclass
+class _X86Refs:
+    """Fixups collected while encoding: call sites and function addresses.
+
+    Both are PC-relative and can only be resolved once every body's offset in
+    .text is known, exactly like the existing branch patcher.
+    """
+
+    calls: list = dataclasses.field(default_factory=list)
+    addresses: list = dataclasses.field(default_factory=list)
+
+
 def _mov_imm32(register_opcode: bytes, value: int) -> bytes:
     return b"\x48\xc7" + register_opcode + struct.pack("<I", value & 0xFFFFFFFF)
 
@@ -74,7 +93,12 @@ def _frame_bytes(stack_slots: int, base: int = 0) -> int:
     return base + variable_bytes
 
 
-def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> None:
+def _expression(
+    code: bytearray,
+    expression: IntExpression,
+    slot_base: int,
+    refs: "_X86Refs | None" = None,
+) -> None:
     """Place one signed 64-bit native integer expression in RAX."""
 
     if isinstance(expression, IntConstant):
@@ -89,7 +113,7 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         code.extend(b"\x48\x8d\x85" + struct.pack("<i", displacement))  # lea rax,[rbp+d]
         return
     if isinstance(expression, IntUnary):
-        _expression(code, expression.operand, slot_base)
+        _expression(code, expression.operand, slot_base, refs)
         if expression.operator == "pos":
             return
         if expression.operator == "neg":
@@ -103,10 +127,14 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
             return
         raise ValueError(f"unknown x86-64 unary operation {expression.operator!r}")
     if isinstance(expression, (IntBinary, IntCompare)):
-        _expression(code, expression.left, slot_base)
-        code.extend(b"\x50")  # push rax
-        _expression(code, expression.right, slot_base)
-        code.extend(b"\x48\x89\xc1\x58")  # mov rcx, rax; pop rax
+        _expression(code, expression.left, slot_base, refs)
+        # A 16-byte spill, not "push rax": System V requires rsp % 16 == 0
+        # at every call, and a call in the right operand would otherwise
+        # run with rsp misaligned by 8.
+        code.extend(b"\x48\x83\xec\x10\x48\x89\x04\x24")  # sub rsp,16; mov [rsp],rax
+        _expression(code, expression.right, slot_base, refs)
+        code.extend(b"\x48\x89\xc1")  # mov rcx, rax
+        code.extend(b"\x48\x8b\x04\x24\x48\x83\xc4\x10")  # mov rax,[rsp]; add rsp,16
         if isinstance(expression, IntBinary):
             instructions = {
                 "add": b"\x48\x01\xc8",
@@ -152,7 +180,7 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         code.extend(b"\x48\x39\xc8\x0f" + bytes((condition,)) + b"\xc0\x48\x0f\xb6\xc0")
         return
     if isinstance(expression, FloatToInt):
-        _float_expression(code, expression.value, slot_base)
+        _float_expression(code, expression.value, slot_base, refs)
         if expression.signed:
             code.extend(b"\xf2\x48\x0f\x2c\xc0")  # cvttsd2si rax, xmm0 (toward zero)
             return
@@ -173,7 +201,7 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         code.extend(b"\x48\x31\xc8")  # xor rax, rcx
         return
     if isinstance(expression, FloatBits):
-        _float_expression(code, expression.value, slot_base)
+        _float_expression(code, expression.value, slot_base, refs)
         if expression.size == 8:
             code.extend(b"\x66\x48\x0f\x7e\xc0")  # movq rax, xmm0
         elif expression.size == 4:
@@ -183,9 +211,9 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
             raise ValueError(f"unsupported x86-64 float bit width {expression.size}")
         return
     if isinstance(expression, FloatCompare):
-        _float_expression(code, expression.left, slot_base)
+        _float_expression(code, expression.left, slot_base, refs)
         code.extend(b"\x48\x83\xec\x10\xf2\x0f\x11\x04\x24")  # sub rsp,16; movsd [rsp],xmm0
-        _float_expression(code, expression.right, slot_base)
+        _float_expression(code, expression.right, slot_base, refs)
         code.extend(b"\xf2\x0f\x10\xc8")  # movsd xmm1, xmm0  (right operand)
         code.extend(b"\xf2\x0f\x10\x04\x24\x48\x83\xc4\x10")  # movsd xmm0,[rsp]; add rsp,16
         # UCOMISD reports "unordered" (either operand NaN) as ZF=PF=CF=1, which
@@ -217,11 +245,34 @@ def _expression(code: bytearray, expression: IntExpression, slot_base: int) -> N
         code.extend(b"\x48\x0f\xb6\xc0")  # movzx rax, al
         return
     if isinstance(expression, HeapLoad):
-        _expression(code, expression.address, slot_base)  # rax = address
+        _expression(code, expression.address, slot_base, refs)  # rax = address
         instruction = _X86_LOADS.get((expression.size, bool(expression.signed)))
         if instruction is None:
             raise ValueError(f"unsupported x86-64 heap load size {expression.size}")
         code.extend(instruction)
+        return
+    if isinstance(expression, Call):
+        if refs is None:
+            raise ValueError("x86-64 calls need the function-aware encoder")
+        _direct_call(code, expression, slot_base, refs)
+        return
+    if isinstance(expression, IndirectCall):
+        if refs is None:
+            raise ValueError("x86-64 calls need the function-aware encoder")
+        _indirect_call_x86(code, expression, slot_base, refs)
+        return
+    if isinstance(expression, FunctionAddress):
+        if refs is None:
+            raise ValueError("x86-64 calls need the function-aware encoder")
+        # lea rax, [rip+rel32]: PC-relative, so the image may still be slid.
+        code.extend(b"\x48\x8d\x05\x00\x00\x00\x00")
+        refs.addresses.append((len(code) - 4, expression.name))
+        return
+    if isinstance(expression, GlobalAddress):
+        # The static block's base lives in r15 for the whole run.
+        code.extend(b"\x4c\x89\xf8")  # mov rax, r15
+        if expression.offset:
+            code.extend(b"\x48\x05" + struct.pack("<i", expression.offset))
         return
     raise TypeError(f"unknown x86-64 integer expression {type(expression).__name__}")
 
@@ -231,7 +282,10 @@ def _float_bits(value: float) -> int:
 
 
 def _float_expression(
-    code: bytearray, expression: FloatExpression, slot_base: int
+    code: bytearray,
+    expression: FloatExpression,
+    slot_base: int,
+    refs: "_X86Refs | None" = None,
 ) -> None:
     """Place one IEEE-754 double expression in XMM0."""
 
@@ -244,7 +298,7 @@ def _float_expression(
         code.extend(b"\xf2\x0f\x10\x85" + struct.pack("<i", displacement))  # movsd xmm0,[rbp+disp]
         return
     if isinstance(expression, IntToFloat):
-        _expression(code, expression.value, slot_base)
+        _expression(code, expression.value, slot_base, refs)
         if expression.signed:
             code.extend(b"\xf2\x48\x0f\x2a\xc0")  # cvtsi2sd xmm0, rax
             return
@@ -264,7 +318,7 @@ def _float_expression(
         code.extend(b"\xf2\x0f\x58\xc0")  # addsd xmm0, xmm0
         return
     if isinstance(expression, BitsFloat):
-        _expression(code, expression.value, slot_base)
+        _expression(code, expression.value, slot_base, refs)
         if expression.size == 8:
             code.extend(b"\x66\x48\x0f\x6e\xc0")  # movq xmm0, rax
         elif expression.size == 4:
@@ -274,7 +328,7 @@ def _float_expression(
             raise ValueError(f"unsupported x86-64 float bit width {expression.size}")
         return
     if isinstance(expression, FloatUnary):
-        _float_expression(code, expression.operand, slot_base)
+        _float_expression(code, expression.operand, slot_base, refs)
         if expression.operator == "pos":
             return
         if expression.operator == "neg":
@@ -285,9 +339,9 @@ def _float_expression(
             return
         raise ValueError(f"unknown x86-64 float unary operation {expression.operator!r}")
     if isinstance(expression, FloatBinary):
-        _float_expression(code, expression.left, slot_base)
+        _float_expression(code, expression.left, slot_base, refs)
         code.extend(b"\x48\x83\xec\x10\xf2\x0f\x11\x04\x24")  # sub rsp,16; movsd [rsp],xmm0
-        _float_expression(code, expression.right, slot_base)
+        _float_expression(code, expression.right, slot_base, refs)
         code.extend(b"\xf2\x0f\x10\xc8")  # movsd xmm1, xmm0  (right operand)
         code.extend(b"\xf2\x0f\x10\x04\x24\x48\x83\xc4\x10")  # movsd xmm0,[rsp]; add rsp,16
         instructions = {
@@ -318,18 +372,232 @@ def _patch_branches(
         struct.pack_into("<i", code, position, displacement)
 
 
+
+# --- System V AMD64 calls ----------------------------------------------------
+#
+# Integer and pointer arguments go in rdi, rsi, rdx, rcx, r8, r9 and the result
+# comes back in rax. rsp must be a multiple of 16 immediately before every
+# call, which is why every spill in this backend moves rsp by 16.
+
+X86_ARGUMENT_REGISTERS = 6
+
+# mov <reg>, [rsp] for each argument register, in order.
+_LOAD_ARGUMENT = (
+    b"\x48\x8b\x3c\x24",  # rdi
+    b"\x48\x8b\x34\x24",  # rsi
+    b"\x48\x8b\x14\x24",  # rdx
+    b"\x48\x8b\x0c\x24",  # rcx
+    b"\x4c\x8b\x04\x24",  # r8
+    b"\x4c\x8b\x0c\x24",  # r9
+)
+_SPILL = b"\x48\x83\xec\x10\x48\x89\x04\x24"  # sub rsp,16; mov [rsp],rax
+_DROP = b"\x48\x83\xc4\x10"  # add rsp, 16
+
+
+def _push_arguments(
+    code: bytearray, arguments, slot_base: int, refs: "_X86Refs"
+) -> None:
+    """Evaluate arguments left to right and deliver them in the ABI registers.
+
+    Each result is spilled as it is computed, because evaluating a later
+    argument would otherwise clobber rax, and a later argument may itself
+    contain a call. The spills are unwound in reverse so each value lands in
+    its own register.
+    """
+
+    if len(arguments) > X86_ARGUMENT_REGISTERS:
+        raise ValueError(
+            f"x86-64 passes at most {X86_ARGUMENT_REGISTERS} arguments in "
+            f"registers; this call has {len(arguments)}"
+        )
+    for argument in arguments:
+        _expression(code, argument, slot_base, refs)
+        code.extend(_SPILL)
+    for index in reversed(range(len(arguments))):
+        code.extend(_LOAD_ARGUMENT[index])
+        code.extend(_DROP)
+
+
+def _direct_call(
+    code: bytearray, expression, slot_base: int, refs: "_X86Refs"
+) -> None:
+    _push_arguments(code, expression.arguments, slot_base, refs)
+    code.extend(b"\xe8\x00\x00\x00\x00")  # call rel32, patched after layout
+    refs.calls.append((len(code) - 4, expression.name))
+
+
+def _indirect_call_x86(
+    code: bytearray, expression, slot_base: int, refs: "_X86Refs"
+) -> None:
+    # The target is evaluated first and pinned, so a target expression with a
+    # side effect happens exactly once and cannot be clobbered by an argument.
+    _expression(code, expression.target, slot_base, refs)
+    code.extend(_SPILL)
+    _push_arguments(code, expression.arguments, slot_base, refs)
+    code.extend(b"\x48\x8b\x04\x24")  # mov rax, [rsp]
+    code.extend(_DROP)
+    code.extend(b"\xff\xd0")  # call rax
+
+
+
+# mov <arg register>, rax is not needed; parameters arrive in the ABI
+# registers and are stored straight into the frame's first slots.
+_STORE_PARAMETER = (
+    b"\x48\x89\xb8",  # mov [rax+disp32], rdi  -- rewritten below per slot
+)
+
+
+
+@dataclasses.dataclass
+class _Syscalls86:
+    write_number: int
+    exit_number: int
+    mmap_number: int
+    mmap_flags: int
+
+
+def _emit_x86_operations(
+    code: bytearray,
+    operations,
+    slot_base: int,
+    refs: "_X86Refs",
+    pending_strings: list,
+    system: "_Syscalls86",
+) -> None:
+    """Encode one body's operations. Labels are body-local; strings are shared."""
+
+    labels: dict[str, int] = {}
+    branches: list[tuple[int, str]] = []
+    for operation in operations:
+        if isinstance(operation, HeapInit):
+            code.extend(b"\x31\xff")  # xor edi, edi (addr = 0)
+            code.extend(b"\x48\xc7\xc6" + struct.pack("<I", operation.size))
+            code.extend(b"\xba\x03\x00\x00\x00")  # mov edx, 3
+            code.extend(b"\x49\xc7\xc2" + struct.pack("<I", system.mmap_flags))
+            code.extend(b"\x49\xc7\xc0\xff\xff\xff\xff")  # mov r8, -1
+            code.extend(b"\x45\x31\xc9")  # xor r9d, r9d
+            code.extend(b"\x48\xc7\xc0" + struct.pack("<I", system.mmap_number))
+            code.extend(b"\x0f\x05")  # syscall
+            code.extend(b"\x48\x89\x85" + struct.pack("<i", slot_base + operation.slot * 8))
+        elif isinstance(operation, HeapAlloc):
+            _expression(code, operation.size, slot_base, refs)
+            code.extend(b"\x48\x8b\x8d" + struct.pack("<i", slot_base + operation.bump_slot * 8))
+            code.extend(b"\x48\x89\x8d" + struct.pack("<i", slot_base + operation.dest_slot * 8))
+            code.extend(b"\x48\x01\xc8")
+            code.extend(b"\x48\x89\x85" + struct.pack("<i", slot_base + operation.bump_slot * 8))
+        elif isinstance(operation, HeapStore):
+            _expression(code, operation.address, slot_base, refs)
+            code.extend(_SPILL)  # 16 bytes: a call may appear in the value
+            _expression(code, operation.value, slot_base, refs)
+            code.extend(b"\x48\x8b\x0c\x24")  # mov rcx, [rsp] (address)
+            code.extend(_DROP)
+            instruction = _X86_STORES.get(operation.size)
+            if instruction is None:
+                raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
+            code.extend(instruction)
+        elif isinstance(operation, WriteRuntime):
+            _expression(code, operation.length, slot_base, refs)
+            code.extend(_SPILL)
+            _expression(code, operation.address, slot_base, refs)
+            code.extend(b"\x48\x89\xc6")  # mov rsi, rax (buf)
+            code.extend(b"\x48\x8b\x14\x24")  # mov rdx, [rsp] (count)
+            code.extend(_DROP)
+            code.extend(b"\x48\xc7\xc7\x01\x00\x00\x00")  # mov rdi, 1
+            code.extend(b"\x48\xc7\xc0" + struct.pack("<I", system.write_number))
+            code.extend(b"\x0f\x05")
+        elif isinstance(operation, Write):
+            code.extend(_mov_imm32(b"\xc0", system.write_number))
+            code.extend(_mov_imm32(b"\xc7", operation.fd))
+            position = len(code) + 3
+            code.extend(b"\x48\x8d\x35\x00\x00\x00\x00")
+            code.extend(_mov_imm32(b"\xc2", len(operation.data)))
+            code.extend(b"\x0f\x05")
+            pending_strings.append((position, operation.data))
+        elif isinstance(operation, Store):
+            _expression(code, operation.value, slot_base, refs)
+            code.extend(b"\x48\x89\x85" + struct.pack("<i", slot_base + operation.slot * 8))
+        elif isinstance(operation, FloatStore):
+            _float_expression(code, operation.value, slot_base, refs)
+            code.extend(b"\xf2\x0f\x11\x85" + struct.pack("<i", slot_base + operation.slot * 8))
+        elif isinstance(operation, Label):
+            labels[operation.name] = len(code)
+        elif isinstance(operation, Jump):
+            code.extend(b"\xe9\x00\x00\x00\x00")
+            branches.append((len(code) - 4, operation.target))
+        elif isinstance(operation, JumpIfFalse):
+            _expression(code, operation.condition, slot_base, refs)
+            code.extend(b"\x48\x85\xc0\x0f\x84\x00\x00\x00\x00")
+            branches.append((len(code) - 4, operation.target))
+        elif isinstance(operation, Return):
+            if operation.value is not None:
+                _expression(code, operation.value, slot_base, refs)
+            code.extend(b"\x48\x89\xec\x5d\xc3")  # mov rsp,rbp; pop rbp; ret
+        elif isinstance(operation, Exit):
+            code.extend(_mov_imm32(b"\xc0", system.exit_number))
+            code.extend(_mov_imm32(b"\xc7", operation.status))
+            code.extend(b"\x0f\x05")
+        elif isinstance(operation, ExitValue):
+            _expression(code, operation.value, slot_base, refs)
+            code.extend(b"\x48\x89\xc7")  # mov rdi, rax
+            code.extend(_mov_imm32(b"\xc0", system.exit_number))
+            code.extend(b"\x0f\x05")
+    _patch_branches(code, labels, branches)
+
+
+def _emit_function(
+    code: bytearray,
+    function: Function,
+    refs: "_X86Refs",
+    pending_strings: list,
+    system: "_Syscalls86",
+) -> None:
+    """Encode one callable body with a System V AMD64 frame.
+
+    The frame is `push rbp; mov rbp, rsp; sub rsp, N`, so the saved frame
+    pointer and return address sit above rbp and the function's slots below it.
+    Slots are addressed at a negative displacement from rbp, which is what
+    ``slot_base`` carries. N is a multiple of 16, so rsp stays 16-aligned and
+    every nested call meets the ABI's alignment rule.
+    """
+
+    if function.parameters > X86_ARGUMENT_REGISTERS:
+        raise ValueError(
+            f"x86-64 function {function.name!r} declares {function.parameters} "
+            f"parameters; at most {X86_ARGUMENT_REGISTERS} arrive in registers"
+        )
+    if function.parameters > function.stack_slots:
+        raise ValueError(
+            f"x86-64 function {function.name!r} has fewer stack slots than parameters"
+        )
+    frame = (function.stack_slots * 8 + 15) & ~15
+    code.extend(b"\x55")  # push rbp
+    code.extend(b"\x48\x89\xe5")  # mov rbp, rsp
+    if frame:
+        code.extend(b"\x48\x81\xec" + struct.pack("<I", frame))
+    slot_base = -frame
+    # Spill the incoming argument registers into slots 0..parameters-1 so the
+    # body reads a parameter exactly like any other local.
+    stores = (
+        b"\x48\x89\xbd",  # mov [rbp+disp32], rdi
+        b"\x48\x89\xb5",  # rsi
+        b"\x48\x89\x95",  # rdx
+        b"\x48\x89\x8d",  # rcx
+        b"\x4c\x89\x85",  # r8
+        b"\x4c\x89\x8d",  # r9
+    )
+    for index in range(function.parameters):
+        code.extend(stores[index] + struct.pack("<i", slot_base + index * 8))
+    _emit_x86_operations(
+        code, function.operations, slot_base, refs, pending_strings, system
+    )
+    # Fall off the end: return an unspecified value, as the IR allows.
+    code.extend(b"\x48\x89\xec")  # mov rsp, rbp
+    code.extend(b"\x5d")  # pop rbp
+    code.extend(b"\xc3")  # ret
+
+
 def encode(module: Module, platform: str, code_address: int) -> bytes:
     """Encode native syscalls directly; no text assembly is produced."""
-    if module.functions:
-        raise ValueError(
-            "internal function calls (and therefore recursion) are not "
-            "implemented for x86-64 yet; the ARM64 backend implements them"
-        )
-    if module.static_bytes:
-        raise ValueError(
-            "static storage (C file-scope variables) is not implemented for "
-            "x86-64 yet; the ARM64 backend implements it"
-        )
     if platform == "linux":
         write_number, exit_number = 1, 60
         mmap_number, mmap_flags = 9, 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
@@ -338,92 +606,54 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
         mmap_number, mmap_flags = 0x020000C5, 0x1002  # MAP_ANON | MAP_PRIVATE
     else:
         raise ValueError(f"unsupported x86-64 syscall platform: {platform}")
+    system = _Syscalls86(write_number, exit_number, mmap_number, mmap_flags)
 
     code = bytearray()
     code.extend(_sub_stack(_frame_bytes(module.stack_slots)))
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp; stable variable base
-    pending_strings: list[tuple[int, bytes]] = []
-    labels: dict[str, int] = {}
-    branches: list[tuple[int, str]] = []
-    for operation in module.operations:
-        if isinstance(operation, HeapInit):
-            # mmap(addr=0, len, prot=3, flags, fd=-1, off=0); base -> rax
-            code.extend(b"\x31\xff")  # xor edi, edi (addr = 0)
-            code.extend(b"\x48\xc7\xc6" + struct.pack("<I", operation.size))  # mov rsi, len
-            code.extend(b"\xba\x03\x00\x00\x00")  # mov edx, 3 (PROT_READ|WRITE)
-            code.extend(b"\x49\xc7\xc2" + struct.pack("<I", mmap_flags))  # mov r10, flags
-            code.extend(b"\x49\xc7\xc0\xff\xff\xff\xff")  # mov r8, -1 (fd)
-            code.extend(b"\x45\x31\xc9")  # xor r9d, r9d (off = 0)
-            code.extend(b"\x48\xc7\xc0" + struct.pack("<I", mmap_number))  # mov rax, mmap
-            code.extend(b"\x0f\x05")  # syscall
-            code.extend(b"\x48\x89\x85" + struct.pack("<i", operation.slot * 8))  # mov [rbp+off], rax
-        elif isinstance(operation, HeapAlloc):
-            _expression(code, operation.size, 0)  # rax = size (8-aligned)
-            code.extend(b"\x48\x8b\x8d" + struct.pack("<i", operation.bump_slot * 8))  # mov rcx, [rbp+bump]
-            code.extend(b"\x48\x89\x8d" + struct.pack("<i", operation.dest_slot * 8))  # mov [rbp+dest], rcx
-            code.extend(b"\x48\x01\xc8")  # add rax, rcx (new bump)
-            code.extend(b"\x48\x89\x85" + struct.pack("<i", operation.bump_slot * 8))  # mov [rbp+bump], rax
-        elif isinstance(operation, HeapStore):
-            _expression(code, operation.address, 0)  # rax = address
-            code.extend(b"\x50")  # push rax
-            _expression(code, operation.value, 0)  # rax = value
-            code.extend(b"\x59")  # pop rcx (rcx = address)
-            instruction = _X86_STORES.get(operation.size)
-            if instruction is None:
-                raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
-            code.extend(instruction)
-        elif isinstance(operation, WriteRuntime):
-            _expression(code, operation.length, 0)  # rax = length
-            code.extend(b"\x50")  # push rax
-            _expression(code, operation.address, 0)  # rax = address
-            code.extend(b"\x48\x89\xc6")  # mov rsi, rax (buf)
-            code.extend(b"\x5a")  # pop rdx (count = length)
-            code.extend(b"\x48\xc7\xc7\x01\x00\x00\x00")  # mov rdi, 1 (stdout)
-            code.extend(b"\x48\xc7\xc0" + struct.pack("<I", write_number))  # mov rax, write
-            code.extend(b"\x0f\x05")  # syscall
-        elif isinstance(operation, Write):
-            # mov rax, write; mov rdi, 1; lea rsi, [rip+disp32];
-            # mov rdx, len; syscall
-            code.extend(_mov_imm32(b"\xc0", write_number))
-            code.extend(_mov_imm32(b"\xc7", operation.fd))
-            lea_displacement_position = len(code) + 3
-            code.extend(b"\x48\x8d\x35\x00\x00\x00\x00")
-            code.extend(_mov_imm32(b"\xc2", len(operation.data)))
-            code.extend(b"\x0f\x05")
-            pending_strings.append((lea_displacement_position, operation.data))
-        elif isinstance(operation, Store):
-            _expression(code, operation.value, 0)
-            code.extend(
-                b"\x48\x89\x85" + struct.pack("<i", operation.slot * 8)
-            )
-        elif isinstance(operation, FloatStore):
-            _float_expression(code, operation.value, 0)
-            code.extend(
-                b"\xf2\x0f\x11\x85" + struct.pack("<i", operation.slot * 8)
-            )  # movsd [rbp+disp], xmm0
-        elif isinstance(operation, Label):
-            labels[operation.name] = len(code)
-        elif isinstance(operation, Jump):
-            code.extend(b"\xe9\x00\x00\x00\x00")
-            branches.append((len(code) - 4, operation.target))
-        elif isinstance(operation, JumpIfFalse):
-            _expression(code, operation.condition, 0)
-            code.extend(b"\x48\x85\xc0\x0f\x84\x00\x00\x00\x00")
-            branches.append((len(code) - 4, operation.target))
-        elif isinstance(operation, Exit):
-            code.extend(_mov_imm32(b"\xc0", exit_number))
-            code.extend(_mov_imm32(b"\xc7", operation.status))
-            code.extend(b"\x0f\x05")
-        elif isinstance(operation, ExitValue):
-            _expression(code, operation.value, 0)
-            code.extend(b"\x48\x89\xc7")  # mov rdi, rax
-            code.extend(_mov_imm32(b"\xc0", exit_number))
-            code.extend(b"\x0f\x05")
+    if module.static_bytes:
+        # One anonymous read/write mapping for every file-scope object, with
+        # its base parked in r15 for the whole run. r15 is callee-saved and
+        # this backend never writes it elsewhere, so a global keeps its address
+        # across calls.
+        code.extend(b"\x31\xff")  # xor edi, edi
+        code.extend(b"\x48\xc7\xc6" + struct.pack("<I", module.static_bytes))
+        code.extend(b"\xba\x03\x00\x00\x00")  # mov edx, PROT_READ|PROT_WRITE
+        code.extend(b"\x49\xc7\xc2" + struct.pack("<I", mmap_flags))
+        code.extend(b"\x49\xc7\xc0\xff\xff\xff\xff")  # mov r8, -1
+        code.extend(b"\x45\x31\xc9")  # xor r9d, r9d
+        code.extend(b"\x48\xc7\xc0" + struct.pack("<I", mmap_number))
+        code.extend(b"\x0f\x05")  # syscall
+        code.extend(b"\x49\x89\xc7")  # mov r15, rax
 
-    _patch_branches(code, labels, branches)
+    refs = _X86Refs()
+    pending_strings: list[tuple[int, bytes]] = []
+    _emit_x86_operations(
+        code, module.operations, 0, refs, pending_strings, system
+    )
+
+    offsets: dict[str, int] = {}
+    for function in module.functions:
+        if function.name in offsets:
+            raise ValueError(f"duplicate native IR function {function.name!r}")
+        offsets[function.name] = len(code)
+        _emit_function(code, function, refs, pending_strings, system)
+
+    # call rel32 and lea rip-relative are both relative to the END of the
+    # instruction, which is the four displacement bytes plus nothing more.
+    for position, name in refs.calls:
+        if name not in offsets:
+            raise ValueError(f"call to undefined native IR function {name!r}")
+        struct.pack_into("<i", code, position, offsets[name] - (position + 4))
+    for position, name in refs.addresses:
+        if name not in offsets:
+            raise ValueError(
+                f"address taken of undefined native IR function {name!r}"
+            )
+        struct.pack_into("<i", code, position, offsets[name] - (position + 4))
+
     for displacement_position, data in pending_strings:
         data_offset = len(code)
-        # Displacement is relative to the instruction following lea.
         displacement = data_offset - (displacement_position + 4)
         struct.pack_into("<i", code, displacement_position, displacement)
         code += data

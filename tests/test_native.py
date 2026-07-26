@@ -861,7 +861,7 @@ class Arm64CallAbiTests(unittest.TestCase):
             encode_darwin_arm64(module, 0x100004000)
 
     def test_targets_without_a_call_abi_reject_the_module(self):
-        for target in ("windows-arm64", "windows-x86_64", "linux-x86_64", "darwin-x86_64"):
+        for target in ("windows-arm64", "windows-x86_64"):
             with self.subTest(target=target):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -965,8 +965,6 @@ class Arm64StaticStorageTests(unittest.TestCase):
         for target in (
             "windows-arm64",
             "windows-x86_64",
-            "linux-x86_64",
-            "darwin-x86_64",
         ):
             with self.subTest(target=target):
                 from py2bin.native.ir import ExitValue, GlobalAddress, HeapLoad

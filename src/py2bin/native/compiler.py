@@ -241,13 +241,17 @@ def _module_uses_extern(module: Module) -> bool:
 #: saved link register, arguments in the platform argument registers, and a
 #: direct branch-and-link). Everything else must reject a module that contains
 #: a ``Function`` rather than emit a binary that cannot make the call.
-CALL_CAPABLE_TARGETS = frozenset({"darwin-arm64", "linux-arm64"})
+CALL_CAPABLE_TARGETS = frozenset(
+    {"darwin-arm64", "linux-arm64", "darwin-x86_64", "linux-x86_64"}
+)
 
 #: Targets whose encoder establishes the module's static storage block (see
 #: ``Module.static_bytes``). It is a kernel-supplied anonymous mapping whose
 #: base lives in a reserved callee-saved register for the whole run, and only
 #: the ARM64 syscall encoders set that register up.
-STATIC_CAPABLE_TARGETS = frozenset({"darwin-arm64", "linux-arm64"})
+STATIC_CAPABLE_TARGETS = frozenset(
+    {"darwin-arm64", "linux-arm64", "darwin-x86_64", "linux-x86_64"}
+)
 
 
 def _emit_native_module(
