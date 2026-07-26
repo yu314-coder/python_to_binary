@@ -644,6 +644,26 @@ class _RenameFunctionLocals(ast.NodeTransformer):
         )
 
 
+@dataclass(slots=True)
+class ComprehensionSource:
+    """One `for` clause of a comprehension, already measured.
+
+    Every clause's source is evaluated once, before any loop runs, so `span`
+    is a fact by the time the reserve is computed and stays one while the
+    loops run.
+    """
+
+    target: str
+    conditions: list[ast.expr]
+    index_slot: int
+    start: IntExpression
+    limit_slot: int
+    span: IntExpression
+    element_kind: str
+    pointer_slot: int | None
+    holds_bool: bool | None
+
+
 class Frontend:
     """Lower the first useful static-Python subset into portable native IR.
 
@@ -733,6 +753,10 @@ class Frontend:
         # in an inlined __enter__ harmless.
         self.finally_scopes: list[tuple[int, int, int]] = []
         self.continue_targets: list[str] = []
+        # The list names a `for` is walking right now, innermost last. A walk
+        # takes the length once and counts up, so a body that shortens the list
+        # would run off the end of it.
+        self.iterated_lists: list[str] = []
         self.return_targets: list[tuple[int | None, str]] = []
         self.active_functions: list[tuple[int, str]] = []
 
@@ -877,6 +901,49 @@ class Frontend:
                 elif isinstance(node, ast.For):
                     names.update(cls.target_names(node.target))
         return names
+
+    @staticmethod
+    def block_breaks(body: list[ast.stmt]) -> bool:
+        """Whether a `break` in this block belongs to the loop that owns it.
+
+        A break inside a nested loop is that loop's, and a break inside a
+        nested function is not a break out of anything here, so neither says
+        the owning loop can skip its `else`.
+        """
+
+        found = False
+
+        class BreakVisitor(ast.NodeVisitor):
+            def visit_Break(self, node: ast.Break) -> None:
+                nonlocal found
+                found = True
+
+            def visit_For(self, node: ast.For) -> None:
+                # The nested loop owns its own breaks, but its `else` body is
+                # still part of this block.
+                for statement in node.orelse:
+                    self.visit(statement)
+
+            def visit_AsyncFor(self, node) -> None:
+                return
+
+            def visit_While(self, node: ast.While) -> None:
+                for statement in node.orelse:
+                    self.visit(statement)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                return
+
+            def visit_AsyncFunctionDef(self, node) -> None:
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+        visitor = BreakVisitor()
+        for statement in body:
+            visitor.visit(statement)
+        return found
 
     @classmethod
     def loop_mutated_names(cls, tree: ast.AST) -> set[str]:
@@ -1178,11 +1245,13 @@ class Frontend:
                 raise NativeCompileError(
                     self.path,
                     node,
-                    "a native function cannot return a float yet: the call site "
-                    "has to choose an integer or float lowering before the body "
-                    "is inlined, and the returned kind is only known afterwards; "
-                    "pass a float in and assign the result to an attribute or "
-                    "list element instead",
+                    "a native function with a loop or an early return cannot "
+                    "return a float: this body is inlined statement by "
+                    "statement, and the call site had to choose an integer or "
+                    "float lowering before that started. A body that is one "
+                    "expression, or a chain of ifs that all end in a return, "
+                    "is folded into a conditional expression instead and can "
+                    "return a float.",
                 )
             self.operations.append(Store(result_slot, self.integer(node.value)))
             self.operations.append(Jump(return_label))
@@ -1197,6 +1266,8 @@ class Frontend:
             self.import_from(node)
         elif isinstance(node, ast.Import):
             self.import_statement(node)
+        elif isinstance(node, ast.Delete):
+            self.delete_statement(node)
         elif isinstance(node, ast.Raise):
             self.raise_statement(node)
         elif isinstance(node, ast.With):
@@ -2744,6 +2815,19 @@ class Frontend:
             key_kind, value_kind = self.dict_kinds(kind)
             self.dict_assignment(name, expression, key_kind, value_kind)
         elif self.list_kind(kind) is not None:
+            if (
+                isinstance(expression, ast.Name)
+                and self.list_kind_of(expression.id) is not None
+            ):
+                raise NativeCompileError(
+                    self.path,
+                    expression,
+                    f"a native list variable holds the block itself, not a "
+                    f"reference to it, so {name!r} cannot be another name for "
+                    f"{expression.id!r}: appending moves the block and only one "
+                    "of them would follow it. Copy it with a slice "
+                    f"({expression.id}[:]) if a second list is what you want",
+                )
             self.list_assignment(name, expression, self.list_kind(kind))
         elif kind == "str":
             self.string_assignment(name, expression)
@@ -2941,6 +3025,237 @@ class Frontend:
         self.operations.append(Label(end))
         return result
 
+    def emit_list_copy(self, source: IntExpression) -> IntExpression:
+        """A fresh block holding the same elements as ``source``.
+
+        The elements move as raw 64-bit words, so a float's bit pattern
+        arrives unchanged and -0.0 stays -0.0.
+        """
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, source))
+        origin = IntLoad(source_slot)
+        count_slot = self.new_temp()
+        self.operations.append(
+            Store(count_slot, HeapLoad(IntBinary("add", origin, IntConstant(8)), 8))
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                result_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.LIST_HEADER_BYTES),
+                    IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, IntLoad(count_slot), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result, IntConstant(8)), IntLoad(count_slot), 8
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("list_copy")
+        end = self.new_label("list_copy_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(count_slot)), end
+            )
+        )
+        offset = IntBinary(
+            "add",
+            IntConstant(self.LIST_HEADER_BYTES),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result, offset),
+                HeapLoad(IntBinary("add", origin, offset), 8),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return result
+
+    def list_word_address(
+        self, pointer_slot: int, index: IntExpression
+    ) -> IntExpression:
+        """The address of element ``index`` of the list in ``pointer_slot``."""
+
+        return IntBinary(
+            "add",
+            IntBinary(
+                "add", IntLoad(pointer_slot), IntConstant(self.LIST_HEADER_BYTES)
+            ),
+            IntBinary("mul", index, IntConstant(8)),
+        )
+
+    def emit_refuse_nan(self, pointer_slot: int) -> None:
+        """Refuse to sort a float list that holds a NaN.
+
+        CPython does not raise on one - it returns whatever order timsort's
+        particular sequence of comparisons happens to leave behind, and an
+        insertion sort makes a different sequence. Matching would mean
+        reimplementing timsort, so a NaN is refused rather than answered with a
+        different order. A NaN is the one value that is not equal to itself,
+        and both backends make that comparison unordered-correct.
+        """
+
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                length_slot,
+                HeapLoad(IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8),
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        item_slot = self.new_temp()
+        start = self.new_label("nan_scan")
+        found = self.new_label("nan_scan_found")
+        end = self.new_label("nan_scan_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
+            )
+        )
+        self.operations.append(
+            Store(
+                item_slot,
+                HeapLoad(self.list_word_address(pointer_slot, IntLoad(index_slot)), 8),
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare(
+                    "eq",
+                    BitsFloat(IntLoad(item_slot)),
+                    BitsFloat(IntLoad(item_slot)),
+                ),
+                found,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(found))
+        self.raise_exception(
+            "ValueError",
+            b"ValueError: py2bin cannot sort a list containing nan; CPython's "
+            b"order for one is whatever its own comparisons leave behind, and "
+            b"this sort would produce a different one\n",
+        )
+        self.operations.append(Label(end))
+
+    def emit_insertion_sort(
+        self, pointer_slot: int, element_kind: str, descending: bool
+    ) -> None:
+        """Sort a list block in place, stably, allocating nothing.
+
+        Insertion sort rather than something faster because the arena never
+        reclaims: a merge sort's scratch buffer would be abandoned once per
+        call, and a sort inside a loop would exhaust the arena. Only a strict
+        comparison moves an element, which is what keeps equal elements in the
+        order they arrived - observable when -0.0 sits beside 0.0.
+        """
+
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                length_slot,
+                HeapLoad(IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8),
+            )
+        )
+        outer_slot = self.new_temp()
+        self.operations.append(Store(outer_slot, IntConstant(1)))
+        value_slot = self.new_temp()
+        inner_slot = self.new_temp()
+        outer = self.new_label("sort_outer")
+        outer_end = self.new_label("sort_outer_end")
+        inner = self.new_label("sort_inner")
+        inner_end = self.new_label("sort_inner_end")
+        self.operations.append(Label(outer))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(outer_slot), IntLoad(length_slot)), outer_end
+            )
+        )
+        # The element being placed has to be held in a slot: the shifting below
+        # overwrites the position it came from.
+        self.operations.append(
+            Store(
+                value_slot,
+                HeapLoad(self.list_word_address(pointer_slot, IntLoad(outer_slot)), 8),
+            )
+        )
+        self.operations.append(
+            Store(inner_slot, IntBinary("sub", IntLoad(outer_slot), IntConstant(1)))
+        )
+        self.operations.append(Label(inner))
+        # Two jumps rather than one `j >= 0 and a[j] > v`: the backends evaluate
+        # an expression tree eagerly, so the fused form would load a[-1] - the
+        # word in front of the block - on every insertion at the front.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ge", IntLoad(inner_slot), IntConstant(0)), inner_end
+            )
+        )
+        held = HeapLoad(self.list_word_address(pointer_slot, IntLoad(inner_slot)), 8)
+        if element_kind == "float":
+            # Compare the numbers, not the words holding them: read as signed
+            # integers, -1.0 sorts above -2.0, the reverse of the float order.
+            comparison = FloatCompare(
+                "lt" if descending else "gt",
+                BitsFloat(held),
+                BitsFloat(IntLoad(value_slot)),
+            )
+        else:
+            comparison = IntCompare(
+                "lt" if descending else "gt", held, IntLoad(value_slot)
+            )
+        self.operations.append(JumpIfFalse(comparison, inner_end))
+        self.operations.append(
+            HeapStore(
+                self.list_word_address(
+                    pointer_slot, IntBinary("add", IntLoad(inner_slot), IntConstant(1))
+                ),
+                HeapLoad(self.list_word_address(pointer_slot, IntLoad(inner_slot)), 8),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(inner_slot, IntBinary("sub", IntLoad(inner_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(inner))
+        self.operations.append(Label(inner_end))
+        self.operations.append(
+            HeapStore(
+                self.list_word_address(
+                    pointer_slot, IntBinary("add", IntLoad(inner_slot), IntConstant(1))
+                ),
+                IntLoad(value_slot),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(outer_slot, IntBinary("add", IntLoad(outer_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(outer))
+        self.operations.append(Label(outer_end))
+
     def emit_codepoint_offset(
         self, pointer: IntExpression, count: IntExpression
     ) -> IntExpression:
@@ -3074,9 +3389,10 @@ class Frontend:
             )
 
     _AGGREGATES = {"sum": "add", "min": "lt", "max": "gt"}
+    _AGGREGATE_CALLS = frozenset({"sum", "min", "max", "any", "all"})
 
     def aggregate_call(self, node: ast.Call, bindings, call_stack):
-        """`sum(xs)`, `min(xs)`, `max(xs)` over a runtime list."""
+        """`sum/min/max/any/all(xs)` over a runtime list or a generator."""
 
         name = node.func.id
         if len(node.args) != 1 or node.keywords:
@@ -3084,10 +3400,17 @@ class Frontend:
                 self.path, node, f"native {name}() takes one iterable"
             )
         source = node.args[0]
+        if isinstance(source, ast.GeneratorExp):
+            return self.aggregate_over_generator(
+                node, name, source, bindings, call_stack
+            )
         element_kind = self.list_kind(self.expression_type(source, bindings))
         if element_kind is None:
             raise NativeCompileError(
-                self.path, node, f"native {name}() takes a runtime list"
+                self.path,
+                node,
+                f"native {name}() takes a runtime list or a generator "
+                "expression over one",
             )
         if element_kind != "int":
             raise NativeCompileError(
@@ -3103,12 +3426,151 @@ class Frontend:
         self.operations.append(
             Store(length_slot, HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8))
         )
-        if name != "sum":
-            # min() and max() of an empty list raise; nothing to return here.
+        first = IntBinary("add", pointer, IntConstant(self.LIST_HEADER_BYTES))
+
+        def walk(step) -> None:
+            index_slot = self.new_temp()
+            self.operations.append(Store(index_slot, IntConstant(0)))
+            start = self.new_label("aggregate")
+            end = self.new_label("aggregate_end")
+            self.operations.append(Label(start))
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
+                )
+            )
+            step(
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        first,
+                        IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                    ),
+                    8,
+                )
+            )
+            self.operations.append(
+                Store(
+                    index_slot,
+                    IntBinary("add", IntLoad(index_slot), IntConstant(1)),
+                )
+            )
+            self.operations.append(Jump(start))
+            self.operations.append(Label(end))
+
+        return self.emit_aggregate(name, walk)
+
+    def aggregate_over_generator(
+        self,
+        node: ast.Call,
+        name: str,
+        generator: ast.GeneratorExp,
+        bindings=None,
+        call_stack: tuple[int, ...] = (),
+    ):
+        """`sum(v * 2 for v in xs)` lowered as the loop it describes.
+
+        A generator expression is consumed here and nowhere else, so nothing
+        has to represent the lazy object: the loops run and the accumulator is
+        the answer. No list is built, which matters because the arena never
+        gives anything back.
+        """
+
+        element_kind = self.comprehension_element_kind(generator, bindings)
+        if element_kind != "int":
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native {name}() works on integer elements; a float one "
+                "would need a float accumulator this call cannot return",
+            )
+        sources, element = self.comprehension_clause_sources(
+            generator, bindings, call_stack
+        )
+
+        def walk(step) -> None:
+            self.emit_comprehension_loops(
+                sources,
+                lambda: step(self.integer(element, bindings, call_stack)),
+                bindings,
+                call_stack,
+            )
+
+        return self.emit_aggregate(name, walk)
+
+    def emit_aggregate(self, name: str, emit_loop):
+        """Fold every value ``emit_loop`` hands to the ``step`` it is given.
+
+        Only the accumulator lives here, so walking a list and running a
+        generator expression's loops share one definition of what each of the
+        five names means.
+        """
+
+        result_slot = self.new_temp()
+        seeded_slot = self.new_temp() if name in {"min", "max"} else None
+        self.operations.append(
+            Store(result_slot, IntConstant(1 if name == "all" else 0))
+        )
+        if seeded_slot is not None:
+            self.operations.append(Store(seeded_slot, IntConstant(0)))
+        done = self.new_label("aggregate_done")
+
+        def step(value: IntExpression) -> None:
+            value_slot = self.new_temp()
+            self.operations.append(Store(value_slot, value))
+            item = IntLoad(value_slot)
+            if name == "sum":
+                self.operations.append(
+                    Store(result_slot, IntBinary("add", IntLoad(result_slot), item))
+                )
+                return
+            if name in {"any", "all"}:
+                keep_going = self.new_label("aggregate_keep")
+                decisive = "ne" if name == "any" else "eq"
+                self.operations.append(
+                    JumpIfFalse(
+                        IntCompare(decisive, item, IntConstant(0)), keep_going
+                    )
+                )
+                self.operations.append(
+                    Store(result_slot, IntConstant(1 if name == "any" else 0))
+                )
+                # CPython stops at the first decisive element. Nothing here has
+                # an effect worth observing, but leaving early is still what
+                # the loop means.
+                self.operations.append(Jump(done))
+                self.operations.append(Label(keep_going))
+                return
+            take = self.new_label("aggregate_take")
+            kept = self.new_label("aggregate_kept")
+            # The first item seeds the accumulator: no value a 64-bit slot can
+            # hold is unavailable to an element, so emptiness needs its own flag.
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(seeded_slot), IntConstant(0)), take
+                )
+            )
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        self._AGGREGATES[name], item, IntLoad(result_slot)
+                    ),
+                    kept,
+                )
+            )
+            self.operations.append(Label(take))
+            self.operations.append(Store(result_slot, item))
+            self.operations.append(Store(seeded_slot, IntConstant(1)))
+            self.operations.append(Label(kept))
+
+        emit_loop(step)
+        if seeded_slot is not None:
+            # min() and max() of an empty iterable raise; with a generator the
+            # emptiness is only known once the loops are over.
             ok = self.new_label("aggregate_ok")
             self.operations.append(
                 JumpIfFalse(
-                    IntCompare("gt", IntLoad(length_slot), IntConstant(0)),
+                    IntCompare("ne", IntLoad(seeded_slot), IntConstant(0)),
                     ok + "_empty",
                 )
             )
@@ -3119,60 +3581,148 @@ class Frontend:
                 f"ValueError: {name}() iterable argument is empty\n".encode(),
             )
             self.operations.append(Label(ok))
-        result_slot = self.new_temp()
-        first = IntBinary(
-            "add", pointer, IntConstant(self.LIST_HEADER_BYTES)
-        )
-        self.operations.append(
-            Store(
-                result_slot,
-                IntConstant(0) if name == "sum" else HeapLoad(first, 8),
-            )
-        )
-        index_slot = self.new_temp()
-        self.operations.append(
-            Store(index_slot, IntConstant(0 if name == "sum" else 1))
-        )
-        start = self.new_label("aggregate")
-        end = self.new_label("aggregate_end")
-        step = self.new_label("aggregate_next")
-        self.operations.append(Label(start))
-        self.operations.append(
-            JumpIfFalse(
-                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
-            )
-        )
-        item = HeapLoad(
-            IntBinary(
-                "add", first, IntBinary("mul", IntLoad(index_slot), IntConstant(8))
-            ),
-            8,
-        )
-        if name == "sum":
-            self.operations.append(
-                Store(result_slot, IntBinary("add", IntLoad(result_slot), item))
-            )
-        else:
-            item_slot = self.new_temp()
-            self.operations.append(Store(item_slot, item))
-            self.operations.append(
-                JumpIfFalse(
-                    IntCompare(
-                        self._AGGREGATES[name],
-                        IntLoad(item_slot),
-                        IntLoad(result_slot),
-                    ),
-                    step,
-                )
-            )
-            self.operations.append(Store(result_slot, IntLoad(item_slot)))
-        self.operations.append(Label(step))
-        self.operations.append(
-            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
-        )
-        self.operations.append(Jump(start))
-        self.operations.append(Label(end))
+        if name in {"any", "all"}:
+            self.operations.append(Label(done))
         return IntLoad(result_slot)
+
+    def sort_direction(self, node: ast.expr, keywords: list[ast.keyword]) -> bool:
+        """Read `reverse=` off a sort, refusing everything else by name."""
+
+        descending = False
+        for keyword in keywords:
+            if keyword.arg is None:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native sorting does not take **kwargs; the only keyword it "
+                    "accepts is reverse=True or reverse=False",
+                )
+            if keyword.arg != "reverse":
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"native sorting does not support {keyword.arg}=; there is "
+                    "no way to hold a comparison callable in the subset, so "
+                    "only reverse=True and reverse=False are accepted",
+                )
+            try:
+                value = self.constant(keyword.value)
+            except NativeCompileError:
+                value = None
+            if not isinstance(value, bool):
+                raise NativeCompileError(
+                    self.path,
+                    keyword.value,
+                    "native sorting needs reverse= to be the constant True or "
+                    "False; a direction only known at run time would need both "
+                    "comparison directions compiled in and chosen between",
+                )
+            descending = value
+        return descending
+
+    def sorted_call_shape(self, node: ast.expr):
+        """The list `sorted(...)` sorts, its element kind and its direction.
+
+        Returns None only when this is not a `sorted()` call at all. A call
+        that is one but is spelled in a way the subset cannot do is refused
+        here, so the keyword or the argument names itself instead of reaching
+        a generic "not an integer" message further down.
+        """
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id != "sorted"
+            or node.func.id in self.functions
+        ):
+            return None
+        if len(node.args) != 1:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native sorted() takes one runtime list, optionally with "
+                "reverse=True or reverse=False",
+            )
+        source = node.args[0]
+        element_kind = self.list_kind(self.expression_type(source))
+        if element_kind is None:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native sorted() takes a runtime list of integers or floats; "
+                "sorting a string or a dict would have to build a list of "
+                "strings or of keys, which is not in the subset",
+            )
+        return source, element_kind, self.sort_direction(node, node.keywords)
+
+    def list_source_name(self, node: ast.expr) -> str | None:
+        """The name whose bookkeeping answers for this list expression."""
+
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self.list_source_name(node.value)
+        shape = self.sorted_call_shape(node)
+        if shape is not None:
+            return self.list_source_name(shape[0])
+        return None
+
+    def list_holds_bool(self, node: ast.expr) -> bool | None:
+        """Whether every element of this list expression is a bool.
+
+        `container_bool` is keyed by name, so a list that was never bound to
+        one - a comprehension's result, a slice of a slice - has no entry
+        there and its elements would print as 1 and 0.
+        """
+
+        if isinstance(node, ast.ListComp):
+            try:
+                return self.comprehension_element_bool(node)
+            except NativeCompileError:
+                return None
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self.list_holds_bool(node.value)
+        shape = self.sorted_call_shape(node)
+        if shape is not None:
+            return self.list_holds_bool(shape[0])
+        name = self.list_source_name(node)
+        if name is None:
+            return None
+        return self.container_bool.get(name)
+
+    def refuse_bool_list(self, node: ast.expr, source: ast.expr, what: str) -> None:
+        """Refuse to reorder a list of bools.
+
+        `sorted([True, False])` is `[False, True]` and prints as bools, but
+        nothing at run time tells True from 1, and the name a sorted copy is
+        bound to does not inherit the source's entry. Reordering one would
+        print 1 and 0.
+        """
+
+        if self.list_holds_bool(source) is not True:
+            return
+        raise NativeCompileError(
+            self.path,
+            node,
+            f"native {what} works on lists of integers or floats, and this one "
+            "holds bools; nothing at run time tells True from 1, so the result "
+            "would print as 1 and 0. Store int(b) instead if the numbers are "
+            "what you want",
+        )
+
+    def sorted_call(self, node: ast.Call) -> IntExpression:
+        """`sorted(xs)` - a new sorted list, leaving `xs` in its own order."""
+
+        source, element_kind, descending = self.sorted_call_shape(node)
+        self.refuse_bool_list(node, source, "sorted()")
+        pointer_slot = self.new_temp()
+        self.operations.append(
+            Store(pointer_slot, self.emit_list_copy(self.list_pointer(source)))
+        )
+        if element_kind == "float":
+            self.emit_refuse_nan(pointer_slot)
+        self.emit_insertion_sort(pointer_slot, element_kind, descending)
+        return IntLoad(pointer_slot)
 
     def membership_container_kind(self, node: ast.expr) -> str | None:
         """What `x in node` would search: a dict, a string, or a list's kind."""
@@ -3244,36 +3794,46 @@ class Frontend:
         self.operations.append(Label(end))
         return found_slot
 
-    def emit_substring_search(self, needle: ast.expr, haystack: ast.expr) -> int:
-        """Return a 0/1 slot saying whether one string contains the other.
+    def emit_substring_scan(
+        self, haystack_slot: int, needle_slot: int, from_slot: int
+    ) -> tuple[int, int]:
+        """Look for a needle at or after a byte offset into a haystack.
+
+        Returns a 0/1 slot and the byte offset the match starts at. The three
+        arguments are slot numbers holding two string-block pointers and a
+        starting offset; nothing here re-evaluates them, so a caller may drive
+        this from inside a loop to walk every occurrence.
 
         A plain scan: for every starting byte, compare forward. UTF-8 makes
         that safe without decoding, because a multi-byte character can never
         match part of another one - lead and continuation bytes come from
         disjoint ranges.
+
+        Only code-point boundaries are offered as starting positions. For a
+        non-empty needle that is already implied, since its first byte can
+        never equal a continuation byte; the empty needle is what needs it,
+        because CPython finds an empty string between characters and not
+        between the bytes of one.
         """
 
-        outer_slot = self.new_temp()
-        inner_slot = self.new_temp()
-        self.operations.append(Store(outer_slot, self.string_pointer(haystack)))
-        self.operations.append(Store(inner_slot, self.string_pointer(needle)))
-        outer = IntBinary("add", IntLoad(outer_slot), IntConstant(8))
-        inner = IntBinary("add", IntLoad(inner_slot), IntConstant(8))
+        outer = IntBinary("add", IntLoad(haystack_slot), IntConstant(8))
+        inner = IntBinary("add", IntLoad(needle_slot), IntConstant(8))
         outer_length = self.new_temp()
         inner_length = self.new_temp()
         self.operations.append(
-            Store(outer_length, HeapLoad(IntLoad(outer_slot), 8))
+            Store(outer_length, HeapLoad(IntLoad(haystack_slot), 8))
         )
         self.operations.append(
-            Store(inner_length, HeapLoad(IntLoad(inner_slot), 8))
+            Store(inner_length, HeapLoad(IntLoad(needle_slot), 8))
         )
         found_slot = self.new_temp()
         self.operations.append(Store(found_slot, IntConstant(0)))
         start_slot = self.new_temp()
-        self.operations.append(Store(start_slot, IntConstant(0)))
+        self.operations.append(Store(start_slot, IntLoad(from_slot)))
         scan = self.new_label("find")
         done = self.new_label("find_done")
         next_start = self.new_label("find_next")
+        aligned = self.new_label("find_aligned")
         self.operations.append(Label(scan))
         # Stop once the remainder is shorter than what is being looked for;
         # this also makes the empty needle match at once, as Python does.
@@ -3287,6 +3847,31 @@ class Frontend:
                 done,
             )
         )
+        # The end of the string is a boundary, and reading a byte there would
+        # be a read past the block.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(start_slot), IntLoad(outer_length)),
+                aligned,
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne",
+                    IntBinary(
+                        "and",
+                        HeapLoad(
+                            IntBinary("add", outer, IntLoad(start_slot)), 1
+                        ),
+                        IntConstant(0xC0),
+                    ),
+                    IntConstant(0x80),
+                ),
+                next_start,
+            )
+        )
+        self.operations.append(Label(aligned))
         cursor_slot = self.new_temp()
         self.operations.append(Store(cursor_slot, IntConstant(0)))
         compare = self.new_label("find_compare")
@@ -3332,6 +3917,22 @@ class Frontend:
         )
         self.operations.append(Jump(scan))
         self.operations.append(Label(done))
+        return found_slot, start_slot
+
+    def emit_substring_search(self, needle: ast.expr, haystack: ast.expr) -> int:
+        """Return a 0/1 slot saying whether one string contains the other."""
+
+        haystack_slot = self.new_temp()
+        needle_slot = self.new_temp()
+        from_slot = self.new_temp()
+        self.operations.append(
+            Store(haystack_slot, self.string_pointer(haystack))
+        )
+        self.operations.append(Store(needle_slot, self.string_pointer(needle)))
+        self.operations.append(Store(from_slot, IntConstant(0)))
+        found_slot, _ = self.emit_substring_scan(
+            haystack_slot, needle_slot, from_slot
+        )
         return found_slot
 
     def note_stored_bool(self, name: str, node: ast.expr, where: str) -> None:
@@ -3493,8 +4094,27 @@ class Frontend:
             )
         )
 
+    def list_sort_call(self, node: ast.Call, name: str) -> None:
+        """`xs.sort()` - reorder the block the name already points at."""
+
+        if node.args:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native sort() takes no positional argument; there is no way "
+                "to hold a comparison callable in the subset, so only "
+                "reverse=True and reverse=False are accepted",
+            )
+        descending = self.sort_direction(node, node.keywords)
+        self.refuse_bool_list(node, node.func.value, "sort()")
+        element_kind = self.list_kind_of(name)
+        pointer_slot = self.slot(name)
+        if element_kind == "float":
+            self.emit_refuse_nan(pointer_slot)
+        self.emit_insertion_sort(pointer_slot, element_kind, descending)
+
     def list_method_call(self, node: ast.Call) -> bool:
-        """Lower `xs.append(v)`; returns whether this was one."""
+        """Lower `xs.append(v)` and `xs.sort()`; returns whether this was one."""
 
         if (
             not isinstance(node.func, ast.Attribute)
@@ -3503,12 +4123,15 @@ class Frontend:
         ):
             return False
         name = node.func.value.id
+        if node.func.attr == "sort":
+            self.list_sort_call(node, name)
+            return True
         if node.func.attr != "append":
             raise NativeCompileError(
                 self.path,
                 node,
-                f"native lists support append(); {node.func.attr}() is not in "
-                "the subset",
+                f"native lists support append() and sort(); {node.func.attr}() "
+                "is not in the subset",
             )
         if len(node.args) != 1 or node.keywords:
             raise NativeCompileError(
@@ -3545,9 +4168,41 @@ class Frontend:
             return self.emit_list_slice(
                 self.list_pointer(node.value), node.slice
             )
+        if self.sorted_call_shape(node) is not None:
+            return self.sorted_call(node)
+        self.refuse_lazy_comprehension(node)
+        if isinstance(node, ast.List):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native list literal is built into a name's own slot, so it "
+                "cannot be used in place here; bind it to a name first and "
+                "iterate that",
+            )
         raise NativeCompileError(
             self.path, node, "expression is not a native runtime list"
         )
+
+    def refuse_lazy_comprehension(self, node: ast.expr) -> None:
+        """Name the comprehension forms that have no native representation."""
+
+        if isinstance(node, ast.GeneratorExp):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a generator expression is a lazy object and nothing here can "
+                "hold one; it is supported only as the sole argument of sum(), "
+                "min(), max(), any() or all(). Write [ ... ] for a list "
+                "comprehension if you need the values kept",
+            )
+        if isinstance(node, (ast.SetComp, ast.DictComp)):
+            what = "set" if isinstance(node, ast.SetComp) else "dict"
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"a native comprehension builds a list; there is no runtime "
+                f"{what} for a {what} comprehension to build",
+            )
 
     def list_assignment(
         self, name: str, node: ast.expr, element_kind: str
@@ -3555,8 +4210,16 @@ class Frontend:
         if not isinstance(node, ast.List):
             # Not a literal, but perhaps a list-valued expression such as a
             # slice; that block is already built, so just bind the name to it.
+            # Ask before emitting: the answer is about the source expression,
+            # and lowering it renames a comprehension's targets.
+            holds_bool = self.list_holds_bool(node)
             pointer = self.list_pointer(node)
+            self.container_bool[name] = holds_bool
             self.runtime_names.add(name)
+            # Whatever length a literal left recorded under this name is no
+            # longer this list's length, and an index checked against the old
+            # one would be refused for being out of a range it is inside.
+            self.list_lengths.pop(name, None)
             self.operations.append(Store(self.slot(name), pointer))
             return
         elements = node.elts
@@ -3671,7 +4334,35 @@ class Frontend:
                 "operand, because its bounds check would run even when Python "
                 "would not evaluate that branch; use an if statement instead",
             )
-        index = self.integer(index_node)
+        index_slot, _length_slot = self.resolve_list_index(
+            pointer,
+            self.integer(index_node),
+            # CPython words the two cases differently, and matching it is the
+            # difference between the same message and merely the same class.
+            assigning=isinstance(node.ctx, ast.Store),
+        )
+        offset = IntBinary(
+            "add",
+            IntConstant(self.LIST_HEADER_BYTES),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        )
+        return IntBinary("add", pointer, offset)
+
+    def resolve_list_index(
+        self,
+        pointer: IntExpression,
+        index: IntExpression,
+        *,
+        assigning: bool = False,
+    ) -> tuple[int, int]:
+        """Normalize an index against a list's length and check it is in range.
+
+        Returns the slots holding the resolved index and the length. A negative
+        index counts back from the end the way Python's does, and one outside
+        the list raises IndexError rather than addressing outside the block.
+        ``assigning`` picks the wording CPython uses for a store or a del.
+        """
+
         bad_label = self.new_label("index_error")
         ok_label = self.new_label("index_ok")
         index_slot = self.slot(f"<index-{bad_label}>")
@@ -3705,15 +4396,157 @@ class Frontend:
         # Uncaught, this prints to stderr and exits 1 as CPython does; inside a
         # try it goes to the handler, so `except IndexError` works on it.
         self.raise_exception(
-            "IndexError", b"IndexError: list index out of range\n"
+            "IndexError",
+            b"IndexError: list assignment index out of range\n"
+            if assigning
+            else b"IndexError: list index out of range\n",
         )
         self.operations.append(Label(ok_label))
-        offset = IntBinary(
-            "add",
-            IntConstant(self.LIST_HEADER_BYTES),
-            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        return index_slot, length_slot
+
+    def delete_statement(self, node: ast.Delete) -> None:
+        """`del xs[i]` on a runtime list; everything else is refused by name."""
+
+        # Python evaluates the targets left to right, and each one can raise.
+        for target in node.targets:
+            self.delete_list_element(target)
+
+    def delete_list_element(self, target: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"del {target.id} is not supported: a native variable is a "
+                "stack slot holding a value, with nothing in it that could "
+                "record being unbound, so a later read cannot raise "
+                "NameError the way CPython's would; del one element of a "
+                "runtime list instead",
+            )
+        if isinstance(target, ast.Attribute):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "del on an attribute is not supported: a native object's "
+                "fields are fixed slots laid out at build time, so a later "
+                "read of a deleted one cannot raise AttributeError; del one "
+                "element of a runtime list instead",
+            )
+        if not isinstance(target, ast.Subscript):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "native del takes one element of a runtime list held by a name",
+            )
+        if isinstance(target.slice, ast.Slice):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "del on a list slice is not supported; del one element at a "
+                "time",
+            )
+        if (
+            isinstance(target.value, ast.Name)
+            and self.dict_kinds_of(target.value.id) is not None
+        ):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "del on a native dict is not supported: the open-addressing "
+                "table has no tombstone state, so probing past a deleted entry "
+                "would stop early and report a live key as missing; del one "
+                "element of a runtime list instead",
+            )
+        if (
+            not isinstance(target.value, ast.Name)
+            or self.list_kind_of(target.value.id) is None
+        ):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "native del takes one element of a runtime list held by a name",
+            )
+        name = target.value.id
+        if name in self.iterated_lists:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"del cannot shorten {name!r} while a for loop is walking it: "
+                "the walk took its length once and counts up, so it would run "
+                "past the new end and yield an element CPython's iterator "
+                "skips; collect the indexes to remove and del them after the "
+                "loop",
+            )
+        pointer = IntLoad(self.slot(name))
+        length = self.list_lengths.get(name)
+        try:
+            folded = self.constant(target.slice)
+        except NativeCompileError:
+            folded = None
+        # A length known at build time settles a constant index now, the same
+        # way indexing does, rather than leaving it to the run-time check.
+        if (
+            isinstance(folded, int)
+            and not isinstance(folded, bool)
+            and length is not None
+        ):
+            resolved = folded + length if folded < 0 else folded
+            if not 0 <= resolved < length:
+                raise NativeCompileError(
+                    self.path,
+                    target,
+                    f"native list index {folded} is out of range for {name!r} "
+                    f"(length {length})",
+                )
+        index_slot, length_slot = self.resolve_list_index(
+            pointer, self.integer(target.slice), assigning=True
         )
-        return IntBinary("add", pointer, offset)
+        elements = IntBinary("add", pointer, IntConstant(self.LIST_HEADER_BYTES))
+        cursor_slot = self.new_temp()
+        self.operations.append(Store(cursor_slot, IntLoad(index_slot)))
+        shift = self.new_label("del_shift")
+        shifted = self.new_label("del_shifted")
+        self.operations.append(Label(shift))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntBinary("add", IntLoad(cursor_slot), IntConstant(1)),
+                    IntLoad(length_slot),
+                ),
+                shifted,
+            )
+        )
+        # One 8-byte word per element whatever the list holds: a float lives in
+        # it as its bit pattern, so moving the word moves the value.
+        element = IntBinary(
+            "add",
+            elements,
+            IntBinary("mul", IntLoad(cursor_slot), IntConstant(8)),
+        )
+        self.operations.append(
+            HeapStore(
+                element,
+                HeapLoad(IntBinary("add", element, IntConstant(8)), 8),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(cursor_slot, IntBinary("add", IntLoad(cursor_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(shift))
+        self.operations.append(Label(shifted))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(8)),
+                IntBinary("sub", IntLoad(length_slot), IntConstant(1)),
+                8,
+            )
+        )
+        # Another name can hold this same block, and its recorded length is now
+        # one too many - which would let a constant index past the new end pass
+        # the build-time check and skip the run-time one. Nothing here tracks
+        # which names alias which block, so every recorded length goes.
+        self.list_lengths.clear()
 
     def subscript_dict_kinds(self, node: ast.Subscript) -> tuple[str, str] | None:
         if not isinstance(node.value, ast.Name):
@@ -3822,6 +4655,12 @@ class Frontend:
                     target.slice,
                     f"this dict has {key_kind} keys",
                 )
+            if key_kind == "int":
+                self.note_stored_bool(
+                    self.dict_keys_name(target.value.id),
+                    target.slice,
+                    "this dict's keys",
+                )
             if value_kind == "float":
                 if self.expression_type(value) not in {"float", "int"}:
                     raise NativeCompileError(
@@ -3870,10 +4709,16 @@ class Frontend:
 
     # --- runtime dictionaries -----------------------------------------------
     #
-    # Layout: [capacity][count] then `capacity` slots of [state][key][value],
-    # 24 bytes each. A state of 0 means the slot is empty; collisions are
-    # resolved by linear probing, and the table doubles and rehashes once it
-    # passes half full.
+    # Layout: [capacity][count][keys] then `capacity` slots of
+    # [state][key][value], 24 bytes each. A state of 0 means the slot is empty;
+    # collisions are resolved by linear probing, and the table doubles and
+    # rehashes once it passes half full.
+    #
+    # The third header word points at a runtime list of the keys in the order
+    # they were first stored. The table itself cannot answer that question -
+    # walking it yields hash order, and CPython iterates in insertion order -
+    # so the order is recorded as it happens and iteration walks the list,
+    # looking each key back up in the table.
     #
     # Keys are either signed 64-bit integers or runtime strings, and values are
     # either signed 64-bit integers or IEEE-754 doubles held as their bit
@@ -3891,7 +4736,8 @@ class Frontend:
 
     LIST_HEADER_BYTES = 16
     DICT_SLOT_BYTES = 24
-    DICT_HEADER_BYTES = 16
+    DICT_HEADER_BYTES = 24
+    DICT_KEYS_OFFSET = 16
     DICT_KEY_KINDS = {"int", "str"}
     DICT_VALUE_KINDS = {"int", "float"}
 
@@ -3910,6 +4756,50 @@ class Frontend:
 
     def dict_kinds_of(self, name: str) -> tuple[str, str] | None:
         return self.dict_kinds(self.value_types.get(name))
+
+    @staticmethod
+    def dict_keys_name(name: str) -> str:
+        """The bookkeeping name under which a dict's KEYS are bools or not.
+
+        The values already answer to ``name``, and keys need their own answer:
+        `{True: 1}` iterates to True, not to 1.
+        """
+
+        return f"{name}<keys>"
+
+    def emit_dict_key_order_block(
+        self, pointer_slot: int, entries: int, bump: int
+    ) -> None:
+        """Give a fresh dict its insertion-order list, empty."""
+
+        keys_slot = self.new_temp()
+        capacity = max(4, entries)
+        self.operations.append(
+            HeapAlloc(
+                keys_slot,
+                IntConstant(self.LIST_HEADER_BYTES + capacity * 8),
+                bump,
+            )
+        )
+        self.operations.append(
+            HeapStore(IntLoad(keys_slot), IntConstant(capacity), 8)
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(keys_slot), IntConstant(8)),
+                IntConstant(0),
+                8,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary(
+                    "add", IntLoad(pointer_slot), IntConstant(self.DICT_KEYS_OFFSET)
+                ),
+                IntLoad(keys_slot),
+                8,
+            )
+        )
 
     def dict_capacity(self, entries: int) -> int:
         """A power-of-two capacity with room to spare, so probing terminates."""
@@ -3952,6 +4842,10 @@ class Frontend:
                     f"this dict has {key_kind} keys, so every key must be "
                     f"{key_kind}",
                 )
+            if key_kind == "int":
+                self.note_stored_bool(
+                    self.dict_keys_name(name), key, "this dict's keys"
+                )
             if value_kind == "float":
                 if self.expression_type(value) not in {"float", "int"}:
                     raise NativeCompileError(
@@ -3976,6 +4870,7 @@ class Frontend:
                 IntBinary("add", pointer, IntConstant(8)), IntConstant(0), 8
             )
         )
+        self.emit_dict_key_order_block(pointer_slot, len(node.keys), bump)
         # HeapAlloc hands back fresh arena memory, which the kernel zero-filled,
         # so every state field already reads as empty.
         for key, value in zip(node.keys, node.values):
@@ -4267,6 +5162,17 @@ class Frontend:
                 8,
             )
         )
+        # The rehash below scatters the entries into new home slots, so the
+        # insertion order lives only in this list; carry it over or it is lost.
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", new, IntConstant(self.DICT_KEYS_OFFSET)),
+                HeapLoad(
+                    IntBinary("add", old, IntConstant(self.DICT_KEYS_OFFSET)), 8
+                ),
+                8,
+            )
+        )
         mask_slot = self.new_temp()
         self.operations.append(
             Store(
@@ -4467,6 +5373,14 @@ class Frontend:
                 8,
             )
         )
+        # Only a key that was not already here joins the order list, which is
+        # why this sits in the new-entry arm: replacing a value must not move a
+        # key, and must not list it twice.
+        keys_slot = self.new_temp()
+        keys_field = IntBinary("add", pointer, IntConstant(self.DICT_KEYS_OFFSET))
+        self.operations.append(Store(keys_slot, HeapLoad(keys_field, 8)))
+        self.emit_list_append(keys_slot, IntLoad(key_slot))
+        self.operations.append(HeapStore(keys_field, IntLoad(keys_slot), 8))
         self.operations.append(Label(existing))
         self.operations.append(
             HeapStore(
@@ -4741,6 +5655,9 @@ class Frontend:
             left = self.string_pointer(node.left)
             right = self.string_pointer(node.right)
             return self.emit_concat(left, right)
+        if self.string_method_kind(node) == "str":
+            assert isinstance(node, ast.Call)
+            return self.string_method_pointer(node)
         raise NativeCompileError(
             self.path, node, "expression is not in the native string subset"
         )
@@ -4756,9 +5673,36 @@ class Frontend:
 
         pointer_slot = self.new_temp()
         self.operations.append(Store(pointer_slot, pointer))
+        return self.emit_code_point_count_upto(
+            IntLoad(pointer_slot), HeapLoad(IntLoad(pointer_slot), 8)
+        )
+
+    def emit_code_point_count_upto(
+        self, pointer: IntExpression, limit: IntExpression
+    ) -> IntExpression:
+        """How many code points begin in the first ``limit`` bytes of a block.
+
+        This is what turns the byte offset of a match into the character index
+        CPython reports from `.find()`. ``limit`` is clamped to the block's own
+        length, so an offset left behind by a search that found nothing cannot
+        walk past the end.
+        """
+
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, pointer))
         base = IntLoad(pointer_slot)
         length_slot = self.new_temp()
-        self.operations.append(Store(length_slot, HeapLoad(base, 8)))
+        self.operations.append(Store(length_slot, limit))
+        self.operations.append(
+            Store(
+                length_slot,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(length_slot), HeapLoad(base, 8)),
+                    IntLoad(length_slot),
+                    HeapLoad(base, 8),
+                ),
+            )
+        )
         count_slot = self.new_temp()
         self.operations.append(Store(count_slot, IntConstant(0)))
         index_slot = self.new_temp()
@@ -4800,6 +5744,1317 @@ class Frontend:
         self.operations.append(Jump(start))
         self.operations.append(Label(done))
         return IntLoad(count_slot)
+
+    # --- runtime string methods ---------------------------------------------
+
+    _STRING_METHOD_KINDS = {
+        "startswith": "bool",
+        "endswith": "bool",
+        "isdigit": "bool",
+        "isalpha": "bool",
+        "find": "int",
+        "index": "int",
+        "count": "int",
+        "replace": "str",
+        "strip": "str",
+        "lstrip": "str",
+        "rstrip": "str",
+        "upper": "str",
+        "lower": "str",
+        "capitalize": "str",
+        "title": "str",
+        "zfill": "str",
+        "center": "str",
+        "ljust": "str",
+        "rjust": "str",
+    }
+    _STRING_METHOD_ARITY = {
+        "startswith": 1,
+        "endswith": 1,
+        "isdigit": 0,
+        "isalpha": 0,
+        "find": 1,
+        "index": 1,
+        "count": 1,
+        "replace": 2,
+        "strip": 0,
+        "lstrip": 0,
+        "rstrip": 0,
+        "upper": 0,
+        "lower": 0,
+        "capitalize": 0,
+        "title": 0,
+        "zfill": 1,
+        "center": 1,
+        "ljust": 1,
+        "rjust": 1,
+    }
+    # These four take a character count, not another string.
+    _STRING_METHOD_WIDTHS = frozenset({"zfill", "center", "ljust", "rjust"})
+    # Case and character-class answers come from Unicode tables that are not in
+    # the binary, so these run only on text proven ASCII at run time.
+    _ASCII_ONLY_STRING_METHODS = frozenset(
+        {"upper", "lower", "capitalize", "title", "isdigit", "isalpha"}
+    )
+
+    def string_method_kind(
+        self,
+        node: ast.expr,
+        bindings: dict[str, KernelValue] | None = None,
+    ) -> str | None:
+        """``"str"``, ``"int"`` or ``"bool"`` if this is a runtime str method."""
+
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return None
+        kind = self._STRING_METHOD_KINDS.get(node.func.attr)
+        if kind is None:
+            return None
+        if self.resolve_object_class(node.func.value) is not None:
+            # A user class may well define its own find(); that one wins.
+            return None
+        try:
+            receiver = self.expression_type(node.func.value, bindings)
+        except NativeCompileError:
+            return None
+        return kind if receiver == "str" else None
+
+    def check_string_method(self, node: ast.Call) -> str:
+        """Validate the shape of a runtime string method call, and name it."""
+
+        assert isinstance(node.func, ast.Attribute)
+        name = node.func.attr
+        arity = self._STRING_METHOD_ARITY[name]
+        if node.keywords or len(node.args) != arity:
+            expected = "no arguments" if arity == 0 else f"{arity} argument"
+            if arity > 1:
+                expected += "s"
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native str.{name}() takes {expected}; the optional start, "
+                "end, count and fill-character forms are not in the subset",
+            )
+        for argument in node.args:
+            wanted = "int" if name in self._STRING_METHOD_WIDTHS else "str"
+            if self.expression_type(argument) != wanted:
+                noun = "an integer width" if wanted == "int" else "a string"
+                raise NativeCompileError(
+                    self.path, argument, f"native str.{name}() takes {noun}"
+                )
+        if self.eager_depth and (
+            name in self._ASCII_ONLY_STRING_METHODS or name == "index"
+        ):
+            # Conditional expressions and short-circuited Boolean operands are
+            # lowered by evaluating both arms and selecting between them. These
+            # methods can stop the program, and doing so on a branch CPython
+            # would never have taken is a divergence, not a refusal.
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native str.{name}() cannot appear in a conditional expression "
+                "or a short-circuited Boolean operand, because this lowering "
+                "evaluates both arms and the call can stop the program from the "
+                "arm Python skips; use an if statement instead",
+            )
+        if name in self._ASCII_ONLY_STRING_METHODS:
+            try:
+                receiver = self.constant(node.func.value)
+            except NativeCompileError:
+                receiver = None
+            if isinstance(receiver, str) and not receiver.isascii():
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"native str.{name}() is limited to ASCII text, and this "
+                    f"receiver holds {receiver!r}; the Unicode tables it would "
+                    "need are not in the binary",
+                )
+        return name
+
+    def string_method_pointer(self, node: ast.Call) -> IntExpression:
+        """Lower a string method whose result is a string."""
+
+        assert isinstance(node.func, ast.Attribute)
+        name = self.check_string_method(node)
+        receiver_slot = self.new_temp()
+        self.operations.append(
+            Store(receiver_slot, self.string_pointer(node.func.value))
+        )
+        if name in self._ASCII_ONLY_STRING_METHODS:
+            self.emit_require_ascii(receiver_slot, name)
+        if name in {"upper", "lower", "capitalize", "title"}:
+            return self.emit_ascii_case(receiver_slot, name)
+        if name in {"strip", "lstrip", "rstrip"}:
+            return self.emit_string_strip(receiver_slot, name)
+        if name == "replace":
+            old_slot = self.new_temp()
+            new_slot = self.new_temp()
+            self.operations.append(
+                Store(old_slot, self.string_pointer(node.args[0]))
+            )
+            self.operations.append(
+                Store(new_slot, self.string_pointer(node.args[1]))
+            )
+            return self.emit_string_replace(receiver_slot, old_slot, new_slot)
+        return self.emit_string_pad(receiver_slot, name, self.integer(node.args[0]))
+
+    def string_method_integer(self, node: ast.Call) -> IntExpression:
+        """Lower a string method whose result is an integer or a bool."""
+
+        assert isinstance(node.func, ast.Attribute)
+        name = self.check_string_method(node)
+        receiver_slot = self.new_temp()
+        self.operations.append(
+            Store(receiver_slot, self.string_pointer(node.func.value))
+        )
+        if name in {"isdigit", "isalpha"}:
+            self.emit_require_ascii(receiver_slot, name)
+            return self.emit_ascii_class(receiver_slot, name)
+        needle_slot = self.new_temp()
+        self.operations.append(
+            Store(needle_slot, self.string_pointer(node.args[0]))
+        )
+        if name == "startswith":
+            return self.emit_string_prefix(
+                receiver_slot, needle_slot, IntConstant(0)
+            )
+        if name == "endswith":
+            return self.emit_string_prefix(
+                receiver_slot,
+                needle_slot,
+                IntBinary(
+                    "sub",
+                    HeapLoad(IntLoad(receiver_slot), 8),
+                    HeapLoad(IntLoad(needle_slot), 8),
+                ),
+            )
+        if name == "count":
+            return self.emit_string_count(receiver_slot, needle_slot)
+        return self.emit_string_find(
+            receiver_slot, needle_slot, raising=name == "index"
+        )
+
+    def emit_require_ascii(self, pointer_slot: int, name: str) -> None:
+        """Stop the program unless the string is ASCII.
+
+        `.upper()` and its neighbours are Unicode mappings, not byte tricks:
+        'e' with an acute uppercases to its accented capital, and the German
+        sharp s uppercases to the two characters "SS", which makes the string
+        longer. Being exactly right needs the full case and category tables in
+        the image. Flipping bit 5 of every letter byte instead would leave
+        every non-ASCII character untouched and print a confidently wrong
+        answer, so text that is not ASCII stops here.
+
+        This is a limit of the compiler rather than a Python-level error, so it
+        is a write and an exit like the arena guard, not a raise: an
+        `except Exception:` must not be able to swallow it and carry on down a
+        path CPython never took.
+        """
+
+        base = IntBinary("add", IntLoad(pointer_slot), IntConstant(8))
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("ascii_check")
+        step = self.new_label("ascii_next")
+        done = self.new_label("ascii_done")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), done
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne",
+                    IntBinary(
+                        "and",
+                        HeapLoad(IntBinary("add", base, IntLoad(index_slot)), 1),
+                        IntConstant(0x80),
+                    ),
+                    IntConstant(0),
+                ),
+                step,
+            )
+        )
+        self.operations.append(
+            Write(
+                f"py2bin: str.{name}() is limited to ASCII text; this string is "
+                "not ASCII, and the Unicode tables it would need are not in "
+                "this binary\n".encode("utf-8"),
+                2,
+            )
+        )
+        self.operations.append(Exit(1))
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(done))
+
+    def emit_byte_fill(
+        self,
+        destination: IntExpression,
+        value: IntExpression,
+        count: IntExpression,
+    ) -> None:
+        """Write ``count`` copies of one byte, for the padding methods."""
+
+        index_slot = self.new_temp()
+        destination_slot = self.new_temp()
+        value_slot = self.new_temp()
+        count_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        self.operations.append(Store(destination_slot, destination))
+        self.operations.append(Store(value_slot, value))
+        self.operations.append(Store(count_slot, count))
+        start_label = self.new_label("fill_start")
+        end_label = self.new_label("fill_end")
+        self.operations.append(Label(start_label))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(count_slot)),
+                end_label,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(destination_slot), IntLoad(index_slot)),
+                IntLoad(value_slot),
+                1,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start_label))
+        self.operations.append(Label(end_label))
+
+    def emit_string_span(
+        self, pointer_slot: int, start: IntExpression, end: IntExpression
+    ) -> IntExpression:
+        """A fresh string block holding the bytes ``[start, end)`` of another."""
+
+        bump = self.ensure_heap()
+        start_slot = self.new_temp()
+        span_slot = self.new_temp()
+        result_slot = self.new_temp()
+        self.operations.append(Store(start_slot, start))
+        self.operations.append(
+            Store(span_slot, IntBinary("sub", end, IntLoad(start_slot)))
+        )
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(span_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(span_slot), 8)
+        )
+        self.emit_byte_copy(
+            IntBinary("add", IntLoad(result_slot), IntConstant(8)),
+            IntBinary(
+                "add",
+                IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+                IntLoad(start_slot),
+            ),
+            IntLoad(span_slot),
+        )
+        return IntLoad(result_slot)
+
+    def emit_next_boundary(
+        self, base: IntExpression, position: IntExpression, limit: IntExpression
+    ) -> IntExpression:
+        """The byte offset one code point past ``position``.
+
+        ``position`` is itself a boundary. At the very end of the string this
+        answers ``limit + 1``, which is what stops a loop stepping over the
+        empty match CPython finds there.
+        """
+
+        base_slot = self.new_temp()
+        limit_slot = self.new_temp()
+        cursor_slot = self.new_temp()
+        self.operations.append(Store(base_slot, base))
+        self.operations.append(Store(limit_slot, limit))
+        self.operations.append(
+            Store(cursor_slot, IntBinary("add", position, IntConstant(1)))
+        )
+        start = self.new_label("boundary")
+        done = self.new_label("boundary_done")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(cursor_slot), IntLoad(limit_slot)), done
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    IntBinary(
+                        "and",
+                        HeapLoad(
+                            IntBinary(
+                                "add", IntLoad(base_slot), IntLoad(cursor_slot)
+                            ),
+                            1,
+                        ),
+                        IntConstant(0xC0),
+                    ),
+                    IntConstant(0x80),
+                ),
+                done,
+            )
+        )
+        self.operations.append(
+            Store(cursor_slot, IntBinary("add", IntLoad(cursor_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(done))
+        return IntLoad(cursor_slot)
+
+    def emit_character_width(
+        self, base_slot: int, offset_slot: int
+    ) -> IntExpression:
+        """How many bytes the UTF-8 character at a boundary offset occupies."""
+
+        byte_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                byte_slot,
+                HeapLoad(
+                    IntBinary("add", IntLoad(base_slot), IntLoad(offset_slot)), 1
+                ),
+            )
+        )
+        byte = IntLoad(byte_slot)
+        return IntBinary(
+            "add",
+            IntConstant(1),
+            IntBinary(
+                "add",
+                IntCompare("ge", byte, IntConstant(0xC0)),
+                IntBinary(
+                    "add",
+                    IntCompare("ge", byte, IntConstant(0xE0)),
+                    IntCompare("ge", byte, IntConstant(0xF0)),
+                ),
+            ),
+        )
+
+    def emit_whitespace_width(
+        self, base_slot: int, offset_slot: int, limit_slot: int
+    ) -> int:
+        """A slot holding the byte width of the whitespace at an offset, or 0.
+
+        `str.strip()` with no argument strips Unicode whitespace, which is 29
+        code points and not the ASCII five. Unlike case mapping that is a small
+        closed set which has not moved in twenty years, so it is matched here
+        as byte sequences rather than refused.
+        """
+
+        def between(value: IntExpression, low: int, high: int) -> IntExpression:
+            return IntBinary(
+                "and",
+                IntCompare("ge", value, IntConstant(low)),
+                IntCompare("le", value, IntConstant(high)),
+            )
+
+        def equals(value: IntExpression, other: int) -> IntExpression:
+            return IntCompare("eq", value, IntConstant(other))
+
+        def room(bytes_needed: int, label: str) -> None:
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "le",
+                        IntBinary(
+                            "add", IntLoad(offset_slot), IntConstant(bytes_needed)
+                        ),
+                        IntLoad(limit_slot),
+                    ),
+                    label,
+                )
+            )
+
+        def byte_at(distance: int) -> IntExpression:
+            address = IntBinary("add", IntLoad(base_slot), IntLoad(offset_slot))
+            if distance:
+                address = IntBinary("add", address, IntConstant(distance))
+            return HeapLoad(address, 1)
+
+        width_slot = self.new_temp()
+        self.operations.append(Store(width_slot, IntConstant(0)))
+        done = self.new_label("ws_done")
+        wide = self.new_label("ws_wide")
+        first_slot = self.new_temp()
+        self.operations.append(Store(first_slot, byte_at(0)))
+        first = IntLoad(first_slot)
+        # Tab through carriage return, then the four separators and the space.
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary("or", between(first, 0x09, 0x0D), between(first, 0x1C, 0x20)),
+                wide,
+            )
+        )
+        self.operations.append(Store(width_slot, IntConstant(1)))
+        self.operations.append(Jump(done))
+        self.operations.append(Label(wide))
+        # Nothing else starts below C2, and reading a second or third byte
+        # needs the room to be there.
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", first, IntConstant(0xC2)), done)
+        )
+        room(2, done)
+        second_slot = self.new_temp()
+        self.operations.append(Store(second_slot, byte_at(1)))
+        second = IntLoad(second_slot)
+        three_byte = self.new_label("ws_three")
+        self.operations.append(
+            JumpIfFalse(equals(first, 0xC2), three_byte)
+        )
+        # U+0085 NEXT LINE and U+00A0 NO-BREAK SPACE.
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary("or", equals(second, 0x85), equals(second, 0xA0)), done
+            )
+        )
+        self.operations.append(Store(width_slot, IntConstant(2)))
+        self.operations.append(Jump(done))
+        self.operations.append(Label(three_byte))
+        room(3, done)
+        third_slot = self.new_temp()
+        self.operations.append(Store(third_slot, byte_at(2)))
+        third = IntLoad(third_slot)
+        ogham = IntBinary(
+            "and",
+            equals(first, 0xE1),
+            IntBinary("and", equals(second, 0x9A), equals(third, 0x80)),
+        )
+        # U+2000-200A, U+2028, U+2029 and U+202F.
+        punctuation = IntBinary(
+            "and",
+            IntBinary("and", equals(first, 0xE2), equals(second, 0x80)),
+            IntBinary(
+                "or",
+                between(third, 0x80, 0x8A),
+                IntBinary(
+                    "or",
+                    IntBinary("or", equals(third, 0xA8), equals(third, 0xA9)),
+                    equals(third, 0xAF),
+                ),
+            ),
+        )
+        # U+205F MEDIUM MATHEMATICAL SPACE.
+        mathematical = IntBinary(
+            "and",
+            IntBinary("and", equals(first, 0xE2), equals(second, 0x81)),
+            equals(third, 0x9F),
+        )
+        # U+3000 IDEOGRAPHIC SPACE.
+        ideographic = IntBinary(
+            "and",
+            IntBinary("and", equals(first, 0xE3), equals(second, 0x80)),
+            equals(third, 0x80),
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "or",
+                    IntBinary("or", ogham, punctuation),
+                    IntBinary("or", mathematical, ideographic),
+                ),
+                done,
+            )
+        )
+        self.operations.append(Store(width_slot, IntConstant(3)))
+        self.operations.append(Label(done))
+        return width_slot
+
+    def emit_string_strip(self, pointer_slot: int, name: str) -> IntExpression:
+        """`.strip()`, `.lstrip()` and `.rstrip()` over Unicode whitespace."""
+
+        length_slot = self.new_temp()
+        base_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        self.operations.append(
+            Store(
+                base_slot,
+                IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+            )
+        )
+        start_slot = self.new_temp()
+        self.operations.append(Store(start_slot, IntConstant(0)))
+        if name in {"strip", "lstrip"}:
+            loop = self.new_label("lstrip")
+            stop = self.new_label("lstrip_done")
+            self.operations.append(Label(loop))
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("lt", IntLoad(start_slot), IntLoad(length_slot)),
+                    stop,
+                )
+            )
+            width_slot = self.emit_whitespace_width(
+                base_slot, start_slot, length_slot
+            )
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(width_slot), IntConstant(0)), stop
+                )
+            )
+            self.operations.append(
+                Store(
+                    start_slot,
+                    IntBinary("add", IntLoad(start_slot), IntLoad(width_slot)),
+                )
+            )
+            self.operations.append(Jump(loop))
+            self.operations.append(Label(stop))
+        end_slot = self.new_temp()
+        self.operations.append(Store(end_slot, IntLoad(length_slot)))
+        if name in {"strip", "rstrip"}:
+            # One forward pass remembering where the last non-whitespace
+            # character ended. Walking backwards would have to step over
+            # continuation bytes to find each character's lead byte first.
+            cursor_slot = self.new_temp()
+            self.operations.append(Store(cursor_slot, IntConstant(0)))
+            self.operations.append(Store(end_slot, IntConstant(0)))
+            loop = self.new_label("rstrip")
+            stop = self.new_label("rstrip_done")
+            skip = self.new_label("rstrip_skip")
+            self.operations.append(Label(loop))
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("lt", IntLoad(cursor_slot), IntLoad(length_slot)),
+                    stop,
+                )
+            )
+            width_slot = self.emit_whitespace_width(
+                base_slot, cursor_slot, length_slot
+            )
+            step_slot = self.new_temp()
+            self.operations.append(
+                Store(
+                    step_slot,
+                    self.select_integer(
+                        IntCompare("ne", IntLoad(width_slot), IntConstant(0)),
+                        IntLoad(width_slot),
+                        self.emit_character_width(base_slot, cursor_slot),
+                    ),
+                )
+            )
+            self.operations.append(
+                Store(
+                    cursor_slot,
+                    IntBinary("add", IntLoad(cursor_slot), IntLoad(step_slot)),
+                )
+            )
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("eq", IntLoad(width_slot), IntConstant(0)), skip
+                )
+            )
+            self.operations.append(Store(end_slot, IntLoad(cursor_slot)))
+            self.operations.append(Label(skip))
+            self.operations.append(Jump(loop))
+            self.operations.append(Label(stop))
+        # An all-whitespace string leaves the end behind the start.
+        self.operations.append(
+            Store(
+                end_slot,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(end_slot), IntLoad(start_slot)),
+                    IntLoad(start_slot),
+                    IntLoad(end_slot),
+                ),
+            )
+        )
+        return self.emit_string_span(
+            pointer_slot, IntLoad(start_slot), IntLoad(end_slot)
+        )
+
+    def emit_ascii_case(self, pointer_slot: int, name: str) -> IntExpression:
+        """`.upper()`, `.lower()`, `.capitalize()` and `.title()` over ASCII.
+
+        The receiver has already been proven ASCII, so one byte is one
+        character and the whole mapping is a per-byte choice.
+        """
+
+        bump = self.ensure_heap()
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(length_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(length_slot), 8)
+        )
+        source = IntBinary("add", IntLoad(pointer_slot), IntConstant(8))
+        destination = IntBinary("add", IntLoad(result_slot), IntConstant(8))
+        index_slot = self.new_temp()
+        upper_slot = self.new_temp()
+        cased_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        self.operations.append(Store(cased_slot, IntConstant(0)))
+        loop = self.new_label("case")
+        stop = self.new_label("case_done")
+        self.operations.append(Label(loop))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), stop
+            )
+        )
+        byte_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                byte_slot,
+                HeapLoad(IntBinary("add", source, IntLoad(index_slot)), 1),
+            )
+        )
+        byte = IntLoad(byte_slot)
+        is_lower = IntBinary(
+            "and",
+            IntCompare("ge", byte, IntConstant(0x61)),
+            IntCompare("le", byte, IntConstant(0x7A)),
+        )
+        is_upper = IntBinary(
+            "and",
+            IntCompare("ge", byte, IntConstant(0x41)),
+            IntCompare("le", byte, IntConstant(0x5A)),
+        )
+        if name == "upper":
+            self.operations.append(Store(upper_slot, IntConstant(1)))
+        elif name == "lower":
+            self.operations.append(Store(upper_slot, IntConstant(0)))
+        elif name == "capitalize":
+            self.operations.append(
+                Store(
+                    upper_slot,
+                    IntCompare("eq", IntLoad(index_slot), IntConstant(0)),
+                )
+            )
+        else:
+            # CPython titlecases a letter whenever the character before it was
+            # not cased, which over ASCII means not a letter: "they're" becomes
+            # "They'Re", and splitting on spaces would not.
+            self.operations.append(
+                Store(upper_slot, IntUnary("not", IntLoad(cased_slot)))
+            )
+        raised = self.select_integer(
+            is_lower, IntBinary("sub", byte, IntConstant(32)), byte
+        )
+        lowered = self.select_integer(
+            is_upper, IntBinary("add", byte, IntConstant(32)), byte
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", destination, IntLoad(index_slot)),
+                self.select_integer(
+                    IntCompare("ne", IntLoad(upper_slot), IntConstant(0)),
+                    raised,
+                    lowered,
+                ),
+                1,
+            )
+        )
+        if name == "title":
+            self.operations.append(
+                Store(cased_slot, IntBinary("or", is_lower, is_upper))
+            )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(stop))
+        return IntLoad(result_slot)
+
+    def emit_ascii_class(self, pointer_slot: int, name: str) -> IntExpression:
+        """`.isdigit()` and `.isalpha()` over text already proven ASCII."""
+
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        result_slot = self.new_temp()
+        # CPython answers False for the empty string.
+        self.operations.append(
+            Store(
+                result_slot,
+                IntCompare("gt", IntLoad(length_slot), IntConstant(0)),
+            )
+        )
+        base = IntBinary("add", IntLoad(pointer_slot), IntConstant(8))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        loop = self.new_label("class")
+        miss = self.new_label("class_miss")
+        stop = self.new_label("class_done")
+        self.operations.append(Label(loop))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), stop
+            )
+        )
+        byte_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                byte_slot,
+                HeapLoad(IntBinary("add", base, IntLoad(index_slot)), 1),
+            )
+        )
+        byte = IntLoad(byte_slot)
+        if name == "isdigit":
+            member = IntBinary(
+                "and",
+                IntCompare("ge", byte, IntConstant(0x30)),
+                IntCompare("le", byte, IntConstant(0x39)),
+            )
+        else:
+            member = IntBinary(
+                "or",
+                IntBinary(
+                    "and",
+                    IntCompare("ge", byte, IntConstant(0x41)),
+                    IntCompare("le", byte, IntConstant(0x5A)),
+                ),
+                IntBinary(
+                    "and",
+                    IntCompare("ge", byte, IntConstant(0x61)),
+                    IntCompare("le", byte, IntConstant(0x7A)),
+                ),
+            )
+        self.operations.append(JumpIfFalse(member, miss))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(miss))
+        self.operations.append(Store(result_slot, IntConstant(0)))
+        self.operations.append(Label(stop))
+        return IntLoad(result_slot)
+
+    def emit_string_prefix(
+        self, pointer_slot: int, needle_slot: int, offset: IntExpression
+    ) -> IntExpression:
+        """Whether the needle's bytes sit at a byte offset of the haystack.
+
+        Both callers pass a code-point boundary, and a valid UTF-8 needle
+        cannot match anywhere else, so this compares bytes.
+        """
+
+        offset_slot = self.new_temp()
+        haystack_length = self.new_temp()
+        needle_length = self.new_temp()
+        result_slot = self.new_temp()
+        self.operations.append(Store(offset_slot, offset))
+        self.operations.append(
+            Store(haystack_length, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        self.operations.append(
+            Store(needle_length, HeapLoad(IntLoad(needle_slot), 8))
+        )
+        self.operations.append(Store(result_slot, IntConstant(1)))
+        miss = self.new_label("prefix_miss")
+        done = self.new_label("prefix_done")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ge", IntLoad(offset_slot), IntConstant(0)), miss
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "le",
+                    IntBinary(
+                        "add", IntLoad(offset_slot), IntLoad(needle_length)
+                    ),
+                    IntLoad(haystack_length),
+                ),
+                miss,
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        loop = self.new_label("prefix")
+        self.operations.append(Label(loop))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(needle_length)),
+                done,
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            IntBinary(
+                                "add",
+                                IntBinary(
+                                    "add",
+                                    IntLoad(pointer_slot),
+                                    IntConstant(8),
+                                ),
+                                IntLoad(offset_slot),
+                            ),
+                            IntLoad(index_slot),
+                        ),
+                        1,
+                    ),
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            IntBinary(
+                                "add", IntLoad(needle_slot), IntConstant(8)
+                            ),
+                            IntLoad(index_slot),
+                        ),
+                        1,
+                    ),
+                ),
+                miss,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(miss))
+        self.operations.append(Store(result_slot, IntConstant(0)))
+        self.operations.append(Label(done))
+        return IntLoad(result_slot)
+
+    def emit_match_advance(
+        self,
+        pointer_slot: int,
+        position_slot: int,
+        needle_length: int,
+        length_slot: int,
+    ) -> IntExpression:
+        """Where to resume scanning after a match.
+
+        Past the needle, so overlapping occurrences are not counted twice -
+        `"aaa".count("aa")` is 1, not 2. An empty needle matches everywhere, so
+        it steps one whole character instead, which is what makes
+        `"abc".count("")` four and a two-byte character count once.
+        """
+
+        boundary_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                boundary_slot,
+                self.emit_next_boundary(
+                    IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+                    IntLoad(position_slot),
+                    IntLoad(length_slot),
+                ),
+            )
+        )
+        return self.select_integer(
+            IntCompare("eq", IntLoad(needle_length), IntConstant(0)),
+            IntLoad(boundary_slot),
+            IntBinary("add", IntLoad(position_slot), IntLoad(needle_length)),
+        )
+
+    def emit_string_count(
+        self, pointer_slot: int, needle_slot: int
+    ) -> IntExpression:
+        """`s.count(t)`, counting non-overlapping occurrences."""
+
+        length_slot = self.new_temp()
+        needle_length = self.new_temp()
+        count_slot = self.new_temp()
+        cursor_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        self.operations.append(
+            Store(needle_length, HeapLoad(IntLoad(needle_slot), 8))
+        )
+        self.operations.append(Store(count_slot, IntConstant(0)))
+        self.operations.append(Store(cursor_slot, IntConstant(0)))
+        loop = self.new_label("occurrences")
+        done = self.new_label("occurrences_done")
+        self.operations.append(Label(loop))
+        found_slot, position_slot = self.emit_substring_scan(
+            pointer_slot, needle_slot, cursor_slot
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)), done
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(
+            Store(
+                cursor_slot,
+                self.emit_match_advance(
+                    pointer_slot, position_slot, needle_length, length_slot
+                ),
+            )
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(done))
+        return IntLoad(count_slot)
+
+    def emit_string_find(
+        self, pointer_slot: int, needle_slot: int, raising: bool
+    ) -> IntExpression:
+        """`s.find(t)`, or `s.index(t)` when a miss must raise."""
+
+        cursor_slot = self.new_temp()
+        self.operations.append(Store(cursor_slot, IntConstant(0)))
+        found_slot, position_slot = self.emit_substring_scan(
+            pointer_slot, needle_slot, cursor_slot
+        )
+        if raising:
+            present = self.new_label("index_present")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("eq", IntLoad(found_slot), IntConstant(0)), present
+                )
+            )
+            self.raise_exception(
+                "ValueError", b"ValueError: substring not found\n"
+            )
+            self.operations.append(Label(present))
+            return self.emit_code_point_count_upto(
+                IntLoad(pointer_slot), IntLoad(position_slot)
+            )
+        # CPython reports a character index, not a byte offset.
+        return self.select_integer(
+            IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+            self.emit_code_point_count_upto(
+                IntLoad(pointer_slot), IntLoad(position_slot)
+            ),
+            IntConstant(-1),
+        )
+
+    def emit_string_replace(
+        self, pointer_slot: int, old_slot: int, new_slot: int
+    ) -> IntExpression:
+        """`s.replace(old, new)`, in two passes over the haystack.
+
+        The first pass only counts, so the size of the answer is known before
+        anything is written and a single allocation covers it. Concatenating
+        once per occurrence would allocate inside the loop, and the arena never
+        reclaims.
+        """
+
+        bump = self.ensure_heap()
+        length_slot = self.new_temp()
+        old_length = self.new_temp()
+        new_length = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        self.operations.append(
+            Store(old_length, HeapLoad(IntLoad(old_slot), 8))
+        )
+        self.operations.append(
+            Store(new_length, HeapLoad(IntLoad(new_slot), 8))
+        )
+        matches_slot = self.new_temp()
+        self.operations.append(
+            Store(matches_slot, self.emit_string_count(pointer_slot, old_slot))
+        )
+        total_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                total_slot,
+                IntBinary(
+                    "add",
+                    IntLoad(length_slot),
+                    IntBinary(
+                        "mul",
+                        IntLoad(matches_slot),
+                        IntBinary(
+                            "sub", IntLoad(new_length), IntLoad(old_length)
+                        ),
+                    ),
+                ),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(total_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(total_slot), 8)
+        )
+        source = IntBinary("add", IntLoad(pointer_slot), IntConstant(8))
+        destination = IntBinary("add", IntLoad(result_slot), IntConstant(8))
+        write_slot = self.new_temp()
+        cursor_slot = self.new_temp()
+        self.operations.append(Store(write_slot, IntConstant(0)))
+        self.operations.append(Store(cursor_slot, IntConstant(0)))
+        loop = self.new_label("replace")
+        done = self.new_label("replace_done")
+        self.operations.append(Label(loop))
+        found_slot, position_slot = self.emit_substring_scan(
+            pointer_slot, old_slot, cursor_slot
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)), done
+            )
+        )
+        chunk_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                chunk_slot,
+                IntBinary("sub", IntLoad(position_slot), IntLoad(cursor_slot)),
+            )
+        )
+        self.emit_byte_copy(
+            IntBinary("add", destination, IntLoad(write_slot)),
+            IntBinary("add", source, IntLoad(cursor_slot)),
+            IntLoad(chunk_slot),
+        )
+        self.operations.append(
+            Store(
+                write_slot, IntBinary("add", IntLoad(write_slot), IntLoad(chunk_slot))
+            )
+        )
+        self.emit_byte_copy(
+            IntBinary("add", destination, IntLoad(write_slot)),
+            IntBinary("add", IntLoad(new_slot), IntConstant(8)),
+            IntLoad(new_length),
+        )
+        self.operations.append(
+            Store(
+                write_slot, IntBinary("add", IntLoad(write_slot), IntLoad(new_length))
+            )
+        )
+        boundary_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                boundary_slot,
+                self.emit_next_boundary(
+                    source, IntLoad(position_slot), IntLoad(length_slot)
+                ),
+            )
+        )
+        stop_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                stop_slot,
+                self.select_integer(
+                    IntCompare(
+                        "lt", IntLoad(boundary_slot), IntLoad(length_slot)
+                    ),
+                    IntLoad(boundary_slot),
+                    IntLoad(length_slot),
+                ),
+            )
+        )
+        # An empty needle matches in front of a character rather than instead
+        # of one, so that character has to be carried across before moving on.
+        carry_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                carry_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(old_length), IntConstant(0)),
+                    IntBinary("sub", IntLoad(stop_slot), IntLoad(position_slot)),
+                    IntConstant(0),
+                ),
+            )
+        )
+        self.emit_byte_copy(
+            IntBinary("add", destination, IntLoad(write_slot)),
+            IntBinary("add", source, IntLoad(position_slot)),
+            IntLoad(carry_slot),
+        )
+        self.operations.append(
+            Store(
+                write_slot, IntBinary("add", IntLoad(write_slot), IntLoad(carry_slot))
+            )
+        )
+        self.operations.append(
+            Store(
+                cursor_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(old_length), IntConstant(0)),
+                    IntLoad(boundary_slot),
+                    IntBinary(
+                        "add", IntLoad(position_slot), IntLoad(old_length)
+                    ),
+                ),
+            )
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(done))
+        tail_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                tail_slot,
+                IntBinary("sub", IntLoad(length_slot), IntLoad(cursor_slot)),
+            )
+        )
+        # The last empty match steps past the end, which leaves no tail.
+        self.operations.append(
+            Store(
+                tail_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(tail_slot), IntConstant(0)),
+                    IntLoad(tail_slot),
+                    IntConstant(0),
+                ),
+            )
+        )
+        self.emit_byte_copy(
+            IntBinary("add", destination, IntLoad(write_slot)),
+            IntBinary("add", source, IntLoad(cursor_slot)),
+            IntLoad(tail_slot),
+        )
+        return IntLoad(result_slot)
+
+    def emit_string_pad(
+        self, pointer_slot: int, name: str, width: IntExpression
+    ) -> IntExpression:
+        """`.zfill()`, `.center()`, `.ljust()` and `.rjust()`.
+
+        The width counts characters, as CPython's does. Padding to a byte
+        length would under-pad every string holding a non-ASCII character.
+        """
+
+        bump = self.ensure_heap()
+        length_slot = self.new_temp()
+        width_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        self.operations.append(Store(width_slot, width))
+        characters = self.materialize_int(
+            self.emit_code_point_count(IntLoad(pointer_slot))
+        )
+        pad_slot = self.new_temp()
+        self.operations.append(
+            Store(pad_slot, IntBinary("sub", IntLoad(width_slot), characters))
+        )
+        self.operations.append(
+            Store(
+                pad_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(pad_slot), IntConstant(0)),
+                    IntLoad(pad_slot),
+                    IntConstant(0),
+                ),
+            )
+        )
+        total_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                total_slot,
+                IntBinary("add", IntLoad(length_slot), IntLoad(pad_slot)),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(total_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(total_slot), 8)
+        )
+        source = IntBinary("add", IntLoad(pointer_slot), IntConstant(8))
+        destination = IntBinary("add", IntLoad(result_slot), IntConstant(8))
+        if name == "zfill":
+            # A leading sign stays in front of the zeros: "-5".zfill(4) is
+            # "-005". Both signs are ASCII, so the first byte answers this;
+            # an empty string has no first byte to read.
+            first_slot = self.new_temp()
+            self.operations.append(Store(first_slot, IntConstant(0)))
+            empty = self.new_label("zfill_empty")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("gt", IntLoad(length_slot), IntConstant(0)), empty
+                )
+            )
+            self.operations.append(Store(first_slot, HeapLoad(source, 1)))
+            self.operations.append(Label(empty))
+            sign_slot = self.new_temp()
+            self.operations.append(
+                Store(
+                    sign_slot,
+                    IntBinary(
+                        "or",
+                        IntCompare("eq", IntLoad(first_slot), IntConstant(0x2D)),
+                        IntCompare("eq", IntLoad(first_slot), IntConstant(0x2B)),
+                    ),
+                )
+            )
+            self.emit_byte_copy(destination, source, IntLoad(sign_slot))
+            self.emit_byte_fill(
+                IntBinary("add", destination, IntLoad(sign_slot)),
+                IntConstant(0x30),
+                IntLoad(pad_slot),
+            )
+            self.emit_byte_copy(
+                IntBinary(
+                    "add",
+                    IntBinary("add", destination, IntLoad(sign_slot)),
+                    IntLoad(pad_slot),
+                ),
+                IntBinary("add", source, IntLoad(sign_slot)),
+                IntBinary("sub", IntLoad(length_slot), IntLoad(sign_slot)),
+            )
+            return IntLoad(result_slot)
+        left_slot = self.new_temp()
+        if name == "ljust":
+            self.operations.append(Store(left_slot, IntConstant(0)))
+        elif name == "rjust":
+            self.operations.append(Store(left_slot, IntLoad(pad_slot)))
+        else:
+            # CPython's split of an odd margin: the extra space goes on the
+            # left when both the margin and the width are odd, which is why
+            # "ab".center(5) is "  ab " and not " ab  ".
+            self.operations.append(
+                Store(
+                    left_slot,
+                    IntBinary(
+                        "add",
+                        IntBinary("rshift", IntLoad(pad_slot), IntConstant(1)),
+                        IntBinary(
+                            "and",
+                            IntBinary(
+                                "and", IntLoad(pad_slot), IntLoad(width_slot)
+                            ),
+                            IntConstant(1),
+                        ),
+                    ),
+                )
+            )
+        self.emit_byte_fill(destination, IntConstant(0x20), IntLoad(left_slot))
+        self.emit_byte_copy(
+            IntBinary("add", destination, IntLoad(left_slot)),
+            source,
+            IntLoad(length_slot),
+        )
+        self.emit_byte_fill(
+            IntBinary(
+                "add",
+                IntBinary("add", destination, IntLoad(left_slot)),
+                IntLoad(length_slot),
+            ),
+            IntConstant(0x20),
+            IntBinary("sub", IntLoad(pad_slot), IntLoad(left_slot)),
+        )
+        return IntLoad(result_slot)
 
     def materialize_string_constant(self, data: bytes) -> IntExpression:
         bump = self.ensure_heap()
@@ -5143,6 +7398,45 @@ class Frontend:
                     )
             self.runtime_names.add(name)
 
+    def open_loop_else(self, node: ast.For | ast.While) -> str | None:
+        """The label a `break` out of this loop jumps to, if it needs its own.
+
+        A loop with an `else` gets two exit labels: the one it falls through to
+        when the test fails, and this one past the `else` body. `break` targets
+        this one, which is how the `else` is skipped without a run-time flag.
+        A loop whose own body never breaks always runs its `else`, so it needs
+        only the ordinary exit.
+        """
+
+        if not node.orelse or not self.block_breaks(node.body):
+            return None
+        # This label is reached both by a break and by falling off the end of
+        # the `else` body, so a name the `else` body assigns holds different
+        # values on the two paths and cannot stay a build-time constant.
+        self.materialize_runtime_names(self.assigned_names(node.orelse))
+        return self.new_label("loop_else_end")
+
+    def close_loop_else(
+        self, node: ast.For | ast.While, broke: str | None
+    ) -> None:
+        """Emit the loop's `else` body, and the label a `break` skipped it by.
+
+        Called after the loop's own binding bookkeeping so that reading the
+        loop variable in the `else` body of a possibly empty loop is refused
+        the same way reading it after the loop is.
+        """
+
+        if not node.orelse:
+            return
+        bound_before = set(self.bound_names)
+        for statement in node.orelse:
+            self.statement(statement)
+        if broke is not None:
+            # The break path jumped over the `else` body, so a name first bound
+            # there is not bound on every path that reaches here.
+            self.possibly_unbound.update(self.bound_names - bound_before)
+            self.operations.append(Label(broke))
+
     def if_statement(self, node: ast.If) -> None:
         try:
             condition = self.constant(node.test)
@@ -5178,13 +7472,12 @@ class Frontend:
                 self.statement(statement)
 
     def while_statement(self, node: ast.While) -> None:
-        if node.orelse:
-            raise NativeCompileError(self.path, node, "native while-else is not supported")
+        broke = self.open_loop_else(node)
         start = self.new_label("while_start")
         end = self.new_label("while_end")
         self.operations.append(Label(start))
         self.operations.append(JumpIfFalse(self.integer(node.test), end))
-        self.break_targets.append(end)
+        self.break_targets.append(end if broke is None else broke)
         self.continue_targets.append(start)
         for statement in node.body:
             self.statement(statement)
@@ -5192,6 +7485,7 @@ class Frontend:
         self.break_targets.pop()
         self.operations.append(Jump(start))
         self.operations.append(Label(end))
+        self.close_loop_else(node, broke)
 
     def iterable_element_kind(self, node: ast.expr) -> str | None:
         """The kind each item of ``node`` has, if it is something to iterate."""
@@ -5220,14 +7514,35 @@ class Frontend:
 
         element_kind = self.list_kind(self.expression_type(node))
         assert element_kind is not None
-        pointer_slot = self.new_temp()
-        self.operations.append(Store(pointer_slot, self.list_pointer(node)))
+        if isinstance(node, ast.Name) and self.list_kind_of(node.id) is not None:
+            # Read through the variable's own slot rather than a snapshot of
+            # it. Appending moves the block and writes the new address back to
+            # that slot, so a copy taken here would leave the walk on the
+            # abandoned one.
+            pointer_slot = self.slot(node.id)
+        else:
+            # A slice or a comprehension built a block nothing else can reach,
+            # so there is nothing to keep up with.
+            pointer_slot = self.new_temp()
+            self.operations.append(Store(pointer_slot, self.list_pointer(node)))
         index_slot = self.new_temp()
         self.operations.append(Store(index_slot, IntConstant(0)))
         return index_slot, pointer_slot, element_kind
 
+    def iterated_list_name(self, node: ast.expr) -> str | None:
+        """The name of the list a `for` walks, when it walks one by name."""
+
+        if isinstance(node, ast.Name) and self.list_kind_of(node.id) is not None:
+            return node.id
+        return None
+
     def bind_list_element(
-        self, target: str, index_slot: int, pointer_slot: int, element_kind: str
+        self,
+        target: str,
+        index_slot: int,
+        pointer_slot: int,
+        element_kind: str,
+        holds_bool: bool | None = None,
     ) -> None:
         address = IntBinary(
             "add",
@@ -5238,7 +7553,15 @@ class Frontend:
         )
         self.values.pop(target, None)
         self.runtime_names.add(target)
-        self.boolean_names.discard(target)
+        # Inside the body the name is bound, whatever an earlier loop that
+        # could run zero times left it as.
+        self.possibly_unbound.discard(target)
+        # The element carries the list's bool-ness: a name bound to one out of
+        # a list of bools has to print True, not 1.
+        if element_kind == "int" and holds_bool is True:
+            self.boolean_names.add(target)
+        else:
+            self.boolean_names.discard(target)
         if element_kind == "float":
             self.operations.append(
                 FloatStore(self.slot(target), BitsFloat(HeapLoad(address, 8)))
@@ -5278,6 +7601,7 @@ class Frontend:
                 "a native enumerate() loop binds two names, the index and the "
                 "item",
             )
+        broke = self.open_loop_else(node)
         counter_name = node.target.elts[0].id
         item_name = node.target.elts[1].id
         was_bound = {
@@ -5320,11 +7644,22 @@ class Frontend:
             )
         )
         self.value_types[counter_name] = "int"
-        self.bind_list_element(item_name, index_slot, pointer_slot, element_kind)
-        self.break_targets.append(end_label)
+        self.bind_list_element(
+            item_name,
+            index_slot,
+            pointer_slot,
+            element_kind,
+            self.list_holds_bool(source),
+        )
+        self.break_targets.append(end_label if broke is None else broke)
         self.continue_targets.append(continue_label)
+        walked = self.iterated_list_name(source)
+        if walked is not None:
+            self.iterated_lists.append(walked)
         for statement in node.body:
             self.statement(statement)
+        if walked is not None:
+            self.iterated_lists.pop()
         self.continue_targets.pop()
         self.break_targets.pop()
         self.operations.append(Label(continue_label))
@@ -5339,39 +7674,193 @@ class Frontend:
             else:
                 # The list may be empty, and then Python binds neither name.
                 self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
+
+    def reversed_source(self, node: ast.expr):
+        """The list `reversed(...)` walks backwards, or None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id != "reversed"
+            or node.func.id in self.functions
+        ):
+            return None
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "native reversed() takes one runtime list"
+            )
+        if self.list_kind(self.expression_type(node.args[0])) is None:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native reversed() takes a runtime list of integers or floats; "
+                "reversing a range or a string is not in the subset",
+            )
+        return node.args[0]
+
+    def refuse_rebinding_the_iterated_list(self, node: ast.For, name: str) -> None:
+        """Refuse a body that assigns to the name being walked backwards.
+
+        The loop reads the block through the name's slot on every iteration, so
+        that growth moving the block never leaves it on a stale copy. Rebinding
+        the name would point it at a different list mid-loop, where CPython's
+        iterator holds on to the original object - a different answer, not just
+        a stale read.
+        """
+
+        # The target counts too: `for xs in reversed(xs)` would write each
+        # element over the very pointer the walk reads.
+        for statement in [node.target, *node.body]:
+            for inner in ast.walk(statement):
+                if (
+                    isinstance(inner, ast.Name)
+                    and isinstance(inner.ctx, ast.Store)
+                    and inner.id == name
+                ):
+                    raise NativeCompileError(
+                        self.path,
+                        inner,
+                        f"'{name}' is the list this loop is walking, and "
+                        "rebinding it would leave the loop on a different list "
+                        "than Python stays on; iterate a copy of the name "
+                        "instead",
+                    )
+
+    def for_over_reversed(self, node: ast.For) -> None:
+        """`for name in reversed(xs):` - the same block, walked from the back.
+
+        Nothing is allocated: the indices run down from the last one, which is
+        what CPython's reverse iterator does rather than building a copy. That
+        iterator re-reads the list on every step and stops as soon as the index
+        is past the current length, so the pointer and the length are read
+        again each time round rather than snapshotted - a body that appends
+        moves the block, and a snapshot would go on reading the abandoned one.
+        """
+
+        assert isinstance(node.target, ast.Name)
+        source = self.reversed_source(node.iter)
+        assert source is not None
+        self.refuse_bool_list(node.iter, source, "reversed()")
+        element_kind = self.list_kind(self.expression_type(source))
+        broke = self.open_loop_else(node)
+        name = node.target.id
+        was_bound = name in self.bound_names
+        if isinstance(source, ast.Name) and self.list_kind_of(source.id) is not None:
+            # Walk through the name's own slot, which append() keeps current.
+            self.refuse_rebinding_the_iterated_list(node, source.id)
+            pointer_slot = self.slot(source.id)
+        else:
+            # A slice or a sorted copy is a block nothing else can reach, so
+            # there is nothing for it to be stale with respect to.
+            pointer_slot = self.new_temp()
+            self.operations.append(Store(pointer_slot, self.list_pointer(source)))
+        index_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                index_slot,
+                IntBinary(
+                    "sub",
+                    HeapLoad(
+                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                    ),
+                    IntConstant(1),
+                ),
+            )
+        )
+        start = self.new_label("for_reversed")
+        continue_label = self.new_label("for_reversed_continue")
+        end = self.new_label("for_reversed_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(index_slot), IntConstant(0)), end)
+        )
+        # An index past the end exhausts CPython's reverse iterator rather than
+        # skipping one element, which is what a list shortened mid-loop does.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntLoad(index_slot),
+                    HeapLoad(
+                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                    ),
+                ),
+                end,
+            )
+        )
+        self.bind_list_element(name, index_slot, pointer_slot, element_kind)
+        self.break_targets.append(end if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        walked = self.iterated_list_name(source)
+        if walked is not None:
+            self.iterated_lists.append(walked)
+        for statement in node.body:
+            self.statement(statement)
+        if walked is not None:
+            self.iterated_lists.pop()
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("sub", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        if was_bound:
+            self.bound_names.add(name)
+        else:
+            # The list may be empty, and then Python leaves the name unbound.
+            self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
 
     def for_over_list(self, node: ast.For) -> None:
         """`for name in <list>:` - walk by index, since there is no iterator."""
 
         assert isinstance(node.target, ast.Name)
+        broke = self.open_loop_else(node)
         name = node.target.id
         was_bound = name in self.bound_names
         index_slot, pointer_slot, element_kind = self.emit_list_iteration(
             node.iter, name
         )
-        length_slot = self.new_temp()
-        self.operations.append(
-            Store(
-                length_slot,
-                HeapLoad(
-                    IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
-                ),
-            )
-        )
         start = self.new_label("for_list")
         continue_label = self.new_label("for_list_continue")
         end = self.new_label("for_list_end")
         self.operations.append(Label(start))
+        # CPython's list iterator holds an index and compares it against the
+        # list's CURRENT length at every step, which is what makes an append
+        # inside the loop extend the walk and a del shorten it. Reading the
+        # length once would stop early or run past the end instead.
         self.operations.append(
             JumpIfFalse(
-                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
+                IntCompare(
+                    "lt",
+                    IntLoad(index_slot),
+                    HeapLoad(
+                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+                        8,
+                    ),
+                ),
+                end,
             )
         )
-        self.bind_list_element(name, index_slot, pointer_slot, element_kind)
-        self.break_targets.append(end)
+        self.bind_list_element(
+            name,
+            index_slot,
+            pointer_slot,
+            element_kind,
+            self.list_holds_bool(node.iter),
+        )
+        self.break_targets.append(end if broke is None else broke)
         self.continue_targets.append(continue_label)
+        walked = self.iterated_list_name(node.iter)
+        if walked is not None:
+            self.iterated_lists.append(walked)
         for statement in node.body:
             self.statement(statement)
+        if walked is not None:
+            self.iterated_lists.pop()
         self.continue_targets.pop()
         self.break_targets.pop()
         self.operations.append(Label(continue_label))
@@ -5385,165 +7874,686 @@ class Frontend:
         else:
             # The list may be empty, and then Python leaves the name unbound.
             self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
 
-    def comprehension_parts(self, node: ast.ListComp):
-        """The comprehension's pieces with its target renamed out of the way.
+    def dict_iteration_source(self, node: ast.expr) -> tuple[str, str] | None:
+        """The dict name and what walking ``node`` yields, or None.
+
+        `d` and `d.keys()` yield keys, `d.values()` values, `d.items()` both.
+        The match is on the shape of the expression rather than on its type,
+        because `d.keys()` has no type of its own here - anything looser would
+        let a stray `d.keys()` elsewhere be taken for something it is not.
+        """
+
+        if isinstance(node, ast.Name):
+            if self.dict_kinds_of(node.id) is None:
+                return None
+            return node.id, "keys"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"keys", "values", "items"}
+            and not node.args
+            and not node.keywords
+            and isinstance(node.func.value, ast.Name)
+            and self.dict_kinds_of(node.func.value.id) is not None
+        ):
+            return node.func.value.id, node.func.attr
+        return None
+
+    def dict_iteration_targets(self, node: ast.For, mode: str) -> list[str]:
+        """The names a dict loop binds, refusing any target it cannot bind."""
+
+        if mode == "items":
+            if (
+                not isinstance(node.target, (ast.Tuple, ast.List))
+                or len(node.target.elts) != 2
+                or not all(isinstance(item, ast.Name) for item in node.target.elts)
+            ):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a native items() loop binds two names, the key and the "
+                    "value",
+                )
+            return [item.id for item in node.target.elts]
+        if not isinstance(node.target, ast.Name):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native loop over a dict binds one name; use items() to bind "
+                "a key and a value",
+            )
+        return [node.target.id]
+
+    def refuse_rebinding_the_iterated_dict(self, node: ast.For, name: str) -> None:
+        """Refuse a body that assigns to the name being walked.
+
+        The loop reads the table through the name's slot on every iteration, so
+        that it never touches a block that growth has moved. Rebinding the name
+        would point it at a different dict mid-loop, where CPython keeps
+        walking the original one - a different answer, not just a stale read.
+        """
+
+        # The target counts too. `for d, v in d.items()` would write the key
+        # over the very slot the walk reads the table through, and the next
+        # iteration would dereference a key as a pointer.
+        for statement in [node.target, *node.body]:
+            for inner in ast.walk(statement):
+                if (
+                    isinstance(inner, ast.Name)
+                    and isinstance(inner.ctx, ast.Store)
+                    and inner.id == name
+                ):
+                    raise NativeCompileError(
+                        self.path,
+                        inner,
+                        f"'{name}' is the dict this loop is walking, and "
+                        "rebinding it would leave the loop on a different "
+                        "dict than Python stays on; iterate a copy of the "
+                        "name instead",
+                    )
+
+    def bind_dict_key(
+        self, target: str, key_slot: int, name: str, key_kind: str
+    ) -> None:
+        self.values.pop(target, None)
+        self.runtime_names.add(target)
+        # Inside the body the name is bound, whatever an earlier loop that
+        # could run zero times left it as.
+        self.possibly_unbound.discard(target)
+        self.operations.append(Store(self.slot(target), IntLoad(key_slot)))
+        self.value_types[target] = key_kind
+        if key_kind == "int" and self.container_bool.get(
+            self.dict_keys_name(name)
+        ) is True:
+            self.boolean_names.add(target)
+        else:
+            self.boolean_names.discard(target)
+
+    def bind_dict_value(
+        self, target: str, address: IntExpression, name: str, value_kind: str
+    ) -> None:
+        self.values.pop(target, None)
+        self.runtime_names.add(target)
+        self.possibly_unbound.discard(target)
+        if value_kind == "float":
+            self.boolean_names.discard(target)
+            self.operations.append(
+                FloatStore(self.slot(target), BitsFloat(HeapLoad(address, 8)))
+            )
+        else:
+            self.operations.append(Store(self.slot(target), HeapLoad(address, 8)))
+            if self.container_bool.get(name) is True:
+                self.boolean_names.add(target)
+            else:
+                self.boolean_names.discard(target)
+        self.value_types[target] = value_kind
+
+    def for_over_dict(self, node: ast.For) -> None:
+        """`for k in d:` and the keys()/values()/items() spellings of it.
+
+        A dict iterates in insertion order, which the table cannot supply, so
+        the walk is over the order list in the dict header and each key is
+        looked back up to reach its value.
+        """
+
+        source = self.dict_iteration_source(node.iter)
+        assert source is not None
+        name, mode = source
+        key_kind, value_kind = self.dict_kinds_of(name)
+        targets = self.dict_iteration_targets(node, mode)
+        self.refuse_rebinding_the_iterated_dict(node, name)
+        broke = self.open_loop_else(node)
+        was_bound = {target: target in self.bound_names for target in targets}
+        dict_slot = self.slot(name)
+        count_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                count_slot,
+                HeapLoad(IntBinary("add", IntLoad(dict_slot), IntConstant(8)), 8),
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("for_dict")
+        continue_label = self.new_label("for_dict_continue")
+        end = self.new_label("for_dict_end")
+        unchanged = self.new_label("for_dict_unchanged")
+        self.operations.append(Label(start))
+        # The size check comes before the bounds test because CPython makes it
+        # first too: a dict grown inside the last iteration raises even though
+        # there was nothing left to yield.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    HeapLoad(
+                        IntBinary("add", IntLoad(dict_slot), IntConstant(8)), 8
+                    ),
+                    IntLoad(count_slot),
+                ),
+                unchanged + "_changed",
+            )
+        )
+        self.operations.append(Jump(unchanged))
+        self.operations.append(Label(unchanged + "_changed"))
+        self.raise_exception(
+            "RuntimeError",
+            b"RuntimeError: dictionary changed size during iteration\n",
+        )
+        self.operations.append(Label(unchanged))
+        # Re-read the header every time: a store inside the body can have grown
+        # the table, which moves it, and the order list moves on its own too.
+        keys_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                keys_slot,
+                HeapLoad(
+                    IntBinary(
+                        "add", IntLoad(dict_slot), IntConstant(self.DICT_KEYS_OFFSET)
+                    ),
+                    8,
+                ),
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntLoad(index_slot),
+                    HeapLoad(
+                        IntBinary("add", IntLoad(keys_slot), IntConstant(8)), 8
+                    ),
+                ),
+                end,
+            )
+        )
+        key_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                key_slot,
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        IntBinary(
+                            "add",
+                            IntLoad(keys_slot),
+                            IntConstant(self.LIST_HEADER_BYTES),
+                        ),
+                        IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                    ),
+                    8,
+                ),
+            )
+        )
+        if mode in {"keys", "items"}:
+            self.bind_dict_key(targets[0], key_slot, name, key_kind)
+        if mode in {"values", "items"}:
+            # This key came out of the order list, so it is in the table; the
+            # probe's found flag has nothing left to say and is dropped. A
+            # string key is hashed again here, once per iteration, which is the
+            # price of not caching entry addresses that growth would move.
+            address_slot, _found, _key, _state = self.dict_probe(
+                dict_slot, IntLoad(key_slot), key_kind
+            )
+            self.bind_dict_value(
+                targets[-1],
+                IntBinary("add", IntLoad(address_slot), IntConstant(16)),
+                name,
+                value_kind,
+            )
+        self.break_targets.append(end if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        for target in targets:
+            if was_bound[target]:
+                self.bound_names.add(target)
+            else:
+                # The dict may be empty, and then Python binds nothing.
+                self.possibly_unbound.add(target)
+        self.close_loop_else(node, broke)
+
+    def comprehension_shape(self, node) -> str:
+        """Check what the clauses are, and name the construct for messages."""
+
+        what = (
+            "list comprehension"
+            if isinstance(node, ast.ListComp)
+            else "generator expression"
+        )
+        for generator in node.generators:
+            if generator.is_async or not isinstance(generator.target, ast.Name):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"a native {what} binds a single name per `for` and is "
+                    "not async",
+                )
+        return what
+
+    def comprehension_parts(self, node):
+        """The clauses with every target renamed out of the way, and the element.
 
         Python 3 gives a comprehension its own scope, so `[k for k in ...]`
         must not disturb an outer `k` - not its value and not its slot. The
-        name is private and derived from this node, so asking for the element
-        kind and emitting the loop agree on it.
+        names are private and derived from this node, so asking for the
+        element kind and emitting the loops agree on them. Renaming is
+        sequential: a clause's iterable sees only the clauses before it, which
+        is what separates `[b for a in xs for b in ys]` from the `ys` an outer
+        scope might also call `a`. The clause index is part of the private
+        name because `[a for a in xs for a in ys]` reuses one.
         """
 
-        generator = node.generators[0]
-        target = generator.target.id
-        private = f"<comp-{id(node):x}:{target}>"
+        renames: dict[str, str] = {}
 
-        class _Rename(ast.NodeTransformer):
-            def visit_Name(self, inner: ast.Name):
-                if inner.id == target:
+        def rewrite(tree: ast.expr) -> ast.expr:
+            class _Rename(ast.NodeTransformer):
+                def visit_Name(self, inner: ast.Name):
+                    replacement = renames.get(inner.id)
+                    if replacement is None:
+                        return inner
                     return ast.copy_location(
-                        ast.Name(id=private, ctx=inner.ctx), inner
+                        ast.Name(id=replacement, ctx=inner.ctx), inner
                     )
-                return inner
 
-        element = _Rename().visit(copy.deepcopy(node.elt))
-        conditions = [
-            _Rename().visit(copy.deepcopy(test)) for test in generator.ifs
-        ]
-        ast.fix_missing_locations(
-            ast.Module(body=[ast.Expr(value=element)], type_ignores=[])
-        )
-        for test in conditions:
+            renamed = _Rename().visit(copy.deepcopy(tree))
             ast.fix_missing_locations(
-                ast.Module(body=[ast.Expr(value=test)], type_ignores=[])
+                ast.Module(body=[ast.Expr(value=renamed)], type_ignores=[])
             )
-        return private, element, conditions, generator.iter
+            return renamed
 
-    def comprehension_element_kind(self, node: ast.ListComp) -> str:
+        clauses = []
+        for index, generator in enumerate(node.generators):
+            iterable = rewrite(generator.iter)
+            private = f"<comp-{id(node):x}-{index}:{generator.target.id}>"
+            renames[generator.target.id] = private
+            clauses.append(
+                (private, iterable, [rewrite(test) for test in generator.ifs])
+            )
+        return clauses, rewrite(node.elt)
+
+    def comprehension_answer(self, node, ask):
+        """Ask ``ask`` about the element with every clause target bound.
+
+        The targets are private names that exist only while the loops run, so
+        whatever the enclosing scope had under them is put back afterwards.
+        """
+
+        clauses, element = self.comprehension_parts(node)
+        restore: list[tuple[str, str | None, bool, bool]] = []
+        try:
+            for target, iterable, _conditions in clauses:
+                item_kind = self.iterable_element_kind(iterable)
+                restore.append(
+                    (
+                        target,
+                        self.value_types.get(target),
+                        target in self.bound_names,
+                        target in self.boolean_names,
+                    )
+                )
+                self.value_types[target] = item_kind or "int"
+                self.bound_names.add(target)
+                if item_kind == "int" and self.list_holds_bool(iterable) is True:
+                    self.boolean_names.add(target)
+                else:
+                    self.boolean_names.discard(target)
+            return ask(element)
+        finally:
+            for target, kind, was_bound, was_bool in reversed(restore):
+                if kind is None:
+                    self.value_types.pop(target, None)
+                else:
+                    self.value_types[target] = kind
+                if was_bound:
+                    self.bound_names.add(target)
+                else:
+                    self.bound_names.discard(target)
+                if was_bool:
+                    self.boolean_names.add(target)
+                else:
+                    self.boolean_names.discard(target)
+
+    def comprehension_element_kind(self, node, bindings=None) -> str:
         """The kind `[expr for t in it]` produces, without emitting anything."""
 
-        if len(node.generators) != 1 or not isinstance(
-            node.generators[0].target, ast.Name
-        ):
-            raise NativeCompileError(
-                self.path,
-                node,
-                "a native list comprehension has one `for` binding one name",
-            )
-        target, element, _tests, iterable = self.comprehension_parts(node)
-        item_kind = self.iterable_element_kind(iterable)
-        previous = self.value_types.get(target)
-        previously_bound = target in self.bound_names
-        self.value_types[target] = item_kind or "int"
-        self.bound_names.add(target)
-        try:
-            kind = self.expression_type(element)
-        finally:
-            if previous is None:
-                self.value_types.pop(target, None)
-            else:
-                self.value_types[target] = previous
-            if not previously_bound:
-                self.bound_names.discard(target)
+        what = self.comprehension_shape(node)
+        kind = self.comprehension_answer(
+            node, lambda element: self.expression_type(element, bindings)
+        )
         if kind not in {"int", "float"}:
             raise NativeCompileError(
-                self.path,
-                node,
-                "a native list comprehension builds integers or floats",
+                self.path, node, f"a native {what} builds integers or floats"
             )
         return kind
 
-    def list_comprehension(self, node: ast.ListComp) -> IntExpression:
-        """`[expr for t in it]`, optionally with `if`.
+    def comprehension_element_bool(self, node) -> bool:
+        """Whether the element this comprehension produces is a bool."""
 
-        The result is sized from the source, not from how many items survive
-        the condition, and the real count is written into the header at the
-        end. Over-reserving costs arena space that is never reclaimed anyway;
-        counting first would mean running the source twice.
+        self.comprehension_shape(node)
+        return self.comprehension_answer(node, self.renders_as_bool)
+
+    def comprehension_source(
+        self,
+        node,
+        outermost: bool,
+        target: str,
+        iterable: ast.expr,
+        conditions: list[ast.expr],
+        bindings=None,
+        call_stack: tuple[int, ...] = (),
+    ) -> ComprehensionSource:
+        """Evaluate one clause's source and describe the loop over it.
+
+        Every source is measured here, before any loop is emitted, which is
+        what makes the product of the spans an upper bound on the result and
+        keeps an inner source from being rebuilt once per outer iteration.
+        Hoisting is only sound if evaluating the source cannot raise where
+        CPython would never have evaluated it at all, so an inner clause is
+        restricted to sources that cannot raise.
         """
 
-        if len(node.generators) != 1:
-            raise NativeCompileError(
-                self.path, node, "a native list comprehension has one `for`"
-            )
-        generator = node.generators[0]
-        if generator.is_async or not isinstance(generator.target, ast.Name):
+        over_range = (
+            isinstance(iterable, ast.Call)
+            and isinstance(iterable.func, ast.Name)
+            and iterable.func.id == "range"
+            and iterable.func.id not in self.functions
+        )
+        if not outermost and not self.hoistable_source(iterable, over_range):
             raise NativeCompileError(
                 self.path,
                 node,
-                "a native list comprehension binds a single name and is not async",
+                "a native comprehension evaluates every `for` source once, "
+                "before the loops; a second or later source must therefore be "
+                "a name holding a list, or range() over names and constants, "
+                "so that hoisting it cannot raise where Python would not have "
+                "reached it",
             )
-        if len(generator.ifs) > 1:
-            raise NativeCompileError(
-                self.path, node, "a native list comprehension has at most one `if`"
-            )
-        element_kind = self.comprehension_element_kind(node)
-        bump = self.ensure_heap()
-        target, element, conditions, _iterable = self.comprehension_parts(node)
-
-        over_range = (
-            isinstance(generator.iter, ast.Call)
-            and isinstance(generator.iter.func, ast.Name)
-            and generator.iter.func.id == "range"
-            and generator.iter.func.id not in self.functions
-        )
         index_slot = self.new_temp()
         limit_slot = self.new_temp()
-        pointer_slot = None
         if over_range:
-            arguments = generator.iter.args
-            if not 1 <= len(arguments) <= 2 or generator.iter.keywords:
+            if not 1 <= len(iterable.args) <= 2 or iterable.keywords:
                 raise NativeCompileError(
                     self.path,
                     node,
                     "a native comprehension over range takes one or two "
                     "arguments and steps by one",
                 )
-            if len(arguments) == 1:
+            start_slot = self.new_temp()
+            if len(iterable.args) == 1:
                 start = IntConstant(0)
-                stop = self.materialize_int(self.integer(arguments[0]))
-            else:
-                start = self.materialize_int(self.integer(arguments[0]))
-                stop = self.materialize_int(self.integer(arguments[1]))
-            self.operations.append(Store(index_slot, start))
-            self.operations.append(Store(limit_slot, stop))
-            reserve = IntBinary("sub", IntLoad(limit_slot), IntLoad(index_slot))
-        else:
-            item_kind = self.list_kind(self.expression_type(generator.iter))
-            if item_kind is None:
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "a native comprehension iterates a range or a runtime list",
+                stop = self.materialize_int(
+                    self.integer(iterable.args[0], bindings, call_stack)
                 )
-            pointer_slot = self.new_temp()
-            self.operations.append(
-                Store(pointer_slot, self.list_pointer(generator.iter))
+            else:
+                start = self.materialize_int(
+                    self.integer(iterable.args[0], bindings, call_stack)
+                )
+                stop = self.materialize_int(
+                    self.integer(iterable.args[1], bindings, call_stack)
+                )
+            self.operations.append(Store(start_slot, start))
+            self.operations.append(Store(limit_slot, stop))
+            return ComprehensionSource(
+                target=target,
+                conditions=conditions,
+                index_slot=index_slot,
+                start=IntLoad(start_slot),
+                limit_slot=limit_slot,
+                span=IntBinary(
+                    "sub", IntLoad(limit_slot), IntLoad(start_slot)
+                ),
+                element_kind="int",
+                pointer_slot=None,
+                holds_bool=False,
             )
-            self.operations.append(Store(index_slot, IntConstant(0)))
+        element_kind = self.list_kind(self.expression_type(iterable))
+        if element_kind is None:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native comprehension iterates a range or a runtime list",
+            )
+        holds_bool = self.list_holds_bool(iterable)
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, self.list_pointer(iterable)))
+        self.operations.append(
+            Store(
+                limit_slot,
+                HeapLoad(IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8),
+            )
+        )
+        return ComprehensionSource(
+            target=target,
+            conditions=conditions,
+            index_slot=index_slot,
+            start=IntConstant(0),
+            limit_slot=limit_slot,
+            span=IntLoad(limit_slot),
+            element_kind=element_kind,
+            pointer_slot=pointer_slot,
+            holds_bool=holds_bool,
+        )
+
+    def hoistable_source(self, iterable: ast.expr, over_range: bool) -> bool:
+        """Whether evaluating this source early can be told from not at all.
+
+        `[1 for a in xs for b in range(0, p // q)]` with an empty `xs` and a
+        zero `q` never evaluates the inner source in CPython. Hoisting it
+        would raise ZeroDivisionError instead. Only sources that cannot raise
+        are allowed there, which closes the difference by construction rather
+        than by hoping the expression is harmless.
+        """
+
+        if over_range:
+            return all(
+                isinstance(argument, ast.Constant)
+                or (
+                    isinstance(argument, ast.Name)
+                    and self.expression_type(argument) in {"int", "float"}
+                )
+                for argument in iterable.args
+            )
+        return (
+            isinstance(iterable, ast.Name)
+            and self.list_kind_of(iterable.id) is not None
+        )
+
+    def comprehension_reserve(
+        self, sources: list[ComprehensionSource]
+    ) -> IntExpression:
+        """How many elements to reserve: the product of the sources.
+
+        `mul` wraps, and a product that came out negative would be clamped to
+        zero here, allocated as a bare header, and then written far past its
+        end - which the arena guard cannot see, because the bump pointer never
+        moved. Each factor is clamped to just past what the arena could hold
+        before it is multiplied, so the running product never approaches the
+        wrap, and the product itself is checked after every step.
+        """
+
+        limit = _HEAP_ARENA_BYTES // 8
+        product_slot = self.new_temp()
+        self.operations.append(Store(product_slot, IntConstant(1)))
+        too_big = self.new_label("comp_too_big")
+        sized = self.new_label("comp_sized")
+        for source in sources:
+            span_slot = self.new_temp()
+            # An empty range gives a negative span; reserve nothing rather
+            # than asking the arena for a negative number of bytes.
             self.operations.append(
                 Store(
-                    limit_slot,
-                    HeapLoad(
-                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                    span_slot,
+                    self.select_integer(
+                        IntCompare("gt", source.span, IntConstant(0)),
+                        source.span,
+                        IntConstant(0),
                     ),
                 )
             )
-            reserve = IntLoad(limit_slot)
-        # An empty range gives a negative span; reserve nothing rather than
-        # asking the arena for a negative number of bytes.
-        reserve_slot = self.new_temp()
-        self.operations.append(
-            Store(
-                reserve_slot,
-                self.select_integer(
-                    IntCompare("gt", reserve, IntConstant(0)),
-                    reserve,
-                    IntConstant(0),
-                ),
+            self.operations.append(
+                Store(
+                    span_slot,
+                    self.select_integer(
+                        IntCompare("gt", IntLoad(span_slot), IntConstant(limit)),
+                        IntConstant(limit + 1),
+                        IntLoad(span_slot),
+                    ),
+                )
             )
+            self.operations.append(
+                Store(
+                    product_slot,
+                    IntBinary("mul", IntLoad(product_slot), IntLoad(span_slot)),
+                )
+            )
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "lt", IntLoad(product_slot), IntConstant(limit + 1)
+                    ),
+                    too_big,
+                )
+            )
+        self.operations.append(Jump(sized))
+        self.operations.append(Label(too_big))
+        # Same report as guard_arena_limit: this is the arena running out, not
+        # a Python-level exception.
+        self.operations.append(Write(b"MemoryError: native arena exhausted\n", 2))
+        self.operations.append(Exit(1))
+        self.operations.append(Label(sized))
+        return IntLoad(product_slot)
+
+    def bind_comprehension_target(self, source: ComprehensionSource) -> None:
+        """Bind one clause's private name to the item the loop is on."""
+
+        if source.pointer_slot is None:
+            self.values.pop(source.target, None)
+            self.runtime_names.add(source.target)
+            self.boolean_names.discard(source.target)
+            self.operations.append(
+                Store(self.slot(source.target), IntLoad(source.index_slot))
+            )
+            self.value_types[source.target] = "int"
+            return
+        self.bind_list_element(
+            source.target,
+            source.index_slot,
+            source.pointer_slot,
+            source.element_kind,
+            source.holds_bool,
         )
+
+    def emit_comprehension_loops(
+        self,
+        sources: list[ComprehensionSource],
+        body,
+        bindings=None,
+        call_stack: tuple[int, ...] = (),
+    ) -> None:
+        """Emit one loop per clause, calling ``body`` at the innermost point."""
+
+        def level(index: int) -> None:
+            if index == len(sources):
+                body()
+                return
+            source = sources[index]
+            # This runs again on every iteration of the loop outside it, so
+            # the index is reset here rather than where the source was
+            # measured.
+            self.operations.append(Store(source.index_slot, source.start))
+            start_label = self.new_label("comp")
+            step_label = self.new_label("comp_next")
+            end_label = self.new_label("comp_end")
+            self.operations.append(Label(start_label))
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "lt",
+                        IntLoad(source.index_slot),
+                        IntLoad(source.limit_slot),
+                    ),
+                    end_label,
+                )
+            )
+            self.bind_comprehension_target(source)
+            for condition in source.conditions:
+                self.operations.append(
+                    JumpIfFalse(
+                        self.integer(condition, bindings, call_stack), step_label
+                    )
+                )
+            level(index + 1)
+            self.operations.append(Label(step_label))
+            self.operations.append(
+                Store(
+                    source.index_slot,
+                    IntBinary("add", IntLoad(source.index_slot), IntConstant(1)),
+                )
+            )
+            self.operations.append(Jump(start_label))
+            self.operations.append(Label(end_label))
+
+        level(0)
+
+    def comprehension_clause_sources(
+        self, node, bindings=None, call_stack: tuple[int, ...] = ()
+    ):
+        """Measure every clause of ``node``, outermost first, and the element."""
+
+        clauses, element = self.comprehension_parts(node)
+        bound: set[str] = set()
+        sources = []
+        for index, (target, iterable, conditions) in enumerate(clauses):
+            if any(
+                isinstance(inner, ast.Name) and inner.id in bound
+                for inner in ast.walk(iterable)
+            ):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "a native comprehension measures every `for` source once, "
+                    "before the loops run, so a later source cannot depend on "
+                    "an earlier target: the size reserved for the result would "
+                    "stop being an upper bound on it",
+                )
+            sources.append(
+                self.comprehension_source(
+                    node,
+                    index == 0,
+                    target,
+                    iterable,
+                    conditions,
+                    bindings,
+                    call_stack,
+                )
+            )
+            bound.add(target)
+        return sources, element
+
+    def list_comprehension(self, node: ast.ListComp) -> IntExpression:
+        """`[expr for t in it ...]`, with any number of `for` and `if` clauses.
+
+        The result is sized from the sources, not from how many items survive
+        the conditions, and the real count is written into the header at the
+        end. Over-reserving costs arena space that is never reclaimed anyway;
+        counting first would mean running the sources twice.
+        """
+
+        element_kind = self.comprehension_element_kind(node)
+        bump = self.ensure_heap()
+        sources, element = self.comprehension_clause_sources(node)
+        reserve = self.comprehension_reserve(sources)
         result_slot = self.new_temp()
         self.operations.append(
             HeapAlloc(
@@ -5551,63 +8561,36 @@ class Frontend:
                 IntBinary(
                     "add",
                     IntConstant(self.LIST_HEADER_BYTES),
-                    IntBinary("mul", IntLoad(reserve_slot), IntConstant(8)),
+                    IntBinary("mul", reserve, IntConstant(8)),
                 ),
                 bump,
             )
         )
         result = IntLoad(result_slot)
-        self.operations.append(HeapStore(result, IntLoad(reserve_slot), 8))
+        self.operations.append(HeapStore(result, reserve, 8))
         count_slot = self.new_temp()
         self.operations.append(Store(count_slot, IntConstant(0)))
 
-        start_label = self.new_label("comp")
-        end_label = self.new_label("comp_end")
-        step_label = self.new_label("comp_next")
-        self.operations.append(Label(start_label))
-        self.operations.append(
-            JumpIfFalse(
-                IntCompare("lt", IntLoad(index_slot), IntLoad(limit_slot)),
-                end_label,
+        def store_element() -> None:
+            address = IntBinary(
+                "add",
+                IntBinary("add", result, IntConstant(self.LIST_HEADER_BYTES)),
+                IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
             )
-        )
-        if over_range:
-            self.values.pop(target, None)
-            self.runtime_names.add(target)
-            self.boolean_names.discard(target)
-            self.operations.append(Store(self.slot(target), IntLoad(index_slot)))
-            self.value_types[target] = "int"
-        else:
-            self.bind_list_element(
-                target,
-                index_slot,
-                pointer_slot,
-                self.list_kind(self.expression_type(generator.iter)),
+            stored = (
+                FloatBits(self.float_expression(element))
+                if element_kind == "float"
+                else self.integer(element)
             )
-        if conditions:
+            self.operations.append(HeapStore(address, stored, 8))
             self.operations.append(
-                JumpIfFalse(self.integer(conditions[0]), step_label)
+                Store(
+                    count_slot,
+                    IntBinary("add", IntLoad(count_slot), IntConstant(1)),
+                )
             )
-        address = IntBinary(
-            "add",
-            IntBinary("add", result, IntConstant(self.LIST_HEADER_BYTES)),
-            IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
-        )
-        stored = (
-            FloatBits(self.float_expression(element))
-            if element_kind == "float"
-            else self.integer(element)
-        )
-        self.operations.append(HeapStore(address, stored, 8))
-        self.operations.append(
-            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
-        )
-        self.operations.append(Label(step_label))
-        self.operations.append(
-            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
-        )
-        self.operations.append(Jump(start_label))
-        self.operations.append(Label(end_label))
+
+        self.emit_comprehension_loops(sources, store_element)
         self.operations.append(
             HeapStore(
                 IntBinary("add", result, IntConstant(8)), IntLoad(count_slot), 8
@@ -5616,19 +8599,26 @@ class Frontend:
         return result
 
     def for_statement(self, node: ast.For) -> None:
+        if self.dict_iteration_source(node.iter) is not None:
+            self.for_over_dict(node)
+            return
         if (
-            not node.orelse
-            and isinstance(node.target, ast.Name)
+            isinstance(node.target, ast.Name)
+            and self.reversed_source(node.iter) is not None
+        ):
+            self.for_over_reversed(node)
+            return
+        if (
+            isinstance(node.target, ast.Name)
             and self.list_kind(self.expression_type(node.iter)) is not None
         ):
             self.for_over_list(node)
             return
-        if not node.orelse and self.enumerate_source(node.iter) is not None:
+        if self.enumerate_source(node.iter) is not None:
             self.for_over_enumerate(node)
             return
         if (
-            node.orelse
-            or not isinstance(node.target, ast.Name)
+            not isinstance(node.target, ast.Name)
             or not isinstance(node.iter, ast.Call)
             or not isinstance(node.iter.func, ast.Name)
             or node.iter.func.id != "range"
@@ -5644,13 +8634,15 @@ class Frontend:
                 hint = "; native enumerate() walks a runtime list"
             elif isinstance(node.iter, ast.Name) and self.value_types.get(
                 node.iter.id
-            ) in {"str", "dict:int:int"}:
+            ) == "str":
                 hint = "; only ranges and runtime lists are iterable here"
             raise NativeCompileError(
                 self.path,
                 node,
                 "native for supports NAME in range(1-3 arguments), NAME in a "
-                "runtime list, or two names in enumerate(list)" + hint,
+                "runtime list, NAME in reversed(list), two names in "
+                "enumerate(list), or a dict with keys(), values() or items()"
+                + hint,
             )
         arguments = node.iter.args
         if len(arguments) == 1:
@@ -5666,6 +8658,7 @@ class Frontend:
                     self.path, node.iter, "native range step must be a nonzero integer constant"
                 )
             step = step_value
+        broke = self.open_loop_else(node)
         name = node.target.id
         # Capture binding state before the loop touches it: after a loop whose
         # range can be empty, Python leaves the name exactly as it was, which
@@ -5694,7 +8687,7 @@ class Frontend:
             )
         )
         self.operations.append(Store(slot, IntLoad(counter_slot)))
-        self.break_targets.append(end_label)
+        self.break_targets.append(end_label if broke is None else broke)
         self.continue_targets.append(continue_label)
         for statement in node.body:
             self.statement(statement)
@@ -5725,12 +8718,24 @@ class Frontend:
         else:
             # The body may never have run, so the name may still be unbound.
             self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
 
     def expression_statement(self, node: ast.expr) -> None:
         if not isinstance(node, ast.Call):
             raise NativeCompileError(self.path, node, "only print() and SystemExit are valid expression statements")
         if self.list_method_call(node):
             return
+        if self.string_method_kind(node) is not None:
+            # Strings are immutable, so this changed nothing. CPython would
+            # discard the result too, but silently, and a discarded
+            # `s.replace(...)` is a bug every time it is written.
+            assert isinstance(node.func, ast.Attribute)
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"str.{node.func.attr}() returns a new string and changes "
+                "nothing; assign the result or print it",
+            )
         if (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
@@ -7816,6 +10821,10 @@ class Frontend:
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
             # An element is a bool when everything stored in the container was.
             return self.container_bool.get(node.value.id) is True
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
+            # Indexing something that was never bound to a name - a slice of a
+            # slice, a comprehension used in place.
+            return self.list_holds_bool(node.value) is True
         if isinstance(node, ast.Attribute):
             native_class = self.resolve_object_class(node.value)
             if native_class is not None:
@@ -7840,8 +10849,30 @@ class Frontend:
                     "the bool in int() or make both arms the same kind",
                 )
             return taken
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in self._AGGREGATE_CALLS
+            and node.func.id not in self.functions
+            and len(node.args) == 1
+        ):
+            if node.func.id in {"any", "all"}:
+                return True
+            if node.func.id in {"min", "max"}:
+                # The answer is one of the elements, so it prints the way they
+                # do. sum() of bools is an int in CPython, so it is not here.
+                argument = node.args[0]
+                if isinstance(argument, ast.GeneratorExp):
+                    try:
+                        return self.comprehension_element_bool(argument)
+                    except NativeCompileError:
+                        return False
+                return self.list_holds_bool(argument) is True
+            return False
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             return self.call_returns_bool(node)
+        if self.string_method_kind(node) == "bool":
+            return True
         return False
 
     def call_returns_bool(self, node: ast.Call) -> bool:
@@ -8314,6 +11345,9 @@ class Frontend:
             return self.list_kind_of(node.value.id)
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
             return self.attribute_kind(node)
+        method = self.string_method_kind(node, bindings)
+        if method is not None:
+            return "str" if method == "str" else "int"
         kind = self.expression_function_kind(node, bindings)
         if kind is not None:
             return kind
@@ -8353,7 +11387,18 @@ class Frontend:
             if node.func.id == "float" and node.func.id not in self.functions:
                 return "float"
             if (
-                node.func.id in {"int", "len", "abs", "sum", "min", "max"}
+                node.func.id == "sorted"
+                and node.func.id not in self.functions
+                and len(node.args) == 1
+            ):
+                # A sorted copy holds what the source held.
+                element = self.list_kind(
+                    self.expression_type(node.args[0], bindings)
+                )
+                if element is not None:
+                    return self.list_tag(element)
+            if (
+                node.func.id in {"int", "len", "abs"} | self._AGGREGATE_CALLS
                 and node.func.id not in self.functions
             ):
                 return "int"
@@ -8383,6 +11428,16 @@ class Frontend:
             if float(divisor) == 0.0:
                 raise NativeCompileError(self.path, node, "float division by zero")
             return FloatConstant(float(divisor))
+        if self.eager_depth:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a float divisor that is not a compile-time constant cannot "
+                "appear in a conditional expression or a short-circuited "
+                "Boolean operand, because its zero check would run even when "
+                "Python would not evaluate that branch; use an if statement "
+                "instead",
+            )
         value = self.float_expression(node, bindings, call_stack)
         # Pin it: the check and the division both read it, and the backends
         # re-emit an expression tree at every occurrence, so an unpinned
@@ -8469,6 +11524,46 @@ class Frontend:
             raise NativeCompileError(
                 self.path, node, f"float variable {node.id!r} is not defined here"
             )
+        if isinstance(node, ast.IfExp):
+            # Both arms land in one slot, so they have to agree on kind. A
+            # branching function body is normalised into one of these, which is
+            # where a function returning a float from one arm and an int from
+            # the other shows up.
+            taken_kind = self.expression_type(node.body, bindings)
+            other_kind = self.expression_type(node.orelse, bindings)
+            if taken_kind != other_kind:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"the two arms of this have different kinds, {taken_kind} "
+                    f"and {other_kind}; they share a slot, and widening the "
+                    "integer arm to a double would print 1.0 where Python "
+                    "prints 1, so write float() on the integer arm",
+                )
+            condition = self.integer(node.test, bindings, call_stack)
+            # A real branch, not the integer path's evaluate-both-and-select: a
+            # float arm can carry a division whose zero check must not run on
+            # the arm Python never evaluates.
+            result_slot = self.new_temp()
+            alternative_label = self.new_label("float_if_else")
+            join_label = self.new_label("float_if_end")
+            self.operations.append(JumpIfFalse(condition, alternative_label))
+            self.operations.append(
+                FloatStore(
+                    result_slot,
+                    self.float_expression(node.body, bindings, call_stack),
+                )
+            )
+            self.operations.append(Jump(join_label))
+            self.operations.append(Label(alternative_label))
+            self.operations.append(
+                FloatStore(
+                    result_slot,
+                    self.float_expression(node.orelse, bindings, call_stack),
+                )
+            )
+            self.operations.append(Label(join_label))
+            return FloatLoad(result_slot)
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.UAdd):
                 return self.float_expression(node.operand, bindings, call_stack)
@@ -8736,9 +11831,11 @@ class Frontend:
             raise NativeCompileError(
                 self.path,
                 node,
-                f"{node.id!r} may be unbound here because its loop can run "
-                "zero times; CPython raises UnboundLocalError, and the "
-                "native slot would hold an unrelated value",
+                f"{node.id!r} may be unbound here because a loop reaching this "
+                "point can be left without binding it - by running zero times, "
+                "or by a break skipping the else body; CPython raises "
+                "UnboundLocalError, and the native slot would hold an "
+                "unrelated value",
             )
         if isinstance(node, ast.Name) and node.id in self.slots:
             kind = self.value_types.get(node.id)
@@ -8806,7 +11903,27 @@ class Frontend:
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in self._AGGREGATES
+            and node.func.id in {"sorted", "reversed"}
+            and node.func.id not in self.functions
+        ):
+            # Check the call before refusing it, so a bad keyword or an
+            # argument that is not a list names itself rather than hiding
+            # behind "this is not a number".
+            if node.func.id == "sorted":
+                self.sorted_call_shape(node)
+            else:
+                self.reversed_source(node)
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native {node.func.id}() produces a sequence, not a number; "
+                "sorted(list) can be assigned to a name, indexed, or iterated, "
+                "and reversed(list) is only a for-loop header",
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in self._AGGREGATE_CALLS
             and node.func.id not in self.functions
         ):
             return self.aggregate_call(node, bindings, call_stack)
@@ -8872,6 +11989,9 @@ class Frontend:
                     self.path, node, "this attribute holds a float"
                 )
             return HeapLoad(self.attribute_address(node), 8)
+        if self.string_method_kind(node, bindings) in {"int", "bool"}:
+            assert isinstance(node, ast.Call)
+            return self.string_method_integer(node)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -9275,6 +12395,7 @@ class Frontend:
                 self.kernel_functions = previous_kernel_functions
                 self.extern_functions = previous_extern_functions
                 self.path = previous_path
+        self.refuse_lazy_comprehension(node)
         raise NativeCompileError(
             self.path,
             node,

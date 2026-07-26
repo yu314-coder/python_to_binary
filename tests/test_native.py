@@ -1322,6 +1322,181 @@ class NativeDictionaryTests(unittest.TestCase):
             self.assertIn("KeyError", str(caught.exception))
 
 
+class NativeDictionaryIterationTests(unittest.TestCase):
+    """Walking a dict, which CPython does in insertion order.
+
+    The table is open-addressed, so its own order is hash order and printing
+    while walking it would be a different program. The dict therefore keeps a
+    list of its keys in the order they were first stored, and every case here
+    compares stdout with CPython so a wrong order cannot pass.
+    """
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "i.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "i.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_keys_come_out_in_insertion_order(self):
+        # 5 and 3 land in slots 5 and 3, so a walk of the table would print 3
+        # first. Insertion order is the other one.
+        self._run("d = {5: 10, 3: 20}\nfor k in d:\n    print(k, d[k])\n")
+
+    def test_order_survives_every_rehash(self):
+        self._run(
+            "d = {}\ni = 0\nwhile i < 40:\n    d[(39 - i) * 8] = i\n    i += 1\n"
+            "for k in d:\n    print(k)\n"
+        )
+
+    def test_string_keys_come_out_in_insertion_order(self):
+        # Hashed, these four sit in the table as two, three, four, one.
+        self._run(
+            'd = {"one": 1, "two": 2, "three": 3, "four": 4}\n'
+            "for k in d:\n    print(k, d[k])\n"
+        )
+
+    def test_keys_values_and_items_over_float_values(self):
+        self._run(
+            "d = {5: 1.5, 3: -0.25, 9: 0.0}\n"
+            "for k in d.keys():\n    print(k)\n"
+            "for v in d.values():\n    print(v)\n"
+            "for k, v in d.items():\n    print(k, v)\n"
+        )
+
+    def test_string_keys_with_items(self):
+        self._run(
+            'd = {"x": 1, "y": 2, "z": 3}\n'
+            "for k, v in d.items():\n    print(k, v)\n"
+        )
+
+    def test_bool_values_print_as_bools(self):
+        self._run(
+            "d = {5: True, 3: False}\n"
+            "for k, v in d.items():\n    print(k, v)\n"
+        )
+
+    def test_bool_keys_print_as_bools(self):
+        self._run("d = {True: 5, False: 6}\nfor k in d:\n    print(k)\n")
+
+    def test_an_empty_dict_binds_nothing(self):
+        self._run(
+            'd: dict[str, int] = {}\nfor k in d:\n    print("never")\n'
+            'print("done")\n'
+        )
+
+    def test_growing_the_dict_raises_after_the_earlier_keys(self):
+        self._run(
+            "d = {1: 1, 2: 2, 3: 3}\nfor k in d:\n    print(k)\n"
+            "    if k == 2:\n        d[9] = 9\n"
+        )
+
+    def test_growing_the_dict_raises_even_when_exhausted(self):
+        self._run(
+            'd = {1: 1}\nfor k in d:\n    d[2] = 2\nprint("unreachable")\n'
+        )
+
+    def test_replacing_an_existing_key_does_not_raise(self):
+        self._run("d = {1: 1, 2: 2}\nfor k in d:\n    d[1] = 9\n    print(k)\n")
+
+    def test_the_runtime_error_is_catchable(self):
+        self._run(
+            "d = {1: 1}\ntry:\n    for k in d:\n        d[2] = 2\n"
+            'except RuntimeError:\n    print("caught")\n'
+        )
+
+    def test_a_store_from_an_inlined_function_still_raises(self):
+        # An AST scan of the loop body would miss this one; the count check at
+        # the top of each iteration does not care where the store came from.
+        self._run(
+            "d = {1: 1, 2: 2}\n"
+            "def grow() -> int:\n    d[7] = 7\n    return 0\n"
+            "for k in d:\n    print(k)\n    n = grow()\n"
+            'print("after")\n'
+        )
+
+    def test_breaking_before_the_next_key_does_not_raise(self):
+        self._run(
+            "d = {1: 1, 2: 2}\nfor k in d:\n    d[9] = 9\n    break\n"
+            "print(len(d))\n"
+        )
+
+    def test_replacing_a_value_does_not_reorder_its_key(self):
+        self._run(
+            "d = {5: 1, 3: 2}\nd[5] = 99\nd[7] = 3\n"
+            "for k in d:\n    print(k, d[k])\n"
+        )
+
+    def test_break_continue_and_nesting(self):
+        self._run(
+            "d = {5: 1, 3: 2, 9: 3}\n"
+            "for k in d:\n    if k == 3:\n        continue\n"
+            "    for j in d:\n        print(k, j)\n"
+            "    if k == 9:\n        break\n"
+        )
+
+    def test_iterating_inside_a_function(self):
+        self._run(
+            "d = {4: 40, 1: 10, 7: 70}\n"
+            "def total() -> int:\n    s = 0\n    for k in d:\n"
+            "        s += k * d[k]\n    return s\n"
+            "print(total())\n"
+        )
+
+    def test_many_string_keys_through_several_rehashes(self):
+        self._run(
+            'd: dict[str, float] = {}\ni = 0\ns = ""\n'
+            "while i < 300:\n    s = s + \"a\"\n    d[s] = i * 0.5\n    i += 1\n"
+            'n = 0\ntotal = 0.0\nlast = ""\n'
+            "for k, v in d.items():\n    n += 1\n    total += v\n    last = k\n"
+            "print(n, total, len(last))\n"
+        )
+
+    def test_what_dict_iteration_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for source, expected in (
+                (
+                    "d = {1: 1, 2: 2}\nfor k in d:\n    d = {3: 3}\n    print(k)\n",
+                    "rebinding it",
+                ),
+                (
+                    "d = {1: 1}\nfor k, v in d:\n    print(k)\n",
+                    "binds one name",
+                ),
+                (
+                    "d = {1: 1}\nfor k in d.items():\n    print(k)\n",
+                    "binds two names",
+                ),
+                ("d = {1: 1}\nn = d.keys()\nprint(n)\n", "native integer subset"),
+                ("d = {1: 1}\nprint(len(d.keys()))\n", "native len()"),
+                (
+                    "d = {1: 1}\nxs = [k for k in d]\nprint(xs)\n",
+                    "a range or a runtime list",
+                ),
+                (
+                    "d = {True: 1, 1: 2}\nprint(len(d))\n",
+                    "this dict's keys holds bools already",
+                ),
+            ):
+                entry = root / "j.py"
+                entry.write_text(source, encoding="utf-8")
+                with self.assertRaises(NativeCompileError) as caught:
+                    compile_native(entry, root / "j.bin", "darwin-arm64", clean=True)
+                self.assertIn(expected, str(caught.exception))
+
+
 class NativeExceptionTests(unittest.TestCase):
     """try/except/else/finally and raise, without runtime type objects.
 
@@ -1927,4 +2102,150 @@ class WithStatementTests(unittest.TestCase):
     def test_a_non_object_manager_is_rejected(self):
         self._reject(
             'with 5 as g:\n    print("x")\n', "needs a native object"
+        )
+
+
+class LoopElseTests(unittest.TestCase):
+    """`for ... else` and `while ... else`: the else runs unless a break skipped it.
+
+    There is no run-time flag. A loop with an else gets a second exit label
+    past the else body, and `break` targets that one, so the skip costs a jump
+    and nothing else.
+    """
+
+    RUNTIME_N = "n = 0\nfor i in range(0, 3):\n    n += 1\n"
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "e.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "e.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, expected: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "e.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "e.bin", "darwin-arm64", clean=True)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_a_range_loop_else_runs_only_without_a_break(self):
+        self._run(
+            self.RUNTIME_N
+            + "for i in range(0, n):\n    if i == 99:\n        break\n"
+            + 'else:\n    print("fell through")\n'
+            + "for i in range(0, n):\n    if i == 1:\n        break\n"
+            + 'else:\n    print("not reached")\n'
+            + 'print("end")\n'
+        )
+
+    def test_a_while_else(self):
+        self._run(
+            self.RUNTIME_N
+            + "k = n\nwhile k > 0:\n    k -= 1\n    if k == 1:\n        break\n"
+            + 'else:\n    print("drained")\n'
+            + "m = n\nwhile m > 0:\n    m -= 1\n"
+            + 'else:\n    print("emptied", m)\n'
+            + 'print("end", k)\n'
+        )
+
+    def test_a_break_in_a_nested_loop_does_not_skip_the_outer_else(self):
+        self._run(
+            self.RUNTIME_N
+            + "for i in range(0, n):\n"
+            + "    for j in range(0, n):\n        if j == 1:\n            break\n"
+            + '    print("body", i)\n'
+            + 'else:\n    print("outer else")\n'
+        )
+
+    def test_a_break_in_an_inner_else_breaks_the_outer_loop(self):
+        # The target stacks are popped before the else body is emitted, so a
+        # break written there belongs to the enclosing loop, as in CPython.
+        self._run(
+            self.RUNTIME_N
+            + "for i in range(0, n):\n"
+            + "    for j in range(0, i):\n        if j == 5:\n            break\n"
+            + '    else:\n        print("inner else", i)\n'
+            + "        if i == 1:\n            break\n"
+            + '    print("body", i)\n'
+            + 'else:\n    print("outer else")\n'
+            + 'print("done")\n'
+        )
+
+    def test_a_continue_in_an_else_body_continues_the_outer_loop(self):
+        self._run(
+            self.RUNTIME_N
+            + "for i in range(0, n):\n"
+            + "    for j in range(0, 1):\n        pass\n"
+            + "    else:\n        continue\n"
+            + '    print("unreachable", i)\n'
+            + 'print("done")\n'
+        )
+
+    def test_a_name_assigned_in_an_else_body_is_not_folded_on_the_break_path(self):
+        # The label after the else is reached from two paths, so a name the
+        # else body assigns cannot stay a build-time constant.
+        self._run(
+            self.RUNTIME_N
+            + "a = 1\nb = 2.5\ns = 'no'\n"
+            + "for i in range(0, n):\n    if i == 1:\n        break\n"
+            + "else:\n    a = 9\n    b = 9.5\n    s = 'yes'\n"
+            + "print(a * 2, b + 0.5, s)\n"
+            + 'if a == 9:\n    print("nine")\nelse:\n    print("not nine")\n'
+        )
+
+    def test_a_for_else_over_a_list_reversed_and_enumerate(self):
+        self._run(
+            self.RUNTIME_N
+            + "xs = [1, 2]\nxs.append(n)\n"
+            + "for v in xs:\n    if v == 99:\n        break\n"
+            + 'else:\n    print("no 99")\n'
+            + "for v in reversed(xs):\n    if v == 99:\n        break\n"
+            + 'else:\n    print("rev no 99")\n'
+            + "for k, v in enumerate(xs):\n    if v == 2:\n        break\n"
+            + 'else:\n    print("not reached")\n'
+            + 'print("end")\n'
+        )
+
+    def test_a_for_else_over_a_dict(self):
+        self._run(
+            self.RUNTIME_N
+            + "d = {}\nd[1] = 10\nd[2] = n\n"
+            + "for k, v in d.items():\n    if v == 99:\n        break\n"
+            + 'else:\n    print("no 99")\n'
+            + 'print("end")\n'
+        )
+
+    def test_a_name_first_bound_in_an_else_body_is_refused_after_a_break(self):
+        # The break path jumped over the else, so the slot holds nothing there.
+        self._reject(
+            self.RUNTIME_N
+            + "for i in range(0, n):\n    if i == 99:\n        break\n"
+            + "else:\n    later = 5\nprint(later)\n",
+            "may be unbound here",
+        )
+
+    def test_a_break_leaving_a_cleanup_scope_is_still_refused(self):
+        # The else body adds a label, not a jump-stack entry, so a `with`
+        # opened inside the loop still refuses a break out of it.
+        self._reject(
+            "class G:\n    def __enter__(self):\n        return self\n"
+            "    def __exit__(self, a, b, c):\n        print('close')\n\n"
+            + self.RUNTIME_N
+            + "for i in range(0, n):\n    with G() as g:\n        break\n"
+            + 'else:\n    print("else")\n',
+            "cannot leave a try that has a finally",
         )

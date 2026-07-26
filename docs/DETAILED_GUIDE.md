@@ -212,13 +212,50 @@ runtime:
   substitutions in reach;
 - `==` and `!=` between runtime strings, comparing length then bytes: the same
   comparison a string-keyed dict already makes when it probes;
+- string methods on any runtime string expression: `.startswith()`,
+  `.endswith()`, `.find()`, `.index()`, `.count()`, `.replace()`, `.strip()`,
+  `.lstrip()`, `.rstrip()`, `.zfill()`, `.center()`, `.ljust()`, `.rjust()`,
+  `.upper()`, `.lower()`, `.capitalize()`, `.title()`, `.isdigit()` and
+  `.isalpha()`. The searches share one scan, and they only start at code-point
+  boundaries so that an empty needle is found between characters rather than
+  between the bytes of one - which is what makes `"é".count("")` two.
+  `.find()` reports a character index, not a byte offset, and widths count
+  characters. `.strip()` removes all 29 Unicode whitespace code points, not the
+  ASCII five. `.replace()` counts first and allocates once, because a
+  concatenation per occurrence would allocate inside a loop.
+  The six case and character-class methods are the honest exception: they are
+  Unicode mappings - `'ß'.upper()` is the *two* characters `'SS'` - and the
+  tables are not in the image, so a receiver that is not ASCII stops the
+  program with a named message on stderr and exit 1 rather than returning a
+  byte-flipped answer. A non-ASCII constant receiver is rejected at build time
+  instead. Because that check can stop the program, those methods and
+  `.index()` are refused inside a conditional expression or a short-circuited
+  Boolean operand, where both arms are lowered eagerly;
 - `for index, item in enumerate(xs)` and `enumerate(xs, start)`;
 - `global` inside a native function names the module's variable rather than a
   local. Such a name is kept in a slot rather than folded, because inlining
   swaps the build-time constant map and a constant written inside the body
   would be dropped when the module's map came back;
-- `sum()`, `min()`, `max()` over a runtime integer list, and `abs()`. `min()`
-  and `max()` of an empty list raise a catchable `ValueError`, as CPython does;
+- `sum()`, `min()`, `max()`, `any()` and `all()` over a runtime integer list or
+  over a generator expression, and `abs()`. `min()` and `max()` of an empty
+  iterable raise a catchable `ValueError`, as CPython does; `any()` of an empty
+  one is `False` and `all()` of it is `True`;
+- `sorted(xs)`, `xs.sort()` and `for v in reversed(xs)` over a runtime list of
+  integers or of floats, with `reverse=True` accepted when it is a constant.
+  The sort is an insertion sort, in place and stable, because the arena never
+  reclaims and a merge sort's scratch buffer would be abandoned once per call;
+  `sorted()` costs one block of `16 + 8n` bytes and the other two allocate
+  nothing. Floats are compared as numbers rather than as the words holding
+  them, so equal values - `-0.0` beside `0.0` - keep the order they arrived in
+  and `reverse=True` flips the comparison rather than reversing the result. A
+  `key=` or a `cmp=` is rejected by name, since the subset has nowhere to keep
+  a callable, and so is a `reverse=` only known at run time. A list of bools is
+  rejected too: which lists hold bools is tracked per name, and neither a
+  sorted copy nor a loop variable inherits that, so the result would print as 1
+  and 0. A NaN in the list is refused at run time with a catchable
+  `ValueError` - CPython does not raise there, it returns whatever order its
+  own sequence of comparisons leaves behind, and this sort would produce a
+  different one;
 - parallel assignment (`a, b = b, a`) reads every right-hand side into a
   temporary before writing any name, so `a, b = b, a + b` is a swap and not two
   assignments in sequence. Chained assignment (`a = b = value`) evaluates the
@@ -230,13 +267,29 @@ runtime:
   bounds count code points, so they are resolved to byte offsets before
   anything is copied. A step other than one is rejected;
 - `for name in <list>:` walks a runtime list by index, and a list
-  comprehension (`[expr for name in it]`, optionally with one `if`) builds one,
-  over a range or another list. The result is sized from the source rather than
-  from how many items survive the condition, and the real count is written into
-  the header at the end: over-reserving costs arena space that is never
-  reclaimed anyway, and counting first would mean running the source twice. The
-  comprehension's name is private, as Python 3's own scope makes it, so an
-  outer variable of the same name keeps both its value and its slot;
+  comprehension (`[expr for name in it ...]`, with any number of `for` and `if`
+  clauses) builds one, over a range or another list. The result is sized from
+  the sources rather than from how many items survive the conditions, and the
+  real count is written into the header at the end: over-reserving costs arena
+  space that is never reclaimed anyway, and counting first would mean running
+  the sources twice. With nested clauses the reserve is the *product* of the
+  sources, so `[x for a in range(0, 1000) for b in range(0, 1000)]` that keeps
+  ten items still burns 8 MB of the 16 MB arena for good. A product that would
+  not fit reports `MemoryError` and exits 1 rather than wrapping. Each
+  comprehension name is private, as Python 3's own scope makes it, so an outer
+  variable of the same name keeps both its value and its slot;
+- every `for` source is evaluated once, before any of the loops run. That is
+  what makes the reserve an upper bound, and it costs two restrictions on any
+  clause after the first: its source may not mention a target bound by an
+  earlier clause (`[b for a in xs for b in range(0, a)]` is refused), and it
+  must be a name holding a list or a `range()` over names and constants, so
+  that hoisting it cannot raise where Python would never have reached it;
+- a generator expression is supported only as the sole argument of `sum()`,
+  `min()`, `max()`, `any()` or `all()`, where it is lowered as the loop it
+  describes and **allocates nothing**. Anywhere else it is rejected: it is a
+  lazy object and there is nothing here to hold one. `sum([...])` over the same
+  comprehension has to build the list first, and the arena never takes it back,
+  so the generator form is the one to reach for;
 - a list whose length is not known at build time - a slice or a comprehension -
   gets a run-time bounds check even for a constant index, since there is
   nothing to prove the index against at build time;
@@ -259,6 +312,12 @@ runtime:
   `MemoryError` and exits 1. The arena is one fixed reservation and the bump
   pointer only moves forward, so passing the end is not a failed allocation but
   a write to memory the process never asked for;
+- a list variable holds the block itself rather than a reference to it, so a
+  second name for the same list is refused: appending moves the block and only
+  one of the two names would follow it. `ys = xs[:]` copies. Iteration reads
+  the block and its length through the variable's own slot at every step, the
+  way CPython's iterator re-checks the length, so an append inside the loop
+  extends the walk and a `del` shortens it;
 - a `bool` keeps its identity through a list, a dict, a function parameter, a
   return value, and a conditional expression. Nothing at run time tells `True`
   from `1` - the slot holds a number either way - so the answer is carried
@@ -287,6 +346,15 @@ runtime:
 - constant `if` selects one branch at build time;
 - integer `if`, `while`, `for NAME in range(...)`, `break`, and `continue`
   emit native labels and branches; range step is a nonzero integer constant;
+- `while ... else` and `for ... else` run the else body when the loop was not
+  left by a break; a loop with an else gets a second exit label past the else
+  body, which is where its break jumps, so there is no run-time flag and a
+  break in a nested loop does not skip the outer loop's else;
+- `del xs[i]` on a runtime list shifts the tail down and drops the header
+  length by one, in place, so another name holding the same list sees it. A
+  negative index counts from the end and one out of range reports `IndexError`.
+  `del d[k]`, `del name`, `del obj.attr`, `del xs[a:b]`, and a `del` that would
+  shorten a list a `for` is walking are each rejected by name;
 - same-module, local, and pinned-source functions are inlined when they use
   positional parameters, optional static integer defaults and named calls, no
   decorators/variadics, supported integer

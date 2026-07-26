@@ -162,6 +162,179 @@ class NativeHeapTests(unittest.TestCase):
             b"tail\n",
         )
 
+    # --- runtime string methods ---------------------------------------------
+    #
+    # Every source below builds its strings in a loop, because the front end
+    # folds aggressively and a folded receiver would test CPython's own
+    # evaluator instead of the emitted code. `_run` diffs stdout and the exit
+    # status against CPython running the same file.
+
+    def test_find_and_index_report_character_offsets(self):
+        # A byte-offset implementation answers 3 and 7 here.
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "héllo wörld"\n'
+            'print(s.find("llo"), s.find("wörld"), s.find("zz"), '
+            's.index("ö"))\n',
+            0,
+            "2 6 -1 7\n".encode("utf-8"),
+        )
+
+    def test_count_skips_overlaps_and_counts_empty_by_character(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "aaa"\n'
+            'e = ""\n'
+            "for i in range(0, 1):\n"
+            '    e = e + "é"\n'
+            'print(s.count("aa"), s.count("a"), s.count(""), e.count(""), '
+            's.count("b"))\n',
+            0,
+            b"1 3 4 2 0\n",
+        )
+
+    def test_replace_grows_shrinks_and_handles_an_empty_needle(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "aaa"\n'
+            'u = ""\n'
+            "for i in range(0, 1):\n"
+            '    u = u + "é"\n'
+            'print(s.replace("a", "bb"))\n'
+            'print("[" + s.replace("a", "") + "]")\n'
+            'print(s.replace("", "-"))\n'
+            'print(u.replace("", "-"))\n'
+            'print(s.replace("aa", "X"))\n',
+            0,
+            "bbbbbb\n[]\n-a-a-a-\n-é-\nXa\n".encode("utf-8"),
+        )
+
+    def test_strip_removes_unicode_whitespace(self):
+        # The ASCII five would leave U+00A0 and U+3000 in place and diverge on
+        # all three calls.
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "  x　 "\n'
+            'print("[" + s.strip() + "]", "[" + s.lstrip() + "]", '
+            '"[" + s.rstrip() + "]")\n',
+            0,
+            "[x] [x　 ] [  x]\n".encode("utf-8"),
+        )
+
+    def test_strip_of_only_whitespace_is_empty(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "    "\n'
+            'print("[" + s.strip() + "]", len(s.strip()), len(s.lstrip()), '
+            "len(s.rstrip()))\n",
+            0,
+            b"[] 0 0 0\n",
+        )
+
+    def test_padding_counts_characters_not_bytes(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "é"\n'
+            't = ""\n'
+            "for i in range(0, 1):\n"
+            '    t = t + "ab"\n'
+            'print("[" + s.rjust(3) + "]", "[" + s.zfill(3) + "]", '
+            '"[" + t.center(5) + "]", "[" + t.center(6) + "]", '
+            '"[" + t.center(1) + "]", "[" + t.ljust(5) + "]")\n',
+            0,
+            "[  é] [00é] [  ab ] [  ab  ] [ab] [ab   ]\n".encode(
+                "utf-8"
+            ),
+        )
+
+    def test_zfill_keeps_a_leading_sign_in_front(self):
+        self._run(
+            'n = ""\n'
+            "for i in range(0, 1):\n"
+            '    n = n + "-5"\n'
+            'p = ""\n'
+            "for i in range(0, 1):\n"
+            '    p = p + "+7"\n'
+            'e = ""\n'
+            "for i in range(0, 1):\n"
+            '    e = e + ""\n'
+            'print("[" + n.zfill(4) + "]", "[" + p.zfill(4) + "]", '
+            '"[" + e.zfill(3) + "]", "[" + n.zfill(1) + "]")\n',
+            0,
+            b"[-005] [+007] [000] [-5]\n",
+        )
+
+    def test_string_predicates_print_as_bools(self):
+        # Without renders_as_bool knowing about these, they would print 1 and 0.
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "abc"\n'
+            'print(s.startswith("ab"), s.endswith("bc"), s.startswith(""), '
+            "s.isdigit(), s.isalpha())\n"
+            'flag = s.isalpha()\n'
+            "print(flag)\n",
+            0,
+            b"True True True False True\nTrue\n",
+        )
+
+    def test_empty_haystack_answers_like_cpython(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + ""\n'
+            'print("[" + s.strip() + "]", s.find("a"), s.count("a"), '
+            's.startswith(""), s.find(""), s.count(""))\n',
+            0,
+            b"[] -1 0 True 0 1\n",
+        )
+
+    def test_ascii_case_methods_match_cpython(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            "    s = s + \"MiXed 42! they're\"\n"
+            "print(s.upper())\n"
+            "print(s.lower())\n"
+            "print(s.capitalize())\n"
+            "print(s.title())\n",
+            0,
+            b"MIXED 42! THEY'RE\nmixed 42! they're\n"
+            b"Mixed 42! they're\nMixed 42! They'Re\n",
+        )
+
+    def test_methods_apply_to_any_string_expression(self):
+        self._run(
+            'a = ""\n'
+            "for i in range(0, 1):\n"
+            '    a = a + "  héllo  "\n'
+            "def tag(t):\n"
+            '    return t + "!"\n'
+            'print("[" + a.strip().replace("é", "e").upper() + "]", '
+            '"[" + tag(a.strip())[1:].rjust(6) + "]")\n',
+            0,
+            "[HELLO] [ éllo!]\n".encode("utf-8"),
+        )
+
+    def test_index_raises_a_catchable_value_error(self):
+        self._run(
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "abc"\n'
+            "try:\n"
+            '    print(s.index("zz"))\n'
+            "except ValueError:\n"
+            '    print("caught")\n',
+            0,
+            b"caught\n",
+        )
+
     # --- honest rejections --------------------------------------------------
 
     def _reject(self, source: str, needle: str) -> None:
@@ -400,4 +573,745 @@ class WindowsArenaEncodingTests(unittest.TestCase):
         self.assertTrue(
             any((word & 0xFF00001F) == 0xB5000000 for word in words),
             "no cbnz x0 guarding the reservation",
+        )
+
+
+class ListSortingTests(unittest.TestCase):
+    """`sorted()`, `list.sort()` and `reversed()` over runtime lists.
+
+    Every expectation is CPython's own output for the same source, diffed
+    against the darwin-arm64 binary. The lists are built by appending inside a
+    loop so that the front end cannot fold them away and answer from its own
+    evaluator instead of from the machine code.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                artifact = root / f"program-{target}.bin"
+                compile_native(entry, artifact, target, clean=True)
+                magic = _MAGIC[target.split("-")[0]]
+                self.assertEqual(
+                    artifact.read_bytes()[: len(magic)],
+                    magic,
+                    f"{target} sorting image has a broken header",
+                )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            if expected_exit == 0:
+                self.assertEqual(native.stdout, reference.stdout)
+                self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    _BUILD = (
+        "xs = []\n"
+        "for i in range(0, 1):\n"
+        "    xs.append(3)\n"
+        "    xs.append(1)\n"
+        "    xs.append(4)\n"
+        "    xs.append(1)\n"
+        "    xs.append(5)\n"
+    )
+    _PRINT = "for i in range(0, len({name})):\n    print({name}[i])\n"
+
+    def test_sorted_builds_a_new_list_and_leaves_the_source_alone(self):
+        self._run(
+            self._BUILD
+            + "ys = sorted(xs)\n"
+            + self._PRINT.format(name="ys")
+            + self._PRINT.format(name="xs"),
+            b"1\n1\n3\n4\n5\n3\n1\n4\n1\n5\n",
+        )
+
+    def test_a_second_name_for_the_sorted_list_is_rejected(self):
+        # sort() reorders in place, which an alias would see - but the alias
+        # itself cannot be made sound, because an append moves the block and
+        # only one name follows it. A slice copies instead.
+        self._reject(
+            self._BUILD + "ys = xs\nxs.sort()\n" + self._PRINT.format(name="ys"),
+            "not a reference to it",
+        )
+
+    def test_a_slice_copy_is_an_independent_list(self):
+        self._run(
+            self._BUILD + "ys = xs[:]\nxs.sort()\n" + self._PRINT.format(name="ys"),
+            b"3\n1\n4\n1\n5\n",
+        )
+
+    def test_reverse_true_flips_the_comparison(self):
+        self._run(
+            self._BUILD
+            + "ys = sorted(xs, reverse=True)\n"
+            + self._PRINT.format(name="ys")
+            + "xs.sort(reverse=True)\n"
+            + self._PRINT.format(name="xs"),
+            b"5\n4\n3\n1\n1\n5\n4\n3\n1\n1\n",
+        )
+
+    def test_sorting_is_signed_at_the_ends_of_the_range(self):
+        # An unsigned comparison, or a subtract-and-test-the-sign one, puts
+        # INT64_MIN above the positives instead of below them.
+        self._run(
+            "xs = []\n"
+            "for i in range(0, 1):\n"
+            "    xs.append(9223372036854775807)\n"
+            "    xs.append(-9223372036854775807 - 1)\n"
+            "    xs.append(0)\n"
+            "    xs.append(-1)\n"
+            "    xs.append(1)\n"
+            "xs.sort()\n" + self._PRINT.format(name="xs"),
+            b"-9223372036854775808\n-1\n0\n1\n9223372036854775807\n",
+        )
+
+    def test_an_empty_and_a_single_element_list_sort(self):
+        self._run(
+            "xs = []\nxs.sort()\nprint(len(xs))\n"
+            "ys = sorted(xs)\nprint(len(ys))\n"
+            "zs = []\n"
+            "for i in range(0, 1):\n    zs.append(7)\n"
+            "zs.sort()\nprint(zs[0])\n",
+            b"0\n0\n7\n",
+        )
+
+    def test_reversed_walks_the_same_block_backwards(self):
+        self._run(
+            self._BUILD + "for v in reversed(xs):\n    print(v)\n",
+            b"5\n1\n4\n1\n3\n",
+        )
+
+    def test_reversed_re_reads_the_list_the_way_cpythons_iterator_does(self):
+        # Appending moves the block to a bigger one. CPython's reverse iterator
+        # holds the list, not a snapshot of it, so the write to xs[0] is seen.
+        self._run(
+            "xs = []\n"
+            "for i in range(0, 1):\n"
+            "    xs.append(1)\n"
+            "    xs.append(2)\n"
+            "    xs.append(3)\n"
+            "    xs.append(4)\n"
+            "for v in reversed(xs):\n"
+            "    xs.append(9)\n"
+            "    xs[0] = 77\n"
+            "    print(v)\n",
+            b"4\n3\n2\n77\n",
+        )
+
+    def test_a_sorted_copy_can_still_grow(self):
+        # The copy is allocated at exactly its own length, so the first append
+        # has to move it rather than write past the block.
+        self._run(
+            self._BUILD
+            + "ys = sorted(xs)\n"
+            + "for i in range(0, 2):\n    ys.append(9)\n"
+            + self._PRINT.format(name="ys"),
+            b"1\n1\n3\n4\n5\n9\n9\n",
+        )
+
+    def test_sorted_is_iterable_and_composable(self):
+        self._run(
+            self._BUILD
+            + "for v in sorted(sorted(xs), reverse=True):\n    print(v)\n"
+            + "for v in reversed(sorted(xs[1:4])):\n    print(v)\n",
+            b"5\n4\n3\n1\n1\n4\n1\n1\n",
+        )
+
+    def test_a_key_or_a_comparison_callable_is_rejected(self):
+        self._reject(self._BUILD + "ys = sorted(xs, key=abs)\n", "does not support key=")
+        self._reject(self._BUILD + "ys = sorted(xs, cmp=abs)\n", "does not support cmp=")
+        self._reject(self._BUILD + "xs.sort(key=abs)\n", "does not support key=")
+        self._reject(self._BUILD + "xs.sort(abs)\n", "takes no positional argument")
+
+    def test_a_runtime_reverse_direction_is_rejected(self):
+        self._reject(
+            self._BUILD + "n = 0\nfor i in range(0, 2):\n    n += 1\n"
+            "ys = sorted(xs, reverse=n)\n",
+            "reverse= to be the constant True or False",
+        )
+
+    def test_sorting_something_that_is_not_a_runtime_list_is_rejected(self):
+        self._reject('ys = sorted("abc")\n', "takes a runtime list of integers")
+        self._reject("d = {1: 2}\nys = sorted(d)\n", "takes a runtime list of integers")
+        self._reject("for v in reversed(range(0, 3)):\n    print(v)\n", "reversed()")
+
+    def test_reversed_outside_a_for_header_is_rejected(self):
+        self._reject(self._BUILD + "ys = reversed(xs)\n", "produces a sequence")
+
+    def test_sorting_a_list_of_bools_is_rejected(self):
+        # sorted([True, False]) is [False, True] and prints as bools, but a
+        # sorted copy does not inherit which container held bools, so the
+        # result would print as 0 and 1.
+        for source in (
+            "bs = [True, False]\nys = sorted(bs)\n",
+            "bs = [True, False]\nbs.sort()\n",
+            "bs = [True, False]\nfor b in reversed(bs):\n    print(b)\n",
+        ):
+            self._reject(source, "holds bools")
+
+    def test_rebinding_the_list_a_reversed_loop_walks_is_rejected(self):
+        self._reject(
+            "xs = []\n"
+            "for i in range(0, 1):\n    xs.append(1)\n"
+            "for v in reversed(xs):\n    xs = [9]\n",
+            "is the list this loop is walking",
+        )
+
+    def test_a_name_a_reversed_loop_may_never_bind_is_rejected(self):
+        self._reject(
+            "xs = []\nfor v in reversed(xs):\n    print(v)\nprint(v)\n",
+            "may be unbound",
+        )
+
+    # --- runtime string methods: what is refused, and how --------------------
+
+    def test_non_ascii_case_methods_stop_the_program(self):
+        # CPython prints CAFÉ. Getting that right needs the Unicode case
+        # tables, which are not in the image, so the binary must refuse rather
+        # than print a byte-flipped CAFé. The refusal is a write and an exit,
+        # not a raise, so an `except Exception:` cannot swallow it.
+        source = (
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "café"\n'
+            "try:\n"
+            "    print(s.upper())\n"
+            "except Exception:\n"
+            '    print("swallowed")\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(binary)], capture_output=True)
+            self.assertEqual(native.returncode, 1)
+            self.assertEqual(native.stdout, b"")
+            self.assertIn(b"str.upper() is limited to ASCII text", native.stderr)
+
+    def test_a_constant_non_ascii_case_receiver_is_rejected_at_build_time(self):
+        self._reject(
+            'print("café".upper())\n', "is limited to ASCII text"
+        )
+        self._reject(
+            'print("é".isalpha())\n', "is limited to ASCII text"
+        )
+
+    def test_an_uncaught_index_miss_reports_a_value_error(self):
+        source = (
+            's = ""\n'
+            "for i in range(0, 1):\n"
+            '    s = s + "abc"\n'
+            'print(s.index("zz"))\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(binary)], capture_output=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.returncode, reference.returncode)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertIn(b"ValueError: substring not found", native.stderr)
+            self.assertIn(b"ValueError: substring not found", reference.stderr)
+
+    _RUNTIME_STRING = 's = ""\nfor i in range(0, 1):\n    s = s + "abc"\n'
+
+    def test_a_stopping_string_method_in_an_eager_arm_is_rejected(self):
+        # Both arms of a conditional expression are lowered, so the ASCII guard
+        # and the index() raise would fire on a branch CPython never takes.
+        flag = "f = len(s) > 0\n"
+        for source in (
+            self._RUNTIME_STRING + flag + "n = len(s.upper()) if f else 0\n",
+            self._RUNTIME_STRING + flag + 'n = s.index("a") if f else 0\n',
+            self._RUNTIME_STRING + flag + "b = f and s.isdigit()\n",
+        ):
+            self._reject(source, "conditional expression")
+
+    def test_a_discarded_string_method_call_is_rejected(self):
+        self._reject(
+            self._RUNTIME_STRING + 's.replace("a", "b")\n',
+            "returns a new string and changes nothing",
+        )
+
+    def test_unsupported_string_method_arguments_are_rejected(self):
+        self._reject(
+            self._RUNTIME_STRING + 'print(s.find("a", 1))\n',
+            "native str.find() takes 1 argument",
+        )
+        self._reject(
+            self._RUNTIME_STRING + 'print(s.center(5, "*"))\n',
+            "native str.center() takes 1 argument",
+        )
+        self._reject(
+            self._RUNTIME_STRING + "print(s.find(1))\n",
+            "native str.find() takes a string",
+        )
+        self._reject(
+            self._RUNTIME_STRING + 'print(s.zfill("3"))\n',
+            "native str.zfill() takes an integer width",
+        )
+
+    def test_mixing_a_string_predicate_with_a_number_in_a_list_is_rejected(self):
+        self._reject(
+            self._RUNTIME_STRING + 'xs = [s.startswith("a"), 1]\n',
+            "mixed container is refused",
+        )
+
+
+class ComprehensionTests(unittest.TestCase):
+    """Multi-clause comprehensions and generator expressions in aggregates.
+
+    Every expectation is CPython's own output for the same source, diffed
+    against the darwin-arm64 binary. Sources are built from names rather than
+    literals so the front end cannot fold the comprehension away and answer
+    from its own evaluator instead of from the machine code.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                artifact = root / f"program-{target}.bin"
+                compile_native(entry, artifact, target, clean=True)
+                magic = _MAGIC[target.split("-")[0]]
+                self.assertEqual(
+                    artifact.read_bytes()[: len(magic)],
+                    magic,
+                    f"{target} comprehension image has a broken header",
+                )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    _RUNTIME_N = "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+
+    def test_generator_in_sum_builds_no_list(self):
+        self._run(
+            "xs = [1, 2, 3]\nprint(sum(v * 2 for v in xs))\n", b"12\n"
+        )
+
+    def test_generator_over_a_runtime_range(self):
+        self._run(
+            self._RUNTIME_N
+            + "print(sum(v * v for v in range(0, n + 2)))\n"
+            + "print(i)\n",
+            b"30\n2\n",
+        )
+
+    def test_generator_aggregates_do_not_allocate_per_call(self):
+        # A list comprehension here would ask the arena for a block a million
+        # times and exhaust it; the generator asks for nothing at all.
+        self._run(
+            "xs = [1, 2, 3]\n"
+            "t = 0\n"
+            "k = 0\n"
+            "while k < 200000:\n"
+            "    t = t + sum(v for v in xs)\n"
+            "    k = k + 1\n"
+            "print(t)\n",
+            b"1200000\n",
+        )
+
+    def test_min_and_max_over_an_empty_generator_raise(self):
+        self._run(
+            "xs = []\n"
+            "try:\n"
+            "    print(min(v for v in xs))\n"
+            "except ValueError:\n"
+            "    print('caught')\n"
+            "ys = [7, 3, 9]\n"
+            "print(max(v for v in ys))\n"
+            "print(min(v for v in ys))\n",
+            b"caught\n9\n3\n",
+        )
+
+    def test_any_and_all_including_empty_sources(self):
+        self._run(
+            "xs = []\n"
+            "ys = [0, 0]\n"
+            "zs = [0, 1]\n"
+            "print(any(v for v in xs))\n"
+            "print(all(v for v in xs))\n"
+            "print(any(v for v in ys))\n"
+            "print(all(v for v in zs))\n"
+            "print(any(zs))\n"
+            "print(all(ys))\n",
+            b"False\nTrue\nFalse\nFalse\nTrue\nFalse\n",
+        )
+
+    def test_nested_clauses_produce_the_cross_product(self):
+        self._run(
+            "xs = [1, 2]\n"
+            "ys = [3, 4, 5]\n"
+            "r = [a * b for a in xs for b in ys]\n"
+            "print(len(r))\n"
+            "print(r[0])\n"
+            "print(r[5])\n"
+            "print(sum(r))\n",
+            b"6\n3\n10\n36\n",
+        )
+
+    def test_conditions_on_more_than_one_clause(self):
+        self._run(
+            "xs = [1, 2, 3]\n"
+            "ys = [4, 5]\n"
+            "r = [a * b for a in xs if a != 2 for b in ys if b != 4]\n"
+            "print(len(r))\n"
+            "print(r[0])\n"
+            "print(r[1])\n",
+            b"2\n5\n15\n",
+        )
+
+    def test_two_ifs_on_one_clause_and_a_condition_that_rejects_everything(self):
+        self._run(
+            "xs = [1, 2, 3]\n"
+            "a = [q for q in xs if q > 99]\n"
+            "b = [q for q in xs if q > 1 if q < 3]\n"
+            "print(len(a))\n"
+            "print(len(b))\n"
+            "print(b[0])\n",
+            b"0\n1\n2\n",
+        )
+
+    def test_an_empty_source_in_either_position(self):
+        self._run(
+            "xs = []\n"
+            "ys = [1, 2]\n"
+            "outer = [a * b for a in xs for b in ys]\n"
+            "inner = [a * b for a in ys for b in xs]\n"
+            "print(len(outer))\n"
+            "print(len(inner))\n"
+            "print(sum(v for v in xs))\n",
+            b"0\n0\n0\n",
+        )
+
+    def test_every_clause_target_keeps_its_own_scope(self):
+        self._run(
+            "a = 7\n"
+            "b = 8\n"
+            "xs = [1, 2]\n"
+            "ys = [3, 4]\n"
+            "r = [a + b for a in xs for b in ys]\n"
+            "print(len(r))\n"
+            "print(r[0])\n"
+            "print(r[3])\n"
+            "print(a)\n"
+            "print(b)\n",
+            b"4\n4\n6\n7\n8\n",
+        )
+
+    def test_two_clauses_may_bind_the_same_name(self):
+        self._run(
+            "xs = [1, 2]\n"
+            "ys = [5, 6, 7]\n"
+            "r = [a for a in xs for a in ys]\n"
+            "print(len(r))\n"
+            "print(r[0])\n"
+            "print(r[5])\n",
+            b"6\n5\n7\n",
+        )
+
+    def test_a_bool_element_still_prints_as_a_bool(self):
+        self._run(
+            self._RUNTIME_N
+            + "xs = [n > 1, n < 1]\n"
+            + "r = [v for v in xs]\n"
+            + "print(r[0])\n"
+            + "for v in xs:\n"
+            + "    print(v)\n"
+            + "print(xs[0:2][0])\n"
+            + "print(max(xs))\n"
+            + "print(max(v for v in xs))\n"
+            + "zs = [1, 2, 3]\n"
+            + "print([q > 1 for q in zs][2])\n"
+            + "print(sum(q > 1 for q in zs))\n",
+            b"True\nTrue\nFalse\nTrue\nTrue\nTrue\nTrue\n2\n",
+        )
+
+    def test_float_elements_survive_the_nested_rewrite(self):
+        self._run(
+            "xs = [1.5, 2.5]\n"
+            "ys = [1, 2]\n"
+            "r = [a * 2 for a in xs]\n"
+            "f = [a * 0.5 for a in ys for b in ys]\n"
+            "print(r[0])\n"
+            "print(r[1])\n"
+            "print(len(f))\n"
+            "print(f[3])\n",
+            b"3.0\n5.0\n4\n1.0\n",
+        )
+
+    def test_a_product_that_would_not_fit_the_arena_reports_memory_error(self):
+        # The spans multiply to more than an i64 holds. A wrapping product
+        # would come out negative, be clamped to zero, and then be written far
+        # past a header-only block without the arena guard ever seeing it.
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("needs the host to run the darwin-arm64 image")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "huge.py"
+            entry.write_text(
+                self._RUNTIME_N
+                + "m = n * 1500000000\n"
+                + "r = [1 for a in range(0, m) for b in range(0, m)]\n"
+                + "print(len(r))\n",
+                encoding="utf-8",
+            )
+            artifact = root / "huge.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.returncode, 1)
+            self.assertEqual(native.stdout, b"")
+            self.assertIn(b"MemoryError", native.stderr)
+
+    def test_a_generator_expression_anywhere_else_is_rejected(self):
+        for source in (
+            "xs = [1, 2]\ng = (v for v in xs)\nprint(1)\n",
+            "xs = [1, 2]\nprint(v for v in xs)\n",
+            "xs = [1, 2]\ndef f(y):\n    return y\nprint(f(v for v in xs))\n",
+        ):
+            self._reject(source, "generator expression is a lazy object")
+
+    def test_a_later_source_may_not_depend_on_an_earlier_target(self):
+        self._reject(
+            "xs = [1, 2]\nr = [b for a in xs for b in range(0, a)]\nprint(len(r))\n",
+            "cannot depend on an earlier target",
+        )
+
+    def test_an_inner_source_that_could_raise_when_hoisted_is_rejected(self):
+        # CPython never evaluates the inner source when the outer one is
+        # empty, so hoisting a division out of it would raise where CPython
+        # would not.
+        self._reject(
+            "xs = []\n"
+            "p = 1\n"
+            "q = 0\n"
+            "r = [1 for a in xs for b in range(0, p // q)]\n",
+            "must therefore be",
+        )
+
+    def test_a_float_element_in_an_aggregate_is_rejected(self):
+        self._reject(
+            "xs = [1.0, 2.0]\nprint(sum(v * 0.5 for v in xs))\n",
+            "would need a float accumulator",
+        )
+
+    def test_set_and_dict_comprehensions_are_rejected_by_name(self):
+        self._reject(
+            "xs = [1, 2]\ns = {v for v in xs}\nprint(1)\n",
+            "no runtime set",
+        )
+        self._reject(
+            "xs = [1, 2]\nd = {v: v * 2 for v in xs}\nprint(1)\n",
+            "no runtime dict",
+        )
+
+    def test_reordering_a_comprehension_of_bools_is_rejected(self):
+        self._reject(
+            self._RUNTIME_N
+            + "xs = [n > 1, n < 1]\n"
+            + "print(sorted([v for v in xs])[0])\n",
+            "holds bools",
+        )
+
+
+class DeleteListElementTests(unittest.TestCase):
+    """`del xs[i]`: the tail shifts down and the header length drops by one."""
+
+    _RUNTIME_N = "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                artifact = root / f"program-{target}.bin"
+                compile_native(entry, artifact, target, clean=True)
+                magic = _MAGIC[target.split("-")[0]]
+                self.assertEqual(
+                    artifact.read_bytes()[: len(magic)],
+                    magic,
+                    f"{target} del image has a broken header",
+                )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def test_deleting_from_the_middle_front_and_back(self):
+        self._run(
+            self._RUNTIME_N
+            + "xs = [10, 20, 30, 40]\n"
+            + "del xs[1]\n"
+            + "print(len(xs), xs[0], xs[1], xs[2])\n"
+            + "del xs[-1]\n"
+            + "print(len(xs), xs[0], xs[1])\n"
+            + "del xs[n - 3]\n"
+            + "print(len(xs), xs[0])\n"
+            + "del xs[0]\n"
+            + "print(len(xs))\n",
+            b"3 10 30 40\n2 10 30\n1 30\n0\n",
+        )
+
+    def test_a_second_name_for_one_list_is_rejected(self):
+        # A list variable holds the block, not a reference to it. `del` shifts
+        # in place and would be visible through both names, but an append moves
+        # the block and writes the new address to only one slot - so the two
+        # names would disagree. Refusing the alias is what keeps them honest.
+        self._reject(
+            self._RUNTIME_N + "xs = [10, 20, 30]\nys = xs\ndel xs[1]\n"
+            "print(len(ys))\n",
+            "not a reference to it",
+        )
+
+    def test_deleting_a_float_element(self):
+        # A float lives in the element as its bit pattern, so the same 8-byte
+        # word shift moves it.
+        self._run(
+            self._RUNTIME_N
+            + "fs = [1.5, 2.5, 3.5]\ndel fs[1]\n"
+            + "print(len(fs), fs[0], fs[1])\n",
+            b"2 1.5 3.5\n",
+        )
+
+    def test_a_deleted_bool_list_still_prints_True(self):
+        self._run(
+            self._RUNTIME_N
+            + "bs = [n > 1, n < 1, n > 2]\ndel bs[1]\n"
+            + "print(len(bs), bs[0], bs[1])\n",
+            b"2 True True\n",
+        )
+
+    def test_an_out_of_range_del_raises_IndexError(self):
+        self._run(
+            self._RUNTIME_N
+            + "xs = [1, 2]\n"
+            + "try:\n    del xs[n + 5]\nexcept IndexError:\n    print('caught')\n"
+            + "print(len(xs))\n"
+            + "del xs[n + 5]\n",
+            b"caught\n2\n",
+            expected_exit=1,
+        )
+
+    def test_deleting_inside_a_loop_shrinks_the_same_block(self):
+        self._run(
+            self._RUNTIME_N
+            + "xs = [1, 2, 3, 4, 5]\n"
+            + "for i in range(0, n):\n    del xs[0]\n"
+            + "print(len(xs), xs[0], xs[1])\n",
+            b"2 4 5\n",
+        )
+
+    def test_del_on_a_dict_is_rejected_by_name(self):
+        self._reject(
+            "d = {}\nd[1] = 2\ndel d[1]\nprint(len(d))\n",
+            "the open-addressing table has no tombstone state",
+        )
+
+    def test_del_on_a_name_is_rejected_by_name(self):
+        self._reject(
+            "x = 1\ndel x\nprint(2)\n",
+            "a native variable is a stack slot holding a value",
+        )
+
+    def test_del_on_a_slice_is_rejected_by_name(self):
+        self._reject(
+            "xs = [1, 2, 3]\ndel xs[0:2]\nprint(len(xs))\n",
+            "del on a list slice is not supported",
+        )
+
+    def test_del_on_an_attribute_is_rejected_by_name(self):
+        self._reject(
+            "class C:\n    def __init__(self):\n        self.a = 1\n"
+            "c = C()\ndel c.a\nprint(1)\n",
+            "del on an attribute is not supported",
+        )
+
+    def test_del_while_a_for_loop_walks_the_list_is_rejected(self):
+        # The walk takes the length once, so a shortened list would yield an
+        # element CPython's iterator skips. Refused rather than mis-yielded.
+        self._reject(
+            self._RUNTIME_N
+            + "xs = [1, 2, 3]\nfor v in xs:\n    del xs[0]\nprint(len(xs))\n",
+            "while a for loop is walking it",
+        )
+        self._reject(
+            self._RUNTIME_N
+            + "xs = [1, 2, 3]\nfor k, v in enumerate(xs):\n    del xs[0]\n"
+            + "print(len(xs))\n",
+            "while a for loop is walking it",
+        )
+
+    def test_deleting_a_different_list_inside_a_walk_is_allowed(self):
+        self._run(
+            self._RUNTIME_N
+            + "xs = [1, 2, 3]\nys = [4, 5, 6, 7]\n"
+            + "for v in xs:\n    del ys[0]\n"
+            + "print(len(ys), ys[0])\n",
+            b"1 7\n",
         )

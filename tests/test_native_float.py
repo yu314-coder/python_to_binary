@@ -531,16 +531,51 @@ class FloatParameterTests(unittest.TestCase):
             ),
         )
 
-    def test_a_float_returned_from_a_branching_body_is_rejected(self):
-        # The call site chooses an integer or float lowering before the body is
-        # inlined, and a branching body's result kind is not knowable then.
-        # Rejected rather than guessed at.
+    def test_a_float_returned_from_a_branching_body(self):
+        # A body whose branches all end in a return is folded into one
+        # conditional expression before the call site picks a lowering, so the
+        # returned kind is known in time after all.
+        self._run(
+            "seed = 0.0\nfor i in range(0, 5):\n    seed += 0.25\n\n"
+            "def grow(v):\n    t = v * 2.0\n    if t > 0.0:\n"
+            "        return t\n    return t\n\nprint(int(grow(seed)))\n",
+            b"2\n",
+        )
+
+    def test_a_float_returned_from_an_imperative_body_is_rejected(self):
+        # A loop makes the body statement-by-statement, and then the call site
+        # really has chosen a lowering before the returned kind is known.
         self.assertIn(
-            "not in the native float subset",
+            "a native function with a loop or an early return cannot return a "
+            "float",
             self._reject(
-                "seed = 0.0\nfor i in range(0, 5):\n    seed += 0.25\n\n"
-                "def grow(v):\n    t = v * 2.0\n    if t > 0.0:\n"
-                "        return t\n    return t\n\nprint(int(grow(seed)))\n"
+                "def acc(k):\n    t = 0.0\n    for i in range(0, k):\n"
+                "        t += 1.5\n    return t\n\n"
+                "n = 0\nfor i in range(0, 3):\n    n += 1\n"
+                "print(acc(n))\n"
+            ),
+        )
+
+    def test_mixed_arms_in_a_conditional_float_are_rejected(self):
+        # One slot cannot print 1 and 2.5; widening the integer arm would print
+        # 1.0 where CPython prints 1.
+        self.assertIn(
+            "the two arms of this have different kinds",
+            self._reject(
+                "n = 0\nfor i in range(0, 3):\n    n += 1\n"
+                "print(1 if n > 2 else 2.5)\n"
+            ),
+        )
+
+    def test_a_runtime_float_divisor_in_an_eager_arm_is_rejected(self):
+        # Both arms of an integer conditional are evaluated, so the divisor's
+        # zero check would raise on the branch CPython never takes.
+        self.assertIn(
+            "a float divisor that is not a compile-time constant cannot appear",
+            self._reject(
+                "n = 0\nfor i in range(0, 3):\n    n += 1\n"
+                "b = float(n) - 3.0\n"
+                "print(0 if b == 0.0 else (1 if (10.0 / b) > 1.0 else 2))\n"
             ),
         )
 
@@ -618,4 +653,125 @@ class ShortestRoundTripPrintingTests(unittest.TestCase):
             [1.0, 1.5, 1.25, 1.125, 0.1, 1 / 3, 2 / 3, 1e23,
              9007199254740993.0, 1685094889599744.2, 1.7976931348623157e308,
              123456789012345.68, 0.30000000000000004]
+        )
+
+
+class FloatSortingTests(unittest.TestCase):
+    """Sorting a runtime list of doubles.
+
+    A double lives in an integer slot as its bit pattern, and those bits do not
+    order the way the numbers do: read as signed integers, -1.0 sits above
+    -2.0. These programs compare the numbers, which is what the outputs below
+    check, and each output is CPython's own for the same source.
+    """
+
+    def _run(
+        self,
+        source: str,
+        expected_stdout: bytes,
+        expected_exit: int = 0,
+        matches_cpython: bool = True,
+        stderr_needle: bytes | None = None,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in ("darwin-arm64", "darwin-x86_64", "linux-x86_64"):
+                artifact = root / f"program-{target}.bin"
+                compile_native(entry, artifact, target, clean=True)
+                magic = _MAGIC[target.split("-")[0]]
+                self.assertEqual(artifact.read_bytes()[: len(magic)], magic)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            if stderr_needle is not None:
+                self.assertIn(stderr_needle, native.stderr)
+            if not matches_cpython:
+                # The NaN programs below refuse where CPython answers; the
+                # refusal is the point, so there is nothing to diff.
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    _PRINT = "for i in range(0, len({name})):\n    print({name}[i])\n"
+
+    def test_negatives_sort_by_value_not_by_bit_pattern(self):
+        # Comparing the bit patterns as signed integers would print
+        # -0.5 -1.0 -2.0 0.0 3.5 here.
+        self._run(
+            "zs = [0.0]\n"
+            "for i in range(0, 1):\n"
+            "    zs.append(-1.0)\n"
+            "    zs.append(-2.0)\n"
+            "    zs.append(3.5)\n"
+            "    zs.append(-0.5)\n"
+            "zs.sort()\n" + self._PRINT.format(name="zs"),
+            b"-2.0\n-1.0\n-0.5\n0.0\n3.5\n",
+        )
+
+    def test_signed_zeros_keep_their_order_in_both_directions(self):
+        # -0.0 and 0.0 compare equal, and only a strict comparison moves an
+        # element, so they stay in the order they arrived. Sorting and then
+        # reversing the result would print them the other way round.
+        self._run(
+            "zs = [0.0]\n"
+            "for i in range(0, 1):\n"
+            "    zs.append(-0.0)\n"
+            "    zs.append(0.0)\n"
+            "    zs.append(-0.0)\n"
+            "ys = sorted(zs)\n" + self._PRINT.format(name="ys")
+            + "rs = sorted(zs, reverse=True)\n" + self._PRINT.format(name="rs"),
+            b"0.0\n-0.0\n0.0\n-0.0\n0.0\n-0.0\n0.0\n-0.0\n",
+        )
+
+    def test_infinities_sort_at_the_ends(self):
+        self._run(
+            "zs = [1.0]\n"
+            "for i in range(0, 1):\n"
+            "    zs.append(1e308 * 10.0)\n"
+            "    zs.append(-1.0 * (1e308 * 10.0))\n"
+            "    zs.append(-2.5)\n"
+            "zs.sort()\n" + self._PRINT.format(name="zs")
+            + "for v in reversed(zs):\n    print(v)\n",
+            b"-inf\n-2.5\n1.0\ninf\ninf\n1.0\n-2.5\n-inf\n",
+        )
+
+    def test_a_nan_is_refused_rather_than_ordered_differently(self):
+        # CPython does not raise here: it returns whatever order its own
+        # sequence of comparisons leaves behind, which an insertion sort does
+        # not reproduce. Refusing is a divergence, but not a wrong order.
+        self._run(
+            "zs = [1.0]\n"
+            "for i in range(0, 1):\n"
+            "    zs.append(1e308 * 10.0)\n"
+            "    zs.append(zs[1] - zs[1])\n"
+            "    zs.append(2.0)\n"
+            "zs.sort()\n",
+            b"",
+            expected_exit=1,
+            matches_cpython=False,
+            stderr_needle=b"ValueError: py2bin cannot sort a list containing nan",
+        )
+
+    def test_the_nan_refusal_is_a_catchable_value_error(self):
+        self._run(
+            "zs = [1.0]\n"
+            "for i in range(0, 1):\n"
+            "    zs.append(1e308 * 10.0)\n"
+            "    zs.append(zs[1] - zs[1])\n"
+            "try:\n"
+            "    ys = sorted(zs)\n"
+            "    print(0)\n"
+            "except ValueError:\n"
+            "    print(1)\n",
+            b"1\n",
+            matches_cpython=False,
         )
