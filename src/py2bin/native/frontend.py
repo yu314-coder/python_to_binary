@@ -500,6 +500,7 @@ class Frontend:
         self.handler_stack: list[str] = []
         self.exception_slot: int | None = None
         self.exception_value_slot: int | None = None
+        self._dtoa_scratch_slot: int | None = None
         self.exception_ids: dict[str, int] = {}
         self.finally_depth = 0
         self.continue_targets: list[str] = []
@@ -523,6 +524,18 @@ class Frontend:
             self.operations.insert(
                 0, HeapInit(self._heap_bump_slot, _HEAP_ARENA_BYTES)
             )
+            if self._dtoa_scratch_slot is not None:
+                # Float rendering needs six big integers and two buffers. They
+                # are reused, so reserve them once here rather than allocating
+                # on every print - which in a loop would exhaust the arena.
+                self.operations.insert(
+                    1,
+                    HeapAlloc(
+                        self._dtoa_scratch_slot,
+                        IntConstant(self.DTOA_SCRATCH_BYTES),
+                        self._heap_bump_slot,
+                    ),
+                )
         return Module(self.operations, len(self.slots))
 
     def ensure_heap(self) -> int:
@@ -3982,6 +3995,982 @@ class Frontend:
         self.operations.append(Label(done))
         return pointer
 
+    # --- rendering a float as the shortest decimal that reads back ----------
+    #
+    # CPython prints the shortest decimal string that parses back to the same
+    # double. Deciding which string that is cannot be done in 64-bit
+    # arithmetic: the comparison is between the value and its two neighbours,
+    # scaled by a power of ten that can be 10^308 or 10^-324. So this carries
+    # its own big integers - fixed-width arrays of 32-bit limbs in the arena -
+    # and runs Burger and Dybvig's algorithm on them.
+    #
+    # Only six big integers are ever live (the value, the scale, the two
+    # margins, and two temporaries), and they are reused, so the scratch is
+    # reserved once at start-up rather than allocated per call. The returned
+    # text lives in that scratch too and stays valid only until the next float
+    # is rendered, which is enough because print() writes each argument before
+    # evaluating the next.
+
+    DTOA_LIMBS = 56  # 1792 bits: the widest intermediate needs about 1130
+    DTOA_LIMB_MASK = 0xFFFFFFFF
+    DTOA_BIGNUM_BYTES = 56 * 8
+    DTOA_R, DTOA_S, DTOA_MP, DTOA_MM, DTOA_T1, DTOA_T2 = range(6)
+    DTOA_DIGITS_OFFSET = 6 * DTOA_BIGNUM_BYTES
+    DTOA_DIGITS_BYTES = 32
+    DTOA_TEXT_OFFSET = DTOA_DIGITS_OFFSET + DTOA_DIGITS_BYTES
+    DTOA_TEXT_BYTES = 64
+    DTOA_SCRATCH_BYTES = DTOA_TEXT_OFFSET + DTOA_TEXT_BYTES
+
+    def ensure_dtoa_scratch(self) -> int:
+        """Reserve the slot holding the float-rendering scratch block."""
+
+        if self._dtoa_scratch_slot is None:
+            self.ensure_heap()
+            self._dtoa_scratch_slot = self.slot("<dtoa-scratch>")
+        return self._dtoa_scratch_slot
+
+    def bignum(self, index: int) -> IntExpression:
+        return IntBinary(
+            "add",
+            IntLoad(self.ensure_dtoa_scratch()),
+            IntConstant(index * self.DTOA_BIGNUM_BYTES),
+        )
+
+    def dtoa_region(self, offset: int) -> IntExpression:
+        return IntBinary(
+            "add", IntLoad(self.ensure_dtoa_scratch()), IntConstant(offset)
+        )
+
+    def bn_limb(self, base: IntExpression, index: IntExpression) -> IntExpression:
+        return IntBinary("add", base, IntBinary("mul", index, IntConstant(8)))
+
+    def bn_loop(self, name: str):
+        """Emit `for index in 0 .. LIMBS-1`; returns (index slot, end label)."""
+
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label(name)
+        end = self.new_label(name + "_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntConstant(self.DTOA_LIMBS)),
+                end,
+            )
+        )
+        return index_slot, start, end
+
+    def bn_loop_end(self, index_slot: int, start: str, end: str) -> None:
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+
+    def bn_zero(self, base: IntExpression) -> None:
+        index_slot, start, end = self.bn_loop("bn_zero")
+        self.operations.append(
+            HeapStore(self.bn_limb(base, IntLoad(index_slot)), IntConstant(0), 8)
+        )
+        self.bn_loop_end(index_slot, start, end)
+
+    def bn_set(self, base: IntExpression, value: IntExpression) -> None:
+        """Set to a non-negative value that fits in 64 bits."""
+
+        value_slot = self.new_temp()
+        self.operations.append(Store(value_slot, value))
+        self.bn_zero(base)
+        self.operations.append(
+            HeapStore(
+                base,
+                IntBinary("and", IntLoad(value_slot), IntConstant(self.DTOA_LIMB_MASK)),
+                8,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", base, IntConstant(8)),
+                IntBinary(
+                    "and",
+                    IntBinary("rshift", IntLoad(value_slot), IntConstant(32)),
+                    IntConstant(self.DTOA_LIMB_MASK),
+                ),
+                8,
+            )
+        )
+
+    def bn_copy(self, destination: IntExpression, source: IntExpression) -> None:
+        index_slot, start, end = self.bn_loop("bn_copy")
+        self.operations.append(
+            HeapStore(
+                self.bn_limb(destination, IntLoad(index_slot)),
+                HeapLoad(self.bn_limb(source, IntLoad(index_slot)), 8),
+                8,
+            )
+        )
+        self.bn_loop_end(index_slot, start, end)
+
+    def bn_mul_small(self, base: IntExpression, multiplier: IntExpression) -> None:
+        """Multiply in place by a small value; limb * multiplier must fit i64."""
+
+        multiplier_slot = self.new_temp()
+        self.operations.append(Store(multiplier_slot, multiplier))
+        carry_slot = self.new_temp()
+        self.operations.append(Store(carry_slot, IntConstant(0)))
+        index_slot, start, end = self.bn_loop("bn_mul")
+        product_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                product_slot,
+                IntBinary(
+                    "add",
+                    IntBinary(
+                        "mul",
+                        HeapLoad(self.bn_limb(base, IntLoad(index_slot)), 8),
+                        IntLoad(multiplier_slot),
+                    ),
+                    IntLoad(carry_slot),
+                ),
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                self.bn_limb(base, IntLoad(index_slot)),
+                IntBinary(
+                    "and", IntLoad(product_slot), IntConstant(self.DTOA_LIMB_MASK)
+                ),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(
+                carry_slot,
+                IntBinary("rshift", IntLoad(product_slot), IntConstant(32)),
+            )
+        )
+        self.bn_loop_end(index_slot, start, end)
+
+    def bn_add(self, base: IntExpression, addend: IntExpression) -> None:
+        carry_slot = self.new_temp()
+        self.operations.append(Store(carry_slot, IntConstant(0)))
+        index_slot, start, end = self.bn_loop("bn_add")
+        total_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                total_slot,
+                IntBinary(
+                    "add",
+                    IntBinary(
+                        "add",
+                        HeapLoad(self.bn_limb(base, IntLoad(index_slot)), 8),
+                        HeapLoad(self.bn_limb(addend, IntLoad(index_slot)), 8),
+                    ),
+                    IntLoad(carry_slot),
+                ),
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                self.bn_limb(base, IntLoad(index_slot)),
+                IntBinary("and", IntLoad(total_slot), IntConstant(self.DTOA_LIMB_MASK)),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(carry_slot, IntBinary("rshift", IntLoad(total_slot), IntConstant(32)))
+        )
+        self.bn_loop_end(index_slot, start, end)
+
+    def bn_sub(self, base: IntExpression, subtrahend: IntExpression) -> None:
+        """Subtract in place. The caller guarantees base >= subtrahend."""
+
+        borrow_slot = self.new_temp()
+        self.operations.append(Store(borrow_slot, IntConstant(0)))
+        index_slot, start, end = self.bn_loop("bn_sub")
+        difference_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                difference_slot,
+                IntBinary(
+                    "sub",
+                    IntBinary(
+                        "sub",
+                        HeapLoad(self.bn_limb(base, IntLoad(index_slot)), 8),
+                        HeapLoad(self.bn_limb(subtrahend, IntLoad(index_slot)), 8),
+                    ),
+                    IntLoad(borrow_slot),
+                ),
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                self.bn_limb(base, IntLoad(index_slot)),
+                IntBinary(
+                    "and", IntLoad(difference_slot), IntConstant(self.DTOA_LIMB_MASK)
+                ),
+                8,
+            )
+        )
+        # A negative difference means this limb borrowed from the next one.
+        self.operations.append(
+            Store(
+                borrow_slot,
+                IntBinary(
+                    "and",
+                    IntBinary("rshift", IntLoad(difference_slot), IntConstant(63)),
+                    IntConstant(1),
+                ),
+            )
+        )
+        self.bn_loop_end(index_slot, start, end)
+
+    def bn_compare(self, left: IntExpression, right: IntExpression) -> int:
+        """Return a slot holding -1, 0, or 1."""
+
+        result_slot = self.new_temp()
+        self.operations.append(Store(result_slot, IntConstant(0)))
+        index_slot = self.new_temp()
+        self.operations.append(
+            Store(index_slot, IntConstant(self.DTOA_LIMBS - 1))
+        )
+        start = self.new_label("bn_cmp")
+        end = self.new_label("bn_cmp_end")
+        step = self.new_label("bn_cmp_next")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ge", IntLoad(index_slot), IntConstant(0)), end
+            )
+        )
+        left_slot = self.new_temp()
+        right_slot = self.new_temp()
+        self.operations.append(
+            Store(left_slot, HeapLoad(self.bn_limb(left, IntLoad(index_slot)), 8))
+        )
+        self.operations.append(
+            Store(right_slot, HeapLoad(self.bn_limb(right, IntLoad(index_slot)), 8))
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(left_slot), IntLoad(right_slot)), step
+            )
+        )
+        # The most significant differing limb decides the whole comparison.
+        self.operations.append(
+            Store(
+                result_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(left_slot), IntLoad(right_slot)),
+                    IntConstant(1),
+                    IntConstant(-1),
+                ),
+            )
+        )
+        self.operations.append(Jump(end))
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("sub", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return result_slot
+
+    def bn_double_times(self, base: IntExpression, count: IntExpression) -> None:
+        """Multiply by 2^count, one doubling at a time."""
+
+        remaining_slot = self.new_temp()
+        self.operations.append(Store(remaining_slot, count))
+        start = self.new_label("bn_shift")
+        end = self.new_label("bn_shift_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("gt", IntLoad(remaining_slot), IntConstant(0)), end
+            )
+        )
+        self.bn_mul_small(base, IntConstant(2))
+        self.operations.append(
+            Store(
+                remaining_slot,
+                IntBinary("sub", IntLoad(remaining_slot), IntConstant(1)),
+            )
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+
+    def dtoa_append(self, length_slot: int, byte: IntExpression) -> None:
+        payload = self.dtoa_region(self.DTOA_TEXT_OFFSET + 8)
+        self.operations.append(
+            HeapStore(IntBinary("add", payload, IntLoad(length_slot)), byte, 1)
+        )
+        self.operations.append(
+            Store(length_slot, IntBinary("add", IntLoad(length_slot), IntConstant(1)))
+        )
+
+    def dtoa_append_text(self, length_slot: int, text: bytes) -> None:
+        for byte in text:
+            self.dtoa_append(length_slot, IntConstant(byte))
+
+    def dtoa_append_repeat(
+        self, length_slot: int, byte: IntExpression, count: IntExpression
+    ) -> None:
+        remaining_slot = self.new_temp()
+        self.operations.append(Store(remaining_slot, count))
+        start = self.new_label("pad")
+        end = self.new_label("pad_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(IntCompare("gt", IntLoad(remaining_slot), IntConstant(0)), end)
+        )
+        self.dtoa_append(length_slot, byte)
+        self.operations.append(
+            Store(
+                remaining_slot,
+                IntBinary("sub", IntLoad(remaining_slot), IntConstant(1)),
+            )
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+
+    def dtoa_append_digits(
+        self, length_slot: int, first: IntExpression, limit: IntExpression
+    ) -> None:
+        digits = self.dtoa_region(self.DTOA_DIGITS_OFFSET)
+        index_slot = self.new_temp()
+        limit_slot = self.new_temp()
+        self.operations.append(Store(index_slot, first))
+        self.operations.append(Store(limit_slot, limit))
+        start = self.new_label("emit_digits")
+        end = self.new_label("emit_digits_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(limit_slot)), end
+            )
+        )
+        self.dtoa_append(
+            length_slot,
+            IntBinary(
+                "add",
+                IntConstant(ord("0")),
+                HeapLoad(
+                    IntBinary("add", digits, IntLoad(index_slot)), 1
+                ),
+            ),
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+
+    def dtoa_boundary(self, comparison: int, inclusive: int, strict: str) -> int:
+        """`comparison <strict> 0`, or `== 0` too when the bound is inclusive."""
+
+        result_slot = self.new_temp()
+        self.operations.append(Store(result_slot, IntConstant(0)))
+        done = self.new_label("bound_done")
+        set_it = self.new_label("bound_set")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(strict, IntLoad(comparison), IntConstant(0)), set_it + "_no"
+            )
+        )
+        self.operations.append(Jump(set_it))
+        self.operations.append(Label(set_it + "_no"))
+        # An even significand makes the neighbour exactly representable too, so
+        # the boundary counts as reached rather than passed.
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(inclusive), IntConstant(0)), done)
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("eq", IntLoad(comparison), IntConstant(0)), done)
+        )
+        self.operations.append(Label(set_it))
+        self.operations.append(Store(result_slot, IntConstant(1)))
+        self.operations.append(Label(done))
+        return result_slot
+
+    def emit_float_to_string(self, value: FloatExpression) -> IntExpression:
+        """Render a double the way CPython's repr() does.
+
+        The shortest decimal that reads back as the same double, found by
+        Burger and Dybvig's method: hold the value and its two neighbours as
+        exact rationals, scale until the first digit is about to come out, then
+        emit digits until what is left is unambiguously nearer this double than
+        either neighbour.
+        """
+
+        scratch = self.ensure_dtoa_scratch()
+        text = self.dtoa_region(self.DTOA_TEXT_OFFSET)
+        digits = self.dtoa_region(self.DTOA_DIGITS_OFFSET)
+        bits_slot = self.new_temp()
+        self.operations.append(Store(bits_slot, FloatBits(value)))
+        bits = IntLoad(bits_slot)
+        length_slot = self.new_temp()
+        self.operations.append(Store(length_slot, IntConstant(0)))
+
+        biased_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                biased_slot,
+                IntBinary(
+                    "and",
+                    IntBinary("rshift", bits, IntConstant(52)),
+                    IntConstant(0x7FF),
+                ),
+            )
+        )
+        fraction_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                fraction_slot,
+                IntBinary("and", bits, IntConstant((1 << 52) - 1)),
+            )
+        )
+        negative_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                negative_slot,
+                IntBinary(
+                    "and", IntBinary("rshift", bits, IntConstant(63)), IntConstant(1)
+                ),
+            )
+        )
+        finish = self.new_label("dtoa_finish")
+
+        # Infinities and NaNs first: a NaN prints unsigned, so this has to come
+        # before the sign is written.
+        ordinary = self.new_label("dtoa_ordinary")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(biased_slot), IntConstant(0x7FF)), ordinary
+            )
+        )
+        infinite = self.new_label("dtoa_inf")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(fraction_slot), IntConstant(0)), infinite
+            )
+        )
+        self.dtoa_append_text(length_slot, b"nan")
+        self.operations.append(Jump(finish))
+        self.operations.append(Label(infinite))
+        signed_infinite = self.new_label("dtoa_inf_signed")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(negative_slot), IntConstant(0)),
+                signed_infinite,
+            )
+        )
+        self.dtoa_append_text(length_slot, b"-")
+        self.operations.append(Label(signed_infinite))
+        self.dtoa_append_text(length_slot, b"inf")
+        self.operations.append(Jump(finish))
+
+        self.operations.append(Label(ordinary))
+        unsigned = self.new_label("dtoa_unsigned")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(negative_slot), IntConstant(0)), unsigned
+            )
+        )
+        self.dtoa_append_text(length_slot, b"-")
+        self.operations.append(Label(unsigned))
+
+        # Zero has no digits to generate, and negative zero keeps its sign.
+        nonzero = self.new_label("dtoa_nonzero")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne",
+                    IntBinary("or", IntLoad(biased_slot), IntLoad(fraction_slot)),
+                    IntConstant(0),
+                ),
+                nonzero + "_zero",
+            )
+        )
+        self.operations.append(Jump(nonzero))
+        self.operations.append(Label(nonzero + "_zero"))
+        self.dtoa_append_text(length_slot, b"0.0")
+        self.operations.append(Jump(finish))
+        self.operations.append(Label(nonzero))
+
+        # v = significand * 2^exponent, with the implicit bit restored unless
+        # the number is subnormal.
+        significand_slot = self.new_temp()
+        exponent_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                significand_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(biased_slot), IntConstant(0)),
+                    IntLoad(fraction_slot),
+                    IntBinary("or", IntLoad(fraction_slot), IntConstant(1 << 52)),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                exponent_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(biased_slot), IntConstant(0)),
+                    IntConstant(-1074),
+                    IntBinary("sub", IntLoad(biased_slot), IntConstant(1075)),
+                ),
+            )
+        )
+        # At the bottom of a binade the gap below is half the gap above - but
+        # not at the bottom of the normal range, where the neighbour below is
+        # subnormal and the gap is the same.
+        asymmetric_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                asymmetric_slot,
+                self.select_integer(
+                    IntBinary(
+                        "and",
+                        IntCompare("eq", IntLoad(fraction_slot), IntConstant(0)),
+                        IntCompare("gt", IntLoad(biased_slot), IntConstant(1)),
+                    ),
+                    IntConstant(1),
+                    IntConstant(0),
+                ),
+            )
+        )
+        inclusive_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                inclusive_slot,
+                self.select_integer(
+                    IntCompare(
+                        "eq",
+                        IntBinary("and", IntLoad(significand_slot), IntConstant(1)),
+                        IntConstant(0),
+                    ),
+                    IntConstant(1),
+                    IntConstant(0),
+                ),
+            )
+        )
+
+        exponent = IntLoad(exponent_slot)
+        asymmetric = IntLoad(asymmetric_slot)
+        nonnegative = IntCompare("ge", exponent, IntConstant(0))
+        value_shift = self.materialize_int(
+            self.select_integer(
+                nonnegative,
+                IntBinary(
+                    "add", IntBinary("add", exponent, IntConstant(1)), asymmetric
+                ),
+                IntBinary("add", IntConstant(1), asymmetric),
+            )
+        )
+        scale_value = self.materialize_int(
+            self.select_integer(
+                nonnegative,
+                IntBinary(
+                    "add",
+                    IntConstant(2),
+                    IntBinary("mul", asymmetric, IntConstant(2)),
+                ),
+                IntConstant(1),
+            )
+        )
+        scale_shift = self.materialize_int(
+            self.select_integer(
+                nonnegative,
+                IntConstant(0),
+                IntBinary(
+                    "add",
+                    IntBinary("sub", IntConstant(1), exponent),
+                    asymmetric,
+                ),
+            )
+        )
+        plus_shift = self.materialize_int(
+            self.select_integer(
+                nonnegative, IntBinary("add", exponent, asymmetric), asymmetric
+            )
+        )
+        minus_shift = self.materialize_int(
+            self.select_integer(nonnegative, exponent, IntConstant(0))
+        )
+
+        r = self.bignum(self.DTOA_R)
+        s = self.bignum(self.DTOA_S)
+        mp = self.bignum(self.DTOA_MP)
+        mm = self.bignum(self.DTOA_MM)
+        t1 = self.bignum(self.DTOA_T1)
+        t2 = self.bignum(self.DTOA_T2)
+        self.bn_set(r, IntLoad(significand_slot))
+        self.bn_double_times(r, value_shift)
+        self.bn_set(s, scale_value)
+        self.bn_double_times(s, scale_shift)
+        self.bn_set(mp, IntConstant(1))
+        self.bn_double_times(mp, plus_shift)
+        self.bn_set(mm, IntConstant(1))
+        self.bn_double_times(mm, minus_shift)
+
+        # Scale until the value sits in (1/10, 1], counting the decimal point
+        # position as it goes. The two tests are exact complements, so the
+        # branches cannot undo each other.
+        point_slot = self.new_temp()
+        self.operations.append(Store(point_slot, IntConstant(0)))
+        scale_start = self.new_label("dtoa_scale")
+        scale_end = self.new_label("dtoa_scale_end")
+        self.operations.append(Label(scale_start))
+        self.bn_copy(t1, r)
+        self.bn_add(t1, mp)
+        upper = self.bn_compare(t1, s)
+        high = self.dtoa_boundary(upper, inclusive_slot, "gt")
+        smaller = self.new_label("dtoa_scale_down")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(high), IntConstant(0)), smaller)
+        )
+        self.bn_mul_small(s, IntConstant(10))
+        self.operations.append(
+            Store(point_slot, IntBinary("add", IntLoad(point_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scale_start))
+        self.operations.append(Label(smaller))
+        self.bn_copy(t2, t1)
+        self.bn_mul_small(t2, IntConstant(10))
+        scaled = self.bn_compare(t2, s)
+        # Exactly the negation of the test above, applied to the scaled value,
+        # which means the opposite inclusivity: not (x > s or (ok and x == s))
+        # is (x < s) when ok, and (x <= s) when not. Anything else lets the two
+        # branches undo each other forever.
+        exclusive_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                exclusive_slot,
+                IntBinary("sub", IntConstant(1), IntLoad(inclusive_slot)),
+            )
+        )
+        too_small = self.dtoa_boundary(scaled, exclusive_slot, "lt")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(too_small), IntConstant(0)), scale_end)
+        )
+        self.bn_mul_small(r, IntConstant(10))
+        self.bn_mul_small(mp, IntConstant(10))
+        self.bn_mul_small(mm, IntConstant(10))
+        self.operations.append(
+            Store(point_slot, IntBinary("sub", IntLoad(point_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scale_start))
+        self.operations.append(Label(scale_end))
+
+        # Generate digits until what remains is closer to this double than to
+        # either neighbour.
+        count_slot = self.new_temp()
+        self.operations.append(Store(count_slot, IntConstant(0)))
+        digit_slot = self.new_temp()
+        generate = self.new_label("dtoa_generate")
+        generated = self.new_label("dtoa_generated")
+        self.operations.append(Label(generate))
+        self.bn_mul_small(r, IntConstant(10))
+        self.operations.append(Store(digit_slot, IntConstant(0)))
+        divide = self.new_label("dtoa_divide")
+        divided = self.new_label("dtoa_divided")
+        self.operations.append(Label(divide))
+        quotient = self.bn_compare(r, s)
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(quotient), IntConstant(0)), divided)
+        )
+        # r < 10s on entry, so this runs at most nine times: no big division.
+        self.bn_sub(r, s)
+        self.operations.append(
+            Store(digit_slot, IntBinary("add", IntLoad(digit_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(divide))
+        self.operations.append(Label(divided))
+        self.bn_mul_small(mp, IntConstant(10))
+        self.bn_mul_small(mm, IntConstant(10))
+        lower = self.bn_compare(r, mm)
+        low = self.dtoa_boundary(lower, inclusive_slot, "lt")
+        self.bn_copy(t1, r)
+        self.bn_add(t1, mp)
+        upper = self.bn_compare(t1, s)
+        high = self.dtoa_boundary(upper, inclusive_slot, "gt")
+
+        terminal = self.new_label("dtoa_terminal")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(low), IntConstant(0)), terminal + "_a")
+        )
+        self.operations.append(Jump(terminal))
+        self.operations.append(Label(terminal + "_a"))
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(high), IntConstant(0)), terminal + "_b")
+        )
+        self.operations.append(Jump(terminal))
+        self.operations.append(Label(terminal + "_b"))
+        # Neither bound reached: this digit is certain, keep going.
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", digits, IntLoad(count_slot)),
+                IntLoad(digit_slot),
+                1,
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(generate))
+
+        self.operations.append(Label(terminal))
+        bump_slot = self.new_temp()
+        self.operations.append(Store(bump_slot, IntConstant(0)))
+        settled = self.new_label("dtoa_settled")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(high), IntConstant(0)), settled)
+        )
+        upper_only = self.new_label("dtoa_upper_only")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(low), IntConstant(0)), upper_only)
+        )
+        self.bn_copy(t2, r)
+        self.bn_add(t2, r)
+        halfway = self.bn_compare(t2, s)
+        self.operations.append(
+            Store(
+                bump_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(halfway), IntConstant(0)),
+                    IntConstant(1),
+                    # An exact tie: CPython breaks it toward the even digit.
+                    self.select_integer(
+                        IntBinary(
+                            "and",
+                            IntCompare("eq", IntLoad(halfway), IntConstant(0)),
+                            IntBinary("and", IntLoad(digit_slot), IntConstant(1)),
+                        ),
+                        IntConstant(1),
+                        IntConstant(0),
+                    ),
+                ),
+            )
+        )
+        self.operations.append(Jump(settled))
+        self.operations.append(Label(upper_only))
+        # Only the upper bound was reached, so the value rounds up.
+        self.operations.append(Store(bump_slot, IntConstant(1)))
+        self.operations.append(Label(settled))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", digits, IntLoad(count_slot)),
+                IntBinary("add", IntLoad(digit_slot), IntLoad(bump_slot)),
+                1,
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Label(generated))
+
+        # Rounding up can turn the last digit into ten. Carry it back, and if
+        # it runs off the front the whole string was nines.
+        carry_slot = self.new_temp()
+        self.operations.append(
+            Store(carry_slot, IntBinary("sub", IntLoad(count_slot), IntConstant(1)))
+        )
+        carry = self.new_label("dtoa_carry")
+        carried = self.new_label("dtoa_carried")
+        self.operations.append(Label(carry))
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(carry_slot), IntConstant(0)), carried)
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    HeapLoad(IntBinary("add", digits, IntLoad(carry_slot)), 1),
+                    IntConstant(10),
+                ),
+                carried,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", digits, IntLoad(carry_slot)), IntConstant(0), 1
+            )
+        )
+        front = self.new_label("dtoa_carry_front")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(carry_slot), IntConstant(0)), front + "_no"
+            )
+        )
+        self.operations.append(HeapStore(digits, IntConstant(1), 1))
+        self.operations.append(Store(count_slot, IntConstant(1)))
+        self.operations.append(
+            Store(point_slot, IntBinary("add", IntLoad(point_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(carried))
+        self.operations.append(Label(front + "_no"))
+        previous = IntBinary(
+            "add", digits, IntBinary("sub", IntLoad(carry_slot), IntConstant(1))
+        )
+        self.operations.append(
+            HeapStore(
+                previous, IntBinary("add", HeapLoad(previous, 1), IntConstant(1)), 1
+            )
+        )
+        self.operations.append(
+            Store(carry_slot, IntBinary("sub", IntLoad(carry_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(carry))
+        self.operations.append(Label(carried))
+        # A trailing zero is never part of the shortest representation.
+        strip = self.new_label("dtoa_strip")
+        stripped = self.new_label("dtoa_stripped")
+        self.operations.append(Label(strip))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("gt", IntLoad(count_slot), IntConstant(1)), stripped
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            digits,
+                            IntBinary("sub", IntLoad(count_slot), IntConstant(1)),
+                        ),
+                        1,
+                    ),
+                    IntConstant(0),
+                ),
+                stripped,
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("sub", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(strip))
+        self.operations.append(Label(stripped))
+
+        # Layout, following CPython: exponential when the point sits more than
+        # four places left of the digits or past the sixteenth place.
+        point = IntLoad(point_slot)
+        count = IntLoad(count_slot)
+        fixed = self.new_label("dtoa_fixed")
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "or",
+                    IntCompare("le", point, IntConstant(-4)),
+                    IntCompare("gt", point, IntConstant(16)),
+                ),
+                fixed,
+            )
+        )
+        self.dtoa_append_digits(length_slot, IntConstant(0), IntConstant(1))
+        single = self.new_label("dtoa_single")
+        self.operations.append(
+            JumpIfFalse(IntCompare("gt", count, IntConstant(1)), single)
+        )
+        self.dtoa_append_text(length_slot, b".")
+        self.dtoa_append_digits(length_slot, IntConstant(1), count)
+        self.operations.append(Label(single))
+        self.dtoa_append_text(length_slot, b"e")
+        power_slot = self.new_temp()
+        self.operations.append(
+            Store(power_slot, IntBinary("sub", point, IntConstant(1)))
+        )
+        positive_power = self.new_label("dtoa_power_positive")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(power_slot), IntConstant(0)), positive_power
+            )
+        )
+        self.dtoa_append_text(length_slot, b"-")
+        self.operations.append(
+            Store(power_slot, IntUnary("neg", IntLoad(power_slot)))
+        )
+        self.operations.append(Jump(positive_power + "_done"))
+        self.operations.append(Label(positive_power))
+        self.dtoa_append_text(length_slot, b"+")
+        self.operations.append(Label(positive_power + "_done"))
+        # At least two digits, three when the exponent reaches a hundred.
+        hundreds = self.new_label("dtoa_hundreds")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ge", IntLoad(power_slot), IntConstant(100)), hundreds
+            )
+        )
+        self.dtoa_append(
+            length_slot,
+            IntBinary(
+                "add",
+                IntConstant(ord("0")),
+                IntBinary("sdiv", IntLoad(power_slot), IntConstant(100)),
+            ),
+        )
+        self.operations.append(Label(hundreds))
+        self.dtoa_append(
+            length_slot,
+            IntBinary(
+                "add",
+                IntConstant(ord("0")),
+                IntBinary(
+                    "smod",
+                    IntBinary("sdiv", IntLoad(power_slot), IntConstant(10)),
+                    IntConstant(10),
+                ),
+            ),
+        )
+        self.dtoa_append(
+            length_slot,
+            IntBinary(
+                "add",
+                IntConstant(ord("0")),
+                IntBinary("smod", IntLoad(power_slot), IntConstant(10)),
+            ),
+        )
+        self.operations.append(Jump(finish))
+
+        self.operations.append(Label(fixed))
+        leading = self.new_label("dtoa_leading")
+        self.operations.append(
+            JumpIfFalse(IntCompare("le", point, IntConstant(0)), leading + "_no")
+        )
+        self.operations.append(Jump(leading))
+        self.operations.append(Label(leading + "_no"))
+        trailing = self.new_label("dtoa_trailing")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", point, count), trailing + "_no")
+        )
+        self.operations.append(Jump(trailing))
+        self.operations.append(Label(trailing + "_no"))
+        # The point falls inside the digits.
+        self.dtoa_append_digits(length_slot, IntConstant(0), point)
+        self.dtoa_append_text(length_slot, b".")
+        self.dtoa_append_digits(length_slot, point, count)
+        self.operations.append(Jump(finish))
+
+        self.operations.append(Label(leading))
+        self.dtoa_append_text(length_slot, b"0.")
+        self.dtoa_append_repeat(
+            length_slot, IntConstant(ord("0")), IntUnary("neg", point)
+        )
+        self.dtoa_append_digits(length_slot, IntConstant(0), count)
+        self.operations.append(Jump(finish))
+
+        self.operations.append(Label(trailing))
+        self.dtoa_append_digits(length_slot, IntConstant(0), count)
+        self.dtoa_append_repeat(
+            length_slot, IntConstant(ord("0")), IntBinary("sub", point, count)
+        )
+        self.dtoa_append_text(length_slot, b".0")
+
+        self.operations.append(Label(finish))
+        self.operations.append(HeapStore(text, IntLoad(length_slot), 8))
+        return text
+
     def emit_print_argument(self, node: ast.expr) -> None:
         """Write one print() argument, with no separator and no newline."""
 
@@ -3997,19 +4986,9 @@ class Frontend:
             pointer = self.string_pointer(node)
         elif kind == "int":
             pointer = self.emit_int_to_string(self.integer(node))
+        elif kind == "float":
+            pointer = self.emit_float_to_string(self.float_expression(node))
         else:
-            if kind == "float":
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "native print() cannot render a runtime float yet. CPython "
-                    "prints the shortest decimal that reads back as the same "
-                    "double, which needs exact big-integer arithmetic; anything "
-                    "cheaper disagrees with CPython on values like "
-                    "0.1 + 0.1 + 0.1. A float known at build time prints "
-                    "exactly; for a computed one, print int() of it, or scale "
-                    "it to an integer first",
-                )
             raise NativeCompileError(
                 self.path,
                 node,

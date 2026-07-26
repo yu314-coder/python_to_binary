@@ -1561,16 +1561,39 @@ class RuntimeIntegerPrintingTests(unittest.TestCase):
             'print("names:", len(counts))\n'
         )
 
-    def test_a_runtime_float_is_still_rejected(self):
-        # Rendering a double needs shortest-round-trip formatting, which is a
-        # different problem; say so rather than print something that disagrees.
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            entry = root / "p.py"
-            entry.write_text(
-                "x = 0.0\nfor i in range(0, 3):\n    x += 0.5\nprint(x)\n",
-                encoding="utf-8",
-            )
-            with self.assertRaises(NativeCompileError) as caught:
-                compile_native(entry, root / "p.bin", "darwin-arm64", clean=True)
-            self.assertIn("cannot render a runtime float", str(caught.exception))
+    def test_a_runtime_float_prints_like_cpython(self):
+        # Not a fixed number of digits: the shortest decimal that reads back as
+        # the same double. 0.1 + 0.1 + 0.1 needs all 17, and its last digit is
+        # an exact tie that CPython breaks toward the even digit.
+        self._run("x = 0.0\nfor i in range(0, 3):\n    x += 0.1\nprint(x)\n")
+
+    def test_float_layout_matches_cpython_at_the_format_boundaries(self):
+        # CPython switches to exponential when the point sits more than four
+        # places left of the digits or past the sixteenth place.
+        self._run(
+            "xs = [1e15, 1e16, 1e17, 1e-4, 1e-5, 0.0001, 0.00001, 1e22, 1e23]\n"
+            "i = 0\nwhile i < 9:\n    print(xs[i])\n    i += 1\n"
+        )
+
+    def test_float_extremes_and_special_values(self):
+        self._run(
+            "xs = [5e-324, 1e-308, 2.2250738585072014e-308, 1e308,\n"
+            "      1.7976931348623157e308, -1.7976931348623157e308,\n"
+            "      0.0, -0.0, 1.0, -1.0, 0.5, 1/3, 3.141592653589793]\n"
+            "i = 0\nwhile i < 13:\n    print(xs[i])\n    i += 1\n"
+        )
+
+    def test_runtime_infinities_and_nan(self):
+        self._run(
+            "big = 0.0\nfor i in range(0, 1):\n    big += 1e308\n"
+            "huge = big * 10.0\n"
+            "print(huge, -huge, huge - huge)\n"
+        )
+
+    def test_several_floats_in_one_call_do_not_share_a_buffer_wrongly(self):
+        # The rendering scratch is reused, so each argument has to be written
+        # out before the next one is rendered.
+        self._run(
+            "xs = [0.1, 2.5, -3.75, 1e100]\ni = 0\n"
+            "while i < 4:\n    print(xs[i], xs[i] * 2.0, i)\n    i += 1\n"
+        )

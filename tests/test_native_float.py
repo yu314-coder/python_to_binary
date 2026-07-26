@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
 import platform
+import struct
+import random
 import subprocess
 import sys
 import tempfile
@@ -539,4 +542,80 @@ class FloatParameterTests(unittest.TestCase):
                 "def grow(v):\n    t = v * 2.0\n    if t > 0.0:\n"
                 "        return t\n    return t\n\nprint(int(grow(seed)))\n"
             ),
+        )
+
+
+class ShortestRoundTripPrintingTests(unittest.TestCase):
+    """print() of a computed double, against CPython's own repr.
+
+    Deciding which decimal string is the shortest one that reads back as the
+    same double cannot be done in 64-bit arithmetic: the value has to be
+    compared with its two neighbours after scaling by a power of ten that
+    reaches 10^308. So the generated code carries fixed-width big integers and
+    runs Burger and Dybvig's algorithm on them, and the only convincing test is
+    a differential one against CPython over a lot of values.
+    """
+
+    def _compare(self, values: list[float]) -> None:
+        source = (
+            "xs = [" + ", ".join(repr(v) for v in values) + "]\n"
+            "i = 0\n"
+            f"while i < {len(values)}:\n"
+            "    print(xs[i])\n"
+            "    i += 1\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "f.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            native = subprocess.run([str(artifact)], capture_output=True)
+            expected = "".join(repr(v) + "\n" for v in values).encode()
+            self.assertEqual(native.stdout, expected)
+
+    def test_random_doubles_match_repr(self):
+        # A fixed seed, so a failure is reproducible rather than occasional.
+        generator = random.Random(20260726)
+        values: list[float] = []
+        while len(values) < 400:
+            kind = generator.randrange(4)
+            if kind == 0:
+                bits = generator.getrandbits(64)
+                value = struct.unpack("<d", struct.pack("<Q", bits))[0]
+            elif kind == 1:
+                value = generator.uniform(-1e6, 1e6)
+            elif kind == 2:
+                value = generator.uniform(-1, 1) * 10 ** generator.randint(-320, 300)
+            else:
+                value = float(generator.randint(-(10**17), 10**17))
+            if value != value or value in (math.inf, -math.inf):
+                continue  # printed by their own test; not repr-able as a literal
+            values.append(value)
+        self._compare(values)
+
+    def test_subnormals_match_repr(self):
+        # Subnormals have the widest scaling range: 10^-324 away from one.
+        generator = random.Random(5)
+        values = [
+            struct.unpack("<d", struct.pack("<Q", generator.getrandbits(52)))[0]
+            for _ in range(60)
+        ]
+        values += [5e-324, 1e-320, 2.2250738585072011e-308]
+        self._compare(values)
+
+    def test_powers_of_ten_match_repr(self):
+        self._compare([float(f"1e{power}") for power in range(-320, 309, 7)])
+
+    def test_values_needing_every_digit_count(self):
+        # One value for each length of digit string, so no path through the
+        # generator's termination test goes unexercised.
+        self._compare(
+            [1.0, 1.5, 1.25, 1.125, 0.1, 1 / 3, 2 / 3, 1e23,
+             9007199254740993.0, 1685094889599744.2, 1.7976931348623157e308,
+             123456789012345.68, 0.30000000000000004]
         )

@@ -271,10 +271,20 @@ runtime:
   string is written straight from its heap block; a runtime integer is rendered
   to decimal first, counting its digits in one pass and filling them in
   backwards in another, with the smallest signed 64-bit value spelled out
-  because it has no positive counterpart to peel digits from. A runtime float
-  is rejected: rendering a double the way CPython does needs
-  shortest-round-trip formatting, and printing something that disagrees would
-  be worse than refusing;
+  because it has no positive counterpart to peel digits from. A runtime
+  `float` prints exactly what CPython's `repr()` would: the shortest decimal
+  string that reads back as the same double, including the layout rules
+  (exponential when the point sits more than four places left of the digits or
+  past the sixteenth place), `inf`, `-inf`, `nan`, and `-0.0`. Deciding which
+  string that is cannot be done in 64-bit arithmetic - the value has to be
+  compared with its two neighbours after scaling by a power of ten that reaches
+  10^308 - so the generated code carries fixed-width big integers in the arena
+  and runs Burger and Dybvig's algorithm on them, breaking exact ties toward
+  the even digit as CPython does. The six big integers and the output buffer
+  are reserved once at start-up and reused, so printing floats in a loop does
+  not consume the arena; the returned text is valid until the next float is
+  rendered, which is enough because `print()` writes each argument before
+  evaluating the next. It costs roughly half a millisecond per value;
 - `SystemExit(integer-expression)` and the restricted
   `import sys; sys.exit(integer-expression)` form emit a native process exit;
 - runtime arguments/input, dynamic integer-to-text printing, Python arbitrary
