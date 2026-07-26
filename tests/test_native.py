@@ -1597,3 +1597,210 @@ class RuntimeIntegerPrintingTests(unittest.TestCase):
             "xs = [0.1, 2.5, -3.75, 1e100]\ni = 0\n"
             "while i < 4:\n    print(xs[i], xs[i] * 2.0, i)\n    i += 1\n"
         )
+
+
+class FormattedStringTests(unittest.TestCase):
+    """f-strings whose fields are only known at run time."""
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "f.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, expected: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "f.bin", "darwin-arm64", clean=True)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_every_renderable_kind_in_one_string(self):
+        self._run(
+            'a = 0\nx = 0.0\ns = ""\n'
+            "for i in range(0, 3):\n    a += 1\n    x += 0.1\n"
+            's = s + "w\u00f6rld"\n'
+            'print(f"int {a}, float {x}, str {s}, bool {a > 2}, done")\n'
+        )
+
+    def test_an_f_string_is_a_string(self):
+        self._run(
+            "a = 0\nfor i in range(0, 3):\n    a += 1\n"
+            'label = f"item-{a}"\nprint(label, len(label))\n'
+        )
+
+    def test_adjacent_fields_and_empty_strings(self):
+        self._run(
+            "a = 0\nfor i in range(0, 3):\n    a += 1\n"
+            'print(f"{a}{a}{a}")\nprint(f"")\nprint(f"no fields here")\n'
+        )
+
+    def test_the_same_float_field_repeated(self):
+        # Float rendering hands back scratch that the next float overwrites, so
+        # each field has to be copied out before the next one is rendered.
+        self._run(
+            "x = 0.0\nfor i in range(0, 3):\n    x += 0.1\n"
+            'print(f"{x} and {x} and {x}")\n'
+        )
+
+    def test_format_specifiers_and_conversions_are_rejected(self):
+        self._reject(
+            'a = 0\nfor i in range(0, 3):\n    a += 1\nprint(f"{a:5d}")\n',
+            "format specifiers",
+        )
+        self._reject(
+            'a = 0\nfor i in range(0, 3):\n    a += 1\nprint(f"{a!r}")\n',
+            "conversions",
+        )
+
+
+class BooleanRenderingTests(unittest.TestCase):
+    """A bool prints as True or False, not as 1 or 0.
+
+    The native subset keeps a bool in an integer slot, which is right for
+    arithmetic and wrong for printing. Nothing tells them apart at run time, so
+    the question is answered from the source.
+    """
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "b.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "b.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_comparisons_and_negations(self):
+        self._run(
+            "a = 0\nfor i in range(0, 3):\n    a += 1\nflag = a > 2\n"
+            "print(a > 2, a < 2, not flag, flag)\nprint(a, a * 2)\n"
+        )
+
+    def test_a_bool_used_arithmetically_stops_being_one(self):
+        # `n = a > 1` then `n += 1` makes n a number again, and 2 is not True.
+        self._run(
+            "a = 0\nfor i in range(0, 3):\n    a += 1\n"
+            "flag = a > 2\ncopied = flag\nn = a > 1\nn += 1\n"
+            "print(copied, n)\n"
+        )
+
+
+class WithStatementTests(unittest.TestCase):
+    """`with` over a native class, resolved at build time.
+
+    There is no run-time protocol lookup, so `__enter__` and `__exit__` are
+    found on the class and inlined. `__exit__` runs on the way out whether the
+    body finished or raised, which is the same problem `finally` solves and is
+    emitted the same way.
+    """
+
+    HEADER = (
+        "class G:\n"
+        "    def __init__(self, n):\n        self.n = n\n"
+        "    def __enter__(self):\n        return self\n"
+        "    def __exit__(self, a, b, c):\n"
+        '        print("close", self.n)\n\n'
+    )
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "w.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "w.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, expected: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "w.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "w.bin", "darwin-arm64", clean=True)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_enter_binds_and_exit_runs(self):
+        self._run(
+            self.HEADER
+            + 'with G(7) as g:\n    print("inside", g.n)\nprint("after")\n'
+        )
+
+    def test_a_manager_that_binds_nothing(self):
+        self._run(
+            "class Q:\n    def __init__(self, n):\n        self.n = n\n"
+            '    def __enter__(self):\n        print("enter")\n'
+            '    def __exit__(self, a, b, c):\n        print("exit")\n\n'
+            'with Q(1):\n    print("body")\n'
+        )
+
+    def test_nested_managers_close_in_reverse(self):
+        self._run(self.HEADER + 'with G(1) as x, G(2) as y:\n    print(x.n, y.n)\n')
+
+    def test_exit_runs_when_the_body_raises(self):
+        self._run(
+            self.HEADER
+            + "try:\n    with G(3) as g:\n"
+            '        print("before")\n        raise ValueError("boom")\n'
+            'except ValueError:\n    print("caught")\n'
+        )
+
+    def test_a_loop_inside_the_body_may_break(self):
+        self._run(
+            self.HEADER
+            + "with G(0) as g:\n    i = 0\n    while i < 5:\n"
+            "        if i == 2:\n            break\n        print(i)\n        i += 1\n"
+        )
+
+    def test_breaking_out_of_a_with_is_rejected(self):
+        self._reject(
+            self.HEADER
+            + "i = 0\nwhile i < 3:\n    with G(i) as g:\n        break\n    i += 1\n",
+            "cannot leave a try that has a finally",
+        )
+
+    def test_an_exit_that_inspects_the_exception_is_rejected(self):
+        self._reject(
+            "class G:\n    def __init__(self, n):\n        self.n = n\n"
+            "    def __enter__(self):\n        return self\n"
+            "    def __exit__(self, kind, value, trace):\n        print(kind)\n\n"
+            'with G(1) as g:\n    print("x")\n',
+            "no exception object to pass",
+        )
+
+    def test_a_non_object_manager_is_rejected(self):
+        self._reject(
+            'with 5 as g:\n    print("x")\n', "needs a native object"
+        )

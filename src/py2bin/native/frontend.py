@@ -501,8 +501,16 @@ class Frontend:
         self.exception_slot: int | None = None
         self.exception_value_slot: int | None = None
         self._dtoa_scratch_slot: int | None = None
+        self._prologue: list[object] = []
+        self._bool_text_slot: int | None = None
+        self.boolean_names: set[str] = set()
         self.exception_ids: dict[str, int] = {}
-        self.finally_depth = 0
+        # Each cleanup scope (a `finally`, or a `with`'s `__exit__`) records
+        # how deep the jump stacks were when it opened. A jump is only a
+        # problem when it would leave the scope: one inside a function or loop
+        # that opened later stays within it, which is what makes a `return self`
+        # in an inlined __enter__ harmless.
+        self.finally_scopes: list[tuple[int, int, int]] = []
         self.continue_targets: list[str] = []
         self.return_targets: list[tuple[int | None, str]] = []
         self.active_functions: list[tuple[int, str]] = []
@@ -524,6 +532,8 @@ class Frontend:
             self.operations.insert(
                 0, HeapInit(self._heap_bump_slot, _HEAP_ARENA_BYTES)
             )
+            for index, operation in enumerate(self._prologue):
+                self.operations.insert(1 + index, operation)
             if self._dtoa_scratch_slot is not None:
                 # Float rendering needs six big integers and two buffers. They
                 # are reused, so reserve them once here rather than allocating
@@ -760,6 +770,7 @@ class Frontend:
                     self.path, node, "unsupported native integer augmented assignment"
                 )
             name = node.target.id
+            self.boolean_names.discard(name)
             if name not in self.slots:
                 raise NativeCompileError(
                     self.path, node, f"runtime integer variable {name!r} is not initialized"
@@ -801,7 +812,7 @@ class Frontend:
         elif isinstance(node, ast.Break):
             if not self.break_targets:
                 raise NativeCompileError(self.path, node, "break is outside a native loop")
-            if self.finally_depth:
+            if self.jump_escapes_cleanup(1, self.break_targets):
                 raise NativeCompileError(
                     self.path,
                     node,
@@ -813,7 +824,7 @@ class Frontend:
         elif isinstance(node, ast.Continue):
             if not self.continue_targets:
                 raise NativeCompileError(self.path, node, "continue is outside a native loop")
-            if self.finally_depth:
+            if self.jump_escapes_cleanup(2, self.continue_targets):
                 raise NativeCompileError(
                     self.path,
                     node,
@@ -825,7 +836,7 @@ class Frontend:
         elif isinstance(node, ast.Return):
             if not self.return_targets:
                 raise NativeCompileError(self.path, node, "return is outside a native function")
-            if self.finally_depth:
+            if self.jump_escapes_cleanup(0, self.return_targets):
                 raise NativeCompileError(
                     self.path,
                     node,
@@ -869,6 +880,13 @@ class Frontend:
             self.import_statement(node)
         elif isinstance(node, ast.Raise):
             self.raise_statement(node)
+        elif isinstance(node, ast.With):
+            self.with_statement(node)
+        elif isinstance(node, ast.AsyncWith):
+            raise NativeCompileError(
+                self.path, node, "native code has no event loop, so `async with` "
+                "is not in the subset"
+            )
         elif isinstance(node, (ast.Try, ast.TryStar)):
             if isinstance(node, ast.TryStar):
                 raise NativeCompileError(
@@ -1038,6 +1056,10 @@ class Frontend:
             self.functions = previous_functions
         initializer = methods.pop("__init__", None)
         for name in methods:
+            # __enter__/__exit__ are resolved at build time by `with`, so they
+            # need no run-time protocol; the rest still have none.
+            if name in {"__enter__", "__exit__"}:
+                continue
             if name.startswith("__") and name.endswith("__"):
                 raise NativeCompileError(
                     self.path,
@@ -2181,6 +2203,10 @@ class Frontend:
                 )
             raise NativeCompileError(self.path, expression, message)
         self.value_types[name] = kind
+        if kind == "int" and self.renders_as_bool(expression):
+            self.boolean_names.add(name)
+        else:
+            self.boolean_names.discard(name)
         if kind == "object":
             self.object_assignment(name, expression)
         elif self.dict_kinds(kind) is not None:
@@ -3130,6 +3156,58 @@ class Frontend:
         self.runtime_names.add(name)
         self.operations.append(Store(self.slot(name), pointer))
 
+    def joined_string(self, node: ast.JoinedStr) -> IntExpression:
+        """Lower an f-string whose pieces are not all known at build time.
+
+        Each piece is rendered the way `str()` would render it and concatenated
+        on the spot. On the spot matters: float rendering hands back a pointer
+        into scratch that the next float would overwrite, and concatenation
+        copies, so the copy has to happen before the next piece is rendered.
+        """
+
+        result = self.materialize_string_constant(b"")
+        for piece in node.values:
+            if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                result = self.emit_concat(
+                    result, self.materialize_string_constant(piece.value.encode())
+                )
+                continue
+            if not isinstance(piece, ast.FormattedValue):
+                raise NativeCompileError(
+                    self.path, node, "unsupported native f-string component"
+                )
+            if piece.conversion != -1:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native f-strings do not support !r, !s, or !a conversions",
+                )
+            if piece.format_spec is not None:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native f-strings do not support format specifiers yet; "
+                    "a width or precision needs a formatter beyond str()",
+                )
+            result = self.emit_concat(result, self.render_as_string(piece.value))
+        return result
+
+    def render_as_string(self, node: ast.expr) -> IntExpression:
+        """A pointer to the text `str()` would produce for this expression."""
+
+        kind = self.expression_type(node)
+        if kind == "str":
+            return self.string_pointer(node)
+        if kind == "float":
+            return self.emit_float_to_string(self.float_expression(node))
+        if kind == "int":
+            if self.renders_as_bool(node):
+                return self.emit_bool_to_string(self.integer(node))
+            return self.emit_int_to_string(self.integer(node))
+        raise NativeCompileError(
+            self.path, node, f"a native f-string cannot render a {kind} yet"
+        )
+
     def string_pointer(self, node: ast.expr) -> IntExpression:
         """Emit any needed heap work and return an i64 pointer to a string block.
 
@@ -3149,6 +3227,8 @@ class Frontend:
             folded = None
         if isinstance(folded, str):
             return self.materialize_string_constant(folded.encode("utf-8"))
+        if isinstance(node, ast.JoinedStr):
+            return self.joined_string(node)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             left = self.string_pointer(node.left)
             right = self.string_pointer(node.right)
@@ -3771,6 +3851,184 @@ class Frontend:
         assert test is not None
         return test
 
+    def jump_escapes_cleanup(self, index: int, targets: list) -> bool:
+        """Whether a jump of this kind would leave a cleanup scope unrun."""
+
+        return any(scope[index] >= len(targets) for scope in self.finally_scopes)
+
+    def open_cleanup_scope(self) -> None:
+        self.finally_scopes.append(
+            (
+                len(self.return_targets),
+                len(self.break_targets),
+                len(self.continue_targets),
+            )
+        )
+
+    def with_statement(self, node: ast.With) -> None:
+        """Run a body with a native object's `__enter__`/`__exit__` around it.
+
+        There are no context-manager protocols to look up at run time here, so
+        this resolves the two methods at build time and inlines them. `__exit__`
+        runs on the way out whether the body finished or raised, which is the
+        same problem `finally` solves and is emitted the same way: once per path
+        out, because there is no return address to come back on.
+        """
+
+        if len(node.items) > 1:
+            # `with a, b:` is `with a: with b:`; rewrite rather than duplicate.
+            inner = ast.copy_location(
+                ast.With(items=node.items[1:], body=node.body, type_comment=None),
+                node,
+            )
+            ast.fix_missing_locations(inner)
+            node = ast.copy_location(
+                ast.With(items=node.items[:1], body=[inner], type_comment=None),
+                node,
+            )
+        item = node.items[0]
+        manager = item.context_expr
+        native_class = self.resolve_object_class(manager)
+        if native_class is None:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native `with` needs a native object with __enter__ and "
+                "__exit__; there is no run-time protocol lookup here",
+            )
+        if isinstance(manager, ast.Name):
+            manager_name = manager.id
+        else:
+            manager_name = f"<with-{self.new_label('object')}>"
+            self.assignment(manager_name, manager)
+        enter = native_class.methods.get("__enter__")
+        exit_method = native_class.methods.get("__exit__")
+        if enter is None or exit_method is None:
+            missing = "__enter__" if enter is None else "__exit__"
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{native_class.name!r} has no native {missing}()",
+            )
+        if exit_method.returns_value:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native __exit__ cannot return a value: a real one returning "
+                "true suppresses the exception, and there is no exception "
+                "object here to decide about",
+            )
+        # Keep the signature Python requires, so the same source still runs
+        # under CPython, but nothing truthful can be passed for the exception
+        # triple - there are no exception objects here. Zeros go in, and a body
+        # that reads them is refused rather than shown the wrong thing.
+        if len(exit_method.parameters) != 4:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{native_class.name}.__exit__() must take self and the three "
+                "exception parameters, as CPython requires",
+            )
+        reported = set(exit_method.parameters[1:])
+        for inner in ast.walk(
+            ast.Module(body=list(exit_method.body), type_ignores=[])
+        ):
+            if isinstance(inner, ast.Name) and inner.id in reported:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{native_class.name}.__exit__() reads {inner.id!r}, but "
+                    "there is no exception object to pass: native exceptions "
+                    "are an integer class id, not a value",
+                )
+        if len(enter.parameters) != 1:
+            raise NativeCompileError(
+                self.path, node, f"{native_class.name}.__enter__() takes only self"
+            )
+        instance = IntLoad(self.slot(manager_name))
+
+        def call(name: str, method: NativeFunction, count: int = 0):
+            invocation = ast.copy_location(
+                ast.Call(
+                    func=ast.copy_location(
+                        ast.Attribute(
+                            value=ast.copy_location(
+                                ast.Name(id=manager_name, ctx=ast.Load()), node
+                            ),
+                            attr=name,
+                            ctx=ast.Load(),
+                        ),
+                        node,
+                    ),
+                    args=[
+                        ast.copy_location(ast.Constant(value=0), node)
+                        for _ in range(count)
+                    ],
+                    keywords=[],
+                ),
+                node,
+            )
+            return self.inline_method(
+                native_class, name, method, instance, invocation, ()
+            )
+
+        # `__exit__` is emitted on each path out, so a name it writes can no
+        # longer be a build-time constant. Same for the body.
+        assigned = list(node.body)
+        assigned.extend(exit_method.body)
+        self.materialize_runtime_names(self.assigned_names(assigned))
+
+        entered = call("__enter__", enter)
+        if item.optional_vars is not None:
+            if not isinstance(item.optional_vars, ast.Name):
+                raise NativeCompileError(
+                    self.path, node, "a native `with ... as` binds a single name"
+                )
+            bound = item.optional_vars.id
+            if self.enter_returns_self(enter):
+                # The usual shape: the name is another way to say the manager.
+                self.runtime_names.add(bound)
+                self.operations.append(Store(self.slot(bound), instance))
+                self.object_classes[bound] = native_class.name
+                self.value_types[bound] = "object"
+            elif entered is not None:
+                self.runtime_names.add(bound)
+                self.operations.append(Store(self.slot(bound), entered))
+                self.value_types[bound] = "int"
+            else:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{native_class.name}.__enter__() returns nothing, so there "
+                    "is nothing for `as` to bind",
+                )
+
+        escape = self.new_label("with_escape")
+        end = self.new_label("with_end")
+        self.open_cleanup_scope()
+        self.handler_stack.append(escape)
+        for statement in node.body:
+            self.statement(statement)
+        self.handler_stack.pop()
+        self.finally_scopes.pop()
+        call("__exit__", exit_method, 3)
+        self.operations.append(Jump(end))
+        self.operations.append(Label(escape))
+        call("__exit__", exit_method, 3)
+        self.propagate()
+        self.operations.append(Label(end))
+
+    @staticmethod
+    def enter_returns_self(method: NativeFunction) -> bool:
+        """Whether `__enter__` is exactly `return self`, the usual shape."""
+
+        return (
+            len(method.body) == 1
+            and isinstance(method.body[0], ast.Return)
+            and isinstance(method.body[0].value, ast.Name)
+            and method.body[0].value.id == "self"
+        )
+
     def try_statement(self, node: ast.Try) -> None:
         for clause in node.handlers:
             if clause.name is not None:
@@ -3801,7 +4059,7 @@ class Frontend:
                 self.statement(statement)
 
         if node.finalbody:
-            self.finally_depth += 1
+            self.open_cleanup_scope()
         self.handler_stack.append(dispatch)
         for statement in node.body:
             self.statement(statement)
@@ -3849,7 +4107,7 @@ class Frontend:
             emit_finally()
             self.propagate()
         if node.finalbody:
-            self.finally_depth -= 1
+            self.finally_scopes.pop()
         self.operations.append(Label(end))
 
     # The smallest signed 64-bit value has no positive counterpart, so the
@@ -4971,6 +5229,70 @@ class Frontend:
         self.operations.append(HeapStore(text, IntLoad(length_slot), 8))
         return text
 
+    def ensure_bool_text(self) -> int:
+        """A slot pointing at the string blocks for ``True`` and ``False``.
+
+        Reserved once at start-up. Rendering them at each site would allocate
+        inside loops, and they never change.
+        """
+
+        if self._bool_text_slot is None:
+            bump = self.ensure_heap()
+            self._bool_text_slot = self.slot("<bool-text>")
+            pointer = IntLoad(self._bool_text_slot)
+            self._prologue.append(
+                HeapAlloc(self._bool_text_slot, IntConstant(32), bump)
+            )
+            for offset, text in ((0, b"True"), (16, b"False")):
+                self._prologue.append(
+                    HeapStore(
+                        IntBinary("add", pointer, IntConstant(offset)),
+                        IntConstant(len(text)),
+                        8,
+                    )
+                )
+                for index, byte in enumerate(text):
+                    self._prologue.append(
+                        HeapStore(
+                            IntBinary(
+                                "add", pointer, IntConstant(offset + 8 + index)
+                            ),
+                            IntConstant(byte),
+                            1,
+                        )
+                    )
+        return self._bool_text_slot
+
+    def renders_as_bool(self, node: ast.expr) -> bool:
+        """Whether this expression's Python value is a ``bool``.
+
+        The native subset keeps a bool in an integer slot, which is right for
+        arithmetic and wrong for printing: CPython writes ``True``, not ``1``.
+        Nothing distinguishes the two at run time, so the question is answered
+        from the source.
+        """
+
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, bool)
+        if isinstance(node, ast.Compare):
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return True
+        if isinstance(node, ast.BoolOp):
+            # `a and b` yields an operand, so it is a bool only if both are.
+            return all(self.renders_as_bool(value) for value in node.values)
+        if isinstance(node, ast.Name):
+            return node.id in self.boolean_names
+        return False
+
+    def emit_bool_to_string(self, value: IntExpression) -> IntExpression:
+        base = IntLoad(self.ensure_bool_text())
+        return self.select_integer(
+            IntCompare("ne", value, IntConstant(0)),
+            base,
+            IntBinary("add", base, IntConstant(16)),
+        )
+
     def emit_print_argument(self, node: ast.expr) -> None:
         """Write one print() argument, with no separator and no newline."""
 
@@ -4984,6 +5306,8 @@ class Frontend:
         kind = self.expression_type(node)
         if kind == "str":
             pointer = self.string_pointer(node)
+        elif kind == "int" and self.renders_as_bool(node):
+            pointer = self.emit_bool_to_string(self.integer(node))
         elif kind == "int":
             pointer = self.emit_int_to_string(self.integer(node))
         elif kind == "float":
@@ -5317,6 +5641,8 @@ class Frontend:
         kind = self.expression_function_kind(node, bindings)
         if kind is not None:
             return kind
+        if isinstance(node, ast.JoinedStr):
+            return "str"
         if isinstance(node, ast.Dict):
             return self.dict_literal_tag(node, bindings)
         if isinstance(node, ast.List):

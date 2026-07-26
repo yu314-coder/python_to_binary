@@ -177,8 +177,26 @@ a 0-d tensor, not a plain `int`). They are available only through `freeze`.
 The current native frontend combines static output with a small integer
 runtime:
 
-- literals, one-name assignments, constant Boolean/conditional expressions,
-  and simple static f-strings are accepted;
+- literals, one-name assignments, and constant Boolean/conditional expressions
+  are accepted;
+- an f-string is built at run time when its fields are: each field is rendered
+  the way `str()` would render it and concatenated on the spot - on the spot
+  because float rendering hands back scratch the next float would overwrite.
+  Conversions (`!r`, `!s`, `!a`) and format specifiers are rejected; a width or
+  precision needs a formatter beyond `str()`;
+- a `bool` prints as `True` or `False`. It lives in an integer slot, which is
+  right for arithmetic and wrong for printing, and nothing tells the two apart
+  at run time - so which names hold one is tracked from the source, and a name
+  used arithmetically stops being one;
+- `with` runs a body between a native class's `__enter__` and `__exit__`, both
+  resolved at build time and inlined; there is no run-time protocol lookup.
+  `__exit__` runs on the way out whether the body finished or raised, and
+  `with a, b:` nests. It must take the three exception parameters CPython
+  requires, so the same source still runs under CPython, but zeros are passed
+  for them - an `__exit__` that reads them, or returns a value to suppress the
+  exception, is rejected rather than shown something untrue. A `break`,
+  `continue`, or `return` that would leave the block is rejected for the same
+  reason it is inside a `finally`;
 - runtime integer variables use signed 64-bit native stack slots; `+`, `-`,
   `*`, bitwise operations, constant-count shifts, and signed comparisons emit
   x86-64 or ARM64 instructions;
