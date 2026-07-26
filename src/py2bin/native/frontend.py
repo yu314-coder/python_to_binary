@@ -570,21 +570,35 @@ class Frontend:
         )
         return IntBinary("add", IntConstant(8), rounded)
 
-    @staticmethod
-    def assigned_names(nodes: list[ast.stmt]) -> set[str]:
+    @classmethod
+    def target_names(cls, target: ast.expr) -> set[str]:
+        """Every name an assignment target binds, unpacking tuples."""
+
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: set[str] = set()
+            for item in target.elts:
+                names.update(cls.target_names(item))
+            return names
+        return set()
+
+    @classmethod
+    def assigned_names(cls, nodes: list[ast.stmt]) -> set[str]:
         names: set[str] = set()
         for statement in nodes:
             for node in ast.walk(statement):
                 if isinstance(node, ast.Assign):
-                    names.update(
-                        target.id for target in node.targets if isinstance(target, ast.Name)
-                    )
+                    for target in node.targets:
+                        # A tuple target assigns every name in it; missing that
+                        # left `a, b = ...` inside a loop folding as constants.
+                        names.update(cls.target_names(target))
                 elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                     names.add(node.target.id)
                 elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
                     names.add(node.target.id)
-                elif isinstance(node, ast.For) and isinstance(node.target, ast.Name):
-                    names.add(node.target.id)
+                elif isinstance(node, ast.For):
+                    names.update(cls.target_names(node.target))
         return names
 
     @classmethod
@@ -609,8 +623,7 @@ class Frontend:
 
             def visit_For(self, node: ast.For) -> None:
                 self.names.update(cls.assigned_names(node.body))
-                if isinstance(node.target, ast.Name):
-                    self.names.add(node.target.id)
+                self.names.update(cls.target_names(node.target))
                 self.generic_visit(node)
 
             def visit_While(self, node: ast.While) -> None:
@@ -706,6 +719,25 @@ class Frontend:
             self.expression_statement(node.value)
         elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             self.assignment(node.targets[0].id, node.value)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], (ast.Tuple, ast.List))
+            and isinstance(node.value, (ast.Tuple, ast.List))
+        ):
+            self.parallel_assignment(node.targets[0], node.value)
+        elif isinstance(node, ast.Assign) and len(node.targets) > 1:
+            # `a = b = value`: one evaluation, several names.
+            first = node.targets[0]
+            if not all(isinstance(item, ast.Name) for item in node.targets):
+                raise NativeCompileError(
+                    self.path, node, "a native chained assignment binds names"
+                )
+            self.assignment(first.id, node.value)
+            for other in node.targets[1:]:
+                self.assignment(
+                    other.id, ast.copy_location(ast.Name(id=first.id, ctx=ast.Load()), node)
+                )
         elif (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
@@ -2341,7 +2373,9 @@ class Frontend:
         source_slot = self.new_temp()
         self.operations.append(Store(source_slot, source))
         origin = IntLoad(source_slot)
-        length = self.materialize_int(HeapLoad(origin, 8))
+        length = self.materialize_int(
+            HeapLoad(IntBinary("add", origin, IntConstant(8)), 8)
+        )
         lower, upper = self.slice_bounds(node, length)
         count_slot = self.new_temp()
         self.operations.append(
@@ -2353,7 +2387,7 @@ class Frontend:
                 result_slot,
                 IntBinary(
                     "add",
-                    IntConstant(8),
+                    IntConstant(self.LIST_HEADER_BYTES),
                     IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
                 ),
                 bump,
@@ -2361,6 +2395,11 @@ class Frontend:
         )
         result = IntLoad(result_slot)
         self.operations.append(HeapStore(result, IntLoad(count_slot), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result, IntConstant(8)), IntLoad(count_slot), 8
+            )
+        )
         index_slot = self.new_temp()
         self.operations.append(Store(index_slot, IntConstant(0)))
         start = self.new_label("slice_copy")
@@ -2374,11 +2413,17 @@ class Frontend:
         offset = IntBinary("mul", IntLoad(index_slot), IntConstant(8))
         self.operations.append(
             HeapStore(
-                IntBinary("add", IntBinary("add", result, IntConstant(8)), offset),
+                IntBinary(
+                    "add",
+                    IntBinary("add", result, IntConstant(self.LIST_HEADER_BYTES)),
+                    offset,
+                ),
                 HeapLoad(
                     IntBinary(
                         "add",
-                        IntBinary("add", origin, IntConstant(8)),
+                        IntBinary(
+                            "add", origin, IntConstant(self.LIST_HEADER_BYTES)
+                        ),
                         IntBinary(
                             "add",
                             IntBinary("mul", lower, IntConstant(8)),
@@ -2499,6 +2544,288 @@ class Frontend:
         )
         return result
 
+    def parallel_assignment(self, target, value) -> None:
+        """`a, b = b, a` - every right-hand side is read before anything moves.
+
+        Without the temporaries this would be two assignments in sequence, and
+        the second would read the name the first had already overwritten.
+        """
+
+        if len(target.elts) != len(value.elts):
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"native parallel assignment needs matching lengths: "
+                f"{len(target.elts)} names, {len(value.elts)} values",
+            )
+        for item in target.elts:
+            if not isinstance(item, ast.Name):
+                raise NativeCompileError(
+                    self.path, item, "a native parallel assignment binds names"
+                )
+        holders: list[str] = []
+        for index, item in enumerate(value.elts):
+            holder = f"<swap-{self.new_label('slot')}:{index}>"
+            self.assignment(holder, item)
+            holders.append(holder)
+        for name, holder in zip(target.elts, holders):
+            self.assignment(
+                name.id,
+                ast.copy_location(ast.Name(id=holder, ctx=ast.Load()), target),
+            )
+
+    _AGGREGATES = {"sum": "add", "min": "lt", "max": "gt"}
+
+    def aggregate_call(self, node: ast.Call, bindings, call_stack):
+        """`sum(xs)`, `min(xs)`, `max(xs)` over a runtime list."""
+
+        name = node.func.id
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, f"native {name}() takes one iterable"
+            )
+        source = node.args[0]
+        element_kind = self.list_kind(self.expression_type(source, bindings))
+        if element_kind is None:
+            raise NativeCompileError(
+                self.path, node, f"native {name}() takes a runtime list"
+            )
+        if element_kind != "int":
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native {name}() works on integer lists; a float one would "
+                "need a float accumulator this call cannot return",
+            )
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, self.list_pointer(source)))
+        pointer = IntLoad(pointer_slot)
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8))
+        )
+        if name != "sum":
+            # min() and max() of an empty list raise; nothing to return here.
+            ok = self.new_label("aggregate_ok")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("gt", IntLoad(length_slot), IntConstant(0)),
+                    ok + "_empty",
+                )
+            )
+            self.operations.append(Jump(ok))
+            self.operations.append(Label(ok + "_empty"))
+            self.raise_exception(
+                "ValueError",
+                f"ValueError: {name}() iterable argument is empty\n".encode(),
+            )
+            self.operations.append(Label(ok))
+        result_slot = self.new_temp()
+        first = IntBinary(
+            "add", pointer, IntConstant(self.LIST_HEADER_BYTES)
+        )
+        self.operations.append(
+            Store(
+                result_slot,
+                IntConstant(0) if name == "sum" else HeapLoad(first, 8),
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(
+            Store(index_slot, IntConstant(0 if name == "sum" else 1))
+        )
+        start = self.new_label("aggregate")
+        end = self.new_label("aggregate_end")
+        step = self.new_label("aggregate_next")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), end
+            )
+        )
+        item = HeapLoad(
+            IntBinary(
+                "add", first, IntBinary("mul", IntLoad(index_slot), IntConstant(8))
+            ),
+            8,
+        )
+        if name == "sum":
+            self.operations.append(
+                Store(result_slot, IntBinary("add", IntLoad(result_slot), item))
+            )
+        else:
+            item_slot = self.new_temp()
+            self.operations.append(Store(item_slot, item))
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        self._AGGREGATES[name],
+                        IntLoad(item_slot),
+                        IntLoad(result_slot),
+                    ),
+                    step,
+                )
+            )
+            self.operations.append(Store(result_slot, IntLoad(item_slot)))
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return IntLoad(result_slot)
+
+    def emit_list_append(
+        self, pointer_slot: int, value: IntExpression
+    ) -> None:
+        """Append to a runtime list, moving it when it is full.
+
+        The block cannot be extended in place - the arena hands out addresses
+        in order and something else may already sit behind this one - so a full
+        list is copied into a block of twice the capacity. The abandoned one
+        stays in the arena, which never reclaims; that is what makes appending
+        amortised rather than free.
+        """
+
+        bump = self.ensure_heap()
+        value_slot = self.new_temp()
+        self.operations.append(Store(value_slot, value))
+        pointer = IntLoad(pointer_slot)
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8))
+        )
+        room = self.new_label("append_room")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(length_slot), HeapLoad(pointer, 8)),
+                room + "_full",
+            )
+        )
+        self.operations.append(Jump(room))
+        self.operations.append(Label(room + "_full"))
+
+        grown_slot = self.new_temp()
+        capacity_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                capacity_slot,
+                self.select_integer(
+                    IntCompare("gt", HeapLoad(pointer, 8), IntConstant(0)),
+                    IntBinary("mul", HeapLoad(pointer, 8), IntConstant(2)),
+                    IntConstant(4),
+                ),
+            )
+        )
+        self.operations.append(
+            HeapAlloc(
+                grown_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.LIST_HEADER_BYTES),
+                    IntBinary("mul", IntLoad(capacity_slot), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        grown = IntLoad(grown_slot)
+        self.operations.append(HeapStore(grown, IntLoad(capacity_slot), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", grown, IntConstant(8)), IntLoad(length_slot), 8
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        copy = self.new_label("append_copy")
+        copied = self.new_label("append_copied")
+        self.operations.append(Label(copy))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), copied
+            )
+        )
+        offset = IntBinary(
+            "add",
+            IntConstant(self.LIST_HEADER_BYTES),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", grown, offset),
+                HeapLoad(IntBinary("add", pointer, offset), 8),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(copy))
+        self.operations.append(Label(copied))
+        self.operations.append(Store(pointer_slot, IntLoad(grown_slot)))
+        self.operations.append(Label(room))
+
+        self.operations.append(
+            HeapStore(
+                IntBinary(
+                    "add",
+                    IntBinary(
+                        "add", IntLoad(pointer_slot), IntConstant(self.LIST_HEADER_BYTES)
+                    ),
+                    IntBinary("mul", IntLoad(length_slot), IntConstant(8)),
+                ),
+                IntLoad(value_slot),
+                8,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+                IntBinary("add", IntLoad(length_slot), IntConstant(1)),
+                8,
+            )
+        )
+
+    def list_method_call(self, node: ast.Call) -> bool:
+        """Lower `xs.append(v)`; returns whether this was one."""
+
+        if (
+            not isinstance(node.func, ast.Attribute)
+            or not isinstance(node.func.value, ast.Name)
+            or self.list_kind_of(node.func.value.id) is None
+        ):
+            return False
+        name = node.func.value.id
+        if node.func.attr != "append":
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native lists support append(); {node.func.attr}() is not in "
+                "the subset",
+            )
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "append() takes exactly one argument"
+            )
+        element_kind = self.list_kind_of(name)
+        argument = node.args[0]
+        if element_kind == "float":
+            if self.expression_type(argument) not in {"float", "int"}:
+                raise NativeCompileError(
+                    self.path, argument, "this list holds floats"
+                )
+            value = FloatBits(self.float_expression(argument))
+        else:
+            if self.expression_type(argument) != "int":
+                raise NativeCompileError(
+                    self.path, argument, "this list holds signed 64-bit integers"
+                )
+            value = self.integer(argument)
+        # A literal's length stops being a build-time fact once it can grow.
+        self.list_lengths.pop(name, None)
+        self.emit_list_append(self.slot(name), value)
+        return True
+
     def list_pointer(self, node: ast.expr) -> IntExpression:
         """A pointer to a runtime list block, building one if needed."""
 
@@ -2541,15 +2868,27 @@ class Frontend:
         self.runtime_names.add(name)
         pointer_slot = self.slot(name)
         length = len(elements)
-        # Layout: [i64 length][i64 element0][i64 element1]... (all 8-aligned).
-        size = 8 + length * 8
+        # Layout: [i64 capacity][i64 length][element0][element1]...
+        # The capacity is what makes append() possible: without it there is
+        # nowhere to put the next item and no way to know when to move.
+        capacity = max(4, length)
+        size = self.LIST_HEADER_BYTES + capacity * 8
         self.operations.append(HeapAlloc(pointer_slot, IntConstant(size), bump))
         self.operations.append(
-            HeapStore(IntLoad(pointer_slot), IntConstant(length), 8)
+            HeapStore(IntLoad(pointer_slot), IntConstant(capacity), 8)
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+                IntConstant(length),
+                8,
+            )
         )
         for index, element in enumerate(elements):
             address = IntBinary(
-                "add", IntLoad(pointer_slot), IntConstant(8 + index * 8)
+                "add",
+                IntLoad(pointer_slot),
+                IntConstant(self.LIST_HEADER_BYTES + index * 8),
             )
             if element_kind == "float":
                 stored = FloatBits(self.float_expression(element))
@@ -2606,7 +2945,9 @@ class Frontend:
                     )
                     + (f" (length {length})" if length is not None else ""),
                 )
-            return IntBinary("add", pointer, IntConstant(8 + resolved * 8))
+            return IntBinary(
+                "add", pointer, IntConstant(self.LIST_HEADER_BYTES + resolved * 8)
+            )
         # A runtime index cannot be proved in range at build time, so normalize
         # negatives the way Python does and emit a real bounds check. Without
         # this the generated code would read or write outside the list and
@@ -2625,7 +2966,12 @@ class Frontend:
         ok_label = self.new_label("index_ok")
         index_slot = self.slot(f"<index-{bad_label}>")
         length_slot = self.slot(f"<length-{bad_label}>")
-        self.operations.append(Store(length_slot, HeapLoad(pointer, 8)))
+        self.operations.append(
+            Store(
+                length_slot,
+                HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8),
+            )
+        )
         # Branchless Python negative indexing: index += length when index < 0.
         negative_mask = IntUnary("neg", IntCompare("lt", index, IntConstant(0)))
         self.operations.append(
@@ -2653,7 +2999,9 @@ class Frontend:
         )
         self.operations.append(Label(ok_label))
         offset = IntBinary(
-            "add", IntConstant(8), IntBinary("mul", IntLoad(index_slot), IntConstant(8))
+            "add",
+            IntConstant(self.LIST_HEADER_BYTES),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
         )
         return IntBinary("add", pointer, offset)
 
@@ -2827,6 +3175,7 @@ class Frontend:
     # walking its bytes, and it means a rehash never has to hash anything
     # again.
 
+    LIST_HEADER_BYTES = 16
     DICT_SLOT_BYTES = 24
     DICT_HEADER_BYTES = 16
     DICT_KEY_KINDS = {"int", "str"}
@@ -3767,7 +4116,9 @@ class Frontend:
     ) -> None:
         address = IntBinary(
             "add",
-            IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+            IntBinary(
+                "add", IntLoad(pointer_slot), IntConstant(self.LIST_HEADER_BYTES)
+            ),
             IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
         )
         self.values.pop(target, None)
@@ -3792,7 +4143,12 @@ class Frontend:
         )
         length_slot = self.new_temp()
         self.operations.append(
-            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+            Store(
+                length_slot,
+                HeapLoad(
+                    IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                ),
+            )
         )
         start = self.new_label("for_list")
         continue_label = self.new_label("for_list_continue")
@@ -3959,7 +4315,12 @@ class Frontend:
             )
             self.operations.append(Store(index_slot, IntConstant(0)))
             self.operations.append(
-                Store(limit_slot, HeapLoad(IntLoad(pointer_slot), 8))
+                Store(
+                    limit_slot,
+                    HeapLoad(
+                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                    ),
+                )
             )
             reserve = IntLoad(limit_slot)
         # An empty range gives a negative span; reserve nothing rather than
@@ -3981,13 +4342,14 @@ class Frontend:
                 result_slot,
                 IntBinary(
                     "add",
-                    IntConstant(8),
+                    IntConstant(self.LIST_HEADER_BYTES),
                     IntBinary("mul", IntLoad(reserve_slot), IntConstant(8)),
                 ),
                 bump,
             )
         )
         result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, IntLoad(reserve_slot), 8))
         count_slot = self.new_temp()
         self.operations.append(Store(count_slot, IntConstant(0)))
 
@@ -4020,7 +4382,7 @@ class Frontend:
             )
         address = IntBinary(
             "add",
-            IntBinary("add", result, IntConstant(8)),
+            IntBinary("add", result, IntConstant(self.LIST_HEADER_BYTES)),
             IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
         )
         stored = (
@@ -4038,7 +4400,11 @@ class Frontend:
         )
         self.operations.append(Jump(start_label))
         self.operations.append(Label(end_label))
-        self.operations.append(HeapStore(result, IntLoad(count_slot), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result, IntConstant(8)), IntLoad(count_slot), 8
+            )
+        )
         return result
 
     def for_statement(self, node: ast.For) -> None:
@@ -4138,6 +4504,8 @@ class Frontend:
     def expression_statement(self, node: ast.expr) -> None:
         if not isinstance(node, ast.Call):
             raise NativeCompileError(self.path, node, "only print() and SystemExit are valid expression statements")
+        if self.list_method_call(node):
+            return
         if (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
@@ -6266,7 +6634,10 @@ class Frontend:
                 return "int"
             if node.func.id == "float" and node.func.id not in self.functions:
                 return "float"
-            if node.func.id in {"int", "len"} and node.func.id not in self.functions:
+            if (
+                node.func.id in {"int", "len", "abs", "sum", "min", "max"}
+                and node.func.id not in self.functions
+            ):
                 return "int"
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
             return "int"  # Attributes are signed 64-bit integers.
@@ -6694,6 +7065,31 @@ class Frontend:
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
+            and node.func.id == "abs"
+            and node.func.id not in self.functions
+        ):
+            if len(node.args) != 1 or node.keywords:
+                raise NativeCompileError(
+                    self.path, node, "native abs() takes exactly one argument"
+                )
+            value = self.materialize_int(
+                self.integer(node.args[0], bindings, call_stack)
+            )
+            return self.select_integer(
+                IntCompare("lt", value, IntConstant(0)),
+                IntUnary("neg", value),
+                value,
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in self._AGGREGATES
+            and node.func.id not in self.functions
+        ):
+            return self.aggregate_call(node, bindings, call_stack)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
             and node.func.id == "len"
             and node.func.id not in self.functions
         ):
@@ -6708,11 +7104,18 @@ class Frontend:
                 isinstance(argument, ast.Name)
                 and self.list_kind_of(argument.id) is not None
             ):
-                return HeapLoad(IntLoad(self.slots[argument.id]), 8)
+                return HeapLoad(
+                    IntBinary(
+                        "add", IntLoad(self.slots[argument.id]), IntConstant(8)
+                    ),
+                    8,
+                )
             if isinstance(argument, ast.Subscript) and isinstance(
                 argument.slice, ast.Slice
             ):
-                return HeapLoad(self.list_pointer(argument), 8)
+                return HeapLoad(
+                    IntBinary("add", self.list_pointer(argument), IntConstant(8)), 8
+                )
             if isinstance(argument, ast.Name) and self.dict_kinds_of(argument.id):
                 # The live count is the second i64 of the table header.
                 return HeapLoad(

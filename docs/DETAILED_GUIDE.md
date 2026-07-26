@@ -184,6 +184,19 @@ runtime:
   because float rendering hands back scratch the next float would overwrite.
   Conversions (`!r`, `!s`, `!a`) and format specifiers are rejected; a width or
   precision needs a formatter beyond `str()`;
+- a runtime list grows. Its block is `[capacity][length][elements]`, and
+  `xs.append(v)` writes at the length and moves on; when the capacity is
+  reached the list is copied into a block of twice the size, because the arena
+  hands out addresses in order and the block cannot be extended where it
+  stands. The abandoned block stays in the arena, which never reclaims, so
+  appending is amortised rather than free. `[]` is a list, and `xs: list[float]
+  = []` is a float one;
+- `sum()`, `min()`, `max()` over a runtime integer list, and `abs()`. `min()`
+  and `max()` of an empty list raise a catchable `ValueError`, as CPython does;
+- parallel assignment (`a, b = b, a`) reads every right-hand side into a
+  temporary before writing any name, so `a, b = b, a + b` is a swap and not two
+  assignments in sequence. Chained assignment (`a = b = value`) evaluates the
+  value once;
 - a slice of a runtime list or string (`xs[a:b]`, `s[a:b]`) builds a new one.
   Bounds clamp rather than raise, negative bounds count from the end, and a
   start past the stop yields nothing - Python's rules, which is why slicing and
