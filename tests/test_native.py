@@ -860,22 +860,6 @@ class Arm64CallAbiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only legal inside a Function"):
             encode_darwin_arm64(module, 0x100004000)
 
-    def test_targets_without_a_call_abi_reject_the_module(self):
-        for target in ("windows-x86_64",):
-            with self.subTest(target=target):
-                with tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    with self.assertRaisesRegex(
-                        NativeCompileError, "function calls .*are only supported"
-                    ):
-                        compile_native_module(
-                            Path("call.py"),
-                            self._module(1),
-                            root / "call.bin",
-                            target=target,
-                            clean=True,
-                        )
-
 
 class Arm64StaticStorageTests(unittest.TestCase):
     """``Module.static_bytes`` and ``GlobalAddress`` at the encoder level.

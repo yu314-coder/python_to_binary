@@ -679,15 +679,10 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
     """Encode calls through a Windows x64 import-address table."""
-    if module.functions:
-        raise ValueError(
-            "internal function calls (and therefore recursion) are not "
-            "implemented for x86-64 yet; the ARM64 backend implements them"
-        )
     if module.static_bytes:
         raise ValueError(
             "static storage (C file-scope variables) is not implemented for "
-            "x86-64 yet; the ARM64 backend implements it"
+            "windows-x86_64 yet; it needs VirtualAlloc in the PE import table"
         )
     variable_base = 0x38
     code = bytearray(_sub_stack(_frame_bytes(module.stack_slots, variable_base)))
@@ -702,66 +697,117 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         code.extend(b"\xff\x15\x00\x00\x00\x00")
         address_patches.append((instruction + 2, imports[symbol]))
 
-    for operation in module.operations:
-        if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
-            raise ValueError(
-                "runtime heap lists/strings are not supported for windows-x86_64 yet"
-            )
-        if isinstance(operation, HeapStore):
-            # Plain memory, not the arena: a C store through a pointer needs no
-            # mmap, so it works on Windows exactly as it does on POSIX.
-            _expression(code, operation.address, variable_base)
-            code.extend(b"\x50")  # push rax
-            _expression(code, operation.value, variable_base)
-            code.extend(b"\x59")  # pop rcx (rcx = address)
-            instruction = _X86_STORES.get(operation.size)
-            if instruction is None:
-                raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
-            code.extend(instruction)
-            continue
-        if isinstance(operation, Write):
-            # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
-            handle = -11 if operation.fd == 1 else -12
-            code.extend(b"\xb9" + struct.pack("<i", handle))
-            indirect_call("GetStdHandle")
-            code.extend(b"\x48\x89\xc1")
-            displacement_position = len(code) + 3
-            code.extend(b"\x48\x8d\x15\x00\x00\x00\x00")
-            string_patches.append((displacement_position, operation.data))
-            code.extend(b"\x41\xb8" + struct.pack("<I", len(operation.data)))
-            code.extend(b"\x4c\x8d\x4c\x24\x28")
-            code.extend(b"\x48\xc7\x44\x24\x20\x00\x00\x00\x00")
-            indirect_call("WriteFile")
-        elif isinstance(operation, Store):
-            _expression(code, operation.value, variable_base)
-            code.extend(
-                b"\x48\x89\x85"
-                + struct.pack("<i", variable_base + operation.slot * 8)
-            )
-        elif isinstance(operation, FloatStore):
-            _float_expression(code, operation.value, variable_base)
-            code.extend(
-                b"\xf2\x0f\x11\x85"
-                + struct.pack("<i", variable_base + operation.slot * 8)
-            )  # movsd [rbp+disp], xmm0
-        elif isinstance(operation, Label):
-            labels[operation.name] = len(code)
-        elif isinstance(operation, Jump):
-            code.extend(b"\xe9\x00\x00\x00\x00")
-            branches.append((len(code) - 4, operation.target))
-        elif isinstance(operation, JumpIfFalse):
-            _expression(code, operation.condition, variable_base)
-            code.extend(b"\x48\x85\xc0\x0f\x84\x00\x00\x00\x00")
-            branches.append((len(code) - 4, operation.target))
-        elif isinstance(operation, Exit):
-            code.extend(b"\xb9" + struct.pack("<I", operation.status))
-            indirect_call("ExitProcess")
-        elif isinstance(operation, ExitValue):
-            _expression(code, operation.value, variable_base)
-            code.extend(b"\x89\xc1")  # mov ecx, eax
-            indirect_call("ExitProcess")
+    refs = _X86Refs()
 
-    _patch_branches(code, labels, branches)
+    def emit(operations, slot_base: int, _epilogue=b"") -> None:
+        """Encode one body. Labels are body-local; imports are shared."""
+
+        nonlocal labels, branches
+        labels = {}
+        branches = []
+        for operation in operations:
+            if isinstance(operation, Return):
+                if operation.value is not None:
+                    _expression(code, operation.value, slot_base, refs)
+                code.extend(_epilogue)
+                continue
+            if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
+                raise ValueError(
+                    "runtime heap lists/strings are not supported for windows-x86_64 yet"
+                )
+            if isinstance(operation, HeapStore):
+                # Plain memory, not the arena: a C store through a pointer needs no
+                # mmap, so it works on Windows exactly as it does on POSIX.
+                _expression(code, operation.address, slot_base, refs)
+                code.extend(b"\x50")  # push rax
+                _expression(code, operation.value, slot_base, refs)
+                code.extend(b"\x59")  # pop rcx (rcx = address)
+                instruction = _X86_STORES.get(operation.size)
+                if instruction is None:
+                    raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
+                code.extend(instruction)
+                continue
+            if isinstance(operation, Write):
+                # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
+                handle = -11 if operation.fd == 1 else -12
+                code.extend(b"\xb9" + struct.pack("<i", handle))
+                indirect_call("GetStdHandle")
+                code.extend(b"\x48\x89\xc1")
+                displacement_position = len(code) + 3
+                code.extend(b"\x48\x8d\x15\x00\x00\x00\x00")
+                string_patches.append((displacement_position, operation.data))
+                code.extend(b"\x41\xb8" + struct.pack("<I", len(operation.data)))
+                code.extend(b"\x4c\x8d\x4c\x24\x28")
+                code.extend(b"\x48\xc7\x44\x24\x20\x00\x00\x00\x00")
+                indirect_call("WriteFile")
+            elif isinstance(operation, Store):
+                _expression(code, operation.value, slot_base, refs)
+                code.extend(
+                    b"\x48\x89\x85"
+                    + struct.pack("<i", slot_base + operation.slot * 8)
+                )
+            elif isinstance(operation, FloatStore):
+                _float_expression(code, operation.value, slot_base, refs)
+                code.extend(
+                    b"\xf2\x0f\x11\x85"
+                    + struct.pack("<i", slot_base + operation.slot * 8)
+                )  # movsd [rbp+disp], xmm0
+            elif isinstance(operation, Label):
+                labels[operation.name] = len(code)
+            elif isinstance(operation, Jump):
+                code.extend(b"\xe9\x00\x00\x00\x00")
+                branches.append((len(code) - 4, operation.target))
+            elif isinstance(operation, JumpIfFalse):
+                _expression(code, operation.condition, slot_base, refs)
+                code.extend(b"\x48\x85\xc0\x0f\x84\x00\x00\x00\x00")
+                branches.append((len(code) - 4, operation.target))
+            elif isinstance(operation, Exit):
+                code.extend(b"\xb9" + struct.pack("<I", operation.status))
+                indirect_call("ExitProcess")
+            elif isinstance(operation, ExitValue):
+                _expression(code, operation.value, slot_base, refs)
+                code.extend(b"\x89\xc1")  # mov ecx, eax
+                indirect_call("ExitProcess")
+
+        _patch_branches(code, labels, branches)
+
+    emit(module.operations, variable_base)
+
+    # Microsoft x64: arguments in rcx, rdx, r8, r9; the caller also owns 32
+    # bytes of shadow space, which each body reserves as part of its frame.
+    offsets: dict[str, int] = {}
+    for function in module.functions:
+        if function.name in offsets:
+            raise ValueError(f"duplicate native IR function {function.name!r}")
+        offsets[function.name] = len(code)
+        frame = (function.stack_slots * 8 + 15) & ~15
+        code.extend(b"\x55\x48\x89\xe5")  # push rbp; mov rbp, rsp
+        if frame:
+            code.extend(b"\x48\x81\xec" + struct.pack("<I", frame))
+        stores = (
+            b"\x48\x89\x8d",  # mov [rbp+disp32], rcx
+            b"\x48\x89\x95",  # rdx
+            b"\x4c\x89\x85",  # r8
+            b"\x4c\x89\x8d",  # r9
+        )
+        if function.parameters > len(stores):
+            raise ValueError(
+                f"windows-x86_64 passes at most {len(stores)} arguments in "
+                f"registers; {function.name!r} declares {function.parameters}"
+            )
+        for index in range(function.parameters):
+            code.extend(stores[index] + struct.pack("<i", -frame + index * 8))
+        epilogue = b"\x48\x89\xec\x5d\xc3"  # mov rsp,rbp; pop rbp; ret
+        emit(function.operations, -frame, epilogue)
+        code.extend(epilogue)
+    for position, name in refs.calls:
+        if name not in offsets:
+            raise ValueError(f"call to undefined native IR function {name!r}")
+        struct.pack_into("<i", code, position, offsets[name] - (position + 4))
+    for position, name in refs.addresses:
+        if name not in offsets:
+            raise ValueError(f"address taken of undefined function {name!r}")
+        struct.pack_into("<i", code, position, offsets[name] - (position + 4))
     for position, target_address in address_patches:
         next_address = code_address + position + 4
         struct.pack_into("<i", code, position, target_address - next_address)

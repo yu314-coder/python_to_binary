@@ -1394,21 +1394,20 @@ int main(void) {
 class RejectionTests(CProgramTestCase):
     """What py2bin's C compiler refuses, with a location, instead of guessing."""
 
-    def test_recursion_is_refused_on_a_target_with_no_call_abi(self):
-        """The ARM64 and System V encoders have a call ABI; the Windows ones
-        still inline, so there recursion is rejected with a location rather
-        than miscompiled."""
+    def test_recursion_compiles_for_every_target(self):
+        """Every backend now implements a call ABI, so recursion is no longer
+        rejected anywhere. It is executed only on darwin-arm64; the rest are
+        encoding-verified, since this host cannot run them and no emulator is
+        used."""
 
         source = (
             "int f(int n) { return n ? f(n - 1) : 0; }\n"
             "int main(void) { return f(3); }\n"
         )
-        for target in ("windows-x86_64",):
+        for target in supported_targets():
             with self.subTest(target=target):
-                with self.assertRaises(CCompileError) as caught:
-                    compile_c_to_ir(source, "reject.c", target)
-                self.assertRegex(str(caught.exception), "recursive call")
-                self.assertRegex(str(caught.exception), r"reject\.c:1:27")
+                compile_c_to_ir(source, "r.c", target)
+
 
     def test_more_than_eight_arguments_is_refused(self):
         parameters = ", ".join(f"int a{index}" for index in range(9))
@@ -3575,14 +3574,14 @@ class FunctionPointerRejectionTests(CProgramTestCase):
             "plain declarator form|cannot return",
         )
 
-    def test_a_function_pointer_needs_a_target_with_a_real_call_abi(self):
+    def test_a_function_pointer_compiles_for_every_target(self):
         source = (
             "int add(int a, int b) { return a + b; }\n"
             "int main(void) { int (*p)(int, int) = add; return p(1, 2); }\n"
         )
-        with self.assertRaises(CCompileError) as caught:
-            compile_c_to_ir(source, "reject.c", "windows-x86_64")
-        self.assertRegex(str(caught.exception), "call ABI is not implemented")
+        for target in supported_targets():
+            with self.subTest(target=target):
+                compile_c_to_ir(source, "p.c", target)
 
 
 class FunctionPointerDifferentialTests(CProgramTestCase):

@@ -248,6 +248,7 @@ CALL_CAPABLE_TARGETS = frozenset(
         "darwin-x86_64",
         "linux-x86_64",
         "windows-arm64",
+        "windows-x86_64",
     }
 )
 
