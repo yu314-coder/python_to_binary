@@ -6923,9 +6923,12 @@ class Frontend:
                 return "str"
             return "float" if isinstance(node.value, float) else "int"
         if isinstance(node, ast.Name):
+            # Checked before `bindings`, because several callers ask for a
+            # type without threading the bindings through - string_pointer
+            # among them, which is exactly where a string parameter is needed.
+            if node.id in self.string_bindings:
+                return "str"
             if node.id in bindings:
-                if node.id in self.string_bindings:
-                    return "str"
                 return (
                     "float"
                     if isinstance(bindings[node.id], FLOAT_EXPRESSIONS)

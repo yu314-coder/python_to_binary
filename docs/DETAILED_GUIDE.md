@@ -196,6 +196,12 @@ runtime:
   string, which scans forward from every byte - safe without decoding, because
   a UTF-8 lead byte and a continuation byte come from disjoint ranges and
   cannot match each other;
+- a native function may take a runtime string and return one. A string is its
+  block pointer, so the value crosses like any integer; what the call has to
+  carry alongside it is the kind, because a pointer and a number are the same
+  thing once they are only a value. An f-string body over a string parameter is
+  still rejected: the builder resolves sub-expressions without the call's
+  substitutions in reach;
 - `==` and `!=` between runtime strings, comparing length then bytes: the same
   comparison a string-keyed dict already makes when it probes;
 - `for index, item in enumerate(xs)` and `enumerate(xs, start)`;
