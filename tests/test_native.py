@@ -1498,3 +1498,79 @@ class NativeExceptionTests(unittest.TestCase):
             'try:\n    raise ValueError("v")\nexcept Boom:\n    pass\n',
             "builtin exception classes",
         )
+
+
+class RuntimeIntegerPrintingTests(unittest.TestCase):
+    """print() of a value that is only known at run time.
+
+    Digits come out least-significant first but have to be written in the other
+    order, so the length is counted first and the digits filled in backwards.
+    Every case compares the binary's stdout against CPython's.
+    """
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "p.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "p.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_a_positive_value(self):
+        self._run("n = 0\nfor i in range(1, 6):\n    n += i\nprint(n)\n")
+
+    def test_zero_prints_one_digit(self):
+        # Peeling digits off zero produces none, so it needs its own answer.
+        self._run("n = 5\nfor i in range(0, 1):\n    n -= 5\nprint(n)\n")
+
+    def test_a_negative_value(self):
+        self._run("n = 0\nfor i in range(1, 6):\n    n -= i\nprint(n)\n")
+
+    def test_the_widest_values(self):
+        for source in (
+            "n = 1\nfor i in range(0, 19):\n    n = n * 3\nprint(n)\n",
+            "n = 9223372036854775806\nfor i in range(0, 1):\n    n += 1\nprint(n)\n",
+            # The smallest signed 64-bit value has no positive counterpart, so
+            # the usual negate-then-peel loop cannot produce it.
+            "n = -9223372036854775807\nfor i in range(0, 1):\n    n -= 1\nprint(n)\n",
+        ):
+            self._run(source)
+
+    def test_several_arguments_with_separators(self):
+        self._run(
+            'a = 0\nfor i in range(1, 4):\n    a += i\nb = ""\nb = b + "items"\n'
+            'print("total", a, b, -a)\n'
+        )
+
+    def test_printing_in_a_loop(self):
+        self._run("i = 0\nwhile i < 12:\n    print(i * i - 30)\n    i += 1\n")
+
+    def test_a_dict_length_is_printable(self):
+        self._run(
+            'counts: dict[str, int] = {}\ncounts["a"] = 1\ncounts["b"] = 2\n'
+            'print("names:", len(counts))\n'
+        )
+
+    def test_a_runtime_float_is_still_rejected(self):
+        # Rendering a double needs shortest-round-trip formatting, which is a
+        # different problem; say so rather than print something that disagrees.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "p.py"
+            entry.write_text(
+                "x = 0.0\nfor i in range(0, 3):\n    x += 0.5\nprint(x)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "p.bin", "darwin-arm64", clean=True)
+            self.assertIn("cannot render a runtime float", str(caught.exception))

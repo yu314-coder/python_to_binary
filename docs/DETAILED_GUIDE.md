@@ -247,8 +247,15 @@ runtime:
   symbol, or a vetted CPython C-API entry point, through real dyld and calls it
   with integer, opaque-handle, or compile-time-constant C-string arguments;
   every other target rejects the extern import;
-- `print` emits constant UTF-8 output, or a runtime ASCII string on POSIX,
-  using the target OS syscall/API;
+- `print` emits constant UTF-8 output, or, on POSIX, any number of runtime
+  arguments with the separators and newline CPython inserts. A runtime ASCII
+  string is written straight from its heap block; a runtime integer is rendered
+  to decimal first, counting its digits in one pass and filling them in
+  backwards in another, with the smallest signed 64-bit value spelled out
+  because it has no positive counterpart to peel digits from. A runtime float
+  is rejected: rendering a double the way CPython does needs
+  shortest-round-trip formatting, and printing something that disagrees would
+  be worse than refusing;
 - `SystemExit(integer-expression)` and the restricted
   `import sys; sys.exit(integer-expression)` form emit a native process exit;
 - runtime arguments/input, dynamic integer-to-text printing, Python arbitrary

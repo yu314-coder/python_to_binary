@@ -626,8 +626,12 @@ class AssemblerTests(unittest.TestCase):
             self.assertEqual(native.artifact.read_bytes()[:4], b"\x7fELF")
 
             dynamic_source = root / "dynamic.py"
+            # The point of this half is the fallback, so the program has to be
+            # one the native backend genuinely cannot take. Keep it a stdlib
+            # import rather than a language feature: features keep moving into
+            # the native subset, and this test would then stop testing anything.
             dynamic_source.write_text(
-                "for value in range(1):\n    print(value)\n", encoding="utf-8"
+                'import json\nprint(json.dumps({"a": 1}))\n', encoding="utf-8"
             )
             compatible = assemble(
                 dynamic_source,

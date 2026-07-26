@@ -3309,27 +3309,19 @@ class Frontend:
             except NativeCompileError:
                 values = None
             if values is not None:
+                # Everything is known now, so the whole line is one constant.
                 text = " ".join(str(value) for value in values) + "\n"
                 self.operations.append(Write(text.encode("utf-8")))
                 return
-            if len(node.args) == 1 and self.expression_type(node.args[0]) == "str":
-                # Runtime string: write its bytes straight from the heap block,
-                # then the trailing newline that print() appends.
-                pointer = self.string_pointer(node.args[0])
-                self.operations.append(
-                    WriteRuntime(
-                        IntBinary("add", pointer, IntConstant(8)),
-                        HeapLoad(pointer, 8),
-                    )
-                )
-                self.operations.append(Write(b"\n"))
-                return
-            raise NativeCompileError(
-                self.path,
-                node,
-                "native print() supports compile-time values or a single runtime "
-                "string argument",
-            )
+            # Otherwise write the arguments one at a time, with the separators
+            # print() would insert. Several writes rather than one buffer: the
+            # process is single-threaded, so the bytes land in order.
+            for index, argument in enumerate(node.args):
+                if index:
+                    self.operations.append(Write(b" "))
+                self.emit_print_argument(argument)
+            self.operations.append(Write(b"\n"))
+            return
         elif self.is_exit_call(node):
             self.system_exit(node, node)
         elif (
@@ -3665,6 +3657,178 @@ class Frontend:
         if node.finalbody:
             self.finally_depth -= 1
         self.operations.append(Label(end))
+
+    # The smallest signed 64-bit value has no positive counterpart, so the
+    # usual "make it positive and peel digits" loop cannot handle it. It is one
+    # value; spell it out rather than complicate the loop for it.
+    _INT64_MIN = -9223372036854775808
+    _INT64_MIN_TEXT = b"-9223372036854775808"
+
+    def emit_int_to_string(self, value: IntExpression) -> IntExpression:
+        """Render a runtime integer as decimal; returns a string-block pointer.
+
+        Digits come out least-significant first, but they have to be written
+        most-significant first, so the length is counted in one pass and the
+        digits are then filled in from the end backwards.
+        """
+
+        bump = self.ensure_heap()
+        pointer_slot = self.new_temp()
+        # 20 digits is the widest a signed 64-bit value gets, plus a sign.
+        self.operations.append(HeapAlloc(pointer_slot, IntConstant(8 + 24), bump))
+        pointer = IntLoad(pointer_slot)
+        payload = IntBinary("add", pointer, IntConstant(8))
+
+        value_slot = self.new_temp()
+        self.operations.append(Store(value_slot, value))
+        done = self.new_label("itoa_done")
+
+        # The one value that cannot be negated.
+        general = self.new_label("itoa_general")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(value_slot), IntConstant(self._INT64_MIN)),
+                general,
+            )
+        )
+        self.operations.append(
+            HeapStore(pointer, IntConstant(len(self._INT64_MIN_TEXT)), 8)
+        )
+        for offset, byte in enumerate(self._INT64_MIN_TEXT):
+            self.operations.append(
+                HeapStore(
+                    IntBinary("add", payload, IntConstant(offset)),
+                    IntConstant(byte),
+                    1,
+                )
+            )
+        self.operations.append(Jump(done))
+        self.operations.append(Label(general))
+
+        sign_slot = self.new_temp()
+        self.operations.append(Store(sign_slot, IntConstant(0)))
+        positive = self.new_label("itoa_positive")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(value_slot), IntConstant(0)), positive
+            )
+        )
+        self.operations.append(Store(sign_slot, IntConstant(1)))
+        self.operations.append(
+            Store(value_slot, IntUnary("neg", IntLoad(value_slot)))
+        )
+        self.operations.append(
+            HeapStore(payload, IntConstant(ord("-")), 1)
+        )
+        self.operations.append(Label(positive))
+
+        # Pass one: how many digits. Zero has one, which no loop would produce.
+        digits_slot = self.new_temp()
+        self.operations.append(Store(digits_slot, IntConstant(1)))
+        scratch_slot = self.new_temp()
+        self.operations.append(
+            Store(scratch_slot, IntBinary("sdiv", IntLoad(value_slot), IntConstant(10)))
+        )
+        count_start = self.new_label("itoa_count")
+        count_done = self.new_label("itoa_counted")
+        self.operations.append(Label(count_start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(scratch_slot), IntConstant(0)), count_done
+            )
+        )
+        self.operations.append(
+            Store(digits_slot, IntBinary("add", IntLoad(digits_slot), IntConstant(1)))
+        )
+        self.operations.append(
+            Store(
+                scratch_slot,
+                IntBinary("sdiv", IntLoad(scratch_slot), IntConstant(10)),
+            )
+        )
+        self.operations.append(Jump(count_start))
+        self.operations.append(Label(count_done))
+
+        self.operations.append(
+            HeapStore(
+                pointer,
+                IntBinary("add", IntLoad(digits_slot), IntLoad(sign_slot)),
+                8,
+            )
+        )
+        # Pass two: fill backwards, so the most significant digit lands first.
+        index_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                index_slot,
+                IntBinary(
+                    "sub",
+                    IntBinary("add", IntLoad(digits_slot), IntLoad(sign_slot)),
+                    IntConstant(1),
+                ),
+            )
+        )
+        fill_start = self.new_label("itoa_fill")
+        fill_done = self.new_label("itoa_filled")
+        self.operations.append(Label(fill_start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ge", IntLoad(index_slot), IntLoad(sign_slot)), fill_done
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", payload, IntLoad(index_slot)),
+                IntBinary(
+                    "add",
+                    IntConstant(ord("0")),
+                    IntBinary("smod", IntLoad(value_slot), IntConstant(10)),
+                ),
+                1,
+            )
+        )
+        self.operations.append(
+            Store(
+                value_slot,
+                IntBinary("sdiv", IntLoad(value_slot), IntConstant(10)),
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("sub", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(fill_start))
+        self.operations.append(Label(fill_done))
+        self.operations.append(Label(done))
+        return pointer
+
+    def emit_print_argument(self, node: ast.expr) -> None:
+        """Write one print() argument, with no separator and no newline."""
+
+        try:
+            self.operations.append(
+                Write(str(self.constant(node)).encode("utf-8"))
+            )
+            return
+        except NativeCompileError:
+            pass  # Not known at build time; render it at run time below.
+        kind = self.expression_type(node)
+        if kind == "str":
+            pointer = self.string_pointer(node)
+        elif kind == "int":
+            pointer = self.emit_int_to_string(self.integer(node))
+        else:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native print() cannot render a runtime {kind} yet; integers "
+                "and strings are supported",
+            )
+        pointer = self.materialize_int(pointer)
+        self.operations.append(
+            WriteRuntime(
+                IntBinary("add", pointer, IntConstant(8)), HeapLoad(pointer, 8)
+            )
+        )
 
     def system_exit(self, expression: ast.expr, location: ast.AST) -> None:
         call = expression if isinstance(expression, ast.Call) else None
