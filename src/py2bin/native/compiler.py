@@ -308,20 +308,6 @@ def _emit_native_module(
             f"target 'darwin-arm64' so far, not {target!r}; the dynamic-link "
             "adapter for this platform is design-only",
         )
-    if target.startswith("windows-") and any(
-        isinstance(operation, HeapInit) for operation in module.operations
-    ):
-        # The runtime arena is obtained with an anonymous mmap on POSIX. The
-        # equivalent Windows path (VirtualAlloc wired into the PE import table)
-        # is not implemented yet, so runtime lists/strings are rejected here
-        # rather than emitting a PE that would run incorrectly.
-        raise NativeCompileError(
-            entry,
-            ast.parse("pass").body[0],
-            f"runtime heap lists/strings are not supported for target {target!r} "
-            "yet (needs VirtualAlloc in the PE import table); POSIX targets are "
-            "supported",
-        )
     info_plist, code_resources = _app_metadata(entry.stem) if app else (None, None)
     if target == "windows-x86_64":
         image = write_pe_x86_64(module)

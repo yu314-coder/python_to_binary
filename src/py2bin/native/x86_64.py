@@ -755,10 +755,68 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                     _expression(code, operation.value, slot_base, refs)
                 code.extend(_epilogue)
                 continue
-            if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
-                raise ValueError(
-                    "runtime heap lists/strings are not supported for windows-x86_64 yet"
+            if isinstance(operation, HeapInit):
+                # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+                # is Windows' equivalent of the anonymous mmap POSIX uses for
+                # the arena: one reservation, zero-filled, never grown.
+                code.extend(b"\x48\x31\xc9")  # xor rcx, rcx (lpAddress = NULL)
+                code.extend(b"\x48\xc7\xc2" + struct.pack("<I", operation.size))
+                code.extend(b"\x41\xb8\x00\x30\x00\x00")  # mov r8d, MEM_COMMIT|MEM_RESERVE
+                code.extend(b"\x41\xb9\x04\x00\x00\x00")  # mov r9d, PAGE_READWRITE
+                indirect_call("VirtualAlloc")
+                code.extend(
+                    b"\x48\x89\x85"
+                    + struct.pack("<i", slot_base + operation.slot * 8)
                 )
+                # A failed reservation returns NULL. Every later heap access
+                # would then write through 0, so stop instead of running on.
+                code.extend(b"\x48\x85\xc0")  # test rax, rax
+                jump_at = len(code)
+                code.extend(b"\x75\x00")  # jnz over the failure path
+                code.extend(b"\xb9\x03\x00\x00\x00")  # mov ecx, 3
+                indirect_call("ExitProcess")
+                code[jump_at + 1] = len(code) - (jump_at + 2)
+                continue
+            if isinstance(operation, HeapAlloc):
+                # Pure slot arithmetic, identical to the POSIX encoder: the
+                # bump pointer moves and the old value is the allocation.
+                _expression(code, operation.size, slot_base, refs)
+                code.extend(
+                    b"\x48\x8b\x8d"
+                    + struct.pack("<i", slot_base + operation.bump_slot * 8)
+                )
+                code.extend(
+                    b"\x48\x89\x8d"
+                    + struct.pack("<i", slot_base + operation.dest_slot * 8)
+                )
+                code.extend(b"\x48\x01\xc8")  # add rax, rcx
+                code.extend(
+                    b"\x48\x89\x85"
+                    + struct.pack("<i", slot_base + operation.bump_slot * 8)
+                )
+                continue
+            if isinstance(operation, WriteRuntime):
+                # Same WriteFile sequence the constant Write below uses; only
+                # the buffer and count come from expressions rather than from
+                # the image. They are spilled because GetStdHandle returns in
+                # rax and takes the shadow space at [rsp].
+                _expression(code, operation.length, slot_base, refs)
+                code.extend(_SPILL)
+                _expression(code, operation.address, slot_base, refs)
+                code.extend(_SPILL)
+                code.extend(b"\xb9\xf5\xff\xff\xff")  # mov ecx, -11 (stdout)
+                code.extend(b"\x48\x83\xec\x20")  # shadow, below the spills
+                indirect_call("GetStdHandle")
+                code.extend(b"\x48\x83\xc4\x20")
+                code.extend(b"\x48\x89\xc1")  # mov rcx, rax (hFile)
+                code.extend(b"\x48\x8b\x14\x24")  # mov rdx, [rsp] (buffer)
+                code.extend(_DROP)
+                code.extend(b"\x4c\x8b\x04\x24")  # mov r8, [rsp] (count)
+                code.extend(_DROP)
+                code.extend(b"\x4c\x8d\x4c\x24\x28")  # lea r9, [rsp+0x28]
+                code.extend(b"\x48\xc7\x44\x24\x20\x00\x00\x00\x00")
+                indirect_call("WriteFile")
+                continue
             if isinstance(operation, HeapStore):
                 # Plain memory, not the arena: a C store through a pointer needs no
                 # mmap, so it works on Windows exactly as it does on POSIX.

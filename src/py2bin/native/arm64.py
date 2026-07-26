@@ -717,10 +717,56 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                     _expression(words, operation.value, slot_base, refs)
                 words.extend(_epilogue)
                 continue
-            if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
-                raise ValueError(
-                    "runtime heap lists/strings are not supported for windows-arm64 yet"
+            if isinstance(operation, HeapInit):
+                # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+                # is Windows' equivalent of the anonymous mmap POSIX uses for
+                # the arena: one reservation, zero-filled, never grown.
+                words.extend(_mov(0, 0))
+                words.extend(_mov(1, operation.size))
+                words.extend(_mov(2, 0x3000))  # MEM_COMMIT | MEM_RESERVE
+                words.extend(_mov(3, 4))  # PAGE_READWRITE
+                call("VirtualAlloc")
+                words.append(_slot_instruction(False, operation.slot, slot_base))
+                # A failed reservation returns NULL. Every later heap access
+                # would then write through 0, so stop instead of running on.
+                branch_at = len(words)
+                words.append(0)  # cbnz x0, over the failure path
+                words.extend(_mov(0, 3))
+                call("ExitProcess")
+                words[branch_at] = 0xB5000000 | (
+                    ((len(words) - branch_at) & 0x7FFFF) << 5
                 )
+                continue
+            if isinstance(operation, HeapAlloc):
+                # Pure slot arithmetic, identical to the POSIX encoder: the
+                # bump pointer moves and the old value is the allocation.
+                _expression(words, operation.size, slot_base, refs)
+                words.append(
+                    _slot_instruction(True, operation.bump_slot, slot_base, rt=1)
+                )
+                words.append(
+                    _slot_instruction(False, operation.dest_slot, slot_base, rt=1)
+                )
+                words.append(0x8B000020)  # add x0, x1, x0  (new bump)
+                words.append(_slot_instruction(False, operation.bump_slot, slot_base))
+                continue
+            if isinstance(operation, WriteRuntime):
+                # Same WriteFile sequence the constant Write below uses; only
+                # the buffer and count come from expressions rather than from
+                # the image. They are spilled because GetStdHandle returns in
+                # x0 and may clobber the argument registers.
+                _expression(words, operation.length, slot_base, refs)
+                words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+                _expression(words, operation.address, slot_base, refs)
+                words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+                words.extend(_mov(0, -11 & 0xFFFFFFFFFFFFFFFF))  # STD_OUTPUT_HANDLE
+                call("GetStdHandle")
+                words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16
+                words.extend((0xF94003E2, 0x910043FF))  # ldr x2,[sp]; add sp,#16
+                words.append(0x910003E3)  # mov x3, sp
+                words.extend(_mov(4, 0))
+                call("WriteFile")
+                continue
             if isinstance(operation, HeapStore):
                 # Plain memory, not the arena: a C store through a pointer needs no
                 # mmap, so it works on Windows exactly as it does on POSIX.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import struct
 import subprocess
 import sys
 import tempfile
@@ -53,12 +54,19 @@ class NativeHeapTests(unittest.TestCase):
                     f"{target} heap image has a broken header",
                 )
 
-            # Windows heap support is an explicit, documented gap: reject, do
-            # not emit a PE that would run incorrectly.
+            # Windows gets the arena from VirtualAlloc rather than mmap. This
+            # machine cannot run a PE, so what is checked here is that a
+            # structurally valid image is produced and that it imports the
+            # entry points the arena and its writes go through; the behaviour
+            # is checked by running the darwin-arm64 image below, which is
+            # built from the same IR.
             for target in _WINDOWS_TARGETS:
-                with self.assertRaises(NativeCompileError) as caught:
-                    compile_native(entry, root / f"program-{target}.exe", target, clean=True)
-                self.assertIn("windows", str(caught.exception).lower())
+                image = root / f"program-{target}.exe"
+                compile_native(entry, image, target, clean=True)
+                data = image.read_bytes()
+                self.assertEqual(data[:2], b"MZ", f"{target} is not a PE")
+                for symbol in (b"VirtualAlloc", b"KERNEL32.dll"):
+                    self.assertIn(symbol, data, f"{target} does not import {symbol!r}")
 
             if _HOST_IS_DARWIN_ARM64:
                 native = subprocess.run(
@@ -336,3 +344,60 @@ class NativeHeapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsArenaEncodingTests(unittest.TestCase):
+    """The Windows arena, checked as far as a machine that cannot run a PE can.
+
+    Behaviour is covered by the POSIX images built from the same IR and run
+    against CPython. What is specific to Windows is the three call sequences
+    the arena needs, and those are pinned here byte for byte so a change to
+    them is deliberate rather than accidental.
+    """
+
+    def _image(self, target: str) -> bytes:
+        source = (
+            'names: dict[str, int] = {}\ns = ""\ni = 0\n'
+            'while i < 5:\n    s = s + "k"\n    names[s] = i\n    i += 1\n'
+            "print(s)\nraise SystemExit(len(names))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            image = root / "program.exe"
+            compile_native(entry, image, target, clean=True)
+            return image.read_bytes()
+
+    def test_both_windows_targets_import_what_the_arena_needs(self):
+        for target in ("windows-x86_64", "windows-arm64"):
+            data = self._image(target)
+            self.assertEqual(data[:2], b"MZ", target)
+            for symbol in (
+                b"KERNEL32.dll",
+                b"VirtualAlloc",
+                b"GetStdHandle",
+                b"WriteFile",
+                b"ExitProcess",
+            ):
+                self.assertIn(symbol, data, f"{target} does not import {symbol!r}")
+
+    def test_x86_64_reserves_the_arena_with_virtualalloc(self):
+        data = self._image("windows-x86_64")
+        # xor rcx,rcx (NULL) ... mov r8d,0x3000 (MEM_COMMIT|MEM_RESERVE),
+        # mov r9d,4 (PAGE_READWRITE) - the argument setup VirtualAlloc needs.
+        self.assertIn(b"\x41\xb8\x00\x30\x00\x00\x41\xb9\x04\x00\x00\x00", data)
+        # test rax,rax then a short jnz: a NULL reservation must not be used.
+        self.assertIn(b"\x48\x85\xc0\x75", data)
+
+    def test_arm64_reserves_the_arena_with_virtualalloc(self):
+        data = self._image("windows-arm64")
+        words = struct.unpack_from("<%dI" % (len(data) // 4), data)
+        # movz x2,#0x3000 and movz x3,#4 sit next to each other in the setup.
+        self.assertIn(0xD2800000 | (0x3000 << 5) | 2, words)
+        self.assertIn(0xD2800000 | (4 << 5) | 3, words)
+        # cbnz x0, +n guards against a NULL reservation.
+        self.assertTrue(
+            any((word & 0xFF00001F) == 0xB5000000 for word in words),
+            "no cbnz x0 guarding the reservation",
+        )

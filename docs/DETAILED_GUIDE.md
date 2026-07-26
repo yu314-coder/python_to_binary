@@ -210,11 +210,15 @@ runtime:
   conversion lower to real SSE2/NEON. A constant zero divisor is a build error;
   a runtime divisor is checked by the generated code, which raises a catchable
   `ZeroDivisionError` rather than producing IEEE infinity or NaN;
-- on POSIX targets only (ELF/Mach-O), a runtime integer `list` (literal build,
+- a runtime `list`, `str`, `dict`, and object instance (literal build,
   constant/runtime index load and store, `len()`) and a runtime ASCII `str`
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a
-  bump-arena backed by anonymous `mmap`; the two Windows targets reject these,
-  and nested lists are rejected. A runtime string holds UTF-8 and may contain
+  bump-arena, obtained once at start-up with anonymous `mmap` on POSIX and
+  `VirtualAlloc` on Windows; a failed reservation exits rather than writing
+  through a null pointer. Nested lists are rejected. The Windows arena is not
+  executed by this project's test suite, which runs on POSIX: its images are
+  checked for structure and for the imports the arena needs, and the behaviour
+  is covered by the POSIX images built from the same IR. A runtime string holds UTF-8 and may contain
   any text: the header counts bytes, which is what a write needs, and `len()`
   counts code points by skipping continuation bytes, which is what CPython
   reports - so `len()` is a pass over the string rather than a header read. A list holds

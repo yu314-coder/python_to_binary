@@ -52,11 +52,14 @@ class NativeClassTests(unittest.TestCase):
                     f"{target} class image has a broken header",
                 )
 
+            # Instances live in the arena, which Windows gets from
+            # VirtualAlloc. A PE cannot run here, so this checks the image is
+            # structurally valid; the behaviour is checked by running the
+            # darwin-arm64 image below, built from the same IR.
             for target in _WINDOWS_TARGETS:
-                with self.assertRaises(NativeCompileError):
-                    compile_native(
-                        entry, root / f"program-{target}.exe", target, clean=True
-                    )
+                image = root / f"program-{target}.exe"
+                compile_native(entry, image, target, clean=True)
+                self.assertEqual(image.read_bytes()[:2], b"MZ", target)
 
             if not _HOST_IS_DARWIN_ARM64:
                 return
