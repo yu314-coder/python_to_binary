@@ -3998,6 +3998,18 @@ class Frontend:
         elif kind == "int":
             pointer = self.emit_int_to_string(self.integer(node))
         else:
+            if kind == "float":
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native print() cannot render a runtime float yet. CPython "
+                    "prints the shortest decimal that reads back as the same "
+                    "double, which needs exact big-integer arithmetic; anything "
+                    "cheaper disagrees with CPython on values like "
+                    "0.1 + 0.1 + 0.1. A float known at build time prints "
+                    "exactly; for a computed one, print int() of it, or scale "
+                    "it to an integer first",
+                )
             raise NativeCompileError(
                 self.path,
                 node,
