@@ -279,10 +279,29 @@ class NativeHeapTests(unittest.TestCase):
             7,
         )
 
-    def test_list_of_floats_is_rejected(self):
-        self._reject(
-            "xs = [1.5, 2.5]\nraise SystemExit(int(xs[0]))\n",
-            "signed 64-bit integers",
+    def test_a_list_holds_floats_when_its_elements_are_floats(self):
+        # The slot is eight bytes either way, so a float element lives there as
+        # its bit pattern, the same way a float dict value does.
+        self._run(
+            "xs = [1.5, 2.25, 4.0]\nxs[1] = 0.75\n"
+            "raise SystemExit(int((xs[0] + xs[1] + xs[2]) * 4))\n",
+            25,
+        )
+
+    def test_an_annotation_types_an_empty_list_literal(self):
+        self._run(
+            "xs: list[float] = [0.0, 0.0, 0.0]\ni = 0\n"
+            "while i < 3:\n    xs[i] = i * 0.5\n    i += 1\n"
+            "raise SystemExit(int((xs[0] + xs[1] + xs[2]) * 2))\n",
+            3,
+        )
+
+    def test_the_first_element_decides_what_a_list_holds(self):
+        # An integer widens into a float list, as it does in a float dict; a
+        # float in an integer list has nowhere to go and is refused.
+        self._reject("xs = [1, 2.5]\nraise SystemExit(1)\n", "signed 64-bit integers")
+        self._run(
+            "xs = [1.5, 2]\nraise SystemExit(int((xs[0] + xs[1]) * 2))\n", 7
         )
 
     def test_list_used_as_bare_integer_is_rejected(self):

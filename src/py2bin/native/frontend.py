@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 
 from .ir import (
@@ -379,6 +379,11 @@ class NativeClass:
     fields: tuple[str, ...]
     initializer: NativeFunction | None
     methods: dict[str, NativeFunction]
+    # A field is an integer unless __init__ annotates it `float`. The slot is
+    # eight bytes either way, so a float lives there as its bit pattern; the
+    # annotation is how the layout learns which it is, since the type of the
+    # value assigned there depends on the arguments at each call site.
+    field_kinds: dict[str, str] = dataclass_field(default_factory=dict)
 
     @property
     def size(self) -> int:
@@ -1005,14 +1010,14 @@ class Frontend:
                     node,
                     f"native classes do not implement the special method {name}()",
                 )
-        fields = self.discover_fields(node, initializer)
+        fields, field_kinds = self.discover_fields(node, initializer)
         self.classes[node.name] = NativeClass(
-            node.name, self.path, fields, initializer, methods
+            node.name, self.path, fields, initializer, methods, field_kinds
         )
 
     def discover_fields(
         self, node: ast.ClassDef, initializer: NativeFunction | None
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
         """Derive the instance layout from ``self.NAME = ...`` in ``__init__``.
 
         Every attribute must be assigned in ``__init__`` so each instance has a
@@ -1022,7 +1027,9 @@ class Frontend:
         """
 
         if initializer is None:
-            return ()
+            return (), {}
+
+        kinds: dict[str, str] = {}
 
         def assigned_attributes(statements) -> list[str]:
             found: list[str] = []
@@ -1042,6 +1049,12 @@ class Frontend:
                         and target.attr not in found
                     ):
                         found.append(target.attr)
+                        annotation = getattr(statement, "annotation", None)
+                        if (
+                            isinstance(annotation, ast.Name)
+                            and annotation.id == "float"
+                        ):
+                            kinds[target.attr] = "float"
             return found
 
         # Only assignments directly in the __init__ body always run, so only
@@ -1065,7 +1078,7 @@ class Frontend:
             raise NativeCompileError(
                 self.path, node, "native classes support at most 1024 attributes"
             )
-        return tuple(fields)
+        return tuple(fields), kinds
 
     def resolve_object_class(self, node: ast.expr) -> NativeClass | None:
         """Return the class of an object-valued expression, if it is known."""
@@ -1156,6 +1169,16 @@ class Frontend:
             )
 
     def attribute_assignment(self, target: ast.Attribute, value: ast.expr) -> None:
+        if self.attribute_kind(target) == "float":
+            if self.expression_type(value) not in {"float", "int"}:
+                raise NativeCompileError(
+                    self.path, value, "this attribute holds a float"
+                )
+            address = self.attribute_address(target)
+            self.operations.append(
+                HeapStore(address, FloatBits(self.float_expression(value)), 8)
+            )
+            return
         if self.expression_type(value) != "int":
             raise NativeCompileError(
                 self.path,
@@ -1164,6 +1187,14 @@ class Frontend:
             )
         address = self.attribute_address(target)
         self.operations.append(HeapStore(address, self.integer(value), 8))
+
+    def attribute_kind(self, node: ast.Attribute) -> str:
+        """``"float"`` if the class annotated this attribute so, else ``"int"``."""
+
+        native_class = self.resolve_object_class(node.value)
+        if native_class is None:
+            return "int"
+        return native_class.field_kinds.get(node.attr, "int")
 
     def inline_method(
         self,
@@ -2080,6 +2111,17 @@ class Frontend:
                 self.runtime_names.add(name)
         self.values.pop(name, None)
         kind = self.expression_type(expression)
+        if annotation is not None and isinstance(expression, ast.List):
+            declared = self.annotated_list_tag(annotation)
+            if declared is not None:
+                if kind != "list:int" and kind != declared:
+                    raise NativeCompileError(
+                        self.path,
+                        expression,
+                        f"this literal builds a {kind} but the annotation says "
+                        f"{declared}",
+                    )
+                kind = declared
         if annotation is not None and isinstance(expression, ast.Dict):
             # `d: dict[str, float] = {}` says what an empty literal cannot.
             declared = self.annotated_dict_tag(annotation)
@@ -2110,8 +2152,8 @@ class Frontend:
         elif self.dict_kinds(kind) is not None:
             key_kind, value_kind = self.dict_kinds(kind)
             self.dict_assignment(name, expression, key_kind, value_kind)
-        elif kind == "list-i64":
-            self.list_assignment(name, expression)
+        elif self.list_kind(kind) is not None:
+            self.list_assignment(name, expression, self.list_kind(kind))
         elif kind == "str":
             self.string_assignment(name, expression)
         elif kind == "float":
@@ -2124,18 +2166,76 @@ class Frontend:
 
     # --- runtime lists ------------------------------------------------------
 
-    def list_assignment(self, name: str, node: ast.expr) -> None:
+    @staticmethod
+    def list_tag(element_kind: str) -> str:
+        return f"list:{element_kind}"
+
+    @staticmethod
+    def list_kind(tag: str | None) -> str | None:
+        """The element kind of a list tag, else None."""
+
+        if not isinstance(tag, str) or not tag.startswith("list:"):
+            return None
+        return tag.split(":", 1)[1]
+
+    def list_kind_of(self, name: str) -> str | None:
+        return self.list_kind(self.value_types.get(name))
+
+    def list_literal_tag(
+        self, node: ast.List, bindings: dict[str, KernelValue] | None = None
+    ) -> str:
+        """The element kind a list literal builds, read off its first element.
+
+        An empty literal has nothing to read, so it holds integers unless an
+        annotation such as `xs: list[float] = []` says otherwise.
+        """
+
+        if not node.elts:
+            return self.list_tag("int")
+        kind = self.expression_type(node.elts[0], bindings)
+        if kind not in {"int", "float"}:
+            raise NativeCompileError(
+                self.path,
+                node.elts[0],
+                "native lists hold signed 64-bit integers or floats",
+            )
+        return self.list_tag(kind)
+
+    def annotated_list_tag(self, annotation: ast.expr) -> str | None:
+        """The element kind `list[T]` names, or None if it is not that shape."""
+
+        if (
+            not isinstance(annotation, ast.Subscript)
+            or not isinstance(annotation.value, ast.Name)
+            or annotation.value.id not in {"list", "List"}
+            or not isinstance(annotation.slice, ast.Name)
+        ):
+            return None
+        if annotation.slice.id not in {"int", "float"}:
+            raise NativeCompileError(
+                self.path, annotation, "a native list annotation is list[int|float]"
+            )
+        return self.list_tag(annotation.slice.id)
+
+    def list_assignment(
+        self, name: str, node: ast.expr, element_kind: str
+    ) -> None:
         if not isinstance(node, ast.List):
             raise NativeCompileError(
                 self.path, node, "native list variables require a list literal"
             )
         elements = node.elts
         for element in elements:
-            if self.expression_type(element) != "int":
+            if element_kind == "float":
+                if self.expression_type(element) not in {"float", "int"}:
+                    raise NativeCompileError(
+                        self.path, element, "this list holds floats"
+                    )
+            elif self.expression_type(element) != "int":
                 raise NativeCompileError(
                     self.path,
                     element,
-                    "native lists currently hold signed 64-bit integers only",
+                    "this list holds signed 64-bit integers",
                 )
         bump = self.ensure_heap()
         self.runtime_names.add(name)
@@ -2151,12 +2251,16 @@ class Frontend:
             address = IntBinary(
                 "add", IntLoad(pointer_slot), IntConstant(8 + index * 8)
             )
-            self.operations.append(HeapStore(address, self.integer(element), 8))
+            if element_kind == "float":
+                stored = FloatBits(self.float_expression(element))
+            else:
+                stored = self.integer(element)
+            self.operations.append(HeapStore(address, stored, 8))
         self.list_lengths[name] = length
 
     def list_element_address(self, node: ast.Subscript) -> IntExpression:
         target = node.value
-        if not isinstance(target, ast.Name) or self.value_types.get(target.id) != "list-i64":
+        if not isinstance(target, ast.Name) or self.list_kind_of(target.id) is None:
             raise NativeCompileError(
                 self.path, node, "native indexing requires a runtime list variable"
             )
@@ -2354,9 +2458,26 @@ class Frontend:
                 key_kind,
             )
             return
+        element_kind = (
+            self.list_kind_of(target.value.id)
+            if isinstance(target.value, ast.Name)
+            else None
+        )
+        if element_kind == "float":
+            if self.expression_type(value) not in {"float", "int"}:
+                raise NativeCompileError(
+                    self.path, value, "this list holds floats"
+                )
+            address = self.list_element_address(target)
+            # The slot is eight bytes either way, so the double goes in as its
+            # bit pattern - the same trick a float dict value uses.
+            self.operations.append(
+                HeapStore(address, FloatBits(self.float_expression(value)), 8)
+            )
+            return
         if self.expression_type(value) != "int":
             raise NativeCompileError(
-                self.path, value, "native list elements are signed 64-bit integers"
+                self.path, value, "this list holds signed 64-bit integers"
             )
         address = self.list_element_address(target)
         self.operations.append(HeapStore(address, self.integer(value), 8))
@@ -4077,10 +4198,18 @@ class Frontend:
             and self.dict_kinds_of(node.value.id)
         ):
             return self.dict_kinds_of(node.value.id)[1]
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and self.list_kind_of(node.value.id) is not None
+        ):
+            return self.list_kind_of(node.value.id)
+        if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
+            return self.attribute_kind(node)
         if isinstance(node, ast.Dict):
             return self.dict_literal_tag(node, bindings)
         if isinstance(node, ast.List):
-            return "list-i64"
+            return self.list_literal_tag(node, bindings)
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, (ast.USub, ast.UAdd)):
                 return self.expression_type(node.operand, bindings)
@@ -4168,6 +4297,18 @@ class Frontend:
             return BitsFloat(
                 HeapLoad(self.dict_lookup_value_address(node, bindings), 8)
             )
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and self.list_kind_of(node.value.id) == "float"
+        ):
+            return BitsFloat(HeapLoad(self.list_element_address(node), 8))
+        if (
+            isinstance(node, ast.Attribute)
+            and self.resolve_object_class(node.value)
+            and self.attribute_kind(node) == "float"
+        ):
+            return BitsFloat(HeapLoad(self.attribute_address(node), 8))
         if isinstance(node, ast.Name):
             if node.id in self.slots and self.value_types.get(node.id) == "float":
                 return FloatLoad(self.slots[node.id])
@@ -4445,7 +4586,7 @@ class Frontend:
                     f"float variable {node.id!r} needs an explicit int({node.id}) "
                     "in an integer context",
                 )
-            if kind == "list-i64":
+            if self.list_kind(kind) is not None:
                 raise NativeCompileError(
                     self.path,
                     node,
@@ -4497,7 +4638,7 @@ class Frontend:
                 return HeapLoad(self.string_pointer(argument), 8)
             if (
                 isinstance(argument, ast.Name)
-                and self.value_types.get(argument.id) == "list-i64"
+                and self.list_kind_of(argument.id) is not None
             ):
                 return HeapLoad(IntLoad(self.slots[argument.id]), 8)
             if isinstance(argument, ast.Name) and self.dict_kinds_of(argument.id):
@@ -4519,8 +4660,19 @@ class Frontend:
                 )
             return HeapLoad(self.dict_lookup_value_address(node, bindings), 8)
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Name)
+                and self.list_kind_of(node.value.id) == "float"
+            ):
+                raise NativeCompileError(
+                    self.path, node, "this list holds floats"
+                )
             return HeapLoad(self.list_element_address(node), 8)
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
+            if self.attribute_kind(node) == "float":
+                raise NativeCompileError(
+                    self.path, node, "this attribute holds a float"
+                )
             return HeapLoad(self.attribute_address(node), 8)
         if (
             isinstance(node, ast.Call)
