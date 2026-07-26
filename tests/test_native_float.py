@@ -136,21 +136,41 @@ class NativeFloatTests(unittest.TestCase):
         expected = int(reference_x * 10.0) & 0xFF
         self._run_arm64(source, expected)
 
-    def test_runtime_float_division_requires_constant_divisor(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            entry = root / "bad.py"
-            entry.write_text(
-                "d = 0.0\n"
-                "for i in range(1, 3):\n"
-                "    d = d + 1.0\n"
-                "x = 6.0 / d\n"  # runtime divisor: rejected, not silent inf/NaN
-                "raise SystemExit(int(x))\n",
-                encoding="utf-8",
-            )
-            with self.assertRaises(NativeCompileError) as caught:
-                compile_native(entry, root / "bad.bin", "darwin-arm64")
-            self.assertIn("constant divisor", str(caught.exception))
+    def test_a_runtime_divisor_divides_and_checks_for_zero(self):
+        # A runtime divisor used to be refused because there was no way to
+        # raise ZeroDivisionError. The program now checks it and raises, so
+        # neither a silent inf/NaN nor a build-time refusal is needed.
+        self._run_arm64(
+            "d = 0.0\n"
+            "for i in range(1, 3):\n"
+            "    d = d + 1.0\n"
+            "x = 6.0 / d\n"
+            "raise SystemExit(int(x))\n",
+            3,
+        )
+
+    def test_a_runtime_divisor_of_zero_raises_like_cpython(self):
+        self._run_arm64(
+            "d = 0.0\n"
+            "for i in range(1, 3):\n"
+            "    d = d + 0.0\n"
+            "x = 6.0 / d\n"
+            "raise SystemExit(int(x))\n",
+            1,
+        )
+
+    def test_a_zero_divisor_is_catchable(self):
+        self._run_arm64(
+            "d = 0.0\n"
+            "for i in range(1, 3):\n"
+            "    d = d + 0.0\n"
+            "try:\n"
+            "    x = 6.0 / d\n"
+            "except ZeroDivisionError:\n"
+            "    x = 9.0\n"
+            "raise SystemExit(int(x))\n",
+            9,
+        )
 
     def test_float_division_by_zero_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -386,18 +406,19 @@ class FloatAugmentedAssignmentTests(unittest.TestCase):
             7,
         )
 
-    def test_a_runtime_divisor_is_still_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            entry = root / "f.py"
-            entry.write_text(
-                "x = 3.0\ny = 2.0\nfor i in range(0, 2):\n    y += 1.0\n"
-                "x /= y\nraise SystemExit(int(x))\n",
-                encoding="utf-8",
-            )
-            with self.assertRaises(NativeCompileError) as caught:
-                compile_native(entry, root / "f.bin", "darwin-arm64", clean=True)
-            self.assertIn("nonzero numeric constant divisor", str(caught.exception))
+    def test_a_runtime_divisor_works_and_checks_for_zero(self):
+        # `/=` goes through the same lowering as `x = x / y`, so the runtime
+        # zero check applies here too.
+        self._run(
+            "x = 3.0\ny = 2.0\nfor i in range(0, 2):\n    y += 1.0\n"
+            "x /= y\nraise SystemExit(int(x * 4))\n",
+            3,  # y accumulates to 4.0, so 3.0 / 4.0 * 4 is 3
+        )
+        self._run(
+            "x = 3.0\ny = 0.0\nfor i in range(0, 2):\n    y += 0.0\n"
+            "x /= y\nraise SystemExit(int(x))\n",
+            1,
+        )
 
 
 class FloatParameterTests(unittest.TestCase):

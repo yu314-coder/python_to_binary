@@ -207,9 +207,9 @@ runtime:
   kind is not known then);
 - runtime `float` (IEEE-754 binary64) variables, `+`/`-`/`*`/unary-`-`,
   comparisons, augmented assignment (`+=`, `-=`, `*=`, `/=`), and `int`/`float`
-  conversion lower to real SSE2/NEON; runtime `float` division is accepted only
-  with a nonzero constant divisor, in an augmented assignment as much as a
-  plain one;
+  conversion lower to real SSE2/NEON. A constant zero divisor is a build error;
+  a runtime divisor is checked by the generated code, which raises a catchable
+  `ZeroDivisionError` rather than producing IEEE infinity or NaN;
 - on POSIX targets only (ELF/Mach-O), a runtime integer `list` (literal build,
   constant/runtime index load and store, `len()`) and a runtime ASCII `str`
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a

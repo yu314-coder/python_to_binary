@@ -4334,25 +4334,37 @@ class Frontend:
     ) -> FloatExpression:
         """Validate and lower a float division right-hand side.
 
-        Runtime float division is accepted only with a nonzero numeric constant
-        divisor. Arbitrary divisors can be zero at runtime, and Python raises
-        ``ZeroDivisionError`` there; honoring that needs the object runtime, so
-        it is rejected rather than silently producing IEEE infinity/NaN.
+        A constant divisor is checked here, where a zero is a build error. A
+        runtime divisor is checked by the program: Python raises
+        ``ZeroDivisionError`` rather than producing IEEE infinity or NaN, and
+        that is now something the generated code can do.
         """
 
         try:
             divisor = self.constant(node)
         except NativeCompileError:
             divisor = None
-        if isinstance(divisor, bool) or not isinstance(divisor, (int, float)):
-            raise NativeCompileError(
-                self.path,
-                node,
-                "runtime float division requires a nonzero numeric constant divisor",
+        if isinstance(divisor, (int, float)) and not isinstance(divisor, bool):
+            if float(divisor) == 0.0:
+                raise NativeCompileError(self.path, node, "float division by zero")
+            return FloatConstant(float(divisor))
+        value = self.float_expression(node, bindings, call_stack)
+        # Pin it: the check and the division both read it, and the backends
+        # re-emit an expression tree at every occurrence, so an unpinned
+        # divisor containing a call would be computed twice.
+        slot = self.new_temp()
+        self.operations.append(FloatStore(slot, value))
+        ok = self.new_label("divisor_nonzero")
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare("eq", FloatLoad(slot), FloatConstant(0.0)), ok
             )
-        if float(divisor) == 0.0:
-            raise NativeCompileError(self.path, node, "float division by zero")
-        return FloatConstant(float(divisor))
+        )
+        self.raise_exception(
+            "ZeroDivisionError", b"ZeroDivisionError: float division by zero\n"
+        )
+        self.operations.append(Label(ok))
+        return FloatLoad(slot)
 
     def float_expression(
         self,
