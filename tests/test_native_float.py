@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import platform
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -335,3 +336,65 @@ class FloatIRNodeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FloatAugmentedAssignmentTests(unittest.TestCase):
+    """`x += 1.5` on a runtime float.
+
+    Lowering it as the equivalent binary operation means every rule that
+    applies to `x = x + 1.5` applies here too, including the restriction that
+    a runtime float division needs a constant divisor.
+    """
+
+    def _run(self, source: str, expected: int) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "f.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            ).returncode
+            self.assertEqual(reference, expected, "test expectation is wrong")
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            native = subprocess.run([str(artifact)], capture_output=True).returncode
+            self.assertEqual(native, reference)
+
+    def test_accumulating_in_a_loop(self):
+        self._run(
+            "total = 0.0\ni = 0\nwhile i < 4:\n    total += 0.5\n    i += 1\n"
+            "raise SystemExit(int(total))\n",
+            2,
+        )
+
+    def test_every_supported_operator(self):
+        self._run(
+            "x = 1.0\ni = 0\nwhile i < 1:\n    x += 5.0\n    x -= 1.0\n"
+            "    x *= 3.0\n    x /= 2.0\n    i += 1\n"
+            "raise SystemExit(int(x))\n",
+            7,
+        )
+
+    def test_a_constant_float_gets_a_slot_when_it_becomes_runtime(self):
+        self._run(
+            "x = 2.5\ni = 0\nwhile i < 3:\n    x += 1.5\n    i += 1\n"
+            "raise SystemExit(int(x))\n",
+            7,
+        )
+
+    def test_a_runtime_divisor_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.py"
+            entry.write_text(
+                "x = 3.0\ny = 2.0\nfor i in range(0, 2):\n    y += 1.0\n"
+                "x /= y\nraise SystemExit(int(x))\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "f.bin", "darwin-arm64", clean=True)
+            self.assertIn("nonzero numeric constant divisor", str(caught.exception))

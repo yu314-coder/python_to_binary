@@ -11,7 +11,9 @@ from .ir import (
     Exit,
     ExitValue,
     ExternCall,
+    BitsFloat,
     FloatBinary,
+    FloatBits,
     FloatCompare,
     FloatConstant,
     FloatExpression,
@@ -686,8 +688,33 @@ class Frontend:
         elif isinstance(node, ast.ClassDef):
             self.class_definition(node)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
-            self.assignment(node.target.id, node.value)
+            self.assignment(node.target.id, node.value, node.annotation)
         elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            if (
+                self.value_types.get(node.target.id) == "float"
+                or isinstance(self.values.get(node.target.id), float)
+            ):
+                if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                    raise NativeCompileError(
+                        self.path,
+                        node,
+                        "native float augmented assignment supports + - * /",
+                    )
+                name = node.target.id
+                # A constant-folded name has no slot yet; give it one, because
+                # the result of this statement is a runtime value.
+                self.materialize_runtime_names({name})
+                # Lowering the equivalent binary operation reuses every rule
+                # that applies to one, including the constant-divisor
+                # restriction on runtime float division.
+                combined = ast.copy_location(
+                    ast.BinOp(left=node.target, op=node.op, right=node.value), node
+                )
+                self.operations.append(
+                    FloatStore(self.slot(name), self.float_expression(combined))
+                )
+                self.value_types[name] = "float"
+                return
             operators = {
                 ast.Add: "add",
                 ast.Sub: "sub",
@@ -2007,7 +2034,12 @@ class Frontend:
             "expression is not in the static rank-1 i64 tensor subset",
         )
 
-    def assignment(self, name: str, expression: ast.expr) -> None:
+    def assignment(
+        self,
+        name: str,
+        expression: ast.expr,
+        annotation: ast.expr | None = None,
+    ) -> None:
         self.possibly_unbound.discard(name)
         self.bound_names.add(name)
         if self.is_kernel_expression(expression):
@@ -2048,6 +2080,18 @@ class Frontend:
                 self.runtime_names.add(name)
         self.values.pop(name, None)
         kind = self.expression_type(expression)
+        if annotation is not None and isinstance(expression, ast.Dict):
+            # `d: dict[str, float] = {}` says what an empty literal cannot.
+            declared = self.annotated_dict_tag(annotation)
+            if declared is not None:
+                if kind != "dict:int:int" and kind != declared:
+                    raise NativeCompileError(
+                        self.path,
+                        expression,
+                        f"this literal builds a {kind} but the annotation says "
+                        f"{declared}",
+                    )
+                kind = declared
         previous = self.value_types.get(name)
         if previous is not None and previous != kind:
             if {previous, kind} <= {"int", "float"}:
@@ -2063,8 +2107,9 @@ class Frontend:
         self.value_types[name] = kind
         if kind == "object":
             self.object_assignment(name, expression)
-        elif kind == "dict-i64":
-            self.dict_assignment(name, expression)
+        elif self.dict_kinds(kind) is not None:
+            key_kind, value_kind = self.dict_kinds(kind)
+            self.dict_assignment(name, expression, key_kind, value_kind)
         elif kind == "list-i64":
             self.list_assignment(name, expression)
         elif kind == "str":
@@ -2185,20 +2230,128 @@ class Frontend:
         )
         return IntBinary("add", pointer, offset)
 
-    def subscript_assignment(self, target: ast.Subscript, value: ast.expr) -> None:
+    def subscript_dict_kinds(self, node: ast.Subscript) -> tuple[str, str] | None:
+        if not isinstance(node.value, ast.Name):
+            return None
+        return self.dict_kinds_of(node.value.id)
+
+    def dict_lookup_value_address(
+        self, node: ast.Subscript, bindings: dict[str, IntExpression] | None = None
+    ) -> IntExpression:
+        """Probe for ``d[k]``, raise KeyError when absent, return where the
+        value lives."""
+
+        kinds = self.subscript_dict_kinds(node)
+        assert kinds is not None and isinstance(node.value, ast.Name)
+        key_kind, _value_kind = kinds
+        if self.eager_depth:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a dict lookup can raise KeyError, so it cannot appear in a "
+                "conditional expression or a short-circuited operand, whose "
+                "arms are both evaluated here; use an if statement",
+            )
+        if self.expression_type(node.slice, bindings) != key_kind:
+            raise NativeCompileError(
+                self.path, node.slice, f"this dict has {key_kind} keys"
+            )
+        address_slot, found_slot, _key, _state = self.dict_probe(
+            self.slot(node.value.id),
+            self.dict_key(node.slice, key_kind),
+            key_kind,
+        )
+        present = self.new_label("dict_present")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+                present + "_missing",
+            )
+        )
+        self.operations.append(Jump(present))
+        self.operations.append(Label(present + "_missing"))
+        self.raise_exception("KeyError", b"KeyError: key not in native dict\n")
+        self.operations.append(Label(present))
+        return IntBinary("add", IntLoad(address_slot), IntConstant(16))
+
+    def dict_literal_tag(
+        self, node: ast.Dict, bindings: dict[str, IntExpression] | None = None
+    ) -> str:
+        """The kinds a dict literal builds, read off its first entry.
+
+        An empty literal has nothing to read, so it defaults to integer keys
+        and values; `d: dict[str, float] = {}` is how to say otherwise.
+        """
+
+        if not node.keys or node.keys[0] is None:
+            return self.dict_tag("int", "int")
+        key_kind = self.expression_type(node.keys[0], bindings)
+        value_kind = self.expression_type(node.values[0], bindings)
+        if key_kind not in self.DICT_KEY_KINDS:
+            raise NativeCompileError(
+                self.path,
+                node.keys[0],
+                "native dict keys are signed 64-bit integers or runtime strings",
+            )
+        if value_kind not in self.DICT_VALUE_KINDS:
+            raise NativeCompileError(
+                self.path,
+                node.values[0],
+                "native dict values are signed 64-bit integers or floats",
+            )
+        return self.dict_tag(key_kind, value_kind)
+
+    def annotated_dict_tag(self, annotation: ast.expr) -> str | None:
+        """The kinds `dict[K, V]` names, or None if it is not that shape."""
+
         if (
-            isinstance(target.value, ast.Name)
-            and self.value_types.get(target.value.id) == "dict-i64"
+            not isinstance(annotation, ast.Subscript)
+            or not isinstance(annotation.value, ast.Name)
+            or annotation.value.id not in {"dict", "Dict"}
+            or not isinstance(annotation.slice, ast.Tuple)
+            or len(annotation.slice.elts) != 2
         ):
-            if self.expression_type(value) != "int":
+            return None
+        names = []
+        for item in annotation.slice.elts:
+            if not isinstance(item, ast.Name):
+                return None
+            names.append(item.id)
+        key_kind, value_kind = names
+        if key_kind not in self.DICT_KEY_KINDS or value_kind not in self.DICT_VALUE_KINDS:
+            raise NativeCompileError(
+                self.path,
+                annotation,
+                "a native dict annotation is dict[int|str, int|float]",
+            )
+        return self.dict_tag(key_kind, value_kind)
+
+    def subscript_assignment(self, target: ast.Subscript, value: ast.expr) -> None:
+        if isinstance(target.value, ast.Name) and self.dict_kinds_of(
+            target.value.id
+        ):
+            key_kind, value_kind = self.dict_kinds_of(target.value.id)
+            if self.expression_type(target.slice) != key_kind:
                 raise NativeCompileError(
-                    self.path, value, "native dict values are signed 64-bit integers"
+                    self.path,
+                    target.slice,
+                    f"this dict has {key_kind} keys",
+                )
+            if value_kind == "float":
+                if self.expression_type(value) not in {"float", "int"}:
+                    raise NativeCompileError(
+                        self.path, value, "this dict has float values"
+                    )
+            elif self.expression_type(value) != "int":
+                raise NativeCompileError(
+                    self.path, value, "this dict has signed 64-bit integer values"
                 )
             self.dict_store(
                 self.slot(target.value.id),
-                self.integer(target.slice),
-                self.integer(value),
+                self.dict_key(target.slice, key_kind),
+                self.dict_value(value, value_kind),
                 target,
+                key_kind,
             )
             return
         if self.expression_type(value) != "int":
@@ -2209,17 +2362,47 @@ class Frontend:
         self.operations.append(HeapStore(address, self.integer(value), 8))
 
 
-    # --- runtime integer-keyed dictionaries ---------------------------------
+    # --- runtime dictionaries -----------------------------------------------
     #
     # Layout: [capacity][count] then `capacity` slots of [state][key][value],
-    # 24 bytes each, state 0 meaning empty. Collisions are resolved by linear
-    # probing, and the capacity is fixed when the dict is created: growing a
-    # hash table means rehashing every entry, which needs a second loop and a
-    # second allocation, so instead the table is sized generously and a full
-    # table is a reported error rather than a silent overwrite.
+    # 24 bytes each. A state of 0 means the slot is empty; collisions are
+    # resolved by linear probing, and the table doubles and rehashes once it
+    # passes half full.
+    #
+    # Keys are either signed 64-bit integers or runtime strings, and values are
+    # either signed 64-bit integers or IEEE-754 doubles held as their bit
+    # pattern - the slot is eight bytes wide either way, so a float costs
+    # nothing extra. Which of the four combinations a dict is, is fixed when it
+    # is created and checked at build time.
+    #
+    # The state word does double duty. An integer-keyed entry stores 1 there
+    # and finds its home slot from the key; a string-keyed entry stores its
+    # hash with the low bit forced on, so the word is still never 0 for a live
+    # entry, and finds its home slot from that. Keeping the hash in the entry
+    # means a probe can reject a colliding key with one comparison instead of
+    # walking its bytes, and it means a rehash never has to hash anything
+    # again.
 
     DICT_SLOT_BYTES = 24
     DICT_HEADER_BYTES = 16
+    DICT_KEY_KINDS = {"int", "str"}
+    DICT_VALUE_KINDS = {"int", "float"}
+
+    @staticmethod
+    def dict_tag(key_kind: str, value_kind: str) -> str:
+        return f"dict:{key_kind}:{value_kind}"
+
+    @staticmethod
+    def dict_kinds(tag: str | None) -> tuple[str, str] | None:
+        """``(key kind, value kind)`` for a dict tag, else None."""
+
+        if not isinstance(tag, str) or not tag.startswith("dict:"):
+            return None
+        _, key_kind, value_kind = tag.split(":")
+        return key_kind, value_kind
+
+    def dict_kinds_of(self, name: str) -> tuple[str, str] | None:
+        return self.dict_kinds(self.value_types.get(name))
 
     def dict_capacity(self, entries: int) -> int:
         """A power-of-two capacity with room to spare, so probing terminates."""
@@ -2229,7 +2412,23 @@ class Frontend:
             capacity *= 2
         return capacity
 
-    def dict_assignment(self, name: str, node: ast.expr) -> None:
+    def dict_key(self, node: ast.expr, key_kind: str) -> IntExpression:
+        """A key as an i64: the value itself, or a pointer to a string block."""
+
+        if key_kind == "str":
+            return self.string_pointer(node)
+        return self.integer(node)
+
+    def dict_value(self, node: ast.expr, value_kind: str) -> IntExpression:
+        """A value as the i64 actually stored: a float goes in as its bits."""
+
+        if value_kind == "float":
+            return FloatBits(self.float_expression(node))
+        return self.integer(node)
+
+    def dict_assignment(
+        self, name: str, node: ast.expr, key_kind: str, value_kind: str
+    ) -> None:
         if not isinstance(node, ast.Dict):
             raise NativeCompileError(
                 self.path, node, "native dict variables require a dict literal"
@@ -2239,13 +2438,21 @@ class Frontend:
                 raise NativeCompileError(
                     self.path, node, "native dicts do not support ** unpacking"
                 )
-            if self.expression_type(key) != "int":
+            if self.expression_type(key) != key_kind:
                 raise NativeCompileError(
-                    self.path, key, "native dict keys are signed 64-bit integers"
+                    self.path,
+                    key,
+                    f"this dict has {key_kind} keys, so every key must be "
+                    f"{key_kind}",
                 )
-            if self.expression_type(value) != "int":
+            if value_kind == "float":
+                if self.expression_type(value) not in {"float", "int"}:
+                    raise NativeCompileError(
+                        self.path, value, "this dict has float values"
+                    )
+            elif self.expression_type(value) != "int":
                 raise NativeCompileError(
-                    self.path, value, "native dict values are signed 64-bit integers"
+                    self.path, value, "this dict has signed 64-bit integer values"
                 )
         capacity = self.dict_capacity(len(node.keys))
         bump = self.ensure_heap()
@@ -2265,23 +2472,156 @@ class Frontend:
         for key, value in zip(node.keys, node.values):
             self.dict_store(
                 pointer_slot,
-                self.integer(key),
-                self.integer(value),
+                self.dict_key(key, key_kind),
+                self.dict_value(value, value_kind),
                 node,
+                key_kind,
             )
 
-    def dict_probe(
-        self, pointer_slot: int, key: IntExpression
-    ) -> tuple[int, int, int]:
-        """Emit a probe loop; return (slot holding the entry address, found flag).
+    # FNV-1a, which is short enough to emit inline and mixes well enough that
+    # linear probing does not degrade on the keys a program actually uses. The
+    # offset basis is written signed because the slots are signed 64-bit.
+    _FNV_OFFSET = -3750763034362895579
+    _FNV_PRIME = 1099511628211
 
-        The address is where the entry belongs whether or not it is present, so
-        one probe serves lookup, membership and insertion.
+    def emit_string_hash(self, pointer_slot: int) -> int:
+        """Hash the string block in ``pointer_slot``; returns a slot holding
+        the state word, which is the hash with its low bit forced on so that a
+        live entry never looks empty."""
+
+        pointer = IntLoad(pointer_slot)
+        length_slot = self.new_temp()
+        self.operations.append(Store(length_slot, HeapLoad(pointer, 8)))
+        hash_slot = self.new_temp()
+        self.operations.append(Store(hash_slot, IntConstant(self._FNV_OFFSET)))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("hash_start")
+        done = self.new_label("hash_done")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), done
+            )
+        )
+        byte = HeapLoad(
+            IntBinary(
+                "add",
+                IntBinary("add", pointer, IntConstant(8)),
+                IntLoad(index_slot),
+            ),
+            1,
+        )
+        self.operations.append(
+            Store(
+                hash_slot,
+                IntBinary(
+                    "mul",
+                    IntBinary("xor", IntLoad(hash_slot), byte),
+                    IntConstant(self._FNV_PRIME),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(done))
+        state_slot = self.new_temp()
+        self.operations.append(
+            Store(state_slot, IntBinary("or", IntLoad(hash_slot), IntConstant(1)))
+        )
+        return state_slot
+
+    def emit_string_equal(self, left: IntExpression, right: IntExpression) -> int:
+        """Compare two string blocks byte for byte; returns a 0/1 slot."""
+
+        left_slot = self.new_temp()
+        right_slot = self.new_temp()
+        self.operations.append(Store(left_slot, left))
+        self.operations.append(Store(right_slot, right))
+        result_slot = self.new_temp()
+        self.operations.append(Store(result_slot, IntConstant(0)))
+        done = self.new_label("streq_done")
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(left_slot), 8))
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    IntLoad(length_slot),
+                    HeapLoad(IntLoad(right_slot), 8),
+                ),
+                done,
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("streq_start")
+        self.operations.append(Label(start))
+        equal = self.new_label("streq_equal")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), equal
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            IntBinary("add", IntLoad(left_slot), IntConstant(8)),
+                            IntLoad(index_slot),
+                        ),
+                        1,
+                    ),
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            IntBinary("add", IntLoad(right_slot), IntConstant(8)),
+                            IntLoad(index_slot),
+                        ),
+                        1,
+                    ),
+                ),
+                done,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(equal))
+        self.operations.append(Store(result_slot, IntConstant(1)))
+        self.operations.append(Label(done))
+        return result_slot
+
+    def dict_probe(
+        self, pointer_slot: int, key: IntExpression, key_kind: str
+    ) -> tuple[int, int, int, int]:
+        """Find where ``key`` lives, or the empty slot it would go in.
+
+        Returns slots holding the entry address, whether the key was found, the
+        key itself, and the state word to write for it. The key is pinned in a
+        slot because the caller stores it afterwards and the backends re-emit an
+        expression tree at every occurrence - re-evaluating the key expression
+        there could compute a different key than the one just probed for.
         """
 
         pointer = IntLoad(pointer_slot)
         key_slot = self.new_temp()
         self.operations.append(Store(key_slot, key))
+        if key_kind == "str":
+            state_slot = self.emit_string_hash(key_slot)
+            home = IntLoad(state_slot)
+        else:
+            state_slot = self.new_temp()
+            self.operations.append(Store(state_slot, IntConstant(1)))
+            home = IntLoad(key_slot)
         mask_slot = self.new_temp()
         self.operations.append(
             Store(
@@ -2291,18 +2631,14 @@ class Frontend:
         )
         index_slot = self.new_temp()
         self.operations.append(
-            Store(
-                index_slot,
-                IntBinary("and", IntLoad(key_slot), IntLoad(mask_slot)),
-            )
+            Store(index_slot, IntBinary("and", home, IntLoad(mask_slot)))
         )
         address_slot = self.new_temp()
         found_slot = self.new_temp()
         self.operations.append(Store(found_slot, IntConstant(0)))
-
-        start = self.new_label("dict_probe")
-        done = self.new_label("dict_probe_done")
-        empty = self.new_label("dict_probe_empty")
+        start = self.new_label("probe_start")
+        done = self.new_label("probe_done")
+        step = self.new_label("probe_next")
         self.operations.append(Label(start))
         self.operations.append(
             Store(
@@ -2323,20 +2659,44 @@ class Frontend:
             )
         )
         state = HeapLoad(IntLoad(address_slot), 8)
+        # An empty slot ends the probe: this key is not in the table, and this
+        # is where it belongs.
         self.operations.append(
-            JumpIfFalse(IntCompare("ne", state, IntConstant(0)), empty)
-        )
-        stored_key = HeapLoad(
-            IntBinary("add", IntLoad(address_slot), IntConstant(8)), 8
+            JumpIfFalse(IntCompare("ne", state, IntConstant(0)), done)
         )
         self.operations.append(
-            JumpIfFalse(
-                IntCompare("eq", stored_key, IntLoad(key_slot)), start + "_next"
+            JumpIfFalse(IntCompare("eq", state, IntLoad(state_slot)), step)
+        )
+        if key_kind == "str":
+            # Equal hashes are not equal strings; check the bytes.
+            equal_slot = self.emit_string_equal(
+                IntLoad(key_slot),
+                HeapLoad(IntBinary("add", IntLoad(address_slot), IntConstant(8)), 8),
             )
-        )
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(equal_slot), IntConstant(0)), step
+                )
+            )
+        else:
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "eq",
+                        HeapLoad(
+                            IntBinary(
+                                "add", IntLoad(address_slot), IntConstant(8)
+                            ),
+                            8,
+                        ),
+                        IntLoad(key_slot),
+                    ),
+                    step,
+                )
+            )
         self.operations.append(Store(found_slot, IntConstant(1)))
         self.operations.append(Jump(done))
-        self.operations.append(Label(start + "_next"))
+        self.operations.append(Label(step))
         self.operations.append(
             Store(
                 index_slot,
@@ -2348,12 +2708,10 @@ class Frontend:
             )
         )
         self.operations.append(Jump(start))
-        self.operations.append(Label(empty))
         self.operations.append(Label(done))
-        return address_slot, found_slot, key_slot
+        return address_slot, found_slot, key_slot, state_slot
 
-
-    def dict_grow(self, pointer_slot: int) -> None:
+    def dict_grow(self, pointer_slot: int, key_kind: str) -> None:
         """Double the table and rehash into it.
 
         A hash table cannot simply be extended: every entry's home slot depends
@@ -2439,10 +2797,13 @@ class Frontend:
                 ),
             )
         )
+        state_slot = self.new_temp()
+        self.operations.append(
+            Store(state_slot, HeapLoad(IntLoad(entry_slot), 8))
+        )
         self.operations.append(
             JumpIfFalse(
-                IntCompare("ne", HeapLoad(IntLoad(entry_slot), 8), IntConstant(0)),
-                step,
+                IntCompare("ne", IntLoad(state_slot), IntConstant(0)), step
             )
         )
         key_slot = self.new_temp()
@@ -2454,12 +2815,11 @@ class Frontend:
                 ),
             )
         )
+        # The stored state IS the string hash, so a rehash never re-hashes.
+        home = IntLoad(state_slot) if key_kind == "str" else IntLoad(key_slot)
         target_slot = self.new_temp()
         self.operations.append(
-            Store(
-                target_slot,
-                IntBinary("and", IntLoad(key_slot), IntLoad(mask_slot)),
-            )
+            Store(target_slot, IntBinary("and", home, IntLoad(mask_slot)))
         )
         place = self.new_label("dict_place")
         placed = self.new_label("dict_placed")
@@ -2503,7 +2863,7 @@ class Frontend:
         self.operations.append(Jump(place))
         self.operations.append(Label(placed))
         self.operations.append(
-            HeapStore(IntLoad(address_slot), IntConstant(1), 8)
+            HeapStore(IntLoad(address_slot), IntLoad(state_slot), 8)
         )
         self.operations.append(
             HeapStore(
@@ -2538,10 +2898,13 @@ class Frontend:
         key: IntExpression,
         value: IntExpression,
         node: ast.AST,
+        key_kind: str,
     ) -> None:
         value_slot = self.new_temp()
         self.operations.append(Store(value_slot, value))
-        address_slot, found_slot, key_slot = self.dict_probe(pointer_slot, key)
+        address_slot, found_slot, key_slot, state_slot = self.dict_probe(
+            pointer_slot, key, key_kind
+        )
         pointer = IntLoad(pointer_slot)
         existing = self.new_label("dict_existing")
         end = self.new_label("dict_store_end")
@@ -2550,7 +2913,7 @@ class Frontend:
                 IntCompare("eq", IntLoad(found_slot), IntConstant(0)), existing
             )
         )
-        # A new entry: refuse to overfill rather than probe forever.
+        # A new entry: grow before filling past half, so probing stays short.
         count = HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8)
         capacity = HeapLoad(pointer, 8)
         room = self.new_label("dict_has_room")
@@ -2566,16 +2929,16 @@ class Frontend:
         )
         self.operations.append(Jump(room))
         self.operations.append(Label(room + "_full"))
-        self.dict_grow(pointer_slot)
+        self.dict_grow(pointer_slot, key_kind)
         # Growth moved the table, so the address the first probe produced points
         # into the abandoned one. Probe again for where this key belongs now.
-        regrown_address, _found, _key = self.dict_probe(
-            pointer_slot, IntLoad(key_slot)
+        regrown_address, _found, _key, _state = self.dict_probe(
+            pointer_slot, IntLoad(key_slot), key_kind
         )
         self.operations.append(Store(address_slot, IntLoad(regrown_address)))
         self.operations.append(Label(room))
         self.operations.append(
-            HeapStore(IntLoad(address_slot), IntConstant(1), 8)
+            HeapStore(IntLoad(address_slot), IntLoad(state_slot), 8)
         )
         self.operations.append(
             HeapStore(
@@ -2604,7 +2967,6 @@ class Frontend:
             )
         )
         self.operations.append(Label(end))
-
 
     # --- runtime strings ----------------------------------------------------
 
@@ -3545,8 +3907,14 @@ class Frontend:
             if isinstance(value, str):
                 return "str"
             return "float" if isinstance(value, float) else "int"
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and self.dict_kinds_of(node.value.id)
+        ):
+            return self.dict_kinds_of(node.value.id)[1]
         if isinstance(node, ast.Dict):
-            return "dict-i64"
+            return self.dict_literal_tag(node, bindings)
         if isinstance(node, ast.List):
             return "list-i64"
         if isinstance(node, ast.UnaryOp):
@@ -3631,6 +3999,11 @@ class Frontend:
             return FloatConstant(float(folded))
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             return FloatConstant(node.value)
+        if isinstance(node, ast.Subscript) and self.subscript_dict_kinds(node):
+            # The value sits in the entry as its bit pattern; reinterpret it.
+            return BitsFloat(
+                HeapLoad(self.dict_lookup_value_address(node, bindings), 8)
+            )
         if isinstance(node, ast.Name):
             if node.id in self.slots and self.value_types.get(node.id) == "float":
                 return FloatLoad(self.slots[node.id])
@@ -3963,10 +4336,7 @@ class Frontend:
                 and self.value_types.get(argument.id) == "list-i64"
             ):
                 return HeapLoad(IntLoad(self.slots[argument.id]), 8)
-            if (
-                isinstance(argument, ast.Name)
-                and self.value_types.get(argument.id) == "dict-i64"
-            ):
+            if isinstance(argument, ast.Name) and self.dict_kinds_of(argument.id):
                 # The live count is the second i64 of the table header.
                 return HeapLoad(
                     IntBinary("add", IntLoad(self.slots[argument.id]), IntConstant(8)),
@@ -3977,38 +4347,13 @@ class Frontend:
                 node,
                 "native len() supports runtime strings and integer lists",
             )
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and self.value_types.get(node.value.id) == "dict-i64"
-        ):
-            if self.eager_depth:
+        if isinstance(node, ast.Subscript) and self.subscript_dict_kinds(node):
+            _key_kind, value_kind = self.subscript_dict_kinds(node)
+            if value_kind != "int":
                 raise NativeCompileError(
-                    self.path,
-                    node,
-                    "a dict lookup can raise KeyError, so it cannot appear in a "
-                    "conditional expression or a short-circuited operand, whose "
-                    "arms are both evaluated here; use an if statement",
+                    self.path, node, "this dict has float values"
                 )
-            address_slot, found_slot, _key = self.dict_probe(
-                self.slot(node.value.id), self.integer(node.slice)
-            )
-            present = self.new_label("dict_present")
-            self.operations.append(
-                JumpIfFalse(
-                    IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
-                    present + "_missing",
-                )
-            )
-            self.operations.append(Jump(present))
-            self.operations.append(Label(present + "_missing"))
-            self.raise_exception(
-                "KeyError", b"KeyError: key not in native dict\n"
-            )
-            self.operations.append(Label(present))
-            return HeapLoad(
-                IntBinary("add", IntLoad(address_slot), IntConstant(16)), 8
-            )
+            return HeapLoad(self.dict_lookup_value_address(node, bindings), 8)
         if isinstance(node, ast.Subscript):
             return HeapLoad(self.list_element_address(node), 8)
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
@@ -4165,13 +4510,19 @@ class Frontend:
             and len(node.ops) == 1
             and isinstance(node.ops[0], (ast.In, ast.NotIn))
             and isinstance(node.comparators[0], ast.Name)
-            and self.value_types.get(node.comparators[0].id) == "dict-i64"
+            and self.dict_kinds_of(node.comparators[0].id)
         ):
             # Membership only probes, so unlike a lookup it cannot raise and is
             # safe in an eagerly evaluated arm.
-            _address, found_slot, _key = self.dict_probe(
+            key_kind, _value_kind = self.dict_kinds_of(node.comparators[0].id)
+            if self.expression_type(node.left, bindings) != key_kind:
+                raise NativeCompileError(
+                    self.path, node.left, f"this dict has {key_kind} keys"
+                )
+            _address, found_slot, _key, _state = self.dict_probe(
                 self.slot(node.comparators[0].id),
-                self.integer(node.left, bindings, call_stack),
+                self.dict_key(node.left, key_kind),
+                key_kind,
             )
             present = isinstance(node.ops[0], ast.In)
             return IntCompare(

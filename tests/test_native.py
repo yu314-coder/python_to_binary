@@ -1212,6 +1212,100 @@ class NativeDictionaryTests(unittest.TestCase):
             "raise SystemExit(hits % 251)\n"
         )
 
+    def test_string_keys(self):
+        self._run(
+            'd = {"alpha": 10, "beta": 20}\nd["gamma"] = 30\n'
+            'raise SystemExit(d["alpha"] + d["beta"] + d["gamma"] + len(d))\n'
+        )
+
+    def test_a_key_built_at_runtime_finds_a_literal_entry(self):
+        # Equal bytes, different pointers: the probe has to compare contents,
+        # not addresses.
+        self._run(
+            'd = {"abc": 42}\nk = ""\nk = k + "a"\nk = k + "b"\nk = k + "c"\n'
+            "raise SystemExit(d[k])\n"
+        )
+
+    def test_a_prefix_is_not_the_same_key(self):
+        self._run(
+            'd = {"abc": 1}\nn = 0\nif "ab" in d:\n    n += 10\n'
+            'if "abcd" in d:\n    n += 100\nif "abc" in d:\n    n += 1\n'
+            "raise SystemExit(n)\n"
+        )
+
+    def test_keys_differing_in_one_byte(self):
+        self._run(
+            'd = {"aaaa": 1, "aaab": 2, "aaba": 3, "abaa": 4, "baaa": 5}\n'
+            'raise SystemExit(d["aaaa"] + d["aaab"] * 2 + d["aaba"] * 3 '
+            '+ d["abaa"] * 4 + d["baaa"] * 5)\n'
+        )
+
+    def test_the_empty_string_is_a_usable_key(self):
+        self._run('d = {"": 5}\nd["a"] = 6\nk = ""\nraise SystemExit(d[k] + d["a"] + len(d))\n')
+
+    def test_string_keys_survive_several_rehashes(self):
+        self._run(
+            'd: dict[str, int] = {}\ni = 0\ns = ""\n'
+            'while i < 300:\n    s = s + "k"\n    d[s] = i\n    i += 1\n'
+            'total = 0\nt = ""\nj = 0\n'
+            'while j < 300:\n    t = t + "k"\n    total += d[t]\n    j += 1\n'
+            "raise SystemExit(total % 251)\n"
+        )
+
+    def test_float_values(self):
+        self._run(
+            "d = {1: 1.5, 2: 2.25}\nd[3] = 4.0\nt = d[1] + d[2] + d[3]\n"
+            "raise SystemExit(int(t * 4))\n"
+        )
+
+    def test_float_values_keep_their_bits_through_a_rehash(self):
+        self._run(
+            "d: dict[int, float] = {}\ni = 0\n"
+            "while i < 200:\n    d[i] = i * 0.5\n    i += 1\n"
+            "total = 0.0\nj = 0\n"
+            "while j < 200:\n    total += d[j]\n    j += 1\n"
+            "raise SystemExit(int(total) % 251)\n"
+        )
+
+    def test_negative_and_fractional_float_values(self):
+        self._run(
+            "d = {1: -1.5, 2: 0.0, 3: 2.75}\nd[4] = -0.125\n"
+            "raise SystemExit(int((d[1] + d[2] + d[3] + d[4]) * 8) + 100)\n"
+        )
+
+    def test_string_keys_with_float_values(self):
+        self._run(
+            'scores: dict[str, float] = {}\nname = ""\ni = 0\n'
+            'while i < 150:\n    name = name + "n"\n    scores[name] = i * 0.25\n'
+            "    i += 1\n"
+            'total = 0.0\nprobe = ""\nj = 0\n'
+            'while j < 150:\n    probe = probe + "n"\n    total += scores[probe]\n'
+            "    j += 1\n"
+            "raise SystemExit(int(total) % 251)\n"
+        )
+
+    def test_an_annotation_types_an_empty_literal(self):
+        self._run(
+            'd: dict[str, float] = {}\nd["x"] = 0.5\nd["y"] = 1.25\n'
+            'raise SystemExit(int((d["x"] + d["y"]) * 16))\n'
+        )
+
+    def test_a_key_of_the_wrong_kind_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for source, expected in (
+                ('d = {1: 10}\nraise SystemExit(d["a"])\n', "int keys"),
+                ('d = {"a": 1}\nraise SystemExit(d[1])\n', "str keys"),
+                ("d = {1: 10}\nd[2] = 1.5\nraise SystemExit(1)\n", "integer values"),
+                ("d = {1.5: 2}\nraise SystemExit(1)\n", "signed 64-bit integers or runtime strings"),
+                ('d: dict[str, str] = {}\nraise SystemExit(1)\n', "dict[int|str, int|float]"),
+            ):
+                entry = root / "k.py"
+                entry.write_text(source, encoding="utf-8")
+                with self.assertRaises(NativeCompileError) as caught:
+                    compile_native(entry, root / "k.bin", "darwin-arm64", clean=True)
+                self.assertIn(expected, str(caught.exception))
+
     def test_a_lookup_is_rejected_where_both_arms_are_evaluated(self):
         # select_integer lowers both arms, so a lookup that can raise KeyError
         # must not be placed in one: the failing arm would run regardless.

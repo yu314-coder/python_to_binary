@@ -200,22 +200,34 @@ runtime:
   within the current non-reflective subset; accepting an annotation does not
   implement its named runtime type;
 - runtime `float` (IEEE-754 binary64) variables, `+`/`-`/`*`/unary-`-`,
-  comparisons, and `int`/`float` conversion lower to real SSE2/NEON; runtime
-  `float` division is accepted only with a nonzero constant divisor;
+  comparisons, augmented assignment (`+=`, `-=`, `*=`, `/=`), and `int`/`float`
+  conversion lower to real SSE2/NEON; runtime `float` division is accepted only
+  with a nonzero constant divisor, in an augmented assignment as much as a
+  plain one;
 - on POSIX targets only (ELF/Mach-O), a runtime integer `list` (literal build,
   constant/runtime index load and store, `len()`) and a runtime ASCII `str`
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a
   bump-arena backed by anonymous `mmap`; the two Windows targets reject these,
   and non-ASCII string literals and float/nested lists are rejected;
-- on the same POSIX targets, a runtime `dict` with signed 64-bit keys and
-  values is lowered to an open-addressing table in that arena: `{}` and
-  `{k: v}` literals, `d[k]` load and store, `len(d)`, and `k in d` / `k not in
-  d`. The table doubles and rehashes when it passes half full, so the arena
-  holds the abandoned tables as well - an arena never reclaims. A `d[k]` whose
-  key is absent writes `KeyError` to standard error and exits 1, and because
-  the conditional lowering evaluates both arms, a lookup is rejected inside a
-  conditional expression or a short-circuited operand rather than being allowed
-  to raise from the arm that was not taken. Only integer keys are supported;
+- on the same POSIX targets, a runtime `dict` is lowered to an open-addressing
+  table in that arena: `{}` and `{k: v}` literals, `d[k]` load and store,
+  `len(d)`, and `k in d` / `k not in d`. Keys are signed 64-bit integers or
+  runtime strings, and values are signed 64-bit integers or IEEE-754 doubles
+  (stored as their bit pattern, so a float value costs no extra space). Which
+  of the four combinations a dict is, is fixed when it is created: a non-empty
+  literal says so by its first entry, and an empty one is integer-to-integer
+  unless an annotation such as `d: dict[str, float] = {}` says otherwise. A key
+  or value of the wrong kind is rejected rather than coerced. String keys are
+  compared by content, not by address, so a key built at runtime finds an entry
+  inserted from a literal; each entry keeps its key's hash in its state word,
+  which is what lets a probe reject a colliding key without walking its bytes
+  and lets a rehash avoid hashing anything again. The table doubles and
+  rehashes when it passes half full, so the arena holds the abandoned tables as
+  well - an arena never reclaims. A `d[k]` whose key is absent raises a
+  catchable `KeyError`, and because the conditional lowering evaluates both
+  arms, a lookup is rejected inside a conditional expression or a
+  short-circuited operand rather than being allowed to raise from the arm that
+  was not taken;
 - `raise` and `try` / `except` / `else` / `finally` are lowered without any
   runtime type object, traceback, or frame stack. Native functions are inlined,
   so an active handler is a label in the same instruction stream and
