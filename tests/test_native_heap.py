@@ -165,15 +165,18 @@ class NativeHeapTests(unittest.TestCase):
                 compile_native(entry, root / "bad.bin", "darwin-arm64")
             self.assertIn(needle, str(caught.exception))
 
-    def test_non_ascii_runtime_string_is_rejected(self):
-        # Byte-length would disagree with CPython's code-point len(); reject
-        # rather than emit a binary whose len() is wrong.
-        self._reject(
-            "s = \"\"\n"
-            "for i in range(3):\n"
-            "    s = s + \"é\"\n"
-            "raise SystemExit(len(s))\n",
-            "ASCII",
+    def test_a_runtime_string_may_hold_any_text(self):
+        # The header counts bytes, which is what a write needs; len() counts
+        # code points by skipping UTF-8 continuation bytes, which is what
+        # CPython reports.
+        self._run(
+            's = ""\ns = s + "caf\u00e9"\nraise SystemExit(len(s))\n', 4
+        )
+        self._run(
+            's = ""\ns = s + "\u65e5\u672c\u8a9e"\nraise SystemExit(len(s))\n', 3
+        )
+        self._run(
+            's = ""\ns = s + "a\U0001f389b"\nraise SystemExit(len(s))\n', 3
         )
 
     def test_constant_out_of_range_index_is_rejected(self):

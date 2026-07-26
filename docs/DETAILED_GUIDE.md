@@ -214,7 +214,10 @@ runtime:
   constant/runtime index load and store, `len()`) and a runtime ASCII `str`
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a
   bump-arena backed by anonymous `mmap`; the two Windows targets reject these,
-  and non-ASCII string literals and nested lists are rejected. A list holds
+  and nested lists are rejected. A runtime string holds UTF-8 and may contain
+  any text: the header counts bytes, which is what a write needs, and `len()`
+  counts code points by skipping continuation bytes, which is what CPython
+  reports - so `len()` is a pass over the string rather than a header read. A list holds
   signed 64-bit integers or floats, decided by its first element or by a
   `xs: list[float] = []` annotation; a float element lives in its eight-byte
   slot as a bit pattern, the same way a float dict value does. Object

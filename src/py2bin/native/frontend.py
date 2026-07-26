@@ -3135,15 +3135,6 @@ class Frontend:
         except NativeCompileError:
             folded = None
         if isinstance(folded, str):
-            if not folded.isascii():
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "native runtime strings are limited to ASCII; a non-ASCII "
-                    "literal would make len() disagree with CPython's code-point "
-                    "count (its bytes still print correctly as a compile-time "
-                    "constant via print())",
-                )
             return self.materialize_string_constant(folded.encode("utf-8"))
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             left = self.string_pointer(node.left)
@@ -3152,6 +3143,62 @@ class Frontend:
         raise NativeCompileError(
             self.path, node, "expression is not in the native string subset"
         )
+
+    def emit_code_point_count(self, pointer: IntExpression) -> IntExpression:
+        """How many code points a UTF-8 string block holds.
+
+        The header counts bytes, which is what a write needs, but `len()` in
+        Python counts code points. In UTF-8 every byte of a continuation is
+        `10xxxxxx`, so the code points are exactly the bytes that are not - one
+        pass, no decoding.
+        """
+
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, pointer))
+        base = IntLoad(pointer_slot)
+        length_slot = self.new_temp()
+        self.operations.append(Store(length_slot, HeapLoad(base, 8)))
+        count_slot = self.new_temp()
+        self.operations.append(Store(count_slot, IntConstant(0)))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("count_start")
+        done = self.new_label("count_done")
+        step = self.new_label("count_next")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), done
+            )
+        )
+        byte = HeapLoad(
+            IntBinary(
+                "add",
+                IntBinary("add", base, IntConstant(8)),
+                IntLoad(index_slot),
+            ),
+            1,
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne",
+                    IntBinary("and", byte, IntConstant(0xC0)),
+                    IntConstant(0x80),
+                ),
+                step,
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(done))
+        return IntLoad(count_slot)
 
     def materialize_string_constant(self, data: bytes) -> IntExpression:
         bump = self.ensure_heap()
@@ -3267,14 +3314,6 @@ class Frontend:
                     )
                     self.value_types[name] = "float"
                 elif isinstance(value, str):
-                    if not value.isascii():
-                        raise NativeCompileError(
-                            self.path,
-                            ast.Constant(value=value),
-                            "native runtime strings are limited to ASCII; a "
-                            "non-ASCII value would make len() disagree with "
-                            "CPython's code-point count",
-                        )
                     pointer = self.materialize_string_constant(value.encode("utf-8"))
                     self.operations.append(Store(self.slot(name), pointer))
                     self.value_types[name] = "str"
@@ -4757,8 +4796,7 @@ class Frontend:
                 )
             argument = node.args[0]
             if self.expression_type(argument, bindings) == "str":
-                # The length header is the first i64 of the string block.
-                return HeapLoad(self.string_pointer(argument), 8)
+                return self.emit_code_point_count(self.string_pointer(argument))
             if (
                 isinstance(argument, ast.Name)
                 and self.list_kind_of(argument.id) is not None
