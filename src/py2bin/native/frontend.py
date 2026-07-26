@@ -504,6 +504,10 @@ class Frontend:
         self._prologue: list[object] = []
         self._bool_text_slot: int | None = None
         self.boolean_names: set[str] = set()
+        # A parameter substituted into a single-expression body is just a
+        # value, and a string's value is a pointer - indistinguishable from an
+        # integer. This records which of them are strings.
+        self.string_bindings: dict[str, IntExpression] = {}
         self.exception_ids: dict[str, int] = {}
         # Each cleanup scope (a `finally`, or a `with`'s `__exit__`) records
         # how deep the jump stacks were when it opened. A jump is only a
@@ -4013,6 +4017,8 @@ class Frontend:
             raise NativeCompileError(
                 self.path, node, "expression is not in the native string subset"
             )
+        if isinstance(node, ast.Name) and node.id in self.string_bindings:
+            return self.string_bindings[node.id]
         if isinstance(node, ast.Name) and self.value_types.get(node.id) == "str":
             return IntLoad(self.slots[node.id])
         try:
@@ -4025,6 +4031,37 @@ class Frontend:
             return self.emit_string_slice(
                 self.string_pointer(node.value), node.slice
             )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and self.expression_function_kind(node) == "str"
+        ):
+            function = self.functions[node.func.id]
+            argument_kinds: list[str] = []
+            arguments = self.bind_native_arguments(
+                node.func.id, function, node, {}, (), kinds=argument_kinds
+            )
+            previous_path, previous_values = self.path, self.values
+            previous_functions = self.functions
+            previous_strings = self.string_bindings
+            self.path, self.values = function.path, function.values
+            self.functions = function.functions
+            self.string_bindings = {
+                **previous_strings,
+                **{
+                    parameter: value
+                    for parameter, value, kind in zip(
+                        function.parameters, arguments, argument_kinds
+                    )
+                    if kind == "str"
+                },
+            }
+            try:
+                return self.string_pointer(function.expression)
+            finally:
+                self.path, self.values = previous_path, previous_values
+                self.functions = previous_functions
+                self.string_bindings = previous_strings
         if isinstance(node, ast.JoinedStr):
             return self.joined_string(node)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -4867,12 +4904,14 @@ class Frontend:
                     node,
                     f"recursive native procedure call to {node.func.id}() is not supported",
                 )
+            argument_kinds: list[str] = []
             arguments = self.bind_native_arguments(
                 node.func.id,
                 function,
                 node,
                 {},
                 (),
+                kinds=argument_kinds,
             )
             if any(isinstance(argument, StaticI64Tensor) for argument in arguments):
                 raise NativeCompileError(
@@ -4890,6 +4929,7 @@ class Frontend:
                 ),
                 node,
                 (),
+                argument_kinds=tuple(argument_kinds),
             )
             assert result is None
         else:
@@ -6844,17 +6884,26 @@ class Frontend:
             return None  # defaults and keywords: let the ordinary path decide
         # Stand-ins of the right kind, so nothing is emitted just to ask.
         stand_ins: dict[str, KernelValue] = {}
+        strings: dict[str, IntExpression] = {}
         for parameter, argument in zip(function.parameters, node.args):
-            if self.expression_type(argument, bindings) == "float":
+            kind = self.expression_type(argument, bindings)
+            if kind == "float":
                 stand_ins[parameter] = FloatConstant(0.0)
             else:
                 stand_ins[parameter] = IntConstant(0)
+                if kind == "str":
+                    # A string's stand-in is a pointer like any other integer,
+                    # so the kind has to be recorded beside it.
+                    strings[parameter] = IntConstant(0)
         previous_functions, previous_values = self.functions, self.values
+        previous_strings = self.string_bindings
         self.functions, self.values = function.functions, function.values
+        self.string_bindings = {**previous_strings, **strings}
         try:
             return self.expression_type(function.expression, stand_ins)
         finally:
             self.functions, self.values = previous_functions, previous_values
+            self.string_bindings = previous_strings
 
     def expression_type(
         self,
@@ -6875,6 +6924,8 @@ class Frontend:
             return "float" if isinstance(node.value, float) else "int"
         if isinstance(node, ast.Name):
             if node.id in bindings:
+                if node.id in self.string_bindings:
+                    return "str"
                 return (
                     "float"
                     if isinstance(bindings[node.id], FLOAT_EXPRESSIONS)
@@ -7305,6 +7356,13 @@ class Frontend:
             return IntConstant(int(node.value))
         if isinstance(node, ast.Name) and node.id in bindings:
             value = bindings[node.id]
+            if node.id in self.string_bindings:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{node.id!r} was passed a string, so it cannot be used "
+                    "where an integer is required",
+                )
             if isinstance(value, FLOAT_EXPRESSIONS):
                 raise NativeCompileError(
                     self.path,
@@ -7827,6 +7885,17 @@ class Frontend:
             self.kernel_modules = function.kernel_modules
             self.kernel_functions = function.kernel_functions
             self.extern_functions = function.extern_functions
+            previous_strings = self.string_bindings
+            self.string_bindings = {
+                **previous_strings,
+                **{
+                    parameter: value
+                    for parameter, value, kind in zip(
+                        function.parameters, arguments, argument_kinds
+                    )
+                    if kind == "str"
+                },
+            }
             try:
                 return self.integer(
                     function.expression,
@@ -7834,6 +7903,7 @@ class Frontend:
                     (*call_stack, identity),
                 )
             finally:
+                self.string_bindings = previous_strings
                 self.functions = previous_functions
                 self.values = previous_values
                 self.kernel_modules = previous_kernel_modules
