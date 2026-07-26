@@ -255,10 +255,14 @@ runtime:
   calls resolve at build time from the variable's class, so there is no vtable
   to make that come out right. A name cannot be both an attribute and a method,
   since the two are looked up by different paths;
+- an allocation that would run past the end of the arena reports
+  `MemoryError` and exits 1. The arena is one fixed reservation and the bump
+  pointer only moves forward, so passing the end is not a failed allocation but
+  a write to memory the process never asked for;
 - a `bool` keeps its identity through a list, a dict, a function parameter, a
   return value, and a conditional expression. Nothing at run time tells `True`
   from `1` - the slot holds a number either way - so the answer is carried
-  where it can be: a container's elements are all bools or none (a variable
+  where it can be: a container's elements are all bools or none, and an object's field is the same question asked of the class rather than of a name (a variable
   holds that answer, and a mix is refused, because one slot cannot print two
   ways), a parameter takes the bool-ness of its argument, and a function's
   result is decided by asking its body under those arguments. A function that

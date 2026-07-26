@@ -754,6 +754,7 @@ class Frontend:
         if not self.operations or not isinstance(self.operations[-1], (Exit, ExitValue)):
             self.operations.append(Exit(0))
         if self._heap_bump_slot is not None:
+            self.guard_arena_limit()
             # Initialize the arena unconditionally at process start so that no
             # runtime path can reach an allocation before the bump pointer is
             # valid, regardless of where the first allocation appears in source.
@@ -775,6 +776,54 @@ class Frontend:
                     ),
                 )
         return Module(self.operations, len(self.slots))
+
+    def guard_arena_limit(self) -> None:
+        """Check every allocation against the end of the arena.
+
+        The arena is one fixed reservation and the bump pointer only moves
+        forward, so running past the end is not a failed allocation - it is a
+        write to memory the process never asked for, which is a segmentation
+        fault at best and silent corruption at worst. The check is added here,
+        once, rather than at the sixteen places that allocate.
+        """
+
+        assert self._heap_bump_slot is not None
+        end_slot = self.slot("<heap-end>")
+        guarded: list[object] = []
+        checks = 0
+        for operation in self.operations:
+            guarded.append(operation)
+            if not isinstance(operation, HeapAlloc):
+                continue
+            checks += 1
+            ok = f"arena_ok_{checks}"
+            guarded.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "gt",
+                        IntLoad(self._heap_bump_slot),
+                        IntLoad(end_slot),
+                    ),
+                    ok,
+                )
+            )
+            guarded.append(
+                Write(b"MemoryError: native arena exhausted\n", 2)
+            )
+            guarded.append(Exit(1))
+            guarded.append(Label(ok))
+        self.operations[:] = guarded
+        self.operations.insert(
+            0,
+            Store(
+                end_slot,
+                IntBinary(
+                    "add",
+                    IntLoad(self._heap_bump_slot),
+                    IntConstant(_HEAP_ARENA_BYTES),
+                ),
+            ),
+        )
 
     def ensure_heap(self) -> int:
         """Reserve the arena bump-pointer slot and return it."""
@@ -1684,8 +1733,26 @@ class Frontend:
             )
 
     def attribute_assignment(self, target: ast.Attribute, value: ast.expr) -> None:
+        native_class = self.resolve_object_class(target.value)
+        if native_class is not None and self.attribute_kind(target) != "float":
+            self.note_stored_bool(
+                f"{native_class.name}.{target.attr}",
+                value,
+                f"{native_class.name}.{target.attr}",
+            )
         if self.attribute_kind(target) == "float":
-            if self.expression_type(value) not in {"float", "int"}:
+            stored = self.expression_type(value)
+            if stored == "int":
+                # CPython keeps the int and prints 3; this slot can only hold a
+                # double and would print 3.0. Widening is the caller's decision.
+                raise NativeCompileError(
+                    self.path,
+                    value,
+                    "this attribute holds a float, and storing an integer here "
+                    "would print as 3.0 where CPython prints 3; write float(x) "
+                    "if widening is what you want",
+                )
+            if stored != "float":
                 raise NativeCompileError(
                     self.path, value, "this attribute holds a float"
                 )
@@ -7736,11 +7803,28 @@ class Frontend:
         if isinstance(node, ast.BoolOp):
             # `a and b` yields an operand, so it is a bool only if both are.
             return all(self.renders_as_bool(value) for value in node.values)
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.BitAnd, ast.BitOr, ast.BitXor)
+        ):
+            # `True & True` is True, but `True & 1` is 1: bool has its own
+            # implementation of these three and it applies only between bools.
+            return self.renders_as_bool(node.left) and self.renders_as_bool(
+                node.right
+            )
         if isinstance(node, ast.Name):
             return node.id in self.boolean_names
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
             # An element is a bool when everything stored in the container was.
             return self.container_bool.get(node.value.id) is True
+        if isinstance(node, ast.Attribute):
+            native_class = self.resolve_object_class(node.value)
+            if native_class is not None:
+                # A field is one slot shared by every instance of the class, so
+                # the answer belongs to the class and the field, not to a name.
+                return (
+                    self.container_bool.get(f"{native_class.name}.{node.attr}")
+                    is True
+                )
         if isinstance(node, ast.IfExp):
             # Both arms land in the same slot, so they have to agree. A
             # branching function body is normalised into one of these, which is
@@ -8567,12 +8651,10 @@ class Frontend:
             JumpIfFalse(IntCompare("eq", right, IntConstant(0)), ok_label)
         )
         self.operations.append(Label(bad_label))
-        self.operations.append(
-            Write(
-                b"ZeroDivisionError: integer division or modulo by zero\n", 2
-            )
+        self.raise_exception(
+            "ZeroDivisionError",
+            b"ZeroDivisionError: integer division or modulo by zero\n",
         )
-        self.operations.append(Exit(1))
         self.operations.append(Label(ok_label))
 
         truncated = self.materialize_int(IntBinary("sdiv", left, right))
