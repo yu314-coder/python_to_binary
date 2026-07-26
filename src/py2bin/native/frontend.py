@@ -5050,7 +5050,8 @@ class Frontend:
         return index_slot, length_slot
 
     def delete_statement(self, node: ast.Delete) -> None:
-        """`del xs[i]` on a runtime list; everything else is refused by name."""
+        """`del xs[i]` on a runtime list and `del d[k]` on a runtime dict;
+        everything else is refused by name."""
 
         # Python evaluates the targets left to right, and each one can raise.
         for target in node.targets:
@@ -5064,8 +5065,8 @@ class Frontend:
                 f"del {target.id} is not supported: a native variable is a "
                 "stack slot holding a value, with nothing in it that could "
                 "record being unbound, so a later read cannot raise "
-                "NameError the way CPython's would; del one element of a "
-                "runtime list instead",
+                "NameError the way CPython's would; native del takes one "
+                "element of a runtime list or one key of a runtime dict",
             )
         if isinstance(target, ast.Attribute):
             raise NativeCompileError(
@@ -5073,16 +5074,30 @@ class Frontend:
                 target,
                 "del on an attribute is not supported: a native object's "
                 "fields are fixed slots laid out at build time, so a later "
-                "read of a deleted one cannot raise AttributeError; del one "
-                "element of a runtime list instead",
+                "read of a deleted one cannot raise AttributeError; native "
+                "del takes one element of a runtime list or one key of a "
+                "runtime dict",
             )
         if not isinstance(target, ast.Subscript):
             raise NativeCompileError(
                 self.path,
                 target,
-                "native del takes one element of a runtime list held by a name",
+                "native del takes one element of a runtime list, or one key "
+                "of a runtime dict, held by a name",
             )
+        on_a_dict = (
+            isinstance(target.value, ast.Name)
+            and self.dict_kinds_of(target.value.id) is not None
+        )
         if isinstance(target.slice, ast.Slice):
+            if on_a_dict:
+                raise NativeCompileError(
+                    self.path,
+                    target,
+                    "del on a dict slice is not supported, as CPython's is not "
+                    "either: a slice is unhashable, so it can never be a key; "
+                    "del one key at a time",
+                )
             raise NativeCompileError(
                 self.path,
                 target,
@@ -5098,20 +5113,13 @@ class Frontend:
                 target,
                 "del on a native tuple is not supported, as CPython's is not "
                 "either: a tuple is immutable and its length is fixed at build "
-                "time; del one element of a runtime list instead",
+                "time; native del takes one element of a runtime list or "
+                "one key of a runtime dict",
             )
-        if (
-            isinstance(target.value, ast.Name)
-            and self.dict_kinds_of(target.value.id) is not None
-        ):
-            raise NativeCompileError(
-                self.path,
-                target,
-                "del on a native dict is not supported: the open-addressing "
-                "table has no tombstone state, so probing past a deleted entry "
-                "would stop early and report a live key as missing; del one "
-                "element of a runtime list instead",
-            )
+        if on_a_dict:
+            assert isinstance(target.value, ast.Name)
+            self.delete_dict_entry(target, target.value.id)
+            return
         if (
             not isinstance(target.value, ast.Name)
             or self.list_kind_of(target.value.id) is None
@@ -5119,7 +5127,8 @@ class Frontend:
             raise NativeCompileError(
                 self.path,
                 target,
-                "native del takes one element of a runtime list held by a name",
+                "native del takes one element of a runtime list, or one key "
+                "of a runtime dict, held by a name",
             )
         name = target.value.id
         if name in self.iterated_lists:
@@ -5156,6 +5165,22 @@ class Frontend:
         index_slot, length_slot = self.resolve_list_index(
             pointer, self.integer(target.slice), assigning=True
         )
+        self.emit_list_remove_at(pointer, index_slot, length_slot)
+        # Another name can hold this same block, and its recorded length is now
+        # one too many - which would let a constant index past the new end pass
+        # the build-time check and skip the run-time one. Nothing here tracks
+        # which names alias which block, so every recorded length goes.
+        self.list_lengths.clear()
+
+    def emit_list_remove_at(
+        self, pointer: IntExpression, index_slot: int, length_slot: int
+    ) -> None:
+        """Drop element ``index_slot`` from a list block, closing the gap.
+
+        ``length_slot`` holds the length the block has now; the caller has
+        already settled that the index is in range.
+        """
+
         elements = IntBinary("add", pointer, IntConstant(self.LIST_HEADER_BYTES))
         cursor_slot = self.new_temp()
         self.operations.append(Store(cursor_slot, IntLoad(index_slot)))
@@ -5198,11 +5223,116 @@ class Frontend:
                 8,
             )
         )
-        # Another name can hold this same block, and its recorded length is now
-        # one too many - which would let a constant index past the new end pass
-        # the build-time check and skip the run-time one. Nothing here tracks
-        # which names alias which block, so every recorded length goes.
-        self.list_lengths.clear()
+
+    def delete_dict_entry(self, target: ast.Subscript, name: str) -> None:
+        """`del d[k]`: tombstone the entry and unlist its key.
+
+        The state word becomes a tombstone rather than empty so that a probe
+        which walked past this slot to reach a later key still walks past it.
+        The count drops, which is also what makes a del inside a walk of the
+        same dict raise RuntimeError the way CPython's does. The used word does
+        not drop: the slot is still not somewhere a probe can stop.
+        """
+
+        key_kind, _value_kind = self.dict_kinds_of(name)
+        if self.expression_type(target.slice) != key_kind:
+            raise NativeCompileError(
+                self.path, target.slice, f"this dict has {key_kind} keys"
+            )
+        pointer_slot = self.slot(name)
+        address_slot, found_slot, _key, _state = self.dict_probe(
+            pointer_slot, self.dict_key(target.slice, key_kind), key_kind
+        )
+        present = self.new_label("dict_del_present")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+                present + "_missing",
+            )
+        )
+        self.operations.append(Jump(present))
+        self.operations.append(Label(present + "_missing"))
+        self.raise_exception("KeyError", b"KeyError: key not in native dict\n")
+        self.operations.append(Label(present))
+        # The key word out of the entry, not out of the source expression: this
+        # is the very word the order list holds, so a str key needs no byte
+        # comparison to be found there.
+        key_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                key_slot,
+                HeapLoad(IntBinary("add", IntLoad(address_slot), IntConstant(8)), 8),
+            )
+        )
+        self.operations.append(
+            HeapStore(IntLoad(address_slot), IntConstant(self.DICT_TOMBSTONE), 8)
+        )
+        pointer = IntLoad(pointer_slot)
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(8)),
+                IntBinary(
+                    "sub",
+                    HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8),
+                    IntConstant(1),
+                ),
+                8,
+            )
+        )
+        keys_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                keys_slot,
+                HeapLoad(
+                    IntBinary("add", pointer, IntConstant(self.DICT_KEYS_OFFSET)), 8
+                ),
+            )
+        )
+        keys = IntLoad(keys_slot)
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntBinary("add", keys, IntConstant(8)), 8))
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        scan = self.new_label("dict_unlist")
+        found = self.new_label("dict_unlisted")
+        done = self.new_label("dict_unlist_done")
+        self.operations.append(Label(scan))
+        # The key is in the list, so the length bound is never what ends this
+        # scan; it is there so that a bug would leave the order untouched
+        # instead of running off the end of the block.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), done
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne",
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            IntBinary(
+                                "add", keys, IntConstant(self.LIST_HEADER_BYTES)
+                            ),
+                            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                        ),
+                        8,
+                    ),
+                    IntLoad(key_slot),
+                ),
+                found,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(found))
+        self.emit_list_remove_at(keys, index_slot, length_slot)
+        self.operations.append(Label(done))
 
     def subscript_dict_kinds(self, node: ast.Subscript) -> tuple[str, str] | None:
         if not isinstance(node.value, ast.Name):
@@ -5833,10 +5963,16 @@ class Frontend:
 
     # --- runtime dictionaries -----------------------------------------------
     #
-    # Layout: [capacity][count][keys] then `capacity` slots of
-    # [state][key][value], 24 bytes each. A state of 0 means the slot is empty;
-    # collisions are resolved by linear probing, and the table doubles and
-    # rehashes once it passes half full.
+    # Layout: [capacity][count][keys][used] then `capacity` slots of
+    # [state][key][value], 24 bytes each. A state of 0 means the slot is empty
+    # and a state of 2 means it held a key that was deleted; collisions are
+    # resolved by linear probing, and the table rehashes once it passes half
+    # full - into twice the capacity, or into the same capacity when what
+    # filled it was tombstones rather than keys.
+    #
+    # The fourth header word is live keys plus tombstones, which is what "half
+    # full" has to mean: a probe stops at an empty slot, and a table with none
+    # left would never stop however few of its keys were live.
     #
     # The third header word points at a runtime list of the keys in the order
     # they were first stored. The table itself cannot answer that question -
@@ -5860,8 +5996,16 @@ class Frontend:
 
     LIST_HEADER_BYTES = 16
     DICT_SLOT_BYTES = 24
-    DICT_HEADER_BYTES = 24
+    DICT_HEADER_BYTES = 32
     DICT_KEYS_OFFSET = 16
+    # Live entries plus tombstones. Growth has to watch this rather than the
+    # count, because a table that is all tombstones has nowhere left for a
+    # probe to stop and would spin forever.
+    DICT_USED_OFFSET = 24
+    # A third state word, meaning "empty now, but a probe must keep walking".
+    # A live state is 1 for an int key and an odd hash for a str key, so no
+    # even nonzero word can be mistaken for one.
+    DICT_TOMBSTONE = 2
     DICT_KEY_KINDS = {"int", "str"}
     DICT_VALUE_KINDS = {"int", "float"}
 
@@ -5995,6 +6139,13 @@ class Frontend:
         self.operations.append(
             HeapStore(
                 IntBinary("add", pointer, IntConstant(8)), IntConstant(0), 8
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(self.DICT_USED_OFFSET)),
+                IntConstant(0),
+                8,
             )
         )
         self.emit_dict_key_order_block(pointer_slot, len(node.keys), bump)
@@ -6144,6 +6295,11 @@ class Frontend:
         slot because the caller stores it afterwards and the backends re-emit an
         expression tree at every occurrence - re-evaluating the key expression
         there could compute a different key than the one just probed for.
+
+        When the key is absent the address is the first tombstone the probe
+        walked over, or the empty slot it stopped at if there was none, so that
+        an insert refills a deleted slot rather than pushing the table towards
+        having nowhere to stop.
         """
 
         pointer = IntLoad(pointer_slot)
@@ -6170,6 +6326,9 @@ class Frontend:
         address_slot = self.new_temp()
         found_slot = self.new_temp()
         self.operations.append(Store(found_slot, IntConstant(0)))
+        # No entry address is ever 0, so 0 means "no tombstone seen yet".
+        reuse_slot = self.new_temp()
+        self.operations.append(Store(reuse_slot, IntConstant(0)))
         start = self.new_label("probe_start")
         done = self.new_label("probe_done")
         step = self.new_label("probe_next")
@@ -6198,6 +6357,28 @@ class Frontend:
         self.operations.append(
             JumpIfFalse(IntCompare("ne", state, IntConstant(0)), done)
         )
+        # A tombstone holds no key to compare, and does not end the probe; it
+        # is only remembered as somewhere an insert may go.
+        live = self.new_label("probe_live")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", state, IntConstant(self.DICT_TOMBSTONE)), live
+            )
+        )
+        self.operations.append(Jump(live + "_alive"))
+        self.operations.append(Label(live))
+        self.operations.append(
+            Store(
+                reuse_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(reuse_slot), IntConstant(0)),
+                    IntLoad(address_slot),
+                    IntLoad(reuse_slot),
+                ),
+            )
+        )
+        self.operations.append(Jump(step))
+        self.operations.append(Label(live + "_alive"))
         self.operations.append(
             JumpIfFalse(IntCompare("eq", state, IntLoad(state_slot)), step)
         )
@@ -6243,15 +6424,39 @@ class Frontend:
         )
         self.operations.append(Jump(start))
         self.operations.append(Label(done))
+        # An absent key belongs in the first tombstone walked over rather than
+        # in the empty slot past it. A found key keeps its own address.
+        reuse = self.new_label("probe_reuse")
+        self.operations.append(
+            JumpIfFalse(IntCompare("eq", IntLoad(found_slot), IntConstant(0)), reuse)
+        )
+        self.operations.append(
+            Store(
+                address_slot,
+                self.select_integer(
+                    IntCompare("ne", IntLoad(reuse_slot), IntConstant(0)),
+                    IntLoad(reuse_slot),
+                    IntLoad(address_slot),
+                ),
+            )
+        )
+        self.operations.append(Label(reuse))
         return address_slot, found_slot, key_slot, state_slot
 
     def dict_grow(self, pointer_slot: int, key_kind: str) -> None:
-        """Double the table and rehash into it.
+        """Rehash into a fresh table, twice the size or the same size.
 
         A hash table cannot simply be extended: every entry's home slot depends
         on the capacity, so growth means allocating a new table and probing each
         live entry into it. The old table is left in the arena, which never
         reclaims, and that is the documented cost of an arena.
+
+        Tombstones are what makes the same size an option. A table filled with
+        them has run out of room for a probe to stop even though few keys are
+        live, and rehashing at the same capacity drops them all. That is also
+        what makes a delete inside a loop allocate: one table per capacity/2
+        deletions, the same shape of cost as sorting inside a loop, and it ends
+        in MemoryError rather than in a wrong answer.
         """
 
         bump = self.ensure_heap()
@@ -6260,11 +6465,31 @@ class Frontend:
         old = IntLoad(old_slot)
         old_capacity_slot = self.new_temp()
         self.operations.append(Store(old_capacity_slot, HeapLoad(old, 8)))
+        # Room for one more live entry in a quarter of the table means the
+        # tombstones were the problem, not the keys. Without a delete the count
+        # equals the used word, this test is always false, and the table
+        # doubles exactly as it did before tombstones existed.
         new_capacity_slot = self.new_temp()
         self.operations.append(
             Store(
                 new_capacity_slot,
-                IntBinary("mul", IntLoad(old_capacity_slot), IntConstant(2)),
+                self.select_integer(
+                    IntCompare(
+                        "le",
+                        IntBinary(
+                            "mul",
+                            IntBinary(
+                                "add",
+                                HeapLoad(IntBinary("add", old, IntConstant(8)), 8),
+                                IntConstant(1),
+                            ),
+                            IntConstant(4),
+                        ),
+                        IntLoad(old_capacity_slot),
+                    ),
+                    IntLoad(old_capacity_slot),
+                    IntBinary("mul", IntLoad(old_capacity_slot), IntConstant(2)),
+                ),
             )
         )
         new_slot = self.new_temp()
@@ -6300,6 +6525,15 @@ class Frontend:
                 HeapLoad(
                     IntBinary("add", old, IntConstant(self.DICT_KEYS_OFFSET)), 8
                 ),
+                8,
+            )
+        )
+        # Only live entries make the move, so the new table starts with no
+        # tombstones and its used word is its count.
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", new, IntConstant(self.DICT_USED_OFFSET)),
+                HeapLoad(IntBinary("add", old, IntConstant(8)), 8),
                 8,
             )
         )
@@ -6349,6 +6583,16 @@ class Frontend:
         self.operations.append(
             JumpIfFalse(
                 IntCompare("ne", IntLoad(state_slot), IntConstant(0)), step
+            )
+        )
+        # A tombstone's key word is whatever the deleted entry left behind, so
+        # carrying one over would resurrect it as an entry with a stale key.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne", IntLoad(state_slot), IntConstant(self.DICT_TOMBSTONE)
+                ),
+                step,
             )
         )
         key_slot = self.new_temp()
@@ -6460,14 +6704,16 @@ class Frontend:
             )
         )
         # A new entry: grow before filling past half, so probing stays short.
-        count = HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8)
+        # Tombstones count towards full as much as live keys do, because what
+        # keeps a probe terminating is a slot it can stop at, not a free key.
+        used = HeapLoad(IntBinary("add", pointer, IntConstant(self.DICT_USED_OFFSET)), 8)
         capacity = HeapLoad(pointer, 8)
         room = self.new_label("dict_has_room")
         self.operations.append(
             JumpIfFalse(
                 IntCompare(
                     "lt",
-                    IntBinary("mul", count, IntConstant(2)),
+                    IntBinary("mul", used, IntConstant(2)),
                     capacity,
                 ),
                 room + "_full",
@@ -6483,6 +6729,25 @@ class Frontend:
         )
         self.operations.append(Store(address_slot, IntLoad(regrown_address)))
         self.operations.append(Label(room))
+        # Refilling a tombstone spends no new slot: one fewer tombstone, one
+        # more live key. Only a slot that was empty raises the used word.
+        fresh = self.new_label("dict_fresh_slot")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq", HeapLoad(IntLoad(address_slot), 8), IntConstant(0)
+                ),
+                fresh,
+            )
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(self.DICT_USED_OFFSET)),
+                IntBinary("add", used, IntConstant(1)),
+                8,
+            )
+        )
+        self.operations.append(Label(fresh))
         self.operations.append(
             HeapStore(IntLoad(address_slot), IntLoad(state_slot), 8)
         )
@@ -6667,6 +6932,16 @@ class Frontend:
         self.operations.append(
             HeapStore(
                 IntBinary("add", pointer, IntConstant(self.DICT_KEYS_OFFSET)),
+                IntConstant(0),
+                8,
+            )
+        )
+        # A set is removed from by rebuilding, so it never holds a tombstone
+        # and its used word only ever tracks its count. dict_store maintains it
+        # either way.
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(self.DICT_USED_OFFSET)),
                 IntConstant(0),
                 8,
             )
@@ -6986,14 +7261,12 @@ class Frontend:
     ) -> None:
         """Remove one element by rebuilding the table without it.
 
-        Linear probing with no tombstone state cannot simply blank a slot: a
-        probe that walks past the hole would stop there and report a live key
-        as missing, which is the same reason `del d[k]` is refused. Rebuilding
-        keeps dict_probe, dict_store and dict_grow byte for byte the code the
-        dicts use. It costs a whole table per call, so discarding inside a loop
-        is quadratic in arena bytes; it fails loudly with MemoryError rather
-        than wrongly. Backward-shift deletion is the allocation-free answer and
-        is not written yet.
+        Linear probing cannot simply blank a slot: a probe that walks past the
+        hole would stop there and report a live key as missing. `del d[k]`
+        answers that with a tombstone, which this could use too; rebuilding is
+        what was already written and tested, and it costs a whole table per
+        call, so discarding inside a loop is quadratic in arena bytes. It fails
+        loudly with MemoryError rather than wrongly.
         """
 
         pointer_slot = self.slot(name)
@@ -10093,6 +10366,46 @@ class Frontend:
             )
         return [node.target.id]
 
+    def refuse_deleting_from_the_iterated_dict(
+        self, node: ast.For, name: str
+    ) -> None:
+        """Refuse a body that deletes a key from the dict being walked.
+
+        The walk counts along the insertion-order list, and deleting shifts
+        every later key down one place, so the index then skips a key or
+        re-reads a shifted one. The size check that guards this loop cannot see
+        it: a body that deletes and inserts in the same pass leaves the count
+        where it was, so the guard never fires and the loop simply visits the
+        wrong keys.
+
+        CPython decides this by key identity rather than size and raises
+        RuntimeError for most of these, though not all - `del d[k]` followed by
+        `d[k] = ...` is legal there and prints. Refusing the whole shape rejects
+        that one legal program, which is the cost of not carrying a version
+        stamp on the dict. A refusal is the acceptable half of that trade; a
+        loop that silently visits the wrong keys is not.
+        """
+
+        for statement in node.body:
+            for inner in ast.walk(statement):
+                if not isinstance(inner, ast.Delete):
+                    continue
+                for target in inner.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == name
+                    ):
+                        raise NativeCompileError(
+                            self.path,
+                            inner,
+                            f"a native `for` over {name!r} cannot delete from "
+                            f"{name!r}: the walk counts along the insertion "
+                            "order, and deleting shifts every later key, so the "
+                            "loop would visit the wrong ones. Collect the keys "
+                            "to remove and delete them after the loop",
+                        )
+
     def refuse_rebinding_the_iterated_dict(self, node: ast.For, name: str) -> None:
         """Refuse a body that assigns to the name being walked.
 
@@ -10171,6 +10484,7 @@ class Frontend:
         key_kind, value_kind = self.dict_kinds_of(name)
         targets = self.dict_iteration_targets(node, mode)
         self.refuse_rebinding_the_iterated_dict(node, name)
+        self.refuse_deleting_from_the_iterated_dict(node, name)
         broke = self.open_loop_else(node)
         was_bound = {target: target in self.bound_names for target in targets}
         dict_slot = self.slot(name)

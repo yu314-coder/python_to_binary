@@ -462,3 +462,29 @@ class Module:
     # before the first operation runs, and starts out entirely zero; every
     # reference to it is a ``GlobalAddress``. Zero means the module has none.
     static_bytes: int = 0
+
+
+#: The most stack slots one frame may hold. A frame is real OS stack, and the
+#: prologue moves SP down by the whole thing at once, so a frame larger than
+#: the thread's stack runs off the end of it and the program dies with a signal
+#: instead of printing an answer. Nothing at build time can measure the stack
+#: the program will get, so the limit is a fixed one and a frame past it is
+#: refused. It is deliberately the same on every target -- the smallest stack
+#: any of them hands the initial thread is the 1 MiB a PE reserves, and one
+#: source file should not compile for macOS and be refused for Windows -- so
+#: 512 KiB of slots leaves the rest of that reserve for whatever the body calls.
+MAXIMUM_STACK_SLOTS = 65536
+
+
+def check_stack_slots(stack_slots: int, owner: str) -> int:
+    """Reject a frame that would not fit on the thread stack. Returns it."""
+
+    if stack_slots > MAXIMUM_STACK_SLOTS:
+        raise ValueError(
+            f"{owner} needs {stack_slots} stack slots ({stack_slots * 8} bytes "
+            f"of frame), past the {MAXIMUM_STACK_SLOTS}-slot "
+            f"({MAXIMUM_STACK_SLOTS * 8}-byte) budget one frame may take from "
+            "the thread stack; a larger frame would overrun the stack at run "
+            "time rather than answer, so split the code into smaller functions"
+        )
+    return stack_slots

@@ -360,8 +360,17 @@ runtime:
 - `del xs[i]` on a runtime list shifts the tail down and drops the header
   length by one, in place, so another name holding the same list sees it. A
   negative index counts from the end and one out of range reports `IndexError`.
-  `del d[k]`, `del name`, `del obj.attr`, `del xs[a:b]`, and a `del` that would
-  shorten a list a `for` is walking are each rejected by name;
+  `del name`, `del obj.attr`, `del xs[a:b]`, and a `del` that would shorten a
+  list a `for` is walking are each rejected by name;
+- `del d[k]` on a runtime dict leaves a tombstone in the entry's state word, so
+  a probe that had walked past that slot to reach a later key still walks past
+  it, and drops the key from the insertion-order list. A missing key reports
+  `KeyError`; deleting while a `for` walks the same dict reports `RuntimeError:
+  dictionary changed size during iteration`, as CPython does, even when the
+  deleted key was the last one left. Tombstones count towards the table being
+  full, so a delete-heavy loop rebuilds the table at the same capacity every
+  capacity/2 deletions - that costs arena bytes, and around 200000 insert and
+  delete pairs on one dict end in `MemoryError` where CPython would keep going;
 - same-module, local, and pinned-source functions are inlined when they use
   positional parameters, optional static integer defaults and named calls, no
   decorators/variadics, supported integer

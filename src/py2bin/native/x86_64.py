@@ -41,6 +41,7 @@ from .ir import (
     Store,
     Write,
     WriteRuntime,
+    check_stack_slots,
 )
 
 
@@ -93,7 +94,8 @@ def _sub_stack(amount: int) -> bytes:
     return b"\x48\x81\xec" + struct.pack("<I", amount)
 
 
-def _frame_bytes(stack_slots: int, base: int = 0) -> int:
+def _frame_bytes(stack_slots: int, base: int = 0, owner: str = "this module") -> int:
+    check_stack_slots(stack_slots, owner)
     variable_bytes = (stack_slots * 8 + 15) & ~15
     return base + variable_bytes
 
@@ -614,7 +616,7 @@ def _emit_function(
         raise ValueError(
             f"x86-64 function {function.name!r} has fewer stack slots than parameters"
         )
-    frame = (function.stack_slots * 8 + 15) & ~15
+    frame = _frame_bytes(function.stack_slots, 0, f"function {function.name!r}")
     code.extend(b"\x55")  # push rbp
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp
     if frame:
@@ -882,7 +884,7 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         if function.name in offsets:
             raise ValueError(f"duplicate native IR function {function.name!r}")
         offsets[function.name] = len(code)
-        frame = (function.stack_slots * 8 + 15) & ~15
+        frame = _frame_bytes(function.stack_slots, 0, f"function {function.name!r}")
         code.extend(b"\x55\x48\x89\xe5")  # push rbp; mov rbp, rsp
         if frame:
             code.extend(b"\x48\x81\xec" + struct.pack("<I", frame))

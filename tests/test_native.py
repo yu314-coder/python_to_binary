@@ -997,6 +997,162 @@ class Arm64StaticStorageTests(unittest.TestCase):
             encode_darwin_arm64(module, 0x100004000)
 
 
+class Arm64FarStackSlotTests(unittest.TestCase):
+    """Frame references past the 12-bit reach of LDR/STR.
+
+    The scaled immediate stops at 32760 bytes, which used to cap a function at
+    4095 slots. Past that the offset's high 12 bits go into X17 and the access
+    is made off X17 instead of X29. The encodings below were checked against
+    ``clang -target arm64-apple-darwin``.
+    """
+
+    def _reference(self, offset: int, encoding: int, rt: int = 0):
+        from py2bin.native.arm64 import _frame_reference
+
+        return _frame_reference(offset, encoding, rt)
+
+    def test_an_offset_inside_the_immediate_is_still_one_word(self):
+        # Nothing about the near case may change; existing images must not move.
+        self.assertEqual(
+            self._reference(0x7FF8, 0xF9400000), [0xF97FFFA0]  # ldr x0,[x29,#32760]
+        )
+        self.assertEqual(
+            self._reference(16, 0xFD000000), [0xFD000BA0]  # str d0, [x29, #16]
+        )
+
+    def test_the_first_offset_past_the_immediate_uses_x17(self):
+        self.assertEqual(
+            self._reference(0x8000, 0xF9400000),
+            [0x914023B1, 0xF9400220],  # add x17,x29,#8,lsl#12; ldr x0,[x17]
+        )
+
+    def test_the_register_and_the_float_forms_address_off_x17_too(self):
+        self.assertEqual(
+            self._reference(0x8000 + 0xFF8, 0xF9000000, 3),
+            [0x914023B1, 0xF907FE23],  # add x17,x29,#8,lsl#12; str x3,[x17,#4088]
+        )
+        self.assertEqual(
+            self._reference(0x8010, 0xFD400000),
+            [0x914023B1, 0xFD400A20],  # add x17,x29,#8,lsl#12; ldr d0,[x17,#16]
+        )
+
+    def test_a_far_reference_writes_only_x17(self):
+        # X0 and X1 carry the size and the old bump pointer across the three
+        # slot accesses of a HeapAlloc, and the prologue holds X0-X7 across its
+        # whole spill loop, so a scratch register that is not X17 miscompiles
+        # both. Rd of the ADD is bits [4:0].
+        words = self._reference(0x40000, 0xF9400000, 1)
+        self.assertEqual(words[0] & 0x1F, 17)
+
+    def test_a_frame_reference_past_the_shifted_add_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "beyond the 16777208-byte reach"):
+            self._reference((0xFFF << 12) + 0x1000, 0xF9400000)
+
+    def test_a_function_frame_past_the_old_ceiling_encodes_and_runs(self):
+        # Ten parameters so the ninth and tenth arrive in memory above the
+        # frame, and a frame far past 4095 slots so both the incoming-argument
+        # load and the body's own slot accesses need the X17 path. Only the IR
+        # can build a Function this size; the C front end caps itself lower.
+        from py2bin.native.ir import (
+            Call,
+            ExitValue,
+            Function,
+            IntBinary,
+            IntConstant,
+            IntLoad,
+            Return,
+            Store,
+        )
+        from py2bin.native.formats.macho import write_macho_arm64
+
+        slots = 40000
+        total = IntLoad(0)
+        for index in range(1, 10):
+            total = IntBinary("add", total, IntLoad(index))
+        body = [
+            Store(slots - 1, total),  # a slot far past the immediate
+            Store(10, IntConstant(7)),  # and a near one, written in between
+            Return(IntBinary("add", IntLoad(slots - 1), IntLoad(10))),
+        ]
+        module = Module(
+            [
+                Store(
+                    0,
+                    Call(
+                        "wide",
+                        tuple(IntConstant(value) for value in range(1, 11)),
+                    ),
+                ),
+                ExitValue(IntLoad(0)),
+            ],
+            4,
+            [Function("wide", 10, slots, body)],
+        )
+        code = encode_darwin_arm64(module, 0x100004000)
+        if not (platform.system() == "Darwin" and platform.machine() == "arm64"):
+            return
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "wide"
+            artifact.write_bytes(write_macho_arm64(code))
+            artifact.chmod(0o755)
+            result = subprocess.run([str(artifact)], capture_output=True)
+        self.assertEqual(result.returncode, sum(range(1, 11)) + 7)
+
+
+class NativeStackBudgetTests(unittest.TestCase):
+    """A frame is real OS stack, so an unbounded one crashes instead of answering.
+
+    Before this limit existed, x86-64 (whose displacement is 32 bits and has no
+    encoding ceiling) compiled a 10 MB frame without complaint and the binary
+    died with SIGSEGV while CPython printed an answer.
+    """
+
+    @staticmethod
+    def _source(assignments: int) -> str:
+        # ``n`` is unfoldable, so each assignment pins a runtime value.
+        lines = ["n = 0", "for i in range(0, 3):", "    n += 1"]
+        lines += [f"v{index} = n + {index}" for index in range(assignments)]
+        lines.append(f"print(v0, v1, v4095, v{assignments - 1})")
+        return "\n".join(lines) + "\n"
+
+    def test_a_frame_past_the_budget_is_refused_for_every_target(self):
+        from py2bin.native.ir import MAXIMUM_STACK_SLOTS
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "huge.py"
+            entry.write_text(self._source(MAXIMUM_STACK_SLOTS + 1000), encoding="utf-8")
+            for target in supported_targets():
+                with self.assertRaisesRegex(
+                    ValueError, "budget one frame may take from the thread stack"
+                ):
+                    compile_native(entry, root / "huge.bin", target, clean=True)
+
+    def test_a_frame_well_past_the_old_arm64_ceiling_builds_and_runs(self):
+        # 20070 slots: five times the 4095 the immediate allowed. The early,
+        # low-numbered values are read back last, after every high slot has
+        # been written through X17.
+        source = self._source(20000)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "wide.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in supported_targets():
+                compile_native(entry, root / f"wide-{target}", target, clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run(
+                [str(root / "wide-darwin-arm64")], capture_output=True
+            )
+        self.assertEqual(native.stdout, reference.stdout)
+        self.assertEqual(native.returncode, reference.returncode)
+
+
 class WindowsArm64CallAbiTests(unittest.TestCase):
     """The Windows ARM64 call ABI, verified by decoding the instructions.
 
@@ -1126,8 +1282,8 @@ class FloorDivisionTests(unittest.TestCase):
 class NativeDictionaryTests(unittest.TestCase):
     """Integer-keyed dicts lowered to an open-addressing table.
 
-    The table is a header of [capacity][count] followed by capacity entries of
-    [state][key][value]. Every case here compares the compiled binary against
+    The table is a header of [capacity][count][keys][used] followed by capacity
+    entries of [state][key][value]. Every case here compares the binary against
     CPython rather than against a hand-computed number, so a wrong expectation
     cannot hide a wrong answer.
     """
@@ -1495,6 +1651,165 @@ class NativeDictionaryIterationTests(unittest.TestCase):
                 with self.assertRaises(NativeCompileError) as caught:
                     compile_native(entry, root / "j.bin", "darwin-arm64", clean=True)
                 self.assertIn(expected, str(caught.exception))
+
+
+class NativeDictionaryDeleteTests(unittest.TestCase):
+    """`del d[k]`, which leaves a tombstone rather than an empty slot.
+
+    An emptied slot would end a probe that had walked past it to reach a later
+    key, so the state word gets a third value meaning "keep walking". Every
+    case here compares stdout and exit status with CPython.
+    """
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "x.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "x.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run(
+                [str(artifact)], capture_output=True, timeout=60
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_a_probe_walks_past_a_deleted_entry(self):
+        # 1, 9 and 17 all come home to slot 1 at the initial capacity of 8, so
+        # 17 is only reachable through the slot 9 was deleted from.
+        self._run(
+            "d: dict[int, int] = {}\nd[1] = 1\nd[9] = 9\nd[17] = 17\n"
+            "del d[9]\n"
+            "print(len(d), 17 in d, d[17], 9 in d, 1 in d)\n"
+        )
+
+    def test_inserting_and_deleting_forever_terminates(self):
+        # The live count never passes one, so a table that grew on the count
+        # would never grow, would fill with tombstones, and would leave the
+        # probe for the ninth key with nowhere to stop.
+        self._run(
+            "d: dict[int, int] = {}\n"
+            "for i in range(0, 400):\n    d[i] = i\n    del d[i]\n"
+            "print(len(d))\n"
+        )
+
+    def test_a_missing_key_raises_KeyError(self):
+        self._run(
+            "d = {1: 10}\n"
+            "try:\n    del d[2]\nexcept KeyError:\n    print('caught')\n"
+            "print(len(d))\n"
+            "del d[2]\n"
+        )
+
+    def test_tombstones_survive_a_rehash(self):
+        self._run(
+            "d: dict[int, int] = {}\ni = 0\n"
+            "while i < 40:\n    d[i * 8] = i\n    i += 1\n"
+            "i = 0\n"
+            "while i < 40:\n    if i % 3 == 0:\n        del d[i * 8]\n    i += 1\n"
+            "i = 0\n"
+            "while i < 40:\n    print(i * 8, i * 8 in d)\n    i += 1\n"
+            "print(len(d))\n"
+        )
+
+    def test_a_deleted_string_key_is_gone_and_the_rest_are_reachable(self):
+        self._run(
+            'd = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, '
+            '"six": 6}\n'
+            'del d["two"]\ndel d["four"]\ndel d["six"]\n'
+            "for k in d:\n    print(k, d[k], k in d)\n"
+            'print("two" in d, "four" in d, len(d))\n'
+        )
+
+    def test_a_reinserted_key_goes_to_the_end_of_the_order(self):
+        self._run(
+            "d = {5: 10, 3: 20, 9: 30}\ndel d[3]\nd[3] = 99\n"
+            "for k in d:\n    print(k, d[k])\n"
+        )
+
+    def test_deleting_while_walking_the_same_dict_is_rejected(self):
+        # The size check this used to rely on cannot see the general case: a
+        # body that deletes and inserts in one pass leaves the count where it
+        # was, and the walk - which counts along the insertion order - then
+        # visits the wrong keys with nothing raising. Refused at build time
+        # instead, including the shapes CPython allows.
+        for body in (
+            "d = {1: 10}\nfor k in d:\n    print(k)\n    del d[k]\n",
+            "d = {1: 1, 2: 2}\nfor k in d:\n    del d[k]\n    d[k] = k * 10\n",
+            "d = {1: 1, 2: 2}\nfor k, v in d.items():\n    del d[k]\n",
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entry = root / "d.py"
+                entry.write_text(body + 'print("never")\n', encoding="utf-8")
+                with self.assertRaises(NativeCompileError) as caught:
+                    compile_native(entry, root / "d.bin", "darwin-arm64", clean=True)
+                self.assertIn("cannot delete from", str(caught.exception))
+
+    def test_deleting_a_different_dict_inside_a_walk_is_allowed(self):
+        self._run(
+            "a = {1: 1, 2: 2}\nb = {7: 7, 8: 8, 9: 9}\n"
+            "for k in a:\n    del b[k + 6]\n"
+            "print(len(b))\nfor k in b:\n    print(k)\n"
+        )
+
+    def test_bools_keep_their_identity_across_a_delete(self):
+        self._run(
+            "d = {True: 5, False: 6}\ndel d[False]\n"
+            "for k in d:\n    print(k)\n"
+            "e = {5: True, 3: False, 9: True}\ndel e[3]\n"
+            "for k, v in e.items():\n    print(k, v)\n"
+        )
+
+    def test_deleting_a_float_value_from_a_function(self):
+        self._run(
+            "d = {5: 1.5, 3: -0.25, 9: 0.0}\n"
+            "def drop(k):\n    del d[k]\n"
+            "drop(3)\ndel d[9]\n"
+            "for k, v in d.items():\n    print(k, v)\n"
+        )
+
+    def test_a_long_mixed_run_of_inserts_and_deletes(self):
+        # A deterministic pseudo-random walk: the point is that the table stays
+        # in step with CPython's dict over thousands of operations, not that
+        # any one of them is interesting.
+        self._run(
+            "d: dict[int, int] = {}\nseed = 1\ni = 0\n"
+            "while i < 600:\n"
+            "    seed = (seed * 1103515245 + 12345) % 2147483648\n"
+            "    key = seed % 64\n"
+            "    if seed % 3 == 0:\n"
+            "        if key in d:\n            del d[key]\n"
+            "    else:\n        d[key] = i\n"
+            "    i += 1\n"
+            "print(len(d))\n"
+            "for k in d:\n    print(k, d[k])\n"
+        )
+
+    def test_a_key_deleted_by_a_non_constant_expression(self):
+        self._run(
+            "n = 0\nfor i in range(0, 3):\n    n += 1\n"
+            "d = {3: 1, 4: 2}\ndel d[n]\n"
+            "print(len(d), 3 in d, 4 in d)\n"
+        )
+
+    def test_deleting_a_key_of_the_wrong_kind_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "y.py"
+            entry.write_text(
+                'd = {"a": 1}\ndel d[1]\nprint(len(d))\n', encoding="utf-8"
+            )
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "y.bin", "darwin-arm64", clean=True)
+            self.assertIn("this dict has str keys", str(caught.exception))
 
 
 class NativeExceptionTests(unittest.TestCase):

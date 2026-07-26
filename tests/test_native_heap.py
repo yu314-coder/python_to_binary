@@ -1298,10 +1298,21 @@ class DeleteListElementTests(unittest.TestCase):
             b"2 4 5\n",
         )
 
-    def test_del_on_a_dict_is_rejected_by_name(self):
+    def test_one_del_statement_taking_a_dict_key_and_a_list_element(self):
+        # Python evaluates the targets left to right, and the two kinds of
+        # target are lowered by different code; one statement drives both.
+        self._run(
+            "d = {5: 1.5, 3: -0.25, 9: 0.0}\nxs = [1, 2, 3]\n"
+            "del d[9], xs[0]\n"
+            "for k, v in d.items():\n    print(k, v)\n"
+            "print(len(xs), xs[0])\n",
+            b"5 1.5\n3 -0.25\n2 2\n",
+        )
+
+    def test_del_on_a_dict_slice_is_rejected_by_name(self):
         self._reject(
-            "d = {}\nd[1] = 2\ndel d[1]\nprint(len(d))\n",
-            "the open-addressing table has no tombstone state",
+            "d = {1: 2}\ndel d[0:1]\nprint(len(d))\n",
+            "a slice is unhashable",
         )
 
     def test_del_on_a_name_is_rejected_by_name(self):

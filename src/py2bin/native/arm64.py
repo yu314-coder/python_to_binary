@@ -43,6 +43,7 @@ from .ir import (
     Store,
     Write,
     WriteRuntime,
+    check_stack_slots,
 )
 
 
@@ -84,7 +85,8 @@ def _adr(register: int, distance: int) -> int:
     return 0x10000000 | ((encoded & 3) << 29) | (((encoded >> 2) & 0x7FFFF) << 5) | register
 
 
-def _frame_bytes(stack_slots: int, base: int = 0) -> int:
+def _frame_bytes(stack_slots: int, base: int = 0, owner: str = "this module") -> int:
+    check_stack_slots(stack_slots, owner)
     return (base + stack_slots * 8 + 15) & ~15
 
 
@@ -154,20 +156,54 @@ def _static_address(offset: int) -> list[int]:
     return [*_mov(0, offset), 0x8B000000 | (_STATIC_BASE << 5)]
 
 
-def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> int:
-    offset = slot_base + slot * 8
-    if offset < 0 or offset > 0x7FF8 or offset & 7:
-        # LDR/STR reach 32760 bytes from the frame pointer, so a function has
-        # room for 4095 slots. Every expression that has to be pinned takes
-        # one, and slices and comprehensions take a dozen or more each.
+#: How far the scaled 12-bit immediate of LDR/STR reaches from the frame
+#: pointer. Past this an access needs a base register computed first.
+_SLOT_IMMEDIATE_REACH = 0x7FF8
+
+#: The register a far frame reference computes its base in. X17 is IP1, and
+#: this backend writes it nowhere else: X0 is the expression result, X1 the
+#: temporary, X2-X9 carry call, syscall and shuffle values, X16 is the syscall
+#: number and the indirect-call target, X28 is the static base. So nothing can
+#: be holding a live value in it when a slot is addressed -- which matters most
+#: for ``HeapAlloc``, where X0 and X1 hold the size and the old bump pointer
+#: across three slot accesses, and for a prologue that spills X0-X7 one at a
+#: time. The two words are always emitted adjacently with no branch between
+#: them, so nothing can be scheduled or patched into the middle.
+_SLOT_SCRATCH = 17
+
+
+def _frame_reference(offset: int, encoding: int, rt: int) -> list[int]:
+    """Address ``[x29, #offset]`` with ``encoding``, at any reachable offset.
+
+    Inside the immediate's reach this is the single word it has always been.
+    Past it the high 12 bits of the offset go into X17 with an ADD (immediate,
+    shifted), and the same scaled-immediate form then addresses the remaining
+    low 12 bits off X17. Offsets are always 8-aligned, so the low part is too
+    and the scaled encoding still applies.
+    """
+
+    if offset <= _SLOT_IMMEDIATE_REACH:
+        # Rn=x29 (0x1D) is encoded in bits [9:5].
+        return [encoding | ((offset // 8) << 10) | (29 << 5) | rt]
+    high = offset >> 12
+    if high > 0xFFF:
         raise ValueError(
-            f"ARM64 stack slot at offset {offset} is beyond the {0x7FF8}-byte "
-            "reach of a frame-pointer load; this function needs more than the "
-            "4095 slots the encoding allows, so split it into smaller ones"
+            f"ARM64 frame reference at offset {offset} is beyond the "
+            f"{(0xFFF << 12) + 0xFF8}-byte reach of a frame-pointer address"
         )
-    # ldr/str x<rt>, [x29, #offset]. Rn=x29 (0x1D) is encoded in bits [9:5].
-    base = 0xF9400000 if load else 0xF9000000
-    return base | ((offset // 8) << 10) | (29 << 5) | rt
+    return [
+        # add x17, x29, #high, lsl #12
+        0x91400000 | (high << 10) | (29 << 5) | _SLOT_SCRATCH,
+        encoding | (((offset & 0xFFF) // 8) << 10) | (_SLOT_SCRATCH << 5) | rt,
+    ]
+
+
+def _slot_instruction(load: bool, slot: int, slot_base: int, rt: int = 0) -> list[int]:
+    offset = slot_base + slot * 8
+    if offset < 0 or offset & 7:
+        raise ValueError(f"ARM64 stack slot offset {offset} is not a frame cell")
+    # ldr/str x<rt>, [x29, #offset]
+    return _frame_reference(offset, 0xF9400000 if load else 0xF9000000, rt)
 
 
 def _slot_address(slot: int, slot_base: int) -> list[int]:
@@ -181,13 +217,13 @@ def _slot_address(slot: int, slot_base: int) -> list[int]:
     return [*_mov(0, offset), 0x8B0003A0]  # mov x0, #offset; add x0, x29, x0
 
 
-def _float_slot_instruction(load: bool, slot: int, slot_base: int) -> int:
+def _float_slot_instruction(load: bool, slot: int, slot_base: int) -> list[int]:
     """Load or store a double between stack slot ``slot`` and D0."""
     offset = slot_base + slot * 8
-    if offset < 0 or offset > 0x7FF8 or offset & 7:
-        raise ValueError("ARM64 native variable is outside stack-slot range")
-    base = 0xFD4003A0 if load else 0xFD0003A0  # ldr/str d0, [x29, #offset]
-    return base | ((offset // 8) << 10)
+    if offset < 0 or offset & 7:
+        raise ValueError(f"ARM64 stack slot offset {offset} is not a frame cell")
+    # ldr/str d0, [x29, #offset]
+    return _frame_reference(offset, 0xFD400000 if load else 0xFD000000, 0)
 
 
 def _condition_code(operator: str) -> int:
@@ -393,7 +429,7 @@ def _expression(
         words.extend(_mov(0, expression.value))
         return
     if isinstance(expression, IntLoad):
-        words.append(_slot_instruction(True, expression.slot, slot_base))
+        words.extend(_slot_instruction(True, expression.slot, slot_base))
         return
     if isinstance(expression, SlotAddress):
         words.extend(_slot_address(expression.slot, slot_base))
@@ -545,7 +581,7 @@ def _float_expression(
         words.append(0x9E670000)  # fmov d0, x0
         return
     if isinstance(expression, FloatLoad):
-        words.append(_float_slot_instruction(True, expression.slot, slot_base))
+        words.extend(_float_slot_instruction(True, expression.slot, slot_base))
         return
     if isinstance(expression, IntToFloat):
         _expression(words, expression.value, slot_base, refs)
@@ -733,7 +769,7 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 words.extend(_mov(2, 0x3000))  # MEM_COMMIT | MEM_RESERVE
                 words.extend(_mov(3, 4))  # PAGE_READWRITE
                 call("VirtualAlloc")
-                words.append(_slot_instruction(False, operation.slot, slot_base))
+                words.extend(_slot_instruction(False, operation.slot, slot_base))
                 # A failed reservation returns NULL. Every later heap access
                 # would then write through 0, so stop instead of running on.
                 branch_at = len(words)
@@ -748,14 +784,14 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 # Pure slot arithmetic, identical to the POSIX encoder: the
                 # bump pointer moves and the old value is the allocation.
                 _expression(words, operation.size, slot_base, refs)
-                words.append(
+                words.extend(
                     _slot_instruction(True, operation.bump_slot, slot_base, rt=1)
                 )
-                words.append(
+                words.extend(
                     _slot_instruction(False, operation.dest_slot, slot_base, rt=1)
                 )
                 words.append(0x8B000020)  # add x0, x1, x0  (new bump)
-                words.append(_slot_instruction(False, operation.bump_slot, slot_base))
+                words.extend(_slot_instruction(False, operation.bump_slot, slot_base))
                 continue
             if isinstance(operation, WriteRuntime):
                 # Same WriteFile sequence the constant Write below uses; only
@@ -799,10 +835,10 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 call("WriteFile")
             elif isinstance(operation, Store):
                 _expression(words, operation.value, slot_base, refs)
-                words.append(_slot_instruction(False, operation.slot, slot_base))
+                words.extend(_slot_instruction(False, operation.slot, slot_base))
             elif isinstance(operation, FloatStore):
                 _float_expression(words, operation.value, slot_base, refs)
-                words.append(_float_slot_instruction(False, operation.slot, slot_base))
+                words.extend(_float_slot_instruction(False, operation.slot, slot_base))
             elif isinstance(operation, Label):
                 labels[operation.name] = len(words)
             elif isinstance(operation, Jump):
@@ -830,12 +866,12 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         if function.name in offsets:
             raise ValueError(f"duplicate native IR function {function.name!r}")
         offsets[function.name] = len(words)
-        frame = _frame_bytes(function.stack_slots, 16)
+        frame = _frame_bytes(function.stack_slots, 16, f"function {function.name!r}")
         words.extend(_frame_sub(frame))
         words.append(0xA9007BFD)  # stp x29, x30, [sp]
         words.append(0x910003FD)  # mov x29, sp
         for index in range(function.parameters):
-            words.append(_slot_instruction(False, index, 16, index))
+            words.extend(_slot_instruction(False, index, 16, index))
         epilogue = (
             0xA9407BFD,  # ldp x29, x30, [sp]
             *_frame_add(frame),
@@ -931,14 +967,14 @@ def _emit_operations(
             words.extend(_mov(5, 0))
             words.extend(_mov(syscall_register, system.mmap_number))
             words.append(system.svc)
-            words.append(_slot_instruction(False, operation.slot, slot_base))
+            words.extend(_slot_instruction(False, operation.slot, slot_base))
             continue
         if isinstance(operation, HeapAlloc):
             _expression(words, operation.size, slot_base, refs)  # x0 = size
-            words.append(_slot_instruction(True, operation.bump_slot, slot_base, rt=1))
-            words.append(_slot_instruction(False, operation.dest_slot, slot_base, rt=1))
+            words.extend(_slot_instruction(True, operation.bump_slot, slot_base, rt=1))
+            words.extend(_slot_instruction(False, operation.dest_slot, slot_base, rt=1))
             words.append(0x8B000020)  # add x0, x1, x0  (new bump)
-            words.append(_slot_instruction(False, operation.bump_slot, slot_base))
+            words.extend(_slot_instruction(False, operation.bump_slot, slot_base))
             continue
         if isinstance(operation, HeapStore):
             _expression(words, operation.address, slot_base, refs)  # x0 = address
@@ -970,10 +1006,10 @@ def _emit_operations(
             words.append(system.svc)
         elif isinstance(operation, Store):
             _expression(words, operation.value, slot_base, refs)
-            words.append(_slot_instruction(False, operation.slot, slot_base))
+            words.extend(_slot_instruction(False, operation.slot, slot_base))
         elif isinstance(operation, FloatStore):
             _float_expression(words, operation.value, slot_base, refs)
-            words.append(_float_slot_instruction(False, operation.slot, slot_base))
+            words.extend(_float_slot_instruction(False, operation.slot, slot_base))
         elif isinstance(operation, Label):
             labels[operation.name] = len(words)
         elif isinstance(operation, Jump):
@@ -1025,24 +1061,19 @@ def _emit_function(
         raise ValueError(
             f"ARM64 function {function.name!r} has fewer stack slots than parameters"
         )
-    frame = _frame_bytes(function.stack_slots, 16)
+    frame = _frame_bytes(function.stack_slots, 16, f"function {function.name!r}")
     words.extend(_frame_sub(frame))
     words.append(0xA9007BFD)  # stp x29, x30, [sp]   (save the CALLER's frame)
     words.append(0x910003FD)  # mov x29, sp
     for index in range(min(function.parameters, ARM64_ARGUMENT_REGISTERS)):
         # Spill the incoming argument registers into the slots the body reads.
-        words.append(_slot_instruction(False, index, 16, rt=index))
+        words.extend(_slot_instruction(False, index, 16, rt=index))
     # Arguments past the eighth arrived in memory, immediately above this
     # frame: the caller left them at its own sp, which is x29 + frame here.
     for index in range(ARM64_ARGUMENT_REGISTERS, function.parameters):
         incoming = frame + (index - ARM64_ARGUMENT_REGISTERS) * 8
-        if incoming > 0x7FF8:
-            raise ValueError(
-                f"ARM64 function {function.name!r} has an incoming argument "
-                "outside addressable range"
-            )
-        words.append(0xF94003A0 | ((incoming // 8) << 10))  # ldr x0, [x29, #in]
-        words.append(_slot_instruction(False, index, 16))
+        words.extend(_frame_reference(incoming, 0xF9400000, 0))  # ldr x0, [x29, #in]
+        words.extend(_slot_instruction(False, index, 16))
     _emit_operations(
         words, function.operations, 16, refs, system, in_function=True
     )
