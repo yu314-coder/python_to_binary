@@ -346,6 +346,16 @@ class NativeCompileError(ValueError):
         super().__init__(f"{path}:{line}:{column}: {message}")
 
 
+class NotConstant(NativeCompileError):
+    """The catch-all "this simply is not a constant" rejection.
+
+    Every runtime expression raises it, so it says nothing about what is wrong
+    and must never be what a caller reports after also trying a runtime path.
+    A subclass rather than a flag, so that every existing
+    ``except NativeCompileError`` still catches it and no control flow moves.
+    """
+
+
 @dataclass(slots=True)
 class NativeFunction:
     """One Python function eligible for expression or imperative IR inlining."""
@@ -387,14 +397,19 @@ class NativeClass:
 
     name: str
     path: Path
+    # A subclass repeats its base's fields first, in the base's own order, so
+    # one inherited method body reads the same offsets on either class.
     fields: tuple[str, ...]
     initializer: NativeFunction | None
+    # Already merged with the base's methods at definition time, the subclass
+    # winning, so no lookup anywhere else has to walk a chain.
     methods: dict[str, NativeFunction]
     # A field is an integer unless __init__ annotates it `float`. The slot is
     # eight bytes either way, so a float lives there as its bit pattern; the
     # annotation is how the layout learns which it is, since the type of the
     # value assigned there depends on the arguments at each call site.
     field_kinds: dict[str, str] = dataclass_field(default_factory=dict)
+    base: str | None = None
 
     @property
     def size(self) -> int:
@@ -402,6 +417,202 @@ class NativeClass:
 
     def offset(self, field: str) -> int:
         return self.fields.index(field) * 8
+
+
+def method_display_name(owner: str, method: str) -> str:
+    """How a method should be named in a message the user reads.
+
+    The rewritten `super().__init__` has a private key that appears nowhere in
+    the source, so reporting it verbatim would name something the user never
+    wrote. Show it as what they did write.
+    """
+
+    if method.startswith("<") and method.endswith(".__init__>"):
+        return "super().__init__"
+    return f"{owner}.{method}"
+
+
+def super_init_key(base: str) -> str:
+    """The private method name a rewritten ``super().__init__`` calls.
+
+    The angle brackets keep it out of the identifier space a program can
+    write, so it can never collide with a real method or be called directly.
+    """
+
+    return f"<{base}.__init__>"
+
+
+def super_init_call(statement: ast.stmt) -> ast.Call | None:
+    """``super().__init__(...)`` used as a bare statement, or None."""
+
+    if not isinstance(statement, ast.Expr):
+        return None
+    call = statement.value
+    if not isinstance(call, ast.Call):
+        return None
+    attribute = call.func
+    if not (isinstance(attribute, ast.Attribute) and attribute.attr == "__init__"):
+        return None
+    inner = attribute.value
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "super"
+        and not inner.args
+        and not inner.keywords
+    ):
+        return None
+    return call
+
+
+_FORMAT_ALIGNMENTS = "<>=^"
+_FORMAT_DIGITS = "0123456789"
+# Fixed-point digits are generated into a fixed scratch buffer that is written
+# without a bound check, and the padding of one field is allocated out of the
+# arena, so both are capped here rather than trusted.
+_FORMAT_MAX_PRECISION = 100
+_FORMAT_MAX_WIDTH = 1000
+_FORMAT_SUPPORTED = (
+    "a native f-string format specifier is "
+    "[[fill]align][sign][0][width][,][.precision][type] with align one of "
+    "<>=^, type one of d, f, s or omitted, width up to "
+    f"{_FORMAT_MAX_WIDTH} and precision up to {_FORMAT_MAX_PRECISION}"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FormatSpec:
+    """A parsed and kind-checked ``format()`` mini-language specifier."""
+
+    fill: bytes
+    align: str
+    sign: str
+    width: int
+    grouping: bool
+    precision: int | None
+    type: str
+
+
+def parse_format_spec(text: str, kind: str) -> FormatSpec:
+    """Parse a literal format specifier, or raise ValueError explaining why not.
+
+    Only the part of the mini-language the native renderers reproduce exactly
+    is accepted. Everything else is refused here rather than approximated,
+    because a format that is close is indistinguishable from one that is right
+    until someone reads the output.
+    """
+
+    index = 0
+    fill = ""
+    align = ""
+    if len(text) >= 2 and text[1] in _FORMAT_ALIGNMENTS:
+        fill, align, index = text[0], text[1], 2
+    elif text and text[0] in _FORMAT_ALIGNMENTS:
+        align, index = text[0], 1
+    sign = "-"
+    signed = text[index : index + 1] in ("+", "-", " ")
+    if signed:
+        sign, index = text[index], index + 1
+    if text[index : index + 1] in ("z", "#"):
+        raise ValueError(
+            f"the {text[index]!r} flag is not supported; {_FORMAT_SUPPORTED}"
+        )
+    zero = text[index : index + 1] == "0"
+    if zero:
+        index += 1
+    start = index
+    while index < len(text) and text[index] in _FORMAT_DIGITS:
+        index += 1
+    width = int(text[start:index]) if index > start else 0
+    grouping = False
+    if text[index : index + 1] == "_":
+        raise ValueError(f"the '_' separator is not supported; {_FORMAT_SUPPORTED}")
+    if text[index : index + 1] == ",":
+        grouping, index = True, index + 1
+    precision: int | None = None
+    if text[index : index + 1] == ".":
+        index += 1
+        start = index
+        while index < len(text) and text[index] in _FORMAT_DIGITS:
+            index += 1
+        if index == start:
+            raise ValueError(f"the precision has no digits; {_FORMAT_SUPPORTED}")
+        precision = int(text[start:index])
+    type_code = text[index:]
+    if len(type_code) > 1 or (type_code and type_code not in "dfs"):
+        raise ValueError(
+            f"format type {type_code!r} is not supported; {_FORMAT_SUPPORTED}"
+        )
+
+    allowed = {"str": ("", "s"), "int": ("", "d", "f"), "float": ("", "f")}[kind]
+    if type_code not in allowed:
+        raise ValueError(
+            f"format type {type_code!r} is not supported for "
+            f"{'an' if kind[0] in 'aeiou' else 'a'} {kind}; "
+            f"{_FORMAT_SUPPORTED}"
+        )
+    if kind == "str":
+        if signed:
+            raise ValueError("a sign is not allowed in a string format specifier")
+        if align == "=" or zero:
+            raise ValueError(
+                "'=' alignment, and the zero flag that implies it, are not "
+                "allowed in a string format specifier"
+            )
+        if grouping:
+            raise ValueError(
+                "a thousands separator is not allowed in a string format specifier"
+            )
+        if precision is not None:
+            raise ValueError(
+                "a precision truncates a string, which is not supported; "
+                f"{_FORMAT_SUPPORTED}"
+            )
+    else:
+        if precision is not None and type_code != "f":
+            raise ValueError(
+                f"a precision is only supported with format type 'f'; "
+                f"{_FORMAT_SUPPORTED}"
+            )
+        if grouping and (kind != "int" or type_code == "f"):
+            raise ValueError(
+                "a thousands separator is only supported for an integer "
+                f"rendered as an integer; {_FORMAT_SUPPORTED}"
+            )
+        if grouping and (zero or align == "="):
+            # The padding zeros themselves get separators, which needs a
+            # digit-position calculation the renderer does not do.
+            raise ValueError(
+                "a thousands separator combined with zero or '=' padding is "
+                f"not supported; {_FORMAT_SUPPORTED}"
+            )
+    if type_code == "f" and precision is None:
+        precision = 6
+    if precision is not None and precision > _FORMAT_MAX_PRECISION:
+        raise ValueError(
+            f"a precision above {_FORMAT_MAX_PRECISION} is not supported"
+        )
+    if width > _FORMAT_MAX_WIDTH:
+        raise ValueError(f"a width above {_FORMAT_MAX_WIDTH} is not supported")
+
+    if not fill:
+        # A bare zero flag pads with zeros between the sign and the digits, but
+        # an explicit fill or alignment keeps its own meaning and only the
+        # width survives.
+        fill = "0" if zero else " "
+        if not align and zero:
+            align = "="
+    if not align:
+        align = "<" if kind == "str" else ">"
+    return FormatSpec(
+        fill=fill.encode("utf-8"),
+        align=align,
+        sign=sign,
+        width=width,
+        grouping=grouping,
+        precision=precision,
+        type=type_code,
+    )
 
 
 class _SubstituteLocals(ast.NodeTransformer):
@@ -1067,17 +1278,11 @@ class Frontend:
                 node,
                 "native classes must be undecorated and take no class keywords",
             )
-        for base in node.bases:
-            if not (isinstance(base, ast.Name) and base.id == "object"):
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "native classes do not support inheritance; only a bare "
-                    "class or an explicit 'object' base is supported",
-                )
+        base = self.class_base(node)
         previous_functions = self.functions
         self.functions = dict(previous_functions)
         methods: dict[str, NativeFunction] = {}
+        super_called = False
         try:
             for statement in node.body:
                 if isinstance(statement, ast.Pass):
@@ -1101,7 +1306,12 @@ class Frontend:
                         "native methods cannot be decorated, so properties, "
                         "classmethod, and staticmethod are not supported",
                     )
-                self.function_definition(statement)
+                prepared, called_super = self.prepare_method(statement, base)
+                if statement.name == "__init__":
+                    # A redefined __init__ replaces the earlier one, so the
+                    # last definition is the one whose super() call counts.
+                    super_called = called_super
+                self.function_definition(prepared)
                 method = self.functions[statement.name]
                 if not method.parameters or method.parameters[0] != "self":
                     raise NativeCompileError(
@@ -1113,7 +1323,7 @@ class Frontend:
                 methods[statement.name] = method
         finally:
             self.functions = previous_functions
-        initializer = methods.pop("__init__", None)
+        own_initializer = methods.pop("__init__", None)
         for name in methods:
             # __enter__/__exit__ are resolved at build time by `with`, so they
             # need no run-time protocol; the rest still have none.
@@ -1125,13 +1335,141 @@ class Frontend:
                     node,
                     f"native classes do not implement the special method {name}()",
                 )
-        fields, field_kinds = self.discover_fields(node, initializer)
+        fields, field_kinds = self.discover_fields(
+            node, own_initializer, base, super_called
+        )
+        initializer = own_initializer
+        if base is not None:
+            if initializer is None:
+                initializer = base.initializer
+            if super_called and base.initializer is not None:
+                methods[super_init_key(base.name)] = base.initializer
+            # The subclass's own entries overwrite the base's, which is what
+            # makes an override win everywhere the base's name would resolve.
+            methods = {**base.methods, **methods}
+        # An attribute and a method are looked up by two different paths, each
+        # of which finds its own name first, so a name that is both would
+        # resolve to whichever path the expression happens to take. CPython has
+        # one namespace and the attribute shadows the method, making the call a
+        # TypeError; refuse rather than answer from the wrong path. Inheritance
+        # is what makes this an ordinary accident instead of an obvious one.
+        collisions = sorted(set(fields) & {
+            name for name in methods if not name.startswith("<")
+        })
+        if collisions:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{node.name!r} has {collisions[0]!r} as both an attribute and "
+                "a method; they are looked up by different paths here, so one "
+                "name cannot be both",
+            )
         self.classes[node.name] = NativeClass(
-            node.name, self.path, fields, initializer, methods, field_kinds
+            node.name,
+            self.path,
+            fields,
+            initializer,
+            methods,
+            field_kinds,
+            base.name if base is not None else None,
         )
 
+    def class_base(self, node: ast.ClassDef) -> NativeClass | None:
+        """Resolve the single base class of ``node``, or None for a root class."""
+
+        if len(node.bases) > 1:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native classes support only single inheritance",
+            )
+        if not node.bases:
+            return None
+        base = node.bases[0]
+        if isinstance(base, ast.Name) and base.id == "object":
+            return None
+        if isinstance(base, ast.Name) and base.id in self.classes:
+            return self.classes[base.id]
+        name = base.id if isinstance(base, ast.Name) else ast.unparse(base)
+        raise NativeCompileError(
+            self.path,
+            node,
+            f"native base class {name!r} must be a class defined earlier in "
+            "this module",
+        )
+
+    def prepare_method(
+        self, statement: ast.FunctionDef, base: NativeClass | None
+    ) -> tuple[ast.FunctionDef, bool]:
+        """Rewrite ``super().__init__(...)`` and reject every other ``super()``.
+
+        The base initializer is registered as an ordinary method under a
+        private name, so the existing method-inlining path does all the work:
+        ``self`` binds to the subclass instance, and because the base's fields
+        occupy the same leading slots there, its assignments land correctly.
+        Nothing else needs a notion of a base class at a call site.
+        """
+
+        prepared = copy.deepcopy(statement)
+        called_super = False
+        if statement.name == "__init__" and base is not None:
+            body: list[ast.stmt] = []
+            for inner in prepared.body:
+                call = super_init_call(inner)
+                if call is None:
+                    body.append(inner)
+                    continue
+                if called_super:
+                    raise NativeCompileError(
+                        self.path,
+                        inner,
+                        "native __init__ may call super().__init__() only once",
+                    )
+                called_super = True
+                if base.initializer is None:
+                    if call.args or call.keywords:
+                        raise NativeCompileError(
+                            self.path,
+                            inner,
+                            f"{base.name} defines no __init__, so "
+                            "super().__init__() accepts no arguments",
+                        )
+                    continue  # object.__init__(self) does nothing.
+                body.append(
+                    ast.copy_location(
+                        ast.Expr(
+                            ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id="self", ctx=ast.Load()),
+                                    attr=super_init_key(base.name),
+                                    ctx=ast.Load(),
+                                ),
+                                args=call.args,
+                                keywords=call.keywords,
+                            )
+                        ),
+                        inner,
+                    )
+                )
+            prepared.body = body or [ast.copy_location(ast.Pass(), prepared)]
+            ast.fix_missing_locations(prepared)
+        for inner_node in ast.walk(prepared):
+            if isinstance(inner_node, ast.Name) and inner_node.id == "super":
+                raise NativeCompileError(
+                    self.path,
+                    inner_node,
+                    "native super() is supported only as a bare "
+                    "super().__init__(...) statement written directly in the "
+                    "__init__ of a class that has a base class",
+                )
+        return prepared, called_super
+
     def discover_fields(
-        self, node: ast.ClassDef, initializer: NativeFunction | None
+        self,
+        node: ast.ClassDef,
+        initializer: NativeFunction | None,
+        base: NativeClass | None = None,
+        super_called: bool = False,
     ) -> tuple[tuple[str, ...], dict[str, str]]:
         """Derive the instance layout from ``self.NAME = ...`` in ``__init__``.
 
@@ -1139,10 +1477,16 @@ class Frontend:
         complete, statically known layout. An attribute first assigned anywhere
         else would have no reserved storage, so it is rejected rather than
         silently writing outside the object.
+
+        ``initializer`` is the class's *own* ``__init__``. Inherited fields keep
+        the base's order at the front of the layout, ahead of anything the
+        subclass adds, so a base method reads the same slot on either class.
         """
 
+        inherited = base.fields if base is not None else ()
+        inherited_kinds = dict(base.field_kinds) if base is not None else {}
         if initializer is None:
-            return (), {}
+            return inherited, inherited_kinds
 
         kinds: dict[str, str] = {}
 
@@ -1174,11 +1518,13 @@ class Frontend:
 
         # Only assignments directly in the __init__ body always run, so only
         # those reserve a layout slot.
-        fields = assigned_attributes(initializer.body)
+        own = assigned_attributes(initializer.body)
         every = assigned_attributes(
             ast.walk(ast.Module(body=list(initializer.body), type_ignores=[]))
         )
-        conditional = [name for name in every if name not in fields]
+        conditional = [
+            name for name in every if name not in own and name not in inherited
+        ]
         if conditional:
             raise NativeCompileError(
                 self.path,
@@ -1189,11 +1535,40 @@ class Frontend:
                 "for one that was never set and the native layout cannot "
                 "represent an absent attribute",
             )
+        if not super_called:
+            # Without super().__init__(), the base's body never runs, so
+            # Python would leave these attributes absent; a zero-filled slot
+            # would answer 0 where CPython raises AttributeError.
+            missing = [name for name in inherited if name not in own]
+            if missing:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{node.name}.__init__() does not assign inherited "
+                    f"attribute {missing[0]!r}; call super().__init__(...) "
+                    "there or assign it directly, because a native attribute "
+                    "must be assigned unconditionally",
+                )
+        wording = {"int": "an integer", "float": "a float"}
+        for name in inherited:
+            base_kind = inherited_kinds.get(name, "int")
+            own_kind = kinds.get(name, base_kind)
+            if own_kind != base_kind:
+                assert base is not None
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"inherited attribute {name!r} is {wording[base_kind]} in "
+                    f"{base.name} but {wording[own_kind]} in {node.name}; one "
+                    "slot cannot be both",
+                )
+        kinds.update(inherited_kinds)
+        fields = (*inherited, *(name for name in own if name not in inherited))
         if len(fields) > 1024:
             raise NativeCompileError(
                 self.path, node, "native classes support at most 1024 attributes"
             )
-        return tuple(fields), kinds
+        return fields, kinds
 
     def resolve_object_class(self, node: ast.expr) -> NativeClass | None:
         """Return the class of an object-valued expression, if it is known."""
@@ -1238,6 +1613,20 @@ class Frontend:
         ) else IntLoad(self.slots[node.value.id])
         return IntBinary("add", pointer, IntConstant(offset))
 
+    def classes_are_related(self, first: str, second: str) -> bool:
+        """True when one of the two class names inherits from the other."""
+
+        def ancestry(name: str) -> set[str]:
+            seen: set[str] = set()
+            current: str | None = name
+            while current is not None and current not in seen:
+                seen.add(current)
+                found = self.classes.get(current)
+                current = found.base if found is not None else None
+            return seen
+
+        return second in ancestry(first) or first in ancestry(second)
+
     def object_assignment(self, name: str, node: ast.expr) -> None:
         """Construct an instance and bind it to ``name``."""
 
@@ -1251,11 +1640,22 @@ class Frontend:
             )
         previous = self.object_classes.get(name)
         if previous is not None and previous != native_class.name:
+            detail = ""
+            if self.classes_are_related(previous, native_class.name):
+                # Assigning a subclass to a name already holding its base is
+                # the one case Python allows, and it is exactly the case a
+                # vtable would be needed for: there is none, so a method call
+                # would resolve to whichever class the name was declared with.
+                detail = (
+                    "; a base and its subclass are still different classes "
+                    "here, because native method calls resolve at build time "
+                    "from the class of the variable"
+                )
             raise NativeCompileError(
                 self.path,
                 node,
                 f"native object variable {name!r} cannot change class from "
-                f"{previous} to {native_class.name}",
+                f"{previous} to {native_class.name}{detail}",
             )
         bump = self.ensure_heap()
         self.runtime_names.add(name)
@@ -1324,7 +1724,7 @@ class Frontend:
 
         argument_kinds: list[str] = []
         arguments = self.bind_native_arguments(
-            f"{native_class.name}.{method_name}",
+            method_display_name(native_class.name, method_name),
             method,
             node,
             {},
@@ -1333,7 +1733,7 @@ class Frontend:
             kinds=argument_kinds,
         )
         return self.inline_imperative_function(
-            f"{native_class.name}.{method_name}",
+            method_display_name(native_class.name, method_name),
             method,
             (instance, *arguments),
             node,
@@ -4037,21 +4437,164 @@ class Frontend:
                 raise NativeCompileError(
                     self.path, node, "unsupported native f-string component"
                 )
-            if piece.conversion != -1:
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "native f-strings do not support !r, !s, or !a conversions",
-                )
-            if piece.format_spec is not None:
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "native f-strings do not support format specifiers yet; "
-                    "a width or precision needs a formatter beyond str()",
-                )
-            result = self.emit_concat(result, self.render_as_string(piece.value))
+            result = self.emit_concat(result, self.render_formatted(piece))
         return result
+
+    def format_spec_text(self, piece: ast.FormattedValue) -> str:
+        """The literal text of a field's format specifier, or the empty string."""
+
+        spec = piece.format_spec
+        if spec is None:
+            return ""
+        parts: list[str] = []
+        if not isinstance(spec, ast.JoinedStr):
+            raise NativeCompileError(
+                self.path,
+                spec,
+                "native f-strings need a format specifier written out in the "
+                "source; this one is built at run time",
+            )
+        for item in spec.values:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                parts.append(item.value)
+            else:
+                raise NativeCompileError(
+                    self.path,
+                    piece,
+                    "a native f-string format specifier has to be literal text; "
+                    f"{_FORMAT_SUPPORTED}",
+                )
+        return "".join(parts)
+
+    def render_formatted(self, piece: ast.FormattedValue) -> IntExpression:
+        """A pointer to the text one f-string field produces."""
+
+        node = piece.value
+        spec_text = self.format_spec_text(piece)
+        if piece.conversion == -1 and not spec_text:
+            return self.render_as_string(node)
+
+        kind = self.expression_type(node)
+        if kind not in ("int", "float", "str"):
+            raise NativeCompileError(
+                self.path, node, f"a native f-string cannot render a {kind} yet"
+            )
+        body: IntExpression | None = None
+        if piece.conversion != -1:
+            if kind == "str" and piece.conversion != ord("s"):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "!r and !a on a string add quotes and backslash escapes, "
+                    "which a native f-string does not reproduce; only !s is "
+                    "supported on a string",
+                )
+            if piece.conversion not in (ord("s"), ord("r"), ord("a")):
+                raise NativeCompileError(
+                    self.path, node, "unsupported native f-string conversion"
+                )
+            # On an int, a float, or a bool all three conversions produce the
+            # same text str() does, and the field is then a string - which
+            # changes the default alignment, so the kind changes with it.
+            body = self.render_as_string(node)
+            kind = "str"
+        try:
+            spec = parse_format_spec(spec_text, kind)
+        except ValueError as error:
+            raise NativeCompileError(self.path, node, str(error)) from error
+
+        if body is not None:
+            return self.emit_padded_field(None, body, spec)
+        if kind == "str":
+            return self.emit_padded_field(None, self.string_pointer(node), spec)
+        if spec.type == "f":
+            # An int formatted as a fixed-point number goes through the double,
+            # which is what CPython does too, so the whole i64 range matches.
+            magnitude, negative = self.emit_float_fixed(
+                self.float_expression(node), spec.precision or 0
+            )
+        elif kind == "float":
+            magnitude, negative = self.emit_split_sign(
+                self.emit_float_to_string(self.float_expression(node))
+            )
+        else:
+            magnitude, negative = self.emit_split_sign(
+                self.emit_int_to_string(self.integer(node))
+            )
+            if spec.grouping:
+                magnitude = self.emit_group_digits(magnitude)
+        return self.emit_padded_field((negative, spec.sign), magnitude, spec)
+
+    def emit_padded_field(
+        self,
+        sign: tuple[int, str] | None,
+        body: IntExpression,
+        spec: FormatSpec,
+    ) -> IntExpression:
+        """Put the sign in front of a rendered field and pad it to the width.
+
+        The sign is kept apart from the digits because '=' alignment - which a
+        bare zero flag selects - puts the fill between them.
+        """
+
+        body_slot = self.new_temp()
+        self.operations.append(Store(body_slot, body))
+        body = IntLoad(body_slot)
+        prefix: IntExpression | None = None
+        if sign is not None:
+            negative_slot, flag = sign
+            unsigned = {"+": b"+", " ": b" ", "-": b""}[flag]
+            prefix = self.materialize_int(
+                self.select_integer(
+                    IntCompare("ne", IntLoad(negative_slot), IntConstant(0)),
+                    self.materialize_string_constant(b"-"),
+                    self.materialize_string_constant(unsigned),
+                )
+            )
+        if spec.width == 0:
+            return body if prefix is None else self.emit_concat(prefix, body)
+
+        # A width counts code points, not bytes, and the fill may be a
+        # multi-byte character of its own.
+        width_used = self.emit_code_point_count(body)
+        if prefix is not None:
+            width_used = IntBinary("add", HeapLoad(prefix, 8), width_used)
+        pad_slot = self.new_temp()
+        self.operations.append(
+            Store(pad_slot, IntBinary("sub", IntConstant(spec.width), width_used))
+        )
+        self.operations.append(
+            Store(
+                pad_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(pad_slot), IntConstant(0)),
+                    IntLoad(pad_slot),
+                    IntConstant(0),
+                ),
+            )
+        )
+        pad = IntLoad(pad_slot)
+        if spec.align == "=":
+            filled = self.emit_fill_run(spec.fill, pad)
+            assert prefix is not None
+            return self.emit_concat(self.emit_concat(prefix, filled), body)
+        if spec.align == "^":
+            left_slot = self.new_temp()
+            self.operations.append(
+                Store(left_slot, IntBinary("sdiv", pad, IntConstant(2)))
+            )
+            # The odd character goes on the right, as CPython puts it.
+            head = self.emit_fill_run(spec.fill, IntLoad(left_slot))
+            tail = self.emit_fill_run(
+                spec.fill, IntBinary("sub", pad, IntLoad(left_slot))
+            )
+            middle = body if prefix is None else self.emit_concat(prefix, body)
+            return self.emit_concat(self.emit_concat(head, middle), tail)
+        filled = self.emit_fill_run(spec.fill, pad)
+        middle = body if prefix is None else self.emit_concat(prefix, body)
+        if spec.align == "<":
+            return self.emit_concat(middle, filled)
+        return self.emit_concat(filled, middle)
 
     def render_as_string(self, node: ast.expr) -> IntExpression:
         """A pointer to the text `str()` would produce for this expression."""
@@ -4253,6 +4796,222 @@ class Frontend:
         )
         return IntLoad(result_slot)
 
+    def emit_string_tail(
+        self, pointer: IntExpression, skip: IntExpression
+    ) -> IntExpression:
+        """A copy of a string block with its first ``skip`` bytes dropped."""
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        skip_slot = self.new_temp()
+        length_slot = self.new_temp()
+        result_slot = self.new_temp()
+        self.operations.append(Store(source_slot, pointer))
+        self.operations.append(Store(skip_slot, skip))
+        self.operations.append(
+            Store(
+                length_slot,
+                IntBinary(
+                    "sub", HeapLoad(IntLoad(source_slot), 8), IntLoad(skip_slot)
+                ),
+            )
+        )
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(length_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(length_slot), 8)
+        )
+        self.emit_byte_copy(
+            IntBinary("add", IntLoad(result_slot), IntConstant(8)),
+            IntBinary(
+                "add",
+                IntBinary("add", IntLoad(source_slot), IntConstant(8)),
+                IntLoad(skip_slot),
+            ),
+            IntLoad(length_slot),
+        )
+        return IntLoad(result_slot)
+
+    def emit_split_sign(
+        self, pointer: IntExpression
+    ) -> tuple[IntExpression, int]:
+        """Split a rendered number into its magnitude and a negative flag.
+
+        Both number renderers write a leading minus and nothing else in front
+        of the digits, so the sign can be taken off the text rather than
+        threaded through the renderer. Padding needs them apart: zero fill and
+        '=' alignment go between the sign and the first digit.
+        """
+
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, pointer))
+        source = IntLoad(source_slot)
+        negative_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                negative_slot,
+                self.select_integer(
+                    IntCompare(
+                        "eq",
+                        HeapLoad(IntBinary("add", source, IntConstant(8)), 1),
+                        IntConstant(ord("-")),
+                    ),
+                    IntConstant(1),
+                    IntConstant(0),
+                ),
+            )
+        )
+        return self.emit_string_tail(source, IntLoad(negative_slot)), negative_slot
+
+    def emit_fill_run(self, fill: bytes, count: IntExpression) -> IntExpression:
+        """A string block holding ``count`` copies of one literal character."""
+
+        bump = self.ensure_heap()
+        count_slot = self.new_temp()
+        self.operations.append(Store(count_slot, count))
+        self.operations.append(
+            Store(
+                count_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(count_slot), IntConstant(0)),
+                    IntLoad(count_slot),
+                    IntConstant(0),
+                ),
+            )
+        )
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                length_slot,
+                IntBinary("mul", IntLoad(count_slot), IntConstant(len(fill))),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(length_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(length_slot), 8)
+        )
+        cursor_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                cursor_slot,
+                IntBinary("add", IntLoad(result_slot), IntConstant(8)),
+            )
+        )
+        start = self.new_label("fill_start")
+        end = self.new_label("fill_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(IntCompare("gt", IntLoad(count_slot), IntConstant(0)), end)
+        )
+        for offset, byte in enumerate(fill):
+            self.operations.append(
+                HeapStore(
+                    IntBinary("add", IntLoad(cursor_slot), IntConstant(offset)),
+                    IntConstant(byte),
+                    1,
+                )
+            )
+        self.operations.append(
+            Store(
+                cursor_slot,
+                IntBinary("add", IntLoad(cursor_slot), IntConstant(len(fill))),
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("sub", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return IntLoad(result_slot)
+
+    def emit_group_digits(self, pointer: IntExpression) -> IntExpression:
+        """Insert a comma every three digits, counting from the right."""
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, pointer))
+        digits_slot = self.new_temp()
+        self.operations.append(
+            Store(digits_slot, HeapLoad(IntLoad(source_slot), 8))
+        )
+        total_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                total_slot,
+                IntBinary(
+                    "add",
+                    IntLoad(digits_slot),
+                    IntBinary(
+                        "sdiv",
+                        IntBinary("sub", IntLoad(digits_slot), IntConstant(1)),
+                        IntConstant(3),
+                    ),
+                ),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(total_slot)), bump)
+        )
+        self.operations.append(HeapStore(IntLoad(result_slot), IntLoad(total_slot), 8))
+        read_slot = self.new_temp()
+        write_slot = self.new_temp()
+        run_slot = self.new_temp()
+        self.operations.append(
+            Store(read_slot, IntBinary("sub", IntLoad(digits_slot), IntConstant(1)))
+        )
+        self.operations.append(
+            Store(write_slot, IntBinary("sub", IntLoad(total_slot), IntConstant(1)))
+        )
+        self.operations.append(Store(run_slot, IntConstant(0)))
+        source_data = IntBinary("add", IntLoad(source_slot), IntConstant(8))
+        result_data = IntBinary("add", IntLoad(result_slot), IntConstant(8))
+        start = self.new_label("group_start")
+        end = self.new_label("group_end")
+        plain = self.new_label("group_plain")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(read_slot), IntConstant(0)), end)
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("eq", IntLoad(run_slot), IntConstant(3)), plain)
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result_data, IntLoad(write_slot)),
+                IntConstant(ord(",")),
+                1,
+            )
+        )
+        self.operations.append(
+            Store(write_slot, IntBinary("sub", IntLoad(write_slot), IntConstant(1)))
+        )
+        self.operations.append(Store(run_slot, IntConstant(0)))
+        self.operations.append(Label(plain))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result_data, IntLoad(write_slot)),
+                HeapLoad(IntBinary("add", source_data, IntLoad(read_slot)), 1),
+                1,
+            )
+        )
+        self.operations.append(
+            Store(write_slot, IntBinary("sub", IntLoad(write_slot), IntConstant(1)))
+        )
+        self.operations.append(
+            Store(read_slot, IntBinary("sub", IntLoad(read_slot), IntConstant(1)))
+        )
+        self.operations.append(
+            Store(run_slot, IntBinary("add", IntLoad(run_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        return IntLoad(result_slot)
+
     def emit_byte_copy(
         self,
         destination: IntExpression,
@@ -4323,8 +5082,15 @@ class Frontend:
         except NativeCompileError as constant_error:
             try:
                 runtime_condition = self.integer(node.test)
-            except NativeCompileError:
-                raise constant_error
+            except NativeCompileError as runtime_error:
+                # Every runtime condition fails the fold, so "not a constant"
+                # names nothing that is wrong here; the lowering failure does.
+                # A fold that failed for a specific reason is the exception:
+                # there the fold found the real fault and the integer path only
+                # restates that the expression is out of the subset.
+                if isinstance(constant_error, NotConstant):
+                    raise runtime_error from constant_error
+                raise constant_error from runtime_error
             mutated = self.assigned_names(node.body + node.orelse)
             self.materialize_runtime_names(mutated)
             false_label = self.new_label("if_false")
@@ -5623,9 +6389,12 @@ class Frontend:
     DTOA_BIGNUM_BYTES = 56 * 8
     DTOA_R, DTOA_S, DTOA_MP, DTOA_MM, DTOA_T1, DTOA_T2 = range(6)
     DTOA_DIGITS_OFFSET = 6 * DTOA_BIGNUM_BYTES
-    DTOA_DIGITS_BYTES = 32
+    # repr() never needs more than seventeen digits, but a fixed-point field
+    # does: 1e308 with a hundred decimals is 309 integer digits and a hundred
+    # more, and the buffers are written without a bound check.
+    DTOA_DIGITS_BYTES = 512
     DTOA_TEXT_OFFSET = DTOA_DIGITS_OFFSET + DTOA_DIGITS_BYTES
-    DTOA_TEXT_BYTES = 64
+    DTOA_TEXT_BYTES = 8 + 512
     DTOA_SCRATCH_BYTES = DTOA_TEXT_OFFSET + DTOA_TEXT_BYTES
 
     def ensure_dtoa_scratch(self) -> int:
@@ -6577,6 +7346,343 @@ class Frontend:
         self.operations.append(Label(finish))
         self.operations.append(HeapStore(text, IntLoad(length_slot), 8))
         return text
+
+    def emit_float_fixed(
+        self, value: FloatExpression, precision: int
+    ) -> tuple[IntExpression, int]:
+        """Render ``abs(value)`` with exactly ``precision`` decimals.
+
+        This is not repr() with the tail cut off. CPython rounds the exact
+        binary value, so ``f"{2.675:.2f}"`` is ``2.67``: the double really is
+        2.674999999999999822..., and any shortcut that works from the shortest
+        decimal gets it wrong. The value is therefore held exactly as R/S over
+        the same big integers repr() uses, scaled by a power of ten, and
+        rounded half to even against the remainder.
+
+        Returns the magnitude text and a slot holding one when the sign is
+        negative. The sign is left to the caller because zero padding and '='
+        alignment both put the pad between the sign and the digits.
+        """
+
+        text = self.dtoa_region(self.DTOA_TEXT_OFFSET)
+        digits = self.dtoa_region(self.DTOA_DIGITS_OFFSET)
+        bits_slot = self.new_temp()
+        self.operations.append(Store(bits_slot, FloatBits(value)))
+        bits = IntLoad(bits_slot)
+        length_slot = self.new_temp()
+        self.operations.append(Store(length_slot, IntConstant(0)))
+
+        biased_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                biased_slot,
+                IntBinary(
+                    "and",
+                    IntBinary("rshift", bits, IntConstant(52)),
+                    IntConstant(0x7FF),
+                ),
+            )
+        )
+        fraction_slot = self.new_temp()
+        self.operations.append(
+            Store(fraction_slot, IntBinary("and", bits, IntConstant((1 << 52) - 1)))
+        )
+        negative_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                negative_slot,
+                IntBinary(
+                    "and", IntBinary("rshift", bits, IntConstant(63)), IntConstant(1)
+                ),
+            )
+        )
+        finish = self.new_label("fixed_finish")
+
+        ordinary = self.new_label("fixed_ordinary")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(biased_slot), IntConstant(0x7FF)), ordinary
+            )
+        )
+        infinite = self.new_label("fixed_inf")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(fraction_slot), IntConstant(0)), infinite
+            )
+        )
+        # A NaN prints unsigned even when its sign bit is set.
+        self.operations.append(Store(negative_slot, IntConstant(0)))
+        self.dtoa_append_text(length_slot, b"nan")
+        self.operations.append(Jump(finish))
+        self.operations.append(Label(infinite))
+        self.dtoa_append_text(length_slot, b"inf")
+        self.operations.append(Jump(finish))
+        self.operations.append(Label(ordinary))
+
+        # Zero has no digits to scale, and the scaling loop below would spin
+        # forever on it, so it is laid out directly. Negative zero keeps its
+        # sign, which is already in negative_slot.
+        nonzero = self.new_label("fixed_nonzero")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    IntBinary("or", IntLoad(biased_slot), IntLoad(fraction_slot)),
+                    IntConstant(0),
+                ),
+                nonzero,
+            )
+        )
+        self.dtoa_append_text(length_slot, b"0")
+        if precision > 0:
+            self.dtoa_append_text(length_slot, b"." + b"0" * precision)
+        self.operations.append(Jump(finish))
+        self.operations.append(Label(nonzero))
+
+        significand_slot = self.new_temp()
+        exponent_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                significand_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(biased_slot), IntConstant(0)),
+                    IntLoad(fraction_slot),
+                    IntBinary("or", IntLoad(fraction_slot), IntConstant(1 << 52)),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                exponent_slot,
+                self.select_integer(
+                    IntCompare("eq", IntLoad(biased_slot), IntConstant(0)),
+                    IntConstant(-1074),
+                    IntBinary("sub", IntLoad(biased_slot), IntConstant(1075)),
+                ),
+            )
+        )
+        exponent = IntLoad(exponent_slot)
+        value_shift = self.materialize_int(
+            self.select_integer(
+                IntCompare("gt", exponent, IntConstant(0)), exponent, IntConstant(0)
+            )
+        )
+        scale_shift = self.materialize_int(
+            self.select_integer(
+                IntCompare("lt", exponent, IntConstant(0)),
+                IntUnary("neg", exponent),
+                IntConstant(0),
+            )
+        )
+
+        r = self.bignum(self.DTOA_R)
+        s = self.bignum(self.DTOA_S)
+        t1 = self.bignum(self.DTOA_T1)
+        self.bn_set(r, IntLoad(significand_slot))
+        self.bn_double_times(r, value_shift)
+        self.bn_set(s, IntConstant(1))
+        self.bn_double_times(s, scale_shift)
+
+        # Scale into 1/10 <= R/S < 1, counting where the decimal point lands.
+        # Unlike repr() there are no neighbour margins here: the target is a
+        # fixed number of places, not the shortest string that reads back.
+        point_slot = self.new_temp()
+        self.operations.append(Store(point_slot, IntConstant(0)))
+        up_start = self.new_label("fixed_scale_up")
+        up_end = self.new_label("fixed_scale_up_end")
+        self.operations.append(Label(up_start))
+        high = self.bn_compare(r, s)
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(high), IntConstant(0)), up_end)
+        )
+        self.bn_mul_small(s, IntConstant(10))
+        self.operations.append(
+            Store(point_slot, IntBinary("add", IntLoad(point_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(up_start))
+        self.operations.append(Label(up_end))
+
+        down_start = self.new_label("fixed_scale_down")
+        down_end = self.new_label("fixed_scale_down_end")
+        self.operations.append(Label(down_start))
+        self.bn_copy(t1, r)
+        self.bn_mul_small(t1, IntConstant(10))
+        low = self.bn_compare(t1, s)
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(low), IntConstant(0)), down_end)
+        )
+        self.bn_copy(r, t1)
+        self.operations.append(
+            Store(point_slot, IntBinary("sub", IntLoad(point_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(down_start))
+        self.operations.append(Label(down_end))
+
+        count_slot = self.new_temp()
+        self.operations.append(Store(count_slot, IntConstant(0)))
+        last_slot = self.new_temp()
+        self.operations.append(Store(last_slot, IntConstant(0)))
+        wanted_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                wanted_slot,
+                IntBinary("add", IntLoad(point_slot), IntConstant(precision)),
+            )
+        )
+        laid_out = self.new_label("fixed_layout")
+        # Below half of the last kept place there is nothing to generate and
+        # nothing to round; the answer is all zeros, and the digit loop would
+        # otherwise round up on a remainder that is not a remainder yet.
+        representable = self.new_label("fixed_representable")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(wanted_slot), IntConstant(0)), representable
+            )
+        )
+        self.operations.append(Store(point_slot, IntConstant(-precision)))
+        self.operations.append(Jump(laid_out))
+        self.operations.append(Label(representable))
+
+        generate = self.new_label("fixed_generate")
+        generated = self.new_label("fixed_generated")
+        self.operations.append(Label(generate))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(count_slot), IntLoad(wanted_slot)), generated
+            )
+        )
+        self.bn_mul_small(r, IntConstant(10))
+        digit_slot = self.new_temp()
+        self.operations.append(Store(digit_slot, IntConstant(0)))
+        divide = self.new_label("fixed_divide")
+        divided = self.new_label("fixed_divided")
+        self.operations.append(Label(divide))
+        quotient = self.bn_compare(r, s)
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(quotient), IntConstant(0)), divided)
+        )
+        # R < 10S on entry, so this runs at most nine times: no big division.
+        self.bn_sub(r, s)
+        self.operations.append(
+            Store(digit_slot, IntBinary("add", IntLoad(digit_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(divide))
+        self.operations.append(Label(divided))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", digits, IntLoad(count_slot)), IntLoad(digit_slot), 1
+            )
+        )
+        self.operations.append(Store(last_slot, IntLoad(digit_slot)))
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(generate))
+        self.operations.append(Label(generated))
+
+        # Round half to even against the exact remainder. With no digits at all
+        # the notional last digit is zero, which is even, so a tie rounds down.
+        t2 = self.bignum(self.DTOA_T2)
+        self.bn_copy(t2, r)
+        self.bn_add(t2, r)
+        halfway = self.bn_compare(t2, s)
+        bump_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                bump_slot,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(halfway), IntConstant(0)),
+                    IntConstant(1),
+                    self.select_integer(
+                        IntBinary(
+                            "and",
+                            IntCompare("eq", IntLoad(halfway), IntConstant(0)),
+                            IntBinary("and", IntLoad(last_slot), IntConstant(1)),
+                        ),
+                        IntConstant(1),
+                        IntConstant(0),
+                    ),
+                ),
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(bump_slot), IntConstant(0)), laid_out)
+        )
+        carry_slot = self.new_temp()
+        self.operations.append(
+            Store(carry_slot, IntBinary("sub", IntLoad(count_slot), IntConstant(1)))
+        )
+        carry = self.new_label("fixed_carry")
+        overflow = self.new_label("fixed_carry_overflow")
+        self.operations.append(Label(carry))
+        self.operations.append(
+            JumpIfFalse(IntCompare("ge", IntLoad(carry_slot), IntConstant(0)), overflow)
+        )
+        place = IntBinary("add", digits, IntLoad(carry_slot))
+        raised_slot = self.new_temp()
+        self.operations.append(
+            Store(raised_slot, IntBinary("add", HeapLoad(place, 1), IntConstant(1)))
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(raised_slot), IntConstant(10)),
+                carry + "_settled",
+            )
+        )
+        self.operations.append(HeapStore(place, IntConstant(0), 1))
+        self.operations.append(
+            Store(carry_slot, IntBinary("sub", IntLoad(carry_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(carry))
+        self.operations.append(Label(carry + "_settled"))
+        self.operations.append(HeapStore(place, IntLoad(raised_slot), 1))
+        self.operations.append(Jump(laid_out))
+        self.operations.append(Label(overflow))
+        # Every digit was a nine, so the string grows a leading one. The rest
+        # were zeroed on the way out; only the new last place is fresh.
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", digits, IntLoad(count_slot)), IntConstant(0), 1
+            )
+        )
+        self.operations.append(
+            Store(count_slot, IntBinary("add", IntLoad(count_slot), IntConstant(1)))
+        )
+        self.operations.append(
+            Store(point_slot, IntBinary("add", IntLoad(point_slot), IntConstant(1)))
+        )
+        self.operations.append(HeapStore(digits, IntConstant(1), 1))
+
+        self.operations.append(Label(laid_out))
+        # count - point is the precision, always, which is what makes the
+        # layout a single branch on where the point sits.
+        point = IntLoad(point_slot)
+        count = IntLoad(count_slot)
+        leading = self.new_label("fixed_leading")
+        joined = self.new_label("fixed_joined")
+        self.operations.append(
+            JumpIfFalse(IntCompare("le", point, IntConstant(0)), leading + "_no")
+        )
+        self.operations.append(Jump(leading))
+        self.operations.append(Label(leading + "_no"))
+        self.dtoa_append_digits(length_slot, IntConstant(0), point)
+        if precision > 0:
+            self.dtoa_append_text(length_slot, b".")
+            self.dtoa_append_digits(length_slot, point, count)
+        self.operations.append(Jump(joined))
+        self.operations.append(Label(leading))
+        self.dtoa_append_text(length_slot, b"0")
+        if precision > 0:
+            self.dtoa_append_text(length_slot, b".")
+            self.dtoa_append_repeat(
+                length_slot, IntConstant(ord("0")), IntUnary("neg", point)
+            )
+            self.dtoa_append_digits(length_slot, IntConstant(0), count)
+        self.operations.append(Label(joined))
+
+        self.operations.append(Label(finish))
+        self.operations.append(HeapStore(text, IntLoad(length_slot), 8))
+        return text, negative_slot
 
     def ensure_bool_text(self) -> int:
         """A slot pointing at the string blocks for ``True`` and ``False``.
@@ -7925,6 +9031,16 @@ class Frontend:
             ):
                 operator = operators.get(type(operator_node))
                 if operator is None:
+                    if isinstance(operator_node, (ast.Is, ast.IsNot)):
+                        # A runtime slot holds a number or a pointer, never a
+                        # singleton, so there is no object whose identity this
+                        # could ask about. Answering it would mean guessing.
+                        raise NativeCompileError(
+                            self.path,
+                            node,
+                            "native code has no runtime 'is': compare with == "
+                            "or restructure so the identity test is constant",
+                        )
                     raise NativeCompileError(
                         self.path,
                         node,
@@ -8083,6 +9199,47 @@ class Frontend:
             "expression is not in the signed 64-bit native integer subset",
         )
 
+    def constant_field(self, piece: ast.FormattedValue) -> str:
+        """Fold one f-string field at build time.
+
+        The compiler runs on CPython, so the reference implementation of
+        format() is right here and is used directly. The specifier is still
+        checked against what the runtime renderers can do, because a program
+        must not compile only because its values happened to be foldable.
+        """
+
+        value = self.constant(piece.value)
+        spec_text = self.format_spec_text(piece)
+        if piece.conversion == -1 and not spec_text:
+            return str(value)
+        kind = {bool: "int", int: "int", float: "float", str: "str"}.get(type(value))
+        if kind is None:
+            raise NativeCompileError(
+                self.path,
+                piece,
+                f"a native f-string cannot render a {type(value).__name__} yet",
+            )
+        if piece.conversion != -1:
+            if kind == "str" and piece.conversion != ord("s"):
+                raise NativeCompileError(
+                    self.path,
+                    piece,
+                    "!r and !a on a string add quotes and backslash escapes, "
+                    "which a native f-string does not reproduce; only !s is "
+                    "supported on a string",
+                )
+            if piece.conversion not in (ord("s"), ord("r"), ord("a")):
+                raise NativeCompileError(
+                    self.path, piece, "unsupported native f-string conversion"
+                )
+            value = str(value)
+            kind = "str"
+        try:
+            parse_format_spec(spec_text, kind)
+            return format(value, spec_text)
+        except ValueError as error:
+            raise NativeCompileError(self.path, piece, str(error)) from error
+
     def constant(self, node: ast.expr) -> object:
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes, int, float, bool, type(None))):
             return node.value
@@ -8161,6 +9318,11 @@ class Frontend:
                         raise NativeCompileError(
                             self.path, node, "comparison is not in the native subset yet"
                         )
+                except NativeCompileError:
+                    # Our own rejections above are already located and worded;
+                    # NativeCompileError is a ValueError, so without this the
+                    # handler below would wrap one inside a second prefix.
+                    raise
                 except (TypeError, ValueError) as error:
                     raise NativeCompileError(
                         self.path, node, f"constant comparison failed: {error}"
@@ -8178,11 +9340,11 @@ class Frontend:
                 if isinstance(item, ast.Constant) and isinstance(item.value, str):
                     parts.append(item.value)
                 elif isinstance(item, ast.FormattedValue):
-                    parts.append(str(self.constant(item.value)))
+                    parts.append(self.constant_field(item))
                 else:
                     raise NativeCompileError(self.path, item, "unsupported f-string component")
             return "".join(parts)
-        raise NativeCompileError(self.path, node, "expression is not compile-time constant")
+        raise NotConstant(self.path, node, "expression is not compile-time constant")
 
 
 def lower(

@@ -1657,15 +1657,139 @@ class FormattedStringTests(unittest.TestCase):
             'print(f"{x} and {x} and {x}")\n'
         )
 
-    def test_format_specifiers_and_conversions_are_rejected(self):
-        self._reject(
-            'a = 0\nfor i in range(0, 3):\n    a += 1\nprint(f"{a:5d}")\n',
-            "format specifiers",
+    # A specifier is compared against CPython in both of the two paths a
+    # program can take. The constant folder renders an f-string whose fields
+    # are all known at build time without ever reaching the runtime renderers,
+    # so a field that folds and the same field that does not are separate code
+    # and have to be checked separately.
+    _RUNTIME_PRELUDE = (
+        "a = 0\nx = 0.0\ns = \"\"\n"
+        "for i in range(0, 7):\n    a += 1\n    x += 0.5\n    s = s + \"w\u00f6\"\n"
+        "m = 0 - a\ny = 0.0 - x\n"
+    )
+
+    def _both_paths(self, body: str) -> None:
+        self._run(self._RUNTIME_PRELUDE + 'print(f"' + body + '")\n')
+        self._run(
+            'a = 7\nx = 3.5\ns = "w\u00f6w\u00f6w\u00f6w\u00f6w\u00f6w\u00f6w\u00f6"\n'
+            "m = -7\ny = -3.5\n" + 'print(f"' + body + '")\n'
         )
-        self._reject(
-            'a = 0\nfor i in range(0, 3):\n    a += 1\nprint(f"{a!r}")\n',
-            "conversions",
+
+    def test_width_fill_and_alignment(self):
+        self._both_paths(
+            "[{a:5}][{a:<5}][{a:>5}][{a:^5}][{a:*>5}][{a:^6}][{a:*<7}][{a:*^7}]"
         )
+        self._both_paths("[{s:10}][{s:<20}][{s:>20}][{s:^21}][{s:\u00e9^24}][{s:2}]")
+        self._both_paths("[{x:12}][{x:<12}][{x:^13}][{y:12}][{y:0=12}][{y:*>12}]")
+
+    def test_a_bool_with_a_specifier_formats_as_an_integer(self):
+        # An empty specifier keeps True and False; anything else is the int.
+        self._both_paths("[{a > 3}][{a > 3:5}][{a > 3:d}][{a > 3:05}][{a > 3:.2f}]")
+
+    def test_integer_sign_and_zero_padding(self):
+        self._both_paths(
+            "[{a:05d}][{m:05d}][{a:+d}][{m:+d}][{a: d}][{m: d}][{a:d}][{m:08d}]"
+        )
+        # '0>6' and '06' differ on a negative: an explicit alignment keeps the
+        # sign inside the padding, a bare zero flag puts the padding after it.
+        self._both_paths("[{m:0>6d}][{m:06d}][{m:<06d}][{m:=6d}][{a:+06d}][{m:*=7d}]")
+
+    def test_thousands_separator(self):
+        self._both_paths("[{a:,}][{a:,d}][{m:,d}][{a:+,d}][{a * 1000000:,d}]")
+
+    def test_fixed_point_matches_cpython(self):
+        # 2.675 is really 2.67499999999999982..., so half-to-even on the exact
+        # binary value gives 2.67 and any shortcut off the repr gives 2.68.
+        self._run(
+            "xs = [2.675, 0.5, 1.5, 2.5, 0.125, 0.35, 0.45, 0.55, 0.75, 9.99,\n"
+            "      0.006, 0.005, 0.0001, 1e16, 1e17, -2.5, -0.125, 5e-324]\n"
+            "for k in range(0, 18):\n"
+            "    v = xs[k]\n"
+            '    print(f"{v:.0f}|{v:.1f}|{v:.2f}|{v:.3f}|{v:8.3f}|{v:+.2f}|{v:08.2f}")\n'
+        )
+        self._run(
+            "print(f'{2.675:.2f} {0.5:.0f} {1.5:.0f} {2.5:.0f} {0.125:.2f}"
+            " {1e16:.2f} {5e-324:.2f} {-0.0:.2f}')\n"
+        )
+        self._both_paths("[{x:.0f}][{x:.7f}][{y:+.3f}][{y:012.4f}][{a:.2f}][{m:.2f}]")
+
+    def test_signed_zero_and_infinities(self):
+        self._run(
+            "z = 0.0\nfor i in range(0, 1):\n    z -= 0.0\n"
+            "big = 1e308\ninf = big * 10.0\nnan = inf - inf\n"
+            'print(f"{z:.2f}|{z:.0f}|{z:06.2f}|{z:+.2f}")\n'
+            'print(f"{inf:.2f}|{inf:08.2f}|{-inf:+10.2f}|{nan:.2f}|{nan:+08.2f}")\n'
+            'print(f"{inf}|{inf:8}|{-inf:08}|{nan:08}|{nan:>8}")\n'
+        )
+
+    def test_the_widest_and_narrowest_magnitudes(self):
+        # 1e308 with two decimals is 312 characters; the digit and text
+        # buffers are written without a bound check.
+        self._run(
+            "v = 1e308\nfor i in range(0, 1):\n    v = v * 1.0\n"
+            'print(f"{v:.2f}")\nprint(f"{-v:.100f}")\n'
+            "u = 5e-324\nfor i in range(0, 1):\n    u = u * 1.0\n"
+            'print(f"{u:.100f}|{u:.0f}|{u:.1f}")\n'
+        )
+
+    def test_the_integer_extremes(self):
+        self._run(
+            "k = -9223372036854775807\nfor i in range(0, 1):\n    k -= 1\n"
+            'print(f"{k:d}|{k:025d}|{k:.2f}|{k:,d}")\n'
+            "j = 9223372036854775807\nfor i in range(0, 1):\n    j -= 0\n"
+            'print(f"{j:d}|{j:+,d}|{j:.2f}")\n'
+        )
+
+    def test_conversions(self):
+        # !r, !s, and !a all give str() on a number, and the field then
+        # formats under string rules - which left-align by default.
+        self._both_paths("[{a!r}][{a!r:6}][{x!s:>9}][{x!a:*^11}][{s!s:14}]")
+
+    def test_unsupported_specifiers_are_rejected(self):
+        prelude = self._RUNTIME_PRELUDE
+        for body, expected in (
+            ("{a:5e}", "format type 'e' is not supported"),
+            ("{a:5g}", "format type 'g' is not supported"),
+            ("{a:x}", "format type 'x' is not supported"),
+            ("{a:b}", "format type 'b' is not supported"),
+            ("{a:o}", "format type 'o' is not supported"),
+            ("{a:n}", "format type 'n' is not supported"),
+            ("{a:%}", "format type '%' is not supported"),
+            ("{a:#x}", "the '#' flag is not supported"),
+            ("{a:z.2f}", "the 'z' flag is not supported"),
+            ("{a:_d}", "the '_' separator is not supported"),
+            ("{x:d}", "format type 'd' is not supported for a float"),
+            ("{a:5s}", "format type 's' is not supported for an int"),
+            ("{s:5d}", "format type 'd' is not supported for a str"),
+            ("{s:.2}", "a precision truncates a string"),
+            ("{s:+5}", "a sign is not allowed in a string format specifier"),
+            ("{s:=5}", "'=' alignment, and the zero flag that implies it"),
+            ("{s:05}", "'=' alignment, and the zero flag that implies it"),
+            ("{s:,}", "a thousands separator is not allowed in a string"),
+            ("{x:,.2f}", "a thousands separator is only supported for an integer"),
+            ("{a:0,d}", "a thousands separator combined with zero or '=' padding"),
+            ("{a:.2}", "a precision is only supported with format type 'f'"),
+            ("{x:.2}", "a precision is only supported with format type 'f'"),
+            ("{a:.200f}", "a precision above 100 is not supported"),
+            ("{a:2000}", "a width above 1000 is not supported"),
+            ("{a:{a}}", "format specifier has to be literal text"),
+            ("{s!r}", "!r and !a on a string add quotes"),
+            ("{s!a}", "!r and !a on a string add quotes"),
+        ):
+            with self.subTest(body=body):
+                self._reject(prelude + 'print(f"' + body + '")\n', expected)
+                # The same field folded: the constant path must refuse it too,
+                # or a program would compile only because its values folded.
+                self._reject(
+                    'a = 7\nx = 3.5\ns = "q"\nprint(f"' + body + '")\n', expected
+                )
+
+    def test_every_rejection_names_what_is_supported(self):
+        self._reject(
+            'print(f"{1.5:5g}")\n',
+            "[[fill]align][sign][0][width][,][.precision][type]",
+        )
+        self._reject('print(f"{1.5:5g}")\n', "type one of d, f, s or omitted")
 
 
 class BooleanRenderingTests(unittest.TestCase):

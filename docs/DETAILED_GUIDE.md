@@ -182,8 +182,16 @@ runtime:
 - an f-string is built at run time when its fields are: each field is rendered
   the way `str()` would render it and concatenated on the spot - on the spot
   because float rendering hands back scratch the next float would overwrite.
-  Conversions (`!r`, `!s`, `!a`) and format specifiers are rejected; a width or
-  precision needs a formatter beyond `str()`;
+  A field may carry a literal format specifier
+  `[[fill]align][sign][0][width][,][.precision][type]` with `type` one of `d`,
+  `f`, `s` or omitted: `{x:>8}`, `{x:*^11}`, `{n:05d}`, `{n:+,d}`, `{v:8.3f}`.
+  Fixed point rounds the exact binary value half to even, as CPython does, so
+  `f"{2.675:.2f}"` is `2.67`. `!r`, `!s`, and `!a` are accepted on numbers,
+  where all three are `str()`; on a string only `!s` is, because `!r` would
+  have to reproduce Python's quoting and escaping. Everything else - `e`, `g`,
+  `n`, `%`, `b`, `o`, `x`, `#`, `z`, `_`, a precision on a string, a separator
+  next to zero padding, and a specifier that is itself an expression - is
+  rejected at build time with a message naming what is supported;
 - a runtime list grows. Its block is `[capacity][length][elements]`, and
   `xs.append(v)` writes at the length and moves on; when the capacity is
   reached the list is copied into a block of twice the size, because the arena
@@ -236,6 +244,17 @@ runtime:
   frame-pointer load). Each pinned value takes one and a slice takes a dozen or
   more, so a function with hundreds of slices is refused with a message saying
   so, rather than miscompiled;
+- a class may have one base class. The subclass's layout is the base's fields
+  first and its own after, which is what lets a method inherited from the base
+  use the same offsets on either kind of instance; methods are inherited unless
+  the subclass defines its own. `super().__init__(...)` is supported as a bare
+  statement in the subclass's `__init__`, and a subclass `__init__` that leaves
+  an inherited attribute unassigned is rejected, because a native attribute has
+  to be assigned unconditionally. Multiple bases are rejected, and so is a
+  variable that would hold a base on one path and a subclass on another: method
+  calls resolve at build time from the variable's class, so there is no vtable
+  to make that come out right. A name cannot be both an attribute and a method,
+  since the two are looked up by different paths;
 - a `bool` keeps its identity through a list, a dict, a function parameter, a
   return value, and a conditional expression. Nothing at run time tells `True`
   from `1` - the slot holds a number either way - so the answer is carried
@@ -368,7 +387,8 @@ runtime:
   `import sys; sys.exit(integer-expression)` form emit a native process exit;
 - runtime arguments/input, dynamic integer-to-text printing, Python arbitrary
   precision integers, integer division/modulo, recursive functions, dicts/sets
-  and other general containers, classes, general exceptions, dynamic calls, and
+  and other general containers, class hierarchies beyond single inheritance,
+  general exceptions, dynamic calls, and
   general library imports (including NumPy/Torch) are rejected.
 
 The signed integer runtime wraps overflow to 64 bits; it does not silently
