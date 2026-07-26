@@ -63,6 +63,11 @@ def _imports(section_rva: int, image_base: int) -> tuple[bytes, dict[str, int], 
     )
 
 
+# A thread stack past this is a runaway rather than a program, and committing
+# it up front would be a real cost to every process that runs the image.
+_MAXIMUM_STACK_RESERVE = 16 * 1024 * 1024
+
+
 def _pe_image(
     code: bytes,
     rdata: bytes,
@@ -72,7 +77,30 @@ def _pe_image(
     iat_size: int,
     writable_rdata: bool = False,
     subsystem: int = 3,
+    stack_bytes: int = 0,
 ) -> bytes:
+    # Windows grows a thread stack one page at a time, by faulting on the
+    # guard page that sits just below the committed region. Both prologues here
+    # move the stack pointer down by the whole frame and then write at the new
+    # low end, so a frame larger than a page steps clean over the guard page and
+    # the write lands in reserved-but-uncommitted memory - an access violation
+    # rather than a stack that grows. Committing enough up front for the largest
+    # frame in the image means every such write lands inside committed memory
+    # and no guard page is ever involved. The alternative, a probe loop in each
+    # prologue touching one byte per page, is what MSVC emits; it is also
+    # machine code for two architectures that cannot be run or tested here,
+    # where this is a header field with exactly this purpose.
+    page = 0x1000
+    guard_slack = 4 * page  # room for the guard pages Windows keeps below it
+    stack_commit = max(page, _align(stack_bytes + guard_slack, page))
+    stack_reserve = max(0x100000, _align(stack_commit + guard_slack, page))
+    if stack_reserve > _MAXIMUM_STACK_RESERVE:
+        raise ValueError(
+            f"a frame of {stack_bytes} bytes would need a "
+            f"{stack_reserve}-byte thread stack, past the "
+            f"{_MAXIMUM_STACK_RESERVE}-byte ceiling this writer commits; split "
+            "the code into smaller functions"
+        )
     image_base = 0x140000000
     section_alignment = 0x1000
     file_alignment = 0x200
@@ -97,7 +125,15 @@ def _pe_image(
     struct.pack_into("<HHHHHH", optional, 40, 6, 0, 0, 1, 6, 0)
     struct.pack_into("<III", optional, 52, 0, image_size, headers_size)
     struct.pack_into("<IHH", optional, 64, 0, subsystem, 0x8160)
-    struct.pack_into("<QQQQ", optional, 72, 0x100000, 0x1000, 0x100000, 0x1000)
+    struct.pack_into(
+        "<QQQQ",
+        optional,
+        72,
+        stack_reserve,
+        stack_commit,
+        0x100000,
+        0x1000,
+    )
     struct.pack_into("<II", optional, 104, 0, 16)
     struct.pack_into("<II", optional, 120, rdata_rva, 40)
     struct.pack_into("<II", optional, 208, rdata_rva + iat_offset, iat_size)
@@ -151,12 +187,26 @@ def _write_pe(module: Module, machine: int, arm64: bool) -> bytes:
     rdata, imports, iat_offset, iat_size = _imports(rdata_rva, image_base)
     encoder = encode_windows_arm64 if arm64 else encode_windows
     code = encoder(module, image_base + text_rva, imports)
+    # An upper bound on how much stack the program can be using at once. The
+    # largest single frame is not enough: the C front end emits real calls, so
+    # frames nest, and a deep chain lands below the committed region exactly the
+    # way one oversized frame does. Summing every body bounds any non-recursive
+    # nesting - conservative, since most of those bodies never share the stack,
+    # but the cost is committed pages and the alternative is a fault.
+    #
+    # Recursion deeper than this still walks off the end. That is stack
+    # exhaustion rather than this bug, and it behaved the same way before.
+    slots = module.stack_slots + sum(
+        function.stack_slots for function in module.functions
+    )
+    stack_bytes = slots * 8 + 0x200 * (1 + len(module.functions))
     return _pe_image(
         code,
         rdata,
         machine=machine,
         iat_offset=iat_offset,
         iat_size=iat_size,
+        stack_bytes=stack_bytes,
     )
 
 
