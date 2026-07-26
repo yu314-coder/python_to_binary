@@ -236,6 +236,14 @@ runtime:
   frame-pointer load). Each pinned value takes one and a slice takes a dozen or
   more, so a function with hundreds of slices is refused with a message saying
   so, rather than miscompiled;
+- storing a `bool` in a list or a dict is refused. Which slots hold one is
+  tracked from the source, and a container loses that: the value would read
+  back as `1` rather than `True`, which is a wrong answer rather than a
+  refusal. Wrap it in `int()` when the number is what is wanted. Passing one as
+  an argument is **not** refused, because a function that never renders its
+  parameter is unaffected and refusing every call would reject working
+  programs - but a bool parameter that is printed does still come out as `1`,
+  and that is a known divergence rather than a fixed one;
 - a `bool` prints as `True` or `False`. It lives in an integer slot, which is
   right for arithmetic and wrong for printing, and nothing tells the two apart
   at run time - so which names hold one is tracked from the source, and a name

@@ -2861,6 +2861,30 @@ class Frontend:
         self.operations.append(Label(done))
         return found_slot
 
+    def refuse_stored_bool(self, node: ast.expr, where: str) -> None:
+        """Refuse to store a bool where its kind would be forgotten.
+
+        A bool lives in an integer slot, and which slots hold one is tracked
+        from the source rather than at run time. Storing one in a list or a
+        dict loses that tracking, and reading it back would print 1 instead of
+        True - a wrong answer rather than a refusal. Until the kind travels
+        with the value, say so.
+
+        A bool passed as an argument has the same problem, but is not refused
+        here: a procedure that never renders its parameter is unaffected, and
+        refusing every call would reject working programs to catch the few that
+        print. That case is still a divergence, and is documented as one.
+        """
+
+        if self.renders_as_bool(node):
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"a bool cannot be stored in {where} yet: nothing distinguishes "
+                "True from 1 at run time, so it would print as 1; wrap it in "
+                "int() if the number is what you want",
+            )
+
     def emit_list_append(
         self, pointer_slot: int, value: IntExpression
     ) -> None:
@@ -3006,6 +3030,7 @@ class Frontend:
                 raise NativeCompileError(
                     self.path, argument, "this list holds signed 64-bit integers"
                 )
+            self.refuse_stored_bool(argument, "a list")
             value = self.integer(argument)
         # A literal's length stops being a build-time fact once it can grow.
         self.list_lengths.pop(name, None)
@@ -3050,6 +3075,8 @@ class Frontend:
                     element,
                     "this list holds signed 64-bit integers",
                 )
+            else:
+                self.refuse_stored_bool(element, "a list")
         bump = self.ensure_heap()
         self.runtime_names.add(name)
         pointer_slot = self.slot(name)
@@ -3307,6 +3334,8 @@ class Frontend:
                 raise NativeCompileError(
                     self.path, value, "this dict has signed 64-bit integer values"
                 )
+            else:
+                self.refuse_stored_bool(value, "a dict")
             self.dict_store(
                 self.slot(target.value.id),
                 self.dict_key(target.slice, key_kind),
@@ -3336,6 +3365,7 @@ class Frontend:
             raise NativeCompileError(
                 self.path, value, "this list holds signed 64-bit integers"
             )
+        self.refuse_stored_bool(value, "a list")
         address = self.list_element_address(target)
         self.operations.append(HeapStore(address, self.integer(value), 8))
 
@@ -3433,6 +3463,8 @@ class Frontend:
                 raise NativeCompileError(
                     self.path, value, "this dict has signed 64-bit integer values"
                 )
+            else:
+                self.refuse_stored_bool(value, "a dict")
         capacity = self.dict_capacity(len(node.keys))
         bump = self.ensure_heap()
         self.runtime_names.add(name)
