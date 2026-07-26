@@ -3759,3 +3759,55 @@ class SystemVCallAbiTests(unittest.TestCase):
         self.assertTrue(amounts)
         for amount in amounts:
             self.assertEqual(int(amount, 16) % 16, 0, f"0x{amount} misaligns rsp")
+
+
+class MathBuiltinTests(CProgramTestCase):
+    """C math functions the CPU implements directly.
+
+    Nothing is linked: each of these is a single floating-point instruction the
+    hardware already has, which is why they work in a compiler with no linker
+    and no libm.
+    """
+
+    def test_sqrt_is_correctly_rounded(self):
+        self.run_c(
+            _STDIO + "#include <math.h>\n"
+            "int main(void) {\n"
+            "    printf(\"%.6f %.6f %.6f\\n\", sqrt(9.0), sqrt(2.0), sqrt(0.0));\n"
+            "    return 0;\n}\n",
+            stdout="3.000000 1.414214 0.000000\n",
+        )
+
+    def test_fabs_clears_the_sign(self):
+        self.run_c(
+            _STDIO + "#include <math.h>\n"
+            "int main(void) {\n"
+            "    printf(\"%.3f %.3f\\n\", fabs(-2.5), fabs(2.5));\n"
+            "    return 0;\n}\n",
+            stdout="2.500 2.500\n",
+        )
+
+    def test_the_rounding_functions_pick_the_right_direction(self):
+        self.run_c(
+            _STDIO + "#include <math.h>\n"
+            "int main(void) {\n"
+            "    printf(\"%.1f %.1f %.1f %.1f\\n\","
+            " floor(-2.5), ceil(-2.5), trunc(-2.7), trunc(2.7));\n"
+            "    return 0;\n}\n",
+            stdout="-3.0 -2.0 -2.0 2.0\n",
+        )
+
+    def test_an_integer_argument_is_converted(self):
+        self.run_c(
+            _STDIO + "#include <math.h>\n"
+            "int main(void) { printf(\"%.3f\\n\", sqrt(16)); return 0; }\n",
+            stdout="4.000\n",
+        )
+
+    def test_a_local_named_sqrt_shadows_the_builtin(self):
+        self.run_c(
+            _STDIO + "#include <math.h>\n"
+            "double sqrt(double v) { return v + 1.0; }\n"
+            "int main(void) { printf(\"%.3f\\n\", sqrt(4.0)); return 0; }\n",
+            stdout="5.000\n",
+        )

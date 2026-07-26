@@ -331,6 +331,23 @@ def _float_expression(
         _float_expression(code, expression.operand, slot_base, refs)
         if expression.operator == "pos":
             return
+        if expression.operator == "sqrt":
+            code.extend(b"\xf2\x0f\x51\xc0")  # sqrtsd xmm0, xmm0
+            return
+        if expression.operator == "abs":
+            # Clear the sign bit through the integer register file, which needs
+            # no constant pool.
+            code.extend(b"\x66\x48\x0f\x7e\xc0")  # movq rax, xmm0
+            code.extend(b"\x48\x0f\xba\xf0\x3f")  # btr rax, 63
+            code.extend(b"\x66\x48\x0f\x6e\xc0")  # movq xmm0, rax
+            return
+        # roundsd has no ties-away-from-zero mode, so C round() is not a
+        # single instruction here and is rejected by the front end.
+        rounding = {"floor": 1, "ceil": 2, "trunc": 3}
+        if expression.operator in rounding:
+            # roundsd xmm0, xmm0, imm8 (SSE4.1, universal on x86-64 since 2008)
+            code.extend(b"\x66\x0f\x3a\x0b\xc0" + bytes((rounding[expression.operator],)))
+            return
         if expression.operator == "neg":
             code.extend(b"\x66\x48\x0f\x7e\xc0")  # movq rax, xmm0
             code.extend(b"\x48\xb9" + struct.pack("<Q", 0x8000000000000000))  # mov rcx, sign bit

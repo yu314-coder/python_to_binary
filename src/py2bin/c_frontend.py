@@ -2716,6 +2716,20 @@ _MAXIMUM_STATIC_BYTES = 8 << 20
 _MAXIMUM_ARGUMENTS = 8
 
 
+# The C math functions the target implements as a single instruction. No
+# library is linked and no libm is bundled: py2bin emits the hardware
+# operation, which is why these work with no linker at all. Anything needing a
+# software implementation (sin, cos, exp, log, pow) is deliberately absent.
+_MATH_BUILTINS = {
+    "sqrt": "sqrt",
+    "fabs": "abs",
+    "floor": "floor",
+    "ceil": "ceil",
+    "trunc": "trunc",
+    "round": "round",
+}
+
+
 class Lowerer:
     """Lowers a parsed translation unit to py2bin's native IR."""
 
@@ -3724,7 +3738,38 @@ class Lowerer:
         )
         return ctype, FunctionAddress(name)
 
+
+    def math_builtin(self, node: Call) -> Value:
+        """Lower a one-instruction C math function.
+
+        These are not library calls. Each maps to a single floating-point
+        instruction the CPU already has, so the result is exact for the
+        operations IEEE-754 defines exactly (sqrt is correctly rounded, and the
+        rounding functions are exact), and nothing has to be linked.
+        """
+
+        if len(node.arguments) != 1:
+            self.error(
+                f"{node.name}() takes exactly one argument", node.token
+            )
+        if node.name == "round" and not self.target.endswith("-arm64"):
+            self.error(
+                "round() breaks ties away from zero, which x86-64's roundsd "
+                "cannot do in one instruction and py2bin will not approximate; "
+                "use trunc(), floor() or ceil(), or target arm64",
+                node.token,
+            )
+        value = self.rvalue(node.arguments[0])
+        if not is_arithmetic(value.ctype):
+            self.error(
+                f"{node.name}() needs a number, not {value.ctype}", node.token
+            )
+        return Value(DOUBLE, FloatUnary(_MATH_BUILTINS[node.name], self.widen(value)))
+
     def call(self, node: Call) -> Value:
+        if node.name in _MATH_BUILTINS and self.lookup(node.name) is None:
+            if node.name not in self.unit.functions:
+                return self.math_builtin(node)
         if node.name == "printf":
             self.error(
                 "printf's return value is not implemented; call it as a statement",

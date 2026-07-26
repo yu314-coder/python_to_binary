@@ -551,6 +551,21 @@ def _float_expression(
         if expression.operator == "neg":
             words.append(0x1E614000)  # fneg d0, d0
             return
+        # The C math functions that ARM64 implements as one instruction. No
+        # library and no linker is involved: these ARE the operations.
+        unary = {
+            "sqrt": 0x1E61C000,  # fsqrt  d0, d0
+            "abs": 0x1E60C000,  # fabs   d0, d0
+            "floor": 0x1E654000,  # frintm d0, d0  (toward -inf)
+            "ceil": 0x1E64C000,  # frintp d0, d0  (toward +inf)
+            "trunc": 0x1E65C000,  # frintz d0, d0  (toward zero)
+            # C round() breaks ties AWAY from zero, which is FRINTA, not
+            # FRINTN (ties to even): round(2.5) is 3.0, not 2.0.
+            "round": 0x1E664000,  # frinta d0, d0
+        }
+        if expression.operator in unary:
+            words.append(unary[expression.operator])
+            return
         raise ValueError(f"unknown ARM64 float unary operation {expression.operator!r}")
     if isinstance(expression, FloatBinary):
         _float_expression(words, expression.left, slot_base, refs)
