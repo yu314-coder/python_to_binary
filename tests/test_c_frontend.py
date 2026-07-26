@@ -1409,17 +1409,18 @@ class RejectionTests(CProgramTestCase):
                 compile_c_to_ir(source, "r.c", target)
 
 
-    def test_more_than_eight_arguments_needs_a_target_with_a_memory_area(self):
+    def test_more_arguments_than_registers_compiles_for_every_target(self):
+        # Each convention passes its own register quota and puts the rest in
+        # memory: eight for AAPCS64, six for System V, four for Microsoft x64.
         source = (
             "long long s(long long a, long long b, long long c, long long d,\n"
             "            long long e, long long f, long long g, long long h,\n"
             "            long long i, long long j) { return a + j; }\n"
             "int main(void) { return s(1,2,3,4,5,6,7,8,9,10); }\n"
         )
-        compile_c_to_ir(source, "many.c", "darwin-arm64")
-        with self.assertRaises(CCompileError) as caught:
-            compile_c_to_ir(source, "many.c", "darwin-x86_64")
-        self.assertIn("at most", str(caught.exception))
+        for target in supported_targets():
+            with self.subTest(target=target):
+                compile_c_to_ir(source, "many.c", target)
 
 
     def test_long_double_is_refused(self):

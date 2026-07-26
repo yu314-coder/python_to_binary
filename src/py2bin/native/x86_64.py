@@ -74,6 +74,11 @@ class _X86Refs:
 
     calls: list = dataclasses.field(default_factory=list)
     addresses: list = dataclasses.field(default_factory=list)
+    #: Integer argument registers: six under System V, four under Microsoft x64.
+    registers: int = 6
+    #: Bytes the caller reserves below the stack arguments. Microsoft x64
+    #: requires 32 so a callee can spill rcx-r9; System V has none.
+    shadow: int = 0
 
 
 def _mov_imm32(register_opcode: bytes, value: int) -> bytes:
@@ -408,12 +413,24 @@ _LOAD_ARGUMENT = (
     b"\x4c\x8b\x0c\x24",  # r9
 )
 _SPILL = b"\x48\x83\xec\x10\x48\x89\x04\x24"  # sub rsp,16; mov [rsp],rax
+# mov <reg>, [rsp + disp32] for each argument register, in order.
+_LOAD_ARGUMENT_AT = (
+    b"\x48\x8b\xbc\x24",  # rdi
+    b"\x48\x8b\xb4\x24",  # rsi
+    b"\x48\x8b\x94\x24",  # rdx
+    b"\x48\x8b\x8c\x24",  # rcx
+    b"\x4c\x8b\x84\x24",  # r8
+    b"\x4c\x8b\x8c\x24",  # r9
+)
 _DROP = b"\x48\x83\xc4\x10"  # add rsp, 16
 
 
 def _push_arguments(
-    code: bytearray, arguments, slot_base: int, refs: "_X86Refs"
-) -> None:
+    code: bytearray,
+    arguments,
+    slot_base: int,
+    refs: "_X86Refs",
+) -> int:
     """Evaluate arguments left to right and deliver them in the ABI registers.
 
     Each result is spilled as it is computed, because evaluating a later
@@ -422,25 +439,38 @@ def _push_arguments(
     its own register.
     """
 
-    if len(arguments) > X86_ARGUMENT_REGISTERS:
-        raise ValueError(
-            f"x86-64 passes at most {X86_ARGUMENT_REGISTERS} arguments in "
-            f"registers; this call has {len(arguments)}"
-        )
+    count = len(arguments)
+    registers = refs.registers
+    shadow = refs.shadow
     for argument in arguments:
         _expression(code, argument, slot_base, refs)
         code.extend(_SPILL)
-    for index in reversed(range(len(arguments))):
-        code.extend(_LOAD_ARGUMENT[index])
-        code.extend(_DROP)
+    # Cell for argument i sits at [rsp + (count - 1 - i) * 16].
+    overflow = max(0, count - registers)
+    area = ((overflow * 8 + shadow) + 15) & ~15
+    if area:
+        code.extend(b"\x48\x81\xec" + struct.pack("<I", area))  # sub rsp, area
+        for index in range(registers, count):
+            source = area + (count - 1 - index) * 16
+            destination = shadow + (index - registers) * 8
+            # mov r11, [rsp+src]; mov [rsp+dst], r11   (r11 is caller-saved and
+            # is not an argument register in either convention)
+            code.extend(b"\x4c\x8b\x9c\x24" + struct.pack("<I", source))
+            code.extend(b"\x4c\x89\x9c\x24" + struct.pack("<I", destination))
+    for index in range(min(count, registers)):
+        offset = area + (count - 1 - index) * 16
+        code.extend(_LOAD_ARGUMENT_AT[index] + struct.pack("<I", offset))
+    return area + count * 16
 
 
 def _direct_call(
     code: bytearray, expression, slot_base: int, refs: "_X86Refs"
 ) -> None:
-    _push_arguments(code, expression.arguments, slot_base, refs)
+    allocated = _push_arguments(code, expression.arguments, slot_base, refs)
     code.extend(b"\xe8\x00\x00\x00\x00")  # call rel32, patched after layout
     refs.calls.append((len(code) - 4, expression.name))
+    if allocated:
+        code.extend(b"\x48\x81\xc4" + struct.pack("<I", allocated))
 
 
 def _indirect_call_x86(
@@ -450,10 +480,13 @@ def _indirect_call_x86(
     # side effect happens exactly once and cannot be clobbered by an argument.
     _expression(code, expression.target, slot_base, refs)
     code.extend(_SPILL)
-    _push_arguments(code, expression.arguments, slot_base, refs)
-    code.extend(b"\x48\x8b\x04\x24")  # mov rax, [rsp]
-    code.extend(_DROP)
-    code.extend(b"\xff\xd0")  # call rax
+    allocated = _push_arguments(code, expression.arguments, slot_base, refs)
+    # The target's own cell sits just above everything the arguments allocated.
+    code.extend(b"\x4c\x8b\x9c\x24" + struct.pack("<I", allocated))  # mov r11,[rsp+n]
+    if allocated:
+        code.extend(b"\x48\x81\xc4" + struct.pack("<I", allocated))
+    code.extend(b"\x48\x83\xc4\x10")  # add rsp, 16  (release the target cell)
+    code.extend(b"\x41\xff\xd3")  # call r11
 
 
 
@@ -577,11 +610,6 @@ def _emit_function(
     every nested call meets the ABI's alignment rule.
     """
 
-    if function.parameters > X86_ARGUMENT_REGISTERS:
-        raise ValueError(
-            f"x86-64 function {function.name!r} declares {function.parameters} "
-            f"parameters; at most {X86_ARGUMENT_REGISTERS} arrive in registers"
-        )
     if function.parameters > function.stack_slots:
         raise ValueError(
             f"x86-64 function {function.name!r} has fewer stack slots than parameters"
@@ -594,6 +622,7 @@ def _emit_function(
     slot_base = -frame
     # Spill the incoming argument registers into slots 0..parameters-1 so the
     # body reads a parameter exactly like any other local.
+    shadow = 0  # System V has no shadow space; Microsoft x64 reserves 32 bytes
     stores = (
         b"\x48\x89\xbd",  # mov [rbp+disp32], rdi
         b"\x48\x89\xb5",  # rsi
@@ -602,8 +631,15 @@ def _emit_function(
         b"\x4c\x89\x85",  # r8
         b"\x4c\x89\x8d",  # r9
     )
-    for index in range(function.parameters):
+    for index in range(min(function.parameters, len(stores))):
         code.extend(stores[index] + struct.pack("<i", slot_base + index * 8))
+    # Arguments past the register count arrived in memory. [rbp] holds the
+    # saved frame pointer and [rbp+8] the return address, so the caller's
+    # outgoing area starts at [rbp+16].
+    for index in range(len(stores), function.parameters):
+        incoming = 16 + shadow + (index - len(stores)) * 8
+        code.extend(b"\x48\x8b\x85" + struct.pack("<i", incoming))  # mov rax,[rbp+in]
+        code.extend(b"\x48\x89\x85" + struct.pack("<i", slot_base + index * 8))
     _emit_x86_operations(
         code, function.operations, slot_base, refs, pending_strings, system
     )
@@ -697,7 +733,7 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         code.extend(b"\xff\x15\x00\x00\x00\x00")
         address_patches.append((instruction + 2, imports[symbol]))
 
-    refs = _X86Refs()
+    refs = _X86Refs(registers=4, shadow=32)
 
     def emit(operations, slot_base: int, _epilogue=b"") -> None:
         """Encode one body. Labels are body-local; imports are shared."""
@@ -790,13 +826,15 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
             b"\x4c\x89\x85",  # r8
             b"\x4c\x89\x8d",  # r9
         )
-        if function.parameters > len(stores):
-            raise ValueError(
-                f"windows-x86_64 passes at most {len(stores)} arguments in "
-                f"registers; {function.name!r} declares {function.parameters}"
-            )
-        for index in range(function.parameters):
+        for index in range(min(function.parameters, len(stores))):
             code.extend(stores[index] + struct.pack("<i", -frame + index * 8))
+        # Past the fourth, arguments arrive in memory above the caller's 32
+        # bytes of shadow space: [rbp] is the saved frame pointer, [rbp+8] the
+        # return address, [rbp+16..47] the shadow area.
+        for index in range(len(stores), function.parameters):
+            incoming = 16 + 32 + (index - len(stores)) * 8
+            code.extend(b"\x48\x8b\x85" + struct.pack("<i", incoming))
+            code.extend(b"\x48\x89\x85" + struct.pack("<i", -frame + index * 8))
         epilogue = b"\x48\x89\xec\x5d\xc3"  # mov rsp,rbp; pop rbp; ret
         emit(function.operations, -frame, epilogue)
         code.extend(epilogue)

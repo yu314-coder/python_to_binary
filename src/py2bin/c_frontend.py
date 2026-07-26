@@ -2716,8 +2716,16 @@ _MAXIMUM_STATIC_BYTES = 8 << 20
 #: Arguments a target can pass. ARM64 implements the AAPCS64 memory
 #: argument area; the x86 encoders stop at their register count.
 _MAXIMUM_ARGUMENTS = 8
+#: Every target now implements its convention's memory argument area.
 _STACK_ARGUMENT_TARGETS = frozenset(
-    {"darwin-arm64", "linux-arm64", "windows-arm64"}
+    {
+        "darwin-arm64",
+        "linux-arm64",
+        "windows-arm64",
+        "darwin-x86_64",
+        "linux-x86_64",
+        "windows-x86_64",
+    }
 )
 _ARGUMENT_CEILING = 64
 
