@@ -2713,7 +2713,13 @@ _MAXIMUM_STATIC_BYTES = 8 << 20
 #: py2bin's call ABI passes every argument in a register. AAPCS64 has eight
 #: integer parameter registers, and stack argument passing is not implemented,
 #: so a longer parameter list is rejected rather than silently truncated.
+#: Arguments a target can pass. ARM64 implements the AAPCS64 memory
+#: argument area; the x86 encoders stop at their register count.
 _MAXIMUM_ARGUMENTS = 8
+_STACK_ARGUMENT_TARGETS = frozenset(
+    {"darwin-arm64", "linux-arm64", "windows-arm64"}
+)
+_ARGUMENT_CEILING = 64
 
 
 # The C math functions the target implements as a single instruction. No
@@ -3725,10 +3731,11 @@ class Lowerer:
                 "process, so py2bin does not let a program take its address",
                 token,
             )
-        if len(function.parameters) > _MAXIMUM_ARGUMENTS:
+        limit = self.argument_limit()
+        if len(function.parameters) > limit:
             self.error(
                 f"{name}() takes {len(function.parameters)} parameters; py2bin's "
-                f"call ABI passes at most {_MAXIMUM_ARGUMENTS} arguments in "
+                f"call ABI passes at most {limit} arguments in "
                 "registers and does not implement stack arguments",
                 token,
             )
@@ -3765,6 +3772,18 @@ class Lowerer:
                 f"{node.name}() needs a number, not {value.ctype}", node.token
             )
         return Value(DOUBLE, FloatUnary(_MATH_BUILTINS[node.name], self.widen(value)))
+
+    def argument_limit(self) -> int:
+        """How many arguments this target can pass.
+
+        ARM64 implements the AAPCS64 memory argument area, so it is bounded
+        only by the frame; the x86 encoders still stop at their register
+        count and reject the rest rather than truncating.
+        """
+
+        if self.target in _STACK_ARGUMENT_TARGETS:
+            return _ARGUMENT_CEILING
+        return _MAXIMUM_ARGUMENTS
 
     def call(self, node: Call) -> Value:
         if node.name in _MATH_BUILTINS and self.lookup(node.name) is None:
@@ -3833,10 +3852,11 @@ class Lowerer:
                 f"and the call ABI is not implemented for target {self.target!r}",
                 token,
             )
-        if len(signature.parameters) > _MAXIMUM_ARGUMENTS:
+        limit = self.argument_limit()
+        if len(signature.parameters) > limit:
             self.error(
                 f"{signature} takes {len(signature.parameters)} parameters; "
-                f"py2bin's call ABI passes at most {_MAXIMUM_ARGUMENTS} arguments "
+                f"py2bin's call ABI passes at most {limit} arguments "
                 "in registers and does not implement stack arguments",
                 token,
             )
@@ -3984,10 +4004,11 @@ class Lowerer:
     # body being lowered simply refers to itself by name.
 
     def direct_call(self, function: Function, node: Call) -> Value:
-        if len(function.parameters) > _MAXIMUM_ARGUMENTS:
+        limit = self.argument_limit()
+        if len(function.parameters) > limit:
             self.error(
                 f"{function.name}() takes {len(function.parameters)} parameters; "
-                f"py2bin's call ABI passes at most {_MAXIMUM_ARGUMENTS} arguments "
+                f"py2bin's call ABI passes at most {limit} arguments "
                 "in registers and does not implement stack arguments",
                 node.token,
             )

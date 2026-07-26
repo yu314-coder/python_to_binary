@@ -803,13 +803,24 @@ class Arm64CallAbiTests(unittest.TestCase):
         return list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
 
     def test_arguments_land_in_x0_through_x7(self):
+        # Each argument is loaded from its own spill cell into its register.
+        # The cells are read at an offset now that a memory argument area may
+        # sit below them, so check the registers, not the order.
         words = self._words(encode_darwin_arm64(self._module(8), 0x100004000))
-        loads = [word for word in words if word & 0xFFFFFFF8 == 0xF94003E0]
-        self.assertEqual([word & 7 for word in loads[:8]], [7, 6, 5, 4, 3, 2, 1, 0])
+        loads = [word for word in words if word & 0xFFC003E0 == 0xF94003E0]
+        self.assertEqual(sorted({word & 7 for word in loads}), list(range(8)))
 
-    def test_more_arguments_than_registers_is_refused_not_truncated(self):
-        with self.assertRaisesRegex(ValueError, "at most 8"):
-            encode_darwin_arm64(self._module(9), 0x100004000)
+    def test_arguments_past_the_eighth_go_in_the_memory_area(self):
+        # AAPCS64 passes the ninth argument onward at [sp], [sp+8], ... The
+        # encoder copies them there through x9, so a ten-argument call must
+        # contain stores of x9 that an eight-argument call does not.
+        few = self._words(encode_darwin_arm64(self._module(8), 0x100004000))
+        many = self._words(encode_darwin_arm64(self._module(10), 0x100004000))
+        stores = lambda words: sum(
+            1 for word in words if word & 0xFFC003FF == 0xF90003E9
+        )
+        self.assertEqual(stores(few), 0)
+        self.assertEqual(stores(many), 2)
 
     def test_the_branch_targets_the_callee_and_the_stack_is_aligned(self):
         words = self._words(encode_darwin_arm64(self._module(3), 0x100004000))
@@ -827,8 +838,10 @@ class Arm64CallAbiTests(unittest.TestCase):
         # The callee starts with its prologue: a frame, then the saved pair.
         self.assertEqual(words[target + 1], 0xA9007BFD)  # stp x29, x30, [sp]
         self.assertEqual(words[target + 2], 0x910003FD)  # mov x29, sp
-        # SP must be a multiple of 16 at the branch: every adjustment before it
-        # is a push or pop of one 16-byte cell.
+        # SP must be a MULTIPLE OF 16 at the branch, which AAPCS64 requires.
+        # It is not back at zero: the argument spill cells and the memory
+        # argument area stay allocated across the call and are released after
+        # it, so the test checks alignment rather than depth.
         depth = 0
         for word in words[2:index]:  # words[0:2] are the entry point's own frame
             if word & 0xFFC003FF == 0xD10003FF:  # sub sp, sp, #imm
@@ -836,7 +849,7 @@ class Arm64CallAbiTests(unittest.TestCase):
             elif word & 0xFFC003FF == 0x910003FF:  # add sp, sp, #imm
                 depth += (word >> 10) & 0xFFF
         self.assertEqual(depth % 16, 0)
-        self.assertEqual(depth, 0, "the argument spills must be popped before the call")
+        self.assertEqual(depth % 16, 0, "sp must be 16-byte aligned at the call")
 
     def test_the_callee_saves_and_restores_the_frame_and_returns(self):
         module = self._module(1, callee_slots=4)

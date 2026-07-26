@@ -309,19 +309,32 @@ def _internal_call(
             "call-capable encoders are encode_darwin/encode_darwin_extern and "
             "encode_linux"
         )
-    if len(expression.arguments) > ARM64_ARGUMENT_REGISTERS:
-        raise ValueError(
-            f"ARM64 internal calls pass at most {ARM64_ARGUMENT_REGISTERS} "
-            "arguments in registers"
-        )
+    count = len(expression.arguments)
+    # Every argument is evaluated left to right into its own 16-byte cell
+    # first, so a later argument (which may itself contain a call) cannot
+    # clobber an earlier result.
     for argument in expression.arguments:
         _expression(words, argument, slot_base, refs)  # arg -> x0
         words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-    for index in reversed(range(len(expression.arguments))):
-        words.append(0xF94003E0 | index)  # ldr x{index}, [sp]
-        words.append(0x910043FF)  # add sp, sp, #16
+    # Cell for argument i sits at [sp + (count - 1 - i) * 16].
+    spilled = count * 16
+    overflow = max(0, count - ARM64_ARGUMENT_REGISTERS)
+    area = (overflow * 8 + 15) & ~15  # AAPCS64 keeps sp 16-byte aligned
+    if area:
+        words.extend(_frame_sub(area))
+        # Arguments past the eighth are passed in memory at [sp], [sp+8], ...
+        for index in range(ARM64_ARGUMENT_REGISTERS, count):
+            source = area + (count - 1 - index) * 16
+            destination = (index - ARM64_ARGUMENT_REGISTERS) * 8
+            words.append(0xF94003E9 | ((source // 8) << 10))  # ldr x9, [sp, #src]
+            words.append(0xF90003E9 | ((destination // 8) << 10))  # str x9, [sp, #dst]
+    for index in range(min(count, ARM64_ARGUMENT_REGISTERS)):
+        offset = area + (count - 1 - index) * 16
+        words.append(0xF94003E0 | index | ((offset // 8) << 10))  # ldr xN, [sp, #off]
     refs.calls.append((len(words), expression.name))
     words.append(0)  # bl <function> (patched once every body offset is known)
+    if area + spilled:
+        words.extend(_frame_add(area + spilled))
 
 
 def _indirect_call(
@@ -942,11 +955,6 @@ def _emit_function(
     local array routinely needs more than that.
     """
 
-    if function.parameters > ARM64_ARGUMENT_REGISTERS:
-        raise ValueError(
-            f"ARM64 function {function.name!r} declares {function.parameters} "
-            f"parameters; at most {ARM64_ARGUMENT_REGISTERS} are passed in registers"
-        )
     if function.parameters > function.stack_slots:
         raise ValueError(
             f"ARM64 function {function.name!r} has fewer stack slots than parameters"
@@ -955,9 +963,20 @@ def _emit_function(
     words.extend(_frame_sub(frame))
     words.append(0xA9007BFD)  # stp x29, x30, [sp]   (save the CALLER's frame)
     words.append(0x910003FD)  # mov x29, sp
-    for index in range(function.parameters):
+    for index in range(min(function.parameters, ARM64_ARGUMENT_REGISTERS)):
         # Spill the incoming argument registers into the slots the body reads.
         words.append(_slot_instruction(False, index, 16, rt=index))
+    # Arguments past the eighth arrived in memory, immediately above this
+    # frame: the caller left them at its own sp, which is x29 + frame here.
+    for index in range(ARM64_ARGUMENT_REGISTERS, function.parameters):
+        incoming = frame + (index - ARM64_ARGUMENT_REGISTERS) * 8
+        if incoming > 0x7FF8:
+            raise ValueError(
+                f"ARM64 function {function.name!r} has an incoming argument "
+                "outside addressable range"
+            )
+        words.append(0xF94003A0 | ((incoming // 8) << 10))  # ldr x0, [x29, #in]
+        words.append(_slot_instruction(False, index, 16))
     _emit_operations(
         words, function.operations, 16, refs, system, in_function=True
     )

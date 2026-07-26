@@ -1409,14 +1409,18 @@ class RejectionTests(CProgramTestCase):
                 compile_c_to_ir(source, "r.c", target)
 
 
-    def test_more_than_eight_arguments_is_refused(self):
-        parameters = ", ".join(f"int a{index}" for index in range(9))
-        arguments = ", ".join(str(index) for index in range(9))
-        self.reject(
-            f"int wide({parameters}) {{ return a0; }}\n"
-            f"int main(void) {{ return wide({arguments}); }}\n",
-            "at most 8 arguments in registers",
+    def test_more_than_eight_arguments_needs_a_target_with_a_memory_area(self):
+        source = (
+            "long long s(long long a, long long b, long long c, long long d,\n"
+            "            long long e, long long f, long long g, long long h,\n"
+            "            long long i, long long j) { return a + j; }\n"
+            "int main(void) { return s(1,2,3,4,5,6,7,8,9,10); }\n"
         )
+        compile_c_to_ir(source, "many.c", "darwin-arm64")
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(source, "many.c", "darwin-x86_64")
+        self.assertIn("at most", str(caught.exception))
+
 
     def test_long_double_is_refused(self):
         self.reject(
@@ -3809,4 +3813,50 @@ class MathBuiltinTests(CProgramTestCase):
             "double sqrt(double v) { return v + 1.0; }\n"
             "int main(void) { printf(\"%.3f\\n\", sqrt(4.0)); return 0; }\n",
             stdout="5.000\n",
+        )
+
+
+class StackArgumentTests(CProgramTestCase):
+    """Arguments past the eighth travel in AAPCS64's memory argument area."""
+
+    def test_ten_arguments_all_arrive(self):
+        self.run_c(
+            _STDIO
+            + """
+long long s(long long a, long long b, long long c, long long d, long long e,
+            long long f, long long g, long long h, long long i, long long j)
+{ return a + b*2 + c*3 + d*4 + e*5 + f*6 + g*7 + h*8 + i*9 + j*10; }
+int main(void) { printf("%lld\\n", s(1,2,3,4,5,6,7,8,9,10)); return 0; }
+""",
+            stdout="385\n",
+        )
+
+    def test_recursion_through_the_memory_area(self):
+        self.run_c(
+            _STDIO
+            + """
+long long r(long long a, long long b, long long c, long long d, long long e,
+            long long f, long long g, long long h, long long i, long long n)
+{ if (n <= 0) { return 0; } return n + r(a,b,c,d,e,f,g,h,i,n-1); }
+int main(void) { printf("%lld\\n", r(0,0,0,0,0,0,0,0,0,10)); return 0; }
+""",
+            stdout="55\n",
+        )
+
+    def test_a_call_in_a_memory_argument_position(self):
+        # The inner calls sit in the ninth and tenth argument slots, which are
+        # exactly the ones that travel through memory.
+        self.run_c(
+            _STDIO
+            + """
+long long id(long long v) { return v; }
+long long s(long long a, long long b, long long c, long long d, long long e,
+            long long f, long long g, long long h, long long i, long long j)
+{ return i + j; }
+int main(void) {
+    printf("%lld\\n", s(0,0,0,0,0,0,0,0, id(9), id(11)));
+    return 0;
+}
+""",
+            stdout="20\n",
         )
