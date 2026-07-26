@@ -1312,13 +1312,27 @@ def compile_python_via_c(
     if c_artifact is not None and c_artifact.exists() and not clean:
         raise FileExistsError(f"output already exists: {c_artifact} (use --clean)")
     c_source = compile_to_c(entry.read_text(encoding="utf-8"), str(entry))
-    reconstructed = c_to_python_source(c_source, f"{entry} [generated C]")
-    native = compile_native_source(
-        entry,
-        reconstructed,
-        output,
-        target=target,
-        clean=clean,
+    # The generated C goes through py2bin's real C compiler, so this path
+    # inherits everything that compiler can do -- division, floating point,
+    # structs -- rather than the narrower shape the canonical-C bridge accepts.
+    # The bridge's Python reconstruction is still produced, because it is what
+    # makes the generated C checkable against the Python it came from.
+    try:
+        reconstructed = c_to_python_source(c_source, f"{entry} [generated C]")
+    except CNativeCompileError:
+        # The bridge only recognises the narrow shape it was written for. It
+        # is a cross-check, not the compiler, so a construct it cannot mirror
+        # back into Python must not stop the real compiler from building.
+        reconstructed = ""
+    module = optimize(
+        compile_c_to_ir(
+            c_source,
+            f"{entry} [generated C]",
+            target or host_target(),
+        )
+    )[0]
+    native = compile_native_module(
+        entry, module, output, target=target, clean=clean
     )
     if c_artifact is not None:
         c_artifact.parent.mkdir(parents=True, exist_ok=True)

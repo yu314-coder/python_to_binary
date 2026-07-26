@@ -2,6 +2,7 @@ import ast
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -306,3 +307,71 @@ class CForLoopSemanticsTests(unittest.TestCase):
         )
         if result >= 0:
             self.assertEqual(result, 56)
+
+
+class PythonViaCTests(unittest.TestCase):
+    """Python -> generated C -> py2bin's C compiler -> machine code.
+
+    The generated C now goes through the real C front end, so this path
+    inherits what that compiler can do rather than the narrow shape the
+    canonical-C bridge was written for. Each program is run natively and
+    compared against CPython running the same source.
+    """
+
+    def _matches_cpython(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "p.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "p.bin"
+            compile_python_via_c(
+                entry, artifact, target="darwin-arm64", clean=True
+            )
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            native = subprocess.run([str(artifact)], capture_output=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.returncode, reference.returncode)
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_integer_division_and_modulo(self):
+        self._matches_cpython(
+            "a = 0\n"
+            "for i in range(1, 20):\n"
+            "    a += (i * 7) // 3 + (i * 7) % 3\n"
+            "raise SystemExit(a % 251)\n"
+        )
+
+    def test_floating_arithmetic(self):
+        self._matches_cpython(
+            "x = 0.0\n"
+            "for i in range(1, 11):\n"
+            "    x = x + 1.0 / float(i)\n"
+            "raise SystemExit(int(x * 100.0))\n"
+        )
+
+    def test_a_function_with_a_loop(self):
+        self._matches_cpython(
+            "def gcd(a: int, b: int) -> int:\n"
+            "    while b != 0:\n"
+            "        t = b\n"
+            "        b = a % b\n"
+            "        a = t\n"
+            "    return a\n"
+            "raise SystemExit(gcd(1071, 462))\n"
+        )
+
+    def test_boolean_operators_and_elif(self):
+        self._matches_cpython(
+            "n = 0\n"
+            "for i in range(1, 30):\n"
+            "    if i % 3 == 0 and i % 5 == 0:\n"
+            "        n += 10\n"
+            "    elif i % 3 == 0 or i % 5 == 0:\n"
+            "        n += 1\n"
+            "raise SystemExit(n)\n"
+        )
