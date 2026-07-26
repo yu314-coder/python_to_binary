@@ -215,8 +215,15 @@ runtime:
 - string methods on any runtime string expression: `.startswith()`,
   `.endswith()`, `.find()`, `.index()`, `.count()`, `.replace()`, `.strip()`,
   `.lstrip()`, `.rstrip()`, `.zfill()`, `.center()`, `.ljust()`, `.rjust()`,
-  `.upper()`, `.lower()`, `.capitalize()`, `.title()`, `.isdigit()` and
-  `.isalpha()`. The searches share one scan, and they only start at code-point
+  `.upper()`, `.lower()`, `.capitalize()`, `.title()`, `.isdigit()`,
+  `.isalpha()`, `.split()` and `.join()`. `.split()` with no argument splits on
+  runs of the same 29 Unicode whitespace code points `.strip()` uses and drops
+  every empty piece; `.split(sep)` keeps them, so `",a,".split(",")` is three
+  pieces and `"".split(",")` is one. An empty separator raises a catchable
+  `ValueError` at run time, and is refused at build time when it is already
+  known to be empty. `.join()` measures the pieces in one pass and allocates
+  once, because a concatenation per element would be quadratic in an arena that
+  never reclaims. The searches share one scan, and they only start at code-point
   boundaries so that an empty needle is found between characters rather than
   between the bytes of one - which is what makes `"é".count("")` two.
   `.find()` reports a character index, not a byte offset, and widths count
@@ -385,16 +392,29 @@ runtime:
   (`""` seed, `+` concatenation, `len()`, and `print()`) are lowered onto a
   bump-arena, obtained once at start-up with anonymous `mmap` on POSIX and
   `VirtualAlloc` on Windows; a failed reservation exits rather than writing
-  through a null pointer. Nested lists are rejected. The Windows arena is not
+  through a null pointer. The Windows arena is not
   executed by this project's test suite, which runs on POSIX: its images are
   checked for structure and for the imports the arena needs, and the behaviour
   is covered by the POSIX images built from the same IR. A runtime string holds UTF-8 and may contain
   any text: the header counts bytes, which is what a write needs, and `len()`
   counts code points by skipping continuation bytes, which is what CPython
-  reports - so `len()` is a pass over the string rather than a header read. A list holds
-  signed 64-bit integers or floats, decided by its first element or by a
-  `xs: list[float] = []` annotation; a float element lives in its eight-byte
-  slot as a bit pattern, the same way a float dict value does. Object
+  reports - so `len()` is a pass over the string rather than a header read. A
+  list holds signed 64-bit integers, bools, floats, runtime strings, or other
+  lists, decided by its first element or by a `xs: list[list[float]] = []`
+  annotation that may nest to any depth. Every element is eight bytes: a float
+  lives there as a bit pattern, the same way a float dict value does, and a
+  string or an inner list lives there as the address of its own block. One list
+  holds one kind - `[1, [2]]` is refused rather than guessed at, and so is an
+  integer in a float list, because CPython would read the integer back out
+  rather than a 1.0. A list variable holds its block rather than a reference to
+  it, and appending moves that block, so storing one list inside another and
+  then appending to it through its own name is refused: the element would be
+  left on the abandoned copy. Writes that do not move a block - `xs[i] = v` and
+  `del xs[i]` - stay allowed through both, as they are in CPython. Sorting,
+  `sum`/`min`/`max`, and `in` over lists of lists are refused, because the eight
+  bytes there are an address and comparing them would answer in allocation
+  order; `in` over a list of strings compares the bytes. There is no renderer
+  for a list, so `print(xs)` is refused rather than printed wrongly. Object
   attributes work the same way, except that the layout learns which fields are
   floats from an annotation in `__init__` (`self.x: float = ...`), because the
   type of what is stored there depends on the arguments at each call site;

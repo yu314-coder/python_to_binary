@@ -335,6 +335,32 @@ class NativeHeapTests(unittest.TestCase):
             b"caught\n",
         )
 
+    def test_a_literal_that_reads_the_name_it_replaces(self):
+        # The new block is built into a slot of its own and moved onto the name
+        # afterwards. Building it in place would put the new, empty block's
+        # address in the name before the right-hand side read the old one.
+        self._run(
+            "xs = [1]\n"
+            "w = 0\n"
+            "while w < 3:\n"
+            "    xs = [xs[0] + 1]\n"
+            "    w += 1\n"
+            "print(xs[0])\n",
+            0,
+            b"4\n",
+        )
+        self._run(
+            "d = {}\n"
+            "d[0] = 1\n"
+            "w = 0\n"
+            "while w < 3:\n"
+            "    d = {0: d[0] + 1}\n"
+            "    w += 1\n"
+            "print(d[0])\n",
+            0,
+            b"4\n",
+        )
+
     # --- honest rejections --------------------------------------------------
 
     def _reject(self, source: str, needle: str) -> None:
@@ -481,11 +507,14 @@ class NativeHeapTests(unittest.TestCase):
         )
 
     def test_the_first_element_decides_what_a_list_holds(self):
-        # An integer widens into a float list, as it does in a float dict; a
-        # float in an integer list has nowhere to go and is refused.
+        # One list holds one kind. A float in an integer list has nowhere to
+        # go, and an integer in a float list used to be widened - which prints
+        # 2.0 where CPython prints 2, because a list element keeps whatever
+        # object was put in it rather than converting to the list's type.
         self._reject("xs = [1, 2.5]\nraise SystemExit(1)\n", "signed 64-bit integers")
+        self._reject("xs = [1.5, 2]\nprint(xs[1])\n", "write 1.0 rather than 1")
         self._run(
-            "xs = [1.5, 2]\nraise SystemExit(int((xs[0] + xs[1]) * 2))\n", 7
+            "xs = [1.5, 2.0]\nraise SystemExit(int((xs[0] + xs[1]) * 2))\n", 7
         )
 
     def test_list_used_as_bare_integer_is_rejected(self):
@@ -1144,9 +1173,11 @@ class ComprehensionTests(unittest.TestCase):
         )
 
     def test_set_and_dict_comprehensions_are_rejected_by_name(self):
+        # There IS a runtime set now, so the reason is no longer that one: a
+        # set comprehension would build a set nothing may iterate.
         self._reject(
             "xs = [1, 2]\ns = {v for v in xs}\nprint(1)\n",
-            "no runtime set",
+            "would build a set nothing may iterate",
         )
         self._reject(
             "xs = [1, 2]\nd = {v: v * 2 for v in xs}\nprint(1)\n",
@@ -1314,4 +1345,308 @@ class DeleteListElementTests(unittest.TestCase):
             + "for v in xs:\n    del ys[0]\n"
             + "print(len(ys), ys[0])\n",
             b"1 7\n",
+        )
+
+
+class NestedListTests(unittest.TestCase):
+    """Lists whose elements are strings or other lists.
+
+    An element is eight bytes either way, so a string or an inner list travels
+    as the address of its block and only the element kind has to be carried
+    along. Every expectation here is CPython's own output for the same source,
+    diffed against the darwin-arm64 binary.
+    """
+
+    _RUNTIME_N = "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                artifact = root / f"program-{target}.bin"
+                compile_native(entry, artifact, target, clean=True)
+                magic = _MAGIC[target.split("-")[0]]
+                self.assertEqual(
+                    artifact.read_bytes()[: len(magic)],
+                    magic,
+                    f"{target} nested-list image has a broken header",
+                )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def test_a_literal_of_literals_indexes_and_iterates(self):
+        self._run(
+            "xs = [[1, 2], [3]]\n"
+            "print(xs[0][1])\nprint(len(xs[0]))\nprint(len(xs))\n"
+            "for row in xs:\n    print(len(row))\n    print(row[0])\n",
+            b"2\n2\n2\n2\n1\n1\n3\n",
+        )
+
+    def test_an_empty_literal_takes_its_kind_from_the_annotation(self):
+        self._run(
+            "xs: list[list[int]] = []\n"
+            + self._RUNTIME_N
+            + "for i in range(0, 3):\n    xs.append([i, n])\n"
+            "print(xs[2][1])\nprint(len(xs))\n",
+            b"3\n3\n",
+        )
+        self._reject(
+            "xs: list[list[int]] = []\nxs.append(7)\n",
+            "this list holds lists of signed 64-bit integers",
+        )
+
+    def test_an_annotation_nests_to_any_depth(self):
+        self._run(
+            "xs: list[list[list[int]]] = []\n"
+            + self._RUNTIME_N
+            + "xs.append([[n], [n, n]])\n"
+            "print(xs[0][1][0])\nprint(len(xs[0][1]))\n",
+            b"3\n2\n",
+        )
+
+    def test_a_nested_bool_still_prints_as_a_bool(self):
+        # `xs[0][1]` has no name whose bookkeeping could say it is a bool, so
+        # the answer has to come from the list's own element kind.
+        self._run(
+            self._RUNTIME_N
+            + "xs = [[n > 1, n < 1], [n < 1]]\n"
+            "print(xs[0][0])\nprint(xs[0][1])\n"
+            "for row in xs:\n    print(row[0])\n",
+            b"True\nFalse\nTrue\nFalse\n",
+        )
+
+    def test_a_nested_float_keeps_its_bit_pattern(self):
+        self._run(
+            "xs: list[list[float]] = [[1.5, -0.0], [2.25]]\n"
+            "print(xs[0][1])\nprint(xs[1][0])\n",
+            b"-0.0\n2.25\n",
+        )
+
+    def test_a_list_of_strings_holds_runtime_ones_too(self):
+        self._run(
+            'parts = ["a", "b"]\ns = ""\ns = s + "c"\n'
+            "parts.append(s)\n"
+            "print(parts[0])\nprint(parts[2])\nprint(len(parts))\n"
+            "print(len(parts[2]))\n"
+            "for w in parts:\n    print(w)\n",
+            b"a\nc\n3\n1\na\nb\nc\n",
+        )
+
+    def test_membership_over_strings_compares_the_bytes(self):
+        # The words are block addresses and two equal strings are two
+        # allocations, so identity would answer False where CPython says True.
+        self._run(
+            'parts = ["a", "b"]\ns = ""\ns = s + "a"\n'
+            "print(s in parts)\nprint(\"c\" in parts)\n",
+            b"True\nFalse\n",
+        )
+
+    def test_slices_and_comprehensions_produce_nested_lists(self):
+        self._run(
+            "xs = [[1, 2], [3], [4, 5, 6]]\n"
+            "ys = xs[1:]\nprint(len(ys))\nprint(ys[1][2])\n"
+            "zs = [row[0] for row in xs]\nprint(zs[2])\n"
+            "ws = [[k, k] for k in range(0, 3)]\nprint(ws[2][1])\n",
+            b"2\n6\n4\n2\n",
+        )
+
+    def test_appending_a_name_that_is_also_an_element_is_rejected(self):
+        # Appending moves the block and writes the new address back to the
+        # variable's slot only. The element would be left on the abandoned
+        # copy, printing 4 where CPython prints 5.
+        self._reject(
+            "inner = [1, 2, 3, 4]\nxs: list[list[int]] = []\n"
+            "xs.append(inner)\ninner.append(5)\nprint(len(xs[0]))\n",
+            "is stored inside another container somewhere in this module",
+        )
+        # The refusal is whole-module, because a loop's back edge puts the
+        # append textually before the store that shared the block.
+        self._reject(
+            "xs: list[list[int]] = []\nrow = [1]\n"
+            "for i in range(0, 3):\n    row.append(i)\n    xs.append(row)\n",
+            "is stored inside another container somewhere in this module",
+        )
+        # A copy is the way out, and leaves the two lists independent.
+        self._run(
+            "inner = [1, 2, 3, 4]\nxs: list[list[int]] = []\n"
+            "xs.append(inner[:])\ninner.append(5)\n"
+            "print(len(xs[0]))\nprint(len(inner))\n",
+            b"4\n5\n",
+        )
+
+    def test_appending_to_a_name_bound_from_an_element_is_rejected(self):
+        self._reject(
+            "xs = [[1, 2, 3, 4]]\nrow = xs[0]\nrow.append(5)\n",
+            "names a list that is an element of another one",
+        )
+        self._reject(
+            "xs = [[1, 2, 3, 4]]\nfor row in xs:\n    row.append(5)\n",
+            "names a list that is an element of another one",
+        )
+        self._reject(
+            "xs = [[1, 2]]\nxs[0].append(5)\n",
+            "is only called on a list held by a name",
+        )
+
+    def test_writes_that_do_not_move_the_block_stay_allowed(self):
+        # `xs[i] = v` and `del xs[i]` rewrite the block in place, which CPython
+        # sees through every reference to it, so the alias is honest there.
+        self._run(
+            "xs: list[list[int]] = []\nrow = [1, 2, 3, 4]\n"
+            "xs.append(row)\nrow[0] = 9\ndel row[1]\n"
+            "print(xs[0][0])\nprint(len(xs[0]))\n",
+            b"9\n3\n",
+        )
+
+    def test_growing_the_outer_list_carries_the_inner_blocks(self):
+        self._run(
+            "xs: list[list[int]] = []\n"
+            + self._RUNTIME_N
+            + "for i in range(0, 8):\n    xs.append([i, i * n])\n"
+            "print(len(xs))\nprint(xs[7][1])\nprint(xs[0][0])\n",
+            b"8\n21\n0\n",
+        )
+
+    def test_a_mixed_list_is_rejected_from_either_side(self):
+        self._reject("xs = [1, [2]]\nprint(xs[0])\n", "one list holds one kind")
+        self._reject("xs = [[2], 1]\nprint(len(xs))\n", "one list holds one kind")
+        self._reject('xs = ["a", 1]\nprint(len(xs))\n', "one list holds one kind")
+
+    def test_printing_a_list_is_still_rejected(self):
+        self._reject("xs = [[1, 2]]\nprint(xs)\n", "cannot render a runtime")
+        self._reject("xs = [[1, 2]]\nprint(xs[0])\n", "cannot render a runtime")
+        self._reject('parts = ["a"]\nprint(parts[0:1])\n', "cannot render a runtime")
+
+    def test_reordering_and_reducing_strings_or_lists_is_rejected(self):
+        self._reject('parts = ["b", "a"]\nparts.sort()\n', "compare block addresses")
+        self._reject('parts = ["b", "a"]\nys = sorted(parts)\n', "compare block addresses")
+        self._reject('parts = ["a"]\nprint(sum(parts))\n', "compare block addresses")
+        self._reject("xs = [[1], [2]]\nxs.sort()\n", "compare block addresses")
+        self._reject("xs = [[1], [2]]\nprint([1] in xs)\n", "over a list of lists")
+
+
+class SplitAndJoinTests(unittest.TestCase):
+    """`str.split()` and `str.join()`, which needed a list of strings first."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                artifact = root / f"program-{target}.bin"
+                compile_native(entry, artifact, target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def _runtime(self, name: str, text: str) -> str:
+        return f'{name} = ""\n{name} = {name} + {text!r}\n'
+
+    def test_whitespace_split_drops_every_empty_piece(self):
+        self._run(
+            self._runtime("s", "  a  b  ")
+            + "print(len(s.split()))\n"
+            + "for w in s.split():\n    print(\"[\" + w + \"]\")\n"
+            + self._runtime("t", "   ")
+            + "print(len(t.split()))\n"
+            + self._runtime("u", "")
+            + "print(len(u.split()))\n",
+            b"2\n[a]\n[b]\n0\n0\n",
+        )
+
+    def test_whitespace_split_uses_the_unicode_set(self):
+        # The same 29 code points `.strip()` uses, so a non-breaking space and
+        # an ideographic space separate here exactly as they do in CPython.
+        self._run(
+            self._runtime("s", "\t\n x   y 　 z \n")
+            + "print(len(s.split()))\n"
+            + "for w in s.split():\n    print(w)\n",
+            "3\nx\ny\nz\n".encode("utf-8"),
+        )
+
+    def test_a_separator_split_keeps_the_empty_pieces(self):
+        self._run(
+            self._runtime("t", ",a,")
+            + self._runtime("c", ",")
+            + "print(len(t.split(c)))\n"
+            + 'print(t.split(c)[0] == "")\nprint(t.split(c)[2] == "")\n'
+            + self._runtime("u", "")
+            + "print(len(u.split(c)))\n"
+            + self._runtime("v", "aaa")
+            + self._runtime("aa", "aa")
+            + "print(len(v.split(aa)))\nprint(v.split(aa)[1])\n",
+            b"3\nTrue\nTrue\n1\n2\na\n",
+        )
+
+    def test_an_empty_separator_raises_a_catchable_value_error(self):
+        self._run(
+            self._runtime("s", "abc")
+            + "sep = s[0:0]\n"
+            + "try:\n    print(len(s.split(sep)))\n"
+            + "except ValueError:\n    print(\"caught\")\n"
+            + "print(len(s.split(s[0:1])))\n",
+            b"caught\n2\n",
+        )
+        # A separator already known to be empty can only fail, so say so at
+        # build time rather than emitting a program that always dies.
+        self._reject('print(len("abc".split("")))\n', "raises ValueError: empty separator")
+
+    def test_join_concatenates_with_one_allocation(self):
+        self._run(
+            'parts = ["a", "b", "c"]\n'
+            'print("".join(parts))\nprint("-".join(parts))\n'
+            'empty: list[str] = []\nprint("-".join(empty) == "")\n'
+            + self._runtime("s", "x y z")
+            + 'print("|".join(s.split()))\n',
+            b"abc\na-b-c\nTrue\nx|y|z\n",
+        )
+
+    def test_the_shapes_outside_the_subset_are_rejected(self):
+        self._reject(
+            self._runtime("s", "a b") + 'print(len(s.split(" ", 1)))\n',
+            "the maxsplit form is not in the subset",
+        )
+        self._reject(
+            'xs = [1, 2]\nprint("-".join(xs))\n',
+            "takes a list of strings",
         )

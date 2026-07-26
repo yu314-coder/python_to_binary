@@ -709,6 +709,12 @@ class Frontend:
         # Known compile-time lengths of runtime lists built from literals, keyed
         # by variable name. Used only to reject out-of-range constant indices.
         self.list_lengths: dict[str, int] = {}
+        # Names bound to a lambda, and the source position of every lambda that
+        # is such a binding. Positions rather than identities because a function
+        # body is deep-copied at definition, so the lambda lowered at a call
+        # site is not the node the whole-tree pass looked at.
+        self.lambda_names: set[str] = set()
+        self._lambda_bindings: set[tuple[int, int]] = set()
         # Lazily reserved stack slot holding the arena bump pointer, plus a flag
         # recording that the program needs the arena (so HeapInit is emitted).
         self._heap_bump_slot: int | None = None
@@ -740,7 +746,23 @@ class Frontend:
         # a property of the variable, decided by everything stored into it.
         # None means nothing has been stored yet.
         self.container_bool: dict[str, bool | None] = {}
+        # An empty list literal with no annotation has nothing to read its
+        # element kind from, so it waits for the first thing stored in it
+        # rather than guessing integers and refusing anything else.
+        self.undecided_lists: set[str] = set()
         self._bool_query: set[int] = set()
+        # Per tuple name, the bytes print() must write for each element whose
+        # repr is settled at build time, and None where it is not. CPython
+        # prints a tuple with the repr of every element, and the quotes and
+        # backslash escapes repr picks for a string built at run time are not
+        # something the string machinery here can reproduce.
+        self.tuple_texts: dict[str, tuple[bytes | None, ...]] = {}
+        # Names whose list block is also reachable through a container: one
+        # that was stored into a list anywhere in the module, and one that was
+        # read back out of one. Appending moves a block, and only the name it
+        # moves through learns the new address.
+        self.escaped_list_names: set[str] = set()
+        self.shared_list_names: set[str] = set()
         # A parameter substituted into a single-expression body is just a
         # value, and a string's value is a pointer - indistinguishable from an
         # integer. This records which of them are strings.
@@ -766,6 +788,7 @@ class Frontend:
         except SyntaxError as error:
             raise ValueError(f"{self.path}:{error.lineno}:{error.offset}: {error.msg}") from error
         self.runtime_names.update(self.loop_mutated_names(tree))
+        self.note_escaping_list_names(tree)
         # A name a function declares global has to live in a slot. Inlining
         # swaps the build-time constant map for the function's own, so a
         # constant written inside the body would be dropped when the module's
@@ -773,6 +796,7 @@ class Frontend:
         for node in ast.walk(tree):
             if isinstance(node, ast.Global):
                 self.runtime_names.update(node.names)
+        self.note_lambda_bindings(tree)
         for statement in tree.body:
             self.statement(statement)
         if not self.operations or not isinstance(self.operations[-1], (Exit, ExitValue)):
@@ -901,6 +925,136 @@ class Frontend:
                 elif isinstance(node, ast.For):
                     names.update(cls.target_names(node.target))
         return names
+
+    @classmethod
+    def name_binding_sites(cls, tree: ast.AST) -> dict[str, list[ast.AST]]:
+        """Every place each name is given a value, with the node that does it.
+
+        Broader than `assigned_names`, which only cares about what a block
+        rewrites: this has to see every way a name could come to mean something
+        else, so a name may be shown to mean one thing everywhere.
+        """
+
+        sites: dict[str, list[ast.AST]] = {}
+
+        def note(name: str, node: ast.AST) -> None:
+            sites.setdefault(name, []).append(node)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in cls.target_names(target):
+                        note(name, node)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                if isinstance(node.target, ast.Name):
+                    note(node.target.id, node)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                for name in cls.target_names(node.target):
+                    note(name, node)
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                note(node.name, node)
+            elif isinstance(node, ast.arg):
+                # A parameter shadows the outer name for the whole body.
+                note(node.arg, node)
+            elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+                note(node.target.id, node)
+            elif isinstance(node, ast.comprehension):
+                for name in cls.target_names(node.target):
+                    note(name, node.target)
+            elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+                for name in cls.target_names(node.optional_vars):
+                    note(name, node.optional_vars)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                note(node.name, node)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    note(alias.asname or alias.name.split(".")[0], node)
+        return sites
+
+    _LAMBDA_REFUSAL = (
+        "a native lambda is compiled as the one-expression function it would "
+        "otherwise be written as, under the name it is bound to, and a call is "
+        "resolved to that function at build time. No value here carries code, "
+        "so the only lambda with a representation is `name = lambda ...:` "
+        "written directly in a module or function body - not one passed as an "
+        "argument, returned, stored in a container, or called where it stands"
+    )
+
+    def note_lambda_bindings(self, tree: ast.Module) -> None:
+        """Accept the lambdas that are plain function definitions in disguise."""
+
+        bodies: list[list[ast.stmt]] = [tree.body]
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bodies.append(node.body)
+        bindings: dict[str, ast.Assign] = {}
+        for body in bodies:
+            for statement in body:
+                if (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and isinstance(statement.value, ast.Lambda)
+                ):
+                    bound = statement.value
+                    self._lambda_bindings.add((bound.lineno, bound.col_offset))
+                    # Keep the first, so a rebinding is reported as the second
+                    # thing that happened rather than the first.
+                    bindings.setdefault(statement.targets[0].id, statement)
+        # A lambda spelled as a keyword argument is left alone here: whatever
+        # rejects that keyword knows why its own callee cannot take a callable,
+        # which is a better answer than this general one. `integer()` refuses
+        # it by name if nothing more specific speaks first.
+        keyword_values = {
+            id(node.value) for node in ast.walk(tree) if isinstance(node, ast.keyword)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Lambda)
+                and (node.lineno, node.col_offset) not in self._lambda_bindings
+                and id(node) not in keyword_values
+            ):
+                raise NativeCompileError(self.path, node, self._LAMBDA_REFUSAL)
+        if not bindings:
+            return
+        sites = self.name_binding_sites(tree)
+        for name, statement in bindings.items():
+            others = sorted(
+                (site for site in sites.get(name, ()) if site is not statement),
+                key=lambda site: (site.lineno, site.col_offset),
+            )
+            if others:
+                raise NativeCompileError(
+                    self.path,
+                    others[0],
+                    f"{name!r} is bound to a lambda on line {statement.lineno} and "
+                    f"bound again on line {others[0].lineno}; a call to it is "
+                    "resolved to one compiled function at build time, so which "
+                    "code the name means cannot depend on what ran. Give the "
+                    "other binding a name of its own",
+                )
+        self.lambda_names.update(bindings)
+        called = {
+            id(node.func)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Name)
+                and node.id in self.lambda_names
+                and isinstance(node.ctx, ast.Load)
+                and id(node) not in called
+            ):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{node.id!r} names a lambda compiled as a native function, "
+                    "so it can only be called; there is no run-time value here "
+                    "for a name to hold that carries code",
+                )
 
     @staticmethod
     def block_breaks(body: list[ast.stmt]) -> bool:
@@ -1068,6 +1222,13 @@ class Frontend:
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 return  # Module docstring.
             self.expression_statement(node.value)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Lambda)
+        ):
+            self.lambda_definition(node.targets[0].id, node.value)
         elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             self.assignment(node.targets[0].id, node.value)
         elif (
@@ -1077,6 +1238,13 @@ class Frontend:
             and isinstance(node.value, (ast.Tuple, ast.List))
         ):
             self.parallel_assignment(node.targets[0], node.value)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], (ast.Tuple, ast.List))
+            and self.unpacked_tuple_kinds(node.value) is not None
+        ):
+            self.tuple_unpacking(node.targets[0], node.value)
         elif isinstance(node, ast.Assign) and len(node.targets) > 1:
             # `a = b = value`: one evaluation, several names.
             first = node.targets[0]
@@ -1137,6 +1305,29 @@ class Frontend:
                 )
                 self.value_types[name] = "float"
                 return
+            if self.set_kind_of(node.target.id) is not None or (
+                isinstance(node.value, ast.Name)
+                and self.set_kind_of(node.value.id) is not None
+            ):
+                # Checked before the integer operator table below, which would
+                # otherwise read `s |= t` as bitwise-or over the two slots and
+                # write the or of two table addresses into the variable.
+                if type(node.op) not in self._SET_OPERATORS:
+                    raise NativeCompileError(
+                        self.path,
+                        node,
+                        "native set augmented assignment supports |= &= -=",
+                    )
+                combined = ast.copy_location(
+                    ast.BinOp(left=node.target, op=node.op, right=node.value),
+                    node,
+                )
+                kind = self.expression_type(combined)
+                self.values.pop(node.target.id, None)
+                self.set_assignment(
+                    node.target.id, combined, self.set_kind(kind)
+                )
+                return
             operators = {
                 ast.Add: "add",
                 ast.Sub: "sub",
@@ -1190,8 +1381,10 @@ class Frontend:
             self.if_statement(node)
         elif isinstance(node, ast.While):
             self.while_statement(node)
+            self.forget_conditional_list_lengths(node.body + node.orelse)
         elif isinstance(node, ast.For):
             self.for_statement(node)
+            self.forget_conditional_list_lengths(node.body + node.orelse)
         elif isinstance(node, ast.Break):
             if not self.break_targets:
                 raise NativeCompileError(self.path, node, "break is outside a native loop")
@@ -1283,12 +1476,45 @@ class Frontend:
                     self.path, node, "native try does not support exception groups"
                 )
             self.try_statement(node)
+            conditional: list[ast.stmt] = list(node.body)
+            for clause in node.handlers:
+                conditional.extend(clause.body)
+            conditional.extend(node.orelse)
+            self.forget_conditional_list_lengths(conditional)
         else:
             raise NativeCompileError(
                 self.path,
                 node,
                 f"{type(node).__name__} is not in the native subset yet; use bundle mode for full CPython semantics",
             )
+
+    def lambda_definition(self, name: str, node: ast.Lambda) -> None:
+        """Define `name = lambda ...:` as the function it would otherwise be.
+
+        Calls here are resolved by name and inlined at build time, so a lambda
+        bound to a name is a one-expression function under that name and
+        nothing else. Rewriting it into one gets the parameter, default and
+        return-kind handling of `def` rather than a second copy of it.
+        """
+
+        if (node.lineno, node.col_offset) not in self._lambda_bindings:
+            # A binding the whole-tree pass did not accept: inside an `if`, a
+            # loop, or any block that may not run, where which lambda the name
+            # means would depend on what happened.
+            raise NativeCompileError(self.path, node, self._LAMBDA_REFUSAL)
+        synthetic = ast.FunctionDef(
+            name=name,
+            args=node.args,
+            body=[ast.copy_location(ast.Return(value=node.body), node)],
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        if "type_params" in ast.FunctionDef._fields:
+            synthetic.type_params = []
+        ast.copy_location(synthetic, node)
+        ast.fix_missing_locations(synthetic)
+        self.function_definition(synthetic)
 
     def function_definition(self, node: ast.FunctionDef) -> None:
         arguments = node.args
@@ -1966,6 +2192,18 @@ class Frontend:
                 and len(statement.targets) == 1
                 and isinstance(statement.targets[0], ast.Name)
             ):
+                if isinstance(statement.value, ast.Lambda):
+                    # A lambda binding is a definition, not a value to copy
+                    # into the uses of its name: substituting it would leave a
+                    # call whose callee is the lambda itself, which resolves to
+                    # no function. The imperative inliner runs the binding as
+                    # the definition it is.
+                    raise NativeCompileError(
+                        self.path,
+                        statement,
+                        "a lambda binding defines a function, so this body is "
+                        "inlined statement by statement rather than folded",
+                    )
                 replacements[statement.targets[0].id] = self.substitute_locals(
                     statement.value,
                     replacements,
@@ -2772,14 +3010,26 @@ class Frontend:
         if annotation is not None and isinstance(expression, ast.List):
             declared = self.annotated_list_tag(annotation)
             if declared is not None:
-                if kind != "list:int" and kind != declared:
+                if not expression.elts:
+                    # Only the empty literal has nothing to read its kind from,
+                    # which is the whole reason to write the annotation.
+                    kind = declared
+                elif kind != declared and {kind, declared} != {
+                    "list:int",
+                    "list:bool",
+                }:
+                    # A non-empty literal says what it holds. Believing the
+                    # annotation over it would store 1 as 1.0 and print it back
+                    # as 1.0, where CPython keeps the int. `list[int] = [True]`
+                    # is the exception: CPython keeps the bools too.
                     raise NativeCompileError(
                         self.path,
                         expression,
                         f"this literal builds a {kind} but the annotation says "
-                        f"{declared}",
+                        f"{declared}; an annotation names what an EMPTY literal "
+                        "holds, it does not convert the elements of one that is "
+                        "not empty",
                     )
-                kind = declared
         if annotation is not None and isinstance(expression, ast.Dict):
             # `d: dict[str, float] = {}` says what an empty literal cannot.
             declared = self.annotated_dict_tag(annotation)
@@ -2790,6 +3040,23 @@ class Frontend:
                         expression,
                         f"this literal builds a {kind} but the annotation says "
                         f"{declared}",
+                    )
+                kind = declared
+        if annotation is not None and (
+            isinstance(expression, ast.Set) or self.empty_set_call(expression)
+        ):
+            # `s: set[str] = set()` says what set() cannot.
+            declared = self.annotated_set_tag(annotation)
+            if declared is not None:
+                # A non-empty literal says what it holds, and believing the
+                # annotation over it would hash an integer as a string pointer.
+                if not self.empty_set_call(expression) and kind != declared:
+                    raise NativeCompileError(
+                        self.path,
+                        expression,
+                        f"this literal builds a {kind} but the annotation says "
+                        f"{declared}; an annotation names what set() holds, it "
+                        "does not convert the elements of a literal",
                     )
                 kind = declared
         previous = self.value_types.get(name)
@@ -2814,7 +3081,16 @@ class Frontend:
         elif self.dict_kinds(kind) is not None:
             key_kind, value_kind = self.dict_kinds(kind)
             self.dict_assignment(name, expression, key_kind, value_kind)
+        elif self.set_kind(kind) is not None:
+            self.set_assignment(name, expression, self.set_kind(kind))
         elif self.list_kind(kind) is not None:
+            if isinstance(expression, ast.List) and not expression.elts:
+                if annotation is None or self.annotated_list_tag(annotation) is None:
+                    self.undecided_lists.add(name)
+                else:
+                    self.undecided_lists.discard(name)
+            else:
+                self.undecided_lists.discard(name)
             if (
                 isinstance(expression, ast.Name)
                 and self.list_kind_of(expression.id) is not None
@@ -2829,6 +3105,8 @@ class Frontend:
                     f"({expression.id}[:]) if a second list is what you want",
                 )
             self.list_assignment(name, expression, self.list_kind(kind))
+        elif self.tuple_kinds(kind) is not None:
+            self.tuple_assignment(name, expression, self.tuple_kinds(kind))
         elif kind == "str":
             self.string_assignment(name, expression)
         elif kind == "float":
@@ -2856,24 +3134,141 @@ class Frontend:
     def list_kind_of(self, name: str) -> str | None:
         return self.list_kind(self.value_types.get(name))
 
+    # An element is eight bytes whatever it holds, so a string or a nested list
+    # travels as its block pointer and only the kind has to be carried along.
+    # `bool` is an element kind of its own rather than an integer, because
+    # nothing at run time tells True from 1 and an element read back out of an
+    # unnamed list - `xs[0][1]` - has no name whose bookkeeping could say.
+    _LIST_LEAF_KINDS = frozenset({"int", "float", "str", "bool"})
+
+    @staticmethod
+    def element_value_type(element_kind: str) -> str:
+        """The `expression_type` reading an element of this kind gives back."""
+
+        return "int" if element_kind == "bool" else element_kind
+
+    def kind_noun(self, kind: str) -> str:
+        """How a diagnostic names an element kind."""
+
+        nested = self.list_kind(kind)
+        if nested is not None:
+            return f"lists of {self.kind_noun(nested)}"
+        return {
+            "int": "signed 64-bit integers",
+            "bool": "bools",
+            "float": "floats",
+            "str": "strings",
+        }.get(kind, kind)
+
+    def element_kind_of(
+        self, node: ast.expr, bindings: dict[str, KernelValue] | None = None
+    ) -> str:
+        """The element kind storing ``node`` in a native list would need."""
+
+        kind = self.expression_type(node, bindings)
+        if kind == "int" and self.renders_as_bool(node):
+            return "bool"
+        return kind
+
+    def storable_element_kind(self, kind: str) -> bool:
+        return kind in self._LIST_LEAF_KINDS or self.list_kind(kind) is not None
+
+    def settle_element_kind(self, name: str, node: ast.expr) -> str:
+        """The element kind of ``name``, deciding it now if it is still open.
+
+        `xs = []` has nothing to read a kind from, so the first thing stored
+        chooses one. Guessing integers at the literal and refusing everything
+        else would reject `flags = []` followed by `flags.append(a > b)`, which
+        is ordinary Python.
+        """
+
+        element_kind = self.list_kind_of(name)
+        if name not in self.undecided_lists:
+            return element_kind
+        found = self.element_kind_of(node)
+        if not self.storable_element_kind(found):
+            return element_kind
+        self.undecided_lists.discard(name)
+        self.value_types[name] = self.list_tag(found)
+        return found
+
+    def check_element(self, node: ast.expr, element_kind: str, where: str) -> None:
+        """Refuse an expression that cannot be stored as this element kind."""
+
+        found = self.element_kind_of(node)
+        if found != element_kind:
+            self.refuse_element_mismatch(node, element_kind, found, where)
+
+    def refuse_element_mismatch(
+        self, node: ast.expr, element_kind: str, found: str, where: str
+    ) -> None:
+        """Say why an element of one kind cannot join a list of another.
+
+        A list element keeps whatever was put in it - CPython does not convert
+        one to the list's declared type - so widening an integer into a float
+        list would read back as 2.0 where CPython reads 2.
+        """
+
+        if {found, element_kind} == {"bool", "int"}:
+            self.refuse_bool_mix(node, element_kind == "bool", where)
+        hint = (
+            "; write 1.0 rather than 1, because an element keeps whatever it "
+            "was given and CPython would read the integer back out"
+            if element_kind == "float" and found == "int"
+            else "; one list holds one kind, because nothing at run time tells "
+            "the eight bytes of an element apart. An empty inner literal "
+            "counts as a list of integers, so annotate the name if that is "
+            "what disagrees"
+        )
+        raise NativeCompileError(
+            self.path,
+            node,
+            f"{where} holds {self.kind_noun(element_kind)} and this is "
+            f"{self.kind_noun(found)}{hint}",
+        )
+
+    def element_word(self, node: ast.expr, element_kind: str) -> IntExpression:
+        """The eight bytes an element of this kind stores for ``node``.
+
+        A float goes in as its bit pattern, and a string or a nested list as
+        the address of its block; an integer and a bool are already words.
+        """
+
+        if element_kind == "float":
+            return FloatBits(self.float_expression(node))
+        if element_kind == "str":
+            return self.string_pointer(node)
+        if self.list_kind(element_kind) is not None:
+            return self.list_pointer(node)
+        return self.integer(node)
+
     def list_literal_tag(
         self, node: ast.List, bindings: dict[str, KernelValue] | None = None
     ) -> str:
         """The element kind a list literal builds, read off its first element.
 
-        An empty literal has nothing to read, so it holds integers unless an
-        annotation such as `xs: list[float] = []` says otherwise.
+        An empty literal has nothing to read, so its kind is settled by the
+        first thing stored in it, or by an annotation such as
+        `xs: list[float] = []`. The rest of the elements have to agree: one
+        list is one kind, because the eight bytes of an element say nothing
+        about what they hold.
         """
 
         if not node.elts:
             return self.list_tag("int")
-        kind = self.expression_type(node.elts[0], bindings)
-        if kind not in {"int", "float"}:
+        kind = self.element_kind_of(node.elts[0], bindings)
+        if not self.storable_element_kind(kind):
             raise NativeCompileError(
                 self.path,
                 node.elts[0],
-                "native lists hold signed 64-bit integers or floats",
+                "a native list element is a signed 64-bit integer, a float, a "
+                "string, a bool, or another list",
             )
+        for element in node.elts[1:]:
+            other = self.element_kind_of(element, bindings)
+            if other == kind:
+                continue
+            self.refuse_element_mismatch(element, kind, other, "this list")
         return self.list_tag(kind)
 
     def annotated_list_tag(self, annotation: ast.expr) -> str | None:
@@ -2883,14 +3278,26 @@ class Frontend:
             not isinstance(annotation, ast.Subscript)
             or not isinstance(annotation.value, ast.Name)
             or annotation.value.id not in {"list", "List"}
-            or not isinstance(annotation.slice, ast.Name)
         ):
             return None
-        if annotation.slice.id not in {"int", "float"}:
+        return self.list_tag(self.annotated_element_kind(annotation.slice))
+
+    def annotated_element_kind(self, node: ast.expr) -> str:
+        """The element kind the `T` of a `list[T]` annotation names."""
+
+        if isinstance(node, ast.Name) and node.id in self._LIST_LEAF_KINDS:
+            return node.id
+        nested = (
+            self.annotated_list_tag(node) if isinstance(node, ast.Subscript) else None
+        )
+        if nested is None:
             raise NativeCompileError(
-                self.path, annotation, "a native list annotation is list[int|float]"
+                self.path,
+                node,
+                "a native list annotation is list[T] where T is int, float, "
+                "str, bool, or another list[...]",
             )
-        return self.list_tag(annotation.slice.id)
+        return nested
 
     # --- slicing ------------------------------------------------------------
     #
@@ -3412,12 +3819,14 @@ class Frontend:
                 f"native {name}() takes a runtime list or a generator "
                 "expression over one",
             )
-        if element_kind != "int":
+        if element_kind not in {"int", "bool"}:
             raise NativeCompileError(
                 self.path,
                 node,
-                f"native {name}() works on integer lists; a float one would "
-                "need a float accumulator this call cannot return",
+                f"native {name}() works on integer lists, and this one holds "
+                f"{self.kind_noun(element_kind)}; a float one would need a "
+                "float accumulator this call cannot return, and a string or a "
+                "list one would compare block addresses",
             )
         pointer_slot = self.new_temp()
         self.operations.append(Store(pointer_slot, self.list_pointer(source)))
@@ -3477,12 +3886,14 @@ class Frontend:
         """
 
         element_kind = self.comprehension_element_kind(generator, bindings)
-        if element_kind != "int":
+        if element_kind not in {"int", "bool"}:
             raise NativeCompileError(
                 self.path,
                 node,
-                f"native {name}() works on integer elements; a float one "
-                "would need a float accumulator this call cannot return",
+                f"native {name}() works on integer elements, and these are "
+                f"{self.kind_noun(element_kind)}; a float one would need a "
+                "float accumulator this call cannot return, and a string or a "
+                "list one would compare block addresses",
             )
         sources, element = self.comprehension_clause_sources(
             generator, bindings, call_stack
@@ -3644,14 +4055,41 @@ class Frontend:
                 "reverse=True or reverse=False",
             )
         source = node.args[0]
+        if isinstance(source, ast.Name) and self.set_kind_of(source.id) is not None:
+            # Sorting is the one thing that can be read out of a set without
+            # ever observing its order, because the answer does not depend on
+            # the order the elements came out in.
+            element_kind = self.set_kind_of(source.id)
+            if element_kind != "int":
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native sorted() takes a set of integers; sorting a set of "
+                    "strings would compare block addresses rather than text, "
+                    "which is allocation order and not the order Python gives",
+                )
+            if self.container_bool.get(source.id):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native sorted() works on sets of integers, and this one "
+                    "holds bools; nothing at run time tells True from 1, so "
+                    "the result would print as 1 and 0",
+                )
+            return source, element_kind, self.sort_direction(node, node.keywords)
         element_kind = self.list_kind(self.expression_type(source))
-        if element_kind is None:
+        # A bool list reaches `refuse_bool_list`, which says why in its own
+        # words; everything else that is not a number is refused here, because
+        # the comparison would be between block addresses - allocation order,
+        # which is neither lexicographic nor structural.
+        if element_kind is None or element_kind not in {"int", "float", "bool"}:
             raise NativeCompileError(
                 self.path,
                 node,
                 "native sorted() takes a runtime list of integers or floats; "
-                "sorting a string or a dict would have to build a list of "
-                "strings or of keys, which is not in the subset",
+                "sorting a string, a dict, or a list of strings or of lists "
+                "would compare block addresses rather than values, which is "
+                "allocation order and not the order Python gives",
             )
         return source, element_kind, self.sort_direction(node, node.keywords)
 
@@ -3670,25 +4108,18 @@ class Frontend:
     def list_holds_bool(self, node: ast.expr) -> bool | None:
         """Whether every element of this list expression is a bool.
 
-        `container_bool` is keyed by name, so a list that was never bound to
-        one - a comprehension's result, a slice of a slice - has no entry
-        there and its elements would print as 1 and 0.
+        The list's own tag answers this, which is what lets an element of a
+        list nobody named - `xs[0]`, a slice of a slice, a comprehension used
+        in place - still print True rather than 1.
         """
 
-        if isinstance(node, ast.ListComp):
-            try:
-                return self.comprehension_element_bool(node)
-            except NativeCompileError:
-                return None
-        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
-            return self.list_holds_bool(node.value)
-        shape = self.sorted_call_shape(node)
-        if shape is not None:
-            return self.list_holds_bool(shape[0])
-        name = self.list_source_name(node)
-        if name is None:
+        try:
+            kind = self.list_kind(self.expression_type(node))
+        except NativeCompileError:
             return None
-        return self.container_bool.get(name)
+        if kind is None:
+            return None
+        return kind == "bool"
 
     def refuse_bool_list(self, node: ast.expr, source: ast.expr, what: str) -> None:
         """Refuse to reorder a list of bools.
@@ -3714,6 +4145,10 @@ class Frontend:
         """`sorted(xs)` - a new sorted list, leaving `xs` in its own order."""
 
         source, element_kind, descending = self.sorted_call_shape(node)
+        if isinstance(source, ast.Name) and self.set_kind_of(source.id) is not None:
+            pointer_slot = self.emit_set_to_list(source.id)
+            self.emit_insertion_sort(pointer_slot, element_kind, descending)
+            return IntLoad(pointer_slot)
         self.refuse_bool_list(node, source, "sorted()")
         pointer_slot = self.new_temp()
         self.operations.append(
@@ -3725,23 +4160,73 @@ class Frontend:
         return IntLoad(pointer_slot)
 
     def membership_container_kind(self, node: ast.expr) -> str | None:
-        """What `x in node` would search: a dict, a string, or a list's kind."""
+        """What `x in node` searches: "dict", "str", or the list's own tag.
+
+        The tag rather than the element kind, because a list of strings and a
+        string are two different searches and both would answer "str".
+        """
 
         if isinstance(node, ast.Name) and self.dict_kinds_of(node.id):
             return "dict"
+        if isinstance(node, ast.Name) and self.set_kind_of(node.id) is not None:
+            return "set"
+        if isinstance(node, ast.Set):
+            # Probing needs a table, and building one here would allocate on
+            # every evaluation - once per iteration inside a loop.
+            raise NativeCompileError(
+                self.path,
+                node,
+                "`in` over a set literal is not supported: searching one means "
+                "building its table first, and doing that here would allocate "
+                "on every evaluation. Bind the set to a name and search that",
+            )
         try:
             kind = self.expression_type(node)
         except NativeCompileError:
             return None
         if kind == "str":
             return "str"
-        return self.list_kind(kind)
+        if self.tuple_kinds(kind) is not None:
+            # A tuple search compares each element with a different comparison
+            # per position, and nothing here does that.
+            raise NativeCompileError(
+                self.path,
+                node,
+                "`in` over a native tuple is not supported: searching one "
+                "means comparing the left side with each element, and a tuple "
+                "can hold a different kind at every position. Search a runtime "
+                "list, a runtime dict or a string instead",
+            )
+        return kind if self.list_kind(kind) is not None else None
 
     def emit_list_membership(
         self, node: ast.expr, container: ast.expr, element_kind: str
     ) -> int:
         """Return a 0/1 slot saying whether ``node`` is in the list."""
 
+        if self.list_kind(element_kind) is not None:
+            raise NativeCompileError(
+                self.path,
+                container,
+                "native `in` over a list of lists is not in the subset: CPython "
+                "compares the elements of the two lists, and the eight bytes "
+                "here are a block address, so two equal lists that were "
+                "allocated separately would answer False",
+            )
+        wanted = self.element_kind_of(node)
+        agrees = (
+            wanted in {"int", "float", "bool"}
+            if element_kind == "float"
+            else self.element_value_type(wanted)
+            == self.element_value_type(element_kind)
+        )
+        if not agrees:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"this list holds {self.kind_noun(element_kind)} and this is "
+                f"{self.kind_noun(wanted)}",
+            )
         pointer_slot = self.new_temp()
         self.operations.append(Store(pointer_slot, self.list_pointer(container)))
         pointer = IntLoad(pointer_slot)
@@ -3756,6 +4241,8 @@ class Frontend:
             self.operations.append(
                 FloatStore(wanted_slot, self.float_expression(node))
             )
+        elif element_kind == "str":
+            self.operations.append(Store(wanted_slot, self.string_pointer(node)))
         else:
             self.operations.append(Store(wanted_slot, self.integer(node)))
         index_slot = self.new_temp()
@@ -3781,6 +4268,15 @@ class Frontend:
             # Compare as floats, not as bits: 0.0 equals -0.0 and a NaN equals
             # nothing, and the bit patterns say otherwise on both counts.
             same = FloatCompare("eq", BitsFloat(item), FloatLoad(wanted_slot))
+        elif element_kind == "str":
+            # The words are block addresses, and two equal strings are two
+            # allocations; compare the bytes rather than where they live.
+            item_slot = self.new_temp()
+            self.operations.append(Store(item_slot, item))
+            equal_slot = self.emit_string_equal(
+                IntLoad(item_slot), IntLoad(wanted_slot)
+            )
+            same = IntCompare("ne", IntLoad(equal_slot), IntConstant(0))
         else:
             same = IntCompare("eq", item, IntLoad(wanted_slot))
         self.operations.append(JumpIfFalse(same, step))
@@ -3949,15 +4445,22 @@ class Frontend:
         if current is None:
             self.container_bool[name] = stored
             return
-        if current != stored:
-            raise NativeCompileError(
-                self.path,
-                node,
-                f"{where} holds {'bools' if current else 'numbers'} already, and "
-                f"this is a {'bool' if stored else 'number'}. One slot cannot "
-                "print both ways, so a mixed container is refused; wrap the "
-                "bool in int() to store the number instead",
-            )
+        self.refuse_bool_mix(node, current, where)
+
+    def refuse_bool_mix(self, node: ast.expr, current: bool, where: str) -> None:
+        """Refuse a bool beside a number, or the reverse, in one container."""
+
+        stored = self.renders_as_bool(node)
+        if current == stored:
+            return
+        raise NativeCompileError(
+            self.path,
+            node,
+            f"{where} holds {'bools' if current else 'numbers'} already, and "
+            f"this is a {'bool' if stored else 'number'}. One slot cannot "
+            "print both ways, so a mixed container is refused; wrap the "
+            "bool in int() to store the number instead",
+        )
 
     def refuse_stored_bool(self, node: ast.expr, where: str) -> None:
         """Refuse to store a bool where its kind would be forgotten.
@@ -3981,6 +4484,72 @@ class Frontend:
                 f"a bool cannot be stored in {where} yet: nothing distinguishes "
                 "True from 1 at run time, so it would print as 1; wrap it in "
                 "int() if the number is what you want",
+            )
+
+    def note_escaping_list_names(self, tree: ast.Module) -> None:
+        """Record every name whose block is stored inside a container.
+
+        A native list variable holds its block rather than a reference to it,
+        and appending to a full one copies the block and writes the new address
+        back into that variable's slot. An element that was handed the old
+        address is not updated, so ``xs.append(inner)`` followed later by
+        ``inner.append(v)`` would leave ``xs[0]`` on the abandoned copy - a
+        stale length and stale contents, where CPython's element is the same
+        object and sees the growth.
+
+        Collected over the whole module rather than in source order, because a
+        loop's back edge puts the append textually before the store that shared
+        the block.
+        """
+
+        for node in ast.walk(tree):
+            stored: list[ast.expr] = []
+            if isinstance(node, ast.List):
+                stored = list(node.elts)
+            elif isinstance(node, ast.ListComp):
+                stored = [node.elt]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append"
+                and len(node.args) == 1
+            ):
+                stored = list(node.args)
+            elif isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Subscript) for target in node.targets
+            ):
+                stored = [node.value]
+            for item in stored:
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load):
+                    self.escaped_list_names.add(item.id)
+
+    def refuse_appending_to_a_shared_block(
+        self, node: ast.expr, name: str
+    ) -> None:
+        """Refuse append() on a list whose block another container also holds."""
+
+        if name in self.escaped_list_names:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{name!r} is stored inside another container somewhere in this "
+                "module, and a native list variable holds its block rather than "
+                "a reference to it: appending moves the block, and the element "
+                "holding the old address would be left on the abandoned copy "
+                f"while CPython sees the growth. Store a copy ({name}[:]) so "
+                "the two are separate lists, or build the elements before "
+                "storing them",
+            )
+        if name in self.shared_list_names:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{name!r} names a list that is an element of another one, and "
+                "a native list variable holds its block rather than a reference "
+                "to it: appending moves the block and the element it came from "
+                "would be left on the abandoned copy while CPython sees the "
+                f"growth. Copy it ({name} = {name}[:]) if a separate list is "
+                "what you want",
             )
 
     def emit_list_append(
@@ -4108,6 +4677,15 @@ class Frontend:
         descending = self.sort_direction(node, node.keywords)
         self.refuse_bool_list(node, node.func.value, "sort()")
         element_kind = self.list_kind_of(name)
+        if element_kind not in {"int", "float"}:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native sort() works on lists of integers or floats, and this "
+                f"one holds {self.kind_noun(element_kind)}; comparing those "
+                "would compare block addresses, which is allocation order and "
+                "not the order Python gives",
+            )
         pointer_slot = self.slot(name)
         if element_kind == "float":
             self.emit_refuse_nan(pointer_slot)
@@ -4116,11 +4694,23 @@ class Frontend:
     def list_method_call(self, node: ast.Call) -> bool:
         """Lower `xs.append(v)` and `xs.sort()`; returns whether this was one."""
 
-        if (
-            not isinstance(node.func, ast.Attribute)
-            or not isinstance(node.func.value, ast.Name)
-            or self.list_kind_of(node.func.value.id) is None
-        ):
+        if not isinstance(node.func, ast.Attribute):
+            return False
+        if not isinstance(node.func.value, ast.Name):
+            if node.func.attr in {"append", "sort"} and self.list_kind(
+                self.expression_type(node.func.value)
+            ) is not None:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"native {node.func.attr}() is only called on a list held "
+                    "by a name: appending writes the moved block back into the "
+                    "variable's slot, and an element inside another list has "
+                    "no slot to write back to. Bind it to a name first, and "
+                    "note that doing so makes it share the block",
+                )
+            return False
+        if self.list_kind_of(node.func.value.id) is None:
             return False
         name = node.func.value.id
         if node.func.attr == "sort":
@@ -4137,21 +4727,11 @@ class Frontend:
             raise NativeCompileError(
                 self.path, node, "append() takes exactly one argument"
             )
-        element_kind = self.list_kind_of(name)
         argument = node.args[0]
-        if element_kind == "float":
-            if self.expression_type(argument) not in {"float", "int"}:
-                raise NativeCompileError(
-                    self.path, argument, "this list holds floats"
-                )
-            value = FloatBits(self.float_expression(argument))
-        else:
-            if self.expression_type(argument) != "int":
-                raise NativeCompileError(
-                    self.path, argument, "this list holds signed 64-bit integers"
-                )
-            self.note_stored_bool(name, argument, "this list")
-            value = self.integer(argument)
+        self.refuse_appending_to_a_shared_block(node, name)
+        element_kind = self.settle_element_kind(name, argument)
+        self.check_element(argument, element_kind, "this list")
+        value = self.element_word(argument, element_kind)
         # A literal's length stops being a build-time fact once it can grow.
         self.list_lengths.pop(name, None)
         self.emit_list_append(self.slot(name), value)
@@ -4168,17 +4748,21 @@ class Frontend:
             return self.emit_list_slice(
                 self.list_pointer(node.value), node.slice
             )
+        if (
+            isinstance(node, ast.Subscript)
+            and self.list_kind(self.expression_type(node)) is not None
+        ):
+            # A nested list is stored as the address of its own block, so the
+            # element word is already the pointer.
+            return HeapLoad(self.list_element_address(node), 8)
         if self.sorted_call_shape(node) is not None:
             return self.sorted_call(node)
+        if self.list_kind(self.string_method_kind(node) or "") is not None:
+            assert isinstance(node, ast.Call)
+            return self.string_method_list(node)
         self.refuse_lazy_comprehension(node)
         if isinstance(node, ast.List):
-            raise NativeCompileError(
-                self.path,
-                node,
-                "a native list literal is built into a name's own slot, so it "
-                "cannot be used in place here; bind it to a name first and "
-                "iterate that",
-            )
+            return self.emit_list_block(node, self.list_kind(self.expression_type(node)))
         raise NativeCompileError(
             self.path, node, "expression is not a native runtime list"
         )
@@ -4195,14 +4779,56 @@ class Frontend:
                 "min(), max(), any() or all(). Write [ ... ] for a list "
                 "comprehension if you need the values kept",
             )
-        if isinstance(node, (ast.SetComp, ast.DictComp)):
-            what = "set" if isinstance(node, ast.SetComp) else "dict"
+        if isinstance(node, ast.SetComp):
             raise NativeCompileError(
                 self.path,
                 node,
-                f"a native comprehension builds a list; there is no runtime "
-                f"{what} for a {what} comprehension to build",
+                "a native comprehension builds a list, and a set comprehension "
+                "would build a set nothing may iterate; a set's order here "
+                "could not match CPython's. Write [ ... ] for a list, or build "
+                "the set with add()",
             )
+        if isinstance(node, ast.DictComp):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native comprehension builds a list; there is no runtime "
+                "dict for a dict comprehension to build",
+            )
+
+    def refuse_set_iteration(self, node: ast.expr) -> None:
+        """Refuse to walk a set's elements.
+
+        CPython's set iteration order is unspecified, is not insertion order,
+        and for strings is randomized per process by PYTHONHASHSEED, so there
+        is no order this compiler could produce that matches it for every
+        input. Refusing only `print` inside the loop would not be honest:
+        appending to a list, breaking after the first element, or building a
+        string all carry the order out of the loop just as well, and each would
+        become a silent wrong answer.
+        """
+
+        try:
+            kind = self.expression_type(node)
+        except NativeCompileError:
+            return
+        if self.set_kind(kind) is None:
+            return
+        element_kind = self.set_kind(kind)
+        hint = (
+            "; sorted(s) gives a runtime list in a defined order"
+            if element_kind == "int"
+            else ""
+        )
+        raise NativeCompileError(
+            self.path,
+            node,
+            "a native set cannot be iterated: CPython's set order is not "
+            "insertion order and is not specified, so any order produced here "
+            "would differ from it for some input and print the wrong answer. "
+            "Sets support len(s), x in s, x not in s, s.add(), s.discard(), "
+            "s.remove() and the | & - operators" + hint,
+        )
 
     def list_assignment(
         self, name: str, node: ast.expr, element_kind: str
@@ -4215,6 +4841,13 @@ class Frontend:
             holds_bool = self.list_holds_bool(node)
             pointer = self.list_pointer(node)
             self.container_bool[name] = holds_bool
+            if isinstance(node, ast.Subscript) and not isinstance(
+                node.slice, ast.Slice
+            ):
+                # This name and the element it came from are the same block.
+                self.shared_list_names.add(name)
+            else:
+                self.shared_list_names.discard(name)
             self.runtime_names.add(name)
             # Whatever length a literal left recorded under this name is no
             # longer this list's length, and an index checked against the old
@@ -4222,24 +4855,33 @@ class Frontend:
             self.list_lengths.pop(name, None)
             self.operations.append(Store(self.slot(name), pointer))
             return
+        self.container_bool[name] = element_kind == "bool"
+        self.shared_list_names.discard(name)
+        self.runtime_names.add(name)
+        # Build into a slot of its own and move it over afterwards. A literal
+        # that reads the name it is being assigned to - `xs = [xs[0] + 1]` -
+        # would otherwise take the new block's address out of the name and read
+        # its uninitialised elements.
+        pointer_slot = self.new_temp()
+        self.emit_list_literal(pointer_slot, node, element_kind)
+        self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
+        self.list_lengths[name] = len(node.elts)
+
+    def emit_list_block(self, node: ast.List, element_kind: str) -> IntExpression:
+        """Build a list literal that no name owns - a nested one, or an
+        argument to append() - and hand back a pointer to it."""
+
+        pointer_slot = self.new_temp()
+        self.emit_list_literal(pointer_slot, node, element_kind)
+        return IntLoad(pointer_slot)
+
+    def emit_list_literal(
+        self, pointer_slot: int, node: ast.List, element_kind: str
+    ) -> None:
         elements = node.elts
         for element in elements:
-            if element_kind == "float":
-                if self.expression_type(element) not in {"float", "int"}:
-                    raise NativeCompileError(
-                        self.path, element, "this list holds floats"
-                    )
-            elif self.expression_type(element) != "int":
-                raise NativeCompileError(
-                    self.path,
-                    element,
-                    "this list holds signed 64-bit integers",
-                )
-            else:
-                self.note_stored_bool(name, element, "this list")
+            self.check_element(element, element_kind, "this list")
         bump = self.ensure_heap()
-        self.runtime_names.add(name)
-        pointer_slot = self.slot(name)
         length = len(elements)
         # Layout: [i64 capacity][i64 length][element0][element1]...
         # The capacity is what makes append() possible: without it there is
@@ -4258,17 +4900,16 @@ class Frontend:
             )
         )
         for index, element in enumerate(elements):
+            # An inner literal or a concatenation allocates while it is being
+            # lowered, so the word is built before the store that takes its
+            # address - the arena only moves forward, so this block stays put.
+            stored = self.element_word(element, element_kind)
             address = IntBinary(
                 "add",
                 IntLoad(pointer_slot),
                 IntConstant(self.LIST_HEADER_BYTES + index * 8),
             )
-            if element_kind == "float":
-                stored = FloatBits(self.float_expression(element))
-            else:
-                stored = self.integer(element)
             self.operations.append(HeapStore(address, stored, 8))
-        self.list_lengths[name] = length
 
     def list_element_address(self, node: ast.Subscript) -> IntExpression:
         target = node.value
@@ -4329,10 +4970,14 @@ class Frontend:
             raise NativeCompileError(
                 self.path,
                 node,
-                "a list index that is not a compile-time constant cannot appear "
-                "in a conditional expression or a short-circuited Boolean "
-                "operand, because its bounds check would run even when Python "
-                "would not evaluate that branch; use an if statement instead",
+                "a list index whose bounds check has to run at run time cannot "
+                "appear in a conditional expression or a short-circuited "
+                "Boolean operand, because the check would run even when Python "
+                "would not evaluate that branch; use an if statement instead. "
+                "An index is checked at run time when it is not a constant, or "
+                "when the list's length is not known at build time - which is "
+                "the case for an element of another list, a slice, and a "
+                "comprehension, even under a constant index",
             )
         index_slot, _length_slot = self.resolve_list_index(
             pointer,
@@ -4443,6 +5088,17 @@ class Frontend:
                 target,
                 "del on a list slice is not supported; del one element at a "
                 "time",
+            )
+        if (
+            isinstance(target.value, ast.Name)
+            and self.tuple_kinds_of(target.value.id) is not None
+        ):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "del on a native tuple is not supported, as CPython's is not "
+                "either: a tuple is immutable and its length is fixed at build "
+                "time; del one element of a runtime list instead",
             )
         if (
             isinstance(target.value, ast.Name)
@@ -4645,10 +5301,26 @@ class Frontend:
         return self.dict_tag(key_kind, value_kind)
 
     def subscript_assignment(self, target: ast.Subscript, value: ast.expr) -> None:
+        if self.tuple_kinds(self.expression_type(target.value)) is not None:
+            raise NativeCompileError(
+                self.path,
+                target,
+                "a native tuple is immutable, as CPython's is, so an element "
+                "cannot be assigned; build a new tuple, or use a runtime list, "
+                "whose elements do assign",
+            )
         if isinstance(target.value, ast.Name) and self.dict_kinds_of(
             target.value.id
         ):
             key_kind, value_kind = self.dict_kinds_of(target.value.id)
+            if self.tuple_kinds(self.expression_type(target.slice)) is not None:
+                raise NativeCompileError(
+                    self.path,
+                    target.slice,
+                    "a native dict key is a signed 64-bit integer or a runtime "
+                    "string; a tuple key would need an element-wise hash and "
+                    "an element-wise comparison that the table does not have",
+                )
             if self.expression_type(target.slice) != key_kind:
                 raise NativeCompileError(
                     self.path,
@@ -4680,32 +5352,484 @@ class Frontend:
                 key_kind,
             )
             return
-        element_kind = (
-            self.list_kind_of(target.value.id)
-            if isinstance(target.value, ast.Name)
+        element_kind = self.list_kind(self.expression_type(target.value))
+        if element_kind is None:
+            raise NativeCompileError(
+                self.path, target, "native indexing requires a runtime list"
+            )
+        self.check_element(value, element_kind, "this list")
+        # The eight bytes go in as they are: a double as its bit pattern, a
+        # string or a nested list as the address of its block.
+        stored = self.element_word(value, element_kind)
+        address = self.list_element_address(target)
+        self.operations.append(HeapStore(address, stored, 8))
+
+    # --- runtime tuples -----------------------------------------------------
+    #
+    # Layout: [i64 length][element0][element1]... A tuple is immutable and its
+    # length is fixed when it is written, so unlike a list it needs no capacity
+    # word and no room to grow, and the block it is given is the block it keeps
+    # for the life of the program.
+    #
+    # The length is also in the tag, so nothing reads that first word; it is
+    # there so an empty tuple is still an eight-byte block with an address of
+    # its own rather than a zero-byte one sharing whatever is allocated next.
+    #
+    # The tag carries one kind PER ELEMENT - `tuple:int,float,str` - which is
+    # the whole reason a tuple is worth having beside a list. A list is one
+    # kind throughout because nothing at run time tells the eight bytes of one
+    # element from another's; a tuple gets away with mixing them because every
+    # index that reads one is a constant, so the kind is settled at build time.
+
+    TUPLE_HEADER_BYTES = 8
+    _TUPLE_LEAF_KINDS = frozenset({"int", "float", "str", "bool"})
+
+    @staticmethod
+    def tuple_tag(kinds: tuple[str, ...]) -> str:
+        return "tuple:" + ",".join(kinds)
+
+    @staticmethod
+    def tuple_kinds(tag: str | None) -> tuple[str, ...] | None:
+        """The per-element kinds of a tuple tag, else None."""
+
+        if not isinstance(tag, str) or not tag.startswith("tuple:"):
+            return None
+        rest = tag[len("tuple:") :]
+        return tuple(rest.split(",")) if rest else ()
+
+    def tuple_kinds_of(self, name: str) -> tuple[str, ...] | None:
+        return self.tuple_kinds(self.value_types.get(name))
+
+    def tuple_literal_kinds(
+        self, node: ast.Tuple, bindings: dict[str, KernelValue] | None = None
+    ) -> tuple[str, ...]:
+        """The kind of every element of a tuple literal, in order."""
+
+        kinds: list[str] = []
+        for element in node.elts:
+            kind = self.element_kind_of(element, bindings)
+            if kind not in self._TUPLE_LEAF_KINDS:
+                raise NativeCompileError(
+                    self.path,
+                    element,
+                    "a native tuple element is a signed 64-bit integer, a "
+                    "float, a string or a bool; a nested tuple, a list, a dict "
+                    "or an object cannot be one, because every element is read "
+                    "back by a load whose kind is fixed at build time",
+                )
+            kinds.append(kind)
+        return tuple(kinds)
+
+    def constant_index(self, node: ast.expr) -> int | None:
+        """A subscript's index when it is a build-time integer, else None."""
+
+        try:
+            folded = self.constant(node)
+        except NativeCompileError:
+            return None
+        if isinstance(folded, bool) or not isinstance(folded, int):
+            return None
+        return folded
+
+    def tuple_subscript_kind(
+        self, node: ast.expr, bindings: dict[str, KernelValue] | None = None
+    ) -> str | None:
+        """The element kind ``t[i]`` reads, or None when that is not settled.
+
+        None also covers a runtime index into a tuple of mixed kinds and an
+        out-of-range constant one; both are refused where the read is lowered,
+        which is where there is something to say about them.
+        """
+
+        if not isinstance(node, ast.Subscript) or isinstance(node.slice, ast.Slice):
+            return None
+        try:
+            kinds = self.tuple_kinds(self.expression_type(node.value, bindings))
+        except NativeCompileError:
+            return None
+        if kinds is None:
+            return None
+        index = self.constant_index(node.slice)
+        if index is not None:
+            resolved = index + len(kinds) if index < 0 else index
+            return kinds[resolved] if 0 <= resolved < len(kinds) else None
+        return kinds[0] if kinds and len(set(kinds)) == 1 else None
+
+    def tuple_pointer(
+        self, node: ast.expr, bindings: dict[str, KernelValue] | None = None
+    ) -> IntExpression:
+        """An i64 pointer to a tuple block, building a literal if that is what
+        this is."""
+
+        if isinstance(node, ast.Name) and self.tuple_kinds_of(node.id) is not None:
+            return IntLoad(self.slots[node.id])
+        if isinstance(node, ast.Tuple):
+            pointer_slot = self.new_temp()
+            self.emit_tuple_literal(
+                pointer_slot, node, self.tuple_literal_kinds(node, bindings)
+            )
+            return IntLoad(pointer_slot)
+        raise NativeCompileError(
+            self.path,
+            node,
+            "expression is not a native runtime tuple: a tuple comes from a "
+            "literal or from a name bound to one. A native function returns a "
+            "signed 64-bit integer, a float or a string, never a tuple, and "
+            "there is no tuple slicing or concatenation",
+        )
+
+    def emit_tuple_literal(
+        self, pointer_slot: int, node: ast.Tuple, kinds: tuple[str, ...]
+    ) -> None:
+        bump = self.ensure_heap()
+        size = self.TUPLE_HEADER_BYTES + len(kinds) * 8
+        self.operations.append(HeapAlloc(pointer_slot, IntConstant(size), bump))
+        self.operations.append(
+            HeapStore(IntLoad(pointer_slot), IntConstant(len(kinds)), 8)
+        )
+        for index, (element, kind) in enumerate(zip(node.elts, kinds)):
+            # A string element allocates its own block while it is lowered, so
+            # the word is built before the store that takes its address; the
+            # arena only moves forward, so this block stays where it is.
+            stored = self.element_word(element, kind)
+            address = IntBinary(
+                "add",
+                IntLoad(pointer_slot),
+                IntConstant(self.TUPLE_HEADER_BYTES + index * 8),
+            )
+            self.operations.append(HeapStore(address, stored, 8))
+
+    def tuple_literal_texts(
+        self, node: ast.Tuple, kinds: tuple[str, ...]
+    ) -> tuple[bytes | None, ...]:
+        """What print() must write for each element whose repr is settled now.
+
+        Only a string needs this: an int, a float and a bool are rendered at
+        run time by code that already matches CPython. A string's repr is
+        computed here by the host, on the very same `str` object the target
+        will hold, so it is exact by construction.
+        """
+
+        texts: list[bytes | None] = []
+        for element, kind in zip(node.elts, kinds):
+            if kind != "str":
+                texts.append(None)
+                continue
+            try:
+                folded = self.constant(element)
+            except NativeCompileError:
+                folded = None
+            texts.append(
+                repr(folded).encode("utf-8") if isinstance(folded, str) else None
+            )
+        return tuple(texts)
+
+    def tuple_element_texts(
+        self, node: ast.expr, kinds: tuple[str, ...]
+    ) -> tuple[bytes | None, ...]:
+        if isinstance(node, ast.Tuple):
+            return self.tuple_literal_texts(node, kinds)
+        if isinstance(node, ast.Name):
+            recorded = self.tuple_texts.get(node.id)
+            if recorded is not None and len(recorded) == len(kinds):
+                return recorded
+        return (None,) * len(kinds)
+
+    def tuple_assignment(
+        self, name: str, node: ast.expr, kinds: tuple[str, ...]
+    ) -> None:
+        self.runtime_names.add(name)
+        self.boolean_names.discard(name)
+        self.shared_list_names.discard(name)
+        self.container_bool.pop(name, None)
+        self.list_lengths.pop(name, None)
+        if isinstance(node, ast.Tuple):
+            self.tuple_texts[name] = self.tuple_literal_texts(node, kinds)
+            # Build into a slot of its own and move it over afterwards. A
+            # literal that reads the name it is being assigned to - `t = (t[0]
+            # - 1, t[1])` - would otherwise take the new block's address out of
+            # the name and read its uninitialised elements.
+            pointer_slot = self.new_temp()
+            self.emit_tuple_literal(pointer_slot, node, kinds)
+            self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
+            return
+        # A second name for the same block, which a list refuses: appending
+        # moves a list and only the name it moves through learns the new
+        # address, but a tuple has no append and never moves.
+        self.tuple_texts[name] = self.tuple_element_texts(node, kinds)
+        self.operations.append(Store(self.slot(name), self.tuple_pointer(node)))
+
+    def tuple_element_address(self, node: ast.Subscript) -> IntExpression:
+        target = node.value
+        kinds = self.tuple_kinds(self.expression_type(target))
+        assert kinds is not None
+        pointer = self.materialize_int(self.tuple_pointer(target))
+        index = self.constant_index(node.slice)
+        if index is not None:
+            resolved = index + len(kinds) if index < 0 else index
+            if not 0 <= resolved < len(kinds):
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"native tuple index {index} is out of range"
+                    + (f" for {target.id!r}" if isinstance(target, ast.Name) else "")
+                    + f" (length {len(kinds)})",
+                )
+            return IntBinary(
+                "add",
+                pointer,
+                IntConstant(self.TUPLE_HEADER_BYTES + resolved * 8),
+            )
+        if len(set(kinds)) > 1:
+            # The point of a tuple is that each element can be a different
+            # kind, and the kind is what decides whether this reads an integer,
+            # the bits of a double, or the address of a string block. A runtime
+            # index has no kind, so there is no load to emit.
+            raise NativeCompileError(
+                self.path,
+                node,
+                "indexing a tuple whose elements are not all the same kind "
+                f"needs a constant index (this one holds {', '.join(kinds)}); "
+                "a runtime index is supported when every element is one kind",
+            )
+        if self.eager_depth:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a tuple index whose bounds check has to run at run time "
+                "cannot appear in a conditional expression or a short-circuited "
+                "Boolean operand, because the check would run even when Python "
+                "would not evaluate that branch; use an if statement instead",
+            )
+        index_slot = self.resolve_tuple_index(self.integer(node.slice), len(kinds))
+        offset = IntBinary(
+            "add",
+            IntConstant(self.TUPLE_HEADER_BYTES),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        )
+        return IntBinary("add", pointer, offset)
+
+    def resolve_tuple_index(self, index: IntExpression, length: int) -> int:
+        """Normalize a runtime index against a build-time length and check it.
+
+        Returns the slot holding the resolved index. The length never has to be
+        read from the block: a tuple cannot grow or shrink, so how many
+        elements it has is settled where it was written.
+        """
+
+        index = self.materialize_int(index)
+        bad_label = self.new_label("tuple_index_error")
+        ok_label = self.new_label("tuple_index_ok")
+        index_slot = self.slot(f"<index-{bad_label}>")
+        # Branchless Python negative indexing: index += length when index < 0.
+        negative_mask = IntUnary("neg", IntCompare("lt", index, IntConstant(0)))
+        self.operations.append(
+            Store(
+                index_slot,
+                IntBinary(
+                    "add",
+                    index,
+                    IntBinary("and", IntConstant(length), negative_mask),
+                ),
+            )
+        )
+        in_range = IntBinary(
+            "and",
+            IntCompare("ge", IntLoad(index_slot), IntConstant(0)),
+            IntCompare("lt", IntLoad(index_slot), IntConstant(length)),
+        )
+        self.operations.append(JumpIfFalse(in_range, bad_label))
+        self.operations.append(Jump(ok_label))
+        self.operations.append(Label(bad_label))
+        self.raise_exception(
+            "IndexError", b"IndexError: tuple index out of range\n"
+        )
+        self.operations.append(Label(ok_label))
+        return index_slot
+
+    def unpacked_tuple_kinds(self, value: ast.expr) -> tuple[str, ...] | None:
+        """The kinds `a, b = value` would bind, when value is a tuple."""
+
+        try:
+            return self.tuple_kinds(self.expression_type(value))
+        except NativeCompileError:
+            return None
+
+    def tuple_unpacking(self, target: ast.expr, value: ast.expr) -> None:
+        """`a, b = t` - bind one name per element, each with its own kind."""
+
+        kinds = self.tuple_kinds(self.expression_type(value))
+        assert kinds is not None
+        for item in target.elts:
+            if not isinstance(item, ast.Name):
+                raise NativeCompileError(
+                    self.path, item, "a native tuple unpacking binds names"
+                )
+        if len(target.elts) != len(kinds):
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"native tuple unpacking needs matching lengths: "
+                f"{len(target.elts)} names, {len(kinds)} values",
+            )
+        # Bind the right-hand side once. Reading it again per name would build
+        # a literal once per element, and CPython evaluates it exactly once.
+        holder = f"<unpack-{self.new_label('slot')}>"
+        self.assignment(holder, value)
+        for index, item in enumerate(target.elts):
+            element = ast.copy_location(
+                ast.Subscript(
+                    value=ast.copy_location(
+                        ast.Name(id=holder, ctx=ast.Load()), target
+                    ),
+                    slice=ast.copy_location(ast.Constant(value=index), target),
+                    ctx=ast.Load(),
+                ),
+                target,
+            )
+            self.assignment(item.id, element)
+
+    def bind_tuple_element(
+        self, target: str, index_slot: int, pointer_slot: int, element_kind: str
+    ) -> None:
+        address = IntBinary(
+            "add",
+            IntBinary(
+                "add", IntLoad(pointer_slot), IntConstant(self.TUPLE_HEADER_BYTES)
+            ),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+        )
+        self.values.pop(target, None)
+        self.runtime_names.add(target)
+        self.possibly_unbound.discard(target)
+        self.shared_list_names.discard(target)
+        self.list_lengths.pop(target, None)
+        self.tuple_texts.pop(target, None)
+        if element_kind == "bool":
+            self.boolean_names.add(target)
+        else:
+            self.boolean_names.discard(target)
+        if element_kind == "float":
+            self.operations.append(
+                FloatStore(self.slot(target), BitsFloat(HeapLoad(address, 8)))
+            )
+        else:
+            self.operations.append(Store(self.slot(target), HeapLoad(address, 8)))
+        self.value_types[target] = self.element_value_type(element_kind)
+
+    def for_over_tuple(self, node: ast.For) -> None:
+        """`for name in <tuple>:` - a walk of a length fixed at build time."""
+
+        assert isinstance(node.target, ast.Name)
+        kinds = self.tuple_kinds(self.expression_type(node.iter))
+        assert kinds is not None
+        if len(set(kinds)) > 1:
+            raise NativeCompileError(
+                self.path,
+                node.iter,
+                "iterating a tuple needs every element to be the same kind, "
+                "because the loop name is one stack slot and nothing at run "
+                f"time says what a slot holds (this one holds {', '.join(kinds)}); "
+                "read the elements by constant index instead",
+            )
+        broke = self.open_loop_else(node)
+        name = node.target.id
+        was_bound = name in self.bound_names
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, self.tuple_pointer(node.iter)))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        element_kind = kinds[0] if kinds else "int"
+        start = self.new_label("for_tuple")
+        continue_label = self.new_label("for_tuple_continue")
+        end = self.new_label("for_tuple_end")
+        self.operations.append(Label(start))
+        # A list iterator re-reads the list's length every step so that an
+        # append inside the loop extends the walk. A tuple has no append, so
+        # its length is a constant here and there is nothing to re-read.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt", IntLoad(index_slot), IntConstant(len(kinds))
+                ),
+                end,
+            )
+        )
+        self.bind_tuple_element(name, index_slot, pointer_slot, element_kind)
+        self.break_targets.append(end if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        if was_bound:
+            self.bound_names.add(name)
+        else:
+            # An empty tuple runs the body zero times, and then Python leaves
+            # the name unbound.
+            self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
+
+    def emit_print_tuple(self, node: ast.expr, kinds: tuple[str, ...]) -> None:
+        """Write a whole tuple the way CPython's repr does."""
+
+        texts = self.tuple_element_texts(node, kinds)
+        for index, kind in enumerate(kinds):
+            if kind == "str" and texts[index] is None:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native print() renders a tuple whose string elements are "
+                    "known at build time, because CPython prints the repr of "
+                    "every element and picking the quote character and the "
+                    "backslash escapes for a string built at run time is not "
+                    "implemented here; print that element on its own, where it "
+                    "is written as itself. Integers, floats and bools in a "
+                    "tuple are supported",
+                )
+        # Nothing is loaded when every element is a build-time string, so there
+        # is no reason to build the block for one.
+        pointer = (
+            self.materialize_int(self.tuple_pointer(node))
+            if any(kind != "str" for kind in kinds)
             else None
         )
-        if element_kind == "float":
-            if self.expression_type(value) not in {"float", "int"}:
-                raise NativeCompileError(
-                    self.path, value, "this list holds floats"
-                )
-            address = self.list_element_address(target)
-            # The slot is eight bytes either way, so the double goes in as its
-            # bit pattern - the same trick a float dict value uses.
+        self.operations.append(Write(b"("))
+        for index, kind in enumerate(kinds):
+            if index:
+                self.operations.append(Write(b", "))
+            if kind == "str":
+                self.operations.append(Write(texts[index]))
+                continue
+            word = HeapLoad(
+                IntBinary(
+                    "add",
+                    pointer,
+                    IntConstant(self.TUPLE_HEADER_BYTES + index * 8),
+                ),
+                8,
+            )
+            if kind == "bool":
+                text = self.emit_bool_to_string(word)
+            elif kind == "float":
+                text = self.emit_float_to_string(BitsFloat(word))
+            else:
+                text = self.emit_int_to_string(word)
+            text = self.materialize_int(text)
             self.operations.append(
-                HeapStore(address, FloatBits(self.float_expression(value)), 8)
+                WriteRuntime(
+                    IntBinary("add", text, IntConstant(8)), HeapLoad(text, 8)
+                )
             )
-            return
-        if self.expression_type(value) != "int":
-            raise NativeCompileError(
-                self.path, value, "this list holds signed 64-bit integers"
-            )
-        if isinstance(target.value, ast.Name):
-            self.note_stored_bool(target.value.id, value, "this list")
-        address = self.list_element_address(target)
-        self.operations.append(HeapStore(address, self.integer(value), 8))
-
+        # `(1,)` is a tuple and `(1)` is an integer, so CPython's repr keeps the
+        # comma that says which.
+        self.operations.append(Write(b",)" if len(kinds) == 1 else b")"))
 
     # --- runtime dictionaries -----------------------------------------------
     #
@@ -4860,7 +5984,10 @@ class Frontend:
         capacity = self.dict_capacity(len(node.keys))
         bump = self.ensure_heap()
         self.runtime_names.add(name)
-        pointer_slot = self.slot(name)
+        # Build into a slot of its own and move it over once it is filled. A
+        # literal that reads the name it is being assigned to - `d = {0: d[0] +
+        # 1}` - would otherwise look the old key up in the new, empty table.
+        pointer_slot = self.new_temp()
         size = self.DICT_HEADER_BYTES + capacity * self.DICT_SLOT_BYTES
         self.operations.append(HeapAlloc(pointer_slot, IntConstant(size), bump))
         pointer = IntLoad(pointer_slot)
@@ -4881,6 +6008,9 @@ class Frontend:
                 node,
                 key_kind,
             )
+        # dict_store rewrites pointer_slot when the table grows, so the address
+        # the name gets is read after the last store rather than before it.
+        self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
 
     # FNV-1a, which is short enough to emit inline and mixes well enough that
     # linear probing does not degrade on the keys a program actually uses. The
@@ -5314,6 +6444,7 @@ class Frontend:
         value: IntExpression,
         node: ast.AST,
         key_kind: str,
+        order: bool = True,
     ) -> None:
         value_slot = self.new_temp()
         self.operations.append(Store(value_slot, value))
@@ -5375,12 +6506,17 @@ class Frontend:
         )
         # Only a key that was not already here joins the order list, which is
         # why this sits in the new-entry arm: replacing a value must not move a
-        # key, and must not list it twice.
-        keys_slot = self.new_temp()
-        keys_field = IntBinary("add", pointer, IntConstant(self.DICT_KEYS_OFFSET))
-        self.operations.append(Store(keys_slot, HeapLoad(keys_field, 8)))
-        self.emit_list_append(keys_slot, IntLoad(key_slot))
-        self.operations.append(HeapStore(keys_field, IntLoad(keys_slot), 8))
+        # key, and must not list it twice. A set passes order=False: nothing
+        # may read a set's order, so keeping one would only be a list that
+        # grows with every add and that discard would leave stale.
+        if order:
+            keys_slot = self.new_temp()
+            keys_field = IntBinary(
+                "add", pointer, IntConstant(self.DICT_KEYS_OFFSET)
+            )
+            self.operations.append(Store(keys_slot, HeapLoad(keys_field, 8)))
+            self.emit_list_append(keys_slot, IntLoad(key_slot))
+            self.operations.append(HeapStore(keys_field, IntLoad(keys_slot), 8))
         self.operations.append(Label(existing))
         self.operations.append(
             HeapStore(
@@ -5390,6 +6526,564 @@ class Frontend:
             )
         )
         self.operations.append(Label(end))
+
+    # --- runtime sets -------------------------------------------------------
+
+    # A set is a dict block with the value word never written and never read,
+    # and with the insertion-order field left 0 because nothing may read a
+    # set's order. Sharing the block means sharing dict_probe, dict_grow and
+    # dict_store, so a set's probing, growth and rehashing are the same code
+    # the dicts have already been tested through rather than a second table
+    # written from scratch. The price is eight wasted bytes per slot in an
+    # arena that never reclaims anyway.
+
+    SET_ELEMENT_KINDS = {"int", "str"}
+
+    @staticmethod
+    def set_tag(element_kind: str) -> str:
+        return f"set:{element_kind}"
+
+    @staticmethod
+    def set_kind(tag: str | None) -> str | None:
+        """The element kind of a set tag, else None."""
+
+        if not isinstance(tag, str) or not tag.startswith("set:"):
+            return None
+        return tag.split(":", 1)[1]
+
+    def set_kind_of(self, name: str) -> str | None:
+        return self.set_kind(self.value_types.get(name))
+
+    def set_literal_tag(
+        self, node: ast.Set, bindings: dict[str, IntExpression] | None = None
+    ) -> str:
+        """The kind a set literal builds, read off its first element."""
+
+        element_kind = self.expression_type(node.elts[0], bindings)
+        if element_kind not in self.SET_ELEMENT_KINDS:
+            raise NativeCompileError(
+                self.path,
+                node.elts[0],
+                "native set elements are signed 64-bit integers or runtime "
+                "strings",
+            )
+        return self.set_tag(element_kind)
+
+    def annotated_set_tag(self, annotation: ast.expr) -> str | None:
+        """The kind `set[T]` names, or None if it is not that shape."""
+
+        if (
+            not isinstance(annotation, ast.Subscript)
+            or not isinstance(annotation.value, ast.Name)
+            or annotation.value.id not in {"set", "Set"}
+            or not isinstance(annotation.slice, ast.Name)
+        ):
+            return None
+        element_kind = annotation.slice.id
+        if element_kind not in self.SET_ELEMENT_KINDS:
+            raise NativeCompileError(
+                self.path, annotation, "a native set annotation is set[int|str]"
+            )
+        return self.set_tag(element_kind)
+
+    def empty_set_call(self, node: ast.expr) -> bool:
+        """Whether this is `set()`, the only way to write an empty set."""
+
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set"
+            and node.func.id not in self.functions
+            and node.func.id not in self.slots
+        )
+
+    _SET_OPERATORS = {
+        ast.BitOr: "union",
+        ast.BitAnd: "intersection",
+        ast.Sub: "difference",
+    }
+
+    def set_binop_operands(self, node: ast.expr) -> tuple[str, str, str] | None:
+        """`(left name, right name, element kind)` for `a | b`, `a & b`, `a - b`.
+
+        None when this is not a set operation at all; a build error when one
+        side is a set and the other is not, because `s - 1` has no meaning and
+        falling through would lower the set's slot as a number.
+        """
+
+        if not isinstance(node, ast.BinOp) or type(node.op) not in self._SET_OPERATORS:
+            return None
+        left_kind = (
+            self.set_kind_of(node.left.id)
+            if isinstance(node.left, ast.Name)
+            else None
+        )
+        right_kind = (
+            self.set_kind_of(node.right.id)
+            if isinstance(node.right, ast.Name)
+            else None
+        )
+        if left_kind is None and right_kind is None:
+            return None
+        if left_kind is None or right_kind is None:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native set operation has a set on both sides; | & and - "
+                "combine two set variables of the same element kind",
+            )
+        if left_kind != right_kind:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"these sets hold different kinds ({left_kind} and "
+                f"{right_kind}), so they cannot be combined",
+            )
+        assert isinstance(node.left, ast.Name) and isinstance(node.right, ast.Name)
+        return node.left.id, node.right.id, left_kind
+
+    def emit_set_block(self, capacity: IntExpression, bump: int) -> int:
+        """Allocate a zeroed set table and return the slot holding it."""
+
+        pointer_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                pointer_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.DICT_HEADER_BYTES),
+                    IntBinary("mul", capacity, IntConstant(self.DICT_SLOT_BYTES)),
+                ),
+                bump,
+            )
+        )
+        pointer = IntLoad(pointer_slot)
+        self.operations.append(HeapStore(pointer, capacity, 8))
+        self.operations.append(
+            HeapStore(IntBinary("add", pointer, IntConstant(8)), IntConstant(0), 8)
+        )
+        # The order field stays 0 for a set. dict_grow copies it across, and 0
+        # copies to 0, so growth never looks for a list that is not there.
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", pointer, IntConstant(self.DICT_KEYS_OFFSET)),
+                IntConstant(0),
+                8,
+            )
+        )
+        # HeapAlloc hands back fresh arena memory, which the kernel zero-filled,
+        # so every state field already reads as empty.
+        return pointer_slot
+
+    def emit_set_scan(self, source_slot: int, emit_body) -> None:
+        """Walk every live entry of the set in ``source_slot``.
+
+        ``emit_body`` is called with the slot holding the entry address and the
+        slot holding its element. The source is read from its slot on every
+        iteration, so nothing the body does may move it - the destinations here
+        are always a different block.
+        """
+
+        capacity_slot = self.new_temp()
+        self.operations.append(
+            Store(capacity_slot, HeapLoad(IntLoad(source_slot), 8))
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        scan = self.new_label("set_scan")
+        after = self.new_label("set_scan_done")
+        step = self.new_label("set_scan_next")
+        self.operations.append(Label(scan))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(capacity_slot)),
+                after,
+            )
+        )
+        entry_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                entry_slot,
+                IntBinary(
+                    "add",
+                    IntLoad(source_slot),
+                    IntBinary(
+                        "add",
+                        IntConstant(self.DICT_HEADER_BYTES),
+                        IntBinary(
+                            "mul",
+                            IntLoad(index_slot),
+                            IntConstant(self.DICT_SLOT_BYTES),
+                        ),
+                    ),
+                ),
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", HeapLoad(IntLoad(entry_slot), 8), IntConstant(0)),
+                step,
+            )
+        )
+        element_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                element_slot,
+                HeapLoad(IntBinary("add", IntLoad(entry_slot), IntConstant(8)), 8),
+            )
+        )
+        emit_body(entry_slot, element_slot)
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(after))
+
+    def emit_set_scan_add(
+        self,
+        destination_slot: int,
+        source_slot: int,
+        key_kind: str,
+        node: ast.AST,
+        filter_slot: int | None = None,
+        want_found: int = 1,
+        exclude_slot: int | None = None,
+    ) -> None:
+        """Copy the elements of one set into another, optionally filtered.
+
+        With ``filter_slot`` an element joins only when probing that set
+        answers ``want_found``, which is intersection and difference. With
+        ``exclude_slot`` the one entry at that address is left behind, which is
+        discard. The result depends on which elements are copied and never on
+        the order they are copied in, so nothing here observes a set's order.
+        """
+
+        def body(entry_slot: int, element_slot: int) -> None:
+            skip = self.new_label("set_copy_skip")
+            if exclude_slot is not None:
+                self.operations.append(
+                    JumpIfFalse(
+                        IntCompare(
+                            "ne", IntLoad(entry_slot), IntLoad(exclude_slot)
+                        ),
+                        skip,
+                    )
+                )
+            if filter_slot is not None:
+                _address, found_slot, _key, _state = self.dict_probe(
+                    filter_slot, IntLoad(element_slot), key_kind
+                )
+                self.operations.append(
+                    JumpIfFalse(
+                        IntCompare(
+                            "eq", IntLoad(found_slot), IntConstant(want_found)
+                        ),
+                        skip,
+                    )
+                )
+            self.dict_store(
+                destination_slot,
+                IntLoad(element_slot),
+                IntConstant(0),
+                node,
+                key_kind,
+                order=False,
+            )
+            self.operations.append(Label(skip))
+
+        self.emit_set_scan(source_slot, body)
+
+    def set_binop(self, node: ast.BinOp) -> int:
+        """Build the set `a | b`, `a & b` or `a - b` into a fresh block."""
+
+        operands = self.set_binop_operands(node)
+        assert operands is not None
+        left, right, key_kind = operands
+        bump = self.ensure_heap()
+        # A fresh block every time, and never one of the operands: dict_store
+        # relocates on growth, and scanning a block that moves underneath the
+        # scan would read the abandoned one. This is also what makes `a |= b`
+        # and `a |= a` safe.
+        destination_slot = self.emit_set_block(IntConstant(8), bump)
+        left_slot = self.new_temp()
+        self.operations.append(Store(left_slot, IntLoad(self.slots[left])))
+        right_slot = self.new_temp()
+        self.operations.append(Store(right_slot, IntLoad(self.slots[right])))
+        operation = self._SET_OPERATORS[type(node.op)]
+        if operation == "union":
+            self.emit_set_scan_add(destination_slot, left_slot, key_kind, node)
+            self.emit_set_scan_add(destination_slot, right_slot, key_kind, node)
+        else:
+            self.emit_set_scan_add(
+                destination_slot,
+                left_slot,
+                key_kind,
+                node,
+                filter_slot=right_slot,
+                want_found=1 if operation == "intersection" else 0,
+            )
+        return destination_slot
+
+    def set_result_holds_bool(self, node: ast.expr, name: str) -> bool | None:
+        """Whether the set this expression builds holds bools.
+
+        A set built from two others inherits their answer, and two operands
+        that disagree have no single answer, so they are refused rather than
+        guessed at.
+        """
+
+        operands = self.set_binop_operands(node)
+        if operands is None:
+            return None
+        left, right, _kind = operands
+        left_bool = self.container_bool.get(left)
+        right_bool = self.container_bool.get(right)
+        if left_bool is None:
+            return right_bool
+        if right_bool is None:
+            return left_bool
+        if left_bool != right_bool:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"one of these sets holds bools and the other holds numbers, "
+                f"so {name!r} could not print either way; nothing at run time "
+                "tells True from 1",
+            )
+        return left_bool
+
+    def set_assignment(self, name: str, node: ast.expr, element_kind: str) -> None:
+        if isinstance(node, ast.Name) and self.set_kind_of(node.id) is not None:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"a native set variable holds the block itself, not a "
+                f"reference to it, so {name!r} cannot be another name for "
+                f"{node.id!r}: adding to one moves the block and only one of "
+                f"them would follow it. Write {name} = {node.id} | {node.id} "
+                "if a second set is what you want",
+            )
+        if self.set_binop_operands(node) is not None:
+            assert isinstance(node, ast.BinOp)
+            holds_bool = self.set_result_holds_bool(node, name)
+            pointer_slot = self.set_binop(node)
+            self.runtime_names.add(name)
+            if holds_bool is None:
+                self.container_bool.pop(name, None)
+            else:
+                self.container_bool[name] = holds_bool
+            self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
+            return
+        if self.empty_set_call(node):
+            assert isinstance(node, ast.Call)
+            if node.args or node.keywords:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native set() takes no arguments; build a set from a "
+                    "literal such as {1, 2} or add() to an empty one",
+                )
+            self.container_bool.pop(name, None)
+            bump = self.ensure_heap()
+            self.runtime_names.add(name)
+            pointer_slot = self.emit_set_block(IntConstant(8), bump)
+            self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
+            return
+        if not isinstance(node, ast.Set):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native set variable is built from a set literal, from "
+                "set(), or from | & - over two set variables",
+            )
+        for element in node.elts:
+            if self.expression_type(element) != element_kind:
+                raise NativeCompileError(
+                    self.path,
+                    element,
+                    f"this set holds {element_kind} elements, so every element "
+                    f"must be {element_kind}",
+                )
+            if element_kind == "int":
+                # `{True, 1}` is one element in CPython because True == 1, and
+                # two here, because the probe cannot tell them apart either -
+                # but then one of them has to print wrongly. Refuse the mix.
+                # The answer belongs to the NAME, not to this literal: rebinding
+                # the name to a set of the other kind is refused too, because a
+                # rebinding inside an `if` would leave the build-time answer
+                # disagreeing with what the slot holds at run time.
+                self.note_stored_bool(name, element, f"the set {name!r}")
+        capacity = self.dict_capacity(len(node.elts))
+        bump = self.ensure_heap()
+        self.runtime_names.add(name)
+        # Build into a slot of its own and move it over once it is filled, so
+        # that a literal reading the name it is assigned to reads the old set.
+        pointer_slot = self.emit_set_block(IntConstant(capacity), bump)
+        for element in node.elts:
+            self.dict_store(
+                pointer_slot,
+                self.dict_key(element, element_kind),
+                IntConstant(0),
+                node,
+                element_kind,
+                order=False,
+            )
+        self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
+
+    def set_method_call(self, node: ast.Call) -> bool:
+        """Lower `s.add(v)`, `s.discard(v)` and `s.remove(v)`."""
+
+        if not isinstance(node.func, ast.Attribute):
+            return False
+        if not isinstance(node.func.value, ast.Name):
+            return False
+        name = node.func.value.id
+        element_kind = self.set_kind_of(name)
+        if element_kind is None:
+            return False
+        method = node.func.attr
+        if method not in {"add", "discard", "remove"}:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native sets support add(), discard() and remove(); "
+                f"{method}() is not in the subset",
+            )
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, f"{method}() takes exactly one argument"
+            )
+        argument = node.args[0]
+        if self.expression_type(argument) != element_kind:
+            raise NativeCompileError(
+                self.path,
+                argument,
+                f"this set holds {element_kind} elements",
+            )
+        if element_kind == "int":
+            self.note_stored_bool(name, argument, f"the set {name!r}")
+        if method == "add":
+            self.dict_store(
+                self.slot(name),
+                self.dict_key(argument, element_kind),
+                IntConstant(0),
+                node,
+                element_kind,
+                order=False,
+            )
+            return True
+        self.emit_set_remove(name, argument, element_kind, node, method == "remove")
+        return True
+
+    def emit_set_remove(
+        self,
+        name: str,
+        argument: ast.expr,
+        element_kind: str,
+        node: ast.AST,
+        raising: bool,
+    ) -> None:
+        """Remove one element by rebuilding the table without it.
+
+        Linear probing with no tombstone state cannot simply blank a slot: a
+        probe that walks past the hole would stop there and report a live key
+        as missing, which is the same reason `del d[k]` is refused. Rebuilding
+        keeps dict_probe, dict_store and dict_grow byte for byte the code the
+        dicts use. It costs a whole table per call, so discarding inside a loop
+        is quadratic in arena bytes; it fails loudly with MemoryError rather
+        than wrongly. Backward-shift deletion is the allocation-free answer and
+        is not written yet.
+        """
+
+        pointer_slot = self.slot(name)
+        address_slot, found_slot, _key, _state = self.dict_probe(
+            pointer_slot, self.dict_key(argument, element_kind), element_kind
+        )
+        if raising:
+            present = self.new_label("set_remove_present")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+                    present + "_missing",
+                )
+            )
+            self.operations.append(Jump(present))
+            self.operations.append(Label(present + "_missing"))
+            self.raise_exception(
+                "KeyError", b"KeyError: element not in native set\n"
+            )
+            self.operations.append(Label(present))
+        done = self.new_label("set_discard_done")
+        # Absent is a no-op, and skipping the rebuild also skips its allocation.
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(found_slot), IntConstant(0)), done)
+        )
+        bump = self.ensure_heap()
+        old_slot = self.new_temp()
+        self.operations.append(Store(old_slot, IntLoad(pointer_slot)))
+        destination_slot = self.emit_set_block(
+            HeapLoad(IntLoad(old_slot), 8), bump
+        )
+        self.emit_set_scan_add(
+            destination_slot,
+            old_slot,
+            element_kind,
+            node,
+            exclude_slot=address_slot,
+        )
+        self.operations.append(Store(pointer_slot, IntLoad(destination_slot)))
+        self.operations.append(Label(done))
+
+    def emit_set_to_list(self, name: str) -> int:
+        """Copy a set's elements into a fresh list block, in table order.
+
+        Table order is not an order any program may see, so this is only ever
+        handed straight to a sort.
+        """
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, IntLoad(self.slots[name])))
+        list_slot = self.new_temp()
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                length_slot,
+                HeapLoad(
+                    IntBinary("add", IntLoad(source_slot), IntConstant(8)), 8
+                ),
+            )
+        )
+        # Sized to the live count, so the appends below never grow it. An
+        # empty set gives a capacity of 0, which emit_list_append handles.
+        self.operations.append(
+            HeapAlloc(
+                list_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.LIST_HEADER_BYTES),
+                    IntBinary("mul", IntLoad(length_slot), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        self.operations.append(
+            HeapStore(IntLoad(list_slot), IntLoad(length_slot), 8)
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(list_slot), IntConstant(8)),
+                IntConstant(0),
+                8,
+            )
+        )
+
+        def body(_entry_slot: int, element_slot: int) -> None:
+            self.emit_list_append(list_slot, IntLoad(element_slot))
+
+        self.emit_set_scan(source_slot, body)
+        return list_slot
 
     # --- runtime strings ----------------------------------------------------
 
@@ -5619,6 +7313,15 @@ class Frontend:
                 self.string_pointer(node.value), node.slice
             )
         if (
+            isinstance(node, ast.Subscript)
+            and self.list_kind(self.expression_type(node.value)) == "str"
+        ):
+            # A string element is the address of its block, already a pointer.
+            return HeapLoad(self.list_element_address(node), 8)
+        if self.tuple_subscript_kind(node) == "str":
+            assert isinstance(node, ast.Subscript)
+            return HeapLoad(self.tuple_element_address(node), 8)
+        if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and self.expression_function_kind(node) == "str"
@@ -5748,6 +7451,8 @@ class Frontend:
     # --- runtime string methods ---------------------------------------------
 
     _STRING_METHOD_KINDS = {
+        "split": "list:str",
+        "join": "str",
         "startswith": "bool",
         "endswith": "bool",
         "isdigit": "bool",
@@ -5768,6 +7473,9 @@ class Frontend:
         "ljust": "str",
         "rjust": "str",
     }
+    # split() and join() are not in this table: split() takes no argument or
+    # one, and join() takes a list rather than a string or a width, neither of
+    # which the fixed-arity check below can express.
     _STRING_METHOD_ARITY = {
         "startswith": 1,
         "endswith": 1,
@@ -5823,6 +7531,8 @@ class Frontend:
 
         assert isinstance(node.func, ast.Attribute)
         name = node.func.attr
+        if name in {"split", "join"}:
+            return self.check_split_or_join(node, name)
         arity = self._STRING_METHOD_ARITY[name]
         if node.keywords or len(node.args) != arity:
             expected = "no arguments" if arity == 0 else f"{arity} argument"
@@ -5871,6 +7581,401 @@ class Frontend:
                 )
         return name
 
+    def check_split_or_join(self, node: ast.Call, name: str) -> str:
+        """Validate `s.split(...)` and `sep.join(...)`, which have their own shapes."""
+
+        if name == "join":
+            if node.keywords or len(node.args) != 1:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native str.join() takes one runtime list of strings",
+                )
+            if self.list_kind(self.expression_type(node.args[0])) != "str":
+                raise NativeCompileError(
+                    self.path,
+                    node.args[0],
+                    "native str.join() takes a list of strings; there is no "
+                    "run-time str() to render other elements with",
+                )
+            return name
+        if node.keywords or len(node.args) > 1:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native str.split() takes no argument or one separator string; "
+                "the maxsplit form is not in the subset",
+            )
+        if not node.args:
+            return name
+        if self.expression_type(node.args[0]) != "str":
+            raise NativeCompileError(
+                self.path, node.args[0], "native str.split() takes a separator string"
+            )
+        try:
+            folded = self.constant(node.args[0])
+        except NativeCompileError:
+            folded = None
+        if folded == "":
+            raise NativeCompileError(
+                self.path,
+                node,
+                "str.split('') raises ValueError: empty separator, so this call "
+                "can only fail; split() with no argument is the form that "
+                "splits on whitespace",
+            )
+        if folded is None and self.eager_depth:
+            # The empty separator raises, and raising from an arm Python never
+            # evaluates is a divergence rather than a refusal.
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native str.split() with a separator that is not a literal "
+                "cannot appear in a conditional expression or a short-circuited "
+                "Boolean operand, because this lowering evaluates both arms and "
+                "an empty separator raises ValueError from the arm Python "
+                "skips; use an if statement instead",
+            )
+        return name
+
+    def emit_empty_list_block(self, capacity: int = 4) -> int:
+        """A slot holding a fresh, empty list block."""
+
+        bump = self.ensure_heap()
+        slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                slot,
+                IntConstant(self.LIST_HEADER_BYTES + capacity * 8),
+                bump,
+            )
+        )
+        self.operations.append(HeapStore(IntLoad(slot), IntConstant(capacity), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(slot), IntConstant(8)), IntConstant(0), 8
+            )
+        )
+        return slot
+
+    def string_method_list(self, node: ast.Call) -> IntExpression:
+        """Lower a string method whose result is a runtime list of strings."""
+
+        assert isinstance(node.func, ast.Attribute)
+        self.check_string_method(node)
+        receiver_slot = self.new_temp()
+        self.operations.append(
+            Store(receiver_slot, self.string_pointer(node.func.value))
+        )
+        if not node.args:
+            return self.emit_split_whitespace(receiver_slot)
+        separator_slot = self.new_temp()
+        self.operations.append(
+            Store(separator_slot, self.string_pointer(node.args[0]))
+        )
+        return self.emit_split_separator(receiver_slot, separator_slot)
+
+    def emit_split_separator(
+        self, receiver_slot: int, separator_slot: int
+    ) -> IntExpression:
+        """`s.split(sep)` - the pieces between non-overlapping separators.
+
+        This form keeps the empty pieces, which is what makes it differ from
+        the whitespace one: `",a,".split(",")` is three pieces and `"".split(",")`
+        is one empty piece rather than none. There is always one more piece
+        than there were separators, so the tail is appended unconditionally.
+        """
+
+        separator_length = HeapLoad(IntLoad(separator_slot), 8)
+        usable = self.new_label("split_separator_ok")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", separator_length, IntConstant(0)), usable
+            )
+        )
+        self.raise_exception("ValueError", b"ValueError: empty separator\n")
+        self.operations.append(Label(usable))
+
+        result_slot = self.emit_empty_list_block()
+        from_slot = self.new_temp()
+        self.operations.append(Store(from_slot, IntConstant(0)))
+        scan = self.new_label("split_scan")
+        done = self.new_label("split_scanned")
+        self.operations.append(Label(scan))
+        found_slot, at_slot = self.emit_substring_scan(
+            receiver_slot, separator_slot, from_slot
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(found_slot), IntConstant(0)), done)
+        )
+        self.emit_list_append(
+            result_slot,
+            self.emit_string_span(
+                receiver_slot, IntLoad(from_slot), IntLoad(at_slot)
+            ),
+        )
+        self.operations.append(
+            Store(
+                from_slot,
+                IntBinary("add", IntLoad(at_slot), separator_length),
+            )
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(done))
+        self.emit_list_append(
+            result_slot,
+            self.emit_string_span(
+                receiver_slot,
+                IntLoad(from_slot),
+                HeapLoad(IntLoad(receiver_slot), 8),
+            ),
+        )
+        return IntLoad(result_slot)
+
+    def emit_split_whitespace(self, receiver_slot: int) -> IntExpression:
+        """`s.split()` - the runs of non-whitespace, dropping every empty piece.
+
+        The predicate is the 29 Unicode whitespace code points, the same set
+        `.strip()` uses, so `"\\u00a0"` separates here as it does in CPython.
+        """
+
+        result_slot = self.emit_empty_list_block()
+        length_slot = self.new_temp()
+        base_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(receiver_slot), 8))
+        )
+        self.operations.append(
+            Store(
+                base_slot, IntBinary("add", IntLoad(receiver_slot), IntConstant(8))
+            )
+        )
+        cursor_slot = self.new_temp()
+        self.operations.append(Store(cursor_slot, IntConstant(0)))
+        outer = self.new_label("wsplit")
+        outer_end = self.new_label("wsplit_end")
+        self.operations.append(Label(outer))
+
+        skip = self.new_label("wsplit_skip")
+        skipped = self.new_label("wsplit_skipped")
+        self.operations.append(Label(skip))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(cursor_slot), IntLoad(length_slot)),
+                skipped,
+            )
+        )
+        width_slot = self.emit_whitespace_width(base_slot, cursor_slot, length_slot)
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(width_slot), IntConstant(0)), skipped
+            )
+        )
+        self.operations.append(
+            Store(
+                cursor_slot,
+                IntBinary("add", IntLoad(cursor_slot), IntLoad(width_slot)),
+            )
+        )
+        self.operations.append(Jump(skip))
+        self.operations.append(Label(skipped))
+        # Trailing whitespace ends the walk without producing a piece, which is
+        # what makes `"  ".split()` empty where `"  ".split(" ")` is not.
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(cursor_slot), IntLoad(length_slot)),
+                outer_end,
+            )
+        )
+        start_slot = self.new_temp()
+        self.operations.append(Store(start_slot, IntLoad(cursor_slot)))
+
+        run = self.new_label("wsplit_run")
+        ran = self.new_label("wsplit_ran")
+        self.operations.append(Label(run))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(cursor_slot), IntLoad(length_slot)), ran
+            )
+        )
+        run_width_slot = self.emit_whitespace_width(
+            base_slot, cursor_slot, length_slot
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(run_width_slot), IntConstant(0)), ran
+            )
+        )
+        # One byte at a time: a continuation byte is never whitespace, so the
+        # run cannot stop inside a character even though the step is not a
+        # whole one.
+        self.operations.append(
+            Store(
+                cursor_slot, IntBinary("add", IntLoad(cursor_slot), IntConstant(1))
+            )
+        )
+        self.operations.append(Jump(run))
+        self.operations.append(Label(ran))
+        self.emit_list_append(
+            result_slot,
+            self.emit_string_span(
+                receiver_slot, IntLoad(start_slot), IntLoad(cursor_slot)
+            ),
+        )
+        self.operations.append(Jump(outer))
+        self.operations.append(Label(outer_end))
+        return IntLoad(result_slot)
+
+    def emit_string_join(
+        self, separator_slot: int, pieces: IntExpression
+    ) -> IntExpression:
+        """`sep.join(xs)` - one allocation, sized by a first pass.
+
+        Concatenating in a loop would allocate an intermediate per element and
+        abandon every one of them, which is quadratic in an arena that never
+        gives anything back.
+        """
+
+        bump = self.ensure_heap()
+        pieces_slot = self.new_temp()
+        self.operations.append(Store(pieces_slot, pieces))
+        count_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                count_slot,
+                HeapLoad(IntBinary("add", IntLoad(pieces_slot), IntConstant(8)), 8),
+            )
+        )
+        index_slot = self.new_temp()
+        piece_slot = self.new_temp()
+        separator_length = HeapLoad(IntLoad(separator_slot), 8)
+
+        def load_piece() -> None:
+            self.operations.append(
+                Store(
+                    piece_slot,
+                    HeapLoad(
+                        IntBinary(
+                            "add",
+                            IntBinary(
+                                "add",
+                                IntLoad(pieces_slot),
+                                IntConstant(self.LIST_HEADER_BYTES),
+                            ),
+                            IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                        ),
+                        8,
+                    ),
+                )
+            )
+
+        total_slot = self.new_temp()
+        self.operations.append(Store(total_slot, IntConstant(0)))
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        measure = self.new_label("join_measure")
+        measured = self.new_label("join_measured")
+        self.operations.append(Label(measure))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(count_slot)), measured
+            )
+        )
+        load_piece()
+        self.operations.append(
+            Store(
+                total_slot,
+                IntBinary(
+                    "add", IntLoad(total_slot), HeapLoad(IntLoad(piece_slot), 8)
+                ),
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(measure))
+        self.operations.append(Label(measured))
+        # One separator fewer than there are pieces, and none at all for an
+        # empty list, where the answer is the empty string.
+        self.operations.append(
+            Store(
+                total_slot,
+                IntBinary(
+                    "add",
+                    IntLoad(total_slot),
+                    IntBinary(
+                        "mul",
+                        separator_length,
+                        self.select_integer(
+                            IntCompare("gt", IntLoad(count_slot), IntConstant(0)),
+                            IntBinary("sub", IntLoad(count_slot), IntConstant(1)),
+                            IntConstant(0),
+                        ),
+                    ),
+                ),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(total_slot)), bump)
+        )
+        self.operations.append(
+            HeapStore(IntLoad(result_slot), IntLoad(total_slot), 8)
+        )
+        write_slot = self.new_temp()
+        self.operations.append(Store(write_slot, IntConstant(0)))
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        copy = self.new_label("join_copy")
+        copied = self.new_label("join_copied")
+        plain = self.new_label("join_no_separator")
+        self.operations.append(Label(copy))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(count_slot)), copied
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("gt", IntLoad(index_slot), IntConstant(0)), plain)
+        )
+        self.emit_byte_copy(
+            IntBinary(
+                "add",
+                IntBinary("add", IntLoad(result_slot), IntConstant(8)),
+                IntLoad(write_slot),
+            ),
+            IntBinary("add", IntLoad(separator_slot), IntConstant(8)),
+            separator_length,
+        )
+        self.operations.append(
+            Store(
+                write_slot, IntBinary("add", IntLoad(write_slot), separator_length)
+            )
+        )
+        self.operations.append(Label(plain))
+        load_piece()
+        self.emit_byte_copy(
+            IntBinary(
+                "add",
+                IntBinary("add", IntLoad(result_slot), IntConstant(8)),
+                IntLoad(write_slot),
+            ),
+            IntBinary("add", IntLoad(piece_slot), IntConstant(8)),
+            HeapLoad(IntLoad(piece_slot), 8),
+        )
+        self.operations.append(
+            Store(
+                write_slot,
+                IntBinary(
+                    "add", IntLoad(write_slot), HeapLoad(IntLoad(piece_slot), 8)
+                ),
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(copy))
+        self.operations.append(Label(copied))
+        return IntLoad(result_slot)
+
     def string_method_pointer(self, node: ast.Call) -> IntExpression:
         """Lower a string method whose result is a string."""
 
@@ -5886,6 +7991,10 @@ class Frontend:
             return self.emit_ascii_case(receiver_slot, name)
         if name in {"strip", "lstrip", "rstrip"}:
             return self.emit_string_strip(receiver_slot, name)
+        if name == "join":
+            return self.emit_string_join(
+                receiver_slot, self.list_pointer(node.args[0])
+            )
         if name == "replace":
             old_slot = self.new_temp()
             new_slot = self.new_temp()
@@ -7398,6 +9507,52 @@ class Frontend:
                     )
             self.runtime_names.add(name)
 
+    def forget_conditional_list_lengths(self, bodies: list[ast.stmt]) -> None:
+        """Drop the recorded length of every list a maybe-skipped block assigns.
+
+        A list literal records its length under the name it is bound to, and a
+        constant index is proved in range against that. Lowering a branch or a
+        loop body records the length whether or not the block runs, so on the
+        path that skipped it the recorded length belongs to a list that was
+        never built - and an index past the real end was proved in range and
+        read uninitialised memory instead of raising IndexError.
+        """
+
+        for name in self.assigned_names(bodies):
+            self.list_lengths.pop(name, None)
+
+    def forget_looped_list_lengths(self, body: list[ast.stmt]) -> None:
+        """Drop the length of every list a loop body can resize, before it runs.
+
+        A loop body is lowered once but runs many times, so a length recorded
+        before the loop only describes the first pass. `xs.append(...)` after a
+        `f(*xs)` in the same body leaves the star standing for one fewer
+        argument than the second iteration actually has, which CPython answers
+        with a TypeError.
+
+        Deliberately over-broad: a name listed here only loses a build-time
+        length, which costs an honest refusal, while one missed costs a wrong
+        answer.
+        """
+
+        names = self.assigned_names(body)
+        for statement in body:
+            for node in ast.walk(statement):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                ):
+                    names.add(node.func.value.id)
+                elif isinstance(node, ast.Delete):
+                    for target in node.targets:
+                        if isinstance(target, ast.Subscript) and isinstance(
+                            target.value, ast.Name
+                        ):
+                            names.add(target.value.id)
+        for name in names:
+            self.list_lengths.pop(name, None)
+
     def open_loop_else(self, node: ast.For | ast.While) -> str | None:
         """The label a `break` out of this loop jumps to, if it needs its own.
 
@@ -7466,6 +9621,7 @@ class Frontend:
                 self.statement(statement)
             if node.orelse:
                 self.operations.append(Label(end_label))
+            self.forget_conditional_list_lengths(node.body + node.orelse)
         else:
             branch = node.body if bool(condition) else node.orelse
             for statement in branch:
@@ -7558,17 +9714,28 @@ class Frontend:
         self.possibly_unbound.discard(target)
         # The element carries the list's bool-ness: a name bound to one out of
         # a list of bools has to print True, not 1.
-        if element_kind == "int" and holds_bool is True:
+        if element_kind == "bool" or (element_kind == "int" and holds_bool is True):
             self.boolean_names.add(target)
         else:
             self.boolean_names.discard(target)
+        if self.list_kind(element_kind) is not None:
+            # The name and the element are the same block, so growing one
+            # through the name would leave the other on the abandoned copy.
+            self.shared_list_names.add(target)
+        else:
+            self.shared_list_names.discard(target)
+        # Whatever length a literal recorded under this name is not this
+        # value's length, and an index checked against it would be refused for
+        # being outside a range it is inside.
+        self.list_lengths.pop(target, None)
+        self.container_bool[target] = element_kind == "bool"
         if element_kind == "float":
             self.operations.append(
                 FloatStore(self.slot(target), BitsFloat(HeapLoad(address, 8)))
             )
         else:
             self.operations.append(Store(self.slot(target), HeapLoad(address, 8)))
-        self.value_types[target] = element_kind
+        self.value_types[target] = self.element_value_type(element_kind)
 
     def enumerate_source(self, node: ast.expr):
         """The list and start `enumerate(...)` names, or None."""
@@ -7694,8 +9861,8 @@ class Frontend:
             raise NativeCompileError(
                 self.path,
                 node,
-                "native reversed() takes a runtime list of integers or floats; "
-                "reversing a range or a string is not in the subset",
+                "native reversed() takes a runtime list; reversing a range or "
+                "a string is not in the subset",
             )
         return node.args[0]
 
@@ -8202,9 +10369,9 @@ class Frontend:
                         target in self.boolean_names,
                     )
                 )
-                self.value_types[target] = item_kind or "int"
+                self.value_types[target] = self.element_value_type(item_kind or "int")
                 self.bound_names.add(target)
-                if item_kind == "int" and self.list_holds_bool(iterable) is True:
+                if item_kind == "bool":
                     self.boolean_names.add(target)
                 else:
                     self.boolean_names.discard(target)
@@ -8229,11 +10396,14 @@ class Frontend:
 
         what = self.comprehension_shape(node)
         kind = self.comprehension_answer(
-            node, lambda element: self.expression_type(element, bindings)
+            node, lambda element: self.element_kind_of(element, bindings)
         )
-        if kind not in {"int", "float"}:
+        if not self.storable_element_kind(kind):
             raise NativeCompileError(
-                self.path, node, f"a native {what} builds integers or floats"
+                self.path,
+                node,
+                f"a native {what} builds integers, floats, strings, bools or "
+                "lists",
             )
         return kind
 
@@ -8577,11 +10747,7 @@ class Frontend:
                 IntBinary("add", result, IntConstant(self.LIST_HEADER_BYTES)),
                 IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
             )
-            stored = (
-                FloatBits(self.float_expression(element))
-                if element_kind == "float"
-                else self.integer(element)
-            )
+            stored = self.element_word(element, element_kind)
             self.operations.append(HeapStore(address, stored, 8))
             self.operations.append(
                 Store(
@@ -8602,6 +10768,7 @@ class Frontend:
         if self.dict_iteration_source(node.iter) is not None:
             self.for_over_dict(node)
             return
+        self.refuse_set_iteration(node.iter)
         if (
             isinstance(node.target, ast.Name)
             and self.reversed_source(node.iter) is not None
@@ -8613,6 +10780,12 @@ class Frontend:
             and self.list_kind(self.expression_type(node.iter)) is not None
         ):
             self.for_over_list(node)
+            return
+        if (
+            isinstance(node.target, ast.Name)
+            and self.tuple_kinds(self.expression_type(node.iter)) is not None
+        ):
+            self.for_over_tuple(node)
             return
         if self.enumerate_source(node.iter) is not None:
             self.for_over_enumerate(node)
@@ -8640,8 +10813,9 @@ class Frontend:
                 self.path,
                 node,
                 "native for supports NAME in range(1-3 arguments), NAME in a "
-                "runtime list, NAME in reversed(list), two names in "
-                "enumerate(list), or a dict with keys(), values() or items()"
+                "runtime list, NAME in a tuple whose elements are all one "
+                "kind, NAME in reversed(list), two names in enumerate(list), "
+                "or a dict with keys(), values() or items()"
                 + hint,
             )
         arguments = node.iter.args
@@ -8724,6 +10898,8 @@ class Frontend:
         if not isinstance(node, ast.Call):
             raise NativeCompileError(self.path, node, "only print() and SystemExit are valid expression statements")
         if self.list_method_call(node):
+            return
+        if self.set_method_call(node):
             return
         if self.string_method_kind(node) is not None:
             # Strings are immutable, so this changed nothing. CPython would
@@ -8834,6 +11010,7 @@ class Frontend:
             )
             assert result is None
         else:
+            self.refuse_starred_call(node)
             raise NativeCompileError(
                 self.path,
                 node,
@@ -10818,13 +12995,21 @@ class Frontend:
             )
         if isinstance(node, ast.Name):
             return node.id in self.boolean_names
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-            # An element is a bool when everything stored in the container was.
-            return self.container_bool.get(node.value.id) is True
         if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
-            # Indexing something that was never bound to a name - a slice of a
-            # slice, a comprehension used in place.
-            return self.list_holds_bool(node.value) is True
+            # A tuple answers per element, so `(True, 1)[0]` is a bool and
+            # `(True, 1)[1]` is not - which is the whole point of it.
+            element = self.tuple_subscript_kind(node)
+            if element is not None:
+                return element == "bool"
+            # A list says what its elements are in its own tag, which is what
+            # answers for one nobody named - `xs[0][1]`, a slice of a slice, a
+            # comprehension used in place. A dict keeps the answer under a name.
+            holds = self.list_holds_bool(node.value)
+            if holds is not None:
+                return holds
+            if isinstance(node.value, ast.Name):
+                return self.container_bool.get(node.value.id) is True
+            return False
         if isinstance(node, ast.Attribute):
             native_class = self.resolve_object_class(node.value)
             if native_class is not None:
@@ -10885,12 +13070,13 @@ class Frontend:
         """
 
         function = self.functions.get(node.func.id)
-        if (
-            function is None
-            or node.keywords
-            or len(node.args) != len(function.parameters)
-            or id(function) in self._bool_query
-        ):
+        if function is None or id(function) in self._bool_query:
+            return False
+        # Ask about the arguments the call really passes. An unexpanded star
+        # looks like the wrong number of them, and the "not a bool" that would
+        # come back prints 1 where CPython prints True.
+        node = self.call_with_expanded_stars(node)
+        if node.keywords or len(node.args) != len(function.parameters):
             return False
         previous = set(self.boolean_names)
         self._bool_query.add(id(function))
@@ -10983,12 +13169,33 @@ class Frontend:
             pointer = self.emit_int_to_string(self.integer(node))
         elif kind == "float":
             pointer = self.emit_float_to_string(self.float_expression(node))
+        elif self.tuple_kinds(kind) is not None:
+            self.emit_print_tuple(node, self.tuple_kinds(kind))
+            return
+        elif self.set_kind(kind) is not None:
+            # Rendering a set means choosing an order to render it in, and no
+            # order here matches CPython's.
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native print() cannot render a runtime {kind}: writing one "
+                "means choosing the order of its elements, and CPython's set "
+                "order is unspecified, so any choice would print the wrong "
+                "answer for some input. Print len(s), or `x in s`"
+                + (
+                    ", or print sorted(s) one element at a time"
+                    if self.set_kind(kind) == "int"
+                    else ""
+                ),
+            )
         else:
             raise NativeCompileError(
                 self.path,
                 node,
-                f"native print() cannot render a runtime {kind} yet; integers "
-                "and strings are supported",
+                f"native print() cannot render a runtime {kind} yet: nothing "
+                "here writes the brackets and commas CPython would, so print "
+                "the elements one at a time. Integers, floats, bools and "
+                "strings are supported",
             )
         pointer = self.materialize_int(pointer)
         self.operations.append(
@@ -11150,6 +13357,110 @@ class Frontend:
         self.operations.append(Label(return_label))
         return IntLoad(result_slot) if result_slot is not None else None
 
+    def starred_refusal(self, value: ast.expr) -> str:
+        accepted = (
+            "a list or tuple literal, or a name holding a list or tuple whose "
+            "length is still known here"
+        )
+        if isinstance(value, ast.Name) and self.list_kind_of(value.id) is not None:
+            return (
+                f"the length of {value.id!r} is no longer a build-time fact, so "
+                "* cannot say how many arguments it stands for. A list loses its "
+                "known length once it is appended to, del'd from, assigned from "
+                "anything but a literal, or assigned inside a block that may not "
+                "run. The callee is inlined against a parameter count fixed at "
+                f"build time and needs a known number of arguments: * accepts "
+                f"{accepted}"
+            )
+        return (
+            "a native call is inlined against a parameter count fixed at build "
+            "time, so the callee needs a number of arguments known then; * "
+            f"accepts {accepted}"
+        )
+
+    def starred_elements(self, node: ast.Starred) -> list[ast.expr]:
+        """The arguments one `*` stands for, as expressions to splice in."""
+
+        value = node.value
+        if isinstance(value, (ast.List, ast.Tuple)):
+            return list(value.elts)
+        length: int | None = None
+        if isinstance(value, ast.Name):
+            if self.list_kind_of(value.id) is not None:
+                length = self.list_lengths.get(value.id)
+            else:
+                kinds = self.tuple_kinds_of(value.id)
+                if kinds is not None:
+                    length = len(kinds)
+        if length is None:
+            raise NativeCompileError(self.path, node, self.starred_refusal(value))
+        assert isinstance(value, ast.Name)
+        elements: list[ast.expr] = []
+        for index in range(length):
+            element = ast.Subscript(
+                value=ast.Name(id=value.id, ctx=ast.Load()),
+                slice=ast.Constant(value=index),
+                ctx=ast.Load(),
+            )
+            ast.copy_location(element, node)
+            ast.fix_missing_locations(element)
+            elements.append(element)
+        return elements
+
+    def call_with_expanded_stars(self, node: ast.Call) -> ast.Call:
+        """Spell `f(*xs)` out as `f(xs[0], xs[1], ...)`, or say why it cannot be.
+
+        Indexing already knows an element's kind, whether it renders as a bool,
+        and how to prove a constant index in range, so the expansion is written
+        as subscripts and handed back to the ordinary argument path rather than
+        lowered here. A new node every time: a function body is deep-copied once
+        and re-lowered per call site, so a rewrite kept on the shared body would
+        freeze one call site's known lengths into another's.
+        """
+
+        if not any(isinstance(argument, ast.Starred) for argument in node.args):
+            return node
+        companions = [
+            argument for argument in node.args if not isinstance(argument, ast.Starred)
+        ]
+        companions.extend(keyword.value for keyword in node.keywords)
+        for other in companions:
+            if any(isinstance(inner, ast.Call) for inner in ast.walk(other)):
+                raise NativeCompileError(
+                    self.path,
+                    other,
+                    "a native starred call cannot share its argument list with "
+                    "a call: CPython unpacks the list after that call has run, "
+                    "so a call that appended to it would change how many "
+                    "arguments the star stands for, and this build already "
+                    "fixed that number. Evaluate the call into a name first",
+                )
+        expanded: list[ast.expr] = []
+        for argument in node.args:
+            if isinstance(argument, ast.Starred):
+                expanded.extend(self.starred_elements(argument))
+            else:
+                expanded.append(argument)
+        replacement = ast.Call(func=node.func, args=expanded, keywords=node.keywords)
+        return ast.copy_location(replacement, node)
+
+    def refuse_starred_call(self, node: ast.expr) -> None:
+        """Name the callees that cannot take a `*` argument at all."""
+
+        if not isinstance(node, ast.Call) or not any(
+            isinstance(argument, ast.Starred) for argument in node.args
+        ):
+            return
+        raise NativeCompileError(
+            self.path,
+            node,
+            "* argument expansion is supported only when calling a function, "
+            "lambda or procedure defined in this file, because the expansion "
+            "is spelled out against that callee's parameter count at build "
+            "time. This callee takes its arguments another way, so write them "
+            "out",
+        )
+
     def bind_native_arguments(
         self,
         function_name: str,
@@ -11163,6 +13474,7 @@ class Frontend:
         # ``skip_parameters`` hides leading parameters the caller supplies
         # itself, which is how a method's ``self`` is bound to the instance
         # rather than to a call argument.
+        node = self.call_with_expanded_stars(node)
         parameters = function.parameters[skip_parameters:]
         defaults = function.defaults[skip_parameters:]
         if len(node.args) > len(parameters):
@@ -11260,6 +13572,7 @@ class Frontend:
         function = self.functions.get(node.func.id)
         if function is None:
             return None
+        node = self.call_with_expanded_stars(node)
         if function.expression is None:
             # A statement body is inlined, and its result kind is only known
             # once it has been. Say integer so the caller takes the integer
@@ -11330,24 +13643,43 @@ class Frontend:
         if isinstance(node, ast.ListComp):
             return self.list_tag(self.comprehension_element_kind(node))
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
-            return self.expression_type(node.value, bindings)
+            sliced = self.expression_type(node.value, bindings)
+            if self.tuple_kinds(sliced) is not None:
+                # A slice of a tuple is a shorter tuple, and answering with the
+                # whole one would tell len() the wrong number.
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "native tuple slicing is not supported: read one element "
+                    "at a time by index, or use a runtime list, which slices",
+                )
+            return sliced
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
             and self.dict_kinds_of(node.value.id)
         ):
             return self.dict_kinds_of(node.value.id)[1]
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and self.list_kind_of(node.value.id) is not None
-        ):
-            return self.list_kind_of(node.value.id)
+        element_kind = self.tuple_subscript_kind(node, bindings)
+        if element_kind is not None:
+            return self.element_value_type(element_kind)
+        if isinstance(node, ast.Subscript):
+            # Any list expression, not just a name: this is what lets
+            # `xs[0][1]` know what it has at whatever depth it sits.
+            try:
+                container = self.expression_type(node.value, bindings)
+            except NativeCompileError:
+                container = None
+            element = self.list_kind(container)
+            if element is not None:
+                return self.element_value_type(element)
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
             return self.attribute_kind(node)
         method = self.string_method_kind(node, bindings)
         if method is not None:
-            return "str" if method == "str" else "int"
+            if method == "str" or self.list_kind(method) is not None:
+                return method
+            return "int"
         kind = self.expression_function_kind(node, bindings)
         if kind is not None:
             return kind
@@ -11355,13 +13687,24 @@ class Frontend:
             return "str"
         if isinstance(node, ast.Dict):
             return self.dict_literal_tag(node, bindings)
+        if isinstance(node, ast.Set):
+            return self.set_literal_tag(node, bindings)
+        if self.empty_set_call(node):
+            # `set()` alone cannot say what it will hold; int unless an
+            # annotation says otherwise, the same rule `{}` follows.
+            return self.set_tag("int")
         if isinstance(node, ast.List):
             return self.list_literal_tag(node, bindings)
+        if isinstance(node, ast.Tuple):
+            return self.tuple_tag(self.tuple_literal_kinds(node, bindings))
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, (ast.USub, ast.UAdd)):
                 return self.expression_type(node.operand, bindings)
             return "int"
         if isinstance(node, ast.BinOp):
+            operands = self.set_binop_operands(node)
+            if operands is not None:
+                return self.set_tag(operands[2])
             if isinstance(node.op, ast.Div):
                 return "float"
             if isinstance(node.op, ast.Add):
@@ -11392,11 +13735,12 @@ class Frontend:
                 and len(node.args) == 1
             ):
                 # A sorted copy holds what the source held.
-                element = self.list_kind(
-                    self.expression_type(node.args[0], bindings)
-                )
+                source_kind = self.expression_type(node.args[0], bindings)
+                element = self.list_kind(source_kind)
                 if element is not None:
                     return self.list_tag(element)
+                if self.set_kind(source_kind) is not None:
+                    return self.list_tag(self.set_kind(source_kind))
             if (
                 node.func.id in {"int", "len", "abs"} | self._AGGREGATE_CALLS
                 and node.func.id not in self.functions
@@ -11482,10 +13826,13 @@ class Frontend:
             )
         if (
             isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and self.list_kind_of(node.value.id) == "float"
+            and not isinstance(node.slice, ast.Slice)
+            and self.list_kind(self.expression_type(node.value, bindings)) == "float"
         ):
             return BitsFloat(HeapLoad(self.list_element_address(node), 8))
+        if self.tuple_subscript_kind(node, bindings) == "float":
+            assert isinstance(node, ast.Subscript)
+            return BitsFloat(HeapLoad(self.tuple_element_address(node), 8))
         if (
             isinstance(node, ast.Attribute)
             and self.resolve_object_class(node.value)
@@ -11853,11 +14200,39 @@ class Frontend:
                     f"list variable {node.id!r} needs indexing or len() in an "
                     "integer context",
                 )
+            if self.tuple_kinds(kind) is not None:
+                # Without this the compare ladder below would lower each side
+                # to its slot and compare BLOCK ADDRESSES, so two equal tuples
+                # at different addresses would answer False where CPython
+                # answers True.
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"tuple variable {node.id!r} needs indexing or len() in an "
+                    "integer context: a whole tuple cannot be compared, added, "
+                    "or passed to a native function, because the slot holds "
+                    "the address of its block and not the elements",
+                )
             if kind == "str":
                 raise NativeCompileError(
                     self.path,
                     node,
                     f"string variable {node.id!r} needs len() in an integer context",
+                )
+            if self.dict_kinds(kind) is not None or self.set_kind(kind) is not None:
+                # Without this the slot lowers to the table's ADDRESS, so
+                # `d + 1` answered with an arena offset and `if d:` was true
+                # for an empty table. Both are wrong answers, not refusals.
+                what = "dict" if self.dict_kinds(kind) is not None else "set"
+                extra = "a lookup, " if what == "dict" else ""
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"{what} variable {node.id!r} needs len(), {extra}or `in` "
+                    f"in an integer context: the slot holds the address of its "
+                    f"table, so arithmetic on it, comparing it, or testing it "
+                    f"for truth would use that address. Write len({node.id}) "
+                    f"> 0 for the truth test",
                 )
             return IntLoad(self.slots[node.id])
         if (
@@ -11950,22 +14325,39 @@ class Frontend:
                     ),
                     8,
                 )
-            if isinstance(argument, ast.Subscript) and isinstance(
-                argument.slice, ast.Slice
+            if isinstance(argument, ast.Name) and (
+                self.dict_kinds_of(argument.id)
+                or self.set_kind_of(argument.id) is not None
             ):
-                return HeapLoad(
-                    IntBinary("add", self.list_pointer(argument), IntConstant(8)), 8
-                )
-            if isinstance(argument, ast.Name) and self.dict_kinds_of(argument.id):
-                # The live count is the second i64 of the table header.
+                # The live count is the second i64 of the table header, and a
+                # set is the same table.
                 return HeapLoad(
                     IntBinary("add", IntLoad(self.slots[argument.id]), IntConstant(8)),
+                    8,
+                )
+            tuple_kinds = self.tuple_kinds(
+                self.expression_type(argument, bindings)
+            )
+            if tuple_kinds is not None:
+                # A tuple cannot grow, so how long it is was settled where it
+                # was written and nothing has to be read from the block.
+                return IntConstant(len(tuple_kinds))
+            if self.list_kind(self.expression_type(argument, bindings)) is not None:
+                # A slice, a comprehension, an inner list: the length is the
+                # second word of whatever block it built or pointed at.
+                return HeapLoad(
+                    IntBinary(
+                        "add",
+                        self.materialize_int(self.list_pointer(argument)),
+                        IntConstant(8),
+                    ),
                     8,
                 )
             raise NativeCompileError(
                 self.path,
                 node,
-                "native len() supports runtime strings and integer lists",
+                "native len() supports runtime strings, runtime lists, runtime "
+                "dicts, runtime sets and tuples",
             )
         if isinstance(node, ast.Subscript) and self.subscript_dict_kinds(node):
             _key_kind, value_kind = self.subscript_dict_kinds(node)
@@ -11974,13 +14366,39 @@ class Frontend:
                     self.path, node, "this dict has float values"
                 )
             return HeapLoad(self.dict_lookup_value_address(node, bindings), 8)
+        if (
+            isinstance(node, ast.Subscript)
+            and not isinstance(node.slice, ast.Slice)
+            and self.tuple_kinds(self.expression_type(node.value, bindings))
+            is not None
+        ):
+            element_kind = self.tuple_subscript_kind(node, bindings)
+            if element_kind == "float":
+                raise NativeCompileError(
+                    self.path, node, "this tuple element is a float"
+                )
+            if element_kind == "str":
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "this tuple element is a string, so it needs len() in an "
+                    "integer context",
+                )
+            return HeapLoad(self.tuple_element_address(node), 8)
         if isinstance(node, ast.Subscript):
-            if (
-                isinstance(node.value, ast.Name)
-                and self.list_kind_of(node.value.id) == "float"
-            ):
+            element_kind = self.list_kind(self.expression_type(node.value, bindings))
+            if element_kind == "float":
                 raise NativeCompileError(
                     self.path, node, "this list holds floats"
+                )
+            if element_kind is not None and element_kind not in {"int", "bool"}:
+                # The word is a block address, and an address is not the value
+                # CPython would put here.
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"this list holds {self.kind_noun(element_kind)}, so this "
+                    "element needs len() or indexing in an integer context",
                 )
             return HeapLoad(self.list_element_address(node), 8)
         if isinstance(node, ast.Attribute) and self.resolve_object_class(node.value):
@@ -12168,11 +14586,31 @@ class Frontend:
             container = node.comparators[0]
             shape = self.membership_container_kind(container)
             present = isinstance(node.ops[0], ast.In)
+            if shape == "set":
+                element_kind = self.set_kind_of(container.id)
+                if self.expression_type(node.left, bindings) != element_kind:
+                    raise NativeCompileError(
+                        self.path,
+                        node.left,
+                        f"this set holds {element_kind} elements",
+                    )
+                _address, found_slot, _key, _state = self.dict_probe(
+                    self.slot(container.id),
+                    self.dict_key(node.left, element_kind),
+                    element_kind,
+                )
+                return IntCompare(
+                    "ne" if present else "eq",
+                    IntLoad(found_slot),
+                    IntConstant(0),
+                )
             if shape != "dict":
                 if shape == "str":
                     found = self.emit_substring_search(node.left, container)
                 else:
-                    found = self.emit_list_membership(node.left, container, shape)
+                    found = self.emit_list_membership(
+                        node.left, container, self.list_kind(shape)
+                    )
                 return IntCompare(
                     "ne" if present else "eq",
                     IntLoad(found),
@@ -12395,7 +14833,32 @@ class Frontend:
                 self.kernel_functions = previous_kernel_functions
                 self.extern_functions = previous_extern_functions
                 self.path = previous_path
+        if isinstance(node, ast.Lambda):
+            raise NativeCompileError(self.path, node, self._LAMBDA_REFUSAL)
+        if isinstance(node, ast.Starred):
+            # Reached one argument at a time, so the call around it is gone by
+            # here; only the callees that lower their arguments this way get
+            # this far, and none of them has a parameter list to expand against.
+            raise NativeCompileError(
+                self.path,
+                node,
+                "* expansion is accepted only when calling a function, lambda "
+                "or procedure defined in this file, where the expansion is "
+                "spelled out against that callee's parameter count at build "
+                "time; print() and the builtins take their arguments written "
+                "out",
+            )
+        self.refuse_starred_call(node)
         self.refuse_lazy_comprehension(node)
+        if isinstance(node, ast.Tuple):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native tuple cannot be used where a signed 64-bit integer "
+                "is required: it is a block of elements, not a number. Index "
+                "it, take its len(), unpack it, or bind it to a name; a whole "
+                "tuple cannot be compared, added or concatenated",
+            )
         raise NativeCompileError(
             self.path,
             node,

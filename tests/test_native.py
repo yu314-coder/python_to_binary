@@ -2249,3 +2249,292 @@ class LoopElseTests(unittest.TestCase):
             + 'else:\n    print("else")\n',
             "cannot leave a try that has a finally",
         )
+
+
+class NativeSetTests(unittest.TestCase):
+    """Sets, which share the dict's open-addressing table.
+
+    A set is the same block with the value word never written and the
+    insertion-order field left 0. Every case compares stdout and exit status
+    with CPython rather than a hand-computed number, so a wrong expectation
+    cannot hide a wrong answer.
+    """
+
+    RUNTIME_N = "n = 0\nfor i in range(0, 3):\n    n += 1\n"
+
+    def _run(self, source: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "s.py"
+            entry.write_text(source, encoding="utf-8")
+            artifact = root / "s.bin"
+            compile_native(entry, artifact, "darwin-arm64", clean=True)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            native = subprocess.run([str(artifact)], capture_output=True)
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_a_literal_drops_duplicates(self):
+        self._run("s = {1, 1, 2, 9, 17}\nprint(len(s))\n")
+
+    def test_keys_that_share_a_home_slot(self):
+        # 1, 9 and 17 are congruent modulo the initial capacity of 8, so each
+        # is found only by probing past the others.
+        self._run(
+            self.RUNTIME_N
+            + "s = {1, 9, 17}\nprint(9 in s, 17 in s, 8 in s, n * 3 in s)\n"
+        )
+
+    def test_discarding_the_middle_of_a_probe_chain(self):
+        # The case a tombstone-free blank would get wrong: removing 9 would
+        # leave a hole that stops the probe for 17 before it reaches it.
+        self._run(
+            "n = 0\nfor i in range(0, 9):\n    n += 1\n"
+            "s = {1, 9, 17}\ns.discard(n)\n"
+            "print(len(s), 1 in s, 9 in s, 17 in s)\n"
+        )
+
+    def test_discarding_something_absent_changes_nothing(self):
+        self._run("s = {5}\ns.discard(6)\nprint(len(s))\ns.discard(5)\nprint(len(s), 5 in s)\n")
+
+    def test_adding_after_discarding_everything(self):
+        self._run(
+            's: set[str] = set()\ns.add("aa")\ns.add("bb")\ns.discard("aa")\n'
+            'print(len(s), "aa" in s, "bb" in s)\ns.discard("bb")\n'
+            's.add("cc")\nprint(len(s), "cc" in s)\n'
+        )
+
+    def test_growth_and_rehashing_of_integer_elements(self):
+        self._run(
+            "s = set()\ni = 0\nwhile i < 300:\n    s.add(i * 7)\n    i += 1\n"
+            "print(len(s), 700 in s, 701 in s)\n"
+        )
+
+    def test_growth_and_rehashing_of_string_elements(self):
+        self._run(
+            's: set[str] = set()\ni = 0\nt = ""\nwhile i < 300:\n'
+            '    t = t + "a"\n    s.add(t)\n    i += 1\n'
+            'print(len(s), "aaa" in s, "b" in s)\n'
+        )
+
+    def test_discarding_half_a_grown_table(self):
+        self._run(
+            "s = set()\ni = 0\nwhile i < 40:\n    s.add(i)\n    i += 1\n"
+            "i = 0\nwhile i < 20:\n    s.discard(i * 2)\n    i += 1\n"
+            "print(len(s), 0 in s, 1 in s, 38 in s, 39 in s)\n"
+        )
+
+    def test_an_empty_dict_and_an_empty_set_are_different_things(self):
+        self._run("d = {}\ns = set()\ns.add(1)\nprint(len(d), len(s))\n")
+
+    def test_negative_and_extreme_elements(self):
+        # The home slot is key & mask on a signed value, so a negative element
+        # has to land somewhere the probe can find it again.
+        self._run(
+            self.RUNTIME_N
+            + "s = {-1, -3, 9223372036854775807}\n"
+            "print(-n in s, -1 in s, 0 in s, 9223372036854775807 in s)\n"
+        )
+
+    def test_not_in(self):
+        self._run("s = {1, 2}\nprint(2 not in s, 3 not in s)\n")
+
+    def test_union_intersection_and_difference(self):
+        self._run(
+            "a = {1, 2, 3}\nb = {2, 3, 4}\n"
+            "c = a | b\nprint(len(c), 4 in c)\n"
+            "c = a & b\nprint(len(c), 1 in c, 2 in c)\n"
+            "c = a - b\nprint(len(c), 1 in c, 2 in c)\n"
+            "a |= b\nprint(len(a))\n"
+        )
+
+    def test_operators_over_string_elements(self):
+        self._run(
+            'a: set[str] = set()\na.add("x")\na.add("y")\n'
+            'b: set[str] = set()\nb.add("y")\nb.add("z")\n'
+            'c = a | b\nprint(len(c), "x" in c, "z" in c)\n'
+            'c = a & b\nprint(len(c), "y" in c, "x" in c)\n'
+            'c = a - b\nprint(len(c), "x" in c, "y" in c)\n'
+        )
+
+    def test_augmented_operators_chain(self):
+        self._run(
+            "a = {1, 2}\nb = {2, 3}\na |= b\na &= b\n"
+            "print(len(a), 2 in a, 3 in a, 1 in a)\na -= b\nprint(len(a))\n"
+        )
+
+    def test_union_with_itself_is_a_copy_that_does_not_share(self):
+        self._run(
+            "a = {1, 2}\nb = a | a\nb.add(3)\n"
+            "print(len(a), len(b), 3 in a, 3 in b)\n"
+        )
+
+    def test_an_intersection_can_be_empty(self):
+        self._run("a = {1, 2}\nb = {3, 4}\nc = a & b\nprint(len(c), 1 in c)\n")
+
+    def test_bools_are_a_set_of_their_own(self):
+        self._run(
+            self.RUNTIME_N
+            + "s = {True, False}\n"
+            "print(len(s), True in s, False in s, (n > 2) in s)\n"
+        )
+
+    def test_remove_raises_when_the_element_is_absent(self):
+        self._run("s = {1, 2, 3}\ns.remove(2)\nprint(len(s), 2 in s)\ns.remove(7)\n")
+
+    def test_a_module_level_set_read_inside_an_inlined_function(self):
+        self._run(
+            "s = {4, 1, 7}\ndef hits() -> int:\n    return len(s) + (7 in s)\n"
+            "print(hits())\n"
+        )
+
+    def test_adding_inside_an_inlined_function(self):
+        self._run(
+            "s = {1, 2}\ndef f() -> int:\n    s.add(3)\n    return len(s)\n"
+            "print(f())\n"
+        )
+
+    def test_sorted_is_the_one_defined_order(self):
+        self._run(
+            "s = {5, 1, 9, 1, 3}\nfor v in sorted(s):\n    print(v)\n"
+            "xs = sorted(s, reverse=True)\nprint(len(xs), xs[0], xs[3])\n"
+        )
+
+    def test_sorted_of_an_empty_set(self):
+        self._run("s = set()\nxs = sorted(s)\nprint(len(xs))\n")
+
+
+class NativeSetRefusalTests(unittest.TestCase):
+    """What a set refuses, and why.
+
+    Iteration is refused outright: CPython's set order is unspecified, is not
+    insertion order, and for strings is randomized per process, so no order
+    produced here could match it for every input.
+    """
+
+    def _reject(self, source: str, expected: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "s.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "s.bin", "darwin-arm64", clean=True)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_iterating_a_set_is_refused(self):
+        self._reject(
+            "s = {1, 2}\nfor v in s:\n    print(v)\n",
+            "a native set cannot be iterated",
+        )
+
+    def test_iterating_a_set_literal_is_refused(self):
+        self._reject("for v in {1, 2}:\n    print(v)\n", "a native set cannot be iterated")
+
+    def test_every_way_the_order_could_escape_a_loop_is_refused(self):
+        # Why the ban is on iteration and not on printing inside it: each of
+        # these carries the order out of the loop with no print in the body,
+        # so a print-only ban would pass them through as wrong answers.
+        for body in (
+            "xs = []\nfor v in s:\n    xs.append(v)\nprint(len(xs))\n",
+            "for v in s:\n    print(v)\n    break\n",
+            't = ""\nfor v in s:\n    t = t + str(v)\nprint(t)\n',
+            "def first() -> int:\n    for v in s:\n        return v\n"
+            "    return 0\nprint(first())\n",
+        ):
+            with self.subTest(body=body):
+                self._reject("s = {5, 3}\n" + body, "a native set cannot be iterated")
+
+    def test_printing_a_set_is_refused(self):
+        self._reject("s = {1, 2}\nprint(s)\n", "cannot render a runtime set:int")
+
+    def test_a_bool_beside_a_number_is_refused(self):
+        # CPython makes {True, 1} one element because True == 1; here the two
+        # are the same 64 bits, so one of them would have to print wrongly.
+        self._reject("s = {True, 1}\nprint(len(s))\n", "holds bools already")
+        self._reject("s = set()\ns.add(True)\ns.add(1)\n", "holds bools already")
+
+    def test_rebinding_a_set_name_to_the_other_bool_kind_is_refused(self):
+        # A false refusal, and the deliberate one: the answer belongs to the
+        # name, and letting a rebinding reset it would let `if c: s = {1}`
+        # leave the build-time answer disagreeing with the slot, which
+        # sorted() would then print as 1 and 0 instead of True and False.
+        self._reject(
+            "s = {True}\ns = {1}\nprint(1 in s)\n", "holds bools already"
+        )
+
+    def test_a_set_in_an_integer_context_is_refused(self):
+        self._reject("s = {1, 2}\nx = s + 1\nprint(x)\n", "set variable 's' needs len()")
+        self._reject("s = {1, 2}\nif s:\n    print(1)\n", "set variable 's' needs len()")
+        self._reject(
+            "s = {1, 2}\nt = {1, 2}\nprint(s == t)\n", "set variable 's' needs len()"
+        )
+
+    def test_a_dict_in_an_integer_context_is_refused(self):
+        # The same hole, and it was open for dicts too: `d + 1` answered with
+        # an arena address and `if d:` was true for an empty table.
+        self._reject("d = {1: 1}\nx = d + 1\nprint(x)\n", "dict variable 'd' needs len()")
+        self._reject(
+            "d: dict[int, int] = {}\nif d:\n    print(1)\n",
+            "dict variable 'd' needs len()",
+        )
+
+    def test_a_second_name_for_the_same_set_is_refused(self):
+        self._reject("s = {1, 2}\nt = s\nprint(len(t))\n", "cannot be another name for")
+
+    def test_unsupported_methods_are_named(self):
+        self._reject(
+            "s = {1, 2}\ns.pop()\nprint(len(s))\n",
+            "native sets support add(), discard() and remove()",
+        )
+
+    def test_mixed_element_kinds_are_refused(self):
+        self._reject('s = {1, "a"}\nprint(len(s))\n', "so every element must be int")
+
+    def test_set_takes_no_arguments(self):
+        self._reject("s = set([1, 2])\nprint(len(s))\n", "native set() takes no arguments")
+
+    def test_combining_sets_of_different_kinds_is_refused(self):
+        self._reject(
+            'a = {1, 2}\nb: set[str] = set()\nc = a | b\nprint(len(c))\n',
+            "hold different kinds",
+        )
+
+    def test_an_operator_needs_a_set_on_both_sides(self):
+        self._reject(
+            "a = {1, 2}\nc = a | 3\nprint(len(c))\n", "a set on both sides"
+        )
+
+    def test_membership_over_a_set_literal_is_refused(self):
+        self._reject(
+            "n = 0\nfor i in range(0, 2):\n    n += 1\nprint(n in {1, 2, 5})\n",
+            "`in` over a set literal is not supported",
+        )
+
+    def test_sorted_of_a_string_set_is_refused(self):
+        self._reject(
+            's: set[str] = set()\ns.add("a")\nxs = sorted(s)\nprint(len(xs))\n',
+            "native sorted() takes a set of integers",
+        )
+
+    def test_sorted_of_a_set_of_bools_is_refused(self):
+        self._reject(
+            "s = {True, False}\nxs = sorted(s)\nprint(len(xs))\n",
+            "sets of integers, and this one holds bools",
+        )
+
+    def test_an_annotation_does_not_convert_a_literal(self):
+        self._reject(
+            "s: set[str] = {1, 2}\nprint(len(s))\n", "the annotation says set:str"
+        )
+
+    def test_an_unsupported_augmented_operator_is_named(self):
+        self._reject(
+            "a = {1, 2}\nb = {3}\na += b\nprint(len(a))\n",
+            "native set augmented assignment supports |= &= -=",
+        )
