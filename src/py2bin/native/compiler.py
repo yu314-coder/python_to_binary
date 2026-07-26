@@ -249,6 +249,7 @@ CALL_CAPABLE_TARGETS = frozenset(
         "linux-x86_64",
         "windows-arm64",
         "windows-x86_64",
+        "windows-arm64",
     }
 )
 
@@ -257,7 +258,14 @@ CALL_CAPABLE_TARGETS = frozenset(
 #: base lives in a reserved callee-saved register for the whole run, and only
 #: the ARM64 syscall encoders set that register up.
 STATIC_CAPABLE_TARGETS = frozenset(
-    {"darwin-arm64", "linux-arm64", "darwin-x86_64", "linux-x86_64"}
+    {
+        "darwin-arm64",
+        "linux-arm64",
+        "darwin-x86_64",
+        "linux-x86_64",
+        "windows-x86_64",
+        "windows-arm64",
+    }
 )
 
 

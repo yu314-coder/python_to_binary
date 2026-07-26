@@ -7,7 +7,13 @@ import unittest
 
 import struct
 
-from py2bin.native import NativeCompileError, compile_all, compile_native, resolve_target
+from py2bin.native import (
+    NativeCompileError,
+    compile_all,
+    compile_native,
+    resolve_target,
+    supported_targets,
+)
 from py2bin.native.arm64 import encode_darwin as encode_darwin_arm64
 from py2bin.native.compiler import compile_native_module
 from py2bin.native.ir import IntConstant, Module
@@ -958,31 +964,28 @@ class Arm64StaticStorageTests(unittest.TestCase):
             # via the function's address held in a stack slot.
             self.assertEqual(subprocess.run([str(artifact)]).returncode, 223)
 
-    def test_targets_without_a_static_base_reject_the_module(self):
-        for target in (
-            "windows-x86_64",
-        ):
-            with self.subTest(target=target):
-                from py2bin.native.ir import ExitValue, GlobalAddress, HeapLoad
+    def test_every_target_establishes_a_static_base(self):
+        """No target lacks static storage now: the POSIX encoders reserve the
+        block with an anonymous mmap and the Windows ones with VirtualAlloc,
+        both giving the zero-filled writable memory C requires."""
 
-                # No Function, so this reaches the static-storage check rather
-                # than the call-ABI one that precedes it.
-                module = Module(
-                    [ExitValue(HeapLoad(GlobalAddress(0), 8, True))],
-                    0,
-                    static_bytes=4096,
-                )
+        from py2bin.c_native import compile_c_native
+
+        source = (
+            "int counter;\n"
+            "void bump(void) { counter = counter + 5; }\n"
+            "int main(void) { counter = 1; bump(); return counter; }\n"
+        )
+        for target in supported_targets():
+            with self.subTest(target=target):
                 with tempfile.TemporaryDirectory() as directory:
-                    with self.assertRaisesRegex(
-                        NativeCompileError, "static storage .*only supported"
-                    ):
-                        compile_native_module(
-                            Path("static.py"),
-                            module,
-                            Path(directory) / "static.bin",
-                            target=target,
-                            clean=True,
-                        )
+                    root = Path(directory)
+                    entry = root / "g.c"
+                    entry.write_text(source, encoding="utf-8")
+                    compile_c_native(
+                        entry, root / "g.bin", target=target, clean=True
+                    )
+
 
     def test_the_address_of_an_undefined_function_is_refused(self):
         from py2bin.native.ir import ExitValue, FunctionAddress, Store

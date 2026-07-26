@@ -57,7 +57,9 @@ def _imports(section_rva: int, image_base: int) -> tuple[bytes, dict[str, int], 
     return _imports_for(
         section_rva,
         image_base,
-        ("GetStdHandle", "WriteFile", "ExitProcess"),
+        # VirtualAlloc supplies the writable block that holds file-scope
+        # variables, the way an anonymous mmap does on POSIX.
+        ("GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc"),
     )
 
 

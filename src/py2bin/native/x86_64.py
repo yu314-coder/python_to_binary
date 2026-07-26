@@ -715,11 +715,6 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
     """Encode calls through a Windows x64 import-address table."""
-    if module.static_bytes:
-        raise ValueError(
-            "static storage (C file-scope variables) is not implemented for "
-            "windows-x86_64 yet; it needs VirtualAlloc in the PE import table"
-        )
     variable_base = 0x38
     code = bytearray(_sub_stack(_frame_bytes(module.stack_slots, variable_base)))
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp
@@ -734,6 +729,19 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         address_patches.append((instruction + 2, imports[symbol]))
 
     refs = _X86Refs(registers=4, shadow=32)
+
+    if module.static_bytes:
+        # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+        # The result is a zero-filled writable block; its base stays in
+        # r15, which is callee-saved and untouched elsewhere here.
+        code.extend(b"\x48\x31\xc9")  # xor rcx, rcx (lpAddress = NULL)
+        code.extend(b"\x48\xc7\xc2" + struct.pack("<I", module.static_bytes))
+        code.extend(b"\x41\xb8\x00\x30\x00\x00")  # mov r8d, 0x3000
+        code.extend(b"\x41\xb9\x04\x00\x00\x00")  # mov r9d, PAGE_READWRITE
+        code.extend(b"\x48\x83\xec\x20")  # shadow space
+        indirect_call("VirtualAlloc")
+        code.extend(b"\x48\x83\xc4\x20")
+        code.extend(b"\x49\x89\xc7")  # mov r15, rax
 
     def emit(operations, slot_base: int, _epilogue=b"") -> None:
         """Encode one body. Labels are body-local; imports are shared."""

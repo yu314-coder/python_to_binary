@@ -670,16 +670,12 @@ def encode_darwin_extern(
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
     """Encode calls through a Windows ARM64 import-address table."""
-    if module.static_bytes:
-        raise ValueError(
-            "static storage (C file-scope variables) is not supported for "
-            "windows-arm64 yet; it needs VirtualAlloc in the PE import table"
-        )
     slot_base = 16
     words: list[int] = [
         *_frame_sub(_frame_bytes(module.stack_slots, slot_base)),
         0x910003FD,  # mov x29, sp; stable variable base
     ]
+    static_pending = module.static_bytes
     function_references: list[tuple[int, str]] = []
     string_references: list[tuple[int, bytes]] = []
     labels: dict[str, int] = {}
@@ -689,6 +685,23 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         index = len(words)
         words.extend((0, 0, 0xD63F0200))  # adrp x16; ldr x16, [x16,#off]; blr x16
         function_references.append((index, symbol))
+
+    if static_pending:
+        # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+        # returns a zero-filled writable block, which is the initial value C
+        # gives an object with static storage duration. Its base lives in x28
+        # for the whole run; nothing else writes that register.
+        words.extend(_mov(0, 0))
+        words.extend(_mov(1, static_pending))
+        words.extend(_mov(2, 0x3000))  # MEM_COMMIT | MEM_RESERVE
+        words.extend(_mov(3, 4))  # PAGE_READWRITE
+        call("VirtualAlloc")
+        words.append(0xAA0003FC)  # mov x28, x0
+        # A failed reservation returns NULL; writing a global through 0 would
+        # be a wild store, so exit instead of running on.
+        words.append(0xB50000BC)  # cbnz x28, +3 instructions
+        words.extend(_mov(0, 3))
+        call("ExitProcess")
 
     refs = _Refs()
 
