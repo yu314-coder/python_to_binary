@@ -11,6 +11,7 @@ from .application import (
     require_aot_application,
 )
 from .compiler import (
+    host_target,
     NativeResult,
     compile_all,
     compile_native_module,
@@ -49,6 +50,7 @@ __all__ = [
     "compile_all",
     "compile_native_module",
     "compile_native",
+    "host_target",
     "compile_native_source",
     "emit_ir_c",
     "parse_ir_c",

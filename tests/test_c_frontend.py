@@ -22,7 +22,8 @@ from pathlib import Path
 
 from py2bin.c_frontend import CCompileError, compile_c_to_ir
 from py2bin.c_native import compile_c_native
-from py2bin.native import supported_targets
+from py2bin.cli import main
+from py2bin.native import host_target, supported_targets
 
 
 _HOST_IS_DARWIN_ARM64 = (
@@ -3949,3 +3950,82 @@ class TranscendentalTests(CProgramTestCase):
         if got:
             self.assertEqual(got[0], math.sqrt(2.0))
             self.assertEqual(got[1:], [-3.0, -2.0])
+
+
+class CcCommandTests(unittest.TestCase):
+    """`py2bin cc` is the front door: sensible defaults, no required flags."""
+
+    _HELLO = '#include <stdio.h>\nint main(void) { printf("hi\\n"); return 0; }\n'
+
+    def test_the_output_name_defaults_to_the_source_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "hello.c"
+            entry.write_text(self._HELLO, encoding="utf-8")
+            self.assertEqual(main(["cc", str(entry)]), 0)
+            self.assertTrue((root / "hello").is_file())
+
+    def test_the_target_defaults_to_this_machine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "hello.c"
+            entry.write_text(self._HELLO, encoding="utf-8")
+            main(["cc", str(entry)])
+            image = (root / "hello").read_bytes()[:4]
+            expected = {
+                "darwin": b"\xcf\xfa\xed\xfe",
+                "linux": b"\x7fELF",
+                "windows": b"MZ\x90\x00",
+            }[host_target().split("-")[0]]
+            self.assertEqual(image[: len(expected)], expected[: len(image)])
+
+    def test_rebuilding_overwrites_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "hello.c"
+            entry.write_text(self._HELLO, encoding="utf-8")
+            self.assertEqual(main(["cc", str(entry)]), 0)
+            self.assertEqual(main(["cc", str(entry)]), 0)
+
+    def test_keep_refuses_to_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "hello.c"
+            entry.write_text(self._HELLO, encoding="utf-8")
+            main(["cc", str(entry)])
+            self.assertNotEqual(main(["cc", str(entry), "--keep"]), 0)
+
+    def test_include_paths_and_defines_reach_the_preprocessor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "inc").mkdir()
+            (root / "inc" / "g.h").write_text(
+                '#define GREETING "from a header"\n', encoding="utf-8"
+            )
+            entry = root / "u.c"
+            entry.write_text(
+                '#include <stdio.h>\n#include "g.h"\n'
+                'int main(void) { printf("%s %d\\n", GREETING, SCALE); return 0; }\n',
+                encoding="utf-8",
+            )
+            code = main(
+                ["cc", str(entry), "-I", str(root / "inc"), "-D", "SCALE=42"]
+            )
+            self.assertEqual(code, 0)
+            if not (
+                platform.system() == "Darwin" and platform.machine() == "arm64"
+            ):
+                return
+            run = subprocess.run([str(root / "u")], capture_output=True, text=True)
+            self.assertEqual(run.stdout, "from a header 42\n")
+
+    def test_a_cross_target_can_be_spelled_loosely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "hello.c"
+            entry.write_text(
+                "int main(void) { return 3; }\n", encoding="utf-8"
+            )
+            main(["cc", str(entry), "--os", "linux", "--arch", "aarch64",
+                  "-o", str(root / "out")])
+            self.assertEqual((root / "out").read_bytes()[:4], b"\x7fELF")

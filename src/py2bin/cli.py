@@ -26,6 +26,7 @@ from .native import (
     build_aot_application,
     compile_all,
     compile_native,
+    host_target,
     plan_aot_application,
     require_native_library,
     resolve_target,
@@ -186,6 +187,37 @@ def _parser() -> argparse.ArgumentParser:
     )
     target_options(via_c_parser)
     via_c_parser.add_argument("--clean", action="store_true")
+    cc_parser = commands.add_parser(
+        "cc",
+        help="compile a C file to a native executable (the easy front door)",
+        description=(
+            "Compile C to machine code. With no --output the executable takes "
+            "the source file's name, and with no --target it is built for this "
+            "machine, so `py2bin cc hello.c` writes ./hello. No assembler, "
+            "linker, or C toolchain is used."
+        ),
+    )
+    cc_parser.add_argument("entry", type=Path, help=".c source file")
+    cc_parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        help="executable to write (default: the source name without .c)",
+    )
+    cc_parser.add_argument(
+        "--include-dir", "-I", action="append", default=[], metavar="DIR",
+        help="a directory the preprocessor searches for #include",
+    )
+    cc_parser.add_argument(
+        "--define", "-D", action="append", default=[], metavar="NAME[=VALUE]",
+        help="define a macro before the file is preprocessed",
+    )
+    target_options(cc_parser)
+    cc_parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="fail instead of overwriting an existing output file",
+    )
     compile_c_parser = commands.add_parser(
         "compile-c",
         help="compile C to machine code with py2bin's own C compiler",
@@ -758,6 +790,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             if bridge.c_artifact is not None:
                 print(f"retained parsed C source at {bridge.c_artifact}")
+            return 0
+        if args.command == "cc":
+            # Defaults chosen so the common case needs no flags at all:
+            # `py2bin cc hello.c` builds ./hello for this machine.
+            output = args.output
+            if output is None:
+                output = entry.with_suffix("")
+                if output == entry:
+                    output = entry.with_name(entry.name + ".bin")
+            target = _target_from_args(args)
+            result = compile_c_native(
+                entry,
+                output,
+                target=target,
+                clean=not args.keep,
+                include_dirs=tuple(args.include_dir),
+                defines=tuple(args.define),
+            )
+            print(
+                f"{result.artifact} ({result.bytes} bytes, {result.target})",
+            )
             return 0
         if args.command == "compile-c":
             result = compile_c_native(

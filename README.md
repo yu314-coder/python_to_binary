@@ -82,6 +82,47 @@ None of these tiers invokes gcc, clang, `as`, `ld`, Xcode, or an SDK. py2bin
 cannot: the library does not import `subprocess` and never starts a process, and
 the test suite fails if that changes.
 
+## Compiling C
+
+py2bin includes a C compiler written in Python. It lexes and parses C, applies
+C's own type rules, and writes machine code directly -- no assembler, no
+linker, no gcc or clang anywhere in the path.
+
+```sh
+py2bin cc hello.c        # writes ./hello for this machine
+./hello
+```
+
+That is the whole common case. `--output/-o` names the executable, `-I` and
+`-D` reach the preprocessor, and `--target` (or `--os`/`--arch`) cross-compiles
+to any of the six supported targets from any host:
+
+```sh
+py2bin cc hello.c --os windows --arch x64 -o hello.exe
+py2bin cc hello.c --target linux-arm64 -o hello-arm64
+```
+
+**What compiles.** The integer types with C11 promotion and conversion, `float`
+and `double`, pointers, arrays, `struct`, `union`, `enum`, `typedef`, function
+pointers, file-scope variables, recursion, the full statement set including
+`switch` and `goto`, a real preprocessor (`#define` with function-like and
+variadic macros, `#if`, `#include`, `#` and `##`), and `printf` with runtime
+conversions. `<math.h>` supplies `sqrt`, `fabs`, `floor`, `ceil` and `trunc` as
+single hardware instructions, and `exp`, `log`, `sin`, `cos`, `tan` and `pow`
+as C that py2bin compiles -- accurate to within one unit in the last place
+against the platform's own libm.
+
+**What does not.** Variadic *functions* you define yourself, `long double`,
+`_Complex`, `_Atomic`, variable-length arrays, bitfields, inline assembly,
+compiler builtins, and real system headers, which use extensions this front end
+does not implement. There is no linker, so a program is one translation unit
+and cannot call into a separate object file or library. Each of these is
+refused with a `file:line:col` message rather than mis-compiled.
+
+**This is not a C++ compiler**, and C++ is not a small step from here.
+Templates, virtual dispatch, exceptions, destructors, overload resolution and
+name mangling are each larger than everything above.
+
 ## What the C-API path supports
 
 This is the honest boundary of tier (b). It is deliberately unflattering.
