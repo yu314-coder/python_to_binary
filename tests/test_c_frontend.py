@@ -1403,7 +1403,7 @@ class RejectionTests(CProgramTestCase):
             "int f(int n) { return n ? f(n - 1) : 0; }\n"
             "int main(void) { return f(3); }\n"
         )
-        for target in ("windows-arm64", "windows-x86_64"):
+        for target in ("windows-x86_64",):
             with self.subTest(target=target):
                 with self.assertRaises(CCompileError) as caught:
                     compile_c_to_ir(source, "reject.c", target)

@@ -657,10 +657,6 @@ def encode_darwin_extern(
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
     """Encode calls through a Windows ARM64 import-address table."""
-    if module.functions:
-        raise ValueError(
-            "internal function calls are not supported for windows-arm64 yet"
-        )
     if module.static_bytes:
         raise ValueError(
             "static storage (C file-scope variables) is not supported for "
@@ -681,61 +677,106 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         words.extend((0, 0, 0xD63F0200))  # adrp x16; ldr x16, [x16,#off]; blr x16
         function_references.append((index, symbol))
 
-    for operation in module.operations:
-        if isinstance(operation, Return):
-            raise ValueError(
-                "internal function calls are not supported for windows-arm64 yet"
-            )
-        if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
-            raise ValueError(
-                "runtime heap lists/strings are not supported for windows-arm64 yet"
-            )
-        if isinstance(operation, HeapStore):
-            # Plain memory, not the arena: a C store through a pointer needs no
-            # mmap, so it works on Windows exactly as it does on POSIX.
-            _expression(words, operation.address, slot_base)
-            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-            _expression(words, operation.value, slot_base)
-            words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16
-            instruction = _ARM64_STORES.get(operation.size)
-            if instruction is None:
-                raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
-            words.append(instruction)
-            continue
-        if isinstance(operation, Write):
-            # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
-            words.extend(_mov(0, -11 if operation.fd == 1 else -12))
-            call("GetStdHandle")
-            string_index = len(words)
-            words.append(0)  # adr x1, data
-            string_references.append((string_index, operation.data))
-            words.extend(_mov(2, len(operation.data)))
-            words.append(0x910003E3)  # mov x3, sp
-            words.extend(_mov(4, 0))
-            call("WriteFile")
-        elif isinstance(operation, Store):
-            _expression(words, operation.value, slot_base)
-            words.append(_slot_instruction(False, operation.slot, slot_base))
-        elif isinstance(operation, FloatStore):
-            _float_expression(words, operation.value, slot_base)
-            words.append(_float_slot_instruction(False, operation.slot, slot_base))
-        elif isinstance(operation, Label):
-            labels[operation.name] = len(words)
-        elif isinstance(operation, Jump):
-            branches.append((len(words), operation.target, False))
-            words.append(0)
-        elif isinstance(operation, JumpIfFalse):
-            _expression(words, operation.condition, slot_base)
-            branches.append((len(words), operation.target, True))
-            words.append(0)
-        elif isinstance(operation, Exit):
-            words.extend(_mov(0, operation.status))
-            call("ExitProcess")
-        elif isinstance(operation, ExitValue):
-            _expression(words, operation.value, slot_base)
-            call("ExitProcess")
+    refs = _Refs()
 
-    _patch_branches(words, labels, branches)
+    def emit(operations, slot_base: int, _epilogue=()) -> None:
+        """Encode one body. Labels are body-local; imports are shared."""
+
+        nonlocal labels, branches
+        labels = {}
+        branches = []
+        for operation in operations:
+            if isinstance(operation, Return):
+                if operation.value is not None:
+                    _expression(words, operation.value, slot_base, refs)
+                words.extend(_epilogue)
+                continue
+            if isinstance(operation, (HeapInit, HeapAlloc, WriteRuntime)):
+                raise ValueError(
+                    "runtime heap lists/strings are not supported for windows-arm64 yet"
+                )
+            if isinstance(operation, HeapStore):
+                # Plain memory, not the arena: a C store through a pointer needs no
+                # mmap, so it works on Windows exactly as it does on POSIX.
+                _expression(words, operation.address, slot_base, refs)
+                words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+                _expression(words, operation.value, slot_base, refs)
+                words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16
+                instruction = _ARM64_STORES.get(operation.size)
+                if instruction is None:
+                    raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
+                words.append(instruction)
+                continue
+            if isinstance(operation, Write):
+                # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
+                words.extend(_mov(0, -11 if operation.fd == 1 else -12))
+                call("GetStdHandle")
+                string_index = len(words)
+                words.append(0)  # adr x1, data
+                string_references.append((string_index, operation.data))
+                words.extend(_mov(2, len(operation.data)))
+                words.append(0x910003E3)  # mov x3, sp
+                words.extend(_mov(4, 0))
+                call("WriteFile")
+            elif isinstance(operation, Store):
+                _expression(words, operation.value, slot_base, refs)
+                words.append(_slot_instruction(False, operation.slot, slot_base))
+            elif isinstance(operation, FloatStore):
+                _float_expression(words, operation.value, slot_base, refs)
+                words.append(_float_slot_instruction(False, operation.slot, slot_base))
+            elif isinstance(operation, Label):
+                labels[operation.name] = len(words)
+            elif isinstance(operation, Jump):
+                branches.append((len(words), operation.target, False))
+                words.append(0)
+            elif isinstance(operation, JumpIfFalse):
+                _expression(words, operation.condition, slot_base, refs)
+                branches.append((len(words), operation.target, True))
+                words.append(0)
+            elif isinstance(operation, Exit):
+                words.extend(_mov(0, operation.status))
+                call("ExitProcess")
+            elif isinstance(operation, ExitValue):
+                _expression(words, operation.value, slot_base, refs)
+                call("ExitProcess")
+
+        _patch_branches(words, labels, branches)
+
+    emit(module.operations, slot_base)
+
+    # Function bodies follow the entry point in the same .text, with each
+    # bl displacement patched once every body's offset is known.
+    offsets: dict[str, int] = {}
+    for function in module.functions:
+        if function.name in offsets:
+            raise ValueError(f"duplicate native IR function {function.name!r}")
+        offsets[function.name] = len(words)
+        frame = _frame_bytes(function.stack_slots, 16)
+        words.extend(_frame_sub(frame))
+        words.append(0xA9007BFD)  # stp x29, x30, [sp]
+        words.append(0x910003FD)  # mov x29, sp
+        for index in range(function.parameters):
+            words.append(_slot_instruction(False, index, 16, index))
+        epilogue = (
+            0xA9407BFD,  # ldp x29, x30, [sp]
+            *_frame_add(frame),
+            0xD65F03C0,  # ret
+        )
+        emit(function.operations, 16, epilogue)
+        words.extend(epilogue)
+    for instruction_index, name in refs.calls:
+        if name not in offsets:
+            raise ValueError(f"call to undefined native IR function {name!r}")
+        distance = offsets[name] - instruction_index
+        if not -(1 << 25) <= distance < (1 << 25):
+            raise ValueError("Windows ARM64 call is outside branch range")
+        words[instruction_index] = 0x94000000 | (distance & 0x3FFFFFF)
+    for instruction_index, name in refs.addresses:
+        if name not in offsets:
+            raise ValueError(f"address taken of undefined function {name!r}")
+        words[instruction_index] = _adr(
+            0, (offsets[name] - instruction_index) * 4
+        )
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
     for instruction_index, symbol in function_references:
         instruction_address = code_address + instruction_index * 4

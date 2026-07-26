@@ -242,7 +242,13 @@ def _module_uses_extern(module: Module) -> bool:
 #: direct branch-and-link). Everything else must reject a module that contains
 #: a ``Function`` rather than emit a binary that cannot make the call.
 CALL_CAPABLE_TARGETS = frozenset(
-    {"darwin-arm64", "linux-arm64", "darwin-x86_64", "linux-x86_64"}
+    {
+        "darwin-arm64",
+        "linux-arm64",
+        "darwin-x86_64",
+        "linux-x86_64",
+        "windows-arm64",
+    }
 )
 
 #: Targets whose encoder establishes the module's static storage block (see

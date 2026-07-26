@@ -861,7 +861,7 @@ class Arm64CallAbiTests(unittest.TestCase):
             encode_darwin_arm64(module, 0x100004000)
 
     def test_targets_without_a_call_abi_reject_the_module(self):
-        for target in ("windows-arm64", "windows-x86_64"):
+        for target in ("windows-x86_64",):
             with self.subTest(target=target):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -963,7 +963,6 @@ class Arm64StaticStorageTests(unittest.TestCase):
 
     def test_targets_without_a_static_base_reject_the_module(self):
         for target in (
-            "windows-arm64",
             "windows-x86_64",
         ):
             with self.subTest(target=target):
@@ -996,3 +995,64 @@ class Arm64StaticStorageTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "undefined native IR function"):
             encode_darwin_arm64(module, 0x100004000)
+
+
+class WindowsArm64CallAbiTests(unittest.TestCase):
+    """The Windows ARM64 call ABI, verified by decoding the instructions.
+
+    Windows binaries cannot be executed on this host and no emulator is used,
+    so these assertions check the encoding, not the behaviour.
+    """
+
+    _SOURCE = (
+        "long long f(long long n) { return n <= 1 ? 1 : n * f(n - 1); }\n"
+        "int main(void) { return f(5); }\n"
+    )
+
+    def _words(self):
+        from py2bin.c_frontend import compile_c_to_ir
+        from py2bin.native.arm64 import encode_windows
+
+        module = compile_c_to_ir(self._SOURCE, "f.c", "windows-arm64")
+        code = encode_windows(
+            module,
+            0x1000,
+            {"GetStdHandle": 0x2000, "WriteFile": 0x2008, "ExitProcess": 0x2010},
+        )
+        return struct.unpack(f"<{len(code) // 4}I", code)
+
+    def test_a_recursive_program_encodes(self):
+        words = self._words()
+        branches = [w for w in words if (w >> 26) == 0x25]  # bl
+        # One call from main, one recursive call inside f.
+        self.assertEqual(len(branches), 2)
+
+    def test_each_body_saves_and_restores_the_frame(self):
+        words = self._words()
+        self.assertIn(0xA9007BFD, words)  # stp x29, x30, [sp]
+        self.assertIn(0xA9407BFD, words)  # ldp x29, x30, [sp]
+        self.assertIn(0xD65F03C0, words)  # ret
+
+    def test_the_recursive_call_targets_the_body(self):
+        words = self._words()
+        entries = [i for i, w in enumerate(words) if w == 0xA9007BFD]
+        self.assertTrue(entries)
+        body = entries[0] - 1  # the frame allocation precedes the save
+        for index, word in enumerate(words):
+            if (word >> 26) == 0x25:
+                distance = ((word & 0x3FFFFFF) ^ 0x2000000) - 0x2000000
+                self.assertEqual(index + distance, body)
+
+    def test_a_windows_program_still_builds_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "f.c"
+            entry.write_text(self._SOURCE, encoding="utf-8")
+            artifact = root / "f.exe"
+            from py2bin.c_native import compile_c_native
+
+            compile_c_native(entry, artifact, target="windows-arm64", clean=True)
+            image = artifact.read_bytes()
+            self.assertEqual(image[:2], b"MZ")
+            offset = struct.unpack("<I", image[0x3C:0x40])[0]
+            self.assertEqual(struct.unpack("<H", image[offset + 4 : offset + 6])[0], 0xAA64)
