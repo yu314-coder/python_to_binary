@@ -1676,3 +1676,299 @@ class SplitAndJoinTests(unittest.TestCase):
             'xs = [1, 2]\nprint("-".join(xs))\n',
             "takes a list of strings",
         )
+
+
+class StringIndexingTests(unittest.TestCase):
+    """`s[i]` and `for ch in s` - both walk by code point, not by byte."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def _runtime(self, name: str, text: str) -> str:
+        return f'{name} = ""\n{name} = {name} + {text!r}\n'
+
+    # --- indexing ----------------------------------------------------------
+
+    def test_index_returns_a_code_point_not_a_byte(self):
+        # "héllo" is six bytes and five code points. Indexing by byte would
+        # answer with half of the é here.
+        self._run(
+            self._runtime("s", "héllo")
+            + "print(s[0])\nprint(s[1])\nprint(s[4])\n",
+            "h\né\no\n".encode("utf-8"),
+        )
+
+    def test_negative_index_counts_from_the_end(self):
+        self._run(
+            self._runtime("s", "héllo") + "print(s[-1])\nprint(s[-5])\n",
+            "o\nh\n".encode("utf-8"),
+        )
+
+    def test_index_out_of_range_reports_index_error(self):
+        # A slice clamps and answers with "", but an index must raise.
+        self._run(
+            self._runtime("s", "ab") + "print(s[5])\n", b"", expected_exit=1
+        )
+
+    def test_negative_index_out_of_range_reports_index_error(self):
+        self._run(
+            self._runtime("s", "ab") + "print(s[-3])\n", b"", expected_exit=1
+        )
+
+    def test_a_string_can_be_rebuilt_by_indexing_it(self):
+        self._run(
+            self._runtime("s", "héllo")
+            + "out = ''\n"
+            + "i = 0\n"
+            + "while i < len(s):\n    out = out + s[i]\n    i = i + 1\n"
+            + "print(out)\nprint(out == s)\n",
+            "héllo\nTrue\n".encode("utf-8"),
+        )
+
+    # --- iteration ---------------------------------------------------------
+
+    def test_iteration_yields_one_code_point_at_a_time(self):
+        self._run(
+            self._runtime("s", "héllo")
+            + "n = 0\nfor ch in s:\n    n = n + 1\n    print(ch)\nprint(n)\n",
+            "h\né\nl\nl\no\n5\n".encode("utf-8"),
+        )
+
+    def test_iterating_an_empty_string_runs_the_body_zero_times(self):
+        self._run(
+            self._runtime("s", "")
+            + "for ch in s:\n    print('body ran')\nprint('done')\n",
+            b"done\n",
+        )
+
+    def test_break_skips_the_else_body(self):
+        self._run(
+            self._runtime("s", "abc")
+            + "for ch in s:\n    if ch == 'b':\n        break\n"
+            + "else:\n    print('no b')\n"
+            + "print('after')\n",
+            b"after\n",
+        )
+
+    def test_the_else_body_runs_when_nothing_broke(self):
+        self._run(
+            self._runtime("s", "abc")
+            + "for ch in s:\n    if ch == 'z':\n        break\n"
+            + "else:\n    print('no z')\n",
+            b"no z\n",
+        )
+
+    def test_continue_resumes_at_the_next_code_point(self):
+        self._run(
+            self._runtime("s", "a,b,,c")
+            + "out = ''\n"
+            + "for ch in s:\n    if ch == ',':\n        continue\n    out = out + ch\n"
+            + "print(out)\n",
+            b"abc\n",
+        )
+
+    def test_iteration_reverses_a_string(self):
+        self._run(
+            self._runtime("s", "héllo")
+            + "out = ''\nfor ch in s:\n    out = ch + out\nprint(out)\n",
+            "olléh\n".encode("utf-8"),
+        )
+
+    def test_nested_loops_over_the_same_string_keep_separate_positions(self):
+        self._run(
+            self._runtime("s", "ab")
+            + "for a in s:\n    for b in s:\n        print(a + b)\n",
+            b"aa\nab\nba\nbb\n",
+        )
+
+    def test_reading_the_loop_name_afterwards_is_refused(self):
+        # The string may be empty, and then CPython leaves the name unbound.
+        # The slot would hold an unrelated address, so this is refused rather
+        # than dereferenced - the same rule a list loop already follows.
+        self._reject(
+            self._runtime("s", "abc") + "for ch in s:\n    pass\nprint(ch)\n",
+            "may be unbound",
+        )
+
+    def test_a_name_bound_before_the_loop_survives_it(self):
+        self._run(
+            "ch = 'z'\n"
+            + self._runtime("s", "")
+            + "for ch in s:\n    pass\nprint(ch)\n",
+            b"z\n",
+        )
+
+
+class ConditionalBindingTests(unittest.TestCase):
+    """A name one branch binds and another does not.
+
+    CPython raises NameError. There is no run-time bit recording whether a slot
+    was written, so the read is refused at build time - the alternative is what
+    these programs used to do: print a stale constant, or, for a dict, probe an
+    address that is not a table until the process is killed.
+    """
+
+    _RUNTIME = "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+            # CPython must agree that the program is broken, so that what is
+            # refused here is not something that would have worked.
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(reference.returncode, 1)
+            self.assertIn(b"NameError", reference.stderr)
+
+    def test_every_kind_bound_in_one_branch_only_is_refused(self):
+        for binding, use in (
+            ("x = 1", "x"),
+            ("f = 1.5", "f + 1"),
+            ("s = 'hi'", "len(s)"),
+            ("xs = [1]", "len(xs)"),
+            ("xs = [1]", "xs[0]"),
+            ("d = {1: 2}", "len(d)"),
+            ("d = {1: 2}", "d[1]"),
+            ("d = {1: 2}", "1 in d"),
+            ("st = {1, 2}", "len(st)"),
+            ("tp = (1, 2)", "tp[0]"),
+        ):
+            with self.subTest(use=use):
+                self._reject(
+                    f"{self._RUNTIME}if n > 5:\n    {binding}\nprint({use})\n",
+                    "may be unbound",
+                )
+
+    def test_binding_in_every_branch_is_accepted(self):
+        self._run(
+            self._RUNTIME
+            + "if n > 5:\n    d = {1: 2}\nelse:\n    d = {3: 4}\nprint(len(d))\n",
+            b"1\n",
+        )
+
+    def test_an_elif_chain_that_binds_everywhere_is_accepted(self):
+        # An elif is a nested If in the tree, so this only works if the
+        # analysis descends into the else branch rather than stopping there.
+        self._run(
+            self._RUNTIME
+            + "if n > 5:\n    x = 1\nelif n > 2:\n    x = 2\nelse:\n    x = 3\n"
+            + "print(x)\n",
+            b"2\n",
+        )
+
+    def test_a_branch_that_cannot_fall_through_does_not_count(self):
+        # Nothing reaches the print by way of the raise, so `x` is bound on
+        # every path that does reach it.
+        self._run(
+            self._RUNTIME
+            + "if n > 5:\n    raise SystemExit(3)\nelse:\n    x = 9\nprint(x)\n",
+            b"9\n",
+        )
+
+    def test_rebinding_after_the_branch_clears_the_refusal(self):
+        self._run(
+            self._RUNTIME
+            + "if n > 5:\n    xs = [1]\nxs = [9, 9]\nprint(len(xs))\n",
+            b"2\n",
+        )
+
+    def test_using_the_name_inside_its_own_branch_is_accepted(self):
+        self._run(
+            self._RUNTIME + "if n > 1:\n    d = {1: 2}\n    print(len(d))\n",
+            b"1\n",
+        )
+
+    def test_print_writes_nothing_when_a_later_argument_raises(self):
+        # print() evaluates all of its arguments and then writes them, so the
+        # first value must not reach the terminal when the second raises.
+        # This used to print "1 " and then report the error.
+        self._run(
+            self._RUNTIME
+            + "z = n - 3\n"
+            + "print(7, 5 // z)\n",
+            b"",
+            expected_exit=1,
+        )
+
+    def test_pre_evaluating_arguments_keeps_bools_and_kinds_intact(self):
+        # The pre-evaluation binds each scalar to a hidden name, and a name
+        # has to render exactly as the expression did - True, not 1.
+        self._run(
+            self._RUNTIME
+            + "xs = [1, 2]\nd = {1: 2}\n"
+            + "print('x', n * 3, 1.5 + n, xs, d, n > 1)\n",
+            b"x 9 4.5 [1, 2] {1: 2} True\n",
+        )
+
+    def test_a_function_defined_under_a_runtime_condition_is_refused(self):
+        # Both bodies exist, but a call is inlined from one of them chosen at
+        # build time. This used to compile and run the branch that did not.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(
+                self._RUNTIME
+                + "if n > 1:\n    def g(v):\n        return v + 1\n"
+                + "else:\n    def g(v):\n        return v + 100\n"
+                + "print(g(5))\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn("only known at run time", str(caught.exception))
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(reference.stdout, b"6\n")

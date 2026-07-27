@@ -911,6 +911,13 @@ class Frontend:
         # reading one would return whatever the stack happened to hold.
         # CPython raises UnboundLocalError there, so a read is rejected.
         self.possibly_unbound: set[str] = set()
+        # How many runtime `if` arms enclose the statement being lowered. A
+        # `def` inside one cannot be chosen at run time, because a call is
+        # inlined at its site from a single body.
+        self.runtime_branch_depth = 0
+        # Names the print() lowering binds to hold an argument it has already
+        # evaluated. Numbered so that two prints never share one.
+        self.print_argument_count = 0
         # Names that have definitely been assigned at this point.
         self.bound_names: set[str] = set()
         # Runtime name -> "int" | "float". A stack slot is 8 bytes and holds
@@ -1442,6 +1449,27 @@ class Frontend:
         self.label_number += 1
         return f"{prefix}_{self.label_number}"
 
+    def refuse_unbound(self, name: str, node: ast.AST | None = None) -> None:
+        """Refuse a read of a name that may not have been bound.
+
+        CPython raises NameError here. There is no run-time bit saying whether
+        a slot was written, so this is decided at build time: the slot holds
+        whatever preceded it, which for an integer is a stale number and for
+        anything on the heap is an address that is not a block - a dict read
+        that way probed for a key forever instead of answering.
+        """
+
+        if name in self.possibly_unbound:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{name!r} may be unbound here: a path reaching this point "
+                "does not bind it - a loop that runs zero times, a break that "
+                "skips the else body, or a branch that binds it while another "
+                "does not; CPython raises NameError, and the native slot would "
+                "hold an unrelated value",
+            )
+
     def slot(self, name: str) -> int:
         if name not in self.slots:
             self.slots[name] = len(self.slots)
@@ -1747,6 +1775,15 @@ class Frontend:
         self.function_definition(synthetic)
 
     def function_definition(self, node: ast.FunctionDef) -> None:
+        if self.runtime_branch_depth:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{node.name!r} is defined under a condition that is only "
+                "known at run time; a call is inlined from one body chosen at "
+                "build time, so the branch that ran could not decide which "
+                "body that is - define the function once and branch inside it",
+            )
         arguments = node.args
         if (
             node.decorator_list
@@ -3362,7 +3399,10 @@ class Frontend:
         return tag.split(":", 1)[1]
 
     def list_kind_of(self, name: str) -> str | None:
-        return self.list_kind(self.value_types.get(name))
+        kind = self.list_kind(self.value_types.get(name))
+        if kind is not None:
+            self.refuse_unbound(name)
+        return kind
 
     # An element is eight bytes whatever it holds, so a string or a nested list
     # travels as its block pointer and only the kind has to be carried along.
@@ -3968,7 +4008,10 @@ class Frontend:
         return IntLoad(offset_slot)
 
     def emit_string_index(
-        self, source: IntExpression, index: ast.expr
+        self,
+        source: IntExpression,
+        index: ast.expr | None,
+        position: IntExpression | None = None,
     ) -> IntExpression:
         """`s[i]` - the one-code-point string at position ``i``.
 
@@ -3983,7 +4026,9 @@ class Frontend:
         self.operations.append(Store(source_slot, source))
         origin = IntLoad(source_slot)
         length = self.materialize_int(self.emit_code_point_count(origin))
-        wanted = self.materialize_int(self.integer(index))
+        wanted = self.materialize_int(
+            position if position is not None else self.integer(index)
+        )
         position_slot = self.new_temp()
         self.operations.append(
             Store(
@@ -5857,7 +5902,10 @@ class Frontend:
         return tuple(rest.split(",")) if rest else ()
 
     def tuple_kinds_of(self, name: str) -> tuple[str, ...] | None:
-        return self.tuple_kinds(self.value_types.get(name))
+        kind = self.tuple_kinds(self.value_types.get(name))
+        if kind is not None:
+            self.refuse_unbound(name)
+        return kind
 
     def tuple_literal_kinds(
         self, node: ast.Tuple, bindings: dict[str, KernelValue] | None = None
@@ -6576,7 +6624,12 @@ class Frontend:
         return key_kind, value_kind
 
     def dict_kinds_of(self, name: str) -> tuple[str, str] | None:
-        return self.dict_kinds(self.value_types.get(name))
+        kinds = self.dict_kinds(self.value_types.get(name))
+        if kinds is not None:
+            # Asked wherever a name is used as a dict, which is the one place
+            # every read of one passes through.
+            self.refuse_unbound(name)
+        return kinds
 
     @staticmethod
     def dict_keys_name(name: str) -> str:
@@ -7370,7 +7423,10 @@ class Frontend:
         return tag.split(":", 1)[1]
 
     def set_kind_of(self, name: str) -> str | None:
-        return self.set_kind(self.value_types.get(name))
+        kind = self.set_kind(self.value_types.get(name))
+        if kind is not None:
+            self.refuse_unbound(name)
+        return kind
 
     def set_literal_tag(
         self, node: ast.Set, bindings: dict[str, IntExpression] | None = None
@@ -8133,6 +8189,8 @@ class Frontend:
             raise NativeCompileError(
                 self.path, node, "expression is not in the native string subset"
             )
+        if isinstance(node, ast.Name):
+            self.refuse_unbound(node.id, node)
         if isinstance(node, ast.Name) and node.id in self.string_bindings:
             return self.string_bindings[node.id]
         if isinstance(node, ast.Name) and self.value_types.get(node.id) == "str":
@@ -10465,23 +10523,132 @@ class Frontend:
                 raise constant_error from runtime_error
             mutated = self.assigned_names(node.body + node.orelse)
             self.materialize_runtime_names(mutated)
+            bound_before = set(self.bound_names)
             false_label = self.new_label("if_false")
             end_label = self.new_label("if_end")
             self.operations.append(JumpIfFalse(runtime_condition, false_label))
-            for statement in node.body:
-                self.statement(statement)
-            if node.orelse:
-                self.operations.append(Jump(end_label))
-            self.operations.append(Label(false_label))
-            for statement in node.orelse:
-                self.statement(statement)
+            self.runtime_branch_depth += 1
+            try:
+                for statement in node.body:
+                    self.statement(statement)
+                if node.orelse:
+                    self.operations.append(Jump(end_label))
+                self.operations.append(Label(false_label))
+                for statement in node.orelse:
+                    self.statement(statement)
+            finally:
+                self.runtime_branch_depth -= 1
             if node.orelse:
                 self.operations.append(Label(end_label))
             self.forget_conditional_list_lengths(node.body + node.orelse)
+            self.mark_conditionally_bound(node, bound_before)
         else:
             branch = node.body if bool(condition) else node.orelse
             for statement in branch:
                 self.statement(statement)
+
+    def mark_conditionally_bound(
+        self, node: ast.If, bound_before: set[str]
+    ) -> None:
+        """Refuse names one arm binds and the other does not.
+
+        A name is bound after an `if` only if every path reaching that point
+        binds it. Where that does not hold, CPython raises NameError while the
+        slot holds whatever was there before - a stale constant for an integer,
+        and an address that is not a block for anything on the heap, which is
+        why a dict read this way probed forever instead of answering.
+
+        There is no run-time "is it bound" bit to test, so this is refused at
+        build time, the same way a loop that can run zero times already is.
+        """
+
+        paths = []
+        if self.block_falls_through(node.body):
+            paths.append(self.names_every_path_binds(node.body))
+        if self.block_falls_through(node.orelse):
+            paths.append(self.names_every_path_binds(node.orelse))
+        if not paths:
+            # Both arms leave by a raise or a return, so nothing follows.
+            return
+        certain = set.intersection(*paths)
+        possible = self.assigned_names(node.body + node.orelse)
+        possible.update(self.defined_function_names(node.body + node.orelse))
+        for name in (possible - certain) - bound_before:
+            self.bound_names.discard(name)
+            # Drop any value the taken arm folded, so the read is refused
+            # rather than answered from a branch that may not have run.
+            self.values.pop(name, None)
+            self.possibly_unbound.add(name)
+
+    @classmethod
+    def defined_function_names(cls, body: list[ast.stmt]) -> set[str]:
+        return {
+            statement.name
+            for statement in body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    @classmethod
+    def block_falls_through(cls, body: list[ast.stmt]) -> bool:
+        """Whether control can reach the statement after ``body``."""
+
+        for statement in body:
+            if isinstance(
+                statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)
+            ):
+                return False
+            if isinstance(statement, ast.If) and statement.orelse:
+                if not cls.block_falls_through(
+                    statement.body
+                ) and not cls.block_falls_through(statement.orelse):
+                    return False
+        return True
+
+    @classmethod
+    def names_every_path_binds(cls, body: list[ast.stmt]) -> set[str]:
+        """The names ``body`` binds on every path through it.
+
+        Deliberately narrow: a loop may run zero times and a `try` may jump out
+        part-way, so neither counts, and only what is reached unconditionally
+        does. Being wrong in this direction refuses a working program; being
+        wrong in the other direction reads an unbound slot.
+        """
+
+        names: set[str] = set()
+        for statement in body:
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    names.update(cls.target_names(target))
+            elif isinstance(statement, ast.AnnAssign):
+                if statement.value is not None and isinstance(
+                    statement.target, ast.Name
+                ):
+                    names.add(statement.target.id)
+            elif isinstance(statement, ast.AugAssign):
+                names.update(cls.target_names(statement.target))
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(statement.name)
+            elif isinstance(statement, ast.With):
+                # The body of a `with` always runs, and its items bind too.
+                for item in statement.items:
+                    if item.optional_vars is not None:
+                        names.update(cls.target_names(item.optional_vars))
+                names.update(cls.names_every_path_binds(statement.body))
+            elif isinstance(statement, ast.If):
+                # An elif chain is a nested If, so without this an
+                # if/elif/else that binds a name in every arm would be refused.
+                arms = []
+                if cls.block_falls_through(statement.body):
+                    arms.append(cls.names_every_path_binds(statement.body))
+                if cls.block_falls_through(statement.orelse):
+                    arms.append(cls.names_every_path_binds(statement.orelse))
+                if arms:
+                    names.update(set.intersection(*arms))
+            elif isinstance(
+                statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)
+            ):
+                break
+        return names
 
     def while_statement(self, node: ast.While) -> None:
         broke = self.open_loop_else(node)
@@ -10835,6 +11002,61 @@ class Frontend:
         else:
             # The list may be empty, and then Python leaves the name unbound.
             self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
+
+    def for_over_string(self, node: ast.For) -> None:
+        """`for ch in s:` - one code point at a time, as Python iterates.
+
+        A string never moves and never changes length, so unlike a list the
+        block and the count are read once rather than at every step.
+        """
+
+        assert isinstance(node.target, ast.Name)
+        name = node.target.id
+        was_bound = name in self.bound_names
+        broke = self.open_loop_else(node)
+        pointer = self.materialize_int(self.string_pointer(node.iter))
+        length = self.materialize_int(self.emit_code_point_count(pointer))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("for_str")
+        continue_label = self.new_label("for_str_continue")
+        end = self.new_label("for_str_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(index_slot), length), end)
+        )
+        self.values.pop(name, None)
+        self.runtime_names.add(name)
+        self.boolean_names.discard(name)
+        self.possibly_unbound.discard(name)
+        self.operations.append(
+            Store(
+                self.slot(name),
+                self.emit_string_index(pointer, None, IntLoad(index_slot)),
+            )
+        )
+        self.value_types[name] = "str"
+        # A `break` skips the `else` body, so it leaves past it, not here.
+        self.break_targets.append(end if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        if was_bound:
+            self.bound_names.add(name)
+        else:
+            # An empty string binds nothing, exactly as an empty list does.
+            self.possibly_unbound.add(name)
+        # After the bookkeeping, so that the `else` body is held to the same
+        # rule as the code after the loop.
         self.close_loop_else(node, broke)
 
     def for_over_list(self, node: ast.For) -> None:
@@ -11668,6 +11890,12 @@ class Frontend:
         self.refuse_set_iteration(node.iter)
         if (
             isinstance(node.target, ast.Name)
+            and self.expression_type(node.iter) == "str"
+        ):
+            self.for_over_string(node)
+            return
+        if (
+            isinstance(node.target, ast.Name)
             and self.reversed_source(node.iter) is not None
         ):
             self.for_over_reversed(node)
@@ -11847,7 +12075,16 @@ class Frontend:
             # Otherwise write the arguments one at a time, with the separators
             # print() would insert. Several writes rather than one buffer: the
             # process is single-threaded, so the bytes land in order.
-            for index, argument in enumerate(node.args):
+            arguments = node.args
+            if len(arguments) > 1:
+                # print() evaluates every argument before it writes any of
+                # them, so an argument that raises must leave no output at
+                # all. Writing while walking printed the earlier ones first.
+                arguments = [
+                    self.pre_evaluate_print_argument(argument)
+                    for argument in arguments
+                ]
+            for index, argument in enumerate(arguments):
                 if index:
                     self.operations.append(Write(b" "))
                 self.emit_print_argument(argument)
@@ -14062,6 +14299,28 @@ class Frontend:
             IntBinary("add", base, IntConstant(16)),
         )
 
+    def pre_evaluate_print_argument(self, node: ast.expr) -> ast.expr:
+        """Bind a scalar print() argument to a hidden name, and return the name.
+
+        Only scalars. Binding a list or a dict to a second name is an alias,
+        which is refused because growth would move the block and update one
+        name and not the other - and neither can raise while being rendered,
+        so there is nothing here to gain by it.
+        """
+
+        if isinstance(node, (ast.Name, ast.Constant)):
+            return node  # Already a value; evaluating it cannot raise.
+        try:
+            kind = self.expression_type(node)
+        except NativeCompileError:
+            return node  # Let the write path report what is wrong with it.
+        if kind not in ("int", "bool", "float"):
+            return node
+        name = f"__print_argument_{self.print_argument_count}"
+        self.print_argument_count += 1
+        self.assignment(name, node)
+        return ast.copy_location(ast.Name(id=name, ctx=ast.Load()), node)
+
     def emit_print_argument(self, node: ast.expr) -> None:
         """Write one print() argument, with no separator and no newline."""
 
@@ -14796,6 +15055,11 @@ class Frontend:
         """Lower ``node`` to an IEEE-754 double, widening integer operands."""
 
         bindings = bindings or {}
+        if isinstance(node, ast.Name) and node.id not in bindings:
+            # A float has no kind registry to hang this off, so it is asked
+            # here. Not for a name the inliner has substituted: that one is a
+            # parameter standing in for an argument, and it is bound.
+            self.refuse_unbound(node.id, node)
         if self.expression_type(node, bindings) != "float":
             return IntToFloat(self.integer(node, bindings, call_stack))
         if (
