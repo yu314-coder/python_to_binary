@@ -1061,14 +1061,21 @@ class Frontend:
             self.operations.insert(
                 0, HeapInit(self._heap_bump_slot, _HEAP_ARENA_BYTES)
             )
-            for index, operation in enumerate(self._prologue):
-                self.operations.insert(1 + index, operation)
+            # Immediately after the mapping and before anything is taken out of
+            # it, so the end is the arena's own end.
+            self.operations.insert(1, self.arena_end_store())
+            position = 2
+            for operation in self._prologue:
+                self.operations.insert(position, operation)
+                position += 1
             if self._dtoa_scratch_slot is not None:
                 # Float rendering needs six big integers and two buffers. They
                 # are reused, so reserve them once here rather than allocating
                 # on every print - which in a loop would exhaust the arena.
+                # Unchecked, which is sound only because it is the first thing
+                # taken out of a 16 MB arena and cannot be what overruns it.
                 self.operations.insert(
-                    1,
+                    position,
                     HeapAlloc(
                         self._dtoa_scratch_slot,
                         IntConstant(self.DTOA_SCRATCH_BYTES),
@@ -1083,6 +1090,28 @@ class Frontend:
             self.operations,
             len(self.slots),
             functions=list(self._callback_functions.values()),
+        )
+
+    def arena_end_store(self) -> Store:
+        """Record where the arena ends, measured from its base.
+
+        Measured from the base and not from wherever the bump pointer happens
+        to be: this used to be emitted after the float-rendering scratch had
+        already been taken out of the arena, which put the recorded end that
+        many bytes past the real one. Every later check then passed a little
+        too long, and the write that followed was outside the mapping - a
+        segmentation fault in place of the MemoryError the check exists to
+        raise.
+        """
+
+        assert self._heap_bump_slot is not None
+        return Store(
+            self.slot("<heap-end>"),
+            IntBinary(
+                "add",
+                IntLoad(self._heap_bump_slot),
+                IntConstant(_HEAP_ARENA_BYTES),
+            ),
         )
 
     def guard_arena_limit(self) -> None:
@@ -1121,17 +1150,6 @@ class Frontend:
             guarded.append(Exit(1))
             guarded.append(Label(ok))
         self.operations[:] = guarded
-        self.operations.insert(
-            0,
-            Store(
-                end_slot,
-                IntBinary(
-                    "add",
-                    IntLoad(self._heap_bump_slot),
-                    IntConstant(_HEAP_ARENA_BYTES),
-                ),
-            ),
-        )
 
     def ensure_heap(self) -> int:
         """Reserve the arena bump-pointer slot and return it."""

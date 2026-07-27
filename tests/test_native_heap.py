@@ -3754,3 +3754,49 @@ class CommandLineArgumentTests(unittest.TestCase):
                 cwd=directory,
             )
             self.assertEqual(native.stdout, reference.stdout)
+
+
+class ArenaLimitTests(unittest.TestCase):
+    """Running out of arena has to be reported, not walked past."""
+
+    def test_exhaustion_is_reported_even_when_floats_are_rendered(self):
+        # The arena's end is recorded from its base. It used to be recorded
+        # after the float-rendering scratch had already been taken out, which
+        # put it that many bytes past the real end - so the last checks passed
+        # a little too long and the write that followed was outside the
+        # mapping. A program that both renders a runtime float and exhausts
+        # the arena segfaulted where one that only exhausted it reported
+        # MemoryError, which is why nothing caught it.
+        source = (
+            "x = 0.0\nfor _i in range(0, 10):\n    x = x + 1.5\n"
+            's = ""\nfor _i in range(0, 20000):\n    s = s + "ab"\n'
+            "print(x)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(binary)], capture_output=True)
+            self.assertEqual(native.returncode, 1)
+            self.assertIn(b"MemoryError", native.stderr)
+
+    def test_the_arena_end_is_recorded_before_anything_is_allocated(self):
+        from py2bin.native.frontend import lower
+        from py2bin.native.ir import HeapAlloc, HeapInit
+
+        module = lower(
+            Path("program.py"),
+            "x = 0.0\nfor _i in range(0, 3):\n    x = x + 1.5\nprint(x)\n",
+        )
+        operations = module.operations
+        started = next(
+            i for i, op in enumerate(operations) if isinstance(op, HeapInit)
+        )
+        first_allocation = next(
+            i for i, op in enumerate(operations) if isinstance(op, HeapAlloc)
+        )
+        self.assertLess(started + 1, first_allocation)
