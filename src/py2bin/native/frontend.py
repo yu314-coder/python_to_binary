@@ -5090,12 +5090,24 @@ class Frontend:
         if node.func.attr == "sort":
             self.list_sort_call(node, name)
             return True
+        if node.func.attr == "insert":
+            self.emit_list_insert(node, name)
+            return True
+        if node.func.attr == "remove":
+            self.emit_list_remove(node, name)
+            return True
+        if node.func.attr in {"pop", "index", "count"}:
+            # Each answers with a value. As a statement the answer is dropped,
+            # which for pop() is the ordinary way to shorten a list.
+            self.discard_expression(node)
+            return True
         if node.func.attr != "append":
             raise NativeCompileError(
                 self.path,
                 node,
-                f"native lists support append() and sort(); {node.func.attr}() "
-                "is not in the subset",
+                "native lists support append(), sort(), insert(), remove(), "
+                f"pop(), index() and count(); {node.func.attr}() is not in "
+                "the subset",
             )
         if len(node.args) != 1 or node.keywords:
             raise NativeCompileError(
@@ -5116,6 +5128,11 @@ class Frontend:
 
         if isinstance(node, ast.Name) and self.list_kind_of(node.id) is not None:
             return IntLoad(self.slots[node.id])
+        if self.list_kind(self.list_method_shape(node, "pop") or "") is not None:
+            # A nested list is stored as its block address, so the word pop()
+            # answers with already is the pointer.
+            assert isinstance(node, ast.Call)
+            return self.emit_list_pop(node)
         if isinstance(node, ast.ListComp):
             return self.list_comprehension(node)
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
@@ -5373,13 +5390,16 @@ class Frontend:
         index: IntExpression,
         *,
         assigning: bool = False,
+        message: bytes | None = None,
     ) -> tuple[int, int]:
         """Normalize an index against a list's length and check it is in range.
 
         Returns the slots holding the resolved index and the length. A negative
         index counts back from the end the way Python's does, and one outside
         the list raises IndexError rather than addressing outside the block.
-        ``assigning`` picks the wording CPython uses for a store or a del.
+        ``assigning`` picks the wording CPython uses for a store or a del,
+        and ``message`` overrides it where CPython has wording of its own -
+        pop() does.
         """
 
         bad_label = self.new_label("index_error")
@@ -5416,9 +5436,12 @@ class Frontend:
         # try it goes to the handler, so `except IndexError` works on it.
         self.raise_exception(
             "IndexError",
-            b"IndexError: list assignment index out of range\n"
-            if assigning
-            else b"IndexError: list index out of range\n",
+            message
+            or (
+                b"IndexError: list assignment index out of range\n"
+                if assigning
+                else b"IndexError: list index out of range\n"
+            ),
         )
         self.operations.append(Label(ok_label))
         return index_slot, length_slot
@@ -5545,6 +5568,431 @@ class Frontend:
         # the build-time check and skip the run-time one. Nothing here tracks
         # which names alias which block, so every recorded length goes.
         self.list_lengths.clear()
+
+    def discard_expression(self, node: ast.expr) -> None:
+        """Lower an expression for its effect and drop the value it answers.
+
+        The work is already in the operation list by the time the expression
+        comes back, so dropping it drops only the value.
+        """
+
+        kind = self.expression_type(node)
+        if kind == "float":
+            self.float_expression(node)
+        elif kind == "str":
+            self.string_pointer(node)
+        elif self.list_kind(kind) is not None:
+            self.list_pointer(node)
+        else:
+            self.integer(node)
+
+    def emit_list_insert(self, node: ast.Call, name: str) -> None:
+        """`xs.insert(i, v)` - append, then rotate the tail up by one.
+
+        Appending first is what makes the block big enough, and it is the only
+        path that knows how to grow one and write the moved address back.
+        """
+
+        if len(node.args) != 2 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "native insert() takes an index and a value"
+            )
+        if name in self.iterated_lists:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"insert() cannot lengthen {name!r} while a for loop is "
+                "walking it: the walk would see the shifted elements twice",
+            )
+        self.refuse_appending_to_a_shared_block(node, name)
+        element_kind = self.settle_element_kind(name, node.args[1])
+        self.check_element(node.args[1], element_kind, "this list")
+        value = self.new_temp()
+        self.operations.append(
+            Store(value, self.element_word(node.args[1], element_kind))
+        )
+        pointer_slot = self.slot(name)
+        length = HeapLoad(IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8)
+        # insert() clamps rather than raising: xs.insert(99, v) appends and
+        # xs.insert(-99, v) prepends. The length it clamps against is the one
+        # before the insert, so it is read here and not after the append.
+        target = self.new_temp()
+        self.operations.append(Store(target, self.materialize_int(self.integer(node.args[0]))))
+        self.operations.append(
+            Store(
+                target,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(target), IntConstant(0)),
+                    IntBinary("add", IntLoad(target), length),
+                    IntLoad(target),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                target,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(target), IntConstant(0)),
+                    IntConstant(0),
+                    IntLoad(target),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                target,
+                self.select_integer(
+                    IntCompare("gt", IntLoad(target), length),
+                    length,
+                    IntLoad(target),
+                ),
+            )
+        )
+        self.list_lengths.pop(name, None)
+        self.emit_list_append(pointer_slot, IntLoad(value))
+        elements = IntBinary(
+            "add", IntLoad(pointer_slot), IntConstant(self.LIST_HEADER_BYTES)
+        )
+        cursor = self.new_temp()
+        self.operations.append(Store(cursor, IntBinary("sub", length, IntConstant(1))))
+        shift = self.new_label("insert_shift")
+        shifted = self.new_label("insert_shifted")
+        self.operations.append(Label(shift))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ge", IntLoad(cursor), IntLoad(target)), shifted
+            )
+        )
+        at = IntBinary("add", elements, IntBinary("mul", IntLoad(cursor), IntConstant(8)))
+        self.operations.append(
+            HeapStore(IntBinary("add", at, IntConstant(8)), HeapLoad(at, 8), 8)
+        )
+        self.operations.append(
+            Store(cursor, IntBinary("sub", IntLoad(cursor), IntConstant(1)))
+        )
+        self.operations.append(Jump(shift))
+        self.operations.append(Label(shifted))
+        self.operations.append(
+            HeapStore(
+                IntBinary(
+                    "add", elements, IntBinary("mul", IntLoad(target), IntConstant(8))
+                ),
+                IntLoad(value),
+                8,
+            )
+        )
+
+    def emit_list_remove(self, node: ast.Call, name: str) -> None:
+        """`xs.remove(v)` - drop the first element equal to ``v``."""
+
+        element_kind = self.list_kind_of(name)
+        assert element_kind is not None
+        if name in self.iterated_lists:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"remove() cannot shorten {name!r} while a for loop is "
+                "walking it: the walk counts up against the length, so it "
+                "would run past the new end",
+            )
+        wanted = self.list_search_argument(node, element_kind, "remove")
+        pointer = IntLoad(self.slot(name))
+        index_slot, found_slot = self.emit_list_find(pointer, wanted, element_kind)
+        present = self.new_label("remove_present")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+                present + "_missing",
+            )
+        )
+        self.operations.append(Jump(present))
+        self.operations.append(Label(present + "_missing"))
+        self.raise_exception(
+            "ValueError", b"ValueError: list.remove(x): x not in list\n"
+        )
+        self.operations.append(Label(present))
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8))
+        )
+        self.emit_list_remove_at(pointer, index_slot, length_slot)
+        self.list_lengths.clear()
+
+    def emit_list_index(self, node: ast.Call) -> IntExpression:
+        """`xs.index(v)` - where ``v`` first appears, or ValueError."""
+
+        assert isinstance(node.func, ast.Attribute)
+        assert isinstance(node.func.value, ast.Name)
+        element_kind = self.list_kind_of(node.func.value.id)
+        assert element_kind is not None
+        wanted = self.list_search_argument(node, element_kind, "index")
+        index_slot, found_slot = self.emit_list_find(
+            IntLoad(self.slot(node.func.value.id)), wanted, element_kind
+        )
+        present = self.new_label("index_present")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)),
+                present + "_missing",
+            )
+        )
+        self.operations.append(Jump(present))
+        self.operations.append(Label(present + "_missing"))
+        self.raise_exception(
+            "ValueError", b"ValueError: list.index(x): x not in list\n"
+        )
+        self.operations.append(Label(present))
+        return IntLoad(index_slot)
+
+    def emit_list_count(self, node: ast.Call) -> IntExpression:
+        """`xs.count(v)` - how many elements equal ``v``."""
+
+        assert isinstance(node.func, ast.Attribute)
+        assert isinstance(node.func.value, ast.Name)
+        element_kind = self.list_kind_of(node.func.value.id)
+        assert element_kind is not None
+        wanted_slot = self.new_temp()
+        self.operations.append(
+            Store(wanted_slot, self.list_search_argument(node, element_kind, "count"))
+        )
+        pointer_slot = self.new_temp()
+        self.operations.append(
+            Store(pointer_slot, IntLoad(self.slot(node.func.value.id)))
+        )
+        total = self.new_temp()
+        index_slot = self.new_temp()
+        self.operations.append(Store(total, IntConstant(0)))
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        scan = self.new_label("count_scan")
+        done = self.new_label("count_done")
+        step = self.new_label("count_step")
+        self.operations.append(Label(scan))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntLoad(index_slot),
+                    HeapLoad(
+                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                    ),
+                ),
+                done,
+            )
+        )
+        element = HeapLoad(
+            IntBinary(
+                "add",
+                IntBinary(
+                    "add",
+                    IntLoad(pointer_slot),
+                    IntConstant(self.LIST_HEADER_BYTES),
+                ),
+                IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+            ),
+            8,
+        )
+        if element_kind == "str":
+            same: IntExpression = IntLoad(
+                self.emit_string_equal(element, IntLoad(wanted_slot))
+            )
+        elif element_kind == "float":
+            same = FloatCompare(
+                "eq", BitsFloat(element), BitsFloat(IntLoad(wanted_slot))
+            )
+        else:
+            same = IntCompare("eq", element, IntLoad(wanted_slot))
+        self.operations.append(JumpIfFalse(same, step))
+        self.operations.append(
+            Store(total, IntBinary("add", IntLoad(total), IntConstant(1)))
+        )
+        self.operations.append(Label(step))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(done))
+        return IntLoad(total)
+
+    def list_method_shape(self, node: ast.expr, attribute: str) -> str | None:
+        """The element kind of `xs.<attribute>(...)`, or None if it is not that."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != attribute
+            or not isinstance(node.func.value, ast.Name)
+        ):
+            return None
+        return self.list_kind_of(node.func.value.id)
+
+    def emit_list_pop(self, node: ast.Call) -> IntExpression:
+        """`xs.pop()` or `xs.pop(i)` - the element word, with the list closed up.
+
+        The word rather than the value, because every element is eight bytes
+        whatever it holds: a float is its bit pattern and a string its block
+        address, so the caller reinterprets it for the kind it asked for.
+        """
+
+        assert isinstance(node.func, ast.Attribute)
+        assert isinstance(node.func.value, ast.Name)
+        name = node.func.value.id
+        if len(node.args) > 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "native pop() takes an optional index"
+            )
+        if name in self.iterated_lists:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"pop() cannot shorten {name!r} while a for loop is walking "
+                "it: the walk counts up against the length, so it would skip "
+                "the element that moved into the gap",
+            )
+        pointer = IntLoad(self.slot(name))
+        if node.args:
+            index = self.integer(node.args[0])
+        else:
+            # CPython has its own wording for an empty list, so the emptiness
+            # is checked here rather than left to the index check below.
+            nonempty = self.new_label("pop_nonempty")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "eq",
+                        HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8),
+                        IntConstant(0),
+                    ),
+                    nonempty,
+                )
+            )
+            self.raise_exception(
+                "IndexError", b"IndexError: pop from empty list\n"
+            )
+            self.operations.append(Label(nonempty))
+            index = IntBinary(
+                "sub",
+                HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8),
+                IntConstant(1),
+            )
+        index_slot, length_slot = self.resolve_list_index(
+            pointer,
+            index,
+            assigning=True,
+            message=b"IndexError: pop index out of range\n",
+        )
+        taken = self.new_temp()
+        self.operations.append(
+            Store(
+                taken,
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        IntBinary(
+                            "add", pointer, IntConstant(self.LIST_HEADER_BYTES)
+                        ),
+                        IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                    ),
+                    8,
+                ),
+            )
+        )
+        self.emit_list_remove_at(pointer, index_slot, length_slot)
+        # Another name may hold this block, and every recorded length for it is
+        # now one too many - the same reason `del xs[i]` clears them.
+        self.list_lengths.clear()
+        return IntLoad(taken)
+
+    def emit_list_find(
+        self, pointer: IntExpression, wanted: IntExpression, element_kind: str
+    ) -> tuple[int, int]:
+        """Scan for ``wanted``; returns slots holding its index and 0/1 found.
+
+        Stops at the first match, as `index()` and `remove()` both do. A float
+        is compared as a number rather than as its bits, so that -0.0 finds
+        0.0 the way CPython's == does.
+        """
+
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, pointer))
+        wanted_slot = self.new_temp()
+        self.operations.append(Store(wanted_slot, wanted))
+        index_slot = self.new_temp()
+        found_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        self.operations.append(Store(found_slot, IntConstant(0)))
+        scan = self.new_label("list_find")
+        done = self.new_label("list_find_done")
+        miss = self.new_label("list_find_miss")
+        self.operations.append(Label(scan))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntLoad(index_slot),
+                    HeapLoad(
+                        IntBinary("add", IntLoad(pointer_slot), IntConstant(8)), 8
+                    ),
+                ),
+                done,
+            )
+        )
+        element = HeapLoad(
+            IntBinary(
+                "add",
+                IntBinary(
+                    "add",
+                    IntLoad(pointer_slot),
+                    IntConstant(self.LIST_HEADER_BYTES),
+                ),
+                IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+            ),
+            8,
+        )
+        if element_kind == "str":
+            same: IntExpression = IntLoad(
+                self.emit_string_equal(element, IntLoad(wanted_slot))
+            )
+        elif element_kind == "float":
+            same = FloatCompare(
+                "eq", BitsFloat(element), BitsFloat(IntLoad(wanted_slot))
+            )
+        else:
+            same = IntCompare("eq", element, IntLoad(wanted_slot))
+        self.operations.append(JumpIfFalse(same, miss))
+        self.operations.append(Store(found_slot, IntConstant(1)))
+        self.operations.append(Jump(done))
+        self.operations.append(Label(miss))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(scan))
+        self.operations.append(Label(done))
+        return index_slot, found_slot
+
+    def list_search_argument(
+        self, node: ast.Call, element_kind: str, what: str
+    ) -> IntExpression:
+        """The word to search a list for, checked against its element kind."""
+
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, f"native {what}() takes exactly one argument"
+            )
+        argument = node.args[0]
+        kind = self.expression_type(argument)
+        if element_kind == "str":
+            if kind != "str":
+                raise NativeCompileError(
+                    self.path, argument, "this list holds strings"
+                )
+            return self.string_pointer(argument)
+        if element_kind == "float":
+            return FloatBits(self.float_expression(argument))
+        if kind == "float":
+            raise NativeCompileError(
+                self.path, argument, "this list holds integers"
+            )
+        return self.integer(argument)
 
     def emit_list_remove_at(
         self, pointer: IntExpression, index_slot: int, length_slot: int
@@ -6682,6 +7130,79 @@ class Frontend:
         while capacity < (entries + 1) * 4:
             capacity *= 2
         return capacity
+
+    def dict_get_shape(self, node: ast.expr) -> tuple[str, str, str] | None:
+        """`d.get(...)` as (name, key kind, value kind), or None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != "get"
+            or not isinstance(node.func.value, ast.Name)
+        ):
+            return None
+        kinds = self.dict_kinds_of(node.func.value.id)
+        if kinds is None:
+            return None
+        return (node.func.value.id, kinds[0], kinds[1])
+
+    def emit_dict_get(
+        self, node: ast.Call, bindings: dict[str, IntExpression] | None = None
+    ) -> IntExpression:
+        """`d.get(k, default)` - the stored word, or the default word.
+
+        The two-argument form only. `d.get(k)` answers None when the key is
+        absent, and there is no None here to answer with; a default that is
+        never used is better than a value that cannot be represented.
+        """
+
+        shape = self.dict_get_shape(node)
+        assert shape is not None
+        name, key_kind, value_kind = shape
+        if len(node.args) != 2 or node.keywords:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native dict.get() takes a key and a default; the one-argument "
+                "form answers None when the key is absent, and None is not in "
+                "the subset",
+            )
+        if self.expression_type(node.args[0], bindings) != key_kind:
+            raise NativeCompileError(
+                self.path, node.args[0], f"this dict has {key_kind} keys"
+            )
+        if self.expression_type(node.args[1], bindings) != value_kind:
+            raise NativeCompileError(
+                self.path,
+                node.args[1],
+                f"this dict has {value_kind} values, so the default must be "
+                f"a {value_kind}",
+            )
+        result = self.new_temp()
+        # Before the probe: Python evaluates both arguments whether or not the
+        # key turns out to be there.
+        self.operations.append(
+            Store(result, self.dict_value(node.args[1], value_kind))
+        )
+        address_slot, found_slot, _key, _state = self.dict_probe(
+            self.slot(name), self.dict_key(node.args[0], key_kind), key_kind
+        )
+        end = self.new_label("dict_get_end")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)), end
+            )
+        )
+        self.operations.append(
+            Store(
+                result,
+                HeapLoad(
+                    IntBinary("add", IntLoad(address_slot), IntConstant(16)), 8
+                ),
+            )
+        )
+        self.operations.append(Label(end))
+        return IntLoad(result)
 
     def dict_key(self, node: ast.expr, key_kind: str) -> IntExpression:
         """A key as an i64: the value itself, or a pointer to a string block."""
@@ -8191,6 +8712,10 @@ class Frontend:
             )
         if isinstance(node, ast.Name):
             self.refuse_unbound(node.id, node)
+        if self.list_method_shape(node, "pop") == "str":
+            # The element word is the string's block address.
+            assert isinstance(node, ast.Call)
+            return self.emit_list_pop(node)
         if isinstance(node, ast.Name) and node.id in self.string_bindings:
             return self.string_bindings[node.id]
         if isinstance(node, ast.Name) and self.value_types.get(node.id) == "str":
@@ -12076,10 +12601,20 @@ class Frontend:
             # print() would insert. Several writes rather than one buffer: the
             # process is single-threaded, so the bytes land in order.
             arguments = node.args
-            if len(arguments) > 1:
+            if len(arguments) > 1 and all(
+                self.can_pre_evaluate_print_argument(argument)
+                for argument in arguments
+            ):
                 # print() evaluates every argument before it writes any of
                 # them, so an argument that raises must leave no output at
                 # all. Writing while walking printed the earlier ones first.
+                #
+                # All or nothing: only scalars can be bound to a hidden name,
+                # and pre-evaluating some while leaving others to the write
+                # loop would run them out of order - `print(xs.pop(), len(xs))`
+                # measured the list before it was shortened. A print with a
+                # container argument keeps the old order-by-construction walk
+                # and with it the chance of a partial line before a raise.
                 arguments = [
                     self.pre_evaluate_print_argument(argument)
                     for argument in arguments
@@ -14299,6 +14834,22 @@ class Frontend:
             IntBinary("add", base, IntConstant(16)),
         )
 
+    def can_pre_evaluate_print_argument(self, node: ast.expr) -> bool:
+        """Whether this argument can be evaluated ahead of the writing.
+
+        A name or a constant needs no evaluating, and a scalar can be held in
+        a hidden name. Anything else - a list, a dict, a string expression -
+        has nowhere to be held: binding a container to a second name is an
+        alias, which is refused because growth moves the block.
+        """
+
+        if isinstance(node, (ast.Name, ast.Constant)):
+            return True
+        try:
+            return self.expression_type(node) in {"int", "bool", "float"}
+        except NativeCompileError:
+            return False
+
     def pre_evaluate_print_argument(self, node: ast.expr) -> ast.expr:
         """Bind a scalar print() argument to a hidden name, and return the name.
 
@@ -14830,6 +15381,17 @@ class Frontend:
             if isinstance(node.value, str):
                 return "str"
             return "float" if isinstance(node.value, float) else "int"
+        shape = self.dict_get_shape(node)
+        if shape is not None:
+            return shape[2]
+        popped = self.list_method_shape(node, "pop")
+        if popped is not None:
+            return popped
+        if any(
+            self.list_method_shape(node, attribute) is not None
+            for attribute in ("index", "count")
+        ):
+            return "int"
         if isinstance(node, ast.Name):
             # Checked before `bindings`, because several callers ask for a
             # type without threading the bindings through - string_pointer
@@ -15083,6 +15645,11 @@ class Frontend:
             return BitsFloat(
                 HeapLoad(self.dict_lookup_value_address(node, bindings), 8)
             )
+        if self.dict_get_shape(node) is not None:
+            return BitsFloat(self.emit_dict_get(node, bindings))
+        if self.list_method_shape(node, "pop") == "float":
+            assert isinstance(node, ast.Call)
+            return BitsFloat(self.emit_list_pop(node))
         if (
             isinstance(node, ast.Subscript)
             and not isinstance(node.slice, ast.Slice)
@@ -15840,6 +16407,17 @@ class Frontend:
             if self.expression_type(argument, bindings) == "float":
                 return FloatToInt(self.float_expression(argument, bindings, call_stack))
             return self.integer(argument, bindings, call_stack)
+        if self.dict_get_shape(node) is not None:
+            return self.emit_dict_get(node, bindings)
+        if self.list_method_shape(node, "pop") in {"int", "bool"}:
+            assert isinstance(node, ast.Call)
+            return self.emit_list_pop(node)
+        if self.list_method_shape(node, "index") is not None:
+            assert isinstance(node, ast.Call)
+            return self.emit_list_index(node)
+        if self.list_method_shape(node, "count") is not None:
+            assert isinstance(node, ast.Call)
+            return self.emit_list_count(node)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)

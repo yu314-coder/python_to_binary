@@ -1972,3 +1972,143 @@ class ConditionalBindingTests(unittest.TestCase):
                 [sys.executable, str(entry)], capture_output=True
             )
             self.assertEqual(reference.stdout, b"6\n")
+
+
+class DictGetAndListMethodsTests(unittest.TestCase):
+    """`d.get()`, and the list methods that were missing: pop, insert, remove,
+    index and count."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+            if expected_exit:
+                # The message on stderr must be the one CPython gives, not
+                # just the same exception type.
+                self.assertEqual(
+                    native.stderr.strip().splitlines()[-1],
+                    reference.stderr.strip().splitlines()[-1],
+                )
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    # --- dict.get -----------------------------------------------------------
+
+    def test_get_answers_the_value_or_the_default(self):
+        self._run(
+            "d = {1: 10, 2: 20}\nprint(d.get(1, 0), d.get(9, -1))\n", b"10 -1\n"
+        )
+
+    def test_get_works_on_string_keys_and_float_values(self):
+        self._run(
+            's = ""\ns = s + "a"\n'
+            'd = {"a": 1.5}\nprint(d.get(s, 0.0), d.get("zz", 9.25))\n',
+            b"1.5 9.25\n",
+        )
+
+    def test_get_sees_a_deleted_key_as_absent(self):
+        # A delete leaves a tombstone, which the probe must walk over rather
+        # than stop at.
+        self._run(
+            "d = {1: 10, 2: 20}\ndel d[1]\nprint(d.get(1, -1), d.get(2, -1))\n",
+            b"-1 20\n",
+        )
+
+    def test_the_one_argument_form_is_refused(self):
+        self._reject("d = {1: 10}\nprint(d.get(1))\n", "None is not in the subset")
+
+    # --- pop ---------------------------------------------------------------
+
+    def test_pop_takes_the_last_element_by_default(self):
+        self._run("xs = [1, 2, 3]\nprint(xs.pop(), xs)\n", b"3 [1, 2]\n")
+
+    def test_pop_takes_the_element_at_an_index(self):
+        self._run(
+            "xs = [1, 2, 3]\nprint(xs.pop(0), xs)\nprint(xs.pop(-1), xs)\n",
+            b"1 [2, 3]\n3 [2]\n",
+        )
+
+    def test_pop_answers_strings_and_floats(self):
+        self._run('xs = ["a", "b"]\nprint(xs.pop(), len(xs))\n', b"b 1\n")
+        self._run("ys = [1.5, 2.5]\nprint(ys.pop(0), ys)\n", b"1.5 [2.5]\n")
+
+    def test_popping_an_empty_list_uses_cpythons_wording(self):
+        self._run("xs = [1]\nxs.pop()\nxs.pop()\n", b"", expected_exit=1)
+
+    def test_popping_out_of_range_uses_cpythons_wording(self):
+        self._run("xs = [1]\nxs.pop(5)\n", b"", expected_exit=1)
+
+    def test_pop_while_a_loop_walks_the_list_is_refused(self):
+        self._reject(
+            "xs = [1, 2, 3]\nfor v in xs:\n    xs.pop()\n",
+            "cannot shorten",
+        )
+
+    # --- insert, remove, index, count --------------------------------------
+
+    def test_insert_puts_the_value_at_the_index(self):
+        self._run("xs = [1, 3]\nxs.insert(1, 2)\nprint(xs)\n", b"[1, 2, 3]\n")
+
+    def test_insert_clamps_instead_of_raising(self):
+        # Unlike indexing, insert() never raises: past the end it appends and
+        # before the start it prepends.
+        self._run(
+            "xs = [1, 2]\nxs.insert(99, 9)\nxs.insert(-99, 0)\nprint(xs)\n",
+            b"[0, 1, 2, 9]\n",
+        )
+
+    def test_insert_grows_the_block(self):
+        self._run(
+            "xs: list[int] = []\nfor i in range(0, 5):\n    xs.insert(0, i)\n"
+            "print(xs)\n",
+            b"[4, 3, 2, 1, 0]\n",
+        )
+
+    def test_remove_drops_the_first_match_only(self):
+        self._run("xs = [1, 2, 3, 2]\nxs.remove(2)\nprint(xs)\n", b"[1, 3, 2]\n")
+
+    def test_removing_something_absent_reports_value_error(self):
+        self._run("xs = [1]\nxs.remove(9)\n", b"", expected_exit=1)
+
+    def test_index_reports_the_first_position(self):
+        self._run("xs = [5, 6, 7, 6]\nprint(xs.index(6), xs.index(5))\n", b"1 0\n")
+
+    def test_indexing_something_absent_reports_value_error(self):
+        self._run("xs = [5]\nprint(xs.index(9))\n", b"", expected_exit=1)
+
+    def test_count_tallies_every_match(self):
+        self._run("xs = [1, 2, 2, 3]\nprint(xs.count(2), xs.count(9))\n", b"2 0\n")
+
+    def test_index_and_count_work_on_strings_and_floats(self):
+        self._run(
+            'xs = ["a", "b", "a"]\nprint(xs.index("b"), xs.count("a"))\n', b"1 2\n"
+        )
+        self._run("ys = [1.5, 1.5, 2.0]\nprint(ys.count(1.5), ys.index(2.0))\n", b"2 2\n")
+
+    def test_print_keeps_argument_order_when_one_of_them_mutates(self):
+        # The pre-evaluation that keeps a raising argument from printing the
+        # earlier ones must not reorder these: len() has to see the shortened
+        # list, because pop() is written first.
+        self._run("xs = [1, 2, 3]\nprint(xs.pop(), len(xs))\n", b"3 2\n")
