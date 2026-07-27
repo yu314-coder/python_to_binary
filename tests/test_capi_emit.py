@@ -316,6 +316,63 @@ class CApiEmitTests(unittest.TestCase):
             b"400000\n",
         )
 
+    def test_try_except_catches_what_the_interpreter_raised(self):
+        # Inside a try, a failing C-API call becomes a jump to the handler
+        # rather than the end of the process, and PyErr_ExceptionMatches asks
+        # whether the exception is the class this clause catches - the same
+        # question the interpreter asks.
+        self._run(
+            "try:\n    print(1 / 0)\nexcept ZeroDivisionError:\n"
+            '    print("caught")\n',
+            b"caught\n",
+        )
+        self._run(
+            'try:\n    print(1 + "x")\nexcept ZeroDivisionError:\n'
+            '    print("wrong")\nexcept TypeError:\n    print("right")\n',
+            b"right\n",
+        )
+        self._run(
+            'd = {"a": 1}\ntry:\n    print(d["z"])\nexcept KeyError:\n'
+            '    print("no such key")\n',
+            b"no such key\n",
+        )
+
+    def test_a_try_that_does_not_fire_and_a_bare_except(self):
+        self._run(
+            'try:\n    print("fine")\nexcept ValueError:\n    print("never")\n'
+            'print("after")\n',
+            b"fine\nafter\n",
+        )
+        self._run(
+            'try:\n    print(1 / 0)\nexcept:\n    print("caught anything")\n',
+            b"caught anything\n",
+        )
+
+    def test_try_nested_in_a_loop_and_in_a_function(self):
+        self._run(
+            "for i in range(4):\n    try:\n        print(10 // (i - 2))\n"
+            '    except ZeroDivisionError:\n        print("skip")\n',
+            b"-5\n-10\nskip\n10\n",
+        )
+        self._run(
+            "def safe(a, b):\n    try:\n        return a // b\n"
+            "    except ZeroDivisionError:\n        return 0\n"
+            "print(safe(10, 2), safe(10, 0))\n",
+            b"5 0\n",
+        )
+        self._run(
+            "try:\n    try:\n        print(1 / 0)\n"
+            '    except TypeError:\n        print("inner wrong")\n'
+            'except ZeroDivisionError:\n    print("outer caught")\n',
+            b"outer caught\n",
+        )
+
+    def test_an_unmatched_exception_carries_on_outward(self):
+        self._run_failing(
+            'try:\n    print(1 / 0)\nexcept TypeError:\n    print("wrong")\n',
+            b"ZeroDivisionError",
+        )
+
     def test_what_is_not_translated_says_so(self):
         self._reject("class A:\n    pass\n", "has no C-API translation here yet")
         self._reject(

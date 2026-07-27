@@ -240,6 +240,14 @@ A tuple literal is built through a list and handed to the `tuple` builtin:
 arity is fixed at two and cannot serve a general tuple. The extra allocation
 buys any length.
 
+`try`/`except` works by turning a failing call into a jump. Outside a `try` a
+NULL result ends the process; inside one it goes to the handler, where
+`PyErr_ExceptionMatches` asks whether the exception is the class that clause
+catches - the same question the interpreter asks. An exception no clause
+matches carries on outward, to an enclosing `try` if there is one and out of
+the process if not. `finally`, `else` and `except E as name` are not
+translated yet.
+
 Every name a function body binds owns a reference, so they are released on the
 way out - leaving without doing that leaks one per call, which a recursive
 function turns into one per level. Temporaries are *not* released there: each
@@ -1182,7 +1190,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 47 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 48 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

@@ -75,6 +75,8 @@ extern PyObject *PyDict_New(void);
 extern int PyDict_SetItem(PyObject *mapping, PyObject *key, PyObject *value);
 extern PyObject *PyTuple_Pack(long long length, PyObject *a, PyObject *b);
 extern int PySequence_Contains(PyObject *container, PyObject *value);
+extern int PyErr_ExceptionMatches(PyObject *exception);
+extern void PyErr_Clear(void);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -148,6 +150,9 @@ class CApiEmitter:
         self.functions: list[_Function] = []
         self.known_functions: dict[str, int] = {}
         self.current: _Function | None = None
+        #: The label a failing C-API call jumps to. Empty outside a `try`,
+        #: where a failure ends the process instead.
+        self.handlers: list[str] = []
 
     # --- helpers ---------------------------------------------------------
 
@@ -170,7 +175,12 @@ class CApiEmitter:
         catches, and nothing here can catch one yet.
         """
 
-        self.emit(f"if (!{target}) {{ PyErr_Print(); exit(1); }}", indent)
+        if self.handlers:
+            # Inside a `try`, a failure is the handler's business rather than
+            # the end of the process.
+            self.emit(f"if (!{target}) goto {self.handlers[-1]};", indent)
+        else:
+            self.emit(f"if (!{target}) {{ PyErr_Print(); exit(1); }}", indent)
         return target
 
     def temporary(self) -> str:
@@ -632,6 +642,8 @@ class CApiEmitter:
             self.give_back(node, indent)
         elif isinstance(node, ast.Import):
             self.import_module(node, indent)
+        elif isinstance(node, ast.Try):
+            self.guarded(node, indent)
         elif isinstance(node, ast.AugAssign):
             self.augmented(node, indent)
         elif isinstance(node, ast.Break):
@@ -679,6 +691,64 @@ class CApiEmitter:
         # before it is overwritten, which is what keeps a loop from growing.
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+
+    def guarded(self, node: ast.Try, indent: int) -> None:
+        """`try: ... except E: ...` - the body, then a handler it jumps to.
+
+        A C-API call that fails leaves an exception set and answers NULL, and
+        inside a `try` that NULL becomes a jump rather than the end of the
+        process. `PyErr_ExceptionMatches` asks whether the exception is the
+        class this clause catches, exactly as the interpreter asks it.
+        """
+
+        if node.finalbody:
+            raise self.fail(node, "a finally clause is not translated here yet")
+        if node.orelse:
+            raise self.fail(node, "a try-else is not translated here yet")
+        assert self.current is not None
+        self.current.temporaries += 1
+        number = self.current.temporaries
+        handler = f"_handler{number}"
+        done = f"_after{number}"
+        self.handlers.append(handler)
+        try:
+            for statement in node.body:
+                self.statement(statement, indent)
+        finally:
+            self.handlers.pop()
+        self.emit(f"goto {done};", indent)
+        self.emit(f"{handler}:", 0)
+        for clause in node.handlers:
+            if clause.name is not None:
+                raise self.fail(
+                    clause, "`except E as name` is not translated here yet"
+                )
+            if clause.type is None:
+                # A bare except catches whatever is set.
+                self.emit("PyErr_Clear();", indent)
+                for statement in clause.body:
+                    self.statement(statement, indent)
+                self.emit(f"goto {done};", indent)
+                continue
+            if not isinstance(clause.type, ast.Name):
+                raise self.fail(clause, "an except clause names one class here")
+            wanted = self.builtin(clause.type.id, indent)
+            decision = self.temporary_flag()
+            self.emit(f"{decision} = PyErr_ExceptionMatches({wanted});", indent)
+            self.emit(f"Py_DecRef({wanted});", indent)
+            self.emit(f"if ({decision}) {{", indent)
+            self.emit("    PyErr_Clear();", indent)
+            for statement in clause.body:
+                self.statement(statement, indent + 1)
+            self.emit(f"    goto {done};", indent)
+            self.emit("}", indent)
+        # Nothing matched, so the exception carries on outward.
+        if self.handlers:
+            self.emit(f"goto {self.handlers[-1]};", indent)
+        else:
+            self.emit("PyErr_Print(); exit(1);", indent)
+        self.emit(f"{done}:", 0)
+        self.emit(";", indent)
 
     def augmented(self, node: ast.AugAssign, indent: int) -> None:
         """`x += 1` - the operation, then the assignment, as Python does it."""
