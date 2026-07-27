@@ -25,6 +25,8 @@ import ctypes.util
 
 __all__ = [
     "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
+    "objc_getClass", "sel_registerName", "objc_msgSend", "objc_msgSend2",
+    "objc_msgSend_str",
     "Py_Initialize", "Py_Finalize", "Py_IsInitialized", "PyRun_SimpleString",
     "PyLong_FromLongLong", "PyLong_AsLongLong", "PyUnicode_FromString",
     "PyNumber_Add", "PyNumber_Subtract", "PyNumber_Multiply",
@@ -141,7 +143,31 @@ _LIBC_SYMBOLS = frozenset(
 )
 # Everything else exported here is a CPython runtime entry point, so the two
 # sets cannot drift apart as the vetted ABI grows.
-_CPYTHON_SYMBOLS = frozenset(name for name in __all__ if name not in _LIBC_SYMBOLS)
+_OBJC_SYMBOLS = frozenset(
+    {
+        "objc_getClass",
+        "sel_registerName",
+        "objc_msgSend",
+        "objc_msgSend2",
+        "objc_msgSend_str",
+    }
+)
+
+# A class exists only once the framework that defines it is in the process:
+# libobjc holds the runtime, not the classes. Loading Foundation is what makes
+# objc_getClass("NSProcessInfo") answer rather than return nil, and it is what
+# a linked Objective-C program gets from -framework Foundation.
+OBJC_FRAMEWORKS = (
+    "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+)
+
+# Whatever is left over is CPython's, so a new binding elsewhere has to be
+# named in one of the two sets above or it will be looked for in libpython.
+_CPYTHON_SYMBOLS = frozenset(
+    name
+    for name in __all__
+    if name not in _LIBC_SYMBOLS and name not in _OBJC_SYMBOLS
+)
 
 
 def symbol_library(symbol: str) -> str | None:
@@ -149,7 +175,78 @@ def symbol_library(symbol: str) -> str | None:
 
     if symbol in _CPYTHON_SYMBOLS:
         return _cpython_library()
+    if symbol in _OBJC_SYMBOLS:
+        return LIBOBJC
     return LIBSYSTEM
+
+
+# --- the Objective-C runtime ------------------------------------------------
+#
+# Cocoa is not a library with source to compile; it is compiled Objective-C
+# that ships inside macOS. But the runtime that dispatches to it is a plain C
+# API, and these three functions are the whole of it: look up a class by name,
+# look up a selector by name, and send a message. Anything Cocoa can do is
+# reachable through them, which is how a C program drives AppKit without a line
+# of Objective-C.
+#
+# objc_msgSend is declared variadic in the header and is not one: it is a
+# trampoline that reads its arguments from the ordinary registers, which is why
+# an Objective-C compiler casts it to the callee's real prototype before every
+# call. The fixed-arity binding here is that same cast, written once per arity.
+
+LIBOBJC = "/usr/lib/libobjc.A.dylib"
+
+
+def _bytes(text: bytes | str) -> bytes:
+    return text.encode("utf-8") if isinstance(text, str) else bytes(text)
+
+
+_objc = ctypes.CDLL(LIBOBJC)
+
+
+def objc_getClass(name: bytes | str) -> int:
+    """The Class object registered under ``name``, or 0."""
+
+    lookup = _objc.objc_getClass
+    lookup.restype = ctypes.c_void_p
+    lookup.argtypes = (ctypes.c_char_p,)
+    return lookup(_bytes(name)) or 0
+
+
+def sel_registerName(name: bytes | str) -> int:
+    """The selector registered under ``name``."""
+
+    lookup = _objc.sel_registerName
+    lookup.restype = ctypes.c_void_p
+    lookup.argtypes = (ctypes.c_char_p,)
+    return lookup(_bytes(name)) or 0
+
+
+def objc_msgSend(receiver: int, selector: int) -> int:
+    """Send a no-argument message; returns the result as a word."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    return send(receiver, selector) or 0
+
+
+def objc_msgSend_str(receiver: int, selector: int, text: bytes | str) -> int:
+    """Send a message whose one argument is a C string."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)
+    return send(receiver, selector, _bytes(text)) or 0
+
+
+def objc_msgSend2(receiver: int, selector: int, argument: int) -> int:
+    """Send a one-argument message; returns the result as a word."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+    return send(receiver, selector, argument) or 0
 
 
 # --- CPython runtime entry points -------------------------------------------

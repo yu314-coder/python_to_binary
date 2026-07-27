@@ -330,9 +330,19 @@ def _emit_native_module(
                 library = symbol_library(symbol)
                 if library is not None:
                     symbol_libraries[symbol] = library
+            from ..cabi import OBJC_FRAMEWORKS, _OBJC_SYMBOLS
+
+            # A framework has to be loaded for its classes to exist, even when
+            # no symbol is taken from it directly: the runtime looks classes up
+            # by name and finds nothing until the framework registers them.
+            frameworks = (
+                OBJC_FRAMEWORKS
+                if any(symbol in _OBJC_SYMBOLS for symbol in symbol_libraries)
+                else ()
+            )
             libraries = ("/usr/lib/libSystem.B.dylib", *dict.fromkeys(
                 library
-                for library in symbol_libraries.values()
+                for library in (*symbol_libraries.values(), *frameworks)
                 if library != "/usr/lib/libSystem.B.dylib"
             ))
             image = write_macho_arm64_dynamic(

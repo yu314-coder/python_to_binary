@@ -184,6 +184,17 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "abs": ("abs", ("int",)),
     "labs": ("labs", ("int",)),
     "strlen": ("strlen", ("cstr",)),
+    # The Objective-C runtime. Cocoa itself is compiled Objective-C shipped
+    # inside macOS with no source to translate, but the runtime that dispatches
+    # to it is a plain C API, and these are the whole of it. objc_msgSend is
+    # declared variadic and is not one - it reads its arguments from the
+    # ordinary registers - so a fixed-arity binding per arity is the same cast
+    # an Objective-C compiler makes before every call.
+    "objc_getClass": ("objc_getClass", ("cstr",)),
+    "sel_registerName": ("sel_registerName", ("cstr",)),
+    "objc_msgSend": ("objc_msgSend", ("ptr", "ptr")),
+    "objc_msgSend2": ("objc_msgSend", ("ptr", "ptr", "ptr")),
+    "objc_msgSend_str": ("objc_msgSend", ("ptr", "ptr", "cstr")),
     # CPython runtime entry points. These link the already-compiled interpreter
     # through dyld exactly like any other external symbol; no CPython source is
     # translated. They are what lets generated C drive an embedded interpreter,
@@ -236,6 +247,11 @@ _CABI_RESULTS: dict[str, str] = {
     "abs": "int",
     "labs": "int",
     "strlen": "int",
+    "objc_getClass": "ptr",
+    "sel_registerName": "ptr",
+    "objc_msgSend": "ptr",
+    "objc_msgSend2": "ptr",
+    "objc_msgSend_str": "ptr",
     "Py_Initialize": "void",
     "Py_Finalize": "void",
     "Py_IsInitialized": "int",
