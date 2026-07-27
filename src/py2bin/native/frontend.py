@@ -21,6 +21,8 @@ from .ir import (
     FloatStore,
     FloatToInt,
     FloatUnary,
+    Function,
+    FunctionAddress,
     HeapAlloc,
     HeapInit,
     HeapLoad,
@@ -32,10 +34,12 @@ from .ir import (
     IntLoad,
     IntToFloat,
     IntUnary,
+    is_float_expression,
     Jump,
     JumpIfFalse,
     Label,
     Module,
+    Return,
     Store,
     Write,
     WriteRuntime,
@@ -118,10 +122,31 @@ _KERNEL_EXPORTS = {
 #             arm64 ABI passes variadic arguments on the stack rather than in
 #             x0-x7, and this backend does not implement that, so a "cfmt"
 #             literal containing any conversion specifier is rejected.
+#   "f64"  -- a C ``double``, passed in a SIMD&FP argument register. AAPCS64
+#             numbers those from their own counter, so a double never consumes
+#             an integer register and vice versa. Only fixed-arity callees may
+#             take one: Apple's arm64 variadic ABI puts every variadic
+#             argument on the stack, which is the opposite rule, so "f64" must
+#             never appear in a "cfmt" signature.
+#   "imp"  -- an Objective-C method implementation: the ENTRY ADDRESS of a
+#             module-level Python ``def`` in this image, which the runtime will
+#             later call on its own stack. The argument must be a bare name
+#             referring to such a def, and the def is lowered into a real
+#             ``Function`` with its own frame rather than inlined. It occupies
+#             an integer register like "ptr". A signature carrying one must
+#             place a "cstr" immediately after it: that string is the method
+#             type encoding, and it is the only statement of what the runtime
+#             will put in the callee's registers.
+#   "bool" -- a C ``BOOL``, which is ONE BYTE. Handing such a callee an
+#             out-of-range word is undefined -- it may test the whole register,
+#             mask the low bit, or read only the low byte, and those disagree
+#             for 256 -- so the argument is lowered as ``value != 0`` and the
+#             callee only ever receives 0 or 1. It occupies an integer register
+#             like "int".
 # ``_CABI_RESULTS`` records what each callee returns: "int" (a signed 64-bit
-# value), "ptr" (an opaque handle) or "void" (nothing -- using the result of
-# such a call is rejected, because the register would hold garbage natively
-# while the CPython shim would hand back a defined value).
+# value), "ptr" (an opaque handle), "float" (a C double) or "void" (nothing --
+# using the result of such a call is rejected, because the register would hold
+# garbage natively while the CPython shim would hand back a defined value).
 # Only symbols whose ABI is exactly one of these shapes are listed, so the
 # compiler can never emit a call with a mismatched signature.
 _CABI_MODULE = "py2bin.cabi"
@@ -184,6 +209,16 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "abs": ("abs", ("int",)),
     "labs": ("labs", ("int",)),
     "strlen": ("strlen", ("cstr",)),
+    # The libm double entry points. These are the smallest honest exercise of
+    # the floating-point half of AAPCS64: pow/fmod/hypot/atan2/copysign take two
+    # doubles in d0-d1, and ldexp takes a double in d0 AND an int in x0, which
+    # is what proves the two register files are numbered independently.
+    "pow": ("pow", ("f64", "f64")),
+    "fmod": ("fmod", ("f64", "f64")),
+    "hypot": ("hypot", ("f64", "f64")),
+    "atan2": ("atan2", ("f64", "f64")),
+    "copysign": ("copysign", ("f64", "f64")),
+    "ldexp": ("ldexp", ("f64", "int")),
     # The Objective-C runtime. Cocoa itself is compiled Objective-C shipped
     # inside macOS with no source to translate, but the runtime that dispatches
     # to it is a plain C API, and these are the whole of it. objc_msgSend is
@@ -195,6 +230,40 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "objc_msgSend": ("objc_msgSend", ("ptr", "ptr")),
     "objc_msgSend2": ("objc_msgSend", ("ptr", "ptr", "ptr")),
     "objc_msgSend_str": ("objc_msgSend", ("ptr", "ptr", "cstr")),
+    # The message shapes a window and a web view need. There is one entry per
+    # argument SHAPE, not per arity: a cast to the callee's prototype is a
+    # claim about that prototype, and (id, SEL, NSInteger) is a different claim
+    # from (id, SEL, id) even where arm64 places the two identically.
+    #
+    # An NSRect is four CGFloats, which AAPCS64 classifies as a homogeneous
+    # floating-point aggregate and passes in four consecutive SIMD&FP
+    # registers. Because the rectangle is the first floating-point argument in
+    # each of these prototypes, that placement is exactly what four "f64"
+    # entries produce, and the shims declare the real aggregate so the two
+    # paths cannot drift.
+    "objc_msgSend_id_id": ("objc_msgSend", ("ptr", "ptr", "ptr", "ptr")),
+    "objc_msgSend_long": ("objc_msgSend", ("ptr", "ptr", "int")),
+    "objc_msgSend_bool_void": ("objc_msgSend", ("ptr", "ptr", "bool")),
+    "objc_msgSend_rect": ("objc_msgSend", ("ptr", "ptr", "f64", "f64", "f64", "f64")),
+    "objc_msgSend_rect_id": (
+        "objc_msgSend",
+        ("ptr", "ptr", "f64", "f64", "f64", "f64", "ptr"),
+    ),
+    "objc_msgSend_rect_uint_uint_bool": (
+        "objc_msgSend",
+        ("ptr", "ptr", "f64", "f64", "f64", "f64", "int", "int", "bool"),
+    ),
+    # Building a class at run time. Cocoa is not driven by sending messages
+    # alone: an application delegate, a window delegate and a navigation
+    # delegate are all objects the framework calls BACK into, so a program that
+    # cannot hand the runtime a method implementation cannot close its own
+    # window. These three are the whole of that API. A class has to be
+    # registered before it can be messaged, and allocating one whose name is
+    # already taken answers nil -- which is silent, because every message to nil
+    # returns zero.
+    "objc_allocateClassPair": ("objc_allocateClassPair", ("ptr", "cstr", "int")),
+    "class_addMethod": ("class_addMethod", ("ptr", "ptr", "imp", "cstr")),
+    "objc_registerClassPair": ("objc_registerClassPair", ("ptr",)),
     # CPython runtime entry points. These link the already-compiled interpreter
     # through dyld exactly like any other external symbol; no CPython source is
     # translated. They are what lets generated C drive an embedded interpreter,
@@ -247,11 +316,26 @@ _CABI_RESULTS: dict[str, str] = {
     "abs": "int",
     "labs": "int",
     "strlen": "int",
+    "pow": "float",
+    "fmod": "float",
+    "hypot": "float",
+    "atan2": "float",
+    "copysign": "float",
+    "ldexp": "float",
     "objc_getClass": "ptr",
     "sel_registerName": "ptr",
     "objc_msgSend": "ptr",
     "objc_msgSend2": "ptr",
     "objc_msgSend_str": "ptr",
+    "objc_msgSend_id_id": "ptr",
+    "objc_msgSend_long": "ptr",
+    "objc_msgSend_bool_void": "void",
+    "objc_msgSend_rect": "ptr",
+    "objc_msgSend_rect_id": "ptr",
+    "objc_msgSend_rect_uint_uint_bool": "ptr",
+    "objc_allocateClassPair": "ptr",
+    "class_addMethod": "int",
+    "objc_registerClassPair": "void",
     "Py_Initialize": "void",
     "Py_Finalize": "void",
     "Py_IsInitialized": "int",
@@ -287,10 +371,12 @@ _CABI_RESULTS: dict[str, str] = {
 
 assert set(_CABI_RESULTS) == set(_CABI_SYMBOLS), "cabi result kinds are out of sync"
 
-# Width and signedness of each callee's C result. AAPCS64 leaves bits 32-63 of
-# the return register unspecified for a 32-bit result, so the encoder must
-# extend it. Anything absent here returns a full 64-bit word (long long,
-# Py_ssize_t, size_t, or a pointer) and needs no extension.
+# Width and signedness of each callee's C result, keyed by IMPORT NAME so an
+# aliased binding (objc_msgSend2 and friends all share one C symbol) can carry
+# its own result shape. AAPCS64 leaves bits 32-63 of the return register
+# unspecified for a 32-bit result, so the encoder must extend it. Anything
+# absent here returns a full 64-bit word (long long, Py_ssize_t, size_t, or a
+# pointer) and needs no extension.
 _CABI_RESULT_WIDTH: dict[str, str] = {
     # POSIX: pid_t/uid_t/gid_t and int abs(int) are 32 bits.
     "getpid": "i32",
@@ -298,6 +384,21 @@ _CABI_RESULT_WIDTH: dict[str, str] = {
     "getuid": "u32",
     "getgid": "u32",
     "abs": "i32",
+    # class_addMethod returns a C ``BOOL``, which on arm64 macOS is C99 _Bool
+    # and therefore ONE BYTE: AAPCS64 leaves bits 8-63 of the result register
+    # unspecified, so the byte has to be isolated before the value is compared
+    # against anything. The CPython shim declares c_bool and hands back 0 or 1,
+    # so without this the two runs disagree exactly when the register happens
+    # to carry dirt from the call.
+    "class_addMethod": "u8",
+    # The double-returning libm entries. "f64" is not a width but a different
+    # register file: the value comes back in d0, not x0.
+    "pow": "f64",
+    "fmod": "f64",
+    "hypot": "f64",
+    "atan2": "f64",
+    "copysign": "f64",
+    "ldexp": "f64",
     # CPython entry points declared to return C int. Each uses -1 for failure,
     # which is exactly the case a missing sign extension destroys.
     "Py_IsInitialized": "i32",
@@ -309,12 +410,102 @@ _CABI_RESULT_WIDTH: dict[str, str] = {
 }
 
 
-# The arm64 encoder passes every extern argument in x0-x7 (AAPCS64) and has no
-# stack-argument path, so a longer signature must never reach it.
+# The arm64 encoder passes extern arguments in x0-x7 and d0-d7 (AAPCS64) and has
+# no stack-argument path, so a signature that overflows either file must never
+# reach it. The two counters are independent, which is why the budget is checked
+# per file rather than against the total argument count: a nine-argument call is
+# perfectly legal when four of those arguments are doubles.
 _CABI_MAX_ARGUMENTS = 8
+
+
+def _register_demand(signature: tuple[str, ...]) -> tuple[int, int]:
+    """The (integer, floating-point) argument registers ``signature`` consumes."""
+
+    floats = sum(1 for kind in signature if kind == "f64")
+    return len(signature) - floats, floats
+
+
 assert all(
-    len(signature) <= _CABI_MAX_ARGUMENTS for _symbol, signature in _CABI_SYMBOLS.values()
+    max(_register_demand(signature)) <= _CABI_MAX_ARGUMENTS
+    for _symbol, signature in _CABI_SYMBOLS.values()
 ), "an adapter-ABI signature exceeds the register argument budget"
+assert not any(
+    "f64" in signature and "cfmt" in signature
+    for _symbol, signature in _CABI_SYMBOLS.values()
+), "a variadic callee cannot take a double: Apple's arm64 ABI stacks those"
+assert all(
+    (_CABI_RESULT_WIDTH.get(name) == "f64") == (kind == "float")
+    for name, kind in _CABI_RESULTS.items()
+), "a float-returning extern must declare the f64 result width"
+assert all(
+    signature[position + 1 :][:1] == ("cstr",)
+    for _symbol, signature in _CABI_SYMBOLS.values()
+    for position, kind in enumerate(signature)
+    if kind == "imp"
+), "an 'imp' argument must be followed by the 'cstr' that encodes its method type"
+
+
+# --- Objective-C method implementations --------------------------------------
+#
+# A method type encoding is a string whose first character encodes the result
+# and whose remaining characters encode the arguments, the first two of which
+# are always the receiver (``@``) and the selector (``:``). It is not
+# decoration: it is the only statement anywhere of what the runtime will put in
+# the callee's registers, and AppKit reads it back through
+# methodSignatureForSelector: whenever it forwards or observes a message.
+#
+# Only these codes are accepted, and the reason is the calling convention
+# rather than taste. Everything here arrives in an ordinary integer register,
+# which is the only place a compiled ``Function`` prologue looks. A "d" or "f"
+# argument arrives in d0-d7 and a "{...}" struct may arrive in the SIMD&FP
+# registers or through the x8 indirect-result pointer; a body that read those
+# positions as words would get whatever the caller last left in x2, and it
+# would do it silently. Those are rejected rather than approximated.
+_IMP_RESULT_CODES: dict[str, str] = {
+    "v": "void",   # no result; the result register is left undefined
+    "q": "int",    # long long, returned whole in x0
+    "@": "ptr",    # an object pointer, likewise whole
+    "B": "bool",   # a one-byte BOOL, so the value is normalised to 0 or 1
+}
+#: Argument codes an implementation may take. ``:`` is only ever the second one.
+_IMP_ARGUMENT_CODES = frozenset("@q:")
+
+
+def parse_method_encoding(encoding: str) -> tuple[str, tuple[str, ...]]:
+    """Split a vetted method type encoding into ``(result, arguments)``.
+
+    Raises :class:`ValueError` describing the first code that py2bin cannot
+    deliver through the integer registers a compiled ``Function`` reads.
+    """
+
+    if not encoding:
+        raise ValueError("a method type encoding cannot be empty")
+    result, arguments = encoding[0], tuple(encoding[1:])
+    if result not in _IMP_RESULT_CODES:
+        raise ValueError(
+            f"method type encoding {encoding!r} returns {result!r}, and py2bin "
+            f"can only return {', '.join(sorted(_IMP_RESULT_CODES))} from a "
+            "callback: a floating-point result comes back in d0 and a struct "
+            "result through the x8 indirect-result register, neither of which "
+            "a compiled function body writes"
+        )
+    if arguments[:2] != ("@", ":"):
+        raise ValueError(
+            f"method type encoding {encoding!r} must begin its arguments with "
+            "'@:', the receiver and the selector every Objective-C method is "
+            "called with"
+        )
+    for code in arguments[2:]:
+        if code not in _IMP_ARGUMENT_CODES or code == ":":
+            raise ValueError(
+                f"method type encoding {encoding!r} takes an argument of type "
+                f"{code!r}, which py2bin cannot receive: only '@' (an object) "
+                "and 'q' (a long long) arrive in the integer registers a "
+                "compiled function reads. A 'd'/'f' argument arrives in d0-d7, "
+                "a '{...}' struct may arrive there or through x8, and a 'B' is "
+                "one byte whose register's upper bits are undefined"
+            )
+    return _IMP_RESULT_CODES[result], arguments
 
 
 def _ir_contains_extern_call(value: object) -> bool:
@@ -391,6 +582,10 @@ class NativeFunction:
 
 
 # The float-valued IR nodes, so an inlined argument can be recognised as one.
+# Prefer ``is_float_expression`` over a bare isinstance against this tuple: an
+# ExternCall is float-valued or not depending on its declared result, and a
+# class test alone would silently route a returned double through the integer
+# register file.
 FLOAT_EXPRESSIONS = (
     FloatConstant,
     FloatLoad,
@@ -797,12 +992,26 @@ class Frontend:
         self.iterated_lists: list[str] = []
         self.return_targets: list[tuple[int | None, str]] = []
         self.active_functions: list[tuple[int, str]] = []
+        # Python defs handed to the Objective-C runtime as method
+        # implementations, keyed by (def name, method type encoding). Each is a
+        # real ``Function`` with its own frame, because the runtime calls it and
+        # there is no call site here to inline it into.
+        self._callback_functions: dict[tuple[str, str], Function] = {}
+        # How many places in the whole module give each name a value. A
+        # callback is lowered where it is registered but runs at a time nobody
+        # here can name, so a module-level value it reads is only safe to bake
+        # into it when nothing can ever rebind that name.
+        self._binding_counts: dict[str, int] = {}
 
     def compile(self, source: str) -> Module:
         try:
             tree = ast.parse(source, filename=str(self.path))
         except SyntaxError as error:
             raise ValueError(f"{self.path}:{error.lineno}:{error.offset}: {error.msg}") from error
+        self._binding_counts = {
+            name: len(sites)
+            for name, sites in self.name_binding_sites(tree).items()
+        }
         self.runtime_names.update(self.loop_mutated_names(tree))
         self.note_escaping_list_names(tree)
         # A name a function declares global has to live in a slot. Inlining
@@ -839,7 +1048,11 @@ class Frontend:
                         self._heap_bump_slot,
                     ),
                 )
-        return Module(self.operations, len(self.slots))
+        return Module(
+            self.operations,
+            len(self.slots),
+            functions=list(self._callback_functions.values()),
+        )
 
     def guard_arena_limit(self) -> None:
         """Check every allocation against the end of the arena.
@@ -11293,8 +11506,14 @@ class Frontend:
             and node.func.id in self.extern_functions
         ):
             # A bare extern call: run it for its effect and discard the result.
+            # The store has to name the right register file even though nothing
+            # reads the temp, because the encoder rejects a node handed to the
+            # wrong one rather than guessing.
+            call = self.extern_call(node, {}, (), discarded=True)
             self.operations.append(
-                Store(self.new_temp(), self.extern_call(node, {}, (), discarded=True))
+                FloatStore(self.new_temp(), call)
+                if call.result == "f64"
+                else Store(self.new_temp(), call)
             )
         elif (
             isinstance(node.func, ast.Name)
@@ -13634,7 +13853,7 @@ class Frontend:
             # A parameter is just a local: store the argument in its slot and
             # the body reads it through the ordinary variable path. Recording
             # the kind is what makes that path pick float or integer loads.
-            if isinstance(argument, FLOAT_EXPRESSIONS):
+            if is_float_expression(argument):
                 self.operations.append(
                     FloatStore(self.slot(private_parameter), argument)
                 )
@@ -13959,7 +14178,7 @@ class Frontend:
             if node.id in bindings:
                 return (
                     "float"
-                    if isinstance(bindings[node.id], FLOAT_EXPRESSIONS)
+                    if is_float_expression(bindings[node.id])
                     else "int"
                 )
             if node.id in self.object_classes:
@@ -14056,7 +14275,8 @@ class Frontend:
             if node.func.id in self.classes:
                 return "object"
             if node.func.id in self.extern_functions:
-                return "int"
+                key = self.extern_functions[node.func.id]
+                return "float" if _CABI_RESULTS[key] == "float" else "int"
             if node.func.id == "float" and node.func.id not in self.functions:
                 return "float"
             if (
@@ -14130,6 +14350,29 @@ class Frontend:
         self.operations.append(Label(ok))
         return FloatLoad(slot)
 
+    def pin_extern_arguments(self, arguments: tuple[object, ...]) -> tuple[object, ...]:
+        """Store every extern-calling argument in a slot, so each runs once.
+
+        An argument that is spliced in at more than one use of its parameter
+        would otherwise perform its external call once per use, which is a
+        different sequence of calls than CPython makes even when the callee is
+        pure enough that the arithmetic still comes out right.
+        """
+
+        pinned: list[object] = []
+        for argument in arguments:
+            if not _ir_contains_extern_call(argument):
+                pinned.append(argument)
+                continue
+            slot = self.new_temp()
+            if is_float_expression(argument):
+                self.operations.append(FloatStore(slot, argument))
+                pinned.append(FloatLoad(slot))
+            else:
+                self.operations.append(Store(slot, argument))
+                pinned.append(IntLoad(slot))
+        return tuple(pinned)
+
     def float_expression(
         self,
         node: ast.expr,
@@ -14141,6 +14384,14 @@ class Frontend:
         bindings = bindings or {}
         if self.expression_type(node, bindings) != "float":
             return IntToFloat(self.integer(node, bindings, call_stack))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in self.extern_functions
+        ):
+            # Ahead of the constant fold: an extern call has side effects and a
+            # result the compiler cannot know, so it is never a constant.
+            return self.extern_call(node, bindings, call_stack)
         try:
             folded = self.constant(node)
         except NativeCompileError:
@@ -14171,7 +14422,7 @@ class Frontend:
             return BitsFloat(HeapLoad(self.attribute_address(node), 8))
         if isinstance(node, ast.Name) and node.id in bindings:
             bound = bindings[node.id]
-            if isinstance(bound, FLOAT_EXPRESSIONS):
+            if is_float_expression(bound):
                 return bound
         if self.expression_function_kind(node, bindings) == "float":
             assert isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -14179,6 +14430,11 @@ class Frontend:
             arguments = self.bind_native_arguments(
                 node.func.id, function, node, bindings, call_stack
             )
+            if _repeats_extern_argument(function, arguments):
+                # This branch splices the argument expression in at every use of
+                # the parameter, which for an external call would run the callee
+                # once per use. CPython runs it once. Pin it in a slot first.
+                arguments = self.pin_extern_arguments(arguments)
             previous_path, previous_values = self.path, self.values
             previous_functions = self.functions
             self.path, self.values = function.path, function.values
@@ -14279,6 +14535,268 @@ class Frontend:
             self.path, node, "expression is not in the native float subset"
         )
 
+    def callback_address(
+        self,
+        call: ast.Call,
+        target: ast.expr,
+        encoding_node: ast.expr,
+        local_name: str,
+    ) -> FunctionAddress:
+        """Lower a Python ``def`` into a callable ``Function`` and take its address.
+
+        Every other Python function in this compiler is inlined, so it has no
+        address to take. An Objective-C method implementation cannot be: the
+        runtime holds the pointer and calls it later, from its own stack, with
+        the receiver in x0 and the selector in x1. So the def is lowered a
+        second, separate time into a real ``Function`` with a real frame, and
+        the value handed to ``class_addMethod`` is that body's entry address.
+
+        The body is lowered into a FRESH front end, because a callback's frame
+        is not the entry point's. Everything the module's lowering keeps in a
+        stack slot -- the heap arena's bump pointer above all -- is addressed
+        off the entry point's frame pointer and is simply not there when the
+        runtime calls in. Rather than let a callback read a slot that belongs to
+        another frame, the separate lowering is checked afterwards for anything
+        that would have needed one, and the build is refused if it finds any.
+        """
+
+        if not isinstance(target, ast.Name):
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"extern call {local_name}() needs the NAME of a function "
+                "defined in this module for its implementation argument; a "
+                "method implementation is an address in this image, and only a "
+                "def has one",
+            )
+        name = target.id
+        function = self.functions.get(name)
+        if function is None:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"{name!r} is not a function defined in this module, so it has "
+                "no address to give the Objective-C runtime",
+            )
+        try:
+            encoding = self.constant(encoding_node)
+        except NativeCompileError:
+            encoding = None
+        if isinstance(encoding, (bytes, bytearray)):
+            encoding = bytes(encoding).decode("utf-8", "replace")
+        if not isinstance(encoding, str):
+            raise NativeCompileError(
+                self.path,
+                encoding_node,
+                f"extern call {local_name}() requires a compile-time string "
+                "constant for the method type encoding; it decides how the "
+                "runtime passes the arguments, so it cannot be discovered at "
+                "run time",
+            )
+        try:
+            result_kind, argument_codes = parse_method_encoding(encoding)
+        except ValueError as error:
+            raise NativeCompileError(self.path, encoding_node, str(error)) from error
+        if len(function.parameters) != len(argument_codes):
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"method type encoding {encoding!r} describes "
+                f"{len(argument_codes)} argument(s) but {name}() takes "
+                f"{len(function.parameters)}; an Objective-C method is called "
+                "with the receiver and the selector before its own arguments, "
+                f"so {name}() must begin with two parameters for those",
+            )
+        if result_kind == "void" and function.returns_value:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"method type encoding {encoding!r} says the method returns "
+                f"nothing, but {name}() returns a value; the caller would never "
+                "read it",
+            )
+        if result_kind != "void" and not function.returns_value:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"method type encoding {encoding!r} says the method returns a "
+                f"value, but {name}() returns none; the caller would read "
+                "whatever happened to be in the result register",
+            )
+        self.check_callback_names(target, name, function)
+        key = (name, encoding)
+        existing = self._callback_functions.get(key)
+        if existing is not None:
+            return FunctionAddress(existing.name)
+        # A name no C identifier and no Python identifier can have, so a
+        # callback body can never be confused with a ``Call`` target.
+        ir_name = f"objc method {name} {encoding}"
+        body = self.lower_callback(call, target, name, function, result_kind)
+        self._callback_functions[key] = Function(
+            ir_name, len(function.parameters), body[1], body[0]
+        )
+        return FunctionAddress(ir_name)
+
+    def callback_free_names(
+        self, function: NativeFunction, seen: set[int] | None = None
+    ) -> set[str]:
+        """Names ``function`` and everything it calls read without binding first.
+
+        Deliberately over-approximate: a name bound by a lambda parameter or a
+        comprehension target is reported as free too. Naming one name too many
+        costs a refusal, and naming one too few costs a wrong answer.
+        """
+
+        seen = set() if seen is None else seen
+        if id(function) in seen:
+            return set()
+        seen.add(id(function))
+        bound = self.function_local_names(function.body, function.parameters)
+        free: set[str] = set()
+        for statement in function.body:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    if node.id not in bound:
+                        free.add(node.id)
+                elif isinstance(node, ast.Global):
+                    free.update(node.names)
+        for callee in list(free):
+            nested = function.functions.get(callee)
+            if nested is not None:
+                free |= self.callback_free_names(nested, seen)
+        return free
+
+    def check_callback_names(
+        self, target: ast.expr, name: str, function: NativeFunction
+    ) -> None:
+        """Refuse a callback that depends on a module value that can change.
+
+        A callback is lowered here, at the point it is registered, but it runs
+        whenever the runtime decides to call it. Anything it reads from the
+        module is therefore frozen at the value the module happened to hold at
+        registration, while the same source under CPython would read whatever
+        the value is by then. The two only agree when the name can never be
+        rebound, which is what the binding count decides. A name the module
+        keeps in a stack slot is worse still and is refused outright: the
+        callback's frame is not the entry point's, so its copy is not even the
+        same storage.
+        """
+
+        unstable: list[str] = []
+        for free in sorted(self.callback_free_names(function)):
+            if (
+                free in function.functions
+                or free in function.extern_functions
+                or free in function.kernel_functions
+                or free in function.kernel_modules
+                or free in self.classes
+            ):
+                continue
+            if free not in function.values and free not in self.runtime_names:
+                # A builtin, or a name that is not the module's at all. Neither
+                # carries a value that can go stale.
+                continue
+            if free in self.runtime_names or self._binding_counts.get(free, 0) != 1:
+                unstable.append(free)
+        if unstable:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"{name}() reads the module-level name(s) "
+                f"{', '.join(repr(item) for item in unstable)}, which is not a "
+                "value a method implementation can be given. The runtime calls "
+                "it at a time this compiler cannot name, so the only module "
+                "value it could carry is the one that was current when the "
+                "class was built, while the same source under CPython would "
+                "read whatever the name means by then. Only a name bound "
+                "exactly once in the whole module is stable enough; pass "
+                "anything else through the message",
+            )
+
+    def lower_callback(
+        self,
+        call: ast.Call,
+        target: ast.expr,
+        name: str,
+        function: NativeFunction,
+        result_kind: str,
+    ) -> tuple[list[object], int]:
+        """Lower ``function`` as a standalone frame; returns (operations, slots)."""
+
+        provider = Frontend(
+            function.path,
+            self.source_roots,
+            self.import_stack[:-1],
+            self.experimental_kernels,
+        )
+        provider.classes = self.classes
+        # Slots 0 .. n-1 of a Function's frame are where its prologue spills the
+        # incoming argument registers, so those have to be claimed first and in
+        # order. The names are unspellable so no body local can land on one.
+        for index in range(len(function.parameters)):
+            provider.slot(f"<imp-argument:{index}>")
+        arguments = tuple(
+            IntLoad(index) for index in range(len(function.parameters))
+        )
+        result = provider.inline_imperative_function(
+            name, function, arguments, target, ()
+        )
+        if result is not None:
+            if result_kind == "bool":
+                # A BOOL is one byte and its caller may read only that byte, so
+                # returning 2 from a callback would be true natively and could
+                # be anything under a shim that converts through Python's bool.
+                # Normalising here is the same thing an Objective-C compiler
+                # emits for `return (BOOL)(x != 0)`, and it is what makes the
+                # two runs agree for every value the body can produce.
+                result = IntCompare("ne", result, IntConstant(0))
+            provider.operations.append(Return(result))
+        if provider._heap_bump_slot is not None:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"{name}() allocates, so it cannot be a method implementation. "
+                "The heap arena's bump pointer lives in a stack slot of the "
+                "entry point's frame, and the runtime calls a method on a frame "
+                "of its own where that slot does not exist, so the allocation "
+                "would write through whatever the address happened to hold. A "
+                "str, list, tuple, dict, set, f-string, exception, or a print "
+                "of a float all allocate",
+            )
+        if provider._callback_functions:
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"{name}() registers a method implementation of its own, which "
+                "py2bin does not collect from inside a callback; register every "
+                "class from the module body",
+            )
+        leaked = sorted(
+            slot
+            for slot in provider.slots
+            if not slot.startswith("<")
+        )
+        if leaked:
+            # Every slot this lowering creates for its own bookkeeping, and
+            # every local of an inlined body, is given a name in angle brackets
+            # that no Python identifier can have. A bare name surviving here is
+            # therefore a free variable of the callback -- a module-level
+            # runtime variable, or a name declared `global` -- and it has been
+            # given a slot in the CALLBACK's frame, which is not the frame the
+            # module's copy of that variable lives in. Reading it would return
+            # stack dirt and writing it would be invisible to the rest of the
+            # program.
+            raise NativeCompileError(
+                self.path,
+                target,
+                f"{name}() uses the module-level runtime variable(s) "
+                f"{', '.join(repr(item) for item in leaked)}, which a method "
+                "implementation cannot reach: it runs on a frame of the "
+                "runtime's making and the module's variables live in the entry "
+                "point's frame. Pass what it needs through the message instead",
+            )
+        return provider.operations, len(provider.slots)
+
     def extern_call(
         self,
         node: ast.Call,
@@ -14293,7 +14811,8 @@ class Frontend:
         the emitted call always matches the callee's real ABI. ``cstr``/``cfmt``
         operands must be compile-time string constants (materialized as a
         NUL-terminated blob); ``int``/``ptr`` operands are ordinary integer
-        expressions.
+        expressions; ``bool`` is an integer expression normalised to 0 or 1;
+        ``f64`` is a double.
 
         ``discarded`` marks a call used as a bare statement. A callee declared
         to return ``void`` leaves nothing defined in the result register, so its
@@ -14327,13 +14846,15 @@ class Frontend:
                 f"extern call {local_name}() returns void; its result is not a "
                 "value and can only be discarded",
             )
-        if len(signature) > _CABI_MAX_ARGUMENTS:
+        if max(_register_demand(signature)) > _CABI_MAX_ARGUMENTS:
+            words, doubles = _register_demand(signature)
             raise NativeCompileError(
                 self.path,
                 node,
-                f"extern call {local_name}() passes {len(signature)} arguments, "
-                f"but the native backend only implements {_CABI_MAX_ARGUMENTS} "
-                "register arguments and has no stack-argument path",
+                f"extern call {local_name}() passes {words} integer and "
+                f"{doubles} floating-point arguments, but the native backend "
+                f"only implements {_CABI_MAX_ARGUMENTS} registers in each file "
+                "and has no stack-argument path",
             )
         if node.keywords:
             raise NativeCompileError(
@@ -14348,8 +14869,40 @@ class Frontend:
                 f"extern call {local_name}() expects {len(signature)} argument(s), "
                 f"got {len(node.args)}",
             )
-        arguments: list[IntExpression] = []
-        for argument, kind in zip(node.args, signature):
+        arguments: list[IntExpression | FloatExpression] = []
+        for position, (argument, kind) in enumerate(zip(node.args, signature)):
+            if kind == "imp":
+                # The encoding sits in the next argument, which the signature
+                # table is asserted to declare as a "cstr". It has to be read
+                # here rather than later because it decides what the runtime
+                # puts in the callee's registers, and therefore whether the
+                # callee can be compiled at all.
+                arguments.append(
+                    self.callback_address(
+                        node, argument, node.args[position + 1], local_name
+                    )
+                )
+                continue
+            if kind == "f64":
+                arguments.append(
+                    self.float_expression(argument, bindings, call_stack)
+                )
+                continue
+            if kind == "bool":
+                # A C BOOL is one byte, so the callee's reading of an
+                # out-of-range word is its own business: 256 is true if it
+                # tests the register and false if it reads the low byte. The
+                # comparison is the same normalisation an Objective-C compiler
+                # emits for (BOOL)(x != 0), and the CPython shim performs it
+                # too, so neither run can depend on that choice.
+                arguments.append(
+                    IntCompare(
+                        "ne",
+                        self.integer(argument, bindings, call_stack),
+                        IntConstant(0),
+                    )
+                )
+                continue
             if kind in {"cstr", "cfmt"}:
                 try:
                     value = self.constant(argument)
@@ -14393,7 +14946,10 @@ class Frontend:
         return ExternCall(
             symbol,
             tuple(arguments),
-            _CABI_RESULT_WIDTH.get(symbol, "i64"),
+            # Keyed by the import name, not the C symbol: several bindings share
+            # one symbol (the objc_msgSend arities) and each declares its own
+            # result shape. Keying by symbol would silently hand back "i64".
+            _CABI_RESULT_WIDTH.get(key, "i64"),
         )
 
 
@@ -14468,7 +15024,15 @@ class Frontend:
             and isinstance(node.func, ast.Name)
             and node.func.id in self.extern_functions
         ):
-            return self.extern_call(node, bindings, call_stack)
+            call = self.extern_call(node, bindings, call_stack)
+            if call.result == "f64":
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"extern call {node.func.id}() returns a C double, so its "
+                    "result is not an integer; wrap it in int() to truncate",
+                )
+            return call
         if (
             isinstance(node, ast.Constant)
             and isinstance(node.value, int)
@@ -14490,7 +15054,7 @@ class Frontend:
                     f"{node.id!r} was passed a string, so it cannot be used "
                     "where an integer is required",
                 )
-            if isinstance(value, FLOAT_EXPRESSIONS):
+            if is_float_expression(value):
                 raise NativeCompileError(
                     self.path,
                     node,

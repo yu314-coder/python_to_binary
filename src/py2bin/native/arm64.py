@@ -34,6 +34,7 @@ from .ir import (
     IntLoad,
     IntToFloat,
     IntUnary,
+    is_float_expression,
     Jump,
     JumpIfFalse,
     Label,
@@ -296,15 +297,48 @@ class _Refs:
 def _external_call(
     words: list[int], expression: "ExternCall", slot_base: int, refs: "_Refs | None"
 ) -> None:
+    """Emit an AAPCS64 call to a dynamically bound external symbol.
+
+    AAPCS64 allocates the general-purpose and the SIMD&FP argument registers
+    from two INDEPENDENT counters: the first integer argument goes in x0 no
+    matter how many doubles precede it, and the first double goes in d0 no
+    matter how many words precede it. ``ldexp(double, int)`` is the smallest
+    call that shows it -- the double is in d0 and the exponent in x0, both
+    "first". Allocating from one shared counter would put the exponent in x1
+    and leave the callee reading whatever the last call left there.
+    """
+
     if refs is None:
         raise TypeError("ARM64 external calls require the darwin dynamic encoder")
-    if len(expression.arguments) > 8:
-        raise ValueError("ARM64 external calls support at most 8 integer arguments")
+    # A per-position (is_float, register) plan, from a forward scan with the two
+    # counters AAPCS64 defines. The register is NOT the argument's position once
+    # the two kinds are mixed.
+    plan: list[tuple[bool, int]] = []
+    integers = floats = 0
     for argument in expression.arguments:
-        _expression(words, argument, slot_base, refs)  # arg -> x0
-        words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-    for index in reversed(range(len(expression.arguments))):
-        words.append(0xF94003E0 | index)  # ldr x{index}, [sp]
+        if is_float_expression(argument):
+            plan.append((True, floats))
+            floats += 1
+        else:
+            plan.append((False, integers))
+            integers += 1
+    if integers > 8 or floats > 8:
+        raise ValueError(
+            "ARM64 external calls support at most 8 integer and 8 float "
+            "arguments; there is no stack-argument path"
+        )
+    for argument, (is_float, _register) in zip(expression.arguments, plan):
+        if is_float:
+            _float_expression(words, argument, slot_base, refs)  # arg -> d0
+            words.extend((_sub_sp(16), 0xFD0003E0))  # str d0, [sp]
+        else:
+            _expression(words, argument, slot_base, refs)  # arg -> x0
+            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+    for is_float, register in reversed(plan):
+        if is_float:
+            words.append(0xFD4003E0 | register)  # ldr d{register}, [sp]
+        else:
+            words.append(0xF94003E0 | register)  # ldr x{register}, [sp]
         words.append(0x910043FF)  # add sp, sp, #16
     call_index = len(words)
     # adrp x16, <got page>; ldr x16, [x16, #got_off]; blr x16. The two leading
@@ -321,6 +355,13 @@ def _external_call(
         words.append(0x93407C00)  # sxtw x0, w0
     elif expression.result == "u32":
         words.append(0x2A0003E0)  # mov w0, w0 (zero-extends into x0)
+    elif expression.result == "u8":
+        # A C ``_Bool``/``BOOL`` is one byte wide, so the same rule leaves bits
+        # 8-63 unspecified: the callee is free to return 0x1 in a register that
+        # still holds a stale 0x7FFF00 in the bits above it.
+        words.append(0x53001C00)  # uxtb w0, w0
+    # An "f64" result is already the double the caller wants, in d0, and x0
+    # holds nothing meaningful -- which is why _expression refuses this node.
 
 
 #: The maximum number of arguments an internal call passes. AAPCS64 gives eight
@@ -466,6 +507,11 @@ def _expression(
         refs.strings.append((index, expression.data, 0))
         return
     if isinstance(expression, ExternCall):
+        if expression.result == "f64":
+            raise ValueError(
+                f"external call {expression.symbol} returns a double in D0, so "
+                "its result is not an integer expression"
+            )
         _external_call(words, expression, slot_base, refs)
         return
     if isinstance(expression, Call):
@@ -576,6 +622,14 @@ def _float_expression(
 ) -> None:
     """Place one IEEE-754 double expression in D0."""
 
+    if isinstance(expression, ExternCall):
+        if expression.result != "f64":
+            raise ValueError(
+                f"external call {expression.symbol} returns an integer word in "
+                "X0, so its result is not a float expression"
+            )
+        _external_call(words, expression, slot_base, refs)  # result already in d0
+        return
     if isinstance(expression, FloatConstant):
         words.extend(_mov(0, _float_bits(expression.value)))
         words.append(0x9E670000)  # fmov d0, x0

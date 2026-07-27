@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import inspect
 import platform
 import re
 import struct
@@ -33,14 +34,24 @@ from py2bin.c_native import (
     compile_c_native,
 )
 from py2bin.native import NativeCompileError
+from py2bin.native import arm64
 from py2bin.native.arm64 import encode_darwin_extern
 from py2bin.native.frontend import (
     _CABI_MAX_ARGUMENTS,
+    _CABI_RESULT_WIDTH,
     _CABI_RESULTS,
     _CABI_SYMBOLS,
     lower,
 )
-from py2bin.native.ir import ExitValue, ExternCall, IntConstant, Module, Store
+from py2bin.native.ir import (
+    ExitValue,
+    ExternCall,
+    FloatConstant,
+    FloatStore,
+    IntConstant,
+    Module,
+    Store,
+)
 
 
 _HOST_IS_DARWIN_ARM64 = (
@@ -102,14 +113,87 @@ class VettedSymbolTableTests(unittest.TestCase):
             with self.subTest(symbol=name):
                 self.assertIn(name, cabi.__all__)
                 self.assertTrue(callable(getattr(cabi, name)))
-                self.assertIn(_CABI_RESULTS[name], {"int", "ptr", "void"})
+                self.assertIn(_CABI_RESULTS[name], {"int", "ptr", "void", "float"})
 
-    def test_signatures_fit_the_register_argument_budget(self):
+    def test_every_shim_takes_exactly_the_declared_arguments(self):
+        """The two tables are one ABI claim, so their arities cannot differ.
+
+        A shim with one parameter too few would still accept the compiler's
+        call under CPython -- Python would raise, loudly -- but a shim with one
+        too many silently passes a default the native call never sends.
+        """
+
         for name, (_symbol, signature) in _CABI_SYMBOLS.items():
             with self.subTest(symbol=name):
-                self.assertLessEqual(len(signature), _CABI_MAX_ARGUMENTS)
+                parameters = inspect.signature(getattr(cabi, name)).parameters
+                self.assertEqual(len(parameters), len(signature))
+
+    def test_an_nsrect_shim_passes_one_aggregate_not_four_doubles(self):
+        """AAPCS64 puts a four-double struct in four consecutive FP registers.
+
+        That is the same placement four loose doubles get here only because the
+        rectangle is the first floating-point argument in each of these
+        prototypes. Declaring the aggregate is what makes the shim's ABI the
+        callee's ABI rather than a coincidence that a later shape would break.
+        """
+
+        self.assertEqual(ctypes.sizeof(cabi._NSRect), 32)
+        # A nil receiver makes objc_msgSend return nil without looking at the
+        # selector, so these calls are safe and still install the prototype.
+        calls = (
+            lambda: cabi.objc_msgSend_rect(0, 0, 1.0, 2.0, 3.0, 4.0),
+            lambda: cabi.objc_msgSend_rect_id(0, 0, 1.0, 2.0, 3.0, 4.0, 0),
+            lambda: cabi.objc_msgSend_rect_uint_uint_bool(
+                0, 0, 1.0, 2.0, 3.0, 4.0, 0, 0, 0
+            ),
+        )
+        for call in calls:
+            self.assertEqual(call(), 0)
+            self.assertIn(cabi._NSRect, cabi._objc.objc_msgSend.argtypes)
+
+    def test_signatures_fit_the_register_argument_budget(self):
+        """AAPCS64 counts the integer and floating-point files separately."""
+
+        for name, (_symbol, signature) in _CABI_SYMBOLS.items():
+            with self.subTest(symbol=name):
                 for kind in signature:
-                    self.assertIn(kind, {"int", "ptr", "cstr", "cfmt"})
+                    self.assertIn(
+                        kind, {"int", "ptr", "bool", "cstr", "cfmt", "f64", "imp"}
+                    )
+                doubles = sum(1 for kind in signature if kind == "f64")
+                self.assertLessEqual(len(signature) - doubles, _CABI_MAX_ARGUMENTS)
+                self.assertLessEqual(doubles, _CABI_MAX_ARGUMENTS)
+
+    def test_a_float_result_declares_the_f64_result_width(self):
+        """The width table is what tells the encoder to read D0 and not X0."""
+
+        for name, result in _CABI_RESULTS.items():
+            with self.subTest(symbol=name):
+                width = _CABI_RESULT_WIDTH.get(name, "i64")
+                self.assertEqual(result == "float", width == "f64")
+
+    def test_a_variadic_callee_never_takes_a_double(self):
+        """Apple's arm64 ABI stacks variadic doubles, the opposite rule."""
+
+        for name, (_symbol, signature) in _CABI_SYMBOLS.items():
+            with self.subTest(symbol=name):
+                if "cfmt" in signature:
+                    self.assertNotIn("f64", signature)
+
+    def test_a_method_implementation_is_followed_by_its_type_encoding(self):
+        """The encoding is the only statement of the callee's register layout.
+
+        It sits in the argument after the implementation, so the front end can
+        only decide whether a def is compilable as that method by reading the
+        two together. A signature that separated them would leave the
+        implementation lowered against a layout nothing had checked.
+        """
+
+        for name, (_symbol, signature) in _CABI_SYMBOLS.items():
+            with self.subTest(symbol=name):
+                for position, kind in enumerate(signature):
+                    if kind == "imp":
+                        self.assertEqual(signature[position + 1 :][:1], ("cstr",))
 
     def test_every_cpython_symbol_resolves_in_the_interpreter_library(self):
         """A compiled binary binds these through dyld, so they must be exported."""
@@ -404,8 +488,84 @@ class Arm64ExternAbiTests(unittest.TestCase):
         self.assertEqual(offset, -16, "argument spills were not unwound")
 
     def test_more_arguments_than_registers_is_refused_not_truncated(self):
-        with self.assertRaisesRegex(ValueError, "at most 8 integer arguments"):
+        with self.assertRaisesRegex(ValueError, "at most 8 integer and 8 float"):
             self._encode(9)
+
+    def test_nine_arguments_fit_when_four_of_them_are_doubles(self):
+        """The two register files are counted apart, so this is a legal call.
+
+        NSWindow's initWithContentRect:styleMask:backing:defer: is exactly this
+        shape once the NSRect is spelled as its four CGFloat members.
+        """
+
+        call = ExternCall(
+            "objc_msgSend",
+            (
+                IntConstant(1),
+                IntConstant(2),
+                FloatConstant(0.0),
+                FloatConstant(0.0),
+                FloatConstant(640.0),
+                FloatConstant(480.0),
+                IntConstant(15),
+                IntConstant(2),
+                IntConstant(0),
+            ),
+            "i64",
+        )
+        code, externs = arm64.encode_darwin_extern(
+            Module([Store(0, call)], 4), 0x100004000
+        )
+        words = list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
+        branch = externs[0][0] // 4
+        reloads = [
+            word
+            for word in words[:branch]
+            if word & 0xFFFFFFE0 in (0xF94003E0, 0xFD4003E0)
+        ]
+        self.assertEqual(
+            reloads,
+            [
+                0xF94003E4,  # ldr x4, [sp]   defer
+                0xF94003E3,  # ldr x3, [sp]   backing
+                0xF94003E2,  # ldr x2, [sp]   styleMask
+                0xFD4003E3,  # ldr d3, [sp]   height
+                0xFD4003E2,  # ldr d2, [sp]   width
+                0xFD4003E1,  # ldr d1, [sp]   origin y
+                0xFD4003E0,  # ldr d0, [sp]   origin x
+                0xF94003E1,  # ldr x1, [sp]   _cmd
+                0xF94003E0,  # ldr x0, [sp]   self
+            ],
+        )
+
+    def test_integer_only_calls_are_unchanged_by_the_float_argument_path(self):
+        """The whole CPython C-API surface rides this path; drift is silent."""
+
+        for count in range(9):
+            with self.subTest(arguments=count):
+                code, _externs = self._encode(count)
+                words = list(
+                    struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4])
+                )
+                reloads = [
+                    word for word in words if word & 0xFFFFFFE0 == 0xF94003E0
+                ]
+                self.assertEqual(
+                    reloads, [0xF94003E0 | index for index in reversed(range(count))]
+                )
+                self.assertNotIn(0xFD0003E0, words)  # no str d0, [sp]
+
+    def test_a_float_result_is_not_readable_as_an_integer(self):
+        call = ExternCall("pow", (FloatConstant(2.0), FloatConstant(3.0)), "f64")
+        with self.assertRaisesRegex(ValueError, "returns a double in D0"):
+            arm64.encode_darwin_extern(Module([Store(0, call)], 4), 0x100004000)
+
+    def test_an_integer_result_is_not_readable_as_a_float(self):
+        call = ExternCall("getpid", (), "i32")
+        with self.assertRaisesRegex(ValueError, "returns an integer word in"):
+            arm64.encode_darwin_extern(
+                Module([FloatStore(0, call)], 4), 0x100004000
+            )
 
 
 @unittest.skipUnless(

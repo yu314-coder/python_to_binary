@@ -227,12 +227,14 @@ class ExternCall:
     """
 
     symbol: str
-    arguments: tuple["IntExpression", ...] = ()
+    arguments: tuple["IntExpression | FloatExpression", ...] = ()
     # Width and signedness of the callee's C result. AAPCS64 leaves bits 32-63
     # of the return register UNSPECIFIED for a 32-bit result, so a C ``int``
     # must be sign-extended (and ``unsigned int`` zero-extended) before it is
     # used as a signed 64-bit value. Without this, CPython's -1 error return
     # reads as 4294967295 and every ``if (rc < 0)`` check silently fails.
+    # ``"f64"`` means the callee returns a double in the FP result register, so
+    # the node is a float expression rather than an integer one.
     result: str = "i64"
 
 
@@ -304,8 +306,42 @@ IntExpression = (
     | IndirectCall
 )
 FloatExpression = (
-    FloatConstant | FloatLoad | FloatUnary | FloatBinary | IntToFloat | BitsFloat
+    FloatConstant
+    | FloatLoad
+    | FloatUnary
+    | FloatBinary
+    | IntToFloat
+    | BitsFloat
+    | ExternCall
 )
+
+#: The nodes that unconditionally produce a double. ``ExternCall`` is absent
+#: because it belongs to whichever union its ``result`` names, which is why the
+#: predicate below exists rather than a bare isinstance check.
+_FLOAT_NODES = (
+    FloatConstant,
+    FloatLoad,
+    FloatUnary,
+    FloatBinary,
+    IntToFloat,
+    BitsFloat,
+)
+
+
+def is_float_expression(node: object) -> bool:
+    """True when ``node`` yields a double rather than an integer word.
+
+    ``ExternCall`` is the one node that can be either, so every place that has
+    to choose between the integer and the floating-point path -- argument
+    register allocation, ``Store`` versus ``FloatStore``, the frontend's type
+    inference -- must ask this rather than test the node's class. Getting it
+    wrong reads the wrong register file and produces a plausible wrong number
+    with no diagnostic.
+    """
+
+    if isinstance(node, ExternCall):
+        return node.result == "f64"
+    return isinstance(node, _FLOAT_NODES)
 
 
 # --- operations --------------------------------------------------------------

@@ -13,7 +13,7 @@ compiled native binary invoke identical machine code and produce identical
 observable results. That is what makes the compiler's output verifiable against
 CPython.
 
-Only symbols with a simple, fixed integer/pointer ABI are exposed; see
+Only symbols with a simple, fixed integer/pointer/double ABI are exposed; see
 ``py2bin.native.frontend._CABI_SYMBOLS`` for the compiler-side whitelist, which
 must stay in sync with the callables defined here.
 """
@@ -22,11 +22,16 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import operator
 
 __all__ = [
     "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
+    "pow", "fmod", "hypot", "atan2", "copysign", "ldexp",
     "objc_getClass", "sel_registerName", "objc_msgSend", "objc_msgSend2",
-    "objc_msgSend_str",
+    "objc_msgSend_str", "objc_msgSend_id_id", "objc_msgSend_long",
+    "objc_msgSend_bool_void", "objc_msgSend_rect", "objc_msgSend_rect_id",
+    "objc_msgSend_rect_uint_uint_bool",
+    "objc_allocateClassPair", "class_addMethod", "objc_registerClassPair",
     "Py_Initialize", "Py_Finalize", "Py_IsInitialized", "PyRun_SimpleString",
     "PyLong_FromLongLong", "PyLong_AsLongLong", "PyUnicode_FromString",
     "PyNumber_Add", "PyNumber_Subtract", "PyNumber_Multiply",
@@ -60,6 +65,17 @@ _libc.labs.restype = ctypes.c_long
 _libc.labs.argtypes = (ctypes.c_long,)
 _libc.strlen.restype = ctypes.c_size_t
 _libc.strlen.argtypes = (ctypes.c_char_p,)
+
+# The libm doubles. Declaring the prototypes is what makes ctypes marshal these
+# through the SIMD&FP registers, which is the same ABI the compiled call uses,
+# so the two runs execute the identical library code on identical bits.
+for _name in ("pow", "fmod", "hypot", "atan2", "copysign"):
+    _function = getattr(_libc, _name)
+    _function.restype = ctypes.c_double
+    _function.argtypes = (ctypes.c_double, ctypes.c_double)
+del _name, _function
+_libc.ldexp.restype = ctypes.c_double
+_libc.ldexp.argtypes = (ctypes.c_double, ctypes.c_int)
 
 
 def getpid() -> int:
@@ -109,6 +125,61 @@ def strlen(text: str | bytes) -> int:
     return int(_libc.strlen(data))
 
 
+# These are C ``pow``/``fmod``/... and NOT Python's builtins: C pow(-8.0, 1/3)
+# is NaN where Python's ** raises, and C fmod keeps the dividend's sign where
+# Python's % keeps the divisor's. The name in this module always means the C
+# function, which is the whole point of the module.
+
+
+def pow(base: float, exponent: float) -> float:
+    """C ``pow``: ``base`` raised to ``exponent``, both C doubles."""
+
+    return float(_libc.pow(float(base), float(exponent)))
+
+
+def fmod(numerator: float, denominator: float) -> float:
+    """C ``fmod``: the remainder with the sign of ``numerator``."""
+
+    return float(_libc.fmod(float(numerator), float(denominator)))
+
+
+def hypot(x: float, y: float) -> float:
+    """C ``hypot``: sqrt(x*x + y*y) without intermediate overflow."""
+
+    return float(_libc.hypot(float(x), float(y)))
+
+
+def atan2(y: float, x: float) -> float:
+    """C ``atan2``: the angle of the point (x, y), in radians."""
+
+    return float(_libc.atan2(float(y), float(x)))
+
+
+def copysign(magnitude: float, sign: float) -> float:
+    """C ``copysign``: ``magnitude`` with the sign bit of ``sign``."""
+
+    return float(_libc.copysign(float(magnitude), float(sign)))
+
+
+def ldexp(fraction: float, exponent: int) -> float:
+    """C ``ldexp``: ``fraction * 2**exponent``.
+
+    The exponent is a C ``int``, so only its low 32 bits reach the callee. A
+    compiled call puts the whole word in x0 and the callee reads w0; masking to
+    the same 32 bits here is what keeps the two runs identical rather than
+    letting ctypes raise on a value the native side would have accepted.
+
+    ``operator.index`` rather than ``int()`` because the compiler rejects a
+    float in this position: silently truncating one here would make the
+    interpreted run answer where the compiled run refuses to build.
+    """
+
+    truncated = operator.index(exponent) & 0xFFFFFFFF
+    if truncated >= 0x80000000:
+        truncated -= 0x100000000
+    return float(_libc.ldexp(float(fraction), truncated))
+
+
 # --- library routing ---------------------------------------------------------
 #
 # Every extern symbol names the native library that provides it. libSystem is
@@ -139,7 +210,10 @@ def _cpython_library() -> str:
 
 
 _LIBC_SYMBOLS = frozenset(
-    {"getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen"}
+    {
+        "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
+        "pow", "fmod", "hypot", "atan2", "copysign", "ldexp",
+    }
 )
 # Everything else exported here is a CPython runtime entry point, so the two
 # sets cannot drift apart as the vetted ABI grows.
@@ -150,6 +224,15 @@ _OBJC_SYMBOLS = frozenset(
         "objc_msgSend",
         "objc_msgSend2",
         "objc_msgSend_str",
+        "objc_msgSend_id_id",
+        "objc_msgSend_long",
+        "objc_msgSend_bool_void",
+        "objc_msgSend_rect",
+        "objc_msgSend_rect_id",
+        "objc_msgSend_rect_uint_uint_bool",
+        "objc_allocateClassPair",
+        "class_addMethod",
+        "objc_registerClassPair",
     }
 )
 
@@ -157,8 +240,13 @@ _OBJC_SYMBOLS = frozenset(
 # libobjc holds the runtime, not the classes. Loading Foundation is what makes
 # objc_getClass("NSProcessInfo") answer rather than return nil, and it is what
 # a linked Objective-C program gets from -framework Foundation.
+# AppKit defines NSWindow and NSApplication, WebKit defines WKWebView and
+# WKWebViewConfiguration, and neither answers objc_getClass until its framework
+# is in the process, so the window path needs all three loaded.
 OBJC_FRAMEWORKS = (
     "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+    "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
+    "/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit",
 )
 
 # Whatever is left over is CPython's, so a new binding elsewhere has to be
@@ -192,7 +280,10 @@ def symbol_library(symbol: str) -> str | None:
 # objc_msgSend is declared variadic in the header and is not one: it is a
 # trampoline that reads its arguments from the ordinary registers, which is why
 # an Objective-C compiler casts it to the callee's real prototype before every
-# call. The fixed-arity binding here is that same cast, written once per arity.
+# call. Each binding below is one such cast, so there is a binding per argument
+# SHAPE rather than per arity: (id, SEL, NSInteger) and (id, SEL, id) happen to
+# agree on arm64, but a cast is a claim about the callee's prototype and the
+# two claims are not the same one.
 
 LIBOBJC = "/usr/lib/libobjc.A.dylib"
 
@@ -203,6 +294,13 @@ def _bytes(text: bytes | str) -> bytes:
 
 _objc = ctypes.CDLL(LIBOBJC)
 
+# A compiled image lists these in its load commands, so they are in the process
+# before its entry point runs. An interpreted run has to load them at the same
+# point or the two disagree at the very first step: objc_getClass("NSWindow")
+# answers nil under CPython and a real class in the binary, and every message
+# after that goes to nil and silently returns zero.
+_frameworks = tuple(ctypes.CDLL(path) for path in OBJC_FRAMEWORKS)
+
 
 def objc_getClass(name: bytes | str) -> int:
     """The Class object registered under ``name``, or 0."""
@@ -210,7 +308,7 @@ def objc_getClass(name: bytes | str) -> int:
     lookup = _objc.objc_getClass
     lookup.restype = ctypes.c_void_p
     lookup.argtypes = (ctypes.c_char_p,)
-    return lookup(_bytes(name)) or 0
+    return _returned(lookup(_bytes(name)))
 
 
 def sel_registerName(name: bytes | str) -> int:
@@ -219,7 +317,7 @@ def sel_registerName(name: bytes | str) -> int:
     lookup = _objc.sel_registerName
     lookup.restype = ctypes.c_void_p
     lookup.argtypes = (ctypes.c_char_p,)
-    return lookup(_bytes(name)) or 0
+    return _returned(lookup(_bytes(name)))
 
 
 def objc_msgSend(receiver: int, selector: int) -> int:
@@ -228,7 +326,7 @@ def objc_msgSend(receiver: int, selector: int) -> int:
     send = _objc.objc_msgSend
     send.restype = ctypes.c_void_p
     send.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-    return send(receiver, selector) or 0
+    return _returned(send(receiver, selector))
 
 
 def objc_msgSend_str(receiver: int, selector: int, text: bytes | str) -> int:
@@ -237,7 +335,7 @@ def objc_msgSend_str(receiver: int, selector: int, text: bytes | str) -> int:
     send = _objc.objc_msgSend
     send.restype = ctypes.c_void_p
     send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)
-    return send(receiver, selector, _bytes(text)) or 0
+    return _returned(send(receiver, selector, _bytes(text)))
 
 
 def objc_msgSend2(receiver: int, selector: int, argument: int) -> int:
@@ -246,7 +344,310 @@ def objc_msgSend2(receiver: int, selector: int, argument: int) -> int:
     send = _objc.objc_msgSend
     send.restype = ctypes.c_void_p
     send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
-    return send(receiver, selector, argument) or 0
+    return _returned(send(receiver, selector, argument))
+
+
+# The shapes below carry values the compiled call site truncates to a machine
+# word or normalises to a C ``BOOL``. Doing the same arithmetic here is what
+# keeps the two runs identical: ctypes would otherwise raise on an argument the
+# native side would have accepted, and ``operator.index`` refuses a float in a
+# position where the compiler also refuses one.
+
+
+def _word(value: int) -> int:
+    """``value`` as the 64-bit word a compiled call would put in the register."""
+
+    return operator.index(value) & 0xFFFFFFFFFFFFFFFF
+
+
+def _returned(value: int | None) -> int:
+    """A returned machine word, read the way the compiled code reads it.
+
+    ctypes hands a c_void_p result back unsigned, but the compiled call leaves
+    the callee's word in x0 and treats it as signed - so a method returning a
+    negative NSInteger printed 18446744073709551615 interpreted and -1
+    compiled. A pointer on arm64 never sets the top bit, so reading the word as
+    signed costs nothing and is what makes the two runs agree.
+    """
+
+    word = value or 0
+    return word - (1 << 64) if word >= (1 << 63) else word
+
+
+def _flag(value: int) -> bool:
+    """``value`` as the 0-or-1 ``BOOL`` a compiled call passes.
+
+    A C ``BOOL`` is one byte, so handing the callee an out-of-range word is
+    undefined: it may test the whole register, mask the low bit, or read only
+    the low byte, and those disagree for 256. The compiler therefore lowers a
+    ``bool`` argument as ``value != 0`` and this does the same, so no call site
+    can ever pass a value whose meaning depends on the callee's codegen.
+    """
+
+    return operator.index(value) != 0
+
+
+class _NSPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _NSSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _NSRect(ctypes.Structure):
+    """Cocoa's ``NSRect``, spelled exactly as Foundation declares it.
+
+    This has to be a ctypes Structure and not four separate ``c_double``
+    arguments. AAPCS64 classifies a struct of four doubles as a homogeneous
+    floating-point aggregate and hands it to the callee in four CONSECUTIVE
+    SIMD&FP registers, which is the same placement four loose doubles get only
+    because the rectangle is the first floating-point argument in each of these
+    prototypes. Declaring the aggregate keeps that an ABI fact rather than a
+    coincidence, and it is what the compiled call site reproduces.
+    """
+
+    _fields_ = [("origin", _NSPoint), ("size", _NSSize)]
+
+
+def _rect(x: float, y: float, width: float, height: float) -> _NSRect:
+    return _NSRect(_NSPoint(float(x), float(y)), _NSSize(float(width), float(height)))
+
+
+def objc_msgSend_id_id(
+    receiver: int, selector: int, first: int, second: int
+) -> int:
+    """Send a two-object message, as in ``loadHTMLString:baseURL:``."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    )
+    return _returned(send(receiver, selector, _word(first), _word(second)))
+
+
+def objc_msgSend_long(receiver: int, selector: int, value: int) -> int:
+    """Send a message whose one argument is an ``NSInteger``."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64)
+    word = _word(value)
+    if word >= 0x8000000000000000:
+        word -= 0x10000000000000000
+    return _returned(send(receiver, selector, word))
+
+
+def objc_msgSend_bool_void(receiver: int, selector: int, flag: int) -> None:
+    """Send a ``BOOL`` setter that returns nothing.
+
+    The callee leaves the result register undefined, so this returns None and
+    the compiler refuses to use the value of such a call.
+    """
+
+    send = _objc.objc_msgSend
+    send.restype = None
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)
+    send(receiver, selector, _flag(flag))
+
+
+def objc_msgSend_rect(
+    receiver: int, selector: int, x: float, y: float, width: float, height: float
+) -> int:
+    """Send a message whose one argument is an ``NSRect``."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, _NSRect)
+    return _returned(send(receiver, selector, _rect(x, y, width, height)))
+
+
+def objc_msgSend_rect_id(
+    receiver: int,
+    selector: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    argument: int,
+) -> int:
+    """Send ``initWithFrame:configuration:`` and anything shaped like it."""
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (ctypes.c_void_p, ctypes.c_void_p, _NSRect, ctypes.c_void_p)
+    return _returned(send(receiver, selector, _rect(x, y, width, height), _word(argument)))
+
+
+def objc_msgSend_rect_uint_uint_bool(
+    receiver: int,
+    selector: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    style_mask: int,
+    backing: int,
+    defer: int,
+) -> int:
+    """Send ``initWithContentRect:styleMask:backing:defer:``.
+
+    Nine arguments, and every one of them fits in a register because AAPCS64
+    counts the two register files apart: the rectangle takes d0-d3 and the
+    remaining five words take x0-x4.
+    """
+
+    send = _objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        _NSRect,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_bool,
+    )
+    return send(
+        receiver,
+        selector,
+        _rect(x, y, width, height),
+        _word(style_mask),
+        _word(backing),
+        _flag(defer),
+    ) or 0
+
+
+# --- building a class at run time -------------------------------------------
+#
+# Cocoa is not driven by sending messages alone. An application delegate, a
+# window delegate and a navigation delegate are objects the framework calls
+# back into, so a program that cannot hand the runtime a method implementation
+# cannot be told that its own window closed. These three functions are that
+# whole API: allocate a class pair, give it methods, publish it.
+#
+# Compiled, the implementation is the entry address of a real function in the
+# image and the runtime branches straight to it. Here it has to be a C-callable
+# trampoline around the Python function, and the two must agree about what
+# arrives in which register -- which is what the method type encoding says.
+
+
+def _signed(value: int) -> int:
+    """``value`` as the SIGNED 64-bit integer a register holds it as.
+
+    A compiled callback reads its arguments out of stack slots that hold raw
+    machine words interpreted as signed 64-bit integers, and returns one the
+    same way. Passing the Python function a ctypes pointer object instead would
+    hand it ``None`` for a nil receiver where the compiled body sees 0.
+    """
+
+    word = operator.index(value) & 0xFFFFFFFFFFFFFFFF
+    return word - 0x10000000000000000 if word >= 0x8000000000000000 else word
+
+
+# The C types each method type encoding code maps to. This table is the CPython
+# half of ``py2bin.native.frontend.parse_method_encoding``; the two are checked
+# against each other by the test suite, because a disagreement is precisely a
+# case where the interpreted run and the compiled run put a value in different
+# registers.
+_IMP_RESULT_TYPES = {
+    "v": None,
+    "q": ctypes.c_int64,
+    "@": ctypes.c_int64,
+    # A BOOL is one byte and the caller may read only that byte, so the value
+    # is normalised to 0 or 1. The compiled body does the same with an explicit
+    # `!= 0`, so a callback that returns 2 is true in both runs rather than
+    # true in one and 2 in the other.
+    "B": ctypes.c_bool,
+}
+_IMP_ARGUMENT_TYPES = {"@": ctypes.c_int64, ":": ctypes.c_int64, "q": ctypes.c_int64}
+
+# Every trampoline ever built, kept forever. ctypes frees the thunk when the
+# CFUNCTYPE object is collected, and the runtime keeps the pointer for the life
+# of the class: dropping it would leave Cocoa branching into freed memory,
+# which is a crash where the compiled binary is fine.
+_registered_implementations: list[object] = []
+
+
+def _implementation(function, encoding: str):
+    """A C-callable trampoline for ``function`` under the given encoding."""
+
+    result, arguments = encoding[0], encoding[1:]
+    if result not in _IMP_RESULT_TYPES or not set(arguments) <= set(_IMP_ARGUMENT_TYPES):
+        raise ValueError(
+            f"py2bin cannot build a method implementation for the type encoding "
+            f"{encoding!r}; the compiler refuses it too"
+        )
+    prototype = ctypes.CFUNCTYPE(
+        _IMP_RESULT_TYPES[result], *(_IMP_ARGUMENT_TYPES[code] for code in arguments)
+    )
+
+    def entry(*registers):
+        value = function(*(_signed(register) for register in registers))
+        if result == "v":
+            return None
+        if result == "B":
+            return bool(value)
+        # The compiled body leaves a 64-bit register, so an out-of-range result
+        # wraps rather than raising, and this has to wrap identically.
+        return _signed(value)
+
+    thunk = prototype(entry)
+    _registered_implementations.append(thunk)
+    return thunk
+
+
+def objc_allocateClassPair(superclass: int, name: bytes | str, extra: int) -> int:
+    """A new, unregistered subclass of ``superclass``, or 0.
+
+    Returns 0 when a class called ``name`` is already registered, which is the
+    one failure a caller has to check: every message to the nil it leaves
+    behind silently returns zero.
+    """
+
+    allocate = _objc.objc_allocateClassPair
+    allocate.restype = ctypes.c_void_p
+    allocate.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t)
+    return allocate(superclass, _bytes(name), _word(extra)) or 0
+
+
+def class_addMethod(
+    cls: int, selector: int, implementation, types: bytes | str
+) -> int:
+    """Give ``cls`` a method; returns 1 on success and 0 if it already had one.
+
+    ``implementation`` is a Python function here and the address of a compiled
+    function in the binary. It is called with the receiver, the selector, and
+    then the method's own arguments, so it needs two parameters before its own.
+
+    Only an implementation on ``cls`` ITSELF blocks this; an inherited one does
+    not, which is how a subclass overrides a method. Changing an implementation
+    the class already has is ``class_replaceMethod``, not this. Registration
+    order does not matter here -- both sides of
+    :func:`objc_registerClassPair` behave the same -- but a class must be
+    registered before anything can be messaged.
+    """
+
+    encoding = _bytes(types).decode("utf-8")
+    add = _objc.class_addMethod
+    add.restype = ctypes.c_bool
+    add.argtypes = (
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
+    )
+    thunk = _implementation(implementation, encoding)
+    # int(), not the bool: the compiled call site widens the callee's one-byte
+    # BOOL into a machine word, so it prints 1 where an unconverted True would
+    # print True.
+    return int(add(cls, selector, ctypes.cast(thunk, ctypes.c_void_p), _bytes(types)))
+
+
+def objc_registerClassPair(cls: int) -> None:
+    """Publish ``cls`` so it can be messaged. Returns nothing."""
+
+    register = _objc.objc_registerClassPair
+    register.restype = None
+    register.argtypes = (ctypes.c_void_p,)
+    register(cls)
 
 
 # --- CPython runtime entry points -------------------------------------------
