@@ -3400,3 +3400,88 @@ class UncaughtExceptionMessageTests(unittest.TestCase):
             b"",
             0,
         )
+
+
+class PartitionTests(unittest.TestCase):
+    """`str.partition()` and `str.rpartition()`, which answer a tuple."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    @staticmethod
+    def _runtime(text: str) -> str:
+        return f's = ""\nfor _i in range(0, 1):\n    s = s + {text!r}\n'
+
+    def test_it_cuts_at_the_first_and_the_last_separator(self):
+        self._run(
+            self._runtime("key=value=more")
+            + 'a, b, c = s.partition("=")\nprint(a, b, c)\n'
+            + 'd, e, f = s.rpartition("=")\nprint(d, e, f)\n',
+            b"key = value=more\nkey=value = more\n",
+        )
+
+    def test_an_absent_separator_fills_a_different_end(self):
+        # This is the one place the two differ beyond direction: partition
+        # puts the whole string first, rpartition puts it last.
+        self._run(
+            self._runtime("abc")
+            + 'a, b, c = s.partition("|")\nprint("[" + a + "][" + b + "][" + c + "]")\n'
+            + 'd, e, f = s.rpartition("|")\nprint("[" + d + "][" + e + "][" + f + "]")\n',
+            b"[abc][][]\n[][][abc]\n",
+        )
+
+    def test_a_separator_at_either_end(self):
+        self._run(
+            self._runtime("=v")
+            + 'a, b, c = s.partition("=")\nprint("[" + a + "][" + b + "][" + c + "]")\n',
+            b"[][=][v]\n",
+        )
+        self._run(
+            self._runtime("v=")
+            + 'a, b, c = s.partition("=")\nprint("[" + a + "][" + b + "][" + c + "]")\n',
+            b"[v][=][]\n",
+        )
+
+    def test_the_result_can_be_indexed_instead_of_unpacked(self):
+        self._run(
+            self._runtime("k=v") + 'print(s.partition("=")[0], s.partition("=")[2])\n',
+            b"k v\n",
+        )
+
+    def test_a_multi_character_separator(self):
+        self._run(
+            self._runtime("a::b::c") + 'a, b, c = s.rpartition("::")\nprint(a, b, c)\n',
+            b"a::b :: c\n",
+        )
+
+    def test_a_separator_that_is_not_ascii(self):
+        # The cut is by byte, which is safe because a valid UTF-8 separator
+        # can only match at a code-point boundary.
+        self._run(
+            self._runtime("héllo→wörld") + 'a, b, c = s.partition("→")\nprint(a, c)\n',
+            "héllo wörld\n".encode("utf-8"),
+        )
+
+    def test_an_empty_separator_raises(self):
+        self._run(
+            self._runtime("ab") + 'a, b, c = s.partition("")\nprint(a)\n',
+            b"",
+            expected_exit=1,
+        )

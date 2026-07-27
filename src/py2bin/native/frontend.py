@@ -7403,6 +7403,9 @@ class Frontend:
 
         if isinstance(node, ast.Name) and self.tuple_kinds_of(node.id) is not None:
             return IntLoad(self.slots[node.id])
+        if self.tuple_kinds(self.string_method_kind(node)) is not None:
+            assert isinstance(node, ast.Call)
+            return self.string_method_tuple(node)
         if isinstance(node, ast.Tuple):
             pointer_slot = self.new_temp()
             self.emit_tuple_literal(
@@ -7417,6 +7420,180 @@ class Frontend:
             "signed 64-bit integer, a float or a string, never a tuple, and "
             "there is no tuple slicing or concatenation",
         )
+
+    def string_method_tuple(self, node: ast.Call) -> IntExpression:
+        """Lower a string method whose result is a tuple of strings."""
+
+        assert isinstance(node.func, ast.Attribute)
+        name = self.check_string_method(node)
+        receiver_slot = self.new_temp()
+        separator_slot = self.new_temp()
+        self.operations.append(
+            Store(receiver_slot, self.string_pointer(node.func.value))
+        )
+        self.operations.append(
+            Store(separator_slot, self.string_pointer(node.args[0]))
+        )
+        # CPython raises for an empty separator here as it does for split().
+        usable = self.new_label("partition_separator_ok")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq", HeapLoad(IntLoad(separator_slot), 8), IntConstant(0)
+                ),
+                usable,
+            )
+        )
+        self.raise_exception("ValueError", b"ValueError: empty separator\n")
+        self.operations.append(Label(usable))
+        return self.emit_string_partition(
+            receiver_slot, separator_slot, name == "rpartition"
+        )
+
+    def emit_tuple_of_words(self, words: list[IntExpression]) -> IntExpression:
+        """A tuple block holding words already computed.
+
+        The literal path below builds its elements as it goes; this one takes
+        them, for a tuple whose parts were worked out before there was
+        anywhere to put them - which is what partition() has.
+        """
+
+        bump = self.ensure_heap()
+        pointer_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                pointer_slot,
+                IntConstant(self.TUPLE_HEADER_BYTES + len(words) * 8),
+                bump,
+            )
+        )
+        self.operations.append(
+            HeapStore(IntLoad(pointer_slot), IntConstant(len(words)), 8)
+        )
+        for index, word in enumerate(words):
+            self.operations.append(
+                HeapStore(
+                    IntBinary(
+                        "add",
+                        IntLoad(pointer_slot),
+                        IntConstant(self.TUPLE_HEADER_BYTES + index * 8),
+                    ),
+                    word,
+                    8,
+                )
+            )
+        return IntLoad(pointer_slot)
+
+    def emit_string_partition(
+        self, receiver_slot: int, separator_slot: int, from_right: bool
+    ) -> IntExpression:
+        """`s.partition(sep)` - (head, sep, tail), or (s, "", "") when absent.
+
+        The three pieces are cut at byte offsets. A valid UTF-8 separator can
+        only match at a code-point boundary, so no decoding is needed to know
+        the cut is in a legal place.
+        """
+
+        length = HeapLoad(IntLoad(receiver_slot), 8)
+        separator_length = HeapLoad(IntLoad(separator_slot), 8)
+        if from_right:
+            found_slot, at_slot = self.emit_last_substring(
+                receiver_slot, separator_slot
+            )
+        else:
+            found_slot, at_slot = self.emit_substring_scan(
+                receiver_slot,
+                separator_slot,
+                self.materialize_int_slot(IntConstant(0)),
+            )
+        head_slot = self.new_temp()
+        middle_slot = self.new_temp()
+        tail_slot = self.new_temp()
+        empty = self.materialize_int(self.materialize_string_constant(b""))
+        self.operations.append(Store(head_slot, IntLoad(receiver_slot)))
+        self.operations.append(Store(middle_slot, empty))
+        self.operations.append(Store(tail_slot, empty))
+        absent = self.new_label("partition_absent")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(found_slot), IntConstant(0)), absent
+            )
+        )
+        self.operations.append(
+            Store(
+                head_slot,
+                self.emit_string_span(
+                    receiver_slot, IntConstant(0), IntLoad(at_slot)
+                ),
+            )
+        )
+        self.operations.append(Store(middle_slot, IntLoad(separator_slot)))
+        self.operations.append(
+            Store(
+                tail_slot,
+                self.emit_string_span(
+                    receiver_slot,
+                    IntBinary("add", IntLoad(at_slot), separator_length),
+                    length,
+                ),
+            )
+        )
+        self.operations.append(Label(absent))
+        if from_right:
+            # rpartition puts the whole string in the *last* piece when the
+            # separator is absent, which is the one difference between them.
+            missing = self.new_label("rpartition_present")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("eq", IntLoad(found_slot), IntConstant(0)), missing
+                )
+            )
+            self.operations.append(Store(head_slot, empty))
+            self.operations.append(Store(tail_slot, IntLoad(receiver_slot)))
+            self.operations.append(Label(missing))
+        return self.emit_tuple_of_words(
+            [IntLoad(head_slot), IntLoad(middle_slot), IntLoad(tail_slot)]
+        )
+
+    def emit_last_substring(
+        self, receiver_slot: int, separator_slot: int
+    ) -> tuple[int, int]:
+        """The final occurrence of a needle, as (found, offset) slots.
+
+        Found by scanning forward and keeping the last hit rather than by
+        scanning backwards: the forward scan is already written, and walking
+        back would have to re-derive where each candidate starts.
+        """
+
+        cursor_slot = self.materialize_int_slot(IntConstant(0))
+        best_slot = self.new_temp()
+        ever_slot = self.new_temp()
+        self.operations.append(Store(best_slot, IntConstant(0)))
+        self.operations.append(Store(ever_slot, IntConstant(0)))
+        again = self.new_label("rfind")
+        done = self.new_label("rfind_done")
+        self.operations.append(Label(again))
+        found_slot, at_slot = self.emit_substring_scan(
+            receiver_slot, separator_slot, cursor_slot
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", IntLoad(found_slot), IntConstant(0)), done)
+        )
+        self.operations.append(Store(best_slot, IntLoad(at_slot)))
+        self.operations.append(Store(ever_slot, IntConstant(1)))
+        self.operations.append(
+            Store(cursor_slot, IntBinary("add", IntLoad(at_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(again))
+        self.operations.append(Label(done))
+        return ever_slot, best_slot
+
+    def materialize_int_slot(self, value: IntExpression) -> int:
+        """A slot holding ``value``, for a callee that wants one."""
+
+        slot = self.new_temp()
+        self.operations.append(Store(slot, value))
+        return slot
 
     def emit_tuple_literal(
         self, pointer_slot: int, node: ast.Tuple, kinds: tuple[str, ...]
@@ -10064,6 +10241,8 @@ class Frontend:
     _STRING_METHOD_KINDS = {
         "split": "list:str",
         "splitlines": "list:str",
+        "partition": "tuple:str,str,str",
+        "rpartition": "tuple:str,str,str",
         "join": "str",
         "startswith": "bool",
         "endswith": "bool",
@@ -10100,6 +10279,8 @@ class Frontend:
         "isdigit": 0,
         "isalpha": 0,
         "splitlines": 0,
+        "partition": 1,
+        "rpartition": 1,
         "isalnum": 0,
         "isspace": 0,
         "islower": 0,
@@ -17383,7 +17564,11 @@ class Frontend:
             return self.attribute_kind(node)
         method = self.string_method_kind(node, bindings)
         if method is not None:
-            if method == "str" or self.list_kind(method) is not None:
+            if (
+                method == "str"
+                or self.list_kind(method) is not None
+                or self.tuple_kinds(method) is not None
+            ):
                 return method
             return "int"
         kind = self.expression_function_kind(node, bindings)

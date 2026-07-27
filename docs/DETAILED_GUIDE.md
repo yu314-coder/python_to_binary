@@ -250,8 +250,11 @@ runtime:
   `.lstrip()`, `.rstrip()`, `.zfill()`, `.center()`, `.ljust()`, `.rjust()`,
   `.upper()`, `.lower()`, `.capitalize()`, `.title()`, `.isdigit()`,
   `.isalpha()`, `.isalnum()`, `.isspace()`, `.islower()`, `.isupper()`,
-  `.removeprefix()`, `.removesuffix()`, `.split()`, `.splitlines()` and
-  `.join()`. `.splitlines()` breaks on the universal-newline set, which like
+  `.removeprefix()`, `.removesuffix()`, `.split()`, `.splitlines()`,
+  `.partition()`, `.rpartition()` and `.join()`. The two partitions answer a
+  three-element tuple, which can be unpacked or indexed; when the separator is
+  absent they differ, partition putting the whole string in the first piece and
+  rpartition in the last, as CPython's do. `.splitlines()` breaks on the universal-newline set, which like
   Unicode whitespace is a small closed list matched as byte sequences: the
   seven single-byte ones, `\r\n` as one break rather than two, and NEL, LINE
   SEPARATOR and PARAGRAPH SEPARATOR. A trailing break makes no extra piece,
