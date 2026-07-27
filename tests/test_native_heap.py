@@ -3485,3 +3485,138 @@ class PartitionTests(unittest.TestCase):
             b"",
             expected_exit=1,
         )
+
+
+class FileAccessTests(unittest.TestCase):
+    """Reading and writing files through the open/read/write/close syscalls.
+
+    A file is not an object here - there is nothing to hold one - so the
+    surface is narrow: `open(path).read()` answers a string, and a name bound
+    by `with open(path, "w") as f` accepts `f.write(...)` inside that block and
+    means nothing outside it.
+    """
+
+    _POSIX = ("darwin-arm64", "linux-x86_64", "linux-arm64", "darwin-x86_64")
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> str:
+        """Compile for every POSIX target, run the host one, and return the
+        directory it ran in so a test can look at what it wrote."""
+
+        directory = tempfile.mkdtemp()
+        root = Path(directory)
+        entry = root / "program.py"
+        entry.write_text(source, encoding="utf-8")
+        for target in self._POSIX:
+            compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+        if not _HOST_IS_DARWIN_ARM64:
+            return directory
+        native = subprocess.run(
+            [str(root / "program-darwin-arm64.bin")], capture_output=True, cwd=directory
+        )
+        self.assertEqual(native.stdout, expected_stdout)
+        self.assertEqual(native.returncode, expected_exit)
+        return directory
+
+    def _compare(self, source: str, *, files: dict[str, str] | None = None) -> None:
+        """Run the compiled program and CPython in two clean directories and
+        require the same stdout, exit status, and files left behind."""
+
+        results = []
+        for runner in ("native", "cpython"):
+            directory = Path(tempfile.mkdtemp())
+            entry = directory / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for name, text in (files or {}).items():
+                (directory / name).write_text(text, encoding="utf-8")
+            if runner == "native":
+                binary = directory / "program.bin"
+                compile_native(entry, binary, "darwin-arm64", clean=True)
+                if not _HOST_IS_DARWIN_ARM64:
+                    return
+                finished = subprocess.run(
+                    [str(binary)], capture_output=True, cwd=directory
+                )
+            else:
+                finished = subprocess.run(
+                    [sys.executable, str(entry)], capture_output=True, cwd=directory
+                )
+            written = {
+                item.name: item.read_text(encoding="utf-8")
+                for item in sorted(directory.iterdir())
+                if item.suffix not in {".py", ".bin"}
+            }
+            results.append((finished.stdout, finished.returncode, written))
+        self.assertEqual(results[0], results[1])
+
+    def test_reading_a_whole_file(self):
+        self._compare(
+            'text = open("in.txt").read()\nprint(len(text))\nprint(text)\n',
+            files={"in.txt": "hello\nworld\n"},
+        )
+
+    def test_the_with_form_binds_the_file_for_the_block(self):
+        self._compare(
+            'with open("in.txt") as f:\n    text = f.read()\nprint(text.strip())\n',
+            files={"in.txt": "hello\nworld\n"},
+        )
+
+    def test_reading_and_splitting_into_lines(self):
+        self._compare(
+            'text = open("in.txt").read()\n'
+            'for line in text.splitlines():\n    print("[" + line + "]")\n',
+            files={"in.txt": "a\nb\n"},
+        )
+
+    def test_a_file_longer_than_one_read(self):
+        # The buffer doubles, so a file past the chunk size exercises the grow
+        # path and the copy that comes with it.
+        self._compare(
+            'text = open("big.txt").read()\nprint(len(text))\n',
+            files={"big.txt": "x" * 10000},
+        )
+
+    def test_an_empty_file(self):
+        self._compare(
+            'text = open("empty.txt").read()\nprint(len(text), text == "")\n',
+            files={"empty.txt": ""},
+        )
+
+    def test_writing_and_reading_back(self):
+        self._compare(
+            'with open("out.txt", "w") as f:\n    f.write("round trip")\n'
+            'print(open("out.txt").read())\n'
+        )
+
+    def test_appending_to_what_is_there(self):
+        self._compare(
+            'with open("out.txt", "w") as f:\n    f.write("a")\n'
+            'with open("out.txt", "a") as f:\n    f.write("b")\n'
+            'print(open("out.txt").read())\n'
+        )
+
+    def test_writing_text_built_while_running(self):
+        self._compare(
+            'lines = ["x", "y"]\n'
+            'with open("out.txt", "w") as f:\n    f.write("\\n".join(lines))\n'
+            'print(open("out.txt").read())\n'
+        )
+
+    def test_a_missing_file_raises_and_can_be_caught(self):
+        self._compare('text = open("nope.txt").read()\nprint(text)\n')
+        self._compare(
+            'try:\n    text = open("nope.txt").read()\n'
+            'except OSError:\n    print("caught")\n'
+        )
+
+    def test_the_windows_targets_refuse_it(self):
+        # The Windows path would need CreateFile and its handles rather than
+        # these syscalls, so it is refused rather than silently left out.
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "program.py"
+            entry.write_text('print(open("in.txt").read())\n', encoding="utf-8")
+            for target in ("windows-x86_64", "windows-arm64"):
+                with self.assertRaises(ValueError) as caught:
+                    compile_native(
+                        entry, Path(directory) / "p.exe", target, clean=True
+                    )
+                self.assertIn("POSIX only", str(caught.exception))

@@ -315,6 +315,22 @@ runtime:
   at run time; a string key keeps the general wording, because its repr would
   have to choose a quote character and decide what inside it is printable,
   which needs the Unicode tables that are not in the image;
+- reading and writing files, on POSIX targets only, through the open, read,
+  write and close system calls. `open(path).read()` answers the whole file as a
+  string, and a name bound by `with open(path, "w") as f` accepts `f.write(...)`
+  inside that block. A file is not an object here - there is nothing to hold
+  one - so the name means nothing outside the block that opened it, and the
+  modes are `r`, `w` and `a`, with an optional `b` that changes nothing because
+  a native string is already its bytes. The read buffer doubles rather than
+  asking the file how long it is: a regular file could be measured, a pipe
+  could not, and one path that works for both is worth more than a syscall
+  saved. A failed open raises `FileNotFoundError` for ENOENT and `OSError`
+  otherwise, both catchable; the wording is shorter than CPython's, which
+  carries the errno's own text. Darwin reports a failed syscall by setting the
+  carry flag with a positive errno while Linux returns `-errno`, and a small
+  positive number is a perfectly good descriptor, so the backends normalise the
+  carry case rather than testing the value. Windows is refused by name: it
+  would need CreateFile and its handles instead;
 - `assert test` and `assert test, "message"`, which raise a catchable
   `AssertionError`. Always emitted: CPython drops them under -O, there is no -O
   here, and a program that reaches the statement is one whose author wanted the

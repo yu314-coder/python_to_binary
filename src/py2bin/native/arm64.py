@@ -44,6 +44,7 @@ from .ir import (
     Store,
     Write,
     WriteRuntime,
+    FileCall,
     check_stack_slots,
 )
 
@@ -726,6 +727,10 @@ def _darwin_encode(module: Module, code_address: int) -> tuple[bytes, list[tuple
         mmap_number=197,
         mmap_flags=0x1002,  # MAP_ANON | MAP_PRIVATE
         svc=0xD4001001,
+        open_number=5,
+        read_number=3,
+        close_number=6,
+        errors_use_carry=True,
     )
 
 
@@ -738,6 +743,11 @@ def encode_linux(module: Module, code_address: int) -> bytes:
         mmap_number=222,
         mmap_flags=0x22,  # MAP_PRIVATE | MAP_ANONYMOUS
         svc=0xD4000001,
+        # There is no plain open on this kernel, only openat.
+        open_number=56,
+        read_number=63,
+        close_number=57,
+        open_takes_dirfd=True,
     )
     if externs:
         raise ValueError("external symbol calls are not supported for linux-arm64")
@@ -911,6 +921,19 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
             elif isinstance(operation, ExitValue):
                 _expression(words, operation.value, slot_base, refs)
                 call("ExitProcess")
+            else:
+                # Silently skipping an operation would produce an image that
+                # runs and quietly does less than the program says.
+                name = type(operation).__name__
+                if name == "FileCall":
+                    raise ValueError(
+                        "native file access is POSIX only: it goes through the "
+                        "open, read, write and close system calls, and Windows "
+                        "would need CreateFile and its handles instead"
+                    )
+                raise ValueError(
+                    f"{name} is not supported on Windows ARM64"
+                )
 
         _patch_branches(words, labels, branches)
 
@@ -986,12 +1009,46 @@ class _Syscalls:
     mmap_number: int
     mmap_flags: int
     svc: int
+    #: open/read/close, and whether open takes a leading directory descriptor.
+    #: Linux arm64 has no plain open at all, only openat, so the two kernels
+    #: differ in arity and not just in numbering.
+    open_number: int = 0
+    read_number: int = 0
+    close_number: int = 0
+    open_takes_dirfd: bool = False
+    #: Darwin reports a failed syscall by setting the carry flag and leaving a
+    #: positive errno behind; Linux returns -errno. A small positive number is
+    #: a perfectly good file descriptor, so the two cannot be told apart by the
+    #: value and the flag has to be read.
+    errors_use_carry: bool = False
 
     @property
     def register(self) -> int:
         """The register the kernel reads the syscall number from."""
 
         return 8 if self.svc == 0xD4000001 else 16
+
+
+def _file_call_shape(operation, system) -> tuple[int, tuple]:
+    """The syscall number and the argument list the kernel expects."""
+
+    numbers = {
+        "open": system.open_number,
+        "read": system.read_number,
+        "write": system.write_number,
+        "close": system.close_number,
+    }
+    number = numbers.get(operation.kind, 0)
+    if not number:
+        raise ValueError(
+            f"file operation {operation.kind!r} is not available on this target"
+        )
+    arguments = operation.arguments
+    if operation.kind == "open" and system.open_takes_dirfd:
+        # AT_FDCWD, so a relative path is resolved against the working
+        # directory exactly as plain open() would resolve it.
+        arguments = (IntConstant(-100), *arguments)
+    return number, arguments
 
 
 def _emit_operations(
@@ -1042,6 +1099,26 @@ def _emit_operations(
             if instruction is None:
                 raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
             words.append(instruction)
+            continue
+        if isinstance(operation, FileCall):
+            number, arguments = _file_call_shape(operation, system)
+            # Every argument is computed and spilled before any register is
+            # loaded, because computing one can use every scratch register.
+            for argument in arguments:
+                _expression(words, argument, slot_base, refs)
+                words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+            for index in reversed(range(len(arguments))):
+                words.extend(
+                    (0xF94003E0 | index, 0x910043FF)  # ldr xN,[sp]; add sp,#16
+                )
+            words.extend(_mov(syscall_register, number))
+            words.append(system.svc)
+            if system.errors_use_carry:
+                # csneg x0, x0, x0, cc: keep the answer while the carry is
+                # clear, negate it when it is set, so every target leaves
+                # -errno behind and the caller has one thing to test.
+                words.append(0xDA803400)
+            words.extend(_slot_instruction(False, operation.dest_slot, slot_base))
             continue
         if isinstance(operation, WriteRuntime):
             _expression(words, operation.length, slot_base, refs)  # x0 = length
@@ -1189,6 +1266,11 @@ def _encode(
     mmap_number: int,
     mmap_flags: int,
     svc: int,
+    open_number: int = 0,
+    read_number: int = 0,
+    close_number: int = 0,
+    open_takes_dirfd: bool = False,
+    errors_use_carry: bool = False,
 ) -> tuple[bytes, list[tuple[int, str]]]:
     """Encode a module to ARM64 machine code.
 
@@ -1196,7 +1278,18 @@ def _encode(
     ``(byte_offset_in_text, symbol)`` pairs (empty unless the module contains
     ``ExternCall`` operations, which only the darwin dynamic path allows).
     """
-    system = _Syscalls(write_number, exit_number, mmap_number, mmap_flags, svc)
+    system = _Syscalls(
+        write_number,
+        exit_number,
+        mmap_number,
+        mmap_flags,
+        svc,
+        open_number,
+        read_number,
+        close_number,
+        open_takes_dirfd,
+        errors_use_carry,
+    )
     words: list[int] = list(_frame_sub(_frame_bytes(module.stack_slots)))
     words.append(0x910003FD)  # mov x29, sp
     _emit_static_block(words, module.static_bytes, system)

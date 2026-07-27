@@ -43,6 +43,7 @@ from .ir import (
     Store,
     Write,
     WriteRuntime,
+    FileCall,
 )
 from .kernels import (
     KernelValue,
@@ -956,6 +957,10 @@ class Frontend:
         self.exception_slot: int | None = None
         self.exception_value_slot: int | None = None
         self.exception_message_slot: int | None = None
+        # Names bound by `with open(...) as f`, and the descriptor slot each
+        # one stands for. A file is not an object here - there is nothing to
+        # hold one - so the name is known only inside the block that opened it.
+        self.open_files: dict[str, int] = {}
         self._dtoa_scratch_slot: int | None = None
         self._prologue: list[object] = []
         self._bool_text_slot: int | None = None
@@ -7450,6 +7455,306 @@ class Frontend:
             receiver_slot, separator_slot, name == "rpartition"
         )
 
+    #: How much a read() asks for at a time. One page: small enough that a
+    #: short file wastes little of an arena that never reclaims, large enough
+    #: that a big one is not read a byte at a time.
+    READ_CHUNK_BYTES = 4096
+
+    def file_read_shape(self, node: ast.expr) -> ast.Call | None:
+        """`open(path).read()` or `f.read()` on an opened name, else None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != "read"
+            or node.args
+            or node.keywords
+        ):
+            return None
+        receiver = node.func.value
+        if self.open_call_shape(receiver) is not None:
+            return node
+        if isinstance(receiver, ast.Name) and receiver.id in self.open_files:
+            return node
+        return None
+
+    def emit_file_read(self, node: ast.Call) -> IntExpression:
+        """The whole file as a string, closing it if this call opened it."""
+
+        assert isinstance(node.func, ast.Attribute)
+        receiver = node.func.value
+        if isinstance(receiver, ast.Name) and receiver.id in self.open_files:
+            return self.emit_read_all(self.open_files[receiver.id])
+        assert isinstance(receiver, ast.Call)
+        descriptor = self.emit_open(receiver)
+        text = self.materialize_int(self.emit_read_all(descriptor))
+        # Nothing else can reach this descriptor, so it is closed here rather
+        # than left for the process to drop at exit.
+        self.emit_close(descriptor)
+        return text
+
+    def file_write_call(self, node: ast.Call) -> bool:
+        """Lower `f.write(s)` on an opened name; returns whether it was one."""
+
+        if (
+            not isinstance(node.func, ast.Attribute)
+            or node.func.attr not in {"write", "close"}
+            or not isinstance(node.func.value, ast.Name)
+            or node.func.value.id not in self.open_files
+        ):
+            return False
+        descriptor = self.open_files[node.func.value.id]
+        if node.func.attr == "close":
+            if node.args or node.keywords:
+                raise NativeCompileError(
+                    self.path, node, "close() takes no arguments"
+                )
+            self.emit_close(descriptor)
+            return True
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "write() takes exactly one string"
+            )
+        self.emit_write_all(descriptor, self.string_pointer(node.args[0]))
+        return True
+
+    def open_call_shape(self, node: ast.expr) -> tuple[ast.expr, str] | None:
+        """`open(path)` or `open(path, mode)` as (path, mode), or None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id != "open"
+            or node.func.id in self.functions
+        ):
+            return None
+        if node.keywords or not 1 <= len(node.args) <= 2:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native open() takes a path and an optional mode",
+            )
+        mode = "r"
+        if len(node.args) == 2:
+            try:
+                mode = self.constant(node.args[1])
+            except NativeCompileError as error:
+                raise NativeCompileError(
+                    self.path,
+                    node.args[1],
+                    "a native open() mode is written into the image, so it has "
+                    "to be known at build time",
+                ) from error
+            if mode not in {"r", "w", "a", "rb", "wb", "ab"}:
+                raise NativeCompileError(
+                    self.path,
+                    node.args[1],
+                    f"native open() supports the modes r, w and a (with an "
+                    f"optional b); {mode!r} is not one of them",
+                )
+        return node.args[0], mode
+
+    def emit_open(self, node: ast.Call) -> int:
+        """Open a file and return the slot holding its descriptor.
+
+        The path is copied into a block with a zero byte after it, because a
+        native string knows its own length while the kernel wants a terminator.
+        """
+
+        shape = self.open_call_shape(node)
+        assert shape is not None
+        path, mode = shape
+        text = self.materialize_int(self.string_pointer(path))
+        length = self.materialize_int(HeapLoad(text, 8))
+        bump = self.ensure_heap()
+        buffer = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                buffer, IntBinary("add", length, IntConstant(8)), bump
+            )
+        )
+        self.emit_byte_copy(
+            IntLoad(buffer), IntBinary("add", text, IntConstant(8)), length
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", IntLoad(buffer), length), IntConstant(0), 1
+            )
+        )
+        # O_RDONLY is 0; O_WRONLY|O_CREAT|O_TRUNC and the append form are the
+        # same three bits on both kernels this targets.
+        flags = {"r": 0, "w": 0x201 | 0x400, "a": 0x201 | 0x8}[mode.rstrip("b")]
+        descriptor = self.new_temp()
+        self.operations.append(
+            FileCall(
+                "open",
+                descriptor,
+                (IntLoad(buffer), IntConstant(flags), IntConstant(0o644)),
+            )
+        )
+        opened = self.new_label("file_opened")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(descriptor), IntConstant(0)), opened
+            )
+        )
+        # The type is the part a program branches on, and ENOENT is the one
+        # worth telling apart: CPython raises FileNotFoundError there, which
+        # `except OSError` still catches. The wording stays short - CPython's
+        # carries the errno's own text, which would need the table.
+        present = self.new_label("file_present")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(descriptor), IntConstant(-2)), present
+            )
+        )
+        self.raise_exception(
+            "FileNotFoundError", b"FileNotFoundError: no such file\n"
+        )
+        self.operations.append(Label(present))
+        self.raise_exception("OSError", b"OSError: cannot open file\n")
+        self.operations.append(Label(opened))
+        return descriptor
+
+    def emit_read_all(self, descriptor: int) -> IntExpression:
+        """Read to end of file and return a string block holding it.
+
+        The block grows by doubling, the way a list does, because the size is
+        not known before reading: a regular file could be measured with fstat,
+        but a pipe could not, and one path that works for both is worth more
+        than one syscall saved.
+        """
+
+        bump = self.ensure_heap()
+        capacity = self.new_temp()
+        filled = self.new_temp()
+        block = self.new_temp()
+        self.operations.append(Store(capacity, IntConstant(self.READ_CHUNK_BYTES)))
+        self.operations.append(Store(filled, IntConstant(0)))
+        self.operations.append(
+            HeapAlloc(block, IntBinary("add", IntLoad(capacity), IntConstant(8)), bump)
+        )
+        again = self.new_label("read_again")
+        done = self.new_label("read_done")
+        self.operations.append(Label(again))
+        room = self.new_label("read_room")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ge",
+                    IntBinary("sub", IntLoad(capacity), IntLoad(filled)),
+                    IntConstant(self.READ_CHUNK_BYTES),
+                ),
+                room + "_grow",
+            )
+        )
+        self.operations.append(Jump(room))
+        self.operations.append(Label(room + "_grow"))
+        bigger = self.new_temp()
+        self.operations.append(
+            Store(capacity, IntBinary("mul", IntLoad(capacity), IntConstant(2)))
+        )
+        self.operations.append(
+            HeapAlloc(bigger, IntBinary("add", IntLoad(capacity), IntConstant(8)), bump)
+        )
+        self.emit_byte_copy(
+            IntBinary("add", IntLoad(bigger), IntConstant(8)),
+            IntBinary("add", IntLoad(block), IntConstant(8)),
+            IntLoad(filled),
+        )
+        self.operations.append(Store(block, IntLoad(bigger)))
+        self.operations.append(Label(room))
+        taken = self.new_temp()
+        self.operations.append(
+            FileCall(
+                "read",
+                taken,
+                (
+                    IntLoad(descriptor),
+                    IntBinary(
+                        "add",
+                        IntBinary("add", IntLoad(block), IntConstant(8)),
+                        IntLoad(filled),
+                    ),
+                    IntConstant(self.READ_CHUNK_BYTES),
+                ),
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(IntCompare("gt", IntLoad(taken), IntConstant(0)), done)
+        )
+        self.operations.append(
+            Store(filled, IntBinary("add", IntLoad(filled), IntLoad(taken)))
+        )
+        self.operations.append(Jump(again))
+        self.operations.append(Label(done))
+        # A negative result is an error rather than end of file.
+        clean = self.new_label("read_clean")
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(taken), IntConstant(0)), clean)
+        )
+        self.raise_exception("OSError", b"OSError: cannot read file\n")
+        self.operations.append(Label(clean))
+        self.operations.append(HeapStore(IntLoad(block), IntLoad(filled), 8))
+        return IntLoad(block)
+
+    def emit_write_all(self, descriptor: int, text: IntExpression) -> None:
+        """Write a whole string block, looping until the kernel has taken it."""
+
+        source = self.materialize_int(text)
+        remaining = self.new_temp()
+        cursor = self.new_temp()
+        self.operations.append(Store(remaining, HeapLoad(source, 8)))
+        self.operations.append(Store(cursor, IntConstant(0)))
+        again = self.new_label("write_again")
+        done = self.new_label("write_done")
+        self.operations.append(Label(again))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("gt", IntLoad(remaining), IntConstant(0)), done
+            )
+        )
+        written = self.new_temp()
+        self.operations.append(
+            FileCall(
+                "write",
+                written,
+                (
+                    IntLoad(descriptor),
+                    IntBinary(
+                        "add",
+                        IntBinary("add", source, IntConstant(8)),
+                        IntLoad(cursor),
+                    ),
+                    IntLoad(remaining),
+                ),
+            )
+        )
+        progress = self.new_label("write_progress")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("gt", IntLoad(written), IntConstant(0)), progress + "_bad"
+            )
+        )
+        self.operations.append(Jump(progress))
+        self.operations.append(Label(progress + "_bad"))
+        self.raise_exception("OSError", b"OSError: cannot write file\n")
+        self.operations.append(Label(progress))
+        self.operations.append(
+            Store(cursor, IntBinary("add", IntLoad(cursor), IntLoad(written)))
+        )
+        self.operations.append(
+            Store(
+                remaining, IntBinary("sub", IntLoad(remaining), IntLoad(written))
+            )
+        )
+        self.operations.append(Jump(again))
+        self.operations.append(Label(done))
+
+    def emit_close(self, descriptor: int) -> None:
+        ignored = self.new_temp()
+        self.operations.append(FileCall("close", ignored, (IntLoad(descriptor),)))
+
     def emit_tuple_of_words(self, words: list[IntExpression]) -> IntExpression:
         """A tuple block holding words already computed.
 
@@ -9993,6 +10298,9 @@ class Frontend:
             # The answer is an element, and an element of this list is the
             # address of a string block.
             return self.integer(node)
+        if self.file_read_shape(node) is not None:
+            assert isinstance(node, ast.Call)
+            return self.emit_file_read(node)
         if self.list_method_shape(node, "pop") == "str":
             # The element word is the string's block address.
             assert isinstance(node, ast.Call)
@@ -14444,6 +14752,8 @@ class Frontend:
             raise NativeCompileError(self.path, node, "only print() and SystemExit are valid expression statements")
         if self.list_method_call(node):
             return
+        if isinstance(node, ast.Call) and self.file_write_call(node):
+            return
         if self.set_method_call(node):
             return
         if self.string_method_kind(node) is not None:
@@ -14855,6 +15165,48 @@ class Frontend:
             )
         )
 
+    def with_open(self, node: ast.With, item: ast.withitem) -> None:
+        """`with open(path) as f:` - open, run the body, close on the way out.
+
+        The name stands for a descriptor and is known only inside the block.
+        There is no file object to hold, and nothing outside could be given
+        one, so binding it further would be binding a number that has since
+        been closed.
+        """
+
+        assert isinstance(item.context_expr, ast.Call)
+        if item.optional_vars is None or not isinstance(
+            item.optional_vars, ast.Name
+        ):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native `with open(...)` binds one name for the file",
+            )
+        name = item.optional_vars.id
+        if name in self.slots or name in self.values:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"{name!r} already means something else here; a file name is "
+                "only bound inside the block that opened it",
+            )
+        descriptor = self.emit_open(item.context_expr)
+        previous = self.open_files.get(name)
+        self.open_files[name] = descriptor
+        try:
+            for statement in node.body:
+                self.statement(statement)
+        finally:
+            if previous is None:
+                self.open_files.pop(name, None)
+            else:
+                self.open_files[name] = previous
+        # Closed on the way out. A raise inside the body leaves through the
+        # handler stack without passing here, and the process closes it then -
+        # the same trade `finally` would have to make without a return address.
+        self.emit_close(descriptor)
+
     def with_statement(self, node: ast.With) -> None:
         """Run a body with a native object's `__enter__`/`__exit__` around it.
 
@@ -14878,6 +15230,9 @@ class Frontend:
             )
         item = node.items[0]
         manager = item.context_expr
+        if self.open_call_shape(manager) is not None:
+            self.with_open(node, item)
+            return
         native_class = self.resolve_object_class(manager)
         if native_class is None:
             raise NativeCompileError(
@@ -17477,6 +17832,8 @@ class Frontend:
             and node.func.id == "chr"
             and node.func.id not in self.functions
         ):
+            return "str"
+        if self.file_read_shape(node) is not None:
             return "str"
         if (
             isinstance(node, ast.Call)

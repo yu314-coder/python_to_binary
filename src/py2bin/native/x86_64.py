@@ -41,6 +41,7 @@ from .ir import (
     Store,
     Write,
     WriteRuntime,
+    FileCall,
     check_stack_slots,
 )
 
@@ -506,6 +507,34 @@ class _Syscalls86:
     exit_number: int
     mmap_number: int
     mmap_flags: int
+    open_number: int = 0
+    read_number: int = 0
+    close_number: int = 0
+    open_takes_dirfd: bool = False
+    #: Darwin sets the carry flag and returns a positive errno; Linux returns
+    #: -errno. A small positive number is a valid descriptor, so the flag is
+    #: what distinguishes them.
+    errors_use_carry: bool = False
+
+
+def _file_call_shape(operation, system) -> tuple[int, tuple]:
+    """The syscall number and the argument list the kernel expects."""
+
+    numbers = {
+        "open": system.open_number,
+        "read": system.read_number,
+        "write": system.write_number,
+        "close": system.close_number,
+    }
+    number = numbers.get(operation.kind, 0)
+    if not number and operation.kind != "read":
+        raise ValueError(
+            f"file operation {operation.kind!r} is not available on this target"
+        )
+    arguments = operation.arguments
+    if operation.kind == "open" and system.open_takes_dirfd:
+        arguments = (IntConstant(-100), *arguments)  # AT_FDCWD
+    return number, arguments
 
 
 def _emit_x86_operations(
@@ -547,6 +576,34 @@ def _emit_x86_operations(
             if instruction is None:
                 raise ValueError(f"unsupported x86-64 heap store size {operation.size}")
             code.extend(instruction)
+        elif isinstance(operation, FileCall):
+            number, arguments = _file_call_shape(operation, system)
+            # Spilled before any argument register is loaded, because
+            # computing one argument may use every scratch register.
+            for argument in arguments:
+                _expression(code, argument, slot_base, refs)
+                code.extend(_SPILL)
+            # rdi, rsi, rdx, r10 - the syscall order, which is not the call
+            # order: the kernel reads the fourth from r10 and not from rcx.
+            loads = (
+                b"\x48\x8b\x3c\x24",  # mov rdi, [rsp]
+                b"\x48\x8b\x34\x24",  # mov rsi, [rsp]
+                b"\x48\x8b\x14\x24",  # mov rdx, [rsp]
+                b"\x4c\x8b\x14\x24",  # mov r10, [rsp]
+            )
+            for index in reversed(range(len(arguments))):
+                code.extend(loads[index])
+                code.extend(_DROP)
+            code.extend(b"\x48\xc7\xc0" + struct.pack("<I", number))
+            code.extend(b"\x0f\x05")
+            if system.errors_use_carry:
+                # jnc +3; neg rax - so every target leaves -errno behind.
+                code.extend(b"\x73\x03\x48\xf7\xd8")
+            # mov [rbp + slot], rax  - the kernel's answer.
+            code.extend(
+                b"\x48\x89\x85"
+                + struct.pack("<i", slot_base + operation.dest_slot * 8)
+            )
         elif isinstance(operation, WriteRuntime):
             _expression(code, operation.length, slot_base, refs)
             code.extend(_SPILL)
@@ -656,12 +713,16 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
     if platform == "linux":
         write_number, exit_number = 1, 60
         mmap_number, mmap_flags = 9, 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
+        files = (2, 0, 3, False, False)  # open, read, close; this kernel has open
     elif platform == "darwin":
         write_number, exit_number = 0x02000004, 0x02000001
         mmap_number, mmap_flags = 0x020000C5, 0x1002  # MAP_ANON | MAP_PRIVATE
+        files = (0x02000005, 0x02000003, 0x02000006, False, True)
     else:
         raise ValueError(f"unsupported x86-64 syscall platform: {platform}")
-    system = _Syscalls86(write_number, exit_number, mmap_number, mmap_flags)
+    system = _Syscalls86(
+        write_number, exit_number, mmap_number, mmap_flags, *files
+    )
 
     code = bytearray()
     code.extend(_sub_stack(_frame_bytes(module.stack_slots)))
@@ -875,6 +936,19 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 _expression(code, operation.value, slot_base, refs)
                 code.extend(b"\x89\xc1")  # mov ecx, eax
                 indirect_call("ExitProcess")
+            else:
+                # Silently skipping an operation would produce an image that
+                # runs and quietly does less than the program says.
+                name = type(operation).__name__
+                if name == "FileCall":
+                    raise ValueError(
+                        "native file access is POSIX only: it goes through the "
+                        "open, read, write and close system calls, and Windows "
+                        "would need CreateFile and its handles instead"
+                    )
+                raise ValueError(
+                    f"{name} is not supported on Windows x86-64"
+                )
 
         _patch_branches(code, labels, branches)
 

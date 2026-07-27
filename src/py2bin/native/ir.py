@@ -447,6 +447,20 @@ class WriteRuntime:
 
 
 @dataclass(frozen=True, slots=True)
+class FileCall:
+    """One file syscall, with its result left in ``dest_slot``.
+
+    ``kind`` is "open", "read", "write" or "close". The arguments are in the
+    order the kernel wants them, and a negative result is the negated errno,
+    which the caller checks - nothing here raises on its own.
+    """
+
+    kind: str
+    dest_slot: int
+    arguments: tuple["IntExpression", ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Return:
     """Return from the enclosing ``Function`` with ``value`` in the result register.
 
@@ -471,6 +485,7 @@ Operation = (
     | HeapAlloc
     | HeapStore
     | WriteRuntime
+    | FileCall
     | Return
 )
 
