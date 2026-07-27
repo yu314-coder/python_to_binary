@@ -2332,6 +2332,11 @@ def _matches_abi(ctype: CType, kind: str, *, result: bool = False) -> bool:
         return isinstance(ctype, IntegerType)
     if kind == "ptr":
         return isinstance(ctype, PointerType)
+    if kind == "f64":
+        # Specifically a double. A C ``float`` is passed in the same register
+        # class but is half the width, so accepting it would hand the callee
+        # a value it reads as twice the bits it was given.
+        return isinstance(ctype, FloatingType) and ctype.size == 8
     if kind in {"cstr", "cfmt"}:
         return not result and isinstance(ctype, PointerType) and ctype.target in {
             CHAR,
@@ -3953,6 +3958,14 @@ class Lowerer:
                         f"{what} needs a pointer handle; pass a handle or NULL",
                         argument.token,
                     )
+            elif kind == "f64":
+                # A double travels in its own register class, so it is passed
+                # as a double rather than squeezed through an integer.
+                if not isinstance(value.ctype, (FloatingType, IntegerType)):
+                    self.error(
+                        f"{what} needs a number, not {value.ctype}", argument.token
+                    )
+                arguments.append(self.widen(value))
             else:
                 if not is_integer(value.ctype):
                     self.error(

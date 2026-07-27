@@ -67,6 +67,9 @@ extern long long PyObject_Size(PyObject *object);
 extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
 extern PyObject *PyTuple_New(long long length);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
+extern PyObject *PyFloat_FromDouble(double value);
+extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
+extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
 extern int PyList_Append(PyObject *list, PyObject *value);
 extern PyObject *PyObject_GetIter(PyObject *object);
@@ -192,6 +195,10 @@ class CApiEmitter:
             return self.comparison(node, indent)
         if isinstance(node, ast.List):
             return self.list_literal(node, indent)
+        if isinstance(node, ast.Subscript):
+            return self.subscript(node, indent)
+        if isinstance(node, ast.UnaryOp):
+            return self.unary(node, indent)
         if isinstance(node, ast.Attribute):
             return self.attribute(node, indent)
         if isinstance(node, ast.Call):
@@ -203,7 +210,15 @@ class CApiEmitter:
     def constant(self, node: ast.Constant, indent: int) -> str:
         target = self.temporary()
         if isinstance(node.value, bool) or node.value is None:
-            raise self.fail(node, "bool and None are not translated here yet")
+            # True, False and None are attributes of the builtins module, so
+            # they come from the interpreter like every other builtin rather
+            # than being reconstructed here.
+            self.current.temporaries -= 1
+            self.current.locals.remove(target)
+            return self.builtin(repr(node.value), indent)
+        if isinstance(node.value, float):
+            self.emit(f"{target} = PyFloat_FromDouble({node.value!r});", indent)
+            return self.checked(target, indent)
         if isinstance(node.value, int):
             self.emit(
                 f"{target} = PyLong_FromLongLong({node.value}LL);", indent
@@ -256,6 +271,57 @@ class CApiEmitter:
         )
         self.emit(f"Py_DecRef({left});", indent)
         self.emit(f"Py_DecRef({right});", indent)
+        return self.checked(target, indent)
+
+    def unary(self, node: ast.UnaryOp, indent: int) -> str:
+        """`-x` and `not x`. There is no PyNumber_Negative in the vetted set,
+        so a negation is `0 - x`, which is the same operation."""
+
+        if isinstance(node.op, ast.USub):
+            zero = self.temporary()
+            self.emit(f"{zero} = PyLong_FromLongLong(0LL);", indent)
+            self.checked(zero, indent)
+            value = self.expression(node.operand, indent)
+            target = self.temporary()
+            self.emit(f"{target} = PyNumber_Subtract({zero}, {value});", indent)
+            self.emit(f"Py_DecRef({zero});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            return self.checked(target, indent)
+        if isinstance(node.op, ast.Not):
+            value = self.expression(node.operand, indent)
+            decision = self.temporary_flag()
+            self.emit(f"{decision} = PyObject_IsTrue({value});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+            # A conditional expression cannot be a C-API argument here, so
+            # the two names are fetched on their own branches.
+            target = self.temporary()
+            self.emit(f"if ({decision}) {{", indent)
+            self.emit(
+                f'    {target} = PyObject_GetAttrString(_py2bin_builtins, "False");',
+                indent,
+            )
+            self.emit("} else {", indent)
+            self.emit(
+                f'    {target} = PyObject_GetAttrString(_py2bin_builtins, "True");',
+                indent,
+            )
+            self.emit("}", indent)
+            return self.checked(target, indent)
+        raise self.fail(node, f"{type(node.op).__name__} is not translated here yet")
+
+    def subscript(self, node: ast.Subscript, indent: int) -> str:
+        """`xs[k]` - the object protocol, so a list, a dict and a string all
+        work without any of them being known about here."""
+
+        if isinstance(node.slice, ast.Slice):
+            raise self.fail(node, "a slice is not translated here yet")
+        container = self.expression(node.value, indent)
+        key = self.expression(node.slice, indent)
+        target = self.temporary()
+        self.emit(f"{target} = PyObject_GetItem({container}, {key});", indent)
+        self.emit(f"Py_DecRef({container});", indent)
+        self.emit(f"Py_DecRef({key});", indent)
         return self.checked(target, indent)
 
     def list_literal(self, node: ast.List, indent: int) -> str:

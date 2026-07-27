@@ -235,8 +235,9 @@ class CApiEmitTests(unittest.TestCase):
         )
 
     def test_what_is_not_translated_says_so(self):
-        self._reject("x = 1.5\n", "float constant is not translated")
-        self._reject("x = None\n", "bool and None are not translated here yet")
+        self._reject("x = {1: 2}\n", "has no C-API translation here yet")
+        self._reject("x = (1, 2)\n", "has no C-API translation here yet")
+
         # An unknown name is no longer refused at build time: it is looked up
         # in builtins while the program runs, which is how range() and sum()
         # work. One that does not exist fails then, with AttributeError rather

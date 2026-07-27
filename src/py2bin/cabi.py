@@ -46,6 +46,8 @@ __all__ = [
     # Iteration. PyIter_Next answers NULL both when the sequence is exhausted
     # and when it fails, which PyErr_Occurred tells apart.
     "PyObject_GetIter", "PyIter_Next",
+    "PyFloat_FromDouble", "PyFloat_AsDouble",
+    "PyObject_GetItem", "PyObject_SetItem",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -771,6 +773,10 @@ _PyTuple_New = _bind("PyTuple_New", _HANDLE, _SSIZE)
 _PyTuple_SetItem = _bind("PyTuple_SetItem", ctypes.c_int, _HANDLE, _SSIZE, _HANDLE)
 _PyObject_GetIter = _bind("PyObject_GetIter", _HANDLE, _HANDLE)
 _PyIter_Next = _bind("PyIter_Next", _HANDLE, _HANDLE)
+_PyFloat_FromDouble = _bind("PyFloat_FromDouble", _HANDLE, ctypes.c_double)
+_PyFloat_AsDouble = _bind("PyFloat_AsDouble", ctypes.c_double, _HANDLE)
+_PyObject_GetItem = _bind("PyObject_GetItem", _HANDLE, _HANDLE, _HANDLE)
+_PyObject_SetItem = _bind("PyObject_SetItem", ctypes.c_int, _HANDLE, _HANDLE, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -879,6 +885,22 @@ def PyObject_Call(callable_handle: int, arguments: int, keywords: int) -> int:
 
 def PyTuple_New(length: int) -> int:
     return _handle(_PyTuple_New(length))
+
+
+def PyFloat_FromDouble(value: float) -> int:
+    return _handle(_PyFloat_FromDouble(float(value)))
+
+
+def PyFloat_AsDouble(value: int) -> float:
+    return float(_PyFloat_AsDouble(value))
+
+
+def PyObject_GetItem(container: int, key: int) -> int:
+    return _handle(_PyObject_GetItem(container, key))
+
+
+def PyObject_SetItem(container: int, key: int, value: int) -> int:
+    return _returned(_PyObject_SetItem(container, key, value))
 
 
 def PyObject_GetIter(object_handle: int) -> int:
