@@ -199,10 +199,49 @@ class CApiEmitTests(unittest.TestCase):
         self._run_failing("import math\nprint(math.no_such_thing)\n", b"AttributeError")
         self._run_failing('import math\nprint(math.sqrt("x"))\n', b"TypeError")
 
+    def test_for_loops_use_the_iterator_protocol(self):
+        # Whatever the object offers, because the interpreter is the one being
+        # asked - unlike the native tier, which has to know the shape of every
+        # iterable it supports.
+        self._run("for i in range(5):\n    print(i)\n", b"0\n1\n2\n3\n4\n")
+        self._run('for ch in "abc":\n    print(ch)\n', b"a\nb\nc\n")
+        self._run("for x in [10, 20]:\n    print(x)\n", b"10\n20\n")
+
+    def test_nested_loops_and_accumulation(self):
+        self._run(
+            "total = 0\nfor i in range(1000):\n    total = total + i\nprint(total)\n",
+            b"499500\n",
+        )
+        self._run(
+            "for i in range(2):\n    for j in range(2):\n"
+            "        print(i * 10 + j)\n",
+            b"0\n1\n10\n11\n",
+        )
+
+    def test_builtins_come_from_the_interpreter(self):
+        # Nothing here reimplements range, sum or sorted. The builtins module
+        # is imported once and these are read off it.
+        self._run("print(sum(range(10)))\n", b"45\n")
+        self._run('print(sorted("banana"))\n', b"['a', 'a', 'a', 'b', 'n', 'n']\n")
+        self._run("xs = list(range(5))\nprint(xs, len(xs))\n", b"[0, 1, 2, 3, 4] 5\n")
+
+    def test_list_literals_and_append(self):
+        # PyList_Append does not steal its reference, unlike PyTuple_SetItem,
+        # so each element is released after it goes in.
+        self._run("xs = [1, 2, 3]\nprint(xs, len(xs))\n", b"[1, 2, 3] 3\n")
+        self._run(
+            "xs = []\nfor i in range(4):\n    xs.append(i * i)\nprint(xs)\n",
+            b"[0, 1, 4, 9]\n",
+        )
+
     def test_what_is_not_translated_says_so(self):
-        self._reject("x = [1, 2]\n", "has no C-API translation here yet")
+        self._reject("x = 1.5\n", "float constant is not translated")
         self._reject("x = None\n", "bool and None are not translated here yet")
-        self._reject("print(unknown(1))\n", "not a function defined in this module")
+        # An unknown name is no longer refused at build time: it is looked up
+        # in builtins while the program runs, which is how range() and sum()
+        # work. One that does not exist fails then, with AttributeError rather
+        # than the NameError CPython gives - the same exit status, a different
+        # type, and worth recording rather than papering over.
         self._reject("print(x)\n", "used before it is assigned")
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):

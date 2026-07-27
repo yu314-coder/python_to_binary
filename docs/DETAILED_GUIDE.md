@@ -219,10 +219,25 @@ tuple that `PyObject_Call` takes. `PyTuple_SetItem` *steals* the reference it
 is handed, so nothing is released after it - releasing again would drop a
 reference this code no longer owns.
 
-Translated so far: integer and string literals, names, `+ - * /`, the six
-comparisons, `if`/`else`, `while`, `print()` with any number of values,
-`str()`, `len()`, `import`, attribute access, method calls of any arity, and
-functions with positional parameters, including recursive ones.
+`for` goes through the iterator protocol, so whatever the object offers works -
+`range(...)`, a list, a string, a generator - because the interpreter is the
+one being asked. That is the difference from the native tier, which has to know
+the shape of every iterable it supports. `PyIter_Next` answers NULL both when
+the sequence ends and when producing the next item fails, and `PyErr_Occurred`
+is what tells those apart.
+
+A name that is not a local and not a function defined in the module is looked
+up in `builtins`, which is imported once at startup. So `range`, `sum`,
+`sorted`, `list` and the rest are the interpreter's own - nothing here
+reimplements them. One consequence is worth recording: a name that does not
+exist anywhere fails with `AttributeError` rather than the `NameError` CPython
+gives. Same exit status, different type.
+
+Translated so far: integer and string literals, list literals, names,
+`+ - * /`, the six comparisons, `if`/`else`, `while`, `for`, `print()` with any
+number of values, `str()`, `len()`, `import`, attribute access, builtins,
+method calls of any arity, and functions with positional parameters, including
+recursive ones.
 Everything else says which construct it is and that it has no translation yet.
 Text outside ASCII goes into the C as octal escapes so the source stays ASCII,
 and the embedded interpreter's stdout is set to UTF-8 on the way in - without
@@ -1149,7 +1164,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 34 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 36 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

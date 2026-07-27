@@ -67,6 +67,11 @@ extern long long PyObject_Size(PyObject *object);
 extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
 extern PyObject *PyTuple_New(long long length);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
+extern PyObject *PyList_New(long long length);
+extern int PyList_Append(PyObject *list, PyObject *value);
+extern PyObject *PyObject_GetIter(PyObject *object);
+extern PyObject *PyIter_Next(PyObject *iterator);
+extern PyObject *PyErr_Occurred(void);
 extern void PyErr_Print(void);
 extern int exit(int status);
 """
@@ -185,6 +190,8 @@ class CApiEmitter:
             return self.binary(node, indent)
         if isinstance(node, ast.Compare):
             return self.comparison(node, indent)
+        if isinstance(node, ast.List):
+            return self.list_literal(node, indent)
         if isinstance(node, ast.Attribute):
             return self.attribute(node, indent)
         if isinstance(node, ast.Call):
@@ -251,6 +258,38 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({right});", indent)
         return self.checked(target, indent)
 
+    def list_literal(self, node: ast.List, indent: int) -> str:
+        """`[a, b, c]` - an empty list, then each element appended.
+
+        PyList_Append does *not* steal its reference, unlike PyTuple_SetItem,
+        so each element is released after it goes in.
+        """
+
+        target = self.temporary()
+        self.emit(f"{target} = PyList_New(0LL);", indent)
+        self.checked(target, indent)
+        for element in node.elts:
+            value = self.expression(element, indent)
+            self.emit(f"PyList_Append({target}, {value});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+        return target
+
+    def builtin(self, name: str, indent: int) -> str:
+        """A name from the builtins module, fetched the way Python fetches it.
+
+        `range`, `sum`, `sorted`, `abs`, `dict` - anything the interpreter
+        already has. Nothing here reimplements them; the module is imported
+        once at startup and this reads an attribute off it.
+        """
+
+        target = self.temporary()
+        self.emit(
+            f"{target} = PyObject_GetAttrString(_py2bin_builtins, "
+            f"{_c_string(name)});",
+            indent,
+        )
+        return self.checked(target, indent)
+
     def attribute(self, node: ast.Attribute, indent: int) -> str:
         value = self.expression(node.value, indent)
         target = self.temporary()
@@ -285,9 +324,11 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({value});", indent)
             return self.checked(target, indent)
         if node.func.id not in self.known_functions:
-            raise self.fail(
-                node, f"{node.func.id!r} is not a function defined in this module"
-            )
+            # Not one of ours, so ask the interpreter for it.
+            callable_value = self.builtin(node.func.id, indent)
+            target = self.invoke(callable_value, node.args, indent)
+            self.emit(f"Py_DecRef({callable_value});", indent)
+            return target
         expected = self.known_functions[node.func.id]
         if len(node.args) != expected:
             raise self.fail(
@@ -356,6 +397,8 @@ class CApiEmitter:
             self.conditional(node, indent)
         elif isinstance(node, ast.While):
             self.loop(node, indent)
+        elif isinstance(node, ast.For):
+            self.for_loop(node, indent)
         elif isinstance(node, ast.Return):
             self.give_back(node, indent)
         elif isinstance(node, ast.Import):
@@ -452,6 +495,41 @@ class CApiEmitter:
             self.statement(statement, indent + 1)
         self.emit("}", indent)
 
+    def for_loop(self, node: ast.For, indent: int) -> None:
+        """`for x in seq:` - the iterator protocol, exactly as Python runs it.
+
+        `range(...)`, a list, a string, a file, a generator: whatever the
+        object offers, because the interpreter is the one being asked. That is
+        the difference from the native tier, which has to know the shape of
+        every iterable it supports.
+        """
+
+        if node.orelse:
+            raise self.fail(node, "a for-else is not translated here yet")
+        if not isinstance(node.target, ast.Name):
+            raise self.fail(node, "a for loop binds one name here")
+        sequence = self.expression(node.iter, indent)
+        iterator = self.temporary()
+        self.emit(f"{iterator} = PyObject_GetIter({sequence});", indent)
+        self.checked(iterator, indent)
+        self.emit(f"Py_DecRef({sequence});", indent)
+        item = self.temporary()
+        target = self.declare(node.target.id)
+        self.emit("while (1) {", indent)
+        self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
+        # NULL means the sequence ended, or that producing the next item
+        # failed. Asking whether an exception is set is what tells them apart.
+        self.emit(
+            f"if (!{item}) {{ if (PyErr_Occurred()) {{ PyErr_Print(); exit(1); }} break; }}",
+            indent + 1,
+        )
+        self.emit(f"if ({target}) Py_DecRef({target});", indent + 1)
+        self.emit(f"{target} = {item};", indent + 1)
+        for statement in node.body:
+            self.statement(statement, indent + 1)
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({iterator});", indent)
+
     def temporary_flag(self) -> str:
         assert self.current is not None
         self.current.temporaries += 1
@@ -534,8 +612,14 @@ class CApiEmitter:
             out.append("}")
             out.append("")
         entry = self.functions[-1]
+        out.append("static PyObject *_py2bin_builtins = 0;")
+        out.append("")
         out.append("int main(void) {")
         out.append("    Py_Initialize();")
+        out.append('    _py2bin_builtins = PyImport_ImportModule("builtins");')
+        out.append(
+            "    if (!_py2bin_builtins) { PyErr_Print(); exit(1); }"
+        )
         # An embedded interpreter picks its own stdout encoding, and it is not
         # always UTF-8; a program that prints text outside ASCII would stop
         # with a UnicodeEncodeError that has nothing to do with the program.

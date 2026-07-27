@@ -43,6 +43,9 @@ __all__ = [
     # PyObject_Call takes. PyTuple_SetItem steals its reference, which the
     # callers here account for.
     "PyObject_Call", "PyTuple_New", "PyTuple_SetItem",
+    # Iteration. PyIter_Next answers NULL both when the sequence is exhausted
+    # and when it fails, which PyErr_Occurred tells apart.
+    "PyObject_GetIter", "PyIter_Next",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -766,6 +769,8 @@ _PyImport_ImportModule = _bind("PyImport_ImportModule", _HANDLE, ctypes.c_char_p
 _PyObject_Call = _bind("PyObject_Call", _HANDLE, _HANDLE, _HANDLE, _HANDLE)
 _PyTuple_New = _bind("PyTuple_New", _HANDLE, _SSIZE)
 _PyTuple_SetItem = _bind("PyTuple_SetItem", ctypes.c_int, _HANDLE, _SSIZE, _HANDLE)
+_PyObject_GetIter = _bind("PyObject_GetIter", _HANDLE, _HANDLE)
+_PyIter_Next = _bind("PyIter_Next", _HANDLE, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -874,6 +879,20 @@ def PyObject_Call(callable_handle: int, arguments: int, keywords: int) -> int:
 
 def PyTuple_New(length: int) -> int:
     return _handle(_PyTuple_New(length))
+
+
+def PyObject_GetIter(object_handle: int) -> int:
+    return _handle(_PyObject_GetIter(object_handle))
+
+
+def PyIter_Next(iterator: int) -> int:
+    """The next item, or 0 when the sequence is exhausted *or* it failed.
+
+    The two are told apart by asking ``PyErr_Occurred`` afterwards, which is
+    what the generated C does.
+    """
+
+    return _handle(_PyIter_Next(iterator))
 
 
 def PyTuple_SetItem(tuple_handle: int, index: int, value: int) -> int:
