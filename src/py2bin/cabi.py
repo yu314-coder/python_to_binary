@@ -26,6 +26,7 @@ import operator
 
 __all__ = [
     "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
+    "exit",
     "pow", "fmod", "hypot", "atan2", "copysign", "ldexp",
     "objc_getClass", "sel_registerName", "objc_msgSend", "objc_msgSend2",
     "objc_msgSend_str", "objc_msgSend_id_id", "objc_msgSend_long",
@@ -129,6 +130,18 @@ def strlen(text: str | bytes) -> int:
     return int(_libc.strlen(data))
 
 
+def exit(status: int) -> int:  # noqa: A001 - the C name is the point
+    """C ``exit``: end the process with ``status``.
+
+    Under a compiled binary this ends the process. Called from Python here it
+    would end the *interpreter*, which is never what a caller of this module
+    means, so it raises SystemExit instead - the same thing, in the terms this
+    side of the boundary uses.
+    """
+
+    raise SystemExit(int(status))
+
+
 # These are C ``pow``/``fmod``/... and NOT Python's builtins: C pow(-8.0, 1/3)
 # is NaN where Python's ** raises, and C fmod keeps the dividend's sign where
 # Python's % keeps the divisor's. The name in this module always means the C
@@ -216,6 +229,7 @@ def _cpython_library() -> str:
 _LIBC_SYMBOLS = frozenset(
     {
         "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
+        "exit",
         "pow", "fmod", "hypot", "atan2", "copysign", "ldexp",
     }
 )

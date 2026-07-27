@@ -211,6 +211,9 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "abs": ("abs", ("int",)),
     "labs": ("labs", ("int",)),
     "strlen": ("strlen", ("cstr",)),
+    # An uncaught Python exception leaves with status 1, and the C-API
+    # emitter needs a way to do the same from inside a called function.
+    "exit": ("exit", ("int",)),
     # The libm double entry points. These are the smallest honest exercise of
     # the floating-point half of AAPCS64: pow/fmod/hypot/atan2/copysign take two
     # doubles in d0-d1, and ldexp takes a double in d0 AND an int in x0, which
@@ -323,6 +326,7 @@ _CABI_RESULTS: dict[str, str] = {
     "abs": "int",
     "labs": "int",
     "strlen": "int",
+    "exit": "int",
     "pow": "float",
     "fmod": "float",
     "hypot": "float",

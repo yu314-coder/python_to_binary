@@ -192,6 +192,14 @@ typedefs and macros this project's C front end does not parse, and the dozen
 entry points actually used fit in as many `extern` declarations, so the C
 declares them itself.
 
+A C-API call that fails answers NULL and leaves an exception set, and every
+result is checked for it. Letting a NULL travel is how `1 + "x"` came to print
+`<NULL>` and exit 0 where CPython raises TypeError - so on failure the
+exception is printed and the process leaves with status 1, which is what the
+interpreter does with one that nothing catches, and nothing here can catch one
+yet. `1 / 0`, a missing module, a missing attribute and a wrong argument type
+all give CPython's own message and CPython's own exit status.
+
 Reference counting follows one rule, chosen so that it can be checked by
 reading: **every expression yields a reference the caller owns**, and every
 statement releases what it finishes with. Reading a name increments before

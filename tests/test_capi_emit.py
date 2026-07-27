@@ -158,6 +158,47 @@ class CApiEmitTests(unittest.TestCase):
             b"166670\n",
         )
 
+    def _run_failing(self, source: str, needle: bytes) -> None:
+        """A program that raises: the message and the status must both match."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            generated = root / "program.c"
+            generated.write_text(
+                python_to_capi_c(source, str(entry)), encoding="utf-8", newline="\n"
+            )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            binary = root / "program.bin"
+            compile_c_native(generated, binary, target="darwin-arm64", clean=True)
+            native = subprocess.run([str(binary)], capture_output=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.returncode, 1)
+            self.assertEqual(native.returncode, reference.returncode)
+            self.assertIn(needle, native.stderr)
+            self.assertIn(needle, reference.stderr)
+
+    def test_a_failing_call_stops_with_the_interpreters_own_message(self):
+        # A C-API function answers NULL and leaves an exception set. Letting
+        # that NULL travel is how `1 + "x"` came to print `<NULL>` and exit 0
+        # where CPython raises. Every C-API result is checked now, and an
+        # uncaught exception leaves with status 1, which is what CPython does.
+        self._run_failing('print(1 + "x")\n', b"TypeError")
+        self._run_failing("print(1 / 0)\n", b"ZeroDivisionError")
+
+    def test_a_failing_import_stops_rather_than_carrying_on(self):
+        self._run_failing(
+            "import nonexistent_module_xyz\nprint(1)\n", b"ModuleNotFoundError"
+        )
+
+    def test_a_missing_attribute_and_a_bad_argument(self):
+        self._run_failing("import math\nprint(math.no_such_thing)\n", b"AttributeError")
+        self._run_failing('import math\nprint(math.sqrt("x"))\n', b"TypeError")
+
     def test_what_is_not_translated_says_so(self):
         self._reject("x = [1, 2]\n", "has no C-API translation here yet")
         self._reject("x = None\n", "bool and None are not translated here yet")

@@ -67,6 +67,8 @@ extern long long PyObject_Size(PyObject *object);
 extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
 extern PyObject *PyTuple_New(long long length);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
+extern void PyErr_Print(void);
+extern int exit(int status);
 """
 
 #: CPython's comparison opcodes, in the order Py_LT..Py_GE.
@@ -141,6 +143,19 @@ class CApiEmitter:
         assert self.current is not None
         self.current.body.append("    " * indent + line)
 
+    def checked(self, target: str, indent: int) -> str:
+        """Stop if the C-API call failed.
+
+        A C-API function answers NULL and leaves an exception set. Letting that
+        NULL travel is how `1 + "x"` came to print `<NULL>` and exit 0 where
+        CPython raises TypeError and exits 1. Printing the exception and
+        leaving with status 1 is what the interpreter does with one nothing
+        catches, and nothing here can catch one yet.
+        """
+
+        self.emit(f"if (!{target}) {{ PyErr_Print(); exit(1); }}", indent)
+        return target
+
     def temporary(self) -> str:
         assert self.current is not None
         self.current.temporaries += 1
@@ -186,12 +201,12 @@ class CApiEmitter:
             self.emit(
                 f"{target} = PyLong_FromLongLong({node.value}LL);", indent
             )
-            return target
+            return self.checked(target, indent)
         if isinstance(node.value, str):
             self.emit(
                 f"{target} = PyUnicode_FromString({_c_string(node.value)});", indent
             )
-            return target
+            return self.checked(target, indent)
         raise self.fail(node, f"a {type(node.value).__name__} constant is not translated here yet")
 
     def name(self, node: ast.Name, indent: int) -> str:
@@ -218,7 +233,7 @@ class CApiEmitter:
         self.emit(f"{target} = {function}({left}, {right});", indent)
         self.emit(f"Py_DecRef({left});", indent)
         self.emit(f"Py_DecRef({right});", indent)
-        return target
+        return self.checked(target, indent)
 
     def comparison(self, node: ast.Compare, indent: int) -> str:
         if len(node.ops) != 1:
@@ -234,7 +249,7 @@ class CApiEmitter:
         )
         self.emit(f"Py_DecRef({left});", indent)
         self.emit(f"Py_DecRef({right});", indent)
-        return target
+        return self.checked(target, indent)
 
     def attribute(self, node: ast.Attribute, indent: int) -> str:
         value = self.expression(node.value, indent)
@@ -244,7 +259,7 @@ class CApiEmitter:
             indent,
         )
         self.emit(f"Py_DecRef({value});", indent)
-        return target
+        return self.checked(target, indent)
 
     def call(self, node: ast.Call, indent: int) -> str:
         if node.keywords:
@@ -260,7 +275,7 @@ class CApiEmitter:
             target = self.temporary()
             self.emit(f"{target} = PyLong_FromLongLong(PyObject_Size({value}));", indent)
             self.emit(f"Py_DecRef({value});", indent)
-            return target
+            return self.checked(target, indent)
         if node.func.id == "str":
             if len(node.args) != 1:
                 raise self.fail(node, "str() takes one argument")
@@ -268,7 +283,7 @@ class CApiEmitter:
             target = self.temporary()
             self.emit(f"{target} = PyObject_Str({value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
-            return target
+            return self.checked(target, indent)
         if node.func.id not in self.known_functions:
             raise self.fail(
                 node, f"{node.func.id!r} is not a function defined in this module"
@@ -285,7 +300,7 @@ class CApiEmitter:
         self.emit(f"{target} = f_{node.func.id}({', '.join(arguments)});", indent)
         for argument in arguments:
             self.emit(f"Py_DecRef({argument});", indent)
-        return target
+        return self.checked(target, indent)
 
     def method_call(self, node: ast.Call, indent: int) -> str:
         """`x.f()` and `x.f(a)` - the two arities the vetted set can call.
@@ -299,7 +314,7 @@ class CApiEmitter:
         callable_value = self.attribute(node.func, indent)
         target = self.invoke(callable_value, node.args, indent)
         self.emit(f"Py_DecRef({callable_value});", indent)
-        return target
+        return self.checked(target, indent)
 
     def invoke(self, callable_value: str, args: list, indent: int) -> str:
         """Call something with any number of arguments.
@@ -313,14 +328,14 @@ class CApiEmitter:
         target = self.temporary()
         if not args:
             self.emit(f"{target} = PyObject_CallNoArgs({callable_value});", indent)
-            return target
+            return self.checked(target, indent)
         if len(args) == 1:
             argument = self.expression(args[0], indent)
             self.emit(
                 f"{target} = PyObject_CallOneArg({callable_value}, {argument});", indent
             )
             self.emit(f"Py_DecRef({argument});", indent)
-            return target
+            return self.checked(target, indent)
         values = [self.expression(item, indent) for item in args]
         holder = self.temporary()
         self.emit(f"{holder} = PyTuple_New({len(values)}LL);", indent)
@@ -328,7 +343,7 @@ class CApiEmitter:
             self.emit(f"PyTuple_SetItem({holder}, {position}LL, {value});", indent)
         self.emit(f"{target} = PyObject_Call({callable_value}, {holder}, 0);", indent)
         self.emit(f"Py_DecRef({holder});", indent)
-        return target
+        return self.checked(target, indent)
 
     # --- statements ------------------------------------------------------
 
@@ -370,6 +385,7 @@ class CApiEmitter:
             self.emit(
                 f'{target} = PyImport_ImportModule({_c_string(alias.name)});', indent
             )
+            self.checked(target, indent)
 
     def assignment(self, node: ast.Assign, indent: int) -> None:
         if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
