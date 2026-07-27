@@ -14437,6 +14437,17 @@ class Frontend:
         if self.expression_function_kind(node, bindings) == "float":
             assert isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             function = self.functions[node.func.id]
+            if id(function) in call_stack:
+                # This branch substitutes the body at the call site, so a
+                # function that calls itself would substitute forever. The
+                # integer path reports this with a location; get there rather
+                # than running out of Python stack.
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"recursive native function call to {node.func.id}() is "
+                    "not supported",
+                )
             arguments = self.bind_native_arguments(
                 node.func.id, function, node, bindings, call_stack
             )
