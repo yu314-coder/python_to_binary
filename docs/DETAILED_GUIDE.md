@@ -200,9 +200,20 @@ everywhere is worth more than one that saves an increment in places. A
 500,000-iteration loop peaks at 14 MB, which is what that looks like from
 outside.
 
+`import` works, and it is where the tier earns its cost: the interpreter is
+present and its import machinery runs, so a compiled program reaches anything
+installed beside it. That includes modules which are themselves C extensions -
+`import math; print(math.factorial(30))` gives the exact 33-digit answer -
+because those extensions are loaded by the interpreter exactly as they always
+are. Attribute access and method calls follow, though a method call takes no
+more than one argument: the vetted C-API set has `PyObject_CallNoArgs` and
+`PyObject_CallOneArg` and no way to build an argument tuple, so more is refused
+by name rather than approximated.
+
 Translated so far: integer and string literals, names, `+ - * /`, the six
 comparisons, `if`/`else`, `while`, `print()` with any number of values,
-`str()`, and functions with positional parameters, including recursive ones.
+`str()`, `len()`, `import`, attribute access, method calls of no more than one
+argument, and functions with positional parameters, including recursive ones.
 Everything else says which construct it is and that it has no translation yet.
 Text outside ASCII goes into the C as octal escapes so the source stays ASCII,
 and the embedded interpreter's stdout is set to UTF-8 on the way in - without

@@ -116,6 +116,38 @@ class CApiEmitTests(unittest.TestCase):
             b"19999900000\n",
         )
 
+    def test_a_compiled_program_can_import_and_use_a_module(self):
+        # This is what the tier is for. The interpreter is present and its
+        # import machinery works, so the compiled program reaches anything
+        # installed beside it - including modules that are themselves C
+        # extensions, which is what `math` is.
+        self._run("import math\nprint(math.sqrt(2))\n", b"1.4142135623730951\n")
+        self._run(
+            "import math\nprint(math.factorial(30))\n",
+            b"265252859812191058636308480000000\n",
+        )
+
+    def test_modules_that_are_mostly_python(self):
+        self._run("import json\nprint(json.dumps(42))\n", b"42\n")
+        self._run('import re\nprint(re.escape("a.b"))\n', b"a\\.b\n")
+
+    def test_methods_on_ordinary_objects(self):
+        self._run(
+            's = "Hello World"\nprint(s.upper())\nprint(s.lower())\n',
+            b"HELLO WORLD\nhello world\n",
+        )
+
+    def test_len_goes_through_the_object_protocol(self):
+        self._run('print(len("hello"))\n', b"5\n")
+
+    def test_a_method_call_with_too_many_arguments_says_why(self):
+        # The vetted C-API set has CallNoArgs and CallOneArg and no way to
+        # build an argument tuple, so this is refused rather than approximated.
+        self._reject(
+            'import math\nprint(math.pow(2, 3))\n',
+            "no more than one argument",
+        )
+
     def test_what_is_not_translated_says_so(self):
         self._reject("x = [1, 2]\n", "has no C-API translation here yet")
         self._reject("x = None\n", "bool and None are not translated here yet")

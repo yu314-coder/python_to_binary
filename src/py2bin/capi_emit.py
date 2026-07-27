@@ -59,6 +59,11 @@ extern int PyFile_WriteString(const char *text, PyObject *stream);
 extern void Py_IncRef(PyObject *object);
 extern void Py_DecRef(PyObject *object);
 extern int PyRun_SimpleString(const char *command);
+extern PyObject *PyImport_ImportModule(const char *name);
+extern PyObject *PyObject_GetAttrString(PyObject *object, const char *name);
+extern PyObject *PyObject_CallNoArgs(PyObject *callable);
+extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *argument);
+extern long long PyObject_Size(PyObject *object);
 """
 
 #: CPython's comparison opcodes, in the order Py_LT..Py_GE.
@@ -162,6 +167,8 @@ class CApiEmitter:
             return self.binary(node, indent)
         if isinstance(node, ast.Compare):
             return self.comparison(node, indent)
+        if isinstance(node, ast.Attribute):
+            return self.attribute(node, indent)
         if isinstance(node, ast.Call):
             return self.call(node, indent)
         raise self.fail(
@@ -226,11 +233,31 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({right});", indent)
         return target
 
+    def attribute(self, node: ast.Attribute, indent: int) -> str:
+        value = self.expression(node.value, indent)
+        target = self.temporary()
+        self.emit(
+            f"{target} = PyObject_GetAttrString({value}, {_c_string(node.attr)});",
+            indent,
+        )
+        self.emit(f"Py_DecRef({value});", indent)
+        return target
+
     def call(self, node: ast.Call, indent: int) -> str:
-        if not isinstance(node.func, ast.Name):
-            raise self.fail(node, "only a call to a named function is translated here")
         if node.keywords:
             raise self.fail(node, "keyword arguments are not translated here yet")
+        if isinstance(node.func, ast.Attribute):
+            return self.method_call(node, indent)
+        if not isinstance(node.func, ast.Name):
+            raise self.fail(node, "only a call to a named function is translated here")
+        if node.func.id == "len":
+            if len(node.args) != 1:
+                raise self.fail(node, "len() takes one argument")
+            value = self.expression(node.args[0], indent)
+            target = self.temporary()
+            self.emit(f"{target} = PyLong_FromLongLong(PyObject_Size({value}));", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            return target
         if node.func.id == "str":
             if len(node.args) != 1:
                 raise self.fail(node, "str() takes one argument")
@@ -257,6 +284,35 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({argument});", indent)
         return target
 
+    def method_call(self, node: ast.Call, indent: int) -> str:
+        """`x.f()` and `x.f(a)` - the two arities the vetted set can call.
+
+        More arguments need PyObject_Call and a tuple to put them in, and
+        neither is in the vetted set, so they are refused by name rather than
+        approximated.
+        """
+
+        assert isinstance(node.func, ast.Attribute)
+        if len(node.args) > 1:
+            raise self.fail(
+                node,
+                "a method call takes no more than one argument here; the "
+                "vetted C-API set has CallNoArgs and CallOneArg and no way to "
+                "build an argument tuple",
+            )
+        callable_value = self.attribute(node.func, indent)
+        target = self.temporary()
+        if node.args:
+            argument = self.expression(node.args[0], indent)
+            self.emit(
+                f"{target} = PyObject_CallOneArg({callable_value}, {argument});", indent
+            )
+            self.emit(f"Py_DecRef({argument});", indent)
+        else:
+            self.emit(f"{target} = PyObject_CallNoArgs({callable_value});", indent)
+        self.emit(f"Py_DecRef({callable_value});", indent)
+        return target
+
     # --- statements ------------------------------------------------------
 
     def statement(self, node: ast.stmt, indent: int) -> None:
@@ -270,6 +326,8 @@ class CApiEmitter:
             self.loop(node, indent)
         elif isinstance(node, ast.Return):
             self.give_back(node, indent)
+        elif isinstance(node, ast.Import):
+            self.import_module(node, indent)
         elif isinstance(node, ast.Pass):
             pass
         elif isinstance(node, ast.FunctionDef):
@@ -277,6 +335,23 @@ class CApiEmitter:
         else:
             raise self.fail(
                 node, f"{type(node).__name__} has no C-API translation here yet"
+            )
+
+    def import_module(self, node: ast.Import, indent: int) -> None:
+        """`import x` - the module object, bound to a name like any value.
+
+        This is where the tier earns its cost. The interpreter is present and
+        its import machinery works, so a compiled program can reach anything
+        installed beside it - which is the whole reason to pay for libpython.
+        """
+
+        for alias in node.names:
+            if "." in alias.name:
+                raise self.fail(node, "a dotted import is not translated here yet")
+            target = self.declare(alias.asname or alias.name)
+            self.emit(f"if ({target}) Py_DecRef({target});", indent)
+            self.emit(
+                f'{target} = PyImport_ImportModule({_c_string(alias.name)});', indent
             )
 
     def assignment(self, node: ast.Assign, indent: int) -> None:
