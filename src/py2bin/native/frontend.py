@@ -8088,6 +8088,19 @@ class Frontend:
                 self.path, self.values = previous_path, previous_values
                 self.functions = previous_functions
                 self.string_bindings = previous_strings
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "str"
+            and node.func.id not in self.functions
+        ):
+            if len(node.args) != 1 or node.keywords:
+                raise NativeCompileError(
+                    self.path, node, "native str() takes exactly one argument"
+                )
+            # str(x) is what an f-string field already renders, so it is the
+            # same call rather than a second implementation of the same text.
+            return self.render_as_string(node.args[0])
         if isinstance(node, ast.JoinedStr):
             return self.joined_string(node)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -14564,6 +14577,8 @@ class Frontend:
                     return self.list_tag(element)
                 if self.set_kind(source_kind) is not None:
                     return self.list_tag(self.set_kind(source_kind))
+            if node.func.id == "str" and node.func.id not in self.functions:
+                return "str"
             if (
                 node.func.id in {"int", "len", "abs"} | self._AGGREGATE_CALLS
                 and node.func.id not in self.functions
