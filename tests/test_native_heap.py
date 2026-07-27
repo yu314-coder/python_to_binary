@@ -3341,6 +3341,58 @@ class UncaughtExceptionMessageTests(unittest.TestCase):
             1,
         )
 
+    def test_a_missing_integer_key_is_named(self):
+        # KeyError shows the key, which is only known while the program runs,
+        # so the message is built there rather than written into the image.
+        self._run("d = {1: 2}\nprint(d[5])\n", b"", b"KeyError: 5", 1)
+        self._run(
+            "d = {1: 2}\nk = 0\nfor _i in range(0, 9):\n    k = k + 1\n"
+            "print(d[k])\n",
+            b"",
+            b"KeyError: 9",
+            1,
+        )
+
+    def test_a_negative_key_and_one_past_a_rehash(self):
+        self._run(
+            "d = {1: 2}\nk = 0\nfor _i in range(0, 3):\n    k = k - 1\n"
+            "print(d[k])\n",
+            b"",
+            b"KeyError: -3",
+            1,
+        )
+        self._run(
+            "d: dict[int, int] = {}\nfor i in range(0, 40):\n    d[i] = i\n"
+            "print(d[999])\n",
+            b"",
+            b"KeyError: 999",
+            1,
+        )
+
+    def test_a_deleted_key_reads_as_missing(self):
+        self._run("d = {1: 2, 3: 4}\ndel d[1]\nprint(d[1])\n", b"", b"KeyError: 1", 1)
+
+    def test_a_string_key_keeps_the_general_wording(self):
+        # Its repr would have to choose a quote character and escape what is
+        # inside it, and deciding what is printable needs the Unicode tables
+        # that are not in the image. The type and the exit status still match.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text('d = {"a": 1}\nprint(d["z"])\n', encoding="utf-8")
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(binary)], capture_output=True)
+            self.assertEqual(native.returncode, 1)
+            self.assertIn(b"KeyError", native.stderr)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(reference.returncode, 1)
+            self.assertIn(b"KeyError: 'z'", reference.stderr)
+
     def test_a_caught_exception_is_unaffected(self):
         self._run(
             'try:\n    raise ValueError("v")\nexcept ValueError:\n    print("caught")\n',

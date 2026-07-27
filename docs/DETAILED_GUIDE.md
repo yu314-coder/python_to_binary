@@ -304,6 +304,14 @@ runtime:
   with one of the two and one slot cannot hold either kind. An instance is
   always true, which is said outright rather than left to fall out of its
   address being non-zero;
+- an exception keeps its message when it passes a handler that does not match
+  it. The message travels with the identifier, as the address of its string
+  block, so `raise ValueError("v")` inside a `try` that catches only TypeError
+  still reports `ValueError: v` rather than `ValueError`. A dict lookup that
+  misses names the key it did not find - `KeyError: 5` - by building the text
+  at run time; a string key keeps the general wording, because its repr would
+  have to choose a quote character and decide what inside it is printable,
+  which needs the Unicode tables that are not in the image;
 - `assert test` and `assert test, "message"`, which raise a catchable
   `AssertionError`. Always emitted: CPython drops them under -O, there is no -O
   here, and a program that reaches the statement is one whose author wanted the

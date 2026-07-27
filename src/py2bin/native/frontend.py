@@ -7154,9 +7154,36 @@ class Frontend:
         )
         self.operations.append(Jump(present))
         self.operations.append(Label(present + "_missing"))
-        self.raise_exception("KeyError", b"KeyError: key not in native dict\n")
+        self.raise_exception(
+            "KeyError",
+            b"KeyError: key not in native dict\n",
+            message_pointer=self.emit_key_error_message(
+                IntLoad(_key), key_kind
+            ),
+        )
         self.operations.append(Label(present))
         return IntBinary("add", IntLoad(address_slot), IntConstant(16))
+
+    def emit_key_error_message(
+        self, key: IntExpression, key_kind: str
+    ) -> IntExpression | None:
+        """`KeyError: 5` as a string block, or None when it cannot be built.
+
+        Integer keys only. KeyError shows the key's repr, and a string's repr
+        has to choose its quote character and escape what is inside it -
+        which needs the Unicode tables that are not in the image to decide
+        what is printable, so a string key keeps the general wording.
+        """
+
+        if key_kind != "int":
+            return None
+        return self.emit_concat(
+            self.materialize_string_constant(b"KeyError: "),
+            self.emit_concat(
+                self.emit_int_to_string(key),
+                self.materialize_string_constant(b"\n"),
+            ),
+        )
 
     def dict_literal_tag(
         self, node: ast.Dict, bindings: dict[str, IntExpression] | None = None
@@ -14466,10 +14493,28 @@ class Frontend:
         name: str,
         message: bytes,
         value: IntExpression | None = None,
+        message_pointer: IntExpression | None = None,
     ) -> None:
-        """Raise ``name``, either into the innermost handler or out of the program."""
+        """Raise ``name``, either into the innermost handler or out of the program.
+
+        ``message_pointer`` is a string block built while the program runs,
+        for the reports that name a value only known then - the key a dict
+        lookup did not find. ``message`` is still passed as the wording to fall
+        back on if the pointer is not available on some path.
+        """
 
         if not self.handler_stack:
+            if message_pointer is not None and name != "SystemExit":
+                pinned = self.materialize_int(message_pointer)
+                self.operations.append(
+                    WriteRuntime(
+                        IntBinary("add", pinned, IntConstant(8)),
+                        HeapLoad(pinned, 8),
+                        2,
+                    )
+                )
+                self.operations.append(Exit(1))
+                return
             # Nothing can catch it, so report it where it happens: the message
             # is known here and would be lost by going through the dispatch.
             if name == "SystemExit":
@@ -14491,7 +14536,9 @@ class Frontend:
         self.operations.append(
             Store(
                 self.exception_message_slot,
-                self.materialize_string_constant(message),
+                message_pointer
+                if message_pointer is not None
+                else self.materialize_string_constant(message),
             )
         )
         self.operations.append(Jump(self.handler_stack[-1]))
