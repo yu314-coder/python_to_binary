@@ -44,6 +44,7 @@ from .ir import (
     Write,
     WriteRuntime,
     FileCall,
+    EntryArguments,
 )
 from .kernels import (
     KernelValue,
@@ -961,6 +962,9 @@ class Frontend:
         # one stands for. A file is not an object here - there is nothing to
         # hold one - so the name is known only inside the block that opened it.
         self.open_files: dict[str, int] = {}
+        #: Set the first time sys.argv is read; the capture is prepended to
+        #: the module when it is assembled.
+        self._argv_slots: tuple[int, int] | None = None
         self._dtoa_scratch_slot: int | None = None
         self._prologue: list[object] = []
         self._bool_text_slot: int | None = None
@@ -1071,6 +1075,10 @@ class Frontend:
                         self._heap_bump_slot,
                     ),
                 )
+        if self._argv_slots is not None:
+            # First, before the arena mapping: reading the entry state is only
+            # possible while it is still there.
+            self.operations.insert(0, EntryArguments(*self._argv_slots))
         return Module(
             self.operations,
             len(self.slots),
@@ -7460,6 +7468,118 @@ class Frontend:
     #: that a big one is not read a byte at a time.
     READ_CHUNK_BYTES = 4096
 
+    def argv_slots(self) -> tuple[int, int]:
+        """The slots holding argc and argv, reserving them on first use.
+
+        The capture itself is prepended to the module when it is assembled,
+        because it has to run before anything else: it reads what the kernel
+        or the loader left behind at entry, and the heap mapping alone would
+        overwrite that.
+        """
+
+        if self._argv_slots is None:
+            self._argv_slots = (self.new_temp(), self.new_temp())
+        return self._argv_slots
+
+    def is_argv(self, node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "argv"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+            # `import sys` is accepted and emits nothing, so there is no
+            # module object to consult; what matters is that the name has not
+            # been bound to something of the program's own.
+            and "sys" not in self.slots
+            and "sys" not in self.values
+        )
+
+    def emit_argv_element(self, index: IntExpression) -> IntExpression:
+        """`sys.argv[i]` as a string block, copied out of the C string.
+
+        The vector holds pointers to text the kernel owns, terminated by a
+        zero byte rather than counted, so the length is measured before the
+        copy - and the copy is what makes the result an ordinary native string
+        that outlives nothing in particular.
+        """
+
+        count_slot, vector_slot = self.argv_slots()
+        position = self.new_temp()
+        self.operations.append(Store(position, index))
+        self.operations.append(
+            Store(
+                position,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(position), IntConstant(0)),
+                    IntBinary("add", IntLoad(position), IntLoad(count_slot)),
+                    IntLoad(position),
+                ),
+            )
+        )
+        inside = self.new_label("argv_inside")
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "and",
+                    IntCompare("ge", IntLoad(position), IntConstant(0)),
+                    IntCompare("lt", IntLoad(position), IntLoad(count_slot)),
+                ),
+                inside + "_out",
+            )
+        )
+        self.operations.append(Jump(inside))
+        self.operations.append(Label(inside + "_out"))
+        self.raise_exception("IndexError", b"IndexError: list index out of range\n")
+        self.operations.append(Label(inside))
+        text = self.new_temp()
+        self.operations.append(
+            Store(
+                text,
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        IntLoad(vector_slot),
+                        IntBinary("mul", IntLoad(position), IntConstant(8)),
+                    ),
+                    8,
+                ),
+            )
+        )
+        length = self.new_temp()
+        self.operations.append(Store(length, IntConstant(0)))
+        measure = self.new_label("argv_measure")
+        measured = self.new_label("argv_measured")
+        self.operations.append(Label(measure))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "ne",
+                    HeapLoad(
+                        IntBinary("add", IntLoad(text), IntLoad(length)), 1
+                    ),
+                    IntConstant(0),
+                ),
+                measured,
+            )
+        )
+        self.operations.append(
+            Store(length, IntBinary("add", IntLoad(length), IntConstant(1)))
+        )
+        self.operations.append(Jump(measure))
+        self.operations.append(Label(measured))
+        bump = self.ensure_heap()
+        block = self.new_temp()
+        self.operations.append(
+            HeapAlloc(block, self._aligned_size(IntLoad(length)), bump)
+        )
+        self.operations.append(HeapStore(IntLoad(block), IntLoad(length), 8))
+        self.emit_byte_copy(
+            IntBinary("add", IntLoad(block), IntConstant(8)),
+            IntLoad(text),
+            IntLoad(length),
+        )
+        return IntLoad(block)
+
     def file_read_shape(self, node: ast.expr) -> ast.Call | None:
         """`open(path).read()` or `f.read()` on an opened name, else None."""
 
@@ -10298,6 +10418,12 @@ class Frontend:
             # The answer is an element, and an element of this list is the
             # address of a string block.
             return self.integer(node)
+        if (
+            isinstance(node, ast.Subscript)
+            and not isinstance(node.slice, ast.Slice)
+            and self.is_argv(node.value)
+        ):
+            return self.emit_argv_element(self.integer(node.slice))
         if self.file_read_shape(node) is not None:
             assert isinstance(node, ast.Call)
             return self.emit_file_read(node)
@@ -17836,6 +17962,12 @@ class Frontend:
         if self.file_read_shape(node) is not None:
             return "str"
         if (
+            isinstance(node, ast.Subscript)
+            and not isinstance(node.slice, ast.Slice)
+            and self.is_argv(node.value)
+        ):
+            return "str"
+        if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id in {"min", "max"}
@@ -19311,6 +19443,8 @@ class Frontend:
                     ),
                     8,
                 )
+            if self.is_argv(argument):
+                return IntLoad(self.argv_slots()[0])
             if isinstance(argument, ast.Name) and (
                 self.dict_kinds_of(argument.id)
                 or self.set_kind_of(argument.id) is not None

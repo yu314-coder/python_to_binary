@@ -447,6 +447,19 @@ class WriteRuntime:
 
 
 @dataclass(frozen=True, slots=True)
+class EntryArguments:
+    """Capture the process's argument count and vector into two slots.
+
+    Only valid as the very first operation of a module: it reads what the
+    kernel or the loader left behind at entry, and anything before it may have
+    overwritten that.
+    """
+
+    count_slot: int
+    vector_slot: int
+
+
+@dataclass(frozen=True, slots=True)
 class FileCall:
     """One file syscall, with its result left in ``dest_slot``.
 
@@ -486,6 +499,7 @@ Operation = (
     | HeapStore
     | WriteRuntime
     | FileCall
+    | EntryArguments
     | Return
 )
 

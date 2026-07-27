@@ -315,6 +315,17 @@ runtime:
   at run time; a string key keeps the general wording, because its repr would
   have to choose a quote character and decide what inside it is printable,
   which needs the Unicode tables that are not in the image;
+- `sys.argv`, on POSIX targets only: `len(sys.argv)` and `sys.argv[i]`, where
+  each element is copied out of the kernel's C string into an ordinary native
+  string. `sys.argv[0]` is the path the binary was started with, which is the
+  program itself rather than a script. Where the arguments arrive differs by
+  kernel and not by executable format, and that had to be measured rather than
+  assumed: macOS hands them to the entry point in registers for a static
+  LC_UNIXTHREAD image as well as for a dynamic one dyld calls like a C main,
+  while Linux leaves them on the stack where the stack pointer was at entry.
+  The capture is emitted before anything else, because the arena mapping alone
+  would overwrite what it reads. Windows is refused by name: it would need
+  GetCommandLineW and its UTF-16 strings;
 - reading and writing files, on POSIX targets only, through the open, read,
   write and close system calls. `open(path).read()` answers the whole file as a
   string, and a name bound by `with open(path, "w") as f` accepts `f.write(...)`

@@ -42,6 +42,7 @@ from .ir import (
     Write,
     WriteRuntime,
     FileCall,
+    EntryArguments,
     check_stack_slots,
 )
 
@@ -725,8 +726,30 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
     )
 
     code = bytearray()
-    code.extend(_sub_stack(_frame_bytes(module.stack_slots)))
+    entry_frame = _frame_bytes(module.stack_slots)
+    code.extend(_sub_stack(entry_frame))
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp; stable variable base
+    operations = list(module.operations)
+    if operations and isinstance(operations[0], EntryArguments):
+        capture = operations[0]
+        operations = operations[1:]
+        # Before the static mapping below, whose mmap answers in rax and takes
+        # rdi and rsi as arguments - which is where the count and the vector
+        # are on the kernel that passes them in registers.
+        if platform == "darwin":
+            # Measured: macOS hands them to the entry point the way it hands
+            # arguments to a C main.
+            code.extend(b"\x48\x89\xbd" + struct.pack("<i", capture.count_slot * 8))
+            code.extend(b"\x48\x89\xb5" + struct.pack("<i", capture.vector_slot * 8))
+        else:
+            # Linux leaves them on the stack: the count where the stack
+            # pointer was at entry, the vector directly above it. The prologue
+            # has already moved it down by one frame.
+            code.extend(b"\x48\x8d\x85" + struct.pack("<i", entry_frame))  # lea rax,[rbp+f]
+            code.extend(b"\x48\x8b\x08")  # mov rcx, [rax]
+            code.extend(b"\x48\x89\x8d" + struct.pack("<i", capture.count_slot * 8))
+            code.extend(b"\x48\x83\xc0\x08")  # add rax, 8
+            code.extend(b"\x48\x89\x85" + struct.pack("<i", capture.vector_slot * 8))
     if module.static_bytes:
         # One anonymous read/write mapping for every file-scope object, with
         # its base parked in r15 for the whole run. r15 is callee-saved and
@@ -743,6 +766,7 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
         code.extend(b"\x49\x89\xc7")  # mov r15, rax
 
     refs = _X86Refs()
+    module = dataclasses.replace(module, operations=operations)
     pending_strings: list[tuple[int, bytes]] = []
     _emit_x86_operations(
         code, module.operations, 0, refs, pending_strings, system
@@ -940,6 +964,12 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 # Silently skipping an operation would produce an image that
                 # runs and quietly does less than the program says.
                 name = type(operation).__name__
+                if name == "EntryArguments":
+                    raise ValueError(
+                        "sys.argv is POSIX only: the count and the vector come "
+                        "from the kernel at entry, and Windows would need "
+                        "GetCommandLineW and its UTF-16 strings instead"
+                    )
                 if name == "FileCall":
                     raise ValueError(
                         "native file access is POSIX only: it goes through the "

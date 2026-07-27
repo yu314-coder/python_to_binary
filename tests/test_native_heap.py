@@ -3620,3 +3620,137 @@ class FileAccessTests(unittest.TestCase):
                         entry, Path(directory) / "p.exe", target, clean=True
                     )
                 self.assertIn("POSIX only", str(caught.exception))
+
+
+class CommandLineArgumentTests(unittest.TestCase):
+    """`sys.argv` - the count and the strings the process was started with.
+
+    Where they arrive differs by kernel and not by executable format, which is
+    the thing that had to be measured rather than assumed: macOS hands them to
+    the entry point in registers for a static image as well as for a dynamic
+    one, and Linux leaves them on the stack.
+    """
+
+    _POSIX = ("darwin-arm64", "linux-x86_64", "linux-arm64", "darwin-x86_64")
+
+    def _run(self, source: str, arguments: list[str], expected: bytes,
+             expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in self._POSIX:
+                compile_native(entry, root / f"p-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            binary = root / "p-darwin-arm64.bin"
+            native = subprocess.run(
+                [str(binary), *arguments], capture_output=True, cwd=directory
+            )
+            self.assertEqual(native.stdout, expected)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry), *arguments],
+                capture_output=True,
+                cwd=directory,
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_the_count_includes_the_program_itself(self):
+        self._run("import sys\nprint(len(sys.argv))\n", [], b"1\n")
+        self._run("import sys\nprint(len(sys.argv))\n", ["a", "b", "c"], b"4\n")
+
+    def test_the_arguments_are_ordinary_strings(self):
+        self._run(
+            "import sys\nname = sys.argv[1]\n"
+            'print(name.upper(), name + "!", len(name))\n',
+            ["abc"],
+            b"ABC abc! 3\n",
+        )
+
+    def test_walking_them_with_a_loop(self):
+        self._run(
+            "import sys\n"
+            "for i in range(1, len(sys.argv)):\n    print(i, sys.argv[i])\n",
+            ["a", "bb", "ccc"],
+            b"1 a\n2 bb\n3 ccc\n",
+        )
+
+    def test_an_argument_may_hold_spaces_or_non_ascii(self):
+        self._run(
+            'import sys\nprint("[" + sys.argv[1] + "]")\n',
+            ["two words"],
+            b"[two words]\n",
+        )
+        self._run(
+            "import sys\nprint(sys.argv[1], len(sys.argv[1]))\n",
+            ["héllo"],
+            "héllo 5\n".encode("utf-8"),
+        )
+
+    def test_a_negative_index_counts_from_the_end(self):
+        self._run("import sys\nprint(sys.argv[-1])\n", ["x", "y", "last"], b"last\n")
+
+    def test_an_index_past_the_end_raises(self):
+        self._run("import sys\nprint(sys.argv[9])\n", ["only"], b"", expected_exit=1)
+
+    def test_it_reaches_through_the_dynamic_mach_o_writer_too(self):
+        # A program with an extern call is written as a dynamic image that dyld
+        # enters like a C main. That is the second of the two Mach-O entry
+        # paths, and it has to answer the same.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(
+                "import sys\nfrom py2bin.cabi import getpid\n"
+                "print(len(sys.argv), sys.argv[1])\nprint(getpid() > 0)\n",
+                encoding="utf-8",
+            )
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            self.assertIn(b"__LINKEDIT", binary.read_bytes())
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(binary), "hello"], capture_output=True)
+            self.assertEqual(native.stdout, b"2 hello\nTrue\n")
+
+    def test_the_windows_targets_refuse_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "program.py"
+            entry.write_text("import sys\nprint(len(sys.argv))\n", encoding="utf-8")
+            for target in ("windows-x86_64", "windows-arm64"):
+                with self.assertRaises(ValueError) as caught:
+                    compile_native(entry, Path(directory) / "p.exe", target, clean=True)
+                self.assertIn("POSIX only", str(caught.exception))
+
+    def test_a_tool_that_reads_the_files_it_is_given(self):
+        # argv and file access together, which is the point of both.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.txt").write_text("one two\nthree\n", encoding="utf-8")
+            entry = root / "program.py"
+            entry.write_text(
+                "import sys\n"
+                "for i in range(1, len(sys.argv)):\n"
+                "    text = open(sys.argv[i]).read()\n"
+                "    words = 0\n"
+                "    for line in text.splitlines():\n"
+                "        words += len(line.split())\n"
+                "    print(sys.argv[i], words)\n",
+                encoding="utf-8",
+            )
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(binary), "a.txt"], capture_output=True, cwd=directory
+            )
+            self.assertEqual(native.stdout, b"a.txt 3\n")
+            reference = subprocess.run(
+                [sys.executable, str(entry), "a.txt"],
+                capture_output=True,
+                cwd=directory,
+            )
+            self.assertEqual(native.stdout, reference.stdout)

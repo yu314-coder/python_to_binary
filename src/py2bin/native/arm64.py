@@ -45,6 +45,7 @@ from .ir import (
     Write,
     WriteRuntime,
     FileCall,
+    EntryArguments,
     check_stack_slots,
 )
 
@@ -718,10 +719,17 @@ def _patch_branches(
             words[instruction_index] = 0x14000000 | (distance & 0x3FFFFFF)
 
 
-def _darwin_encode(module: Module, code_address: int) -> tuple[bytes, list[tuple[int, str]]]:
+def _darwin_encode(
+    module: Module, code_address: int
+) -> tuple[bytes, list[tuple[int, str]]]:
     return _encode(
         module,
         code_address,
+        # Measured rather than assumed: macOS hands the count and the vector
+        # to the entry point in X0 and X1, for a static LC_UNIXTHREAD image as
+        # well as for a dynamic one dyld calls like a C main. Linux is the
+        # kernel that leaves them on the stack.
+        entry_gets_registers=True,
         write_number=4,
         exit_number=1,
         mmap_number=197,
@@ -771,6 +779,7 @@ def encode_darwin_extern(
 
     Returns the ``.text`` bytes and the ordered extern GOT call sites so the
     dynamic Mach-O writer can lay out the ``__got`` slots and bind opcodes.
+
     """
     return _darwin_encode(module, code_address)
 
@@ -925,6 +934,12 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 # Silently skipping an operation would produce an image that
                 # runs and quietly does less than the program says.
                 name = type(operation).__name__
+                if name == "EntryArguments":
+                    raise ValueError(
+                        "sys.argv is POSIX only: the count and the vector come "
+                        "from the kernel at entry, and Windows would need "
+                        "GetCommandLineW and its UTF-16 strings instead"
+                    )
                 if name == "FileCall":
                     raise ValueError(
                         "native file access is POSIX only: it goes through the "
@@ -1059,6 +1074,8 @@ def _emit_operations(
     system: _Syscalls,
     *,
     in_function: bool,
+    entry_frame: int = 0,
+    entry_gets_registers: bool = False,
 ) -> None:
     """Encode one straight-line operation list into ``words``.
 
@@ -1099,6 +1116,29 @@ def _emit_operations(
             if instruction is None:
                 raise ValueError(f"unsupported ARM64 heap store size {operation.size}")
             words.append(instruction)
+            continue
+        if isinstance(operation, EntryArguments):
+            if in_function:
+                raise ValueError(
+                    "the process arguments can only be read at the entry point"
+                )
+            if entry_gets_registers:
+                # The loader called this like a C main, so the count and the
+                # vector are still in the first two argument registers - the
+                # prologue only touched SP and X29.
+                words.extend(_slot_instruction(False, operation.count_slot, 0, rt=0))
+                words.extend(_slot_instruction(False, operation.vector_slot, 0, rt=1))
+            else:
+                # The kernel left them on the stack: the count where SP pointed
+                # at entry, the vector directly above it. The prologue has
+                # already moved SP down by one frame, so that address is
+                # X29 plus the frame.
+                words.extend(_mov(0, entry_frame))
+                words.append(0x8B0003A0)  # add x0, x29, x0
+                words.append(0xF9400001)  # ldr x1, [x0]
+                words.extend(_slot_instruction(False, operation.count_slot, 0, rt=1))
+                words.append(0x91002000)  # add x0, x0, #8
+                words.extend(_slot_instruction(False, operation.vector_slot, 0, rt=0))
             continue
         if isinstance(operation, FileCall):
             number, arguments = _file_call_shape(operation, system)
@@ -1271,6 +1311,7 @@ def _encode(
     close_number: int = 0,
     open_takes_dirfd: bool = False,
     errors_use_carry: bool = False,
+    entry_gets_registers: bool = False,
 ) -> tuple[bytes, list[tuple[int, str]]]:
     """Encode a module to ARM64 machine code.
 
@@ -1290,11 +1331,37 @@ def _encode(
         open_takes_dirfd,
         errors_use_carry,
     )
-    words: list[int] = list(_frame_sub(_frame_bytes(module.stack_slots)))
+    entry_frame = _frame_bytes(module.stack_slots)
+    words: list[int] = list(_frame_sub(entry_frame))
     words.append(0x910003FD)  # mov x29, sp
+    operations = list(module.operations)
+    if operations and isinstance(operations[0], EntryArguments):
+        # Before the static mapping, whose mmap answers in X0 and would
+        # overwrite the count this is here to keep.
+        _emit_operations(
+            words,
+            operations[:1],
+            0,
+            refs := _Refs(),
+            system,
+            in_function=False,
+            entry_frame=entry_frame,
+            entry_gets_registers=entry_gets_registers,
+        )
+        operations = operations[1:]
+    else:
+        refs = _Refs()
     _emit_static_block(words, module.static_bytes, system)
-    refs = _Refs()
-    _emit_operations(words, module.operations, 0, refs, system, in_function=False)
+    _emit_operations(
+        words,
+        operations,
+        0,
+        refs,
+        system,
+        in_function=False,
+        entry_frame=entry_frame,
+        entry_gets_registers=entry_gets_registers,
+    )
     offsets: dict[str, int] = {}
     for function in module.functions:
         if function.name in offsets:
