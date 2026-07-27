@@ -342,6 +342,15 @@ runtime:
   positive number is a perfectly good descriptor, so the backends normalise the
   carry case rather than testing the value. Windows is refused by name: it
   would need CreateFile and its handles instead;
+- `None` as a function default - `def f(x, opts=None)`, which is how Python
+  spells "no argument given". None is a *kind* here rather than a value: a call
+  is inlined, so whether the argument was given is settled at the call site,
+  `x is None` is answered from the two sides' kinds, and the None never occupies
+  a slot. A conditional whose test is settled that way lowers only the arm that
+  runs, which is also what keeps the other arm from reading the None as a
+  number. Using the None as a number is refused, and identity between two
+  ordinary values still is - CPython's answer there depends on its
+  small-integer cache;
 - `assert test` and `assert test, "message"`, which raise a catchable
   `AssertionError`. Always emitted: CPython drops them under -O, there is no -O
   here, and a program that reaches the statement is one whose author wanted the

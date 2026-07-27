@@ -555,6 +555,23 @@ class NativeCompileError(ValueError):
         super().__init__(f"{path}:{line}:{column}: {message}")
 
 
+class _NoDefault:
+    """Stands for "this parameter has no default at all".
+
+    A distinct object rather than None, because None is a default a parameter
+    can have, and the two mean opposite things when a call omits the argument:
+    one is an error and the other is a value.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<no default>"
+
+
+NO_DEFAULT = _NoDefault()
+
+
 class NotConstant(NativeCompileError):
     """The catch-all "this simply is not a constant" rejection.
 
@@ -1588,6 +1605,60 @@ class Frontend:
             pass
         return self.integer(node, bindings or {})
 
+    def settled_conditional_arm(
+        self, node: ast.IfExp, bindings: dict[str, KernelValue] | None = None
+    ) -> ast.expr | None:
+        """The one arm that runs, when the test is settled at build time."""
+
+        try:
+            return node.body if bool(self.constant(node.test)) else node.orelse
+        except NativeCompileError:
+            return None
+
+    def values_with_omitted_as_none(
+        self, function: NativeFunction, arguments: tuple
+    ) -> dict:
+        """The function's constants, plus a None for every omitted parameter."""
+
+        return {
+            **function.values,
+            **{
+                parameter: None
+                for parameter in function.parameters[len(arguments):]
+            },
+        }
+
+    def identity_against_none(
+        self,
+        left: ast.expr,
+        right: ast.expr,
+        positive: bool,
+        bindings: dict[str, KernelValue] | None = None,
+    ) -> bool | None:
+        """`x is None` answered from kinds, or None meaning "cannot say".
+
+        From the two sides' kinds and not their values: there are no objects
+        here to have identities, but whether something is None is exactly what
+        a kind records, and it is a build-time fact because a parameter takes
+        its None from a call site that left the argument out.
+
+        Identity between two non-None values stays unanswerable. CPython's
+        answer there depends on its small-integer cache, which is not
+        something to imitate.
+        """
+
+        try:
+            kinds = (
+                self.expression_type(left, bindings),
+                self.expression_type(right, bindings),
+            )
+        except NativeCompileError:
+            return None
+        if "none" not in kinds:
+            return None
+        both = kinds == ("none", "none")
+        return both if positive else not both
+
     def refuse_unbound(self, name: str, node: ast.AST | None = None) -> None:
         """Refuse a read of a name that may not have been bound.
 
@@ -2017,8 +2088,8 @@ class Frontend:
         parameters = tuple(
             argument.arg for argument in (*arguments.posonlyargs, *arguments.args)
         )
-        default_values: list[int | None] = [
-            None for _ in range(len(parameters) - len(arguments.defaults))
+        default_values: list[object] = [
+            NO_DEFAULT for _ in range(len(parameters) - len(arguments.defaults))
         ]
         for default in arguments.defaults:
             try:
@@ -2027,13 +2098,21 @@ class Frontend:
                 raise NativeCompileError(
                     self.path,
                     default,
-                    "native function defaults must be compile-time int/bool values",
+                    "native function defaults must be compile-time int, bool "
+                    "or None values",
                 ) from error
+            if value is None:
+                # `def f(x, seen=None)` is how Python spells "no argument
+                # given". A call is inlined, so whether it was given is settled
+                # at the call site and the None never exists at run time.
+                default_values.append(None)
+                continue
             if not isinstance(value, (int, bool)):
                 raise NativeCompileError(
                     self.path,
                     default,
-                    "native function defaults must be compile-time int/bool values",
+                    "native function defaults must be compile-time int, bool "
+                    "or None values",
                 )
             # Kept as a bool where it is one. It is an int either way for
             # arithmetic, and the difference shows only when the value is
@@ -17550,6 +17629,12 @@ class Frontend:
         self.kernel_modules = function.kernel_modules
         self.kernel_functions = function.kernel_functions
         self.extern_functions = function.extern_functions
+        for parameter in function.parameters[len(arguments):]:
+            # Omitted by the call, so it takes its default, and the only
+            # default that reaches here is None. After the function's own value
+            # map is installed above, or that assignment would wipe this.
+            self.values[private_names[parameter]] = None
+            self.runtime_names.discard(private_names[parameter])
         self.return_targets.append((result_slot, return_label))
         previous_returns_string = self.returns_string
         self.returns_string = returns_string
@@ -17751,8 +17836,13 @@ class Frontend:
             if value is not None:
                 continue
             default = defaults[index]
-            if default is None:
+            if default is NO_DEFAULT:
                 missing.append(parameters[index])
+            elif default is None:
+                # Left absent in `bound`, so it is dropped from the argument
+                # tuple: the parameter takes its None from the value map the
+                # inliner installs, not from a register.
+                pass
             else:
                 bound[index] = IntConstant(default)
         if missing:
@@ -17810,7 +17900,7 @@ class Frontend:
         # tag(1) to a path that cannot render a string at all.
         supplied: list[ast.expr] = list(node.args)
         for default in function.defaults[len(node.args) :]:
-            if default is None:
+            if default is NO_DEFAULT:
                 return None  # A missing argument with no default: not our call.
             supplied.append(ast.Constant(value=default))
         # Stand-ins of the right kind, so nothing is emitted just to ask.
@@ -17873,7 +17963,7 @@ class Frontend:
             return False
         supplied: list[ast.expr] = list(node.args)
         for default in function.defaults[skip_parameters + len(node.args) :]:
-            if default is None:
+            if default is NO_DEFAULT:
                 return False
             supplied.append(ast.Constant(value=default))
         stand_ins: dict[str, KernelValue] = {}
@@ -17964,9 +18054,19 @@ class Frontend:
             # parameter of a function further out that happens to share it.
             bindings = {**self.value_bindings, **bindings}
         if isinstance(node, ast.Constant):
+            if node.value is None:
+                # A kind of its own, so that using None as a number is refused
+                # rather than quietly reading a zero out of a slot.
+                return "none"
             if isinstance(node.value, str):
                 return "str"
             return "float" if isinstance(node.value, float) else "int"
+        if isinstance(node, ast.Name):
+            # A name standing for None - a parameter the call left out - is
+            # None-kinded wherever it is read.
+            for source in (bindings, self.values):
+                if node.id in source and source[node.id] is None:
+                    return "none"
         shape = self.dict_get_shape(node)
         if shape is not None:
             return shape[2]
@@ -18612,7 +18712,8 @@ class Frontend:
                 arguments = self.pin_extern_arguments(arguments)
             previous_path, previous_values = self.path, self.values
             previous_functions = self.functions
-            self.path, self.values = function.path, function.values
+            self.path = function.path
+            self.values = self.values_with_omitted_as_none(function, arguments)
             self.functions = function.functions
             try:
                 return self.float_expression(
@@ -19882,6 +19983,14 @@ class Frontend:
                 operator = operators.get(type(operator_node))
                 if operator is None:
                     if isinstance(operator_node, (ast.Is, ast.IsNot)):
+                        settled = self.identity_against_none(
+                            node.left if index == 0 else node.comparators[index - 1],
+                            right,
+                            isinstance(operator_node, ast.Is),
+                            bindings,
+                        )
+                        if settled is not None:
+                            return IntConstant(1 if settled else 0)
                         # A runtime slot holds a number or a pointer, never a
                         # singleton, so there is no object whose identity this
                         # could ask about. Answering it would mean guessing.
@@ -19936,6 +20045,16 @@ class Frontend:
             assert result is not None
             return result
         if isinstance(node, ast.IfExp):
+            taken = self.settled_conditional_arm(node, bindings)
+            if taken is not None:
+                # Only the arm that runs is lowered. Both arms are normally
+                # lowered and selected between, which is right for two numbers
+                # and wrong here: a body of ifs that all end in a return folds
+                # into one of these, so the arm that does not run is the one
+                # holding a parameter the caller left out - and that is None,
+                # which is not a number. Lowering one arm is also what Python
+                # does, so nothing that could trap in the other arm can fire.
+                return self.integer(taken, bindings, call_stack)
             arms = (
                 self.expression_type(node.body, bindings),
                 self.expression_type(node.orelse, bindings),
@@ -20033,7 +20152,7 @@ class Frontend:
             previous_kernel_functions = self.kernel_functions
             previous_extern_functions = self.extern_functions
             self.path = function.path
-            self.values = function.values
+            self.values = self.values_with_omitted_as_none(function, arguments)
             self.functions = function.functions
             self.kernel_modules = function.kernel_modules
             self.kernel_functions = function.kernel_functions
@@ -20181,6 +20300,23 @@ class Frontend:
                         return result
                     result = self.constant(value)
                 return result
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.Is, ast.IsNot))
+        ):
+            # Ahead of the general comparison fold below, which begins by
+            # folding the left operand - and a name standing for None is not
+            # something that fold can produce a value for. Settled here in the
+            # one place constants are decided, so `if x is None:` emits only
+            # the branch that runs.
+            settled = self.identity_against_none(
+                node.left, node.comparators[0], isinstance(node.ops[0], ast.Is)
+            )
+            if settled is not None:
+                return settled
+            # Not about None: fall through to the general fold below, which
+            # reports identity between two ordinary values in its own words.
         if isinstance(node, ast.Compare):
             left = self.constant(node.left)
             for operator, comparator in zip(node.ops, node.comparators):

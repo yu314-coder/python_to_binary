@@ -71,9 +71,12 @@ else:
         # lowered at all.
         cases = [
             (
-                "x = 0\nfor i in range(0, 3):\n    x += 1\n",
-                "x is None",
-                r"native code has no runtime 'is'",
+                # `x is None` is settled by kinds now, so it is no longer a
+                # condition that cannot be lowered. A name that may be unbound
+                # still is.
+                "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    b = [1]\n",
+                "b",
+                r"'b' may be unbound here",
             ),
             (
                 "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    a = [1]\n",
@@ -89,11 +92,11 @@ else:
 
     def test_runtime_condition_failure_survives_a_boolean_operator(self):
         source = (
-            "x = 0\nfor i in range(0, 3):\n    x += 1\n"
-            'if x is None and True:\n    print("y")\n'
+            "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    b = [1]\n"
+            'if b and True:\n    print("y")\n'
         )
         with self.assertRaisesRegex(
-            NativeCompileError, r"native code has no runtime 'is'"
+            NativeCompileError, r"'b' may be unbound here"
         ):
             lower(Path("cond.py"), source)
 

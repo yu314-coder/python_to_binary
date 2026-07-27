@@ -356,19 +356,39 @@ class NativeCompilerTests(unittest.TestCase):
                 run = subprocess.run([str(by_target["darwin-arm64"])])
                 self.assertEqual(run.returncode, 22)
 
+    def test_a_none_default_is_accepted(self):
+        # `def f(x, seen=None)` is how Python spells "no argument given". A
+        # call is inlined, so whether the argument was given is settled at the
+        # call site and the None never exists at run time.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "none_default.py"
+            source.write_text(
+                "def choose(value=None):\n"
+                "    if value is None:\n"
+                "        return 7\n"
+                "    return value\n"
+                "raise SystemExit(choose() + choose(1))\n",
+                encoding="utf-8",
+            )
+            binary = root / "none_default.bin"
+            compile_native(source, binary, "darwin-arm64", clean=True)
+            if platform.system() == "Darwin" and platform.machine() == "arm64":
+                self.assertEqual(subprocess.run([str(binary)]).returncode, 8)
+
     def test_function_non_integer_default_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "bad_default.py"
             source.write_text(
-                "def choose(value: int = None) -> int:\n"
+                "def choose(value: int = 1.5) -> int:\n"
                 "    return value\n"
                 "raise SystemExit(choose())\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
                 NativeCompileError,
-                "defaults must be compile-time int/bool",
+                "defaults must be compile-time int, bool or None",
             ):
                 compile_native(source, root / "bad_default", "linux-x86_64")
 

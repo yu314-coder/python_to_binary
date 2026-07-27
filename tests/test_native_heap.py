@@ -3800,3 +3800,113 @@ class ArenaLimitTests(unittest.TestCase):
             i for i, op in enumerate(operations) if isinstance(op, HeapAlloc)
         )
         self.assertLess(started + 1, first_allocation)
+
+
+class NoneDefaultTests(unittest.TestCase):
+    """`def f(x, opts=None)` - the way Python spells "no argument given".
+
+    None is a kind here rather than a value. A call is inlined, so whether the
+    argument was given is settled at the call site, and `x is None` is answered
+    from the two sides' kinds - which means the None never has to exist at run
+    time and never occupies a slot.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"p-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "p-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def test_the_default_is_replaced_when_it_is_none(self):
+        self._run(
+            "def f(a, start=None):\n"
+            "    if start is None:\n        start = 100\n"
+            "    return a + start\n"
+            "print(f(1), f(1, 5))\n",
+            b"101 6\n",
+        )
+
+    def test_two_call_sites_of_the_same_function_do_not_interfere(self):
+        # Each call inlines the body with its own bindings. The one that omits
+        # the argument folds the test true, the one that passes it folds false,
+        # and neither may leave the other holding a name it never bound.
+        self._run(
+            "def f(a, seen=None):\n"
+            "    if seen is None:\n        return a\n"
+            "    return a + seen\n"
+            "print(f(1), f(1, 5), f(2), f(2, 3))\n",
+            b"1 6 2 5\n",
+        )
+
+    def test_is_not_none_reads_the_other_way(self):
+        self._run(
+            "def f(a, extra=None):\n"
+            "    if extra is not None:\n        return a + extra\n"
+            "    return a\n"
+            "print(f(2), f(2, 3))\n",
+            b"2 5\n",
+        )
+
+    def test_a_string_and_a_list_default(self):
+        self._run(
+            "def label(n, prefix=None):\n"
+            '    if prefix is None:\n        prefix = "n"\n'
+            "    return prefix + str(n)\n"
+            'print(label(3), label(3, "x"))\n',
+            b"n3 x3\n",
+        )
+        self._run(
+            "def collect(n, into=None):\n"
+            "    if into is None:\n        into = []\n"
+            "    into.append(n)\n"
+            "    return len(into)\n"
+            "print(collect(1))\n",
+            b"1\n",
+        )
+
+    def test_a_guard_clause_with_a_further_test(self):
+        self._run(
+            "def f(a, limit=None):\n"
+            "    if limit is None:\n        limit = 10\n"
+            "    if a > limit:\n        return limit\n"
+            "    return a\n"
+            "print(f(5), f(50), f(50, 100))\n",
+            b"5 10 50\n",
+        )
+
+    def test_using_the_none_as_a_number_is_refused(self):
+        # The point of tracking None as a kind: this reads a zero out of a slot
+        # if it is not caught, and the answer would be quietly wrong.
+        self._reject(
+            "def f(a, b=None):\n    return a + b\nprint(f(1))\n",
+            "not in the signed 64-bit native integer subset",
+        )
+
+    def test_identity_between_two_values_is_still_refused(self):
+        # None is the one singleton the subset has. Identity between numbers
+        # depends on CPython's small-integer cache, which is not imitated.
+        self._reject(
+            "n = 0\nfor i in range(0, 3):\n    n += 1\nprint(n is 3)\n",
+            "no runtime 'is'",
+        )

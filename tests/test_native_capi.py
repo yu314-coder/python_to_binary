@@ -373,17 +373,25 @@ class ExternCallSafetyTests(unittest.TestCase):
         return lower(Path("safety.c"), tree)
 
     def test_extern_call_is_rejected_in_a_conditional_expression(self):
-        # Both arms of '?:' and of a short-circuit are lowered eagerly, so a
-        # call in the untaken arm would still run.
+        # Both arms of '?:' and of a short-circuit are lowered eagerly *when
+        # the condition is only known at run time*, so a call in the untaken
+        # arm would still run. A condition settled at build time no longer
+        # lowers both arms - only the one that runs - which is checked below
+        # to be a tightening rather than a hole: the untaken arm's call is not
+        # emitted at all.
         for source in (
             "int main(void) {\n"
+            "    long long c;\n"
+            "    c = PyLong_AsLongLong(PyLong_FromLongLong(1));\n"
             "    long long n;\n"
-            "    n = 1 ? PyLong_AsLongLong(PyLong_FromLongLong(1)) : 0;\n"
+            "    n = c ? PyLong_AsLongLong(PyLong_FromLongLong(2)) : 0;\n"
             "    return n;\n"
             "}\n",
             "int main(void) {\n"
+            "    long long c;\n"
+            "    c = PyLong_AsLongLong(PyLong_FromLongLong(1));\n"
             "    long long n;\n"
-            "    n = 1 && PyLong_AsLongLong(PyLong_FromLongLong(1));\n"
+            "    n = c && PyLong_AsLongLong(PyLong_FromLongLong(2));\n"
             "    return n;\n"
             "}\n",
         ):
@@ -392,6 +400,27 @@ class ExternCallSafetyTests(unittest.TestCase):
                     NativeCompileError, "cannot appear in a conditional expression"
                 ):
                     self._lower_c(source)
+
+    def test_a_settled_condition_lowers_only_the_arm_that_runs(self):
+        # The tightening the test above refers to. With the condition known at
+        # build time the untaken arm is not lowered, so its call cannot run -
+        # which is what the eager-arm refusal existed to prevent.
+        taken = self._lower_c(
+            "int main(void) {\n"
+            "    long long n;\n"
+            "    n = 1 ? PyLong_AsLongLong(PyLong_FromLongLong(1)) : 0;\n"
+            "    return n;\n"
+            "}\n"
+        )
+        self.assertEqual(len(_extern_calls(taken)), 2)
+        skipped = self._lower_c(
+            "int main(void) {\n"
+            "    long long n;\n"
+            "    n = 0 ? PyLong_AsLongLong(PyLong_FromLongLong(1)) : 7;\n"
+            "    return n;\n"
+            "}\n"
+        )
+        self.assertEqual(_extern_calls(skipped), [])
 
     def test_variadic_symbol_rejects_a_format_conversion(self):
         with self.assertRaisesRegex(NativeCompileError, "must not contain '%'"):
