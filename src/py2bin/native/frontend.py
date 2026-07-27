@@ -7614,6 +7614,109 @@ class Frontend:
         self.operations.append(Store(descriptor, IntConstant(0)))
         return self.emit_read_all(descriptor)
 
+    def argv_walk_bounds(self, node: ast.expr):
+        """`sys.argv` or `sys.argv[a:b]` as (first, last), else None.
+
+        The bounds are expressions, resolved against the count when the loop
+        is emitted. `sys.argv[1:]` is how a program says "the arguments", and
+        writing that out by hand with a range was the only way before.
+        """
+
+        if self.is_argv(node):
+            return IntConstant(0), None
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Slice)
+            and self.is_argv(node.value)
+        ):
+            if node.slice.step is not None:
+                raise NativeCompileError(
+                    self.path, node, "a native sys.argv slice steps by one"
+                )
+            lower = node.slice.lower
+            upper = node.slice.upper
+            return (
+                IntConstant(0) if lower is None else self.integer(lower),
+                None if upper is None else self.integer(upper),
+            )
+        return None
+
+    def for_over_argv(self, node: ast.For) -> None:
+        """`for name in sys.argv[1:]:` - each argument as a string."""
+
+        assert isinstance(node.target, ast.Name)
+        bounds = self.argv_walk_bounds(node.iter)
+        assert bounds is not None
+        first, last = bounds
+        name = node.target.id
+        was_bound = name in self.bound_names
+        broke = self.open_loop_else(node)
+        count_slot, _vector = self.argv_slots()
+        index_slot = self.new_temp()
+        end_slot = self.new_temp()
+        self.operations.append(Store(index_slot, first))
+        self.operations.append(
+            Store(end_slot, IntLoad(count_slot) if last is None else last)
+        )
+        # Both ends clamp, the way a list slice does, so `sys.argv[1:]` on a
+        # program run with no arguments walks nothing instead of running away.
+        for slot in (index_slot, end_slot):
+            self.operations.append(
+                Store(
+                    slot,
+                    self.select_integer(
+                        IntCompare("lt", IntLoad(slot), IntConstant(0)),
+                        IntBinary("add", IntLoad(slot), IntLoad(count_slot)),
+                        IntLoad(slot),
+                    ),
+                )
+            )
+            self.operations.append(
+                Store(
+                    slot,
+                    self.select_integer(
+                        IntCompare("gt", IntLoad(slot), IntLoad(count_slot)),
+                        IntLoad(count_slot),
+                        IntLoad(slot),
+                    ),
+                )
+            )
+        start = self.new_label("for_argv")
+        continue_label = self.new_label("for_argv_continue")
+        end = self.new_label("for_argv_end")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(end_slot)), end
+            )
+        )
+        self.values.pop(name, None)
+        self.runtime_names.add(name)
+        self.boolean_names.discard(name)
+        self.possibly_unbound.discard(name)
+        self.operations.append(
+            Store(self.slot(name), self.emit_argv_element(IntLoad(index_slot)))
+        )
+        self.value_types[name] = "str"
+        self.break_targets.append(end if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        if was_bound:
+            self.bound_names.add(name)
+        else:
+            # A program run with no arguments binds nothing.
+            self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
+
     def is_argv(self, node: ast.expr) -> bool:
         return (
             isinstance(node, ast.Attribute)
@@ -14873,6 +14976,9 @@ class Frontend:
         self.refuse_set_iteration(node.iter)
         if self.zip_sources(node.iter) is not None:
             self.for_over_zip(node)
+            return
+        if isinstance(node.target, ast.Name) and self.argv_walk_bounds(node.iter):
+            self.for_over_argv(node)
             return
         if self.enumerated_string_source(node.iter) is not None:
             self.for_over_enumerated_string(node)

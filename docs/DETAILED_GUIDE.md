@@ -326,6 +326,9 @@ runtime:
   The capture is emitted before anything else, because the arena mapping alone
   would overwrite what it reads. Windows is refused by name: it would need
   GetCommandLineW and its UTF-16 strings;
+- `for name in sys.argv[1:]`, and over the whole of `sys.argv`. Both slice
+  bounds clamp the way a list slice's do, so a program run with no arguments
+  walks nothing rather than running away;
 - `sys.stdin.read()`, which reads standard input to end of file and is what
   lets a compiled program sit in a pipe. It is the same walk a file gets, on
   the descriptor the process started with; a pipe has no length to ask for,

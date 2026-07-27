@@ -3715,6 +3715,37 @@ class CommandLineArgumentTests(unittest.TestCase):
             native = subprocess.run([str(binary), "hello"], capture_output=True)
             self.assertEqual(native.stdout, b"2 hello\nTrue\n")
 
+    def test_iterating_the_arguments(self):
+        # `for name in sys.argv[1:]` is how a tool says "the arguments", and
+        # writing it out with a range was the only way before.
+        self._run(
+            "import sys\nfor a in sys.argv[1:]:\n    print(a)\n",
+            ["p", "q"],
+            b"p\nq\n",
+        )
+        self._run("import sys\nfor a in sys.argv[1:]:\n    print(a)\n", [], b"")
+
+    def test_the_slice_bounds_clamp(self):
+        self._run(
+            "import sys\nfor a in sys.argv[1:3]:\n    print(a)\n",
+            ["a", "b", "c", "d"],
+            b"a\nb\n",
+        )
+        self._run(
+            "import sys\nfor a in sys.argv[2:]:\n    print(a)\n",
+            ["a", "b", "c"],
+            b"b\nc\n",
+        )
+
+    def test_a_break_out_of_the_argument_walk(self):
+        self._run(
+            "import sys\n"
+            "for a in sys.argv[1:]:\n"
+            '    if a == "stop":\n        break\n    print(a)\n',
+            ["one", "stop", "three"],
+            b"one\n",
+        )
+
     def test_the_windows_targets_refuse_it(self):
         with tempfile.TemporaryDirectory() as directory:
             entry = Path(directory) / "program.py"
