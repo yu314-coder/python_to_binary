@@ -10035,6 +10035,7 @@ class Frontend:
 
     _STRING_METHOD_KINDS = {
         "split": "list:str",
+        "splitlines": "list:str",
         "join": "str",
         "startswith": "bool",
         "endswith": "bool",
@@ -10070,6 +10071,7 @@ class Frontend:
         "endswith": 1,
         "isdigit": 0,
         "isalpha": 0,
+        "splitlines": 0,
         "isalnum": 0,
         "isspace": 0,
         "islower": 0,
@@ -10268,11 +10270,13 @@ class Frontend:
         """Lower a string method whose result is a runtime list of strings."""
 
         assert isinstance(node.func, ast.Attribute)
-        self.check_string_method(node)
+        name = self.check_string_method(node)
         receiver_slot = self.new_temp()
         self.operations.append(
             Store(receiver_slot, self.string_pointer(node.func.value))
         )
+        if name == "splitlines":
+            return self.emit_split_lines(receiver_slot)
         if not node.args:
             return self.emit_split_whitespace(receiver_slot)
         separator_slot = self.new_temp()
@@ -10336,6 +10340,157 @@ class Frontend:
                 HeapLoad(IntLoad(receiver_slot), 8),
             ),
         )
+        return IntLoad(result_slot)
+
+    def emit_line_break_width(
+        self, base_slot: int, offset_slot: int, limit_slot: int
+    ) -> int:
+        """A slot holding the byte width of the line break at an offset, or 0.
+
+        The universal-newline set, which like Unicode whitespace is a small
+        closed list and so is matched as byte sequences: the seven single-byte
+        ones, `\\r\\n` as one break rather than two, and the three that are not
+        ASCII - NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR.
+        """
+
+        def byte(step: int) -> IntExpression:
+            return HeapLoad(
+                IntBinary(
+                    "add",
+                    IntBinary("add", IntLoad(base_slot), IntLoad(offset_slot)),
+                    IntConstant(step),
+                ),
+                1,
+            )
+
+        def room(count: int) -> IntExpression:
+            return IntCompare(
+                "le",
+                IntBinary("add", IntLoad(offset_slot), IntConstant(count)),
+                IntLoad(limit_slot),
+            )
+
+        def equals(step: int, value: int) -> IntExpression:
+            return IntCompare("eq", byte(step), IntConstant(value))
+
+        width_slot = self.new_temp()
+        self.operations.append(Store(width_slot, IntConstant(0)))
+        done = self.new_label("break_width_done")
+        # Longest first, so that "\r\n" is one break and not a break followed
+        # by another, and so a three-byte sequence is not read as its lead.
+        candidates = [
+            (3, IntBinary("and", room(3), IntBinary(
+                "and",
+                IntBinary("and", equals(0, 0xE2), equals(1, 0x80)),
+                IntBinary("or", equals(2, 0xA8), equals(2, 0xA9)),
+            ))),
+            (2, IntBinary("and", room(2), IntBinary(
+                "and", equals(0, 0x0D), equals(1, 0x0A)
+            ))),
+            (2, IntBinary("and", room(2), IntBinary(
+                "and", equals(0, 0xC2), equals(1, 0x85)
+            ))),
+        ]
+        single = IntBinary(
+            "or",
+            IntBinary(
+                "and",
+                IntCompare("ge", byte(0), IntConstant(0x0A)),
+                IntCompare("le", byte(0), IntConstant(0x0D)),
+            ),
+            IntBinary(
+                "and",
+                IntCompare("ge", byte(0), IntConstant(0x1C)),
+                IntCompare("le", byte(0), IntConstant(0x1E)),
+            ),
+        )
+        candidates.append((1, IntBinary("and", room(1), single)))
+        for width, test in candidates:
+            skip = self.new_label("break_width_next")
+            self.operations.append(JumpIfFalse(test, skip))
+            self.operations.append(Store(width_slot, IntConstant(width)))
+            self.operations.append(Jump(done))
+            self.operations.append(Label(skip))
+        self.operations.append(Label(done))
+        return width_slot
+
+    def emit_split_lines(self, receiver_slot: int) -> IntExpression:
+        """`s.splitlines()` - the pieces between line breaks.
+
+        A trailing break makes no extra piece, which is the difference from
+        `split("\\n")`: `"a\\n"` is one line and two pieces respectively.
+        """
+
+        result_slot = self.emit_empty_list_block()
+        length_slot = self.new_temp()
+        base_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(receiver_slot), 8))
+        )
+        self.operations.append(
+            Store(
+                base_slot, IntBinary("add", IntLoad(receiver_slot), IntConstant(8))
+            )
+        )
+        cursor_slot = self.new_temp()
+        start_slot = self.new_temp()
+        self.operations.append(Store(cursor_slot, IntConstant(0)))
+        self.operations.append(Store(start_slot, IntConstant(0)))
+        walk = self.new_label("lines")
+        walked = self.new_label("lines_end")
+        step = self.new_label("lines_step")
+        self.operations.append(Label(walk))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(cursor_slot), IntLoad(length_slot)),
+                walked,
+            )
+        )
+        width_slot = self.emit_line_break_width(
+            base_slot, cursor_slot, length_slot
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", IntLoad(width_slot), IntConstant(0)), step
+            )
+        )
+        self.emit_list_append(
+            result_slot,
+            self.emit_string_span(
+                receiver_slot, IntLoad(start_slot), IntLoad(cursor_slot)
+            ),
+        )
+        self.operations.append(
+            Store(
+                cursor_slot,
+                IntBinary("add", IntLoad(cursor_slot), IntLoad(width_slot)),
+            )
+        )
+        self.operations.append(Store(start_slot, IntLoad(cursor_slot)))
+        self.operations.append(Jump(walk))
+        self.operations.append(Label(step))
+        # Not a break, so one byte on. A continuation byte is never one of
+        # these, so the walk cannot stop inside a character.
+        self.operations.append(
+            Store(cursor_slot, IntBinary("add", IntLoad(cursor_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(walk))
+        self.operations.append(Label(walked))
+        # What is left after the last break, if the string did not end on one.
+        trailing = self.new_label("lines_trailing")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(start_slot), IntLoad(length_slot)),
+                trailing,
+            )
+        )
+        self.emit_list_append(
+            result_slot,
+            self.emit_string_span(
+                receiver_slot, IntLoad(start_slot), IntLoad(length_slot)
+            ),
+        )
+        self.operations.append(Label(trailing))
         return IntLoad(result_slot)
 
     def emit_split_whitespace(self, receiver_slot: int) -> IntExpression:

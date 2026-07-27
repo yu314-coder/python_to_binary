@@ -3179,3 +3179,80 @@ class MoreStringMethodTests(unittest.TestCase):
             + 'print(s.removeprefix(""), s.removesuffix(""))\n',
             b"True True\nab ab\n",
         )
+
+
+class SplitLinesTests(unittest.TestCase):
+    """`str.splitlines()` over the universal-newline set."""
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    @staticmethod
+    def _runtime(text: str) -> str:
+        return f's = ""\nfor _i in range(0, 1):\n    s = s + {text!r}\n'
+
+    def test_it_splits_on_newlines(self):
+        self._run(
+            self._runtime("a\nb\nc") + 'print(len(s.splitlines()), "|".join(s.splitlines()))\n',
+            b"3 a|b|c\n",
+        )
+
+    def test_a_trailing_break_makes_no_extra_piece(self):
+        # This is the whole difference from split("\n"), which makes two.
+        self._run(
+            self._runtime("a\n") + 'print(len(s.splitlines()), len(s.split("\\n")))\n',
+            b"1 2\n",
+        )
+
+    def test_a_blank_line_is_an_empty_piece(self):
+        self._run(
+            self._runtime("a\n\nb") + 'print(len(s.splitlines()), "|".join(s.splitlines()))\n',
+            b"3 a||b\n",
+        )
+
+    def test_crlf_is_one_break_and_a_lone_cr_is_another(self):
+        self._run(
+            self._runtime("a\r\nb") + 'print(len(s.splitlines()), "|".join(s.splitlines()))\n',
+            b"2 a|b\n",
+        )
+        self._run(self._runtime("a\rb") + "print(len(s.splitlines()))\n", b"2\n")
+
+    def test_an_empty_string_has_no_lines(self):
+        self._run('s = ""\nprint(len(s.splitlines()))\n', b"0\n")
+        self._run(self._runtime("\n\n") + "print(len(s.splitlines()))\n", b"2\n")
+
+    def test_the_other_ascii_breaks(self):
+        # Vertical tab, form feed and the three file/group/record separators.
+        self._run(
+            self._runtime("a\vb\fc\x1cd") + "print(len(s.splitlines()))\n", b"4\n"
+        )
+
+    def test_the_three_breaks_that_are_not_ascii(self):
+        # NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR, matched as the byte
+        # sequences they are rather than refused.
+        self._run(
+            self._runtime("a\u2028b\u2029c\u0085d")
+            + 'print(len(s.splitlines()), "|".join(s.splitlines()))\n',
+            b"4 a|b|c|d\n",
+        )
+
+    def test_the_pieces_keep_their_own_non_ascii_text(self):
+        self._run(
+            self._runtime("héllo\n中") + 'print("|".join(s.splitlines()))\n',
+            "héllo|中\n".encode("utf-8"),
+        )

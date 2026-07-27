@@ -250,7 +250,12 @@ runtime:
   `.lstrip()`, `.rstrip()`, `.zfill()`, `.center()`, `.ljust()`, `.rjust()`,
   `.upper()`, `.lower()`, `.capitalize()`, `.title()`, `.isdigit()`,
   `.isalpha()`, `.isalnum()`, `.isspace()`, `.islower()`, `.isupper()`,
-  `.removeprefix()`, `.removesuffix()`, `.split()` and `.join()`.
+  `.removeprefix()`, `.removesuffix()`, `.split()`, `.splitlines()` and
+  `.join()`. `.splitlines()` breaks on the universal-newline set, which like
+  Unicode whitespace is a small closed list matched as byte sequences: the
+  seven single-byte ones, `\r\n` as one break rather than two, and NEL, LINE
+  SEPARATOR and PARAGRAPH SEPARATOR. A trailing break makes no extra piece,
+  which is the whole difference from `.split("\n")`.
   `.islower()` and `.isupper()` need at least one cased character and none of
   the other case, so `"123"` is neither. `.removeprefix()` and
   `.removesuffix()` compare bytes and need no guard: a valid UTF-8 sequence
