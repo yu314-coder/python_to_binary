@@ -4032,9 +4032,40 @@ class Frontend:
         """`sum/min/max/any/all(xs)` over a runtime list or a generator."""
 
         name = node.func.id
+        if name in {"min", "max"} and len(node.args) == 2 and not node.keywords:
+            bools = [self.renders_as_bool(item) for item in node.args]
+            if any(bools) and not all(bools):
+                # The result is whichever argument wins, so with a bool on one
+                # side and a number on the other its kind is decided at run
+                # time - min(True, 3) is True and min(True, 0) is 0. One slot
+                # cannot print both ways, so this is refused the way a mixed
+                # container and a mixed conditional already are.
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    f"native {name}() is given a bool and a number, and returns "
+                    "whichever wins, so whether the answer prints as True or as "
+                    "1 would be decided at run time; wrap the bool in int() to "
+                    "compare numbers",
+                )
+            # min(a, b) is a comparison, not a walk. CPython returns the FIRST
+            # argument when they are equal, which is why the test is strict.
+            left = self.materialize_int(
+                self.integer(node.args[0], bindings, call_stack)
+            )
+            right = self.materialize_int(
+                self.integer(node.args[1], bindings, call_stack)
+            )
+            keeps_left = IntCompare(
+                "lt" if name == "min" else "gt", right, left
+            )
+            return self.select_integer(keeps_left, right, left)
         if len(node.args) != 1 or node.keywords:
             raise NativeCompileError(
-                self.path, node, f"native {name}() takes one iterable"
+                self.path,
+                node,
+                f"native {name}() takes one iterable"
+                + (", or two values" if name in {"min", "max"} else ""),
             )
         source = node.args[0]
         if isinstance(source, ast.GeneratorExp):
@@ -13851,6 +13882,15 @@ class Frontend:
                 return self.list_holds_bool(argument) is True
             return False
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if (
+                node.func.id in {"min", "max"}
+                and node.func.id not in self.functions
+                and len(node.args) == 2
+                and not node.keywords
+            ):
+                # min(a, b) returns one of its arguments, so it is a bool when
+                # both of them are - the same rule `a and b` follows.
+                return all(self.renders_as_bool(item) for item in node.args)
             return self.call_returns_bool(node)
         if self.string_method_kind(node) == "bool":
             return True
