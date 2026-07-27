@@ -856,7 +856,10 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
                 _expression(words, operation.address, slot_base, refs)
                 words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-                words.extend(_mov(0, -11 & 0xFFFFFFFFFFFFFFFF))  # STD_OUTPUT_HANDLE
+                # -11 is STD_OUTPUT_HANDLE and -12 is STD_ERROR_HANDLE.
+                words.extend(
+                    _mov(0, (-11 if operation.fd == 1 else -12) & 0xFFFFFFFFFFFFFFFF)
+                )
                 call("GetStdHandle")
                 words.extend((0xF94003E1, 0x910043FF))  # ldr x1,[sp]; add sp,#16
                 words.extend((0xF94003E2, 0x910043FF))  # ldr x2,[sp]; add sp,#16
@@ -1046,7 +1049,7 @@ def _emit_operations(
             _expression(words, operation.address, slot_base, refs)  # x0 = address
             words.append(0xAA0003E1)  # mov x1, x0  (buf)
             words.extend((0xF94003E2, 0x910043FF))  # ldr x2,[sp]; add sp,#16
-            words.extend(_mov(0, 1))  # fd = stdout
+            words.extend(_mov(0, operation.fd))
             words.extend(_mov(syscall_register, system.write_number))
             words.append(system.svc)
             continue

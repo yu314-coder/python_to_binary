@@ -3256,3 +3256,95 @@ class SplitLinesTests(unittest.TestCase):
             self._runtime("héllo\n中") + 'print("|".join(s.splitlines()))\n',
             "héllo|中\n".encode("utf-8"),
         )
+
+
+class UncaughtExceptionMessageTests(unittest.TestCase):
+    """An exception that reaches no handler keeps the message it was raised with.
+
+    A raise that goes straight out of the program always printed its message,
+    because the message was known where the raise was. One that passes through
+    a `try` whose handlers do not match went through the dispatch instead, and
+    the dispatch only carried an identifier - so "ValueError" was printed where
+    CPython printed "ValueError: v".
+    """
+
+    def _run(self, source: str, stdout: bytes, stderr_tail: bytes, exit_code: int) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, stdout)
+            self.assertEqual(native.stderr.strip(), stderr_tail)
+            self.assertEqual(native.returncode, exit_code)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+            expected = reference.stderr.strip().splitlines()
+            self.assertEqual(
+                native.stderr.strip(), expected[-1] if expected else b""
+            )
+
+    def test_a_message_survives_a_handler_that_does_not_match(self):
+        self._run(
+            'print("before")\ntry:\n    raise ValueError("v")\n'
+            "except TypeError:\n    pass\n",
+            b"before\n",
+            b"ValueError: v",
+            1,
+        )
+
+    def test_it_survives_two_levels_of_them(self):
+        self._run(
+            "try:\n    try:\n        raise KeyError('inner')\n"
+            "    except IndexError:\n        pass\n"
+            "except TypeError:\n    pass\n",
+            b"",
+            b"KeyError: 'inner'",
+            1,
+        )
+
+    def test_key_error_prints_the_keys_repr(self):
+        # KeyError's own __str__ shows the repr, so the quotes are part of the
+        # message and the quote character depends on what is inside.
+        self._run(
+            "try:\n    raise KeyError(\"it's\")\nexcept IndexError:\n    pass\n",
+            b"",
+            b'KeyError: "it\'s"',
+            1,
+        )
+
+    def test_a_message_from_inside_a_function(self):
+        self._run(
+            "def check(n):\n"
+            '    if n < 0:\n        raise ValueError("negative")\n'
+            "    return n\n"
+            "try:\n    print(check(-1))\nexcept TypeError:\n    pass\n",
+            b"",
+            b"ValueError: negative",
+            1,
+        )
+
+    def test_an_exception_raised_without_a_message(self):
+        self._run(
+            "try:\n    raise ValueError\nexcept TypeError:\n    pass\n",
+            b"",
+            b"ValueError",
+            1,
+        )
+
+    def test_a_caught_exception_is_unaffected(self):
+        self._run(
+            'try:\n    raise ValueError("v")\nexcept ValueError:\n    print("caught")\n',
+            b"caught\n",
+            b"",
+            0,
+        )

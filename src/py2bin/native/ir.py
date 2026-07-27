@@ -435,10 +435,15 @@ class HeapStore:
 
 @dataclass(frozen=True, slots=True)
 class WriteRuntime:
-    """Write ``length`` runtime bytes starting at ``address`` to stdout."""
+    """Write ``length`` runtime bytes at ``address`` to ``fd``.
+
+    ``fd`` is 1 for stdout and 2 for stderr, the same two the constant
+    ``Write`` uses.
+    """
 
     address: IntExpression
     length: IntExpression
+    fd: int = 1
 
 
 @dataclass(frozen=True, slots=True)

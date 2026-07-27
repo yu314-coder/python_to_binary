@@ -955,6 +955,7 @@ class Frontend:
         self.handler_stack: list[str] = []
         self.exception_slot: int | None = None
         self.exception_value_slot: int | None = None
+        self.exception_message_slot: int | None = None
         self._dtoa_scratch_slot: int | None = None
         self._prologue: list[object] = []
         self._bool_text_slot: int | None = None
@@ -14405,6 +14406,11 @@ class Frontend:
         if self.exception_slot is None:
             self.exception_slot = self.new_temp()
             self.exception_value_slot = self.new_temp()
+            # The message the raise site knew. Without it an exception that
+            # travels to a handler and is not caught arrives with only its
+            # identifier, and "ValueError" is printed where CPython printed
+            # "ValueError: v".
+            self.exception_message_slot = self.new_temp()
         assert self.exception_value_slot is not None
         return self.exception_slot, self.exception_value_slot
 
@@ -14430,6 +14436,26 @@ class Frontend:
             if name == "SystemExit":
                 self.operations.append(ExitValue(IntLoad(value_slot)))
             else:
+                assert self.exception_message_slot is not None
+                message = IntLoad(self.exception_message_slot)
+                # The raise site stored the whole line, including its newline;
+                # the name alone is the fallback for an exception raised where
+                # no message was recorded.
+                named = self.new_label("uncaught_named")
+                self.operations.append(
+                    JumpIfFalse(
+                        IntCompare("ne", message, IntConstant(0)), named
+                    )
+                )
+                self.operations.append(
+                    WriteRuntime(
+                        IntBinary("add", message, IntConstant(8)),
+                        HeapLoad(message, 8),
+                        2,
+                    )
+                )
+                self.operations.append(Exit(1))
+                self.operations.append(Label(named))
                 self.operations.append(Write(name.encode("ascii") + b"\n", 2))
                 self.operations.append(Exit(1))
             self.operations.append(Label(skip))
@@ -14460,6 +14486,13 @@ class Frontend:
         )
         self.operations.append(
             Store(value_slot, value if value is not None else IntConstant(0))
+        )
+        assert self.exception_message_slot is not None
+        self.operations.append(
+            Store(
+                self.exception_message_slot,
+                self.materialize_string_constant(message),
+            )
         )
         self.operations.append(Jump(self.handler_stack[-1]))
 
@@ -14530,7 +14563,11 @@ class Frontend:
             except NativeCompileError:
                 text = None
             if isinstance(text, str):
-                detail = ": " + text
+                # KeyError prints the key's repr rather than the key, which is
+                # its own __str__ and not something the raise site chose. The
+                # text is a build-time constant, so Python's own repr is
+                # exactly what CPython would write.
+                detail = ": " + (repr(text) if name == "KeyError" else text)
             elif isinstance(text, (int, bool)):
                 detail = ": " + str(int(text))
         message = (name + detail).encode("utf-8", "replace") + b"\n"

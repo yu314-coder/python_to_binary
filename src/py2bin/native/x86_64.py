@@ -554,7 +554,7 @@ def _emit_x86_operations(
             code.extend(b"\x48\x89\xc6")  # mov rsi, rax (buf)
             code.extend(b"\x48\x8b\x14\x24")  # mov rdx, [rsp] (count)
             code.extend(_DROP)
-            code.extend(b"\x48\xc7\xc7\x01\x00\x00\x00")  # mov rdi, 1
+            code.extend(_mov_imm32(b"\xc7", operation.fd))  # mov rdi, fd
             code.extend(b"\x48\xc7\xc0" + struct.pack("<I", system.write_number))
             code.extend(b"\x0f\x05")
         elif isinstance(operation, Write):
@@ -806,7 +806,10 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
                 code.extend(_SPILL)
                 _expression(code, operation.address, slot_base, refs)
                 code.extend(_SPILL)
-                code.extend(b"\xb9\xf5\xff\xff\xff")  # mov ecx, -11 (stdout)
+                # -11 is STD_OUTPUT_HANDLE and -12 is STD_ERROR_HANDLE.
+                code.extend(
+                    b"\xb9" + struct.pack("<i", -11 if operation.fd == 1 else -12)
+                )
                 code.extend(b"\x48\x83\xec\x20")  # shadow, below the spills
                 indirect_call("GetStdHandle")
                 code.extend(b"\x48\x83\xc4\x20")
