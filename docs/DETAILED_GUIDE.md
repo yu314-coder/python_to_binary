@@ -326,6 +326,10 @@ runtime:
   The capture is emitted before anything else, because the arena mapping alone
   would overwrite what it reads. Windows is refused by name: it would need
   GetCommandLineW and its UTF-16 strings;
+- `sys.stdin.read()`, which reads standard input to end of file and is what
+  lets a compiled program sit in a pipe. It is the same walk a file gets, on
+  the descriptor the process started with; a pipe has no length to ask for,
+  which is why the buffer doubles rather than being sized up front;
 - reading and writing files, on POSIX targets only, through the open, read,
   write and close system calls. `open(path).read()` answers the whole file as a
   string, and a name bound by `with open(path, "w") as f` accepts `f.write(...)`

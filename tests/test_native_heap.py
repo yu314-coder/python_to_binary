@@ -3910,3 +3910,89 @@ class NoneDefaultTests(unittest.TestCase):
             "n = 0\nfor i in range(0, 3):\n    n += 1\nprint(n is 3)\n",
             "no runtime 'is'",
         )
+
+
+class StandardInputTests(unittest.TestCase):
+    """`sys.stdin.read()` - what makes a compiled program usable in a pipe."""
+
+    _POSIX = ("darwin-arm64", "linux-x86_64", "linux-arm64", "darwin-x86_64")
+
+    def _run(self, source: str, given: bytes, expected: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in self._POSIX:
+                compile_native(entry, root / f"p-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "p-darwin-arm64.bin")], input=given, capture_output=True
+            )
+            self.assertEqual(native.stdout, expected)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], input=given, capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_it_reads_everything_it_is_given(self):
+        self._run(
+            "import sys\ntext = sys.stdin.read()\n"
+            'for line in text.splitlines():\n    print("[" + line + "]")\n',
+            b"alpha\nbeta\n",
+            b"[alpha]\n[beta]\n",
+        )
+
+    def test_empty_input_and_no_trailing_newline(self):
+        self._run("import sys\nprint(len(sys.stdin.read()))\n", b"", b"0\n")
+        self._run(
+            "import sys\nt = sys.stdin.read()\nprint(len(t), len(t.splitlines()))\n",
+            b"abc",
+            b"3 1\n",
+        )
+
+    def test_input_longer_than_one_read(self):
+        # A pipe cannot be measured before it is read, which is why the buffer
+        # doubles instead of being sized up front.
+        self._run(
+            "import sys\nprint(len(sys.stdin.read()))\n", b"x" * 20000, b"20000\n"
+        )
+
+    def test_input_that_is_not_ascii(self):
+        self._run(
+            "import sys\nt = sys.stdin.read()\nprint(len(t), t.strip())\n",
+            "héllo\n".encode("utf-8"),
+            "6 héllo\n".encode("utf-8"),
+        )
+
+    def test_a_filter_that_takes_its_pattern_from_the_command_line(self):
+        # argv, stdin and stdout together, which is what a Unix tool is.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(
+                "import sys\n"
+                "needle = sys.argv[1]\n"
+                "kept = 0\n"
+                "for line in sys.stdin.read().splitlines():\n"
+                "    if needle in line:\n        kept += 1\n        print(line)\n"
+                'print("-- " + str(kept) + " matched")\n',
+                encoding="utf-8",
+            )
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            given = b"apple pie\nbanana\napple tart\n"
+            native = subprocess.run(
+                [str(binary), "apple"], input=given, capture_output=True
+            )
+            self.assertEqual(
+                native.stdout, b"apple pie\napple tart\n-- 2 matched\n"
+            )
+            reference = subprocess.run(
+                [sys.executable, str(entry), "apple"],
+                input=given,
+                capture_output=True,
+            )
+            self.assertEqual(native.stdout, reference.stdout)

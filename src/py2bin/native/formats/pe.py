@@ -59,7 +59,18 @@ def _imports(section_rva: int, image_base: int) -> tuple[bytes, dict[str, int], 
         image_base,
         # VirtualAlloc supplies the writable block that holds file-scope
         # variables, the way an anonymous mmap does on POSIX.
-        ("GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc"),
+        (
+            "GetStdHandle",
+            "WriteFile",
+            "ExitProcess",
+            "VirtualAlloc",
+            # File access. CreateFileA takes the same narrow path bytes a
+            # native string already holds, so nothing has to be widened to
+            # UTF-16 on the way in.
+            "CreateFileA",
+            "ReadFile",
+            "CloseHandle",
+        ),
     )
 
 

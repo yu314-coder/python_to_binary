@@ -7578,6 +7578,42 @@ class Frontend:
             self._argv_slots = (self.new_temp(), self.new_temp())
         return self._argv_slots
 
+    def is_standard_stream(self, node: ast.expr, name: str) -> bool:
+        """Whether ``node`` is `sys.<name>` and `sys` still means the module."""
+
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == name
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+            and "sys" not in self.slots
+            and "sys" not in self.values
+        )
+
+    def stdin_read_shape(self, node: ast.expr) -> bool:
+        """`sys.stdin.read()` - the whole of standard input, as a string."""
+
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "read"
+            and not node.args
+            and not node.keywords
+            and self.is_standard_stream(node.func.value, "stdin")
+        )
+
+    def emit_stdin_read(self) -> IntExpression:
+        """Read standard input to end of file.
+
+        The same walk a file gets, on the descriptor the process was started
+        with. Its length cannot be asked for at all here - a pipe has none -
+        which is why the buffer doubles rather than being sized up front.
+        """
+
+        descriptor = self.new_temp()
+        self.operations.append(Store(descriptor, IntConstant(0)))
+        return self.emit_read_all(descriptor)
+
     def is_argv(self, node: ast.expr) -> bool:
         return (
             isinstance(node, ast.Attribute)
@@ -10521,6 +10557,8 @@ class Frontend:
             and self.is_argv(node.value)
         ):
             return self.emit_argv_element(self.integer(node.slice))
+        if self.stdin_read_shape(node):
+            return self.emit_stdin_read()
         if self.file_read_shape(node) is not None:
             assert isinstance(node, ast.Call)
             return self.emit_file_read(node)
@@ -18077,7 +18115,7 @@ class Frontend:
             and node.func.id not in self.functions
         ):
             return "str"
-        if self.file_read_shape(node) is not None:
+        if self.file_read_shape(node) is not None or self.stdin_read_shape(node):
             return "str"
         if (
             isinstance(node, ast.Subscript)
