@@ -1458,6 +1458,104 @@ class Frontend:
         self.label_number += 1
         return f"{prefix}_{self.label_number}"
 
+    def container_length(
+        self, node: ast.expr, bindings: dict[str, KernelValue] | None = None
+    ) -> IntExpression | None:
+        """How many items ``node`` holds, or None when it is not a container.
+
+        A string answers with its byte count rather than its code-point count.
+        Both are zero together, and the truth of a string is the only thing
+        this is asked for, so the cheaper one is enough.
+        """
+
+        try:
+            kind = self.expression_type(node, bindings)
+        except NativeCompileError:
+            return None
+        if kind == "str":
+            return HeapLoad(self.string_pointer(node), 8)
+        if self.list_kind(kind) is not None:
+            return HeapLoad(
+                IntBinary("add", self.list_pointer(node), IntConstant(8)), 8
+            )
+        if isinstance(node, ast.Name) and (
+            self.dict_kinds_of(node.id) is not None
+            or self.set_kind_of(node.id) is not None
+        ):
+            # The live count is the second word of the table header.
+            return HeapLoad(
+                IntBinary("add", IntLoad(self.slots[node.id]), IntConstant(8)), 8
+            )
+        tuple_kinds = self.tuple_kinds(kind)
+        if tuple_kinds is not None:
+            # A tuple's length is fixed when it is written.
+            return IntConstant(len(tuple_kinds))
+        return None
+
+    def truth_value(
+        self, node: ast.expr, bindings: dict[str, KernelValue] | None = None
+    ) -> IntExpression:
+        """``node`` as a condition: a container is true when it is not empty.
+
+        Only where a truth value is what is wanted - a test, a `not`, a
+        `bool()`. Everywhere else a container is still refused in an integer
+        context, because a block's address is not a number and reading it as
+        one is the mistake this compiler exists to prevent.
+        """
+
+        length = self.container_length(node, bindings)
+        if length is not None:
+            return IntCompare("ne", length, IntConstant(0))
+        if isinstance(node, ast.BoolOp) and node.values:
+            # As a condition, `a and b` is true when both are - which is a
+            # question about each operand's truth and not about its value, so
+            # the operands that could not be lowered as numbers still work
+            # here. The value form is still refused: `xs and ys` answers with
+            # one of the two, and one slot cannot hold either kind.
+            parts = [self.truth_value(node.values[0], bindings)]
+            self.eager_depth += 1
+            try:
+                parts.extend(
+                    self.truth_value(value, bindings) for value in node.values[1:]
+                )
+            finally:
+                self.eager_depth -= 1
+            # Each part is reduced to 0 or 1 before they are combined. The
+            # operators here are bitwise, and an operand that answered with its
+            # own value rather than a truth - an integer does - would make
+            # `s and n` with n == 2 come out as 1 & 2, which is false.
+            combined = IntCompare("ne", parts[0], IntConstant(0))
+            for part in parts[1:]:
+                combined = IntBinary(
+                    "and" if isinstance(node.op, ast.And) else "or",
+                    combined,
+                    IntCompare("ne", part, IntConstant(0)),
+                )
+            return combined
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return IntCompare(
+                "eq", self.truth_value(node.operand, bindings), IntConstant(0)
+            )
+        try:
+            if self.expression_type(node, bindings) == "object":
+                # An instance with no __bool__ and no __len__ is always true,
+                # and neither is in the subset. Said outright rather than left
+                # to fall through to the integer path, where the answer would
+                # be right only because a live block's address is never zero.
+                return IntConstant(1)
+        except NativeCompileError:
+            pass
+        try:
+            if self.expression_type(node, bindings) == "float":
+                # Every float but zero is true, and NaN with it, which is what
+                # comparing against zero says.
+                return FloatCompare(
+                    "ne", self.float_expression(node, bindings), FloatConstant(0.0)
+                )
+        except NativeCompileError:
+            pass
+        return self.integer(node, bindings or {})
+
     def refuse_unbound(self, name: str, node: ast.AST | None = None) -> None:
         """Refuse a read of a name that may not have been bound.
 
@@ -9508,7 +9606,7 @@ class Frontend:
             # `"neg" if n < 0 else "pos"` - and also what a body of ifs that
             # all end in a return is folded into, which is how a branching
             # function comes to answer with a string.
-            condition = self.integer(node.test)
+            condition = self.truth_value(node.test)
             self.eager_depth += 1
             try:
                 chosen = self.string_pointer(node.body)
@@ -11908,7 +12006,7 @@ class Frontend:
             condition = self.constant(node.test)
         except NativeCompileError as constant_error:
             try:
-                runtime_condition = self.integer(node.test)
+                runtime_condition = self.truth_value(node.test)
             except NativeCompileError as runtime_error:
                 # Every runtime condition fails the fold, so "not a constant"
                 # names nothing that is wrong here; the lowering failure does.
@@ -12052,7 +12150,7 @@ class Frontend:
         start = self.new_label("while_start")
         end = self.new_label("while_end")
         self.operations.append(Label(start))
-        self.operations.append(JumpIfFalse(self.integer(node.test), end))
+        self.operations.append(JumpIfFalse(self.truth_value(node.test), end))
         self.break_targets.append(end if broke is None else broke)
         self.continue_targets.append(start)
         for statement in node.body:
@@ -15644,6 +15742,13 @@ class Frontend:
 
         if isinstance(node, ast.Constant):
             return isinstance(node.value, bool)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "bool"
+            and node.func.id not in self.functions
+        ):
+            return True
         if isinstance(node, ast.Compare):
             return True
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -16870,7 +16975,7 @@ class Frontend:
                     "integer arm to a double would print 1.0 where Python "
                     "prints 1, so write float() on the integer arm",
                 )
-            condition = self.integer(node.test, bindings, call_stack)
+            condition = self.truth_value(node.test, bindings)
             # A real branch, not the integer path's evaluate-both-and-select: a
             # float arm can carry a division whose zero check must not run on
             # the arm Python never evaluates.
@@ -17574,6 +17679,17 @@ class Frontend:
                 "`q, r = divmod(a, b)`; there is no tuple here for it to be "
                 "held in otherwise",
             )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "bool"
+            and node.func.id not in self.functions
+        ):
+            if len(node.args) != 1 or node.keywords:
+                raise NativeCompileError(
+                    self.path, node, "native bool() takes exactly one argument"
+                )
+            return self.truth_value(node.args[0], bindings)
         if self.dict_get_shape(node) is not None:
             return self.emit_dict_get(node, bindings)
         if self.list_method_shape(node, "pop") in {"int", "bool"}:
@@ -17800,6 +17916,15 @@ class Frontend:
             }
             operator = operators.get(type(node.op))
             if operator is not None:
+                if isinstance(node.op, ast.Not):
+                    # Through the truth question rather than the value, so
+                    # that `not xs` and `not x` work for a container and a
+                    # float as well as for an integer.
+                    return IntCompare(
+                        "eq",
+                        self.truth_value(node.operand, bindings),
+                        IntConstant(0),
+                    )
                 return IntUnary(
                     operator,
                     self.integer(node.operand, bindings, call_stack),
@@ -18126,7 +18251,7 @@ class Frontend:
                     "returns disagree reads as this, because a body of ifs "
                     "that all end in a return is folded into one conditional",
                 )
-            condition = self.integer(node.test, bindings, call_stack)
+            condition = self.truth_value(node.test, bindings)
             # Both arms are evaluated eagerly, so neither may contain an
             # operation that can trap.
             self.eager_depth += 1

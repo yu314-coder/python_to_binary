@@ -2775,3 +2775,104 @@ class SteppedSliceTests(unittest.TestCase):
 
     def test_a_step_of_zero_is_refused(self):
         self._reject("xs = [1, 2]\nprint(xs[::0])\n", "non-zero integer constant")
+
+
+class TruthOfAContainerTests(unittest.TestCase):
+    """`if xs:`, `not s`, `while queue:` - true when it is not empty.
+
+    A container's slot holds the address of its block, which is never zero, so
+    reading it as a number made every container true. It was refused for that
+    reason; the count answers the question properly.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def test_an_empty_container_is_false_and_a_full_one_true(self):
+        self._run(
+            's = ""\ns = s + "abc"\ne = ""\n'
+            "xs = [1]\nys: list[int] = []\n"
+            "d = {1: 2}\nempty: dict[int, int] = {}\n"
+            "print(bool(s), bool(e), bool(xs), bool(ys), bool(d), bool(empty))\n",
+            b"True False True False True False\n",
+        )
+
+    def test_not_reports_emptiness(self):
+        self._run(
+            's = ""\ns = s + "abc"\ne = ""\nxs = [1]\nys: list[int] = []\n'
+            "print(not s, not e, not xs, not ys, not not xs)\n",
+            b"False True False True True\n",
+        )
+
+    def test_a_container_drives_if_and_while(self):
+        self._run(
+            "xs = [1, 2, 3]\n"
+            "while xs:\n    xs.pop()\n"
+            "if xs:\n    print('wrong')\nelse:\n    print('drained')\n",
+            b"drained\n",
+        )
+
+    def test_a_runtime_float_is_true_when_it_is_not_zero(self):
+        self._run(
+            "n = 0.0\nfor i in range(0, 3):\n    n = n + 1.0\n"
+            "z = 0.0\nfor i in range(0, 1):\n    z = z + 0.0\n"
+            "print(bool(n), bool(z), not z)\n",
+            b"True False True\n",
+        )
+
+    def test_boolean_operators_combine_truths_not_values(self):
+        # `s and n` is a question about each operand's truth. Combining the
+        # values instead made this false for n == 2, because 1 & 2 is 0.
+        self._run(
+            's = ""\ns = s + "a"\nn = 0\nfor i in range(0, 2):\n    n = n + 1\n'
+            "xs = [1]\nys: list[int] = []\n"
+            "print(bool(s and n), bool(xs and s and n), bool(ys or xs), bool(ys and xs))\n",
+            b"True True True False\n",
+        )
+
+    def test_the_value_form_of_and_or_is_still_refused(self):
+        # `xs and ys` answers with one of the two, and one slot cannot hold
+        # either kind. Only the truth question is answered.
+        self._reject(
+            "xs = [1]\nys = [2]\nzs = xs and ys\nprint(len(zs))\n",
+            "needs indexing or len()",
+        )
+
+    def test_arithmetic_on_a_container_is_still_refused(self):
+        self._reject("d = {1: 1}\nx = d + 1\nprint(x)\n", "needs len()")
+
+    def test_the_escape_helper_from_a_real_application(self):
+        # Taken from manim_app's app.py, which is what this was added for: a
+        # guard clause on an empty string followed by chained replaces.
+        self._run(
+            "def escape(text):\n"
+            '    if not text:\n        return ""\n'
+            '    return text.replace("\\\\", "\\\\\\\\").replace("\'", "\\\\\'")\n'
+            "s = ''\ns = s + \"a'b\\\\c\"\n"
+            'print(escape(s))\nprint(escape("") == "")\n',
+            b"a\\'b\\\\c\nTrue\n",
+        )

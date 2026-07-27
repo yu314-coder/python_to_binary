@@ -65,26 +65,20 @@ else:
     def test_runtime_condition_reports_the_lowering_failure(self):
         # A runtime condition never folds, so "not a compile-time constant"
         # would be true of every one of these and name nothing.
+        # A float, a list and a string in a condition used to be here too.
+        # They lower now - each is true when it is non-zero or non-empty, as
+        # Python says - so what is left is the conditions that still cannot be
+        # lowered at all.
         cases = [
-            (
-                "n = 0.0\nfor i in range(0, 3):\n    n += 1.0\n",
-                "n",
-                r"float variable 'n' needs an explicit int\(n\)",
-            ),
-            (
-                "a = []\nfor i in range(0, 3):\n    a.append(i)\n",
-                "a",
-                r"list variable 'a' needs indexing or len\(\)",
-            ),
-            (
-                's = ""\nfor i in range(0, 3):\n    s = s + "a"\n',
-                "s",
-                r"string variable 's' needs len\(\)",
-            ),
             (
                 "x = 0\nfor i in range(0, 3):\n    x += 1\n",
                 "x is None",
                 r"native code has no runtime 'is'",
+            ),
+            (
+                "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    a = [1]\n",
+                "a",
+                r"'a' may be unbound here",
             ),
         ]
         for setup, test, expected in cases:
@@ -95,11 +89,11 @@ else:
 
     def test_runtime_condition_failure_survives_a_boolean_operator(self):
         source = (
-            "n = 0.0\nfor i in range(0, 3):\n    n += 1.0\n"
-            'if n and True:\n    print("y")\n'
+            "x = 0\nfor i in range(0, 3):\n    x += 1\n"
+            'if x is None and True:\n    print("y")\n'
         )
         with self.assertRaisesRegex(
-            NativeCompileError, r"float variable 'n' needs an explicit int\(n\)"
+            NativeCompileError, r"native code has no runtime 'is'"
         ):
             lower(Path("cond.py"), source)
 

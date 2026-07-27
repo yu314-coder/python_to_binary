@@ -271,6 +271,16 @@ runtime:
   instead. Because that check can stop the program, those methods and
   `.index()` are refused inside a conditional expression or a short-circuited
   Boolean operand, where both arms are lowered eagerly;
+- a container is true when it is not empty, so `if xs:`, `while queue:`,
+  `not s` and `bool(d)` all work, and so does a runtime float, which is true
+  when it is not zero. This used to be refused, and for a good reason: a
+  container's slot holds the address of its block, that address is never zero,
+  and reading it as a number made an empty list true. The count answers it
+  properly. `and` and `or` work in a condition, where the question is each
+  operand's truth; the value form is still refused, because `xs and ys` answers
+  with one of the two and one slot cannot hold either kind. An instance is
+  always true, which is said outright rather than left to fall out of its
+  address being non-zero;
 - `for index, item in enumerate(xs)` and `enumerate(xs, start)`, and
   `for a, b in zip(xs, ys)` over any number of lists. Each list's length is
   read from its own header at every step, so the walk stops with the shortest

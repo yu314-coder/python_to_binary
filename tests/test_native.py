@@ -2742,6 +2742,22 @@ class NativeSetRefusalTests(unittest.TestCase):
                 compile_native(entry, root / "s.bin", "darwin-arm64", clean=True)
             self.assertIn(expected, str(caught.exception))
 
+    def _accept(self, source: str, expected_stdout: bytes) -> None:
+        """Compile and run, and hold the answer against CPython's."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "s.py"
+            entry.write_text(source, encoding="utf-8")
+            binary = root / "s.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            native = subprocess.run([str(binary)], capture_output=True)
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
     def test_iterating_a_set_is_refused(self):
         self._reject(
             "s = {1, 2}\nfor v in s:\n    print(v)\n",
@@ -2785,7 +2801,15 @@ class NativeSetRefusalTests(unittest.TestCase):
 
     def test_a_set_in_an_integer_context_is_refused(self):
         self._reject("s = {1, 2}\nx = s + 1\nprint(x)\n", "set variable 's' needs len()")
-        self._reject("s = {1, 2}\nif s:\n    print(1)\n", "set variable 's' needs len()")
+        # `if s:` used to be refused for the same reason arithmetic is - the
+        # name holds a block address, and reading it as a number made an empty
+        # table true. It is answered from the count now, so what this once
+        # guarded against is checked by running it.
+        self._accept(
+            "s: set[int] = set()\nif s:\n    print(1)\nelse:\n    print(0)\n"
+            "t = {1, 2}\nprint(1 if t else 0)\n",
+            b"0\n1\n",
+        )
         self._reject(
             "s = {1, 2}\nt = {1, 2}\nprint(s == t)\n", "set variable 's' needs len()"
         )
@@ -2794,9 +2818,10 @@ class NativeSetRefusalTests(unittest.TestCase):
         # The same hole, and it was open for dicts too: `d + 1` answered with
         # an arena address and `if d:` was true for an empty table.
         self._reject("d = {1: 1}\nx = d + 1\nprint(x)\n", "dict variable 'd' needs len()")
-        self._reject(
-            "d: dict[int, int] = {}\nif d:\n    print(1)\n",
-            "dict variable 'd' needs len()",
+        self._accept(
+            "d: dict[int, int] = {}\nif d:\n    print(1)\nelse:\n    print(0)\n"
+            "e = {1: 1}\nprint(1 if e else 0)\n",
+            b"0\n1\n",
         )
 
     def test_a_second_name_for_the_same_set_is_refused(self):
