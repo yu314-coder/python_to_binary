@@ -234,9 +234,58 @@ class CApiEmitTests(unittest.TestCase):
             b"[0, 1, 4, 9]\n",
         )
 
+    def test_break_continue_and_augmented_assignment(self):
+        self._run(
+            "for i in range(10):\n    if i > 2:\n        break\n    print(i)\n",
+            b"0\n1\n2\n",
+        )
+        self._run(
+            "for i in range(5):\n    if i == 2:\n        continue\n    print(i)\n",
+            b"0\n1\n3\n4\n",
+        )
+        self._run("x = 0\nfor i in range(5):\n    x += i\nprint(x)\n", b"10\n")
+
+    def test_the_remaining_arithmetic(self):
+        self._run("print(17 % 5, 17 // 5)\n", b"2 3\n")
+        self._run("print(2 ** 100)\n", b"1267650600228229401496703205376\n")
+
+    def test_dict_and_tuple_literals(self):
+        # PyDict_SetItem steals neither reference, unlike PyTuple_SetItem, so
+        # both go back after the pair is stored.
+        self._run(
+            'd = {"a": 1, "b": 2}\nprint(d, len(d), d["a"])\n',
+            b"{'a': 1, 'b': 2} 2 1\n",
+        )
+        self._run('print((1, 2, 3))\nt = (1, "two")\nprint(t[1])\n', b"(1, 2, 3)\ntwo\n")
+        self._run('d = {"xs": [1, 2, 3]}\nprint(d["xs"][1])\n', b"2\n")
+
+    def test_f_strings(self):
+        self._run(
+            'n = 42\nname = "world"\nprint(f"hello {name}, n is {n}")\n',
+            b"hello world, n is 42\n",
+        )
+        self._run(
+            'for i in range(3):\n    print(f"{i} squared is {i * i}")\n',
+            b"0 squared is 0\n1 squared is 1\n2 squared is 4\n",
+        )
+
+    def test_and_or_yield_an_operand_and_short_circuit(self):
+        # `1 and 2` is 2 in Python, not True. And the second operand must not
+        # run when the first settles the answer - getting the condition the
+        # wrong way round makes `0 and boom()` call boom.
+        self._run('print(1 and 2, 0 or 3, [] or "empty")\n', b"2 3 empty\n")
+        self._run(
+            "def boom():\n    return 1 / 0\nprint(0 and boom())\n", b"0\n"
+        )
+        self._run(
+            "def boom():\n    return 1 / 0\nprint(1 or boom())\n", b"1\n"
+        )
+
     def test_what_is_not_translated_says_so(self):
-        self._reject("x = {1: 2}\n", "has no C-API translation here yet")
-        self._reject("x = (1, 2)\n", "has no C-API translation here yet")
+        self._reject("class A:\n    pass\n", "has no C-API translation here yet")
+        self._reject(
+            'print(f"{x:>3}")\n', "format specifier or conversion is not"
+        )
 
         # An unknown name is no longer refused at build time: it is looked up
         # in builtins while the program runs, which is how range() and sum()

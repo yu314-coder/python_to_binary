@@ -68,6 +68,12 @@ extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwa
 extern PyObject *PyTuple_New(long long length);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
 extern PyObject *PyFloat_FromDouble(double value);
+extern PyObject *PyNumber_Remainder(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_FloorDivide(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Power(PyObject *base, PyObject *exp, PyObject *mod);
+extern PyObject *PyDict_New(void);
+extern int PyDict_SetItem(PyObject *mapping, PyObject *key, PyObject *value);
+extern PyObject *PyTuple_Pack(long long length, PyObject *a, PyObject *b);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -94,6 +100,8 @@ _BINARY = {
     ast.Sub: "PyNumber_Subtract",
     ast.Mult: "PyNumber_Multiply",
     ast.Div: "PyNumber_TrueDivide",
+    ast.Mod: "PyNumber_Remainder",
+    ast.FloorDiv: "PyNumber_FloorDivide",
 }
 
 
@@ -195,10 +203,18 @@ class CApiEmitter:
             return self.comparison(node, indent)
         if isinstance(node, ast.List):
             return self.list_literal(node, indent)
+        if isinstance(node, ast.Dict):
+            return self.dict_literal(node, indent)
+        if isinstance(node, ast.Tuple):
+            return self.tuple_literal(node, indent)
         if isinstance(node, ast.Subscript):
             return self.subscript(node, indent)
         if isinstance(node, ast.UnaryOp):
             return self.unary(node, indent)
+        if isinstance(node, ast.JoinedStr):
+            return self.joined(node, indent)
+        if isinstance(node, ast.BoolOp):
+            return self.boolean(node, indent)
         if isinstance(node, ast.Attribute):
             return self.attribute(node, indent)
         if isinstance(node, ast.Call):
@@ -246,6 +262,17 @@ class CApiEmitter:
         return target
 
     def binary(self, node: ast.BinOp, indent: int) -> str:
+        if isinstance(node.op, ast.Pow):
+            left = self.expression(node.left, indent)
+            right = self.expression(node.right, indent)
+            modulus = self.builtin("None", indent)
+            target = self.temporary()
+            self.emit(
+                f"{target} = PyNumber_Power({left}, {right}, {modulus});", indent
+            )
+            for value in (left, right, modulus):
+                self.emit(f"Py_DecRef({value});", indent)
+            return self.checked(target, indent)
         function = _BINARY.get(type(node.op))
         if function is None:
             raise self.fail(node, f"{type(node.op).__name__} is not translated here yet")
@@ -272,6 +299,66 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({left});", indent)
         self.emit(f"Py_DecRef({right});", indent)
         return self.checked(target, indent)
+
+    def joined(self, node: ast.JoinedStr, indent: int) -> str:
+        """An f-string: each piece rendered, then joined by concatenation.
+
+        A format specifier is not translated - that is `format()` with its own
+        mini-language, and doing half of it would be worse than saying so.
+        """
+
+        target = self.temporary()
+        self.emit(f'{target} = PyUnicode_FromString("");', indent)
+        self.checked(target, indent)
+        for piece in node.values:
+            if isinstance(piece, ast.Constant):
+                rendered = self.constant(piece, indent)
+            elif isinstance(piece, ast.FormattedValue):
+                if piece.format_spec is not None or piece.conversion not in (-1, 115):
+                    raise self.fail(
+                        node,
+                        "an f-string format specifier or conversion is not "
+                        "translated here yet",
+                    )
+                value = self.expression(piece.value, indent)
+                rendered = self.temporary()
+                self.emit(f"{rendered} = PyObject_Str({value});", indent)
+                self.emit(f"Py_DecRef({value});", indent)
+                self.checked(rendered, indent)
+            else:
+                raise self.fail(node, "unsupported f-string piece")
+            joined = self.temporary()
+            self.emit(f"{joined} = PyNumber_Add({target}, {rendered});", indent)
+            self.emit(f"Py_DecRef({target});", indent)
+            self.emit(f"Py_DecRef({rendered});", indent)
+            self.checked(joined, indent)
+            target = joined
+        return target
+
+    def boolean(self, node: ast.BoolOp, indent: int) -> str:
+        """`a and b` - the operand that decides, which is a value and not a
+        bool: `1 and 2` is 2 in Python, and `0 or 3` is 3."""
+
+        target = self.temporary()
+        decision = self.temporary_flag()
+        self.emit(f"{target} = 0;", indent)
+        first = self.expression(node.values[0], indent)
+        self.emit(f"{target} = {first};", indent)
+        for operand in node.values[1:]:
+            self.emit(f"{decision} = PyObject_IsTrue({target});", indent)
+            self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+            # `and` goes on to the next operand when this one is true;
+            # `or` goes on when it is false. Getting this the wrong way round
+            # makes `0 and boom()` call boom.
+            keeps = "" if isinstance(node.op, ast.And) else "!"
+            # Short-circuit: the second operand is only evaluated when the
+            # first does not already settle the answer.
+            self.emit(f"if ({keeps}{decision}) {{", indent)
+            value = self.expression(operand, indent + 1)
+            self.emit(f"Py_DecRef({target});", indent + 1)
+            self.emit(f"{target} = {value};", indent + 1)
+            self.emit("}", indent)
+        return target
 
     def unary(self, node: ast.UnaryOp, indent: int) -> str:
         """`-x` and `not x`. There is no PyNumber_Negative in the vetted set,
@@ -339,6 +426,43 @@ class CApiEmitter:
             self.emit(f"PyList_Append({target}, {value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
         return target
+
+    def dict_literal(self, node: ast.Dict, indent: int) -> str:
+        """`{k: v}` - an empty dict, then each pair set into it."""
+
+        target = self.temporary()
+        self.emit(f"{target} = PyDict_New();", indent)
+        self.checked(target, indent)
+        for key_node, value_node in zip(node.keys, node.values):
+            if key_node is None:
+                raise self.fail(node, "`**` in a dict literal is not translated here")
+            key = self.expression(key_node, indent)
+            value = self.expression(value_node, indent)
+            self.emit(f"PyDict_SetItem({target}, {key}, {value});", indent)
+            # PyDict_SetItem does not steal either reference, so both go back.
+            self.emit(f"Py_DecRef({key});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+        return target
+
+    def tuple_literal(self, node: ast.Tuple, indent: int) -> str:
+        """`(a, b)` - built through the list the vetted set can grow, then
+        handed to the tuple builtin.
+
+        PyTuple_Pack is variadic and py2bin passes no variadic arguments, so
+        its vetted arity is fixed at two and cannot serve a general tuple.
+        Going through `tuple(list)` costs an allocation and works for any
+        length, which is the better trade here.
+        """
+
+        listed = self.list_literal(
+            ast.copy_location(ast.List(elts=node.elts, ctx=ast.Load()), node), indent
+        )
+        maker = self.builtin("tuple", indent)
+        target = self.temporary()
+        self.emit(f"{target} = PyObject_CallOneArg({maker}, {listed});", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.emit(f"Py_DecRef({listed});", indent)
+        return self.checked(target, indent)
 
     def builtin(self, name: str, indent: int) -> str:
         """A name from the builtins module, fetched the way Python fetches it.
@@ -469,6 +593,12 @@ class CApiEmitter:
             self.give_back(node, indent)
         elif isinstance(node, ast.Import):
             self.import_module(node, indent)
+        elif isinstance(node, ast.AugAssign):
+            self.augmented(node, indent)
+        elif isinstance(node, ast.Break):
+            self.emit("break;", indent)
+        elif isinstance(node, ast.Continue):
+            self.emit("continue;", indent)
         elif isinstance(node, ast.Pass):
             pass
         elif isinstance(node, ast.FunctionDef):
@@ -503,6 +633,26 @@ class CApiEmitter:
         target = self.declare(node.targets[0].id)
         # The name may already hold something; that reference is released
         # before it is overwritten, which is what keeps a loop from growing.
+        self.emit(f"if ({target}) Py_DecRef({target});", indent)
+        self.emit(f"{target} = {value};", indent)
+
+    def augmented(self, node: ast.AugAssign, indent: int) -> None:
+        """`x += 1` - the operation, then the assignment, as Python does it."""
+
+        if not isinstance(node.target, ast.Name):
+            raise self.fail(node, "only augmented assignment to a name is translated")
+        rewritten = ast.copy_location(
+            ast.BinOp(
+                left=ast.copy_location(
+                    ast.Name(id=node.target.id, ctx=ast.Load()), node
+                ),
+                op=node.op,
+                right=node.value,
+            ),
+            node,
+        )
+        value = self.expression(rewritten, indent)
+        target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
 

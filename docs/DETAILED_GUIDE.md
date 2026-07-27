@@ -233,11 +233,20 @@ reimplements them. One consequence is worth recording: a name that does not
 exist anywhere fails with `AttributeError` rather than the `NameError` CPython
 gives. Same exit status, different type.
 
-Translated so far: integer and string literals, list literals, names,
-`+ - * /`, the six comparisons, `if`/`else`, `while`, `for`, `print()` with any
-number of values, `str()`, `len()`, `import`, attribute access, builtins,
-method calls of any arity, and functions with positional parameters, including
-recursive ones.
+`and` and `or` answer with an operand rather than a bool - `1 and 2` is 2 -
+and the second operand only runs when the first does not settle the answer.
+A tuple literal is built through a list and handed to the `tuple` builtin:
+`PyTuple_Pack` is variadic, py2bin passes no variadic arguments, so its vetted
+arity is fixed at two and cannot serve a general tuple. The extra allocation
+buys any length.
+
+Translated so far: integers, floats, strings, f-strings without a format
+specifier, list/dict/tuple literals, `True`/`False`/`None`, names, `+ - * / %
+// **`, unary `-` and `not`, `and`/`or`, the six comparisons, subscripting,
+`if`/`elif`/`else`, `while`, `for`, `break`, `continue`, augmented assignment,
+`print()` with any number of values, `str()`, `len()`, `import`, attribute
+access, builtins, method calls of any arity, and functions with positional
+parameters, including recursive ones.
 Everything else says which construct it is and that it has no translation yet.
 Text outside ASCII goes into the C as octal escapes so the source stays ASCII,
 and the embedded interpreter's stdout is set to UTF-8 on the way in - without
@@ -1164,7 +1173,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 40 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 46 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the
