@@ -341,7 +341,16 @@ runtime:
   start past the stop yields nothing - Python's rules, which is why slicing and
   indexing are separate operations here rather than one with a flag. String
   bounds count code points, so they are resolved to byte offsets before
-  anything is copied. A step other than one is rejected;
+  anything is copied. A list takes any non-zero constant step, with Python's
+  own rules for the direction: going backwards the bounds default to the last
+  index and to just before the first, and clamp into `[-1, length - 1]` rather
+  than `[0, length]`. A step is required to be a constant because it decides
+  the direction, and the direction decides what the defaults and the clamps
+  are. A string takes `s[::-1]`, which walks forwards and writes backwards - a
+  UTF-8 sequence can only be measured from its lead byte, so its width is known
+  going forwards and would have to be found by scanning back over continuation
+  bytes going the other way. A wider step on a string is rejected, because it
+  would have to rescan from the start for every code point it lands on;
 - `for name in <list>:` walks a runtime list by index, and a list
   comprehension (`[expr for name in it ...]`, with any number of `for` and `if`
   clauses) builds one, over a range or another list. The result is sized from

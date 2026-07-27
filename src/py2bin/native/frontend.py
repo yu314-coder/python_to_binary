@@ -3687,21 +3687,126 @@ class Frontend:
             )
         )
 
+    def slice_step(self, node: ast.Slice) -> int:
+        """The slice's step, which has to be known at build time.
+
+        A step decides the direction of the walk, and the direction decides
+        what the defaults for the two bounds are and which way they clamp. A
+        step only known at run time would mean emitting both walks and choosing
+        between them, for a shape nothing writes.
+        """
+
+        if node.step is None:
+            return 1
+        try:
+            step = self.constant(node.step)
+        except NativeCompileError:
+            step = None
+        if not isinstance(step, int) or isinstance(step, bool) or step == 0:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native slice steps by a non-zero integer constant"
+                + ("; a step of 0 is an error in Python too" if step == 0 else ""),
+            )
+        return step
+
+    def strided_slice_extent(
+        self, node: ast.Slice, length: IntExpression
+    ) -> tuple[int, int, int]:
+        """Slots holding the first index and how many the slice takes.
+
+        Python's own rules, which differ by direction: going forwards the
+        bounds default to 0 and the length and clamp into `[0, length]`; going
+        backwards they default to the last index and to just before the first,
+        and clamp into `[-1, length - 1]`.
+        """
+
+        step = self.slice_step(node)
+        length_slot = self.materialize_int(length)
+        start_slot = self.new_temp()
+        stop_slot = self.new_temp()
+        for slot, bound, forward_default, backward_default in (
+            (start_slot, node.lower, IntConstant(0), IntBinary("sub", length_slot, IntConstant(1))),
+            (stop_slot, node.upper, length_slot, IntConstant(-1)),
+        ):
+            if bound is None:
+                self.operations.append(
+                    Store(slot, forward_default if step > 0 else backward_default)
+                )
+                continue
+            self.operations.append(Store(slot, self.integer(bound)))
+            self.operations.append(
+                Store(
+                    slot,
+                    self.select_integer(
+                        IntCompare("lt", IntLoad(slot), IntConstant(0)),
+                        IntBinary("add", IntLoad(slot), length_slot),
+                        IntLoad(slot),
+                    ),
+                )
+            )
+            low, high = (
+                (IntConstant(0), length_slot)
+                if step > 0
+                else (IntConstant(-1), IntBinary("sub", length_slot, IntConstant(1)))
+            )
+            self.operations.append(
+                Store(
+                    slot,
+                    self.select_integer(
+                        IntCompare("lt", IntLoad(slot), low), low, IntLoad(slot)
+                    ),
+                )
+            )
+            self.operations.append(
+                Store(
+                    slot,
+                    self.select_integer(
+                        IntCompare("gt", IntLoad(slot), high), high, IntLoad(slot)
+                    ),
+                )
+            )
+        # ceil((stop - start) / step) without a division: the span rounded up
+        # by adding one less than the step's size before dividing.
+        span = (
+            IntBinary("sub", IntLoad(stop_slot), IntLoad(start_slot))
+            if step > 0
+            else IntBinary("sub", IntLoad(start_slot), IntLoad(stop_slot))
+        )
+        size = abs(step)
+        count_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                count_slot,
+                IntBinary(
+                    "sdiv",
+                    IntBinary("add", span, IntConstant(size - 1)),
+                    IntConstant(size),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                count_slot,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(count_slot), IntConstant(0)),
+                    IntConstant(0),
+                    IntLoad(count_slot),
+                ),
+            )
+        )
+        return start_slot, count_slot, step
+
     def slice_bounds(
         self, node: ast.Slice, length: IntExpression
     ) -> tuple[IntExpression, IntExpression]:
-        if node.step is not None:
-            try:
-                step = self.constant(node.step)
-            except NativeCompileError:
-                step = None
-            if step != 1:
-                raise NativeCompileError(
-                    self.path,
-                    node,
-                    "a native slice steps by one; another step would have to "
-                    "walk the source backwards or skip through it",
-                )
+        if self.slice_step(node) != 1:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "this slice steps by one only",
+            )
         lower = self.slice_bound(node.lower, length, IntConstant(0))
         upper = self.slice_bound(node.upper, length, length)
         # A start past the stop is an empty slice, not a negative length.
@@ -3710,9 +3815,88 @@ class Frontend:
         )
         return lower, upper
 
+    def emit_strided_list_slice(
+        self, source: IntExpression, node: ast.Slice
+    ) -> IntExpression:
+        """`xs[a:b:step]` - the selected elements, copied one at a time.
+
+        One at a time because the source words are no longer contiguous; a
+        step of one still goes through the block copy above.
+        """
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, source))
+        origin = IntLoad(source_slot)
+        start_slot, count_slot, step = self.strided_slice_extent(
+            node, HeapLoad(IntBinary("add", origin, IntConstant(8)), 8)
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                result_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.LIST_HEADER_BYTES),
+                    IntBinary("mul", IntLoad(count_slot), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, IntLoad(count_slot), 8))
+        self.operations.append(
+            HeapStore(
+                IntBinary("add", result, IntConstant(8)), IntLoad(count_slot), 8
+            )
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        walk = self.new_label("stride")
+        done = self.new_label("stride_done")
+        self.operations.append(Label(walk))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(count_slot)), done
+            )
+        )
+        taken = IntBinary(
+            "add",
+            IntLoad(start_slot),
+            IntBinary("mul", IntLoad(index_slot), IntConstant(step)),
+        )
+        self.operations.append(
+            HeapStore(
+                IntBinary(
+                    "add",
+                    IntBinary("add", result, IntConstant(self.LIST_HEADER_BYTES)),
+                    IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                ),
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        IntBinary(
+                            "add", origin, IntConstant(self.LIST_HEADER_BYTES)
+                        ),
+                        IntBinary("mul", taken, IntConstant(8)),
+                    ),
+                    8,
+                ),
+                8,
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(walk))
+        self.operations.append(Label(done))
+        return result
+
     def emit_list_slice(
         self, source: IntExpression, node: ast.Slice
     ) -> IntExpression:
+        if self.slice_step(node) != 1:
+            return self.emit_strided_list_slice(source, node)
         bump = self.ensure_heap()
         source_slot = self.new_temp()
         self.operations.append(Store(source_slot, source))
@@ -4492,9 +4676,87 @@ class Frontend:
         )
         return result
 
+    def emit_reversed_string(self, source: IntExpression) -> IntExpression:
+        """`s[::-1]` - the code points in the opposite order.
+
+        Walking forwards and writing backwards, rather than walking backwards:
+        a UTF-8 sequence can only be measured from its lead byte, so the width
+        of each code point is known going forwards and would have to be found
+        by scanning back over continuation bytes going the other way. The
+        result is exactly as long in bytes as the source.
+        """
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, source))
+        origin = IntLoad(source_slot)
+        total = self.materialize_int(HeapLoad(origin, 8))
+        result_slot = self.new_temp()
+        self.operations.append(HeapAlloc(result_slot, self._aligned_size(total), bump))
+        result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, total, 8))
+        read = self.new_temp()
+        write = self.new_temp()
+        self.operations.append(Store(read, IntConstant(0)))
+        self.operations.append(Store(write, total))
+        walk = self.new_label("reverse")
+        done = self.new_label("reverse_done")
+        self.operations.append(Label(walk))
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(read), total), done)
+        )
+        lead = HeapLoad(
+            IntBinary(
+                "add", IntBinary("add", origin, IntConstant(8)), IntLoad(read)
+            ),
+            1,
+        )
+        width = self.new_temp()
+        self.operations.append(Store(width, IntConstant(4)))
+        for limit, size in ((0xF0, 3), (0xE0, 2), (0x80, 1)):
+            wider = self.new_label("reverse_width")
+            self.operations.append(
+                JumpIfFalse(IntCompare("lt", lead, IntConstant(limit)), wider)
+            )
+            self.operations.append(Store(width, IntConstant(size)))
+            self.operations.append(Label(wider))
+        self.operations.append(
+            Store(write, IntBinary("sub", IntLoad(write), IntLoad(width)))
+        )
+        self.emit_byte_copy(
+            IntBinary(
+                "add", IntBinary("add", result, IntConstant(8)), IntLoad(write)
+            ),
+            IntBinary(
+                "add", IntBinary("add", origin, IntConstant(8)), IntLoad(read)
+            ),
+            IntLoad(width),
+        )
+        self.operations.append(
+            Store(read, IntBinary("add", IntLoad(read), IntLoad(width)))
+        )
+        self.operations.append(Jump(walk))
+        self.operations.append(Label(done))
+        return result
+
     def emit_string_slice(
         self, source: IntExpression, node: ast.Slice
     ) -> IntExpression:
+        if self.slice_step(node) != 1:
+            if (
+                self.slice_step(node) == -1
+                and node.lower is None
+                and node.upper is None
+            ):
+                return self.emit_reversed_string(source)
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native string slice steps by one, or is s[::-1]. A wider "
+                "step would have to find the byte offset of every code point "
+                "it lands on, and a UTF-8 sequence can only be measured from "
+                "its lead byte - so it would rescan from the start each time",
+            )
         bump = self.ensure_heap()
         source_slot = self.new_temp()
         self.operations.append(Store(source_slot, source))

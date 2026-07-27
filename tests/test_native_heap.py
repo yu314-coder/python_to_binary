@@ -2689,3 +2689,89 @@ class ReturningAStringTests(unittest.TestCase):
 
     def test_a_string_result_used_as_a_number_is_refused(self):
         self._reject(self._SIGN + "print(sign(1) + 1)\n", "not in the native string subset")
+
+
+class SteppedSliceTests(unittest.TestCase):
+    """`xs[a:b:step]` on a list, and `s[::-1]` on a string."""
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def _runtime(self, name: str, text: str) -> str:
+        return f'{name} = ""\n{name} = {name} + {text!r}\n'
+
+    def test_a_list_reverses_and_strides(self):
+        self._run(
+            "xs = [1, 2, 3, 4, 5]\nprint(xs[::-1], xs[::2], xs[1::2])\n",
+            b"[5, 4, 3, 2, 1] [1, 3, 5] [2, 4]\n",
+        )
+
+    def test_bounds_clamp_the_way_python_clamps_them(self):
+        # Going backwards the defaults and the clamps are different: the start
+        # is the last index and the stop is just before the first.
+        self._run(
+            "xs = [0, 1, 2, 3, 4, 5, 6]\n"
+            "print(xs[1:6:2], xs[5:0:-2], xs[-2::-1], xs[:-3:-1])\n",
+            b"[1, 3, 5] [5, 3, 1] [5, 4, 3, 2, 1, 0] [6, 5]\n",
+        )
+
+    def test_a_stride_that_selects_nothing(self):
+        self._run(
+            "xs = [1, 2, 3]\nprint(xs[::-1][3:], xs[2:0:1], xs[0:2:-1])\n",
+            b"[] [] []\n",
+        )
+
+    def test_a_step_of_one_still_copies_the_block(self):
+        self._run(
+            "xs = [1, 2, 3, 4]\nprint(xs[1:3], xs[:], xs[-2:])\n",
+            b"[2, 3] [1, 2, 3, 4] [3, 4]\n",
+        )
+
+    def test_a_string_reverses_by_code_point(self):
+        # Byte by byte would split the é and the emoji into their parts.
+        self._run(
+            self._runtime("s", "héllo中\U0001f600")
+            + "r = s[::-1]\nprint(r)\nprint(r[::-1] == s, len(r) == len(s))\n",
+            "\U0001f600中olléh\nTrue True\n".encode("utf-8"),
+        )
+
+    def test_reversing_an_empty_and_a_one_character_string(self):
+        self._run(
+            self._runtime("s", "")
+            + self._runtime("t", "x")
+            + 'print(s[::-1] == "", t[::-1])\n',
+            b"True x\n",
+        )
+
+    def test_a_wider_string_step_says_why_it_is_refused(self):
+        self._reject(
+            self._runtime("s", "abcdef") + "print(s[::2])\n",
+            "measured from its lead byte",
+        )
+
+    def test_a_step_of_zero_is_refused(self):
+        self._reject("xs = [1, 2]\nprint(xs[::0])\n", "non-zero integer constant")
