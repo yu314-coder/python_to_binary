@@ -6137,20 +6137,39 @@ class Frontend:
         self.close_loop_else(node, broke)
 
     def emit_print_list(self, node: ast.expr, element_kind: str) -> None:
-        """Write a whole list the way CPython's repr does.
+        """Write a whole list the way CPython's repr does."""
+
+        text = self.materialize_int(self.emit_list_to_string(node, element_kind))
+        self.operations.append(
+            WriteRuntime(IntBinary("add", text, IntConstant(8)), HeapLoad(text, 8))
+        )
+
+    def emit_list_to_string(
+        self, node: ast.expr, element_kind: str
+    ) -> IntExpression:
+        """Build the text CPython's repr gives a list; returns a string block.
 
         Unlike a tuple, the length is only known at run time, so the elements
         are walked rather than unrolled and the separator needs a branch: a
         comma goes before every element except the first.
+
+        print() goes through this too rather than writing each piece straight
+        out. Writing would save the allocations, but then an f-string and a
+        print would be two implementations of one format, free to drift apart -
+        and the cost of that is a wrong answer, while the cost of this is arena
+        space the guard already reports honestly.
         """
 
+        result_slot = self.new_temp()
+        self.operations.append(
+            Store(result_slot, self.materialize_string_constant(b"["))
+        )
         pointer = self.materialize_int(self.list_pointer(node))
         length = self.materialize_int(
             HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8)
         )
         index_slot = self.new_temp()
         self.operations.append(Store(index_slot, IntConstant(0)))
-        self.operations.append(Write(b"["))
         start = self.new_label("print_list")
         end = self.new_label("print_list_end")
         first = self.new_label("print_list_first")
@@ -6163,7 +6182,14 @@ class Frontend:
                 IntCompare("gt", IntLoad(index_slot), IntConstant(0)), first
             )
         )
-        self.operations.append(Write(b", "))
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot), self.materialize_string_constant(b", ")
+                ),
+            )
+        )
         self.operations.append(Label(first))
         word = HeapLoad(
             IntBinary(
@@ -6179,16 +6205,23 @@ class Frontend:
             text = self.emit_float_to_string(BitsFloat(word))
         else:
             text = self.emit_int_to_string(word)
-        text = self.materialize_int(text)
         self.operations.append(
-            WriteRuntime(IntBinary("add", text, IntConstant(8)), HeapLoad(text, 8))
+            Store(result_slot, self.emit_concat(IntLoad(result_slot), text))
         )
         self.operations.append(
             Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
         )
         self.operations.append(Jump(start))
         self.operations.append(Label(end))
-        self.operations.append(Write(b"]"))
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot), self.materialize_string_constant(b"]")
+                ),
+            )
+        )
+        return IntLoad(result_slot)
 
     def emit_print_tuple(self, node: ast.expr, kinds: tuple[str, ...]) -> None:
         """Write a whole tuple the way CPython's repr does."""
@@ -7841,14 +7874,7 @@ class Frontend:
                 return self.emit_bool_to_string(self.integer(node))
             return self.emit_int_to_string(self.integer(node))
         if self.list_kind(kind) in {"int", "float", "bool"}:
-            raise NativeCompileError(
-                self.path,
-                node,
-                f"a native f-string cannot render a {kind} yet, though print() "
-                "can: an f-string has to build the text in memory rather than "
-                "write it out, and that is not implemented. Print the list on "
-                "its own, or format the elements individually",
-            )
+            return self.emit_list_to_string(node, self.list_kind(kind))
         raise NativeCompileError(
             self.path, node, f"a native f-string cannot render a {kind} yet"
         )
