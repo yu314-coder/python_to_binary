@@ -1003,6 +1003,11 @@ class Frontend:
         # would run off the end of it.
         self.iterated_lists: list[str] = []
         self.return_targets: list[tuple[int | None, str]] = []
+        # Whether the innermost inlined function's result slot holds the
+        # address of a string block rather than a number. Decided by the call
+        # site before the body runs, because it is the call site that has to
+        # read the slot back.
+        self.returns_string = False
         self.active_functions: list[tuple[int, str]] = []
         # Python defs handed to the Objective-C runtime as method
         # implementations, keyed by (def name, method type encoding). Each is a
@@ -1715,6 +1720,31 @@ class Frontend:
                     "is folded into a conditional expression instead and can "
                     "return a float.",
                 )
+            if self.expression_type(node.value) == "str":
+                # The slot holds the block's address. What makes this safe is
+                # that the call site already asked what this body returns and
+                # got the same answer, so it is reading the slot as a string.
+                if not self.returns_string:
+                    raise NativeCompileError(
+                        self.path,
+                        node,
+                        "this native function returns a string on one path and "
+                        "a number on another, so the call site cannot know "
+                        "which it is holding; return the same kind everywhere",
+                    )
+                self.operations.append(
+                    Store(result_slot, self.string_pointer(node.value))
+                )
+                self.operations.append(Jump(return_label))
+                return
+            if self.returns_string:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "this native function returns a string on one path and a "
+                    "number on another, so the call site cannot know which it "
+                    "is holding; return the same kind everywhere",
+                )
             self.operations.append(Store(result_slot, self.integer(node.value)))
             self.operations.append(Jump(return_label))
         elif isinstance(node, ast.Global):
@@ -2387,7 +2417,47 @@ class Frontend:
             # `self` is the leading argument the caller supplied, so the kinds
             # the binding produced line up one position later.
             argument_kinds=("object", *argument_kinds),
+            returns_string=self.method_returns_string(native_class, method, node),
         )
+
+    def method_call_kind(self, node: ast.Call) -> str | None:
+        """``"str"`` when this is a method call whose body answers a string.
+
+        None when it is not a method call on a native class at all, and "int"
+        when it is one that answers with a number - the caller only has to
+        tell an address apart from a number.
+        """
+
+        if not isinstance(node.func, ast.Attribute):
+            return None
+        try:
+            native_class = self.resolve_object_class(node.func.value)
+        except NativeCompileError:
+            return None
+        if native_class is None:
+            return None
+        method = native_class.methods.get(node.func.attr)
+        if method is None or not method.returns_value:
+            return None
+        if id(method) in self._kind_query:
+            return "int"  # Recursive; the ordinary path reports it properly.
+        return "str" if self.method_returns_string(native_class, method, node) else "int"
+
+    def method_returns_string(
+        self, native_class: NativeClass, method: NativeFunction, node: ast.Call
+    ) -> bool:
+        """Whether this method answers with a string block's address."""
+
+        previous_objects = self.object_classes
+        # `self` inside the body is an instance of this class, which is what
+        # makes an attribute read there resolve to a field rather than fail.
+        self.object_classes = {**previous_objects, "self": native_class.name}
+        try:
+            return self.statement_body_returns_string(
+                method, node, None, skip_parameters=1
+            )
+        finally:
+            self.object_classes = previous_objects
 
     def contains_extern_call(self, expression: ast.AST) -> bool:
         """True when ``expression`` performs an adapter-ABI external call.
@@ -9168,6 +9238,22 @@ class Frontend:
             )
         if isinstance(node, ast.Name):
             self.refuse_unbound(node.id, node)
+        if isinstance(node, ast.Call) and self.method_call_kind(node) == "str":
+            # Inlined the ordinary way; the difference is only that the result
+            # slot is read as an address.
+            return self.integer(node)
+        if isinstance(node, ast.IfExp):
+            # `"neg" if n < 0 else "pos"` - and also what a body of ifs that
+            # all end in a return is folded into, which is how a branching
+            # function comes to answer with a string.
+            condition = self.integer(node.test)
+            self.eager_depth += 1
+            try:
+                chosen = self.string_pointer(node.body)
+                other = self.string_pointer(node.orelse)
+            finally:
+                self.eager_depth -= 1
+            return self.select_integer(condition, chosen, other)
         if self.list_method_shape(node, "pop") == "str":
             # The element word is the string's block address.
             assert isinstance(node, ast.Call)
@@ -9210,6 +9296,16 @@ class Frontend:
         if self.tuple_subscript_kind(node) == "str":
             assert isinstance(node, ast.Subscript)
             return HeapLoad(self.tuple_element_address(node), 8)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and self.expression_function_kind(node) == "str"
+            and self.functions[node.func.id].expression is None
+        ):
+            # A statement body is inlined the ordinary way; what is different
+            # is only that its result slot is read as an address.
+            result = self.integer(node)
+            return result
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -15638,6 +15734,7 @@ class Frontend:
         call_stack: tuple[int, ...],
         parameter_classes: dict[str, str] | None = None,
         argument_kinds: tuple[str, ...] = (),
+        returns_string: bool = False,
     ) -> IntExpression | None:
         """Inline a function body as labels, jumps, stores, and integer IR.
 
@@ -15726,11 +15823,14 @@ class Frontend:
         self.kernel_functions = function.kernel_functions
         self.extern_functions = function.extern_functions
         self.return_targets.append((result_slot, return_label))
+        previous_returns_string = self.returns_string
+        self.returns_string = returns_string
         self.active_functions.append((identity, function_name))
         try:
             for statement in body:
                 self.statement(statement)
         finally:
+            self.returns_string = previous_returns_string
             self.active_functions.pop()
             self.return_targets.pop()
             self.functions = previous_functions
@@ -15966,9 +16066,14 @@ class Frontend:
             return "int"
         node = self.call_with_expanded_stars(node)
         if function.expression is None:
-            # A statement body is inlined, and its result kind is only known
-            # once it has been. Say integer so the caller takes the integer
-            # path, where a float return is caught and reported precisely.
+            # A statement body is inlined, and what it answers with is only
+            # settled once it has been - except for the one thing the call site
+            # must decide first, which is whether it is holding a number or the
+            # address of a string block.
+            if self.statement_body_returns_string(function, node, bindings):
+                return "str"
+            # Say integer so the caller takes the integer path, where a float
+            # return is caught and reported precisely.
             return "int"
         if node.keywords or len(node.args) > len(function.parameters):
             return None  # keywords: let the ordinary path decide
@@ -16004,6 +16109,114 @@ class Frontend:
             self._kind_query.discard(id(function))
             self.functions, self.values = previous_functions, previous_values
             self.string_bindings = previous_strings
+
+    def statement_body_returns_string(
+        self,
+        function: NativeFunction,
+        node: ast.Call,
+        bindings: dict[str, KernelValue] | None,
+        skip_parameters: int = 0,
+    ) -> bool:
+        """Whether every `return` in this body answers with a string.
+
+        The call site has to know before the body is inlined, because a string
+        is an address and a number is a number and the two are read out of the
+        result slot differently. So the body is read rather than run: the
+        parameters get stand-ins of the right kind, the locals are typed by a
+        walk over the assignments in source order, and each return expression
+        is asked what it is under those.
+
+        Deliberately all-or-nothing. A body that answers a string on one path
+        and a number on another has no single kind for the slot, and saying so
+        here is what lets the return statement report it precisely.
+        """
+
+        if id(function) in self._kind_query:
+            # Asking this body's kind is what led here, so the program is
+            # recursive. Answering "not a string" sends the caller down the
+            # ordinary path, which refuses recursion with a located message
+            # rather than running the compiler out of Python stack.
+            return False
+        returns = self.function_returns(function.body)
+        if not returns or any(item.value is None for item in returns):
+            return False
+        parameters = function.parameters[skip_parameters:]
+        if node.keywords or len(node.args) > len(parameters):
+            return False
+        supplied: list[ast.expr] = list(node.args)
+        for default in function.defaults[skip_parameters + len(node.args) :]:
+            if default is None:
+                return False
+            supplied.append(ast.Constant(value=default))
+        stand_ins: dict[str, KernelValue] = {}
+        strings: dict[str, IntExpression] = {}
+        # A method's `self` is an object; it holds an address like any other
+        # integer here, and only the attribute path cares what it points at.
+        for parameter in function.parameters[:skip_parameters]:
+            stand_ins[parameter] = IntConstant(0)
+        for parameter, argument in zip(parameters, supplied):
+            try:
+                kind = self.expression_type(argument, bindings)
+            except NativeCompileError:
+                return False
+            self.note_stand_in(stand_ins, strings, parameter, kind)
+        previous_functions, previous_values = self.functions, self.values
+        previous_strings = self.string_bindings
+        self.functions = function.functions
+        self.values = {
+            name: value
+            for name, value in function.values.items()
+            if name not in function.parameters
+        }
+        self.string_bindings = {**previous_strings, **strings}
+        self._kind_query.add(id(function))
+        try:
+            for statement in function.body:
+                for inner in ast.walk(statement):
+                    if not isinstance(inner, ast.Assign) or len(inner.targets) != 1:
+                        continue
+                    target = inner.targets[0]
+                    if not isinstance(target, ast.Name):
+                        continue
+                    try:
+                        kind = self.expression_type(inner.value, stand_ins)
+                    except NativeCompileError:
+                        continue
+                    self.note_stand_in(stand_ins, strings, target.id, kind)
+                    self.string_bindings = {**previous_strings, **strings}
+            kinds = set()
+            for item in returns:
+                assert item.value is not None
+                try:
+                    kinds.add(self.expression_type(item.value, stand_ins))
+                except NativeCompileError:
+                    return False
+            return kinds == {"str"}
+        finally:
+            self._kind_query.discard(id(function))
+            self.functions, self.values = previous_functions, previous_values
+            self.string_bindings = previous_strings
+
+    @staticmethod
+    def note_stand_in(
+        stand_ins: dict[str, KernelValue],
+        strings: dict[str, IntExpression],
+        name: str,
+        kind: str,
+    ) -> None:
+        """Record a value of ``kind`` under ``name``, without emitting one."""
+
+        if kind == "float":
+            stand_ins[name] = FloatConstant(0.0)
+            strings.pop(name, None)
+            return
+        stand_ins[name] = IntConstant(0)
+        if kind == "str":
+            # A string's stand-in is a pointer like any other integer, so the
+            # kind has to be recorded beside it.
+            strings[name] = IntConstant(0)
+        else:
+            strings.pop(name, None)
 
     def expression_type(
         self,
@@ -16155,7 +16368,17 @@ class Frontend:
         if isinstance(node, ast.IfExp):
             body = self.expression_type(node.body, bindings)
             orelse = self.expression_type(node.orelse, bindings)
+            if body == "str" and orelse == "str":
+                # Both arms have to agree. One slot holds either an address or
+                # a number, and which one it is cannot be settled at run time.
+                return "str"
             return "float" if "float" in (body, orelse) else "int"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and self.method_call_kind(node) == "str"
+        ):
+            return "str"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self.classes:
                 return "object"
@@ -17624,6 +17847,23 @@ class Frontend:
             assert result is not None
             return result
         if isinstance(node, ast.IfExp):
+            arms = (
+                self.expression_type(node.body, bindings),
+                self.expression_type(node.orelse, bindings),
+            )
+            if "str" in arms:
+                # One slot holds either an address or a number. Which it is
+                # cannot be settled at run time, so it has to be settled here.
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "one arm of this conditional is a string and the other "
+                    f"is {'an ' if (arms[0] if arms[1] == 'str' else arms[1]) == 'int' else 'a '}{arms[0] if arms[1] == 'str' else arms[1]}; the two "
+                    "are held the same way and told apart only at build time, "
+                    "so both arms have to be the same kind. A function whose "
+                    "returns disagree reads as this, because a body of ifs "
+                    "that all end in a return is folded into one conditional",
+                )
             condition = self.integer(node.test, bindings, call_stack)
             # Both arms are evaluated eagerly, so neither may contain an
             # operation that can trap.
@@ -17693,6 +17933,9 @@ class Frontend:
                     node,
                     call_stack,
                     argument_kinds=tuple(argument_kinds),
+                    returns_string=self.statement_body_returns_string(
+                        function, node, bindings
+                    ),
                 )
             previous_path = self.path
             previous_values = self.values

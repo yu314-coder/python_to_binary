@@ -2562,3 +2562,130 @@ class RenderingAFunctionParameterTests(unittest.TestCase):
             'parts = [tag(1), tag(2)]\nprint("|".join(parts))\n',
             b"#1|#2\n",
         )
+
+
+class ReturningAStringTests(unittest.TestCase):
+    """A string returned from a branching body, a loop, or a method.
+
+    The result of an inlined call lives in one slot. A string is the address of
+    a block and a number is a number, and nothing at run time tells them apart,
+    so the call site has to know which it is holding before the body is
+    inlined. It reads the body to find out: parameters get stand-ins of the
+    right kind, locals are typed by a walk over the assignments, and every
+    return has to agree.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    _SIGN = 'def sign(n):\n    if n < 0:\n        return "neg"\n    return "pos"\n'
+
+    def test_a_branching_body_can_answer_with_a_string(self):
+        self._run(self._SIGN + "print(sign(3), sign(-3))\n", b"pos neg\n")
+
+    def test_a_chain_of_three_branches(self):
+        self._run(
+            "def size(n):\n"
+            '    if n < 10:\n        return "small"\n'
+            '    if n < 100:\n        return "medium"\n'
+            '    return "large"\n'
+            "print(size(5), size(50), size(500))\n",
+            b"small medium large\n",
+        )
+
+    def test_a_branch_that_renders_its_parameter(self):
+        self._run(
+            "def sign(n):\n"
+            '    if n < 0:\n        return "neg " + str(n)\n'
+            '    return "pos " + str(n)\n'
+            "print(sign(3), sign(-3))\n",
+            b"pos 3 neg -3\n",
+        )
+
+    def test_a_local_built_by_a_loop_can_be_returned(self):
+        # The local's kind comes from the walk over the assignments; without it
+        # the call site would read the block's address as a number.
+        self._run(
+            'def stars(n):\n    out = ""\n'
+            '    for i in range(0, n):\n        out = out + "*"\n    return out\n'
+            'print(stars(3), stars(0) == "")\n',
+            b"*** True\n",
+        )
+
+    def test_the_result_behaves_like_any_other_string(self):
+        self._run(
+            self._SIGN
+            + 's = sign(3)\nprint(s, len(s), s == "pos")\n'
+            + 'parts = [sign(1), sign(-1)]\nprint("|".join(parts))\n',
+            b"pos 3 True\npos|neg\n",
+        )
+
+    def test_a_conditional_expression_over_two_strings(self):
+        self._run(
+            "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+            'print("big" if n > 2 else "small")\n',
+            b"big\n",
+        )
+
+    def test_a_method_can_answer_with_a_string(self):
+        self._run(
+            "class P:\n"
+            "    def __init__(self, x):\n        self.x = x\n"
+            '    def label(self):\n        return "x=" + str(self.x)\n'
+            "p = P(4)\nq = P(9)\nprint(p.label(), q.label())\n",
+            b"x=4 x=9\n",
+        )
+
+    def test_a_branching_method_and_one_taking_arguments(self):
+        self._run(
+            "class P:\n"
+            "    def __init__(self, x):\n        self.x = x\n"
+            "    def sign(self):\n"
+            '        if self.x < 0:\n            return "neg"\n        return "pos"\n'
+            '    def tag(self, k):\n        return f"{self.x}-{k}"\n'
+            "a = P(3)\nb = P(-3)\nprint(a.sign(), b.sign(), a.tag(9))\n",
+            b"pos neg 3-9\n",
+        )
+
+    def test_a_method_that_answers_a_number_is_unchanged(self):
+        self._run(
+            "class P:\n"
+            "    def __init__(self, x):\n        self.x = x\n"
+            "    def get(self):\n        return self.x * 2\n"
+            "p = P(4)\nprint(p.get())\n",
+            b"8\n",
+        )
+
+    def test_returns_that_disagree_are_refused(self):
+        self._reject(
+            'def bad(n):\n    if n < 0:\n        return "neg"\n    return 1\n'
+            "print(bad(3))\n",
+            "one arm of this conditional is a string",
+        )
+
+    def test_a_string_result_used_as_a_number_is_refused(self):
+        self._reject(self._SIGN + "print(sign(1) + 1)\n", "not in the native string subset")
