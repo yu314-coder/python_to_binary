@@ -97,9 +97,12 @@ is shipped next to an interpreter that runs it. This is the tier that handles
 real applications with NumPy, Torch, or a GUI.
 
 **(b) The CPython C-API path** is the Nuitka-shaped tier, with Nuitka's
-essential dependency removed: Nuitka hands its generated C to gcc, and py2bin
-compiles the C itself. What survives that constraint is genuinely narrower than
-Nuitka. See [What the C-API path supports](#what-the-c-api-path-supports).
+essential dependency removed: Nuitka hands its generated C to clang, and py2bin
+compiles the C itself. `py2bin compile-capi` now goes the whole way from
+Python - it emits the C-API calls and compiles them, so the pipeline is
+Python → C → machine code with nothing outside the standard library in it.
+What survives that constraint is genuinely narrower than Nuitka. See
+[What the C-API path supports](#what-the-c-api-path-supports).
 
 **(c) Native compile** removes CPython entirely. Nothing is interpreted and
 nothing is linked; the ELF/PE/Mach-O contains only instructions py2bin encoded.
@@ -154,17 +157,46 @@ name mangling are each larger than everything above.
 
 This is the honest boundary of tier (b). It is deliberately unflattering.
 
-**How you reach it.** Two entry points, both producing the same IR:
+**How you reach it.** Three entry points, all producing the same IR:
 
 ```sh
-# 1. Python that imports vetted C-API names from py2bin.cabi.
+# 1. Ordinary Python, translated into C-API calls for you. This is the
+#    Nuitka-shaped route: Python -> C -> machine code, no clang.
+PYTHONPATH=src python3 -m py2bin compile-capi program.py \
+  --target darwin-arm64 -o program.bin
+
+# 2. Python that imports vetted C-API names from py2bin.cabi.
 PYTHONPATH=src python3 -m py2bin compile program.py \
   --target darwin-arm64 -o program.bin
 
-# 2. Canonical C that declares the same functions with `extern` prototypes.
+# 3. Canonical C that declares the same functions with `extern` prototypes.
 PYTHONPATH=src python3 -m py2bin compile-c program.c \
   --target darwin-arm64 -o program.bin
 ```
+
+The first is what `compile-capi` adds. It writes the C itself - `--emit-c PATH`
+keeps a copy to read - and every value in it is a `PyObject *`, so the
+interpreter's semantics apply rather than the native subset's:
+
+```python
+def fact(n):
+    if n < 2:
+        return 1
+    return n * fact(n - 1)
+
+print(fact(25))          # 15511210043330985984000000, exact
+```
+
+The native tier answers that one with a wrapped 64-bit integer. This tier hands
+the multiply to `PyNumber_Multiply` and gets Python's own answer. The price is
+the one this whole tier pays: the artifact needs libpython, so it is not
+standalone.
+
+Reference counting follows a single rule, chosen because it can be checked by
+reading rather than by trusting: **every expression yields a reference the
+caller owns**, and every statement releases what it finishes with. Reading a
+name therefore increments first. A 500,000-iteration loop peaks at 14 MB, which
+is what that rule holding looks like from outside.
 
 The two are interconvertible: py2bin's C frontend parses the C into a Python
 AST, so the same program can be run under `python3` (where `py2bin.cabi` makes
@@ -714,7 +746,8 @@ The word “supports” is intentionally narrow:
 | A name bound on only some paths | No | CPython raises `NameError`; there is no run-time bit recording whether a slot was written, so reading one is refused at build time rather than answering with whatever preceded it. An arm that leaves by `raise` or `return` does not count against this |
 | User-defined `class` | Restricted | Construction, integer attributes, attribute load/store, and methods (including a method calling another method) over the same bump arena. Every attribute must be assigned unconditionally in `__init__`, which fixes the layout and guarantees no read hits a slot Python would treat as unset. Dispatch is static, so calls inline. A `float` attribute is declared by annotating it in `__init__` (`self.x: float = ...`); an integer stored into one is refused rather than widened, because CPython keeps the integer. Class attributes, decorated methods (`property`, `staticmethod`, `classmethod`), special methods other than `__enter__`/`__exit__`, recursion, attributes created outside `__init__`, a name that is both an attribute and a method, and rebinding a variable to another class are rejected. Single inheritance is supported: the subclass's layout is the base's attributes followed by its own, methods are inherited unless overridden, and `super().__init__(...)` is accepted as a bare statement in the subclass's `__init__`. Multiple bases, a base that is not a class defined earlier in the same module, `super()` anywhere else, a subclass `__init__` that leaves an inherited attribute unassigned, and an inherited attribute whose `float`/integer kind disagrees between the two classes are rejected. |
 | Adapter-ABI extern call | Restricted, `darwin-arm64` only | `from py2bin.cabi import NAME` binds a vetted libc symbol (e.g. `abs`, `strlen`, `getpid`) through real dyld; integer and compile-time-constant C-string arguments only. Rejected for every non-`darwin-arm64` target and for unknown symbols |
-| CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI also exposes 31 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You write the calls; py2bin never generates them from ordinary Python, never manages reference counts, and never propagates a C-API error. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
+| CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI exposes 31 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You may write those calls yourself, or let `py2bin compile-capi` generate them from Python - see the row below. A C-API error is still not propagated. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
+| `compile-capi`: Python → C-API → machine code | Restricted, `darwin-arm64` only | Translates Python into C that drives the interpreter, then compiles that C with py2bin's own compiler - the strategy Nuitka uses, without Nuitka's clang. Every value is a `PyObject *`, so **Python's own semantics apply**: `2 ** 100` is exact where the native tier wraps at 64 bits. Reference counting follows one rule - every expression yields an owned reference, every statement releases what it finishes with - and a 500,000-iteration loop peaks at 14 MB. Currently integers, strings, `+ - * /`, comparisons, `if`, `while`, `print()`, `str()`, and functions with positional parameters. The artifact needs libpython, so it is not standalone |
 | `print(...)` | Yes | Constant UTF-8 bytes, or (POSIX only) a runtime ASCII string, emitted through an OS write API/syscall |
 | `SystemExit(integer)` / `sys.exit(integer)` | Yes | Constant or runtime integer expression becomes the OS process-exit value |
 | Runtime input (`input()`), multiple inheritance, dynamic attribute access, `set` iteration, and a `def` under a run-time condition | No | Rejected by `compile` with a source location; compatible mode needs CPython |

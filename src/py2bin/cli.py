@@ -171,6 +171,22 @@ def _parser() -> argparse.ArgumentParser:
     c_parser.add_argument("--output", "-o", required=True, type=Path)
     c_parser.add_argument("--container", action="store_true", help="write a checksummed .py2cbin")
     c_parser.add_argument("--clean", action="store_true")
+    capi_parser = commands.add_parser(
+        "compile-capi",
+        help=(
+            "translate Python into C that drives the CPython C API, then "
+            "compile that C to machine code with py2bin's own compiler"
+        ),
+    )
+    capi_parser.add_argument("entry", type=Path)
+    capi_parser.add_argument("--output", "-o", required=True, type=Path)
+    capi_parser.add_argument(
+        "--emit-c", type=Path, help="also write the generated C to this path"
+    )
+    capi_parser.add_argument("--target", choices=supported_targets())
+    capi_parser.add_argument("--os", dest="target_os")
+    capi_parser.add_argument("--arch")
+    capi_parser.add_argument("--clean", action="store_true")
     via_c_parser = commands.add_parser(
         "compile-via-c",
         help=(
@@ -851,6 +867,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             for result in results:
                 print(f"{result.target}: {result.artifact} ({result.bytes} bytes)")
+            return 0
+        if args.command == "compile-capi":
+            from .capi_emit import python_to_capi_c
+
+            target = _target_from_args(args)
+            generated = python_to_capi_c(
+                entry.read_text(encoding="utf-8"), str(entry)
+            )
+            source = args.emit_c or args.output.with_suffix(".capi.c")
+            source.parent.mkdir(parents=True, exist_ok=True)
+            # newline pinned: the generated C has to be byte-identical
+            # whatever host wrote it.
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            artifact = compile_c_native(
+                source, args.output, target=target, clean=args.clean
+            )
+            print(
+                f"compiled {entry} through the CPython C API to "
+                f"{artifact.artifact} ({artifact.bytes} bytes, C at {source})"
+            )
             return 0
         if args.command == "emit-c":
             result = compile_c_file(entry, args.output, container=args.container, clean=args.clean)

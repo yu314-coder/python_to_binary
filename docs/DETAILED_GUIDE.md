@@ -172,6 +172,43 @@ a third-party numerical library, because an integer reimplementation would not
 match the real package's runtime object semantics (a reduction is `np.int64` /
 a 0-d tensor, not a plain `int`). They are available only through `freeze`.
 
+### Python through the CPython C API (`compile-capi`)
+
+The tier Nuitka occupies, reached without Nuitka's toolchain. `compile-capi`
+translates a Python module into C where every value is a `PyObject *` and every
+operation is a C-API call, then hands that C to py2bin's own C compiler - so
+the pipeline is Python → C → machine code with nothing outside the standard
+library taking part.
+
+What it buys over the native subset is the interpreter's own semantics. `2 **
+100` computed by repeated multiplication is exact here, because
+`PyNumber_Multiply` on two `PyLong` objects is the same arbitrary-precision
+multiply CPython performs; the native tier wraps at 64 bits and answers 0. The
+price is the one the whole tier pays: the artifact links libpython and is not
+standalone.
+
+The generated C includes no headers at all. `Python.h` carries function-pointer
+typedefs and macros this project's C front end does not parse, and the dozen
+entry points actually used fit in as many `extern` declarations, so the C
+declares them itself.
+
+Reference counting follows one rule, chosen so that it can be checked by
+reading: **every expression yields a reference the caller owns**, and every
+statement releases what it finishes with. Reading a name increments before
+handing the value back, rather than sometimes borrowing - a rule that holds
+everywhere is worth more than one that saves an increment in places. A
+500,000-iteration loop peaks at 14 MB, which is what that looks like from
+outside.
+
+Translated so far: integer and string literals, names, `+ - * /`, the six
+comparisons, `if`/`else`, `while`, `print()` with any number of values,
+`str()`, and functions with positional parameters, including recursive ones.
+Everything else says which construct it is and that it has no translation yet.
+Text outside ASCII goes into the C as octal escapes so the source stays ASCII,
+and the embedded interpreter's stdout is set to UTF-8 on the way in - without
+that, printing such text stops with a `UnicodeEncodeError` about the encoding
+rather than anything to do with the program.
+
 ### Exact direct-native subset
 
 The current native frontend combines static output with a small integer
