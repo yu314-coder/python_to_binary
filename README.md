@@ -49,6 +49,33 @@ It has seven deliberately separate execution paths. They must not be confused:
    py2bin does **not** translate ordinary Python into those calls — you write
    them, either as canonical C or as Python importing `py2bin.cabi`.
 
+### Reaching a platform framework
+
+Path 7 binds a fixed list of exported C entry points through real dyld. Since
+those may come from any library, they include the Objective-C runtime -
+`objc_getClass`, `sel_registerName`, `objc_msgSend` from
+`/usr/lib/libobjc.A.dylib` - and the image loads Foundation so classes exist,
+because libobjc holds the runtime and not the classes.
+
+That is worth stating carefully, because it is easy to read as more than it is.
+Cocoa is compiled Objective-C shipped inside macOS with no source to translate,
+and that has not changed. What has changed is that a compiled py2bin binary can
+*call* it: the runtime that dispatches to Cocoa is a plain C API, and three
+functions are the whole of it. A native binary already builds an `NSString`,
+uppercases it, and reads `NSProcessInfo` - linking `libSystem`, `libobjc` and
+`Foundation`, with no CPython anywhere in the file.
+
+`objc_msgSend` is declared variadic and is not one: it reads its arguments from
+the ordinary registers, which is why an Objective-C compiler casts it to the
+callee's real prototype before every call. Each binding here is one such cast,
+vetted with an exact signature.
+
+What this does **not** do is make `import webview`, `import AppKit`, or any
+PyObjC-based module compile. Those reach Cocoa through a C extension with no
+Python source, and nothing here changes that. An application written against
+this bridge is written against it directly, in the native subset - it is not a
+translation of an existing PyObjC program.
+
 ## The three tiers, stated plainly
 
 Three different things in this repository all end in "a file you can run". They
@@ -655,7 +682,7 @@ The word “supports” is intentionally narrow:
 | Single-name assignment and annotation | Yes | Static values are folded; runtime integer values use native stack slots |
 | Integer `+`, `-`, `*`, bitwise operations, shifts | Yes | Runtime signed 64-bit instructions; overflow wraps to 64 bits rather than creating Python big integers |
 | Runtime `float` `+`, `-`, `*`, unary `-` | Yes | IEEE-754 binary64 in hardware SSE2/NEON registers; mixed `int`/`float` promotes the integer operand |
-| Runtime `float` `/` | Restricted | Only with a nonzero numeric constant divisor; a runtime divisor is rejected because Python's divide-by-zero exception needs the object runtime |
+| Runtime `float` `/` | Yes | A constant zero divisor is a build error. A runtime divisor is pinned in a slot, compared against zero, and raises a catchable `ZeroDivisionError` rather than producing IEEE infinity or NaN |
 | `float`/`int` conversion and `float` comparisons | Yes | `float(x)` widens with `cvtsi2sd`/`scvtf`; `int(x)` truncates toward zero with `cvttsd2si`/`fcvtzs`; comparisons use `ucomisd`/`fcmp` |
 | Integer comparisons and dynamic `if` | Yes | Runtime signed comparisons and native branches |
 | Constant arithmetic, Boolean and conditional expressions | Yes | Evaluated at build time when no runtime value is involved |
@@ -666,12 +693,12 @@ The word “supports” is intentionally narrow:
 | `del d[k]` on a runtime dict | Restricted, POSIX only | The entry's state word becomes a tombstone, which a probe walks over instead of stopping at, and the key leaves the insertion-order list. A missing key reports `KeyError` and exits 1; deleting while a `for` walks the same dict reports `RuntimeError: dictionary changed size during iteration`, as CPython does, even for the last key. Tombstones count towards the table being full, so the table is rebuilt at the same capacity every capacity/2 deletions and a delete-heavy loop spends arena: around 200000 insert/delete pairs on one dict end in `MemoryError` where CPython keeps going |
 | f-string | Restricted | Fields may be runtime `int`, `float`, `bool`, or `str`. A literal format specifier `[[fill]align][sign][0][width][,][.precision][type]` is supported with `type` one of `d`, `f`, `s` or omitted; `.Nf` rounds the exact binary value half to even, as CPython does. `!r`/`!s`/`!a` are accepted on numbers and `!s` on a string. `e`, `g`, `n`, `%`, `b`, `o`, `x`, `#`, `z`, `_`, a precision on a string, a separator beside zero padding, and a non-literal specifier are rejected at build time |
 | Integer functions and procedures | Restricted | Positional and undecorated; static integer defaults and named calls; assignments, Boolean/chained comparisons, integer control flow, loops, value or bare returns, constant side effects, and acyclic calls are inlined into native IR |
-| Runtime `list` of `int` | Restricted, POSIX only | Literal build, constant/runtime index load and store, and `len()` over a bump-arena (anonymous `mmap`) of signed-64-bit elements. Negative indices count from the end as in Python. A constant index is range-checked at build time; a runtime index is range-checked by emitted instructions that report `IndexError` on stderr and exit 1, exactly like CPython, instead of reading or writing outside the list. Float elements and bare list use are rejected. Rejected for the two Windows targets, which lack the wired allocator |
+| Runtime `list` | Restricted, POSIX only | Literal build, constant/runtime index load and store, and `len()` over a bump-arena (anonymous `mmap`) of signed-64-bit elements. Negative indices count from the end as in Python. A constant index is range-checked at build time; a runtime index is range-checked by emitted instructions that report `IndexError` on stderr and exit 1, exactly like CPython, instead of reading or writing outside the list. An element may be an `int`, `float`, `bool`, `str`, or another list, and one list holds one kind: a list element keeps whatever object was put in it, so widening an integer into a float list would read back as `2.0` where CPython reads `2`, and a mix is refused. An empty literal takes its kind from the first thing stored in it, or from a `list[T]` annotation. A second name for the same list is refused, because appending moves the block and only one name would follow it; `xs[:]` copies. Bare list use is rejected |
 | Runtime list index inside `A if C else B` or `and`/`or` | No | Both arms are lowered eagerly, so a bounds check would run even when Python would not evaluate that branch; rejected with a source location. Use an `if` statement, which is supported |
-| Float `A if C else B`, and a function returning a float from a branching body | Restricted | Lowered as a real branch, so an arm that can trap is only evaluated on the path Python takes. Both arms must have the same kind: one `int` arm and one `float` arm share a slot and one slot cannot print both `1` and `2.5`, so the mix is rejected. A body with a loop or an early return is inlined statement by statement instead and still cannot return a float |
+| Float `A if C else B`, and a function returning a float from a branching body | Restricted | Lowered as a real branch, so an arm that can trap is only evaluated on the path Python takes. Both arms must have the same kind: one `int` arm and one `float` arm share a slot and one slot cannot print both `1` and `2.5`, so the mix is rejected. A body whose branches all end in a return is folded into one conditional expression before the call site picks a lowering, so the returned kind is known in time; a body with a loop is inlined statement by statement instead |
 | Runtime float divisor inside `A if C else B` or `and`/`or` | No | The integer conditional lowers both arms eagerly, so the divisor's zero check would raise on the branch Python never takes; rejected with a source location. Use an `if` statement |
 | Runtime `str` | Restricted | `""` seed, `+` concatenation, slicing, `==`, `in`, `len()`, `print()`, and use as a dict key, via the same arena. Holds any UTF-8 text: the header counts bytes, which is what a write needs, and `len()` counts code points by skipping continuation bytes, which is what CPython reports |
-| User-defined `class` | Restricted, POSIX only | Construction, integer attributes, attribute load/store, and methods (including a method calling another method) over the same bump arena. Every attribute must be assigned unconditionally in `__init__`, which fixes the layout and guarantees no read hits a slot Python would treat as unset. Dispatch is static, so calls inline. Class attributes, decorated methods (`property`, `staticmethod`, `classmethod`), special methods, float attributes, recursion, attributes created outside `__init__`, and rebinding a variable to another class are rejected. Single inheritance is supported: the subclass's layout is the base's attributes followed by its own, methods are inherited unless overridden, and `super().__init__(...)` is accepted as a bare statement in the subclass's `__init__`. Multiple bases, a base that is not a class defined earlier in the same module, `super()` anywhere else, a subclass `__init__` that leaves an inherited attribute unassigned, and an inherited attribute whose `float`/integer kind disagrees between the two classes are rejected. Rejected for the two Windows targets |
+| User-defined `class` | Restricted | Construction, integer attributes, attribute load/store, and methods (including a method calling another method) over the same bump arena. Every attribute must be assigned unconditionally in `__init__`, which fixes the layout and guarantees no read hits a slot Python would treat as unset. Dispatch is static, so calls inline. A `float` attribute is declared by annotating it in `__init__` (`self.x: float = ...`); an integer stored into one is refused rather than widened, because CPython keeps the integer. Class attributes, decorated methods (`property`, `staticmethod`, `classmethod`), special methods other than `__enter__`/`__exit__`, recursion, attributes created outside `__init__`, a name that is both an attribute and a method, and rebinding a variable to another class are rejected. Single inheritance is supported: the subclass's layout is the base's attributes followed by its own, methods are inherited unless overridden, and `super().__init__(...)` is accepted as a bare statement in the subclass's `__init__`. Multiple bases, a base that is not a class defined earlier in the same module, `super()` anywhere else, a subclass `__init__` that leaves an inherited attribute unassigned, and an inherited attribute whose `float`/integer kind disagrees between the two classes are rejected. |
 | Adapter-ABI extern call | Restricted, `darwin-arm64` only | `from py2bin.cabi import NAME` binds a vetted libc symbol (e.g. `abs`, `strlen`, `getpid`) through real dyld; integer and compile-time-constant C-string arguments only. Rejected for every non-`darwin-arm64` target and for unknown symbols |
 | CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI also exposes 31 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You write the calls; py2bin never generates them from ordinary Python, never manages reference counts, and never propagates a C-API error. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
 | `print(...)` | Yes | Constant UTF-8 bytes, or (POSIX only) a runtime ASCII string, emitted through an OS write API/syscall |
