@@ -986,6 +986,10 @@ class Frontend:
         # value, and a string's value is a pointer - indistinguishable from an
         # integer. This records which of them are strings.
         self.string_bindings: dict[str, IntExpression] = {}
+        # The numeric parameters of the function being inlined, held the same
+        # way its string parameters are. Without these a rendering call such as
+        # str(n) inside a string-returning function saw n as nothing at all.
+        self.value_bindings: dict[str, KernelValue] = {}
         self.exception_ids: dict[str, int] = {}
         # Each cleanup scope (a `finally`, or a `with`'s `__exit__`) records
         # how deep the jump stacks were when it opened. A jump is only a
@@ -1839,7 +1843,10 @@ class Frontend:
                     default,
                     "native function defaults must be compile-time int/bool values",
                 )
-            default_values.append(int(value))
+            # Kept as a bool where it is one. It is an int either way for
+            # arithmetic, and the difference shows only when the value is
+            # printed - where True must not come out as 1.
+            default_values.append(value)
         body = tuple(copy.deepcopy(node.body))
         returns = self.function_returns(body)
         value_returns = tuple(item for item in returns if item.value is not None)
@@ -9213,11 +9220,39 @@ class Frontend:
             arguments = self.bind_native_arguments(
                 node.func.id, function, node, {}, (), kinds=argument_kinds
             )
+            # Asked before anything is swapped, in the caller, where the
+            # argument expressions still mean what they say.
+            # bind_native_arguments reports only int, float or str, and a bool
+            # has to be told apart from an int by its source.
+            bool_parameters = {
+                parameter
+                for parameter, argument in zip(function.parameters, node.args)
+                if self.renders_as_bool(argument)
+            } | {
+                # A parameter the call left out takes its default, and
+                # `flag=True` is as much a bool as an argument that says so.
+                parameter
+                for parameter, default in zip(
+                    function.parameters[len(node.args) :],
+                    function.defaults[len(node.args) :],
+                )
+                if isinstance(default, bool)
+            }
             previous_path, previous_values = self.path, self.values
             previous_functions = self.functions
             previous_strings = self.string_bindings
-            self.path, self.values = function.path, function.values
+            self.path = function.path
+            # A parameter shadows a name of its own from outside, so any value
+            # folded for that name has to go; otherwise f"{v}" inside the
+            # function rendered the outer v rather than the argument.
+            self.values = {
+                name: value
+                for name, value in function.values.items()
+                if name not in function.parameters
+            }
             self.functions = function.functions
+            previous_values_bound = self.value_bindings
+            previous_booleans = set(self.boolean_names)
             self.string_bindings = {
                 **previous_strings,
                 **{
@@ -9228,12 +9263,35 @@ class Frontend:
                     if kind == "str"
                 },
             }
+            # The numbers too, so that str(n) and f"{n}" inside the function
+            # can see them. Only the string ones were carried before, which is
+            # why rendering a parameter was refused.
+            self.value_bindings = {
+                **previous_values_bound,
+                **{
+                    parameter: value
+                    for parameter, value, kind in zip(
+                        function.parameters, arguments, argument_kinds
+                    )
+                    if kind != "str"
+                },
+            }
+            # A bool argument keeps its identity across the call, so that
+            # f"{flag}" inside the function writes True and not 1. Nothing
+            # tells the two apart at run time, so it has to be carried.
+            self.boolean_names = {
+                name
+                for name in self.boolean_names
+                if name not in function.parameters
+            } | bool_parameters
             try:
                 return self.string_pointer(function.expression)
             finally:
                 self.path, self.values = previous_path, previous_values
                 self.functions = previous_functions
                 self.string_bindings = previous_strings
+                self.value_bindings = previous_values_bound
+                self.boolean_names = previous_booleans
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -15912,12 +15970,20 @@ class Frontend:
             # once it has been. Say integer so the caller takes the integer
             # path, where a float return is caught and reported precisely.
             return "int"
-        if len(node.args) != len(function.parameters) or node.keywords:
-            return None  # defaults and keywords: let the ordinary path decide
+        if node.keywords or len(node.args) > len(function.parameters):
+            return None  # keywords: let the ordinary path decide
+        # A parameter the call left out takes its default, whose kind is what
+        # the body will see. Treating that as unanswerable sent a call such as
+        # tag(1) to a path that cannot render a string at all.
+        supplied: list[ast.expr] = list(node.args)
+        for default in function.defaults[len(node.args) :]:
+            if default is None:
+                return None  # A missing argument with no default: not our call.
+            supplied.append(ast.Constant(value=default))
         # Stand-ins of the right kind, so nothing is emitted just to ask.
         stand_ins: dict[str, KernelValue] = {}
         strings: dict[str, IntExpression] = {}
-        for parameter, argument in zip(function.parameters, node.args):
+        for parameter, argument in zip(function.parameters, supplied):
             kind = self.expression_type(argument, bindings)
             if kind == "float":
                 stand_ins[parameter] = FloatConstant(0.0)
@@ -15952,6 +16018,10 @@ class Frontend:
         """
 
         bindings = bindings or {}
+        if self.value_bindings:
+            # The call's own substitutions win: a name bound here shadows the
+            # parameter of a function further out that happens to share it.
+            bindings = {**self.value_bindings, **bindings}
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
                 return "str"
@@ -16199,6 +16269,10 @@ class Frontend:
         """Lower ``node`` to an IEEE-754 double, widening integer operands."""
 
         bindings = bindings or {}
+        if self.value_bindings:
+            # The call's own substitutions win: a name bound here shadows the
+            # parameter of a function further out that happens to share it.
+            bindings = {**self.value_bindings, **bindings}
         if isinstance(node, ast.Name) and node.id not in bindings:
             # A float has no kind registry to hang this off, so it is asked
             # here. Not for a name the inliner has substituted: that one is a
@@ -16857,6 +16931,10 @@ class Frontend:
         call_stack: tuple[int, ...] = (),
     ) -> IntExpression:
         bindings = bindings or {}
+        if self.value_bindings:
+            # The call's own substitutions win: a name bound here shadows the
+            # parameter of a function further out that happens to share it.
+            bindings = {**self.value_bindings, **bindings}
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)

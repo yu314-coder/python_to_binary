@@ -2467,3 +2467,98 @@ class ZipAndRoundTests(unittest.TestCase):
 
     def test_the_two_argument_form_says_what_it_would_take(self):
         self._reject("x = 1.55\nprint(round(x, 1))\n", "rounds in decimal")
+
+
+class RenderingAFunctionParameterTests(unittest.TestCase):
+    """`str(n)` and f-strings over a function's own parameters.
+
+    A string-returning function is inlined with its string parameters bound to
+    the caller's blocks. Its numeric parameters were not bound at all, so any
+    call that had to render one - which is most of what a formatting helper
+    does - was refused as "not in the integer subset".
+    """
+
+    def _run(self, source: str, expected_stdout: bytes) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_str_of_an_integer_parameter(self):
+        self._run('def tag(n):\n    return "n" + str(n)\nprint(tag(3))\n', b"n3\n")
+
+    def test_an_f_string_over_parameters_of_every_kind(self):
+        self._run(
+            'def row(name, n, x, flag):\n    return f"{name}: {n} / {x} / {flag}"\n'
+            'print(row("a", 2, 0.25, True))\n',
+            b"a: 2 / 0.25 / True\n",
+        )
+
+    def test_a_bool_argument_keeps_printing_as_a_bool(self):
+        # Nothing tells a bool from an integer at run time, so which one was
+        # passed has to be carried across the call.
+        self._run(
+            'def show(b):\n    return f"{b}"\n'
+            "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+            "print(show(True), show(1), show(n > 2), show(n))\n",
+            b"True 1 True 3\n",
+        )
+
+    def test_a_parameter_shadows_an_outer_name_of_its_own(self):
+        # The outer v is a build-time constant. Inside the function the name
+        # means the argument, so the folded value has to be dropped.
+        self._run(
+            'v = True\ndef show(v):\n    return f"{v}"\nprint(show(7), f"{v}")\n',
+            b"7 True\n",
+        )
+
+    def test_a_defaulted_parameter_can_be_rendered(self):
+        self._run(
+            'def tag(n, k=2):\n    return f"{n}-{k}"\nprint(tag(1), tag(1, 5))\n',
+            b"1-2 1-5\n",
+        )
+        self._run('def tag(k=7):\n    return f"k{k}"\nprint(tag(), tag(9))\n', b"k7 k9\n")
+
+    def test_a_defaulted_bool_stays_a_bool(self):
+        # The default is stored as the number it also is, so the boolness has
+        # to survive that on its own.
+        self._run(
+            'def row(n, flag=True):\n    return f"{n} {flag}"\n'
+            "print(row(1), row(1, False), row(1, 1))\n",
+            b"1 True 1 False 1 1\n",
+        )
+
+    def test_a_runtime_argument_and_a_nested_call(self):
+        self._run(
+            'def inner(n):\n    return f"[{n}]"\n'
+            'def outer(n):\n    return "x" + inner(n + 1)\n'
+            "k = 0\nfor i in range(0, 4):\n    k = k + 1\n"
+            "print(outer(k), outer(k * 2))\n",
+            b"x[5] x[9]\n",
+        )
+
+    def test_a_body_with_statements_before_the_return(self):
+        self._run(
+            'def label(n):\n    prefix = "#"\n    return prefix + str(n)\n'
+            "print(label(12))\n",
+            b"#12\n",
+        )
+
+    def test_the_results_can_be_collected_and_joined(self):
+        self._run(
+            'def tag(n):\n    return f"#{n}"\n'
+            'parts = [tag(1), tag(2)]\nprint("|".join(parts))\n',
+            b"#1|#2\n",
+        )
