@@ -962,6 +962,7 @@ class Frontend:
         # rather than guessing integers and refusing anything else.
         self.undecided_lists: set[str] = set()
         self._bool_query: set[int] = set()
+        self._kind_query: set[int] = set()
         # Per tuple name, the bytes print() must write for each element whose
         # repr is settled at build time, and None where it is not. CPython
         # prints a tuple with the repr of every element, and the quotes and
@@ -14121,6 +14122,13 @@ class Frontend:
         function = self.functions.get(node.func.id)
         if function is None:
             return None
+        if id(function) in self._kind_query:
+            # Asking this function's kind is what led here, so the program is
+            # recursive. Answering "integer" sends the caller down the ordinary
+            # inlining path, which refuses recursion with a located message -
+            # far better than this walk running out of Python stack and killing
+            # the compiler with a traceback.
+            return "int"
         node = self.call_with_expanded_stars(node)
         if function.expression is None:
             # A statement body is inlined, and its result kind is only known
@@ -14146,9 +14154,11 @@ class Frontend:
         previous_strings = self.string_bindings
         self.functions, self.values = function.functions, function.values
         self.string_bindings = {**previous_strings, **strings}
+        self._kind_query.add(id(function))
         try:
             return self.expression_type(function.expression, stand_ins)
         finally:
+            self._kind_query.discard(id(function))
             self.functions, self.values = previous_functions, previous_values
             self.string_bindings = previous_strings
 
