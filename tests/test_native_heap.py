@@ -1565,8 +1565,10 @@ class NestedListTests(unittest.TestCase):
                   b"[1, 2]\n[3]\n")
 
     def test_reordering_and_reducing_strings_or_lists_is_rejected(self):
-        self._reject('parts = ["b", "a"]\nparts.sort()\n', "compare block addresses")
-        self._reject('parts = ["b", "a"]\nys = sorted(parts)\n', "compare block addresses")
+        # Sorting a list of strings used to be here too. It compares the text
+        # now rather than the block addresses, so it is a working feature and
+        # is covered by StringOrderingTests below; what is left rejected is
+        # what still has no order to compare by.
         self._reject('parts = ["a"]\nprint(sum(parts))\n', "compare block addresses")
         self._reject("xs = [[1], [2]]\nxs.sort()\n", "compare block addresses")
         self._reject("xs = [[1], [2]]\nprint([1] in xs)\n", "over a list of lists")
@@ -2237,3 +2239,116 @@ class CodePointAndArithmeticBuiltinTests(unittest.TestCase):
 
     def test_a_float_start_is_refused(self):
         self._reject("xs = [1, 2]\nprint(sum(xs, 1.5))\n", "start must be one too")
+
+
+class StringOrderingTests(unittest.TestCase):
+    """`<`, `<=`, `>`, `>=` between strings, and the sorting they unlock.
+
+    UTF-8 was built so that comparing the bytes of two sequences puts them in
+    the same order as comparing the code points, so a byte walk gives the order
+    CPython gives without decoding anything.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def _runtime(self, name: str, text: str) -> str:
+        return f'{name} = ""\n{name} = {name} + {text!r}\n'
+
+    def test_ordering_two_runtime_strings(self):
+        self._run(
+            self._runtime("t", "b")
+            + 'print(t < "c", t > "c", t <= "b", t >= "b")\n',
+            b"True False True True\n",
+        )
+
+    def test_a_prefix_sorts_before_the_longer_string(self):
+        self._run(
+            self._runtime("a", "ab")
+            + self._runtime("b", "abc")
+            + 'print(a < b, b < a, a < "ab", a <= "ab")\n',
+            b"True False False True\n",
+        )
+
+    def test_an_empty_string_sorts_first(self):
+        self._run(
+            self._runtime("a", "")
+            + self._runtime("b", "x")
+            + "print(a < b, b < a, a < a, a <= a)\n",
+            b"True False False True\n",
+        )
+
+    def test_bytes_are_unsigned_so_non_ascii_sorts_last(self):
+        # Read as signed, a lead byte is negative and "\u00e9" would sort
+        # before "z" instead of after it.
+        self._run(
+            self._runtime("a", "z")
+            + self._runtime("b", "\u00e9")
+            + "print(a < b, b < a)\n",
+            b"True False\n",
+        )
+
+    def test_a_chain_compares_each_pair(self):
+        # The idiom this was all for: a digit test on a loop variable.
+        self._run(
+            self._runtime("s", "12a4")
+            + "n = 0\nfor ch in s:\n    if '0' <= ch <= '9':\n        n = n + 1\n"
+            + "print(n)\n",
+            b"3\n",
+        )
+
+    def test_sorting_a_list_of_strings(self):
+        self._run(
+            'xs = ["pear", "apple", "fig"]\nxs.sort()\nprint("|".join(xs))\n',
+            b"apple|fig|pear\n",
+        )
+
+    def test_sorting_handles_prefixes_duplicates_and_the_empty_string(self):
+        self._run(
+            'xs = ["ab", "a", "abc", "a", ""]\nxs.sort()\nprint("|".join(xs))\n',
+            b"|a|a|ab|abc\n",
+        )
+
+    def test_sorted_leaves_the_original_alone_and_reverse_works(self):
+        self._run(
+            'xs = ["b", "a", "c"]\n'
+            'print("|".join(sorted(xs)), "|".join(xs))\n'
+            'print("|".join(sorted(xs, reverse=True)))\n',
+            b"a|b|c b|a|c\nc|b|a\n",
+        )
+
+    def test_split_sort_join_round_trip(self):
+        self._run(
+            self._runtime("s", "pear apple fig")
+            + 'w = s.split()\nw.sort()\nprint(" ".join(w))\n',
+            b"apple fig pear\n",
+        )
+
+    def test_a_list_of_lists_still_has_no_order(self):
+        self._reject("xs = [[1], [2]]\nxs.sort()\n", "compare block addresses")

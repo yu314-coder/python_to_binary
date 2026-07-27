@@ -3906,6 +3906,15 @@ class Frontend:
                 BitsFloat(held),
                 BitsFloat(IntLoad(value_slot)),
             )
+        elif element_kind == "str":
+            # The words are block addresses, so they are compared through the
+            # text they point at. The byte walk emits here, inside the inner
+            # loop, which is where it has to run.
+            comparison = IntCompare(
+                "lt" if descending else "gt",
+                IntLoad(self.emit_string_order(held, IntLoad(value_slot))),
+                IntConstant(0),
+            )
         else:
             comparison = IntCompare(
                 "lt" if descending else "gt", held, IntLoad(value_slot)
@@ -4742,14 +4751,14 @@ class Frontend:
         # words; everything else that is not a number is refused here, because
         # the comparison would be between block addresses - allocation order,
         # which is neither lexicographic nor structural.
-        if element_kind is None or element_kind not in {"int", "float", "bool"}:
+        if element_kind is None or element_kind not in {"int", "float", "bool", "str"}:
             raise NativeCompileError(
                 self.path,
                 node,
-                "native sorted() takes a runtime list of integers or floats; "
-                "sorting a string, a dict, or a list of strings or of lists "
-                "would compare block addresses rather than values, which is "
-                "allocation order and not the order Python gives",
+                "native sorted() takes a runtime list of integers, floats or "
+                "strings; sorting a dict, or a list of lists, would compare "
+                "block addresses rather than values, which is allocation "
+                "order and not the order Python gives",
             )
         return source, element_kind, self.sort_direction(node, node.keywords)
 
@@ -5337,14 +5346,14 @@ class Frontend:
         descending = self.sort_direction(node, node.keywords)
         self.refuse_bool_list(node, node.func.value, "sort()")
         element_kind = self.list_kind_of(name)
-        if element_kind not in {"int", "float"}:
+        if element_kind not in {"int", "float", "str"}:
             raise NativeCompileError(
                 self.path,
                 node,
-                f"native sort() works on lists of integers or floats, and this "
-                f"one holds {self.kind_noun(element_kind)}; comparing those "
-                "would compare block addresses, which is allocation order and "
-                "not the order Python gives",
+                f"native sort() works on lists of integers, floats or strings, "
+                f"and this one holds {self.kind_noun(element_kind)}; comparing "
+                "those would compare block addresses, which is allocation "
+                "order and not the order Python gives",
             )
         pointer_slot = self.slot(name)
         if element_kind == "float":
@@ -7630,6 +7639,98 @@ class Frontend:
             Store(state_slot, IntBinary("or", IntLoad(hash_slot), IntConstant(1)))
         )
         return state_slot
+
+    def emit_string_order(self, left: IntExpression, right: IntExpression) -> int:
+        """Compare two string blocks; returns a slot holding -1, 0 or 1.
+
+        Byte by byte, which is also code point by code point: UTF-8 was built
+        so that comparing the bytes of two sequences puts them in the same
+        order as comparing the code points, which is the order CPython uses.
+        Bytes are unsigned here, so a continuation byte does not read as
+        negative and sort before ASCII.
+        """
+
+        left_slot = self.new_temp()
+        right_slot = self.new_temp()
+        self.operations.append(Store(left_slot, left))
+        self.operations.append(Store(right_slot, right))
+        left_length = HeapLoad(IntLoad(left_slot), 8)
+        right_length = HeapLoad(IntLoad(right_slot), 8)
+        shortest = self.new_temp()
+        self.operations.append(
+            Store(
+                shortest,
+                self.select_integer(
+                    IntCompare("lt", left_length, right_length),
+                    left_length,
+                    right_length,
+                ),
+            )
+        )
+        result = self.new_temp()
+        index = self.new_temp()
+        self.operations.append(Store(result, IntConstant(0)))
+        self.operations.append(Store(index, IntConstant(0)))
+        scan = self.new_label("strcmp")
+        done = self.new_label("strcmp_done")
+        tail = self.new_label("strcmp_tail")
+        self.operations.append(Label(scan))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index), IntLoad(shortest)), tail
+            )
+        )
+        def byte_at(slot: int) -> IntExpression:
+            return HeapLoad(
+                IntBinary(
+                    "add",
+                    IntBinary("add", IntLoad(slot), IntConstant(8)),
+                    IntLoad(index),
+                ),
+                1,
+            )
+
+        differs = self.new_label("strcmp_differs")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("ne", byte_at(left_slot), byte_at(right_slot)), differs
+            )
+        )
+        self.operations.append(
+            Store(
+                result,
+                self.select_integer(
+                    IntCompare("lt", byte_at(left_slot), byte_at(right_slot)),
+                    IntConstant(-1),
+                    IntConstant(1),
+                ),
+            )
+        )
+        self.operations.append(Jump(done))
+        self.operations.append(Label(differs))
+        self.operations.append(
+            Store(index, IntBinary("add", IntLoad(index), IntConstant(1)))
+        )
+        self.operations.append(Jump(scan))
+        # One is a prefix of the other, or they are equal: the shorter sorts
+        # first, which is what comparing the lengths says.
+        self.operations.append(Label(tail))
+        self.operations.append(
+            Store(
+                result,
+                self.select_integer(
+                    IntCompare("lt", left_length, right_length),
+                    IntConstant(-1),
+                    self.select_integer(
+                        IntCompare("gt", left_length, right_length),
+                        IntConstant(1),
+                        IntConstant(0),
+                    ),
+                ),
+            )
+        )
+        self.operations.append(Label(done))
+        return result
 
     def emit_string_equal(self, left: IntExpression, right: IntExpression) -> int:
         """Compare two string blocks byte for byte; returns a 0/1 slot."""
@@ -17033,6 +17134,61 @@ class Frontend:
                         "unsupported native Boolean operator",
                     )
             return result
+        if (
+            isinstance(node, ast.Compare)
+            and node.ops
+            and all(
+                isinstance(
+                    operator,
+                    (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq),
+                )
+                for operator in node.ops
+            )
+            and any(
+                isinstance(operator, (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+                for operator in node.ops
+            )
+            and all(
+                self.expression_type(item, bindings) == "str"
+                for item in (node.left, *node.comparators)
+            )
+        ):
+            # `"0" <= ch <= "9"` is one chain and two comparisons, so every
+            # operand is lowered once into a slot and reused, the way the
+            # numeric chain below does it.
+            pointers = [
+                self.materialize_int(self.string_pointer(item))
+                for item in (node.left, *node.comparators)
+            ]
+            answer: IntExpression | None = None
+            for position, operator in enumerate(node.ops):
+                left_pointer, right_pointer = pointers[position], pointers[position + 1]
+                if isinstance(operator, (ast.Eq, ast.NotEq)):
+                    same = IntLoad(
+                        self.emit_string_equal(left_pointer, right_pointer)
+                    )
+                    step: IntExpression = IntCompare(
+                        "ne" if isinstance(operator, ast.Eq) else "eq",
+                        same,
+                        IntConstant(0),
+                    )
+                else:
+                    order = IntLoad(
+                        self.emit_string_order(left_pointer, right_pointer)
+                    )
+                    step = IntCompare(
+                        {
+                            ast.Lt: "lt",
+                            ast.LtE: "le",
+                            ast.Gt: "gt",
+                            ast.GtE: "ge",
+                        }[type(operator)],
+                        order,
+                        IntConstant(0),
+                    )
+                answer = step if answer is None else IntBinary("and", answer, step)
+            assert answer is not None
+            return answer
         if (
             isinstance(node, ast.Compare)
             and len(node.ops) == 1
