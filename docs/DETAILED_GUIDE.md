@@ -240,6 +240,15 @@ A tuple literal is built through a list and handed to the `tuple` builtin:
 arity is fixed at two and cannot serve a general tuple. The extra allocation
 buys any length.
 
+Every name a function body binds owns a reference, so they are released on the
+way out - leaving without doing that leaks one per call, which a recursive
+function turns into one per level. Temporaries are *not* released there: each
+was released where it was consumed, and doing it twice crashes outright, which
+is how the rule got written down. A parameter the body assigns to is the same
+storage rather than a new local, because Python rebinds it; the body owns its
+parameters, so overwriting one releases what it held instead of dropping a
+reference the caller still owns.
+
 Translated so far: integers, floats, strings, f-strings without a format
 specifier, list/dict/tuple literals, `True`/`False`/`None`, names, `+ - * / %
 // **`, unary `-` and `not`, `and`/`or`, the six comparisons, subscripting,
@@ -1173,7 +1182,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 46 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 47 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

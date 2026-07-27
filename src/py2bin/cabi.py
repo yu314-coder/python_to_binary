@@ -49,7 +49,7 @@ __all__ = [
     "PyFloat_FromDouble", "PyFloat_AsDouble",
     "PyObject_GetItem", "PyObject_SetItem",
     "PyNumber_Remainder", "PyNumber_FloorDivide", "PyNumber_Power",
-    "PyDict_New", "PyDict_SetItem", "PyTuple_Pack",
+    "PyDict_New", "PyDict_SetItem", "PyTuple_Pack", "PySequence_Contains",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -785,6 +785,7 @@ _PyNumber_Power = _bind("PyNumber_Power", _HANDLE, _HANDLE, _HANDLE, _HANDLE)
 _PyDict_New = _bind("PyDict_New", _HANDLE)
 _PyDict_SetItem = _bind("PyDict_SetItem", ctypes.c_int, _HANDLE, _HANDLE, _HANDLE)
 _PyTuple_Pack = _bind("PyTuple_Pack", _HANDLE, _SSIZE, _HANDLE, _HANDLE)
+_PySequence_Contains = _bind("PySequence_Contains", ctypes.c_int, _HANDLE, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -936,6 +937,13 @@ def PyTuple_Pack(length: int, first: int, second: int) -> int:
     a variadic C function and py2bin passes no variadic arguments."""
 
     return _handle(_PyTuple_Pack(length, first, second))
+
+
+def PySequence_Contains(container: int, value: int) -> int:
+    """1, 0, or -1 on failure - which is why the caller must test for -1 and
+    not merely for truth."""
+
+    return _returned(_PySequence_Contains(container, value))
 
 
 def PyObject_GetIter(object_handle: int) -> int:

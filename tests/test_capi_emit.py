@@ -281,6 +281,41 @@ class CApiEmitTests(unittest.TestCase):
             "def boom():\n    return 1 / 0\nprint(1 or boom())\n", b"1\n"
         )
 
+    def test_membership_and_subscript_assignment(self):
+        # PySequence_Contains answers 1, 0 or -1, and the -1 is a failure
+        # rather than a false - treating it as false would turn a raised
+        # exception into an answer.
+        self._run('print("a" in "abc", "z" in "abc")\n', b"True False\n")
+        self._run("print(2 in [1, 2], 9 not in [1, 2])\n", b"True True\n")
+        self._run(
+            'd = {}\nd["k"] = 1\nd["k"] = d["k"] + 1\nprint(d)\n', b"{'k': 2}\n"
+        )
+
+    def test_a_parameter_the_body_reassigns(self):
+        # A parameter is storage, not a fresh local: Python rebinds it. The
+        # body owns its parameters, so overwriting one releases what it held
+        # instead of dropping a reference the caller still owns.
+        self._run(
+            "def halve_until_one(n):\n"
+            "    steps = 0\n"
+            "    while n != 1:\n        n = n // 2\n        steps += 1\n"
+            "    return steps\n"
+            "print(halve_until_one(1024))\n",
+            b"10\n",
+        )
+
+    def test_a_function_called_many_times_does_not_leak(self):
+        # Every name a body binds owns a reference, and leaving without
+        # releasing them leaks one per call. Temporaries are not released here
+        # - they were released where they were consumed, and doing it twice
+        # crashed outright, which is how this was found.
+        self._run(
+            "def work(a, b):\n    c = a + b\n    c = c * 2\n    return c\n"
+            "total = 0\nfor i in range(200000):\n    total = work(i, 1)\n"
+            "print(total)\n",
+            b"400000\n",
+        )
+
     def test_what_is_not_translated_says_so(self):
         self._reject("class A:\n    pass\n", "has no C-API translation here yet")
         self._reject(

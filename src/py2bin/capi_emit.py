@@ -74,6 +74,7 @@ extern PyObject *PyNumber_Power(PyObject *base, PyObject *exp, PyObject *mod);
 extern PyObject *PyDict_New(void);
 extern int PyDict_SetItem(PyObject *mapping, PyObject *key, PyObject *value);
 extern PyObject *PyTuple_Pack(long long length, PyObject *a, PyObject *b);
+extern int PySequence_Contains(PyObject *container, PyObject *value);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -180,11 +181,19 @@ class CApiEmitter:
         return name
 
     def declare(self, name: str) -> str:
-        """The C name for a Python local, declared on first use."""
+        """The C name for a Python local, declared on first use.
+
+        A parameter that the body assigns to is the same storage, not a new
+        local - Python rebinds the parameter. The body owns its parameters
+        (they are incremented on entry), so overwriting one releases what it
+        held exactly as overwriting any other name does.
+        """
 
         assert self.current is not None
+        if name in self.current.parameters:
+            return f"p_{name}"
         c_name = f"v_{name}"
-        if c_name not in self.current.locals and name not in self.current.parameters:
+        if c_name not in self.current.locals:
             self.current.locals.append(c_name)
         return c_name
 
@@ -287,6 +296,8 @@ class CApiEmitter:
     def comparison(self, node: ast.Compare, indent: int) -> str:
         if len(node.ops) != 1:
             raise self.fail(node, "a comparison chain is not translated here yet")
+        if isinstance(node.ops[0], (ast.In, ast.NotIn)):
+            return self.membership(node, indent)
         operation = _COMPARISONS.get(type(node.ops[0]))
         if operation is None:
             raise self.fail(node, f"{type(node.ops[0]).__name__} is not translated here yet")
@@ -490,6 +501,34 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({value});", indent)
         return self.checked(target, indent)
 
+    def membership(self, node: ast.Compare, indent: int) -> str:
+        """`x in xs` - PySequence_Contains, which answers 1, 0 or -1.
+
+        The -1 is a failure and not a false, so it is tested for separately;
+        treating it as false would turn a raised exception into an answer.
+        """
+
+        value = self.expression(node.left, indent)
+        container = self.expression(node.comparators[0], indent)
+        decision = self.temporary_flag()
+        self.emit(f"{decision} = PySequence_Contains({container}, {value});", indent)
+        self.emit(f"Py_DecRef({value});", indent)
+        self.emit(f"Py_DecRef({container});", indent)
+        self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+        if isinstance(node.ops[0], ast.NotIn):
+            self.emit(f"{decision} = !{decision};", indent)
+        target = self.temporary()
+        self.emit(f"if ({decision}) {{", indent)
+        self.emit(
+            f'    {target} = PyObject_GetAttrString(_py2bin_builtins, "True");', indent
+        )
+        self.emit("} else {", indent)
+        self.emit(
+            f'    {target} = PyObject_GetAttrString(_py2bin_builtins, "False");', indent
+        )
+        self.emit("}", indent)
+        return self.checked(target, indent)
+
     def call(self, node: ast.Call, indent: int) -> str:
         if node.keywords:
             raise self.fail(node, "keyword arguments are not translated here yet")
@@ -627,8 +666,13 @@ class CApiEmitter:
             self.checked(target, indent)
 
     def assignment(self, node: ast.Assign, indent: int) -> None:
-        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-            raise self.fail(node, "only assignment to one name is translated here")
+        if len(node.targets) != 1:
+            raise self.fail(node, "only one assignment target is translated here")
+        if isinstance(node.targets[0], ast.Subscript):
+            self.store_item(node.targets[0], node.value, indent)
+            return
+        if not isinstance(node.targets[0], ast.Name):
+            raise self.fail(node, "only a name or a subscript is assigned to here")
         value = self.expression(node.value, indent)
         target = self.declare(node.targets[0].id)
         # The name may already hold something; that reference is released
@@ -655,6 +699,24 @@ class CApiEmitter:
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+
+    def store_item(
+        self, target: ast.Subscript, value_node: ast.expr, indent: int
+    ) -> None:
+        """`xs[k] = v` - the object protocol, so a list and a dict both work."""
+
+        if isinstance(target.slice, ast.Slice):
+            raise self.fail(target, "assigning to a slice is not translated here yet")
+        container = self.expression(target.value, indent)
+        key = self.expression(target.slice, indent)
+        value = self.expression(value_node, indent)
+        outcome = self.temporary_flag()
+        self.emit(
+            f"{outcome} = PyObject_SetItem({container}, {key}, {value});", indent
+        )
+        for held in (container, key, value):
+            self.emit(f"Py_DecRef({held});", indent)
+        self.emit(f"if ({outcome} < 0) {{ PyErr_Print(); exit(1); }}", indent)
 
     def expression_statement(self, node: ast.Expr, indent: int) -> None:
         if (
@@ -758,7 +820,28 @@ class CApiEmitter:
         if node.value is None:
             raise self.fail(node, "a bare return is not translated here yet")
         value = self.expression(node.value, indent)
+        self.release_locals(indent)
         self.emit(f"return {value};", indent)
+
+    def release_locals(self, indent: int) -> None:
+        """Give back what the body still holds, on the way out.
+
+        Every name the body bound owns a reference, and leaving without
+        releasing them leaks one per call - which a recursive function turns
+        into one per level. The value being returned is a temporary and is not
+        in this list, so it survives.
+        """
+
+        assert self.current is not None
+        for name in self.current.parameters:
+            self.emit(f"Py_DecRef(p_{name});", indent)
+        for name in self.current.locals:
+            # Only the names the program bound. A temporary was released where
+            # it was consumed, so releasing it again here would be a second
+            # drop of a reference this code no longer owns.
+            if not name.startswith("v_"):
+                continue
+            self.emit(f"if ({name}) Py_DecRef({name});", indent)
 
     # --- assembly --------------------------------------------------------
 
@@ -798,11 +881,16 @@ class CApiEmitter:
         parameters = tuple(argument.arg for argument in node.args.args)
         function = _Function(node.name, parameters)
         self.current = function
+        # The body owns its parameters, so rebinding one releases what it held
+        # rather than dropping a reference the caller still owns.
+        for name in parameters:
+            self.emit(f"Py_IncRef(p_{name});", 1)
         for statement in node.body:
             self.statement(statement, 1)
-        # A body that falls off the end has no value to give back; that is
-        # None in Python, and None is not translated here yet.
-        self.emit("return PyLong_FromLongLong(0LL);", 1)
+        # Falling off the end is `return None` in Python.
+        tail = self.builtin("None", 1)
+        self.release_locals(1)
+        self.emit(f"return {tail};", 1)
         self.functions.append(function)
         self.current = None
 
