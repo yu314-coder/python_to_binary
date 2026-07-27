@@ -1878,12 +1878,44 @@ class Frontend:
                 conditional.extend(clause.body)
             conditional.extend(node.orelse)
             self.forget_conditional_list_lengths(conditional)
+        elif isinstance(node, ast.Assert):
+            self.assert_statement(node)
         else:
             raise NativeCompileError(
                 self.path,
                 node,
                 f"{type(node).__name__} is not in the native subset yet; use bundle mode for full CPython semantics",
             )
+
+    def assert_statement(self, node: ast.Assert) -> None:
+        """`assert test, message` - raise AssertionError when the test fails.
+
+        Always emitted. CPython drops asserts under -O, and there is no -O
+        here; a program that reaches this statement is one whose author wanted
+        the check.
+        """
+
+        detail = ""
+        if node.msg is not None:
+            try:
+                text = self.constant(node.msg)
+            except NativeCompileError as error:
+                raise NativeCompileError(
+                    self.path,
+                    node.msg,
+                    "a native assert message is written into the image, so it "
+                    "has to be known at build time",
+                ) from error
+            detail = ": " + (text if isinstance(text, str) else str(text))
+        passed = self.new_label("assert_passed")
+        self.operations.append(JumpIfFalse(self.truth_value(node.test), passed + "_failed"))
+        self.operations.append(Jump(passed))
+        self.operations.append(Label(passed + "_failed"))
+        self.raise_exception(
+            "AssertionError",
+            ("AssertionError" + detail).encode("utf-8", "replace") + b"\n",
+        )
+        self.operations.append(Label(passed))
 
     def lambda_definition(self, name: str, node: ast.Lambda) -> None:
         """Define `name = lambda ...:` as the function it would otherwise be.
@@ -5336,6 +5368,16 @@ class Frontend:
 
         if isinstance(node, ast.Name) and self.dict_kinds_of(node.id):
             return "dict"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "keys"
+            and not node.args
+            and isinstance(node.func.value, ast.Name)
+            and self.dict_kinds_of(node.func.value.id)
+        ):
+            # `k in d.keys()` searches exactly what `k in d` does.
+            return "dict"
         if isinstance(node, ast.Name) and self.set_kind_of(node.id) is not None:
             return "set"
         if isinstance(node, ast.Set):
@@ -5946,6 +5988,12 @@ class Frontend:
             assert isinstance(node, ast.Call)
             return self.string_method_list(node)
         self.refuse_lazy_comprehension(node)
+        shape = self.list_repeat_shape(node)
+        if shape is not None:
+            assert isinstance(node, ast.BinOp)
+            return self.emit_list_repeat(
+                node, self.list_kind(self.expression_type(node))
+            )
         if isinstance(node, ast.List):
             return self.emit_list_block(node, self.list_kind(self.expression_type(node)))
         raise NativeCompileError(
@@ -6051,6 +6099,108 @@ class Frontend:
         self.emit_list_literal(pointer_slot, node, element_kind)
         self.operations.append(Store(self.slot(name), IntLoad(pointer_slot)))
         self.list_lengths[name] = len(node.elts)
+
+    def list_repeat_shape(self, node: ast.expr):
+        """`[v] * n` or `n * [v]` as (the literal, the count), or None."""
+
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Mult):
+            return None
+        for literal, count in ((node.left, node.right), (node.right, node.left)):
+            if isinstance(literal, ast.List):
+                return literal, count
+        return None
+
+    def emit_list_repeat(self, node: ast.BinOp, element_kind: str) -> IntExpression:
+        """`[v] * n` - the elements laid down n times over.
+
+        The count is read once into a slot. It is a run-time value, so the
+        block is sized from it rather than at build time, and a negative count
+        makes an empty list the way Python's does.
+        """
+
+        shape = self.list_repeat_shape(node)
+        assert shape is not None
+        literal, count = shape
+        if not literal.elts:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "repeating an empty list gives an empty list whose element "
+                "kind nothing states; write [] with a list[T] annotation",
+            )
+        for element in literal.elts:
+            self.check_element(element, element_kind, "this list")
+        words = [
+            self.materialize_int(self.element_word(element, element_kind))
+            for element in literal.elts
+        ]
+        times = self.new_temp()
+        self.operations.append(Store(times, self.integer(count)))
+        self.operations.append(
+            Store(
+                times,
+                self.select_integer(
+                    IntCompare("lt", IntLoad(times), IntConstant(0)),
+                    IntConstant(0),
+                    IntLoad(times),
+                ),
+            )
+        )
+        total = self.new_temp()
+        self.operations.append(
+            Store(total, IntBinary("mul", IntLoad(times), IntConstant(len(words))))
+        )
+        bump = self.ensure_heap()
+        pointer_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(
+                pointer_slot,
+                IntBinary(
+                    "add",
+                    IntConstant(self.LIST_HEADER_BYTES),
+                    IntBinary("mul", IntLoad(total), IntConstant(8)),
+                ),
+                bump,
+            )
+        )
+        pointer = IntLoad(pointer_slot)
+        self.operations.append(HeapStore(pointer, IntLoad(total), 8))
+        self.operations.append(
+            HeapStore(IntBinary("add", pointer, IntConstant(8)), IntLoad(total), 8)
+        )
+        cursor = self.new_temp()
+        self.operations.append(Store(cursor, IntConstant(0)))
+        fill = self.new_label("repeat")
+        done = self.new_label("repeat_done")
+        self.operations.append(Label(fill))
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(cursor), IntLoad(times)), done)
+        )
+        for offset, word in enumerate(words):
+            index = IntBinary(
+                "add",
+                IntBinary("mul", IntLoad(cursor), IntConstant(len(words))),
+                IntConstant(offset),
+            )
+            self.operations.append(
+                HeapStore(
+                    IntBinary(
+                        "add",
+                        IntBinary(
+                            "add", pointer, IntConstant(self.LIST_HEADER_BYTES)
+                        ),
+                        IntBinary("mul", index, IntConstant(8)),
+                    ),
+                    word,
+                    8,
+                )
+            )
+        self.operations.append(
+            Store(cursor, IntBinary("add", IntLoad(cursor), IntConstant(1)))
+        )
+        self.operations.append(Jump(fill))
+        self.operations.append(Label(done))
+        return pointer
 
     def emit_list_block(self, node: ast.List, element_kind: str) -> IntExpression:
         """Build a list literal that no name owns - a nested one, or an
@@ -12271,6 +12421,106 @@ class Frontend:
             return None
         return node.args[0], node.args[1] if len(node.args) == 2 else None
 
+    def enumerated_string_source(self, node: ast.expr):
+        """The string and start `enumerate(...)` names, or None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id != "enumerate"
+            or node.func.id in self.functions
+            or node.keywords
+            or not 1 <= len(node.args) <= 2
+        ):
+            return None
+        try:
+            if self.expression_type(node.args[0]) != "str":
+                return None
+        except NativeCompileError:
+            return None
+        return node.args[0], node.args[1] if len(node.args) == 2 else None
+
+    def for_over_enumerated_string(self, node: ast.For) -> None:
+        """`for i, ch in enumerate(s):` - the position and the code point."""
+
+        shape = self.enumerated_string_source(node.iter)
+        assert shape is not None
+        source, start = shape
+        if (
+            not isinstance(node.target, (ast.Tuple, ast.List))
+            or len(node.target.elts) != 2
+            or not all(isinstance(item, ast.Name) for item in node.target.elts)
+        ):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "a native enumerate() loop binds two names, the index and the "
+                "item",
+            )
+        index_name, item_name = (item.id for item in node.target.elts)
+        if index_name == item_name:
+            raise NativeCompileError(
+                self.path, node, "an enumerate() loop needs two different names"
+            )
+        first = IntConstant(0) if start is None else self.integer(start)
+        was_bound = {
+            name: name in self.bound_names for name in (index_name, item_name)
+        }
+        broke = self.open_loop_else(node)
+        pointer = self.materialize_int(self.string_pointer(source))
+        length = self.materialize_int(self.emit_code_point_count(pointer))
+        offset_slot = self.new_temp()
+        self.operations.append(Store(offset_slot, IntConstant(0)))
+        start_slot = self.new_temp()
+        self.operations.append(Store(start_slot, first))
+        loop = self.new_label("for_enum_str")
+        continue_label = self.new_label("for_enum_str_continue")
+        end = self.new_label("for_enum_str_end")
+        self.operations.append(Label(loop))
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(offset_slot), length), end)
+        )
+        for name in (index_name, item_name):
+            self.values.pop(name, None)
+            self.runtime_names.add(name)
+            self.boolean_names.discard(name)
+            self.possibly_unbound.discard(name)
+        self.operations.append(
+            Store(
+                self.slot(index_name),
+                IntBinary("add", IntLoad(start_slot), IntLoad(offset_slot)),
+            )
+        )
+        self.value_types.pop(index_name, None)
+        self.operations.append(
+            Store(
+                self.slot(item_name),
+                self.emit_string_index(pointer, None, IntLoad(offset_slot)),
+            )
+        )
+        self.value_types[item_name] = "str"
+        self.break_targets.append(end if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        for statement in node.body:
+            self.statement(statement)
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(
+                offset_slot,
+                IntBinary("add", IntLoad(offset_slot), IntConstant(1)),
+            )
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(end))
+        for name in (index_name, item_name):
+            if was_bound[name]:
+                self.bound_names.add(name)
+            else:
+                self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
+
     def for_over_enumerate(self, node: ast.For) -> None:
         """`for i, v in enumerate(xs):` - the index and the item together."""
 
@@ -13501,6 +13751,9 @@ class Frontend:
         self.refuse_set_iteration(node.iter)
         if self.zip_sources(node.iter) is not None:
             self.for_over_zip(node)
+            return
+        if self.enumerated_string_source(node.iter) is not None:
+            self.for_over_enumerated_string(node)
             return
         if (
             isinstance(node.target, ast.Name)
@@ -16727,6 +16980,9 @@ class Frontend:
                 if "str" in (left, right):
                     return "str"
                 return "float" if "float" in (left, right) else "int"
+            if self.list_repeat_shape(node) is not None:
+                literal, _count = self.list_repeat_shape(node)
+                return self.expression_type(literal, bindings)
             if isinstance(node.op, (ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)):
                 left = self.expression_type(node.left, bindings)
                 right = self.expression_type(node.right, bindings)
@@ -18397,6 +18653,14 @@ class Frontend:
             # Membership only probes, so unlike a lookup it cannot raise and is
             # safe in an eagerly evaluated arm.
             container = node.comparators[0]
+            if (
+                isinstance(container, ast.Call)
+                and isinstance(container.func, ast.Attribute)
+                and container.func.attr == "keys"
+            ):
+                # `d.keys()` is not a view here, and nothing holds one; the
+                # search is the dict's own, so the dict is what is searched.
+                container = container.func.value
             shape = self.membership_container_kind(container)
             present = isinstance(node.ops[0], ast.In)
             if shape == "set":

@@ -293,7 +293,18 @@ runtime:
   with one of the two and one slot cannot hold either kind. An instance is
   always true, which is said outright rather than left to fall out of its
   address being non-zero;
-- `for index, item in enumerate(xs)` and `enumerate(xs, start)`, and
+- `assert test` and `assert test, "message"`, which raise a catchable
+  `AssertionError`. Always emitted: CPython drops them under -O, there is no -O
+  here, and a program that reaches the statement is one whose author wanted the
+  check. The message is written into the image, so it has to be known at build
+  time;
+- `[v] * n` and `n * [v]`, with the count read at run time and a count of zero
+  or less giving an empty list, as Python's does. Repeating an empty list is
+  refused: there is nothing in it to read an element kind from;
+- `k in d.keys()`, which searches exactly what `k in d` searches. There is no
+  view object here and nothing to hold one, so the dict is what is searched;
+- `for index, item in enumerate(xs)` and `enumerate(xs, start)`, over a list or
+  over a string - where it walks code points, like the plain string loop - and
   `for a, b in zip(xs, ys)` over any number of lists. Each list's length is
   read from its own header at every step, so the walk stops with the shortest
   and an append inside the body lengthens it, both as CPython's does;

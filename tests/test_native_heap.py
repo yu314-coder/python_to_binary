@@ -2876,3 +2876,125 @@ class TruthOfAContainerTests(unittest.TestCase):
             'print(escape(s))\nprint(escape("") == "")\n',
             b"a\\'b\\\\c\nTrue\n",
         )
+
+
+class AssertRepeatAndEnumerateTests(unittest.TestCase):
+    """`assert`, `[v] * n`, `k in d.keys()`, and `enumerate()` over a string."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+            if expected_exit:
+                self.assertEqual(
+                    native.stderr.strip().splitlines()[-1],
+                    reference.stderr.strip().splitlines()[-1],
+                )
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    _N = "n = 0\nfor _i in range(0, 3):\n    n = n + 1\n"
+
+    def test_a_passing_assert_costs_nothing_visible(self):
+        self._run(self._N + "assert n == 3\nprint('ok')\n", b"ok\n")
+
+    def test_a_failing_assert_reports_cpythons_message(self):
+        self._run(self._N + "assert n == 5\nprint('never')\n", b"", expected_exit=1)
+        self._run(
+            self._N + "assert n == 5, 'n should be five'\n", b"", expected_exit=1
+        )
+
+    def test_an_assert_can_be_caught(self):
+        self._run(
+            "try:\n" + "".join("    " + line + "\n" for line in self._N.splitlines())
+            + "    assert n == 5\nexcept AssertionError:\n    print('caught')\n",
+            b"caught\n",
+        )
+
+    def test_an_assert_tests_a_container_for_emptiness(self):
+        self._run("xs: list[int] = []\nassert not xs\nprint('ok')\n", b"ok\n")
+
+    def test_a_runtime_assert_message_is_refused(self):
+        # The message is written into the image, so it cannot be built while
+        # the program runs.
+        self._reject(
+            's = ""\nfor _i in range(0, 1):\n    s = s + "x"\n'
+            "assert False, s\n",
+            "known at build time",
+        )
+
+    def test_a_list_repeats(self):
+        self._run(
+            "print([0] * 5)\nprint([1, 2] * 3)\n",
+            b"[0, 0, 0, 0, 0]\n[1, 2, 1, 2, 1, 2]\n",
+        )
+
+    def test_the_count_can_be_a_runtime_value_and_either_side(self):
+        self._run(
+            self._N + "print([7] * n)\nprint(n * [1])\n",
+            b"[7, 7, 7]\n[1, 1, 1]\n",
+        )
+
+    def test_a_count_of_zero_or_less_gives_an_empty_list(self):
+        self._run(
+            "n = 0\nfor _i in range(0, 1):\n    n = n - 2\nprint([9] * 0, [9] * n)\n",
+            b"[] []\n",
+        )
+
+    def test_a_repeated_list_grows_and_is_indexed_like_any_other(self):
+        self._run(
+            self._N + "xs = [0] * n\nxs[1] = 5\nxs.append(9)\nprint(xs, len(xs))\n",
+            b"[0, 5, 0, 9] 4\n",
+        )
+
+    def test_repeating_an_empty_list_is_refused(self):
+        # There is nothing in it to read an element kind from.
+        self._reject("xs = [] * 3\nprint(xs)\n", "element kind nothing states")
+
+    def test_keys_searches_what_the_dict_searches(self):
+        self._run(
+            "d = {1: 2, 3: 4}\nprint(1 in d.keys(), 9 in d.keys(), 9 not in d.keys())\n",
+            b"True False True\n",
+        )
+
+    def test_enumerate_walks_a_string_by_code_point(self):
+        self._run(
+            's = ""\ns = s + "héllo"\n'
+            "for i, ch in enumerate(s):\n    print(i, ch)\n",
+            "0 h\n1 é\n2 l\n3 l\n4 o\n".encode("utf-8"),
+        )
+
+    def test_enumerate_over_a_string_takes_a_start(self):
+        self._run(
+            's = ""\ns = s + "ab"\n'
+            "for i, ch in enumerate(s, 1):\n    print(i, ch)\n",
+            b"1 a\n2 b\n",
+        )
+
+    def test_enumerate_over_an_empty_string_runs_zero_times(self):
+        self._run(
+            's = ""\nfor i, ch in enumerate(s):\n    print(i, ch)\nprint("done")\n',
+            b"done\n",
+        )
