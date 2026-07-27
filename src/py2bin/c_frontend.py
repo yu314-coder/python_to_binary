@@ -1,0 +1,5840 @@
+"""py2bin's C compiler: C source text straight to py2bin's native IR.
+
+This module is a real (small) C compiler written in pure Python. It lexes and
+parses C, builds a typed syntax tree of its own, applies C's integer promotions
+and conversions, and emits py2bin's native IR -- which the handwritten ARM64 and
+x86-64 encoders turn into machine code. The directives are run first by
+:mod:`py2bin.c_preprocessor`, which is py2bin's own, so no external compiler,
+assembler, linker, preprocessor or toolchain is involved, and no process is
+ever started.
+
+It deliberately does NOT reuse Python's ``ast`` module. An earlier bridge did,
+and C's semantics kept leaking away: a C ``for`` acquired Python ``range``
+behaviour, and nothing in a Python tree can express a narrow integer type, the
+address of a local, or ``goto``. C gets its own front end here, and the pieces
+of C that cannot yet be compiled correctly are rejected with a file:line:column
+error instead of being approximated.
+
+What is implemented
+-------------------
+* the integer type zoo -- ``char``/``short``/``int``/``long``/``long long`` and
+  their unsigned forms, plus the ``<stdint.h>`` fixed-width names -- with C's
+  integer promotions, usual arithmetic conversions, and exact truncation and
+  sign/zero extension on every assignment, cast and narrow-typed operation;
+* ``float`` and ``double``: decimal and hexadecimal floating constants,
+  arithmetic, IEEE comparisons (including the unordered case NaN produces),
+  the usual arithmetic conversions between the integer and floating types, and
+  conversions in both directions -- with ``float`` objects really four bytes
+  wide. Every floating expression is EVALUATED in double precision and rounded
+  to ``float`` only where C requires the extra precision removed, which is
+  ``FLT_EVAL_METHOD == 1``. A floating argument or result crosses a call as its
+  IEEE bit pattern in an integer register; that ABI is py2bin's own and never
+  meets a platform C function. ``long double`` is rejected rather than quietly
+  aliased to ``double``;
+* real memory: local arrays (including multi-dimensional), ``&x``, ``*p``,
+  pointer arithmetic, and ``a[i]``, all with loads and stores at the right
+  width;
+* casts between integer types, between pointer types, and between the two, and
+  ``sizeof`` for every complete type;
+* the full expression grammar: ``++``/``--`` (prefix and postfix), the comma
+  operator, ``?:``, short-circuit ``&&``/``||``, compound assignment, and
+  signed/unsigned division and remainder;
+* statements: ``if``/``else``, ``while``, ``do``/``while``, ``for``,
+  ``switch``/``case``/``default`` with fallthrough, ``break``, ``continue``,
+  ``goto`` with labels, and ``return``;
+* functions, called through a real machine call ABI on the targets whose
+  encoder implements one (see ``CALL_CAPABLE_TARGETS``): each call gets its own
+  stack frame with a saved link register, so **recursion works** -- direct,
+  deep, and mutual. On the remaining targets the call ABI is not implemented,
+  so a call is still inlined at its site and recursion is rejected there rather
+  than miscompiled;
+* function pointers, on the same targets: C's real declarator grammar, so
+  ``int (*p)(int)``, ``int (*ops[3])(void)`` and ``int *(*f)(char *)`` all read
+  the way C says they do; a function designator decaying to a pointer; ``&f``;
+  ``(*p)(x)``; casts naming a function-pointer type; and a genuine indirect
+  machine call. The called expression is evaluated exactly once and BEFORE the
+  arguments. A function type must state its parameters -- C's empty ``()``
+  leaves them unspecified, and py2bin will not emit a call it cannot check;
+* file-scope objects -- objects with static storage duration -- on the targets
+  whose encoder establishes the static block (see ``STATIC_CAPABLE_TARGETS``).
+  They live in one contiguous zero-filled block that outlives every frame, so
+  the same object really is the same object in ``main`` and in everything
+  ``main`` calls. ``static`` at file scope is accepted (it limits a linkage a
+  single translation unit cannot escape). An initializer must be a constant
+  expression, which is what C requires of static storage: arithmetic constants
+  and address constants such as ``&x``, an array name, or a string literal;
+* ``printf`` with real runtime formatting, and the vetted ``extern`` adapter
+  ABI that lets compiled C drive an embedded CPython;
+* the directives, which :mod:`py2bin.c_preprocessor` has already run by the
+  time anything here sees a token: macros with ``#`` and ``##``, ``#include``,
+  and the conditional family. That module documents exactly what it accepts.
+
+What is rejected
+----------------
+``long double``, variadic user functions and variadic function types, a
+function type with an unspecified ``()`` parameter list, a function whose own
+declarator is not the plain ``TYPE *... name(params)`` (write a typedef for the
+result type), ``static`` inside a block, ``extern`` objects (py2bin compiles one
+translation unit and has no linker), a braced initializer for a file-scope
+struct or union, more than eight arguments to a function (py2bin passes
+arguments only in registers), and recursion, function pointers or file-scope
+objects on the targets that have no call ABI or static block yet.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import struct
+
+from .native.frontend import _CABI_RESULT_WIDTH, _CABI_RESULTS, _CABI_SYMBOLS
+from .native.compiler import CALL_CAPABLE_TARGETS
+from .native.ir import (
+    BitsFloat,
+    Call as IRCall,
+    CStringConstant,
+    Exit,
+    ExitValue,
+    ExternCall,
+    FloatBinary,
+    FloatBits,
+    FloatCompare,
+    FloatConstant,
+    FloatExpression,
+    FloatLoad,
+    FloatStore,
+    FloatToInt,
+    FloatUnary,
+    Function as IRFunction,
+    FunctionAddress,
+    GlobalAddress,
+    HeapLoad,
+    HeapStore,
+    IndirectCall,
+    IntBinary,
+    IntCompare,
+    IntConstant,
+    IntExpression,
+    IntLoad,
+    IntToFloat,
+    IntUnary,
+    Jump,
+    JumpIfFalse,
+    Label,
+    Module,
+    Operation,
+    Return as IRReturn,
+    SlotAddress,
+    Store,
+    Write,
+    WriteRuntime,
+)
+
+
+class CCompileError(ValueError):
+    """A source-located rejection from py2bin's C compiler."""
+
+    def __init__(self, filename: str, line: int, column: int, message: str):
+        self.filename = filename
+        self.line = line
+        self.column = column
+        self.message = message
+        super().__init__(f"{filename}:{line}:{column}: {message}")
+
+
+# --- tokens ------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Token:
+    kind: str  # "identifier" | "integer" | "string" | "symbol" | "eof"
+    value: object
+    line: int
+    column: int
+    # Integer literals carry the type their suffix, base and value demand: C
+    # gives a hexadecimal or octal constant an unsigned type when it no longer
+    # fits a signed one, but a plain decimal constant never gets one.
+    suffix: str = ""
+    radix: int = 10
+    # The file the token was really written in, which is not the file being
+    # compiled once #include has brought another one in.
+    origin: str = ""
+
+
+_OPERATORS = (
+    "<<=",
+    ">>=",
+    "...",
+    "->",
+    "++",
+    "--",
+    "<<",
+    ">>",
+    "<=",
+    ">=",
+    "==",
+    "!=",
+    "&&",
+    "||",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "&=",
+    "|=",
+    "^=",
+)
+_PUNCTUATION = set("{}[]();,?:=+-*/%~!<>&|^.")
+
+_SIMPLE_ESCAPES = {
+    "\\": 0x5C,
+    "'": 0x27,
+    '"': 0x22,
+    "?": 0x3F,
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+}
+
+
+class Lexer:
+    """C's tokens, from text that the preprocessor has already been over.
+
+    ``line`` and ``column`` may be set before lexing starts, which is how the
+    preprocessor converts one preprocessing token at a time and still reports
+    the position it was written at.
+    """
+
+    def __init__(self, source: str, filename: str):
+        self.source = source
+        self.filename = filename
+        self.index = 0
+        self.line = 1
+        self.column = 1
+
+    def error(self, message: str, line: int | None = None, column: int | None = None):
+        raise CCompileError(
+            self.filename,
+            self.line if line is None else line,
+            self.column if column is None else column,
+            message,
+        )
+
+    def advance(self) -> str:
+        character = self.source[self.index]
+        self.index += 1
+        if character == "\n":
+            self.line += 1
+            self.column = 1
+        else:
+            self.column += 1
+        return character
+
+    def startswith(self, text: str) -> bool:
+        return self.source.startswith(text, self.index)
+
+    def skip_layout(self) -> None:
+        while self.index < len(self.source):
+            character = self.source[self.index]
+            if character.isspace():
+                self.advance()
+                continue
+            if self.startswith("//"):
+                while self.index < len(self.source) and self.source[self.index] != "\n":
+                    self.advance()
+                continue
+            if self.startswith("/*"):
+                line, column = self.line, self.column
+                self.advance()
+                self.advance()
+                while self.index < len(self.source) and not self.startswith("*/"):
+                    self.advance()
+                if self.index >= len(self.source):
+                    self.error("unterminated block comment", line, column)
+                self.advance()
+                self.advance()
+                continue
+            if character == "#":
+                # The preprocessor consumes every directive before this lexer
+                # runs, so a '#' that reaches here is one it left behind.
+                self.error(
+                    "'#' is a preprocessing operator and means nothing in C; it "
+                    "is only valid at the start of a directive or inside a #define"
+                )
+            return
+
+    def escape(self, quote: str) -> int:
+        """Consume one character (or escape sequence) and return its byte value."""
+
+        character = self.advance()
+        if character != "\\":
+            value = ord(character)
+            if value > 0xFF:
+                self.error(
+                    "py2bin's C compiler handles single-byte characters only; "
+                    "this literal is not representable in one byte"
+                )
+            return value
+        if self.index >= len(self.source):
+            self.error("unterminated escape sequence")
+        escaped = self.advance()
+        if escaped in _SIMPLE_ESCAPES:
+            return _SIMPLE_ESCAPES[escaped]
+        if escaped == "x":
+            digits = ""
+            while self.index < len(self.source) and self.source[self.index] in (
+                "0123456789abcdefABCDEF"
+            ):
+                digits += self.advance()
+            if not digits:
+                self.error("\\x needs at least one hexadecimal digit")
+            value = int(digits, 16)
+            if value > 0xFF:
+                self.error("\\x escape does not fit in one byte")
+            return value
+        if escaped in "01234567":
+            digits = escaped
+            while len(digits) < 3 and self.index < len(self.source) and (
+                self.source[self.index] in "01234567"
+            ):
+                digits += self.advance()
+            value = int(digits, 8)
+            if value > 0xFF:
+                self.error("octal escape does not fit in one byte")
+            return value
+        self.error(f"unsupported escape sequence \\{escaped} in a {quote} literal")
+
+    def digits(self, allowed: str) -> int:
+        """Consume a run of ``allowed`` characters and report how many."""
+
+        seen = 0
+        while self.index < len(self.source) and self.source[self.index] in allowed:
+            self.advance()
+            seen += 1
+        return seen
+
+    def floating(self, start: int, line: int, column: int, *, hexadecimal: bool) -> Token:
+        """Finish scanning a floating constant that began at ``start``.
+
+        C's grammar is followed exactly: a decimal constant needs either a
+        period or an exponent, a hexadecimal one always needs its ``p``
+        exponent, and the suffix selects the type. The value itself is produced
+        by Python's own correctly-rounded decimal-to-binary64 conversion, so a
+        literal is the nearest double to what was written rather than the
+        result of a hand-rolled parse.
+        """
+
+        allowed = "0123456789abcdefABCDEF" if hexadecimal else "0123456789"
+        if self.index < len(self.source) and self.source[self.index] == ".":
+            self.advance()
+            self.digits(allowed)
+        markers = "pP" if hexadecimal else "eE"
+        if self.index < len(self.source) and self.source[self.index] in markers:
+            self.advance()
+            if self.index < len(self.source) and self.source[self.index] in "+-":
+                self.advance()
+            if not self.digits("0123456789"):
+                self.error("this floating constant's exponent has no digits", line, column)
+        elif hexadecimal:
+            self.error(
+                "a hexadecimal floating constant needs a binary exponent, as in "
+                "0x1.8p3",
+                line,
+                column,
+            )
+        text = self.source[start : self.index]
+        suffix = ""
+        if self.index < len(self.source) and self.source[self.index] in "fFlL":
+            suffix = self.advance().lower()
+        if self.index < len(self.source) and (
+            self.source[self.index].isalnum() or self.source[self.index] == "_"
+        ):
+            self.error("unsupported floating literal suffix", line, column)
+        if suffix == "l":
+            self.error(
+                "'long double' is not implemented by py2bin's C compiler; it has "
+                "'float' and 'double', and would have to pretend a wider type was "
+                "wider than double to accept this",
+                line,
+                column,
+            )
+        try:
+            value = float.fromhex(text) if hexadecimal else float(text)
+        except (ValueError, OverflowError):
+            self.error(f"{text!r} is not a valid floating constant", line, column)
+        if suffix == "f":
+            try:
+                value = struct.unpack("<f", struct.pack("<f", value))[0]
+            except OverflowError:
+                value = float("inf")
+        if value in (float("inf"), float("-inf")):
+            self.error(
+                f"the floating constant {text!r} overflows the type it is written "
+                "with; C leaves that undefined, so py2bin refuses it",
+                line,
+                column,
+            )
+        return Token("float", value, line, column, suffix)
+
+    def number(self) -> Token:
+        line, column = self.line, self.column
+        start = self.index
+        radix = 10
+        if self.startswith("0x") or self.startswith("0X"):
+            radix = 16
+            self.advance()
+            self.advance()
+            digits = self.index
+            while self.index < len(self.source) and self.source[self.index] in (
+                "0123456789abcdefABCDEF"
+            ):
+                self.advance()
+            if self.index < len(self.source) and self.source[self.index] in ".pP":
+                return self.floating(start, line, column, hexadecimal=True)
+            if self.index == digits:
+                self.error("hexadecimal integer needs at least one digit", line, column)
+            value = int(self.source[start : self.index], 16)
+        else:
+            while self.index < len(self.source) and self.source[self.index].isdigit():
+                self.advance()
+            text = self.source[start : self.index]
+            if self.index < len(self.source) and self.source[self.index] in ".eE":
+                if self.source[self.index] == "." or (
+                    self.index + 1 < len(self.source)
+                    and (
+                        self.source[self.index + 1].isdigit()
+                        or self.source[self.index + 1] in "+-"
+                    )
+                ):
+                    return self.floating(start, line, column, hexadecimal=False)
+            if text.startswith("0") and len(text) > 1:
+                radix = 8
+                if any(digit not in "01234567" for digit in text):
+                    self.error(
+                        f"{text!r} starts with 0, so C reads it as octal, but it "
+                        "has a digit that is not octal",
+                        line,
+                        column,
+                    )
+                value = int(text, 8)
+            else:
+                value = int(text)
+        suffix = ""
+        while self.index < len(self.source) and self.source[self.index] in "uUlL":
+            suffix += self.advance().lower()
+        if self.index < len(self.source) and (
+            self.source[self.index].isalnum() or self.source[self.index] == "_"
+        ):
+            self.error("unsupported integer literal suffix", line, column)
+        if suffix.replace("u", "", 1).count("u") or suffix.count("l") > 2:
+            self.error("unsupported integer literal suffix", line, column)
+        return Token("integer", value, line, column, suffix, radix)
+
+    def character(self) -> Token:
+        line, column = self.line, self.column
+        self.advance()  # opening quote
+        if self.index < len(self.source) and self.source[self.index] == "'":
+            self.error("empty character constant", line, column)
+        value = self.escape("character")
+        if self.index >= len(self.source) or self.advance() != "'":
+            self.error("multi-character constants are not supported", line, column)
+        # A character constant has type int in C, and a plain 'char' is signed
+        # in this dialect, so \xFF is -1 exactly as it is on Apple's ABI.
+        if value >= 0x80:
+            value -= 0x100
+        return Token("integer", value, line, column, "")
+
+    def string(self) -> Token:
+        line, column = self.line, self.column
+        self.advance()  # opening quote
+        data = bytearray()
+        while True:
+            if self.index >= len(self.source):
+                self.error("unterminated string literal", line, column)
+            if self.source[self.index] == '"':
+                self.advance()
+                break
+            if self.source[self.index] == "\n":
+                self.error("newline in string literal", line, column)
+            data.append(self.escape("string"))
+        return Token("string", bytes(data), line, column)
+
+    def tokens(self) -> list[Token]:
+        result: list[Token] = []
+        while True:
+            self.skip_layout()
+            if self.index >= len(self.source):
+                result.append(Token("eof", "", self.line, self.column))
+                return result
+            character = self.source[self.index]
+            line, column = self.line, self.column
+            if character.isalpha() or character == "_":
+                start = self.index
+                while self.index < len(self.source) and (
+                    self.source[self.index].isalnum() or self.source[self.index] == "_"
+                ):
+                    self.advance()
+                name = self.source[start : self.index]
+                if name in {"L", "u8", "u", "U"} and self.index < len(self.source) and (
+                    self.source[self.index] in "'\""
+                ):
+                    self.error(
+                        "wide and Unicode string/character literals are not "
+                        "supported",
+                        line,
+                        column,
+                    )
+                result.append(Token("identifier", name, line, column))
+                continue
+            if character.isdigit():
+                result.append(self.number())
+                continue
+            if (
+                character == "."
+                and self.index + 1 < len(self.source)
+                and self.source[self.index + 1].isdigit()
+            ):
+                # C lets a floating constant start with its period, as in '.5'.
+                result.append(self.floating(self.index, line, column, hexadecimal=False))
+                continue
+            if character == "'":
+                result.append(self.character())
+                continue
+            if character == '"':
+                result.append(self.string())
+                continue
+            operator = next(
+                (candidate for candidate in _OPERATORS if self.startswith(candidate)),
+                None,
+            )
+            if operator is not None:
+                for _ in operator:
+                    self.advance()
+                result.append(Token("symbol", operator, line, column))
+                continue
+            if character in _PUNCTUATION:
+                self.advance()
+                result.append(Token("symbol", character, line, column))
+                continue
+            self.error(f"unsupported character {character!r}")
+
+
+# --- the C type system -------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class VoidType:
+    def __str__(self) -> str:
+        return "void"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class IntegerType:
+    name: str
+    size: int
+    signed: bool
+    rank: int
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FloatingType:
+    """``float`` or ``double``, both held in IEEE-754 binary64 registers.
+
+    py2bin's C evaluates every floating expression in double precision and
+    rounds to ``float`` only where C says the extra precision must be removed
+    -- assignment, cast, argument passing and return. That is exactly
+    ``FLT_EVAL_METHOD == 1``, which C11 6.3.1.8p2 explicitly permits, and it is
+    what lets one register file and one set of instructions serve both types.
+    ``size`` is still the real storage size, so a ``float`` object occupies four
+    bytes in memory and a ``float`` array indexes by four.
+    """
+
+    name: str
+    size: int
+    rank: int
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PointerType:
+    target: "CType"
+
+    def __str__(self) -> str:
+        if isinstance(self.target, FunctionType):
+            # C writes a pointer to a function with the star inside the
+            # parentheses, and a diagnostic that says 'int (*)(int)' is one a
+            # reader can paste straight back into the program.
+            inside = ", ".join(str(item) for item in self.target.parameters) or "void"
+            return f"{self.target.result} (*)({inside})"
+        return f"{self.target} *"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ArrayType:
+    element: "CType"
+    count: int | None
+
+    def __str__(self) -> str:
+        return f"{self.element}[{'' if self.count is None else self.count}]"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FunctionType:
+    """A function type: what ``f`` names, and what a function pointer points at.
+
+    C never lets a value have this type -- a function designator immediately
+    becomes a pointer to the function everywhere but ``sizeof`` and ``&`` -- so
+    it has no size and no alignment here either. ``parameters`` is the full
+    prototype: py2bin does not accept the unprototyped ``()`` form in a function
+    type, because the calls it would then have to emit could not be checked.
+    """
+
+    result: "CType"
+    parameters: tuple["CType", ...]
+
+    def __str__(self) -> str:
+        inside = ", ".join(str(item) for item in self.parameters) or "void"
+        return f"{self.result} ({inside})"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Member:
+    name: str
+    ctype: "CType"
+    offset: int
+
+
+@dataclasses.dataclass(slots=True)
+class StructType:
+    """A struct or union, laid out by C's alignment and padding rules.
+
+    Each member starts at the next offset satisfying its own alignment, and the
+    whole object is padded to a multiple of the strictest member alignment so
+    that arrays of it stay aligned. A union puts every member at offset 0 and
+    takes the size of its largest. ``members`` is None until the body is seen,
+    which is what makes a forward-declared ``struct T;`` an incomplete type
+    that only a pointer may refer to.
+    """
+
+    name: str | None
+    is_union: bool = False
+    members: tuple[Member, ...] | None = None
+    size: int = 0
+    alignment: int = 1
+
+    def member(self, name: str) -> Member | None:
+        for item in self.members or ():
+            if item.name == name:
+                return item
+        return None
+
+    def __str__(self) -> str:
+        keyword = "union" if self.is_union else "struct"
+        return f"{keyword} {self.name}" if self.name else keyword
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Hole:
+    """A placeholder for the type an enclosing declarator has not built yet.
+
+    ``int (*p)(void)`` is parsed inside-out: ``*p`` is read first, against a
+    hole, and the ``(void)`` that follows the closing parenthesis is then
+    substituted into it by :func:`_fill`. ``key`` keeps nested holes distinct.
+    """
+
+    key: int
+
+    def __str__(self) -> str:  # pragma: no cover - only reachable on a bug
+        return "?"
+
+
+def _fill(ctype: "CType", hole: _Hole, actual: "CType") -> "CType":
+    """Replace ``hole`` inside ``ctype`` with ``actual``."""
+
+    if ctype == hole:
+        return actual
+    if isinstance(ctype, PointerType):
+        return PointerType(_fill(ctype.target, hole, actual))
+    if isinstance(ctype, ArrayType):
+        return ArrayType(_fill(ctype.element, hole, actual), ctype.count)
+    if isinstance(ctype, FunctionType):
+        return FunctionType(_fill(ctype.result, hole, actual), ctype.parameters)
+    return ctype
+
+
+def align_of(ctype: "CType") -> int:
+    """The alignment ``ctype`` requires, in bytes."""
+
+    if isinstance(ctype, (IntegerType, FloatingType)):
+        return ctype.size
+    if isinstance(ctype, PointerType):
+        return 8
+    if isinstance(ctype, ArrayType):
+        return align_of(ctype.element)
+    if isinstance(ctype, StructType):
+        return ctype.alignment
+    return 1
+
+
+def lay_out(struct: StructType, members: list[tuple[str, "CType"]]) -> None:
+    """Assign member offsets and set the struct's size and alignment."""
+
+    placed: list[Member] = []
+    offset = 0
+    alignment = 1
+    for name, ctype in members:
+        member_alignment = align_of(ctype)
+        member_size = size_of(ctype) or 0
+        alignment = max(alignment, member_alignment)
+        if struct.is_union:
+            placed.append(Member(name, ctype, 0))
+            offset = max(offset, member_size)
+            continue
+        # Pad forward to this member's own alignment.
+        offset = (offset + member_alignment - 1) & ~(member_alignment - 1)
+        placed.append(Member(name, ctype, offset))
+        offset += member_size
+    # Tail padding keeps an array of this type aligned.
+    struct.members = tuple(placed)
+    struct.alignment = alignment
+    struct.size = (offset + alignment - 1) & ~(alignment - 1)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class OpaqueType:
+    """A named type py2bin knows only as something a pointer can point at.
+
+    ``PyObject`` is the motivating case: generated C never dereferences a Python
+    object, it only passes the handle back to the interpreter. Modelling these
+    as incomplete types is what lets the compiler reject ``*handle`` and
+    ``handle + 1`` instead of inventing a layout it cannot know.
+    """
+
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+
+CType = (
+    VoidType
+    | IntegerType
+    | FloatingType
+    | PointerType
+    | ArrayType
+    | FunctionType
+    | OpaqueType
+    | StructType
+)
+
+VOID = VoidType()
+CHAR = IntegerType("char", 1, True, 1)
+SCHAR = IntegerType("signed char", 1, True, 1)
+UCHAR = IntegerType("unsigned char", 1, False, 1)
+SHORT = IntegerType("short", 2, True, 2)
+USHORT = IntegerType("unsigned short", 2, False, 2)
+INT = IntegerType("int", 4, True, 3)
+UINT = IntegerType("unsigned int", 4, False, 3)
+LONG = IntegerType("long", 8, True, 4)
+ULONG = IntegerType("unsigned long", 8, False, 4)
+LLONG = IntegerType("long long", 8, True, 5)
+ULLONG = IntegerType("unsigned long long", 8, False, 5)
+BOOL = IntegerType("_Bool", 1, False, 0)
+# Floating ranks sit above every integer rank, which is what makes the usual
+# arithmetic conversions pick the floating type in a mixed expression.
+FLOAT = FloatingType("float", 4, 6)
+DOUBLE = FloatingType("double", 8, 7)
+
+# py2bin's C is LP64 on every target it emits, including Windows. The compiler
+# never shares a header or an ABI with a platform C library beyond the vetted
+# adapter table (whose Py_ssize_t is 64-bit everywhere), so one model keeps the
+# same source producing the same values on all six targets.
+_TYPEDEFS: dict[str, CType] = {
+    "Py_ssize_t": LLONG,
+    "ssize_t": LONG,
+    "size_t": ULONG,
+    "ptrdiff_t": LONG,
+    "intptr_t": LONG,
+    "uintptr_t": ULONG,
+    "intmax_t": LLONG,
+    "uintmax_t": ULLONG,
+    "int8_t": SCHAR,
+    "uint8_t": UCHAR,
+    "int16_t": SHORT,
+    "uint16_t": USHORT,
+    "int32_t": INT,
+    "uint32_t": UINT,
+    "int64_t": LLONG,
+    "uint64_t": ULLONG,
+}
+
+# Types that exist only behind a pointer. Every one of them is a real CPython or
+# C library object whose layout py2bin deliberately does not model.
+_OPAQUE_NAMES = frozenset(
+    {"PyObject", "PyTypeObject", "PyThreadState", "PyCodeObject", "FILE"}
+)
+
+_UNSIGNED_COUNTERPART = {INT: UINT, LONG: ULONG, LLONG: ULLONG}
+
+_TYPE_KEYWORDS = frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "signed",
+        "unsigned",
+        "_Bool",
+        "float",
+        "double",
+    }
+)
+# Qualifiers py2bin can honour by ignoring them. ``const`` and ``restrict``
+# constrain the program, not the generated code, and every C local here lives
+# in addressable stack memory that is loaded and stored on each access, which
+# is what ``volatile`` asks for. ``_Atomic`` is deliberately absent: accepting
+# it would promise an atomicity this backend does not emit.
+_QUALIFIERS = frozenset({"const", "volatile", "restrict"})
+
+_SPECIFIER_COMBINATIONS: dict[tuple[str, ...], CType] = {
+    ("void",): VOID,
+    ("_Bool",): BOOL,
+    ("char",): CHAR,
+    ("signed", "char"): SCHAR,
+    ("char", "signed"): SCHAR,
+    ("unsigned", "char"): UCHAR,
+    ("char", "unsigned"): UCHAR,
+    ("short",): SHORT,
+    ("short", "int"): SHORT,
+    ("signed", "short"): SHORT,
+    ("signed", "short", "int"): SHORT,
+    ("unsigned", "short"): USHORT,
+    ("unsigned", "short", "int"): USHORT,
+    ("int",): INT,
+    ("signed",): INT,
+    ("signed", "int"): INT,
+    ("unsigned",): UINT,
+    ("unsigned", "int"): UINT,
+    ("long",): LONG,
+    ("long", "int"): LONG,
+    ("signed", "long"): LONG,
+    ("signed", "long", "int"): LONG,
+    ("unsigned", "long"): ULONG,
+    ("unsigned", "long", "int"): ULONG,
+    ("long", "long"): LLONG,
+    ("long", "long", "int"): LLONG,
+    ("signed", "long", "long"): LLONG,
+    ("signed", "long", "long", "int"): LLONG,
+    ("unsigned", "long", "long"): ULLONG,
+    ("unsigned", "long", "long", "int"): ULLONG,
+    ("float",): FLOAT,
+    ("double",): DOUBLE,
+}
+
+#: Specifier lists that name a real C type py2bin will not pretend to have.
+#: ``long double`` is the whole list: accepting it would promise a precision
+#: wider than double that this backend does not compute in.
+_REJECTED_COMBINATIONS: dict[tuple[str, ...], str] = {
+    ("long", "double"): "'long double' is not implemented by py2bin's C compiler; "
+    "it evaluates floating expressions in double precision, and accepting the "
+    "name would promise a wider type than it computes with",
+}
+
+
+def size_of(ctype: CType) -> int | None:
+    """The size in bytes of ``ctype``, or None when it is incomplete."""
+
+    if isinstance(ctype, (IntegerType, FloatingType)):
+        return ctype.size
+    if isinstance(ctype, PointerType):
+        return 8
+    if isinstance(ctype, ArrayType):
+        element = size_of(ctype.element)
+        if element is None or ctype.count is None:
+            return None
+        return element * ctype.count
+    if isinstance(ctype, StructType):
+        return ctype.size if ctype.members is not None else None
+    return None
+
+
+def is_signed(ctype: CType) -> bool:
+    return isinstance(ctype, IntegerType) and ctype.signed
+
+
+def is_integer(ctype: CType) -> bool:
+    return isinstance(ctype, IntegerType)
+
+
+def is_floating(ctype: CType) -> bool:
+    return isinstance(ctype, FloatingType)
+
+
+def is_arithmetic(ctype: CType) -> bool:
+    """C's arithmetic types: the integer types and the floating ones."""
+
+    return isinstance(ctype, (IntegerType, FloatingType))
+
+
+def is_scalar(ctype: CType) -> bool:
+    return isinstance(ctype, (IntegerType, FloatingType, PointerType))
+
+
+def promote(ctype: CType) -> CType:
+    """C's integer promotions: everything narrower than int becomes int."""
+
+    if isinstance(ctype, IntegerType) and ctype.rank < INT.rank:
+        return INT
+    return ctype
+
+
+def arithmetic_conversions(left: CType, right: CType) -> CType:
+    """C11 6.3.1.8 with the floating types in front, as the standard orders it.
+
+    If either operand is floating, the common type is the wider of the two
+    floating types (or the one floating type when the other operand is an
+    integer); only when both are integers do the integer rules apply.
+    """
+
+    if is_floating(left) or is_floating(right):
+        if left == DOUBLE or right == DOUBLE:
+            return DOUBLE
+        return FLOAT
+    return usual_conversions(left, right)
+
+
+def usual_conversions(left: IntegerType, right: IntegerType) -> IntegerType:
+    """C11 6.3.1.8 for two integer operands."""
+
+    left = promote(left)
+    right = promote(right)
+    if left == right:
+        return left
+    if left.signed == right.signed:
+        return left if left.rank > right.rank else right
+    unsigned, signed = (left, right) if not left.signed else (right, left)
+    if unsigned.rank >= signed.rank:
+        return unsigned
+    if signed.size > unsigned.size:
+        return signed
+    return _UNSIGNED_COUNTERPART[signed]
+
+
+def compatible(left: CType, right: CType) -> bool:
+    """Assignment compatibility for pointers, ignoring qualifiers."""
+
+    if left == right:
+        return True
+    if isinstance(left, PointerType) and isinstance(right, PointerType):
+        # C11 6.3.2.3 converts between void * and a pointer to an OBJECT only.
+        # A pointer to a function is not one, and the standard gives no
+        # conversion at all in either direction, so it needs an explicit cast.
+        if isinstance(left.target, FunctionType) or isinstance(
+            right.target, FunctionType
+        ):
+            return False
+        if isinstance(left.target, VoidType) or isinstance(right.target, VoidType):
+            return True
+        return left.target == right.target
+    return False
+
+
+# --- the C syntax tree -------------------------------------------------------
+
+
+@dataclasses.dataclass(slots=True)
+class Node:
+    token: Token
+
+
+@dataclasses.dataclass(slots=True)
+class IntLiteral(Node):
+    value: int
+    ctype: CType
+
+
+@dataclasses.dataclass(slots=True)
+class FloatLiteral(Node):
+    value: float
+    ctype: CType
+
+
+@dataclasses.dataclass(slots=True)
+class StringLiteral(Node):
+    data: bytes
+
+
+@dataclasses.dataclass(slots=True)
+class Identifier(Node):
+    name: str
+
+
+@dataclasses.dataclass(slots=True)
+class Unary(Node):
+    operator: str
+    operand: Node
+
+
+@dataclasses.dataclass(slots=True)
+class IncDec(Node):
+    operator: str  # "++" or "--"
+    operand: Node
+    prefix: bool
+
+
+@dataclasses.dataclass(slots=True)
+class Binary(Node):
+    operator: str
+    left: Node
+    right: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Logical(Node):
+    operator: str  # "&&" or "||"
+    left: Node
+    right: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Conditional(Node):
+    test: Node
+    body: Node
+    alternative: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Assignment(Node):
+    operator: str  # "=", "+=", ...
+    target: Node
+    value: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Comma(Node):
+    left: Node
+    right: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Call(Node):
+    name: str
+    arguments: list[Node]
+
+
+@dataclasses.dataclass(slots=True)
+class CallThrough(Node):
+    """``EXPR(args)`` where ``EXPR`` is not a bare name.
+
+    ``(*p)(1)``, ``ops[i](1)`` and ``s.op(1)`` all land here. A call written as
+    a bare name is a :class:`Call`, whose name may still turn out to name an
+    object of function-pointer type rather than a function.
+    """
+
+    target: Node
+    arguments: list[Node]
+
+
+@dataclasses.dataclass(slots=True)
+class MemberAccess(Node):
+    base: Node
+    name: str
+    through_pointer: bool
+
+
+@dataclasses.dataclass(slots=True)
+class Index(Node):
+    base: Node
+    offset: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Cast(Node):
+    ctype: CType
+    operand: Node
+
+
+@dataclasses.dataclass(slots=True)
+class SizeofType(Node):
+    ctype: CType
+
+
+@dataclasses.dataclass(slots=True)
+class SizeofExpression(Node):
+    operand: Node
+
+
+# --- statements --------------------------------------------------------------
+
+
+@dataclasses.dataclass(slots=True)
+class Declaration(Node):
+    entries: list[tuple[CType, str, object]]  # (type, name, initializer)
+
+
+@dataclasses.dataclass(slots=True)
+class ExpressionStatement(Node):
+    expression: Node | None
+
+
+@dataclasses.dataclass(slots=True)
+class Compound(Node):
+    body: list[Node]
+
+
+@dataclasses.dataclass(slots=True)
+class If(Node):
+    test: Node
+    body: Node
+    alternative: Node | None
+
+
+@dataclasses.dataclass(slots=True)
+class While(Node):
+    test: Node
+    body: Node
+
+
+@dataclasses.dataclass(slots=True)
+class DoWhile(Node):
+    body: Node
+    test: Node
+
+
+@dataclasses.dataclass(slots=True)
+class For(Node):
+    initializer: Node | None
+    test: Node | None
+    step: Node | None
+    body: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Switch(Node):
+    control: Node
+    body: Node
+
+
+@dataclasses.dataclass(slots=True)
+class Labeled(Node):
+    kind: str  # "case" | "default" | "label"
+    value: object  # constant expression node, or the label name
+    statement: Node | None
+
+
+@dataclasses.dataclass(slots=True)
+class Goto(Node):
+    name: str
+
+
+@dataclasses.dataclass(slots=True)
+class Break(Node):
+    pass
+
+
+@dataclasses.dataclass(slots=True)
+class Continue(Node):
+    pass
+
+
+@dataclasses.dataclass(slots=True)
+class Return(Node):
+    value: Node | None
+
+
+@dataclasses.dataclass(slots=True)
+class Function:
+    name: str
+    result: CType
+    parameters: list[tuple[CType, str]]
+    #: ``None`` while only a prototype has been seen. py2bin has no linker, so a
+    #: prototype that never acquires a body cannot be called -- but declaring
+    #: one is still the ordinary way to write mutual recursion in C.
+    body: Compound | None
+    token: Token
+
+
+@dataclasses.dataclass(slots=True)
+class GlobalObject:
+    """A file-scope object: one with static storage duration.
+
+    C initializes such an object before the program starts and gives it zero
+    when no initializer is written, so ``initializer`` may only be a constant
+    expression -- there is nothing running yet that could evaluate anything
+    else.
+    """
+
+    name: str
+    ctype: CType
+    initializer: object
+    token: Token
+
+
+@dataclasses.dataclass(slots=True)
+class TranslationUnit:
+    functions: dict[str, Function]
+    externs: dict[str, CType]  # local name -> declared C result type
+    enumerators: dict[str, int] = dataclasses.field(default_factory=dict)
+    globals: dict[str, GlobalObject] = dataclasses.field(default_factory=dict)
+
+
+# --- parser ------------------------------------------------------------------
+
+
+_BINARY_PRECEDENCE = {
+    "||": 1,
+    "&&": 2,
+    "|": 3,
+    "^": 4,
+    "&": 5,
+    "==": 6,
+    "!=": 6,
+    "<": 7,
+    "<=": 7,
+    ">": 7,
+    ">=": 7,
+    "<<": 8,
+    ">>": 8,
+    "+": 9,
+    "-": 9,
+    "*": 10,
+    "/": 10,
+    "%": 10,
+}
+
+_ASSIGNMENTS = {"=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="}
+
+_RESERVED = frozenset(
+    {
+        "auto",
+        "break",
+        "case",
+        "continue",
+        "default",
+        "do",
+        "else",
+        "extern",
+        "for",
+        "goto",
+        "if",
+        "register",
+        "return",
+        "sizeof",
+        "static",
+        "switch",
+        "while",
+        *_TYPE_KEYWORDS,
+        *_QUALIFIERS,
+    }
+)
+
+_UNSUPPORTED_KEYWORDS = {
+    "static": "'static' is accepted on a file-scope declaration, where all it "
+    "limits is a linkage py2bin's single translation unit has no way to escape. "
+    "A static object inside a block is not implemented, because a body that is "
+    "inlined rather than called would get one object per inlining instead of "
+    "the single object C promises",
+    "register": "the 'register' storage class is not accepted",
+    "auto": "the 'auto' storage class is not accepted",
+    "_Complex": "complex types are not implemented",
+    "_Atomic": "atomic types are not implemented; py2bin emits no atomic instructions",
+    "_Thread_local": "thread-local storage is not implemented",
+    "inline": "the 'inline' specifier is not accepted; py2bin decides for itself "
+    "whether a call is a real call or an inlined body",
+}
+
+
+class Parser:
+    def __init__(self, tokens: list[Token], filename: str):
+        self.tokens = tokens
+        self.filename = filename
+        self.index = 0
+        self.functions: dict[str, Function] = {}
+        self.externs: dict[str, CType] = {}
+        # struct/union tags are shared across the translation unit, so a
+        # tag mentioned inside its own body refers to the same type.
+        self.struct_tags: dict[str, StructType] = {}
+        # Copied per parse: a typedef in one translation unit must not
+        # leak into the next compilation in the same process.
+        self.typedefs: dict[str, CType] = dict(_TYPEDEFS)
+        self.enum_tags: dict[str, CType] = {}
+        self.enumerators: dict[str, int] = {}
+        self.globals: dict[str, GlobalObject] = {}
+        # Set by declarator() to the token its name came from, so a caller that
+        # needs to point an error at the name does not have to guess.
+        self.declared_token: Token = self.tokens[0]
+        self.holes = 0
+
+    # --- token helpers ---
+
+    @property
+    def token(self) -> Token:
+        return self.tokens[self.index]
+
+    def peek(self, distance: int = 1) -> Token:
+        return self.tokens[min(self.index + distance, len(self.tokens) - 1)]
+
+    def error(self, message: str, token: Token | None = None):
+        location = token or self.token
+        raise CCompileError(
+            location.origin or self.filename, location.line, location.column, message
+        )
+
+    def at(self, value: str) -> bool:
+        return self.token.value == value and self.token.kind in {"symbol", "identifier"}
+
+    def accept(self, value: str) -> bool:
+        if not self.at(value):
+            return False
+        self.index += 1
+        return True
+
+    def take(self, value: str | None = None) -> Token:
+        token = self.token
+        if value is not None and not self.at(value):
+            self.error(f"expected {value!r}, found {self.describe(token)}")
+        self.index += 1
+        return token
+
+    @staticmethod
+    def describe(token: Token) -> str:
+        if token.kind == "eof":
+            return "end of file"
+        if token.kind == "string":
+            return "a string literal"
+        return repr(token.value)
+
+    def identifier(self) -> Token:
+        token = self.token
+        if token.kind != "identifier":
+            self.error(f"expected an identifier, found {self.describe(token)}")
+        if token.value in _RESERVED or token.value in _UNSUPPORTED_KEYWORDS:
+            self.error(f"{token.value!r} is a keyword and cannot be used as a name")
+        self.index += 1
+        return token
+
+    # --- types ---
+
+    def at_type(self) -> bool:
+        token = self.token
+        if token.kind != "identifier":
+            return False
+        name = str(token.value)
+        if name in _UNSUPPORTED_KEYWORDS:
+            return True
+        if name in _TYPE_KEYWORDS or name in _QUALIFIERS or name in self.typedefs:
+            return True
+        if name in {"struct", "union", "enum", "typedef"}:
+            return True
+        if name in _OPAQUE_NAMES:
+            # 'PyObject x' is not something py2bin can lay out, but 'PyObject *x'
+            # is a handle. Only the pointer form is a type here.
+            return self.peek().value == "*"
+        return False
+
+    def enum_specifier(self) -> CType:
+        """Parse ``enum`` with an optional tag and optional enumerator list.
+
+        C makes each enumerator an ``int`` constant in the ordinary namespace,
+        and an unadorned enumeration compatible with ``int``, so the type here
+        is simply ``int``. Values continue from the previous enumerator unless
+        one is given explicitly.
+        """
+
+        keyword = self.take()  # 'enum'
+        tag: str | None = None
+        if self.token.kind == "identifier" and self.token.value not in _RESERVED:
+            tag = str(self.take().value)
+        if not self.at("{"):
+            if tag is None:
+                self.error("an anonymous enum needs a body", keyword)
+            if tag not in self.enum_tags:
+                self.error(f"enum {tag} has not been defined", keyword)
+            return self.enum_tags[tag]
+        self.take("{")
+        next_value = 0
+        while not self.accept("}"):
+            if self.token.kind == "eof":
+                self.error("unterminated enum body", keyword)
+            name_token = self.identifier()
+            name = str(name_token.value)
+            if name in self.enumerators:
+                self.error(f"duplicate enumerator {name!r}", name_token)
+            if self.accept("="):
+                value_token = self.token
+                next_value = ConstantEvaluator(self.filename).value(
+                    self.assignment_expression()
+                )
+                if not -(1 << 31) <= next_value < (1 << 31):
+                    self.error("an enumerator must fit in an int", value_token)
+            self.enumerators[name] = next_value
+            next_value += 1
+            if not self.accept(","):
+                self.take("}")
+                break
+        if tag is not None:
+            self.enum_tags[tag] = INT
+        return INT
+
+    def typedef_declaration(self) -> None:
+        """Record ``typedef <type> <name>;`` for the rest of this unit."""
+
+        keyword = self.take()  # 'typedef'
+        base = self.type_specifier()
+        while True:
+            name_token = self.token
+            ctype, name = self.declarator(base)
+            if not name:
+                self.error("a typedef needs a name", keyword)
+            existing = self.typedefs.get(name)
+            if existing is not None and existing != ctype:
+                self.error(f"{name!r} is already a different type", name_token)
+            self.typedefs[name] = ctype
+            if not self.accept(","):
+                break
+        self.take(";")
+
+    def struct_specifier(self, is_union: bool) -> "StructType":
+        """Parse ``struct``/``union`` with an optional tag and optional body.
+
+        A tag names one type for the whole translation unit, so ``struct T *``
+        inside ``struct T`` refers to the same object being defined. A tag with
+        no body is a forward declaration: the type stays incomplete, which is
+        what lets a pointer to it exist while ``sizeof`` and member access are
+        still rejected.
+        """
+
+        keyword = self.take()  # 'struct' or 'union'
+        tag: str | None = None
+        if self.token.kind == "identifier" and self.token.value not in _RESERVED:
+            tag = str(self.take().value)
+        if tag is not None and tag in self.struct_tags:
+            struct = self.struct_tags[tag]
+            if struct.is_union != is_union:
+                self.error(
+                    f"{tag!r} was declared as a "
+                    f"{'union' if struct.is_union else 'struct'}",
+                    keyword,
+                )
+        else:
+            struct = StructType(tag, is_union)
+            if tag is not None:
+                self.struct_tags[tag] = struct
+        if not self.at("{"):
+            if tag is None:
+                self.error("an anonymous struct needs a body", keyword)
+            return struct
+        if struct.members is not None:
+            self.error(f"{struct} is defined twice", keyword)
+        self.take("{")
+        members: list[tuple[str, CType]] = []
+        seen: set[str] = set()
+        while not self.accept("}"):
+            if self.token.kind == "eof":
+                self.error("unterminated struct body", keyword)
+            member_start = self.token
+            base = self.type_specifier()
+            while True:
+                name_token = self.token
+                ctype, member_name = self.declarator(base)
+                if member_name in seen:
+                    self.error(
+                        f"duplicate member {member_name!r}", name_token
+                    )
+                if isinstance(ctype, StructType) and ctype.members is None:
+                    self.error(
+                        f"member {member_name!r} has incomplete type {ctype}",
+                        member_start,
+                    )
+                if isinstance(ctype, VoidType):
+                    self.error(f"member {member_name!r} cannot be void", member_start)
+                if isinstance(ctype, FunctionType):
+                    # C has no member of function type. Without this the member
+                    # would be laid out with a size of zero and silently alias
+                    # whatever followed it.
+                    self.error(
+                        f"member {member_name!r} has function type {ctype}; C has "
+                        f"no such member. Write '{ctype.result} (*{member_name})"
+                        "(...)' for a pointer to a function",
+                        member_start,
+                    )
+                if isinstance(ctype, ArrayType) and size_of(ctype) is None:
+                    self.error(
+                        f"member {member_name!r} has the incomplete type {ctype}",
+                        member_start,
+                    )
+                seen.add(member_name)
+                members.append((member_name, ctype))
+                if not self.accept(","):
+                    break
+            self.take(";")
+        if not members:
+            self.error("an empty struct has no size in C", keyword)
+        lay_out(struct, members)
+        return struct
+
+    def type_specifier(self) -> CType:
+        """Parse a declaration specifier list into one type."""
+
+        start = self.token
+        words: list[str] = []
+        base: CType | None = None
+        while self.token.kind == "identifier":
+            name = str(self.token.value)
+            if name in {"struct", "union"} and base is None and not words:
+                base = self.struct_specifier(name == "union")
+                continue
+            if name == "enum" and base is None and not words:
+                base = self.enum_specifier()
+                continue
+            if name in _UNSUPPORTED_KEYWORDS:
+                self.error(_UNSUPPORTED_KEYWORDS[name])
+            if name in _QUALIFIERS:
+                self.index += 1
+                continue
+            if name in _TYPE_KEYWORDS:
+                words.append(name)
+                self.index += 1
+                continue
+            if base is None and not words and name in self.typedefs:
+                base = self.typedefs[name]
+                self.index += 1
+                continue
+            if base is None and not words and name in _OPAQUE_NAMES:
+                base = OpaqueType(name)
+                self.index += 1
+                continue
+            break
+        if words:
+            if base is not None:
+                self.error("conflicting type specifiers", start)
+            key = tuple(words)
+            rejection = _REJECTED_COMBINATIONS.get(key) or _REJECTED_COMBINATIONS.get(
+                tuple(sorted(key))
+            )
+            if rejection is not None:
+                self.error(rejection, start)
+            resolved = _SPECIFIER_COMBINATIONS.get(key)
+            if resolved is None:
+                resolved = _SPECIFIER_COMBINATIONS.get(tuple(sorted(key)))
+            if resolved is None:
+                self.error(f"unsupported type specifier {' '.join(words)!r}", start)
+            base = resolved
+        if base is None:
+            self.error(f"expected a type name, found {self.describe(start)}", start)
+        return base
+
+    def pointer_suffix(self, base: CType) -> CType:
+        while True:
+            if self.accept("*"):
+                base = PointerType(base)
+                while self.token.kind == "identifier" and self.token.value in _QUALIFIERS:
+                    self.index += 1
+                continue
+            return base
+
+    def declarator(
+        self, base: CType, *, abstract: bool = False, optional: bool = False
+    ) -> tuple[CType, str]:
+        """Parse a full C declarator and return the type it builds, plus its name.
+
+        This is C's real declarator grammar, so ``int (*p)(int)``, ``int
+        (*ops[3])(void)`` and ``int *(*f)(char *)`` all read correctly: the
+        prefix ``*``s bind loosest, the postfix ``[]`` and ``()`` bind tighter
+        and apply left to right, and parentheses regroup. The inner declarator
+        is parsed against a hole and the outer type is substituted into it,
+        which is exactly what "declaration mirrors use" means.
+
+        ``optional`` accepts either form, which is what a prototype's parameter
+        list needs: ``int f(int, int *);`` names nothing, ``int f(int a);`` does.
+        ``self.declared_token`` is left holding the token the name came from, so
+        a caller can point an error at it.
+        """
+
+        self.declared_token = self.token
+        base = self.pointer_suffix(base)
+        if self.at("(") and self.at_nested_declarator():
+            self.take("(")
+            hole = _Hole(self.next_hole())
+            inner, name = self.declarator(hole, abstract=abstract, optional=optional)
+            self.take(")")
+            return _fill(inner, hole, self.declarator_suffix(base)), name
+        name = ""
+        if not abstract and not (optional and self.token.kind != "identifier"):
+            self.declared_token = self.token
+            name = str(self.identifier().value)
+        return self.declarator_suffix(base), name
+
+    def next_hole(self) -> int:
+        self.holes += 1
+        return self.holes
+
+    def at_nested_declarator(self) -> bool:
+        """Whether the ``(`` here regroups a declarator rather than starting a
+        parameter list.
+
+        ``int (*p)(void)`` regroups; ``int (void)`` and ``int (int, char *)``
+        are parameter lists. The two are told apart by what follows the ``(``:
+        a ``*``, another ``(``, or a name that is not a type name can only
+        begin a declarator.
+        """
+
+        saved = self.index
+        self.index += 1
+        try:
+            if self.at("*") or self.at("("):
+                return True
+            if self.token.kind != "identifier" or self.token.value in _RESERVED:
+                return False
+            return not self.at_type()
+        finally:
+            self.index = saved
+
+    def declarator_suffix(self, base: CType) -> CType:
+        """Apply a declarator's postfix ``[N]`` and ``(params)`` groups.
+
+        They bind tighter than the prefix ``*``s and apply left to right, so
+        ``int a[2][3]`` is an array of 2 arrays of 3 ints and the list is
+        applied in reverse.
+        """
+
+        suffixes: list[tuple[str, object]] = []
+        while True:
+            if self.accept("["):
+                if self.accept("]"):
+                    suffixes.append(("array", None))
+                    continue
+                length = self.array_length()
+                self.take("]")
+                suffixes.append(("array", length))
+                continue
+            if self.at("("):
+                suffixes.append(("function", self.parameter_type_list()))
+                continue
+            break
+        for kind, payload in reversed(suffixes):
+            if kind == "array":
+                if isinstance(base, FunctionType):
+                    self.error(f"an array of {base} is not a type C has")
+                base = ArrayType(base, payload)  # type: ignore[arg-type]
+            else:
+                if isinstance(base, (ArrayType, FunctionType)):
+                    self.error(f"a function cannot return {base}")
+                base = FunctionType(base, payload)  # type: ignore[arg-type]
+        return base
+
+    def parameter_type_list(self) -> tuple[CType, ...]:
+        """``(void)`` or ``(TYPE, TYPE, ...)`` in a function declarator."""
+
+        token = self.take("(")
+        if self.accept(")"):
+            self.error(
+                "a function type must state its parameter types; write '(void)' "
+                "for a function that takes none. C's empty '()' means the "
+                "parameters are UNSPECIFIED, and py2bin will not emit a call it "
+                "cannot check",
+                token,
+            )
+        if self.at("void") and self.peek().value == ")":
+            self.take("void")
+            self.take(")")
+            return ()
+        parameters: list[CType] = []
+        while True:
+            if self.at("..."):
+                self.error("a variadic function type is not implemented")
+            parameter, _name = self.declarator(self.type_specifier(), optional=True)
+            if isinstance(parameter, ArrayType):
+                # A parameter of array type is adjusted to a pointer, and one of
+                # function type to a pointer to the function (C11 6.7.6.3p7-8).
+                parameter = PointerType(parameter.element)
+            elif isinstance(parameter, FunctionType):
+                parameter = PointerType(parameter)
+            if isinstance(parameter, VoidType):
+                self.error("a parameter cannot have type void", token)
+            parameters.append(parameter)
+            if self.accept(")"):
+                break
+            self.take(",")
+        return tuple(parameters)
+
+    def array_suffix(self, base: CType) -> CType:
+        """The ``[N]`` part of a declarator whose name has already been taken."""
+
+        return self.declarator_suffix(base)
+
+    def array_length(self) -> int:
+        token = self.token
+        value = ConstantEvaluator(self.filename).value(self.assignment_expression())
+        if value <= 0:
+            self.error("an array needs a positive constant length", token)
+        return value
+
+    def type_name(self) -> CType:
+        """A type in a cast or ``sizeof``: specifiers plus an abstract declarator.
+
+        The abstract declarator is the ordinary one with the name left out, so
+        ``int (*)(int)`` -- the type a cast to a function pointer names -- reads
+        through exactly the same code that reads ``int (*p)(int)``.
+        """
+
+        ctype, _name = self.declarator(self.type_specifier(), abstract=True)
+        return ctype
+
+    # --- expressions ---
+
+    def expression(self) -> Node:
+        node = self.assignment_expression()
+        while self.at(","):
+            token = self.take(",")
+            node = Comma(token, node, self.assignment_expression())
+        return node
+
+    def assignment_expression(self) -> Node:
+        node = self.conditional_expression()
+        if self.token.kind == "symbol" and self.token.value in _ASSIGNMENTS:
+            token = self.take()
+            return Assignment(
+                token, str(token.value), node, self.assignment_expression()
+            )
+        return node
+
+    def conditional_expression(self) -> Node:
+        node = self.binary_expression(1)
+        if self.at("?"):
+            token = self.take("?")
+            body = self.expression()
+            self.take(":")
+            return Conditional(token, node, body, self.conditional_expression())
+        return node
+
+    def binary_expression(self, minimum: int) -> Node:
+        node = self.unary_expression()
+        while True:
+            if self.token.kind != "symbol":
+                return node
+            operator = str(self.token.value)
+            precedence = _BINARY_PRECEDENCE.get(operator)
+            if precedence is None or precedence < minimum:
+                return node
+            token = self.take()
+            right = self.binary_expression(precedence + 1)
+            if operator in {"&&", "||"}:
+                node = Logical(token, operator, node, right)
+            else:
+                node = Binary(token, operator, node, right)
+
+    def unary_expression(self) -> Node:
+        token = self.token
+        if token.kind == "symbol" and token.value in {"++", "--"}:
+            self.take()
+            return IncDec(token, str(token.value), self.unary_expression(), True)
+        if token.kind == "symbol" and token.value in {"+", "-", "!", "~", "*", "&"}:
+            self.take()
+            return Unary(token, str(token.value), self.unary_expression())
+        if token.kind == "identifier" and token.value == "sizeof":
+            self.take()
+            if self.at("(") and self.at_type_after_parenthesis():
+                self.take("(")
+                ctype = self.type_name()
+                self.take(")")
+                return SizeofType(token, ctype)
+            return SizeofExpression(token, self.unary_expression())
+        if self.at("(") and self.at_type_after_parenthesis():
+            self.take("(")
+            ctype = self.type_name()
+            self.take(")")
+            return Cast(token, ctype, self.unary_expression())
+        return self.postfix_expression()
+
+    def at_type_after_parenthesis(self) -> bool:
+        saved = self.index
+        self.index += 1
+        result = self.at_type()
+        self.index = saved
+        return result
+
+    def postfix_expression(self) -> Node:
+        node = self.primary_expression()
+        while True:
+            token = self.token
+            if self.accept("["):
+                offset = self.expression()
+                self.take("]")
+                node = Index(token, node, offset)
+                continue
+            if token.kind == "symbol" and token.value in {"++", "--"}:
+                self.take()
+                node = IncDec(token, str(token.value), node, False)
+                continue
+            if token.kind == "symbol" and token.value in {".", "->"}:
+                self.take()
+                member_token = self.identifier()
+                node = MemberAccess(
+                    token, node, str(member_token.value), token.value == "->"
+                )
+                continue
+            if self.at("("):
+                self.take("(")
+                arguments: list[Node] = []
+                if not self.accept(")"):
+                    while True:
+                        arguments.append(self.assignment_expression())
+                        if self.accept(")"):
+                            break
+                        self.take(",")
+                node = CallThrough(token, node, arguments)
+                continue
+            return node
+
+    def primary_expression(self) -> Node:
+        token = self.token
+        if token.kind == "integer":
+            self.take()
+            return IntLiteral(token, int(token.value), _literal_type(token, self.filename))
+        if token.kind == "float":
+            self.take()
+            # An unsuffixed floating constant has type double; 'f' makes it a
+            # float, and the lexer already rounded its value to binary32.
+            return FloatLiteral(
+                token, float(token.value), FLOAT if token.suffix == "f" else DOUBLE
+            )
+        if token.kind == "string":
+            self.take()
+            data = bytes(token.value)  # type: ignore[arg-type]
+            while self.token.kind == "string":  # adjacent literals concatenate
+                data += bytes(self.take().value)  # type: ignore[arg-type]
+            return StringLiteral(token, data)
+        if token.kind == "identifier":
+            if token.value in _UNSUPPORTED_KEYWORDS:
+                self.error(_UNSUPPORTED_KEYWORDS[str(token.value)])
+            if token.value in _RESERVED:
+                self.error(f"unexpected keyword {token.value!r} in an expression")
+            name = str(self.identifier().value)
+            if self.accept("("):
+                arguments: list[Node] = []
+                if not self.accept(")"):
+                    while True:
+                        arguments.append(self.assignment_expression())
+                        if self.accept(")"):
+                            break
+                        self.take(",")
+                return Call(token, name, arguments)
+            return Identifier(token, name)
+        if self.accept("("):
+            node = self.expression()
+            self.take(")")
+            return node
+        self.error(f"expected an expression, found {self.describe(token)}")
+
+    # --- statements ---
+
+    def compound_statement(self) -> Compound:
+        token = self.take("{")
+        body: list[Node] = []
+        while not self.accept("}"):
+            if self.token.kind == "eof":
+                self.error("unterminated block")
+            body.append(self.statement())
+        return Compound(token, body)
+
+    def statement(self) -> Node:
+        token = self.token
+        if self.at("{"):
+            return self.compound_statement()
+        if token.kind == "identifier" and token.value == "typedef":
+            self.typedef_declaration()
+            return Declaration(token, [])
+        if (
+            token.kind == "identifier"
+            and token.value in {"struct", "union", "enum"}
+            and self.declares_type_only()
+        ):
+            self.type_specifier()
+            self.take(";")
+            return Declaration(token, [])
+        if self.at_type():
+            return self.declaration_statement()
+        if token.kind == "identifier":
+            keyword = str(token.value)
+            if keyword == "if":
+                self.take()
+                self.take("(")
+                test = self.expression()
+                self.take(")")
+                body = self.statement()
+                alternative = self.statement() if self.accept("else") else None
+                return If(token, test, body, alternative)
+            if keyword == "while":
+                self.take()
+                self.take("(")
+                test = self.expression()
+                self.take(")")
+                return While(token, test, self.statement())
+            if keyword == "do":
+                self.take()
+                body = self.statement()
+                self.take("while")
+                self.take("(")
+                test = self.expression()
+                self.take(")")
+                self.take(";")
+                return DoWhile(token, body, test)
+            if keyword == "for":
+                return self.for_statement()
+            if keyword == "switch":
+                self.take()
+                self.take("(")
+                control = self.expression()
+                self.take(")")
+                return Switch(token, control, self.statement())
+            if keyword == "break":
+                self.take()
+                self.take(";")
+                return Break(token)
+            if keyword == "continue":
+                self.take()
+                self.take(";")
+                return Continue(token)
+            if keyword == "return":
+                self.take()
+                if self.accept(";"):
+                    return Return(token, None)
+                value = self.expression()
+                self.take(";")
+                return Return(token, value)
+            if keyword == "goto":
+                self.take()
+                name = str(self.identifier().value)
+                self.take(";")
+                return Goto(token, name)
+            if keyword == "case":
+                self.take()
+                value = self.conditional_expression()
+                self.take(":")
+                return Labeled(token, "case", value, self.labeled_body())
+            if keyword == "default":
+                self.take()
+                self.take(":")
+                return Labeled(token, "default", None, self.labeled_body())
+            if self.peek().value == ":" and self.peek().kind == "symbol":
+                name = str(self.identifier().value)
+                self.take(":")
+                return Labeled(token, "label", name, self.labeled_body())
+        if self.accept(";"):
+            return ExpressionStatement(token, None)
+        expression = self.expression()
+        self.take(";")
+        return ExpressionStatement(token, expression)
+
+    def labeled_body(self) -> Node | None:
+        """The statement a label introduces, which may be absent before '}'."""
+
+        if self.at("}"):
+            return None
+        return self.statement()
+
+    def declaration_statement(self) -> Declaration:
+        token = self.token
+        base = self.type_specifier()
+        entries: list[tuple[CType, str, object]] = []
+        while True:
+            ctype, name = self.declarator(base)
+            initializer: object = None
+            if self.accept("="):
+                initializer = self.initializer()
+            entries.append((ctype, name, initializer))
+            if self.accept(";"):
+                break
+            self.take(",")
+        return Declaration(token, entries)
+
+    def initializer(self) -> object:
+        if self.at("{"):
+            token = self.take("{")
+            items: list[object] = []
+            if not self.accept("}"):
+                while True:
+                    items.append(self.initializer())
+                    if self.accept("}"):
+                        break
+                    self.take(",")
+                    if self.accept("}"):  # a trailing comma is legal C
+                        break
+            return (token, items)
+        return self.assignment_expression()
+
+    def for_statement(self) -> For:
+        token = self.take("for")
+        self.take("(")
+        initializer: Node | None
+        if self.accept(";"):
+            initializer = None
+        elif self.at_type():
+            initializer = self.declaration_statement()
+        else:
+            initializer = ExpressionStatement(self.token, self.expression())
+            self.take(";")
+        test = None if self.at(";") else self.expression()
+        self.take(";")
+        step = None if self.at(")") else self.expression()
+        self.take(")")
+        return For(token, initializer, test, step, self.statement())
+
+    # --- translation unit ---
+
+    def translation_unit(self) -> TranslationUnit:
+        while self.token.kind != "eof":
+            if self.accept("extern"):
+                self.extern_prototype()
+                continue
+            # A struct or union definition with no declarator introduces a type
+            # and nothing else: `struct P { int x; };`
+            if self.token.kind == "identifier" and self.token.value == "typedef":
+                self.typedef_declaration()
+                continue
+            if (
+                self.token.kind == "identifier"
+                and self.token.value in {"struct", "union", "enum"}
+                and self.declares_type_only()
+            ):
+                self.type_specifier()
+                self.take(";")
+                continue
+            self.external_declaration()
+        return TranslationUnit(
+            self.functions, self.externs, self.enumerators, self.globals
+        )
+
+    def declares_type_only(self) -> bool:
+        """Whether a struct/union specifier is followed straight by ``;``.
+
+        Scans ahead without consuming: `struct P { ... };` declares a type,
+        while `struct P p;` and `struct P f(void)` declare an object or a
+        function and must go through the normal path.
+        """
+
+        index = self.index + 1
+        if (
+            index < len(self.tokens)
+            and self.tokens[index].kind == "identifier"
+            and self.tokens[index].value not in _RESERVED
+        ):
+            index += 1
+        if index < len(self.tokens) and self.tokens[index].value == "{":
+            depth = 0
+            while index < len(self.tokens):
+                value = self.tokens[index].value
+                if value == "{":
+                    depth += 1
+                elif value == "}":
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+        return index < len(self.tokens) and self.tokens[index].value == ";"
+
+    def external_declaration(self) -> None:
+        """One file-scope declaration: a function, or an object.
+
+        A plain ``TYPE *... name (`` is a function declaration or definition and
+        keeps its own path, because that path also needs the parameter NAMES.
+        Everything else -- including ``int (*handler)(int);``, whose declarator
+        also contains a parameter list -- is an object. ``static`` is accepted
+        and ignored here: it limits linkage, and a single translation unit with
+        no linker has no linkage to limit.
+        """
+
+        if self.token.kind == "identifier" and self.token.value == "static":
+            self.take()
+        base = self.type_specifier()
+        if self.at_function_declarator():
+            declared = self.pointer_suffix(base)
+            name_token = self.identifier()
+            self.function_definition(declared, name_token)
+            return
+        self.object_declaration(base)
+
+    def at_function_declarator(self) -> bool:
+        """Whether what follows is ``*``... ``name`` ``(`` -- a function, not an
+        object. ``int (*p)(void)`` fails this test at its very first token."""
+
+        index = self.index
+        while index < len(self.tokens):
+            token = self.tokens[index]
+            if token.value == "*" or (
+                token.kind == "identifier" and token.value in _QUALIFIERS
+            ):
+                index += 1
+                continue
+            break
+        if index + 1 >= len(self.tokens):
+            return False
+        name = self.tokens[index]
+        if name.kind != "identifier" or name.value in _RESERVED:
+            return False
+        return self.tokens[index + 1].value == "("
+
+    def object_declaration(self, base: CType) -> None:
+        """``TYPE name[= init], *other, third[3];`` at file scope."""
+
+        while True:
+            ctype, name = self.declarator(base)
+            name_token = self.declared_token
+            if not name:
+                self.error("a file-scope declaration needs a name", name_token)
+            if isinstance(ctype, FunctionType):
+                # `int (*f(int))(int)` -- a function whose own declarator is not
+                # simply `TYPE *... name(params)`. The parameter NAMES are what
+                # a definition needs, and this shape does not deliver them here.
+                self.error(
+                    f"{name!r} is declared as a function here, and py2bin only "
+                    "implements the plain declarator form 'TYPE *... name"
+                    "(params)'. Give the result type a typedef and write "
+                    f"'<typedef> {name}(params)'",
+                    name_token,
+                )
+            initializer: object = None
+            if self.accept("="):
+                initializer = self.initializer()
+            self.declare_global(
+                GlobalObject(name, ctype, initializer, name_token)
+            )
+            if self.accept(";"):
+                return
+            self.take(",")
+
+    def declare_global(self, entry: GlobalObject) -> None:
+        if entry.name in self.functions or entry.name in self.externs:
+            self.error(
+                f"{entry.name!r} is already declared as a function", entry.token
+            )
+        if entry.name in self.enumerators:
+            self.error(
+                f"{entry.name!r} is already an enumeration constant", entry.token
+            )
+        previous = self.globals.get(entry.name)
+        if previous is not None:
+            # C's tentative definitions: `int x; int x = 1;` is one object. Two
+            # initializers for it are not, and neither is a change of type.
+            if previous.ctype != entry.ctype:
+                self.error(
+                    f"{entry.name!r} was declared {previous.ctype} and is now "
+                    f"declared {entry.ctype}",
+                    entry.token,
+                )
+            if previous.initializer is not None and entry.initializer is not None:
+                self.error(f"{entry.name!r} is initialized twice", entry.token)
+            if entry.initializer is None:
+                return
+        self.globals[entry.name] = entry
+
+    def function_definition(self, result: CType, name_token: Token) -> None:
+        name = str(name_token.value)
+        self.take("(")
+        parameters: list[tuple[CType, str]] = []
+        if not self.accept(")"):
+            if self.at("void") and self.peek().value == ")":
+                self.take("void")
+                self.take(")")
+            else:
+                while True:
+                    if self.at("..."):
+                        self.error("variadic user functions are not implemented")
+                    parameter_type, parameter_name = self.declarator(
+                        self.type_specifier(), optional=True
+                    )
+                    if isinstance(parameter_type, ArrayType):
+                        # A parameter of array type is adjusted to a pointer.
+                        parameter_type = PointerType(parameter_type.element)
+                    parameters.append((parameter_type, parameter_name))
+                    if self.accept(")"):
+                        break
+                    self.take(",")
+        if name in self.externs or name in self.globals:
+            self.error(f"{name!r} is already declared", name_token)
+        previous = self.functions.get(name)
+        if previous is not None:
+            self.check_redeclaration(previous, result, parameters, name_token)
+        if self.accept(";"):
+            # A prototype. It carries no body, and repeating it is legal C as
+            # long as the signature agrees, which check_redeclaration enforced.
+            if previous is None:
+                self.functions[name] = Function(
+                    name, result, parameters, None, name_token
+                )
+            return
+        if previous is not None and previous.body is not None:
+            self.error(f"{name!r} is already defined", name_token)
+        seen: set[str] = set()
+        for parameter_type, parameter_name in parameters:
+            if not parameter_name:
+                self.error("every parameter needs a name", name_token)
+            if parameter_name in seen:
+                self.error(f"duplicate parameter {parameter_name!r}", name_token)
+            seen.add(parameter_name)
+            if isinstance(parameter_type, VoidType):
+                self.error("a parameter cannot have type void", name_token)
+        # The signature is registered before the body is parsed so that the
+        # function's own name -- and any name a prototype introduced -- resolves
+        # inside it. That is what makes direct and mutual recursion parseable.
+        self.functions[name] = Function(name, result, parameters, None, name_token)
+        body = self.compound_statement()
+        self.functions[name] = Function(name, result, parameters, body, name_token)
+
+    def check_redeclaration(
+        self,
+        previous: Function,
+        result: CType,
+        parameters: list[tuple[CType, str]],
+        name_token: Token,
+    ) -> None:
+        """C requires a redeclaration to agree with what came before."""
+
+        if previous.result != result:
+            self.error(
+                f"{previous.name!r} was declared to return {previous.result} and is "
+                f"now declared to return {result}",
+                name_token,
+            )
+        if len(previous.parameters) != len(parameters):
+            self.error(
+                f"{previous.name!r} was declared with {len(previous.parameters)} "
+                f"parameter(s) and is now declared with {len(parameters)}",
+                name_token,
+            )
+        for position, ((old, _old_name), (new, _new_name)) in enumerate(
+            zip(previous.parameters, parameters), 1
+        ):
+            if old != new:
+                self.error(
+                    f"parameter {position} of {previous.name!r} was declared "
+                    f"{old} and is now declared {new}",
+                    name_token,
+                )
+
+    def extern_prototype(self) -> None:
+        """``extern TYPE name(TYPE, ...);`` bound to py2bin's vetted adapter ABI.
+
+        Writing the prototype out is what removes the need for a preprocessor:
+        the source states the exact ABI it uses, and the compiler checks that
+        statement against the table it will actually emit a call for.
+        """
+
+        result = self.pointer_suffix(self.type_specifier())
+        name_token = self.identifier()
+        name = str(name_token.value)
+        if not self.at("("):
+            self.error(
+                f"'extern {name}' declares an object defined in another "
+                "translation unit; py2bin compiles exactly one translation unit "
+                "and has no linker, so only 'extern' function prototypes bound "
+                "to the vetted adapter ABI are accepted. Drop the 'extern' to "
+                "define the object here.",
+                name_token,
+            )
+        self.take("(")
+        declared: list[CType] = []
+        if not self.accept(")"):
+            while True:
+                parameter_type = self.pointer_suffix(self.type_specifier())
+                if isinstance(parameter_type, VoidType) and not declared:
+                    pass
+                else:
+                    declared.append(parameter_type)
+                if self.token.kind == "identifier" and not self.at_type():
+                    self.identifier()
+                if self.accept(")"):
+                    break
+                self.take(",")
+        self.take(";")
+        if name not in _CABI_SYMBOLS:
+            self.error(
+                f"external symbol {name!r} is not in py2bin's vetted adapter ABI; "
+                f"choose one of {', '.join(sorted(_CABI_SYMBOLS))}",
+                name_token,
+            )
+        _symbol, signature = _CABI_SYMBOLS[name]
+        if len(declared) != len(signature):
+            self.error(
+                f"prototype for {name!r} declares {len(declared)} parameter(s) but "
+                f"its vetted adapter ABI takes {len(signature)}",
+                name_token,
+            )
+        for position, (declared_type, kind) in enumerate(zip(declared, signature), 1):
+            if not _matches_abi(declared_type, kind):
+                self.error(
+                    f"parameter {position} of {name!r} is declared "
+                    f"{declared_type!r} but its vetted adapter ABI passes {kind!r}",
+                    name_token,
+                )
+        if not _matches_abi(result, _CABI_RESULTS[name], result=True):
+            self.error(
+                f"prototype for {name!r} returns {str(result)!r} but its vetted "
+                f"adapter ABI returns {_CABI_RESULTS[name]!r}",
+                name_token,
+            )
+        if name in self.functions or name in self.externs:
+            self.error(f"{name!r} is already declared", name_token)
+        self.externs[name] = result
+
+
+def _literal_type(token: Token, filename: str) -> CType:
+    """The type C gives an integer constant: C11 6.4.4.1 table.
+
+    The first type in the list that can represent the value wins. A ``u``
+    suffix keeps the list unsigned; an ``l``/``ll`` suffix drops the narrower
+    entries; and only a hexadecimal or octal constant may pick an unsigned type
+    it was not asked for, which is what gives ``0xFFFFFFFFFFFFFFFF`` the value
+    18446744073709551615 rather than -1.
+    """
+
+    suffix = token.suffix
+    value = int(token.value)
+    longs = min(suffix.count("l"), 2)
+    if "u" in suffix:
+        candidates = [UINT, ULONG, ULLONG][longs:]
+    elif token.radix == 10:
+        candidates = [INT, LONG, LLONG][longs:]
+    else:
+        candidates = [INT, UINT, LONG, ULONG, LLONG, ULLONG][longs * 2 :]
+    for candidate in candidates:
+        bits = candidate.size * 8
+        low = 0 if not candidate.signed else -(1 << (bits - 1))
+        high = (1 << bits) - 1 if not candidate.signed else (1 << (bits - 1)) - 1
+        if low <= value <= high:
+            return candidate
+    raise CCompileError(
+        filename,
+        token.line,
+        token.column,
+        f"the integer constant {value} does not fit any C integer type; a "
+        "decimal constant never becomes unsigned on its own, so write the 'u' "
+        "suffix if that is what you meant",
+    )
+
+
+def _matches_abi(ctype: CType, kind: str, *, result: bool = False) -> bool:
+    if kind == "void":
+        return isinstance(ctype, VoidType)
+    if kind == "int":
+        return isinstance(ctype, IntegerType)
+    if kind == "ptr":
+        return isinstance(ctype, PointerType)
+    if kind in {"cstr", "cfmt"}:
+        return not result and isinstance(ctype, PointerType) and ctype.target in {
+            CHAR,
+            SCHAR,
+            UCHAR,
+        }
+    return False
+
+
+# --- compile-time constant evaluation ----------------------------------------
+
+
+class ConstantEvaluator:
+    """Evaluates the constant expressions C needs before code generation.
+
+    Array lengths and ``case`` labels must be known at compile time, and they
+    are parsed before any lowering context exists, so this is a small standalone
+    interpreter over the syntax tree rather than a pass over the IR.
+    """
+
+    def __init__(self, filename: str):
+        self.filename = filename
+
+    def error(self, message: str, token: Token):
+        raise CCompileError(
+            token.origin or self.filename, token.line, token.column, message
+        )
+
+    def value(self, node: Node) -> int:
+        result = self.evaluate(node)
+        return result
+
+    def evaluate(self, node: Node) -> int:
+        if isinstance(node, IntLiteral):
+            return node.value
+        if isinstance(node, FloatLiteral):
+            self.error(
+                "a floating constant is not an integer constant expression; an "
+                "array length and a 'case' label must be integers",
+                node.token,
+            )
+        if isinstance(node, SizeofType):
+            size = size_of(node.ctype)
+            if size is None:
+                self.error(f"sizeof({node.ctype}) needs a complete type", node.token)
+            return size
+        if isinstance(node, Unary):
+            operand = self.evaluate(node.operand)
+            if node.operator == "+":
+                return operand
+            if node.operator == "-":
+                return -operand
+            if node.operator == "~":
+                return ~operand
+            if node.operator == "!":
+                return int(operand == 0)
+            self.error(
+                f"unary {node.operator!r} is not allowed in a constant expression",
+                node.token,
+            )
+        if isinstance(node, Cast):
+            value = self.evaluate(node.operand)
+            if not isinstance(node.ctype, IntegerType):
+                self.error(
+                    "only integer casts are allowed in a constant expression",
+                    node.token,
+                )
+            return _wrap(value, node.ctype.size, node.ctype.signed)
+        if isinstance(node, Conditional):
+            return (
+                self.evaluate(node.body)
+                if self.evaluate(node.test)
+                else self.evaluate(node.alternative)
+            )
+        if isinstance(node, Logical):
+            left = self.evaluate(node.left)
+            if node.operator == "&&":
+                return int(bool(left) and bool(self.evaluate(node.right)))
+            return int(bool(left) or bool(self.evaluate(node.right)))
+        if isinstance(node, Binary):
+            left = self.evaluate(node.left)
+            right = self.evaluate(node.right)
+            if node.operator in {"/", "%"} and right == 0:
+                self.error("division by zero in a constant expression", node.token)
+            operations = {
+                "+": lambda a, b: a + b,
+                "-": lambda a, b: a - b,
+                "*": lambda a, b: a * b,
+                "/": lambda a, b: abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1),
+                "%": lambda a, b: a - (abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1)) * b,
+                "&": lambda a, b: a & b,
+                "|": lambda a, b: a | b,
+                "^": lambda a, b: a ^ b,
+                "<<": lambda a, b: a << b,
+                ">>": lambda a, b: a >> b,
+                "<": lambda a, b: int(a < b),
+                "<=": lambda a, b: int(a <= b),
+                ">": lambda a, b: int(a > b),
+                ">=": lambda a, b: int(a >= b),
+                "==": lambda a, b: int(a == b),
+                "!=": lambda a, b: int(a != b),
+            }
+            operation = operations.get(node.operator)
+            if operation is None:
+                self.error(
+                    f"{node.operator!r} is not allowed in a constant expression",
+                    node.token,
+                )
+            return operation(left, right)
+        self.error(
+            "this expression is not a constant expression; an array length and a "
+            "'case' label must be known at compile time",
+            node.token,
+        )
+
+
+def _wrap(value: int, size: int, signed: bool) -> int:
+    modulus = 1 << (size * 8)
+    value &= modulus - 1
+    if signed and value >= modulus >> 1:
+        value -= modulus
+    return value
+
+
+def _s64(value: int) -> int:
+    return _wrap(value, 8, True)
+
+
+def _u64(value: int) -> int:
+    return value & 0xFFFFFFFFFFFFFFFF
+
+
+# --- IR construction helpers -------------------------------------------------
+
+
+def _fold(operator: str, left: int, right: int) -> int | None:
+    """Constant-fold one IR operation with exact 64-bit wrapping semantics."""
+
+    if operator == "add":
+        return _s64(left + right)
+    if operator == "sub":
+        return _s64(left - right)
+    if operator == "mul":
+        return _s64(left * right)
+    if operator == "and":
+        return _s64(_u64(left) & _u64(right))
+    if operator == "or":
+        return _s64(_u64(left) | _u64(right))
+    if operator == "xor":
+        return _s64(_u64(left) ^ _u64(right))
+    if operator == "lshift":
+        return _s64(_u64(left) << (right & 63))
+    if operator == "rshift":
+        return _s64(left >> (right & 63))
+    if operator == "urshift":
+        return _s64(_u64(left) >> (right & 63))
+    if right == 0:
+        return None  # division by zero is undefined; let it happen at runtime
+    if operator == "sdiv":
+        quotient = abs(left) // abs(right)
+        return _s64(quotient if (left < 0) == (right < 0) else -quotient)
+    if operator == "smod":
+        remainder = abs(left) % abs(right)
+        return _s64(remainder if left >= 0 else -remainder)
+    if operator == "udiv":
+        return _s64(_u64(left) // _u64(right))
+    if operator == "umod":
+        return _s64(_u64(left) % _u64(right))
+    return None
+
+
+_COMPARISONS = {
+    "eq": lambda a, b: a == b,
+    "ne": lambda a, b: a != b,
+    "lt": lambda a, b: a < b,
+    "le": lambda a, b: a <= b,
+    "gt": lambda a, b: a > b,
+    "ge": lambda a, b: a >= b,
+    "ult": lambda a, b: _u64(a) < _u64(b),
+    "ule": lambda a, b: _u64(a) <= _u64(b),
+    "ugt": lambda a, b: _u64(a) > _u64(b),
+    "uge": lambda a, b: _u64(a) >= _u64(b),
+}
+
+
+def _constant(value: int) -> IntConstant:
+    """Build an ``IntConstant`` in the IR's one canonical form.
+
+    Every integer in the IR is a 64-bit bit pattern read as SIGNED, because
+    that is what the machine registers hold. A constant that arrives as an
+    unsigned quantity -- ``0xFFFFFFFFFFFFFFFFull``, or a ``case`` label of an
+    unsigned type -- has to be converted here. The encoders mask to 64 bits
+    anyway, so skipping this looks harmless; it is not, because the constant
+    folder then compares and divides Python integers of arbitrary width, and
+    ``(long)0xFFFFFFFFFFFFFFFE >= 79490271399379139`` folds to true when the
+    same expression computed at runtime is false.
+    """
+
+    return IntConstant(_s64(value))
+
+
+def _value_of(expression: IntExpression) -> int | None:
+    return expression.value if isinstance(expression, IntConstant) else None
+
+
+def _binary(operator: str, left: IntExpression, right: IntExpression) -> IntExpression:
+    a, b = _value_of(left), _value_of(right)
+    if a is not None and b is not None:
+        folded = _fold(operator, a, b)
+        if folded is not None:
+            return IntConstant(folded)
+    if b == 0 and operator in {"add", "sub", "or", "xor", "lshift", "rshift", "urshift"}:
+        return left
+    if a == 0 and operator == "add":
+        return right
+    if b == 1 and operator in {"mul", "sdiv", "udiv"}:
+        return left
+    if a == 1 and operator == "mul":
+        return right
+    if (a == 0 or b == 0) and operator == "mul":
+        return IntConstant(0)
+    return IntBinary(operator, left, right)
+
+
+def _compare(operator: str, left: IntExpression, right: IntExpression) -> IntExpression:
+    a, b = _value_of(left), _value_of(right)
+    if a is not None and b is not None:
+        return IntConstant(int(_COMPARISONS[operator](a, b)))
+    return IntCompare(operator, left, right)
+
+
+def _is_link_constant(expression: object) -> bool:
+    """Whether ``expression`` is a value C may initialize static storage with.
+
+    C11 6.7.9p4: the initializer for an object with static storage duration is
+    an arithmetic constant expression, or an address constant -- the address of
+    an object or function, optionally offset by a constant. Everything here is
+    known before the first instruction runs, which is exactly why start-up can
+    place it without evaluating anything.
+    """
+
+    if isinstance(
+        expression,
+        (IntConstant, FloatConstant, CStringConstant, GlobalAddress, FunctionAddress),
+    ):
+        return True
+    if isinstance(expression, IntBinary) and expression.operator in {"add", "sub"}:
+        return _is_link_constant(expression.left) and _is_link_constant(
+            expression.right
+        )
+    if isinstance(expression, (FloatBits, BitsFloat)):
+        return _is_link_constant(expression.value)
+    return False
+
+
+def _contains_call(value: object) -> bool:
+    """True when an IR expression embeds a call, so re-emitting it would repeat it.
+
+    ``Lowerer.extern_call`` and ``Lowerer.direct_call`` pin every call in a slot
+    as soon as it is lowered, so nothing this compiler builds should ever trip
+    this check. It stays as the guard on the two places that reuse an expression
+    -- the address of a read-modify-write target -- because the failure it
+    prevents (a call happening twice because its value appeared twice in a tree)
+    is the defect this backend has produced most often.
+    """
+
+    if isinstance(value, (ExternCall, IRCall, IndirectCall)):
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_contains_call(item) for item in value)
+    for name in getattr(type(value), "__slots__", ()) or ():
+        if _contains_call(getattr(value, name)):
+            return True
+    return False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Value:
+    """A lowered C expression: its type and its canonical IR value.
+
+    Every integer value is kept sign-extended (signed types) or zero-extended
+    (unsigned types) into 64 bits, so one representation serves both the
+    register file and memory of any width. ``null`` marks the null pointer
+    constant, the one integer C lets stand in for a pointer.
+
+    A value whose type is floating carries a ``FloatExpression`` instead, always
+    in binary64 -- including one of type ``float``, whose extra precision C11
+    6.3.1.8p2 lets an implementation keep until an assignment, cast, argument
+    or return removes it. ``ctype`` is what says which of the two ``expr`` is,
+    so nothing has to guess.
+    """
+
+    ctype: CType
+    expr: IntExpression | FloatExpression
+    null: bool = False
+
+
+@dataclasses.dataclass(slots=True)
+class Local:
+    """A named object and where it lives.
+
+    ``slot`` is a stack-slot index for an automatic object, and a byte offset
+    into the module's static storage block when ``static`` is set. The two are
+    deliberately different address spaces: a frame dies when its function
+    returns, and the static block does not.
+    """
+
+    ctype: CType
+    slot: int
+    static: bool = False
+
+
+@dataclasses.dataclass(slots=True)
+class FunctionContext:
+    function: Function
+    result_slot: int | None
+    return_label: str
+    is_main: bool
+    #: True while lowering a body that will become a real IR ``Function``, so a
+    #: ``return`` becomes a machine return instead of a store-and-jump.
+    call_body: bool = False
+    labels: dict[str, str] = dataclasses.field(default_factory=dict)
+    defined: set[str] = dataclasses.field(default_factory=set)
+    pending: list[tuple[str, Token]] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(slots=True)
+class SwitchContext:
+    ctype: IntegerType
+    cases: list[tuple[int, str]]
+    default: str | None
+    seen: set[int]
+
+
+# Every printf conversion py2bin implements, and the C type its argument is
+# converted to before it is formatted.
+_CONVERSIONS = {
+    "d": ("signed", INT),
+    "i": ("signed", INT),
+    "u": ("unsigned", UINT),
+    "x": ("hex", UINT),
+    "X": ("HEX", UINT),
+    "c": ("char", INT),
+    "s": ("string", PointerType(CHAR)),
+}
+#: printf's floating conversions. py2bin emits the whole formatter itself, so
+#: each one is a compile-time choice of shape plus a runtime precision.
+_FLOAT_CONVERSIONS = frozenset({"f", "F", "e", "E", "g", "G"})
+
+#: A conversion's precision bounds the output, and the output goes into a fixed
+#: frame buffer. 120 leaves room for the 309 integer digits the largest double
+#: needs in %f, with the sign and the point, inside _TEXT_BYTES.
+_MAXIMUM_PRECISION = 120
+
+#: Bytes of frame the floating formatter needs. The digit array holds the EXACT
+#: decimal expansion of a double: 767 digits for the smallest subnormal (its
+#: mantissa times 5**1074), plus one the final rounding carry can add.
+_DIGIT_BYTES = 1024
+_TEXT_BYTES = 512
+
+_LENGTHS = {
+    "": {},
+    "hh": {"d": SCHAR, "i": SCHAR, "u": UCHAR, "x": UCHAR, "X": UCHAR},
+    "h": {"d": SHORT, "i": SHORT, "u": USHORT, "x": USHORT, "X": USHORT},
+    "l": {"d": LONG, "i": LONG, "u": ULONG, "x": ULONG, "X": ULONG},
+    "ll": {"d": LLONG, "i": LLONG, "u": ULLONG, "x": ULLONG, "X": ULLONG},
+    "z": {"d": LONG, "i": LONG, "u": ULONG, "x": ULONG, "X": ULONG},
+    "j": {"d": LLONG, "i": LLONG, "u": ULLONG, "x": ULLONG, "X": ULLONG},
+}
+
+_MAXIMUM_SLOTS = 4000
+
+#: Bytes of static storage one translation unit may declare. The block is a
+#: single mapping obtained at start-up, so the limit is a sanity bound rather
+#: than an architectural one; it is stated because exceeding it must be a
+#: compile-time rejection and never a mapping that silently fails at run time.
+_MAXIMUM_STATIC_BYTES = 8 << 20
+
+#: py2bin's call ABI passes every argument in a register. AAPCS64 has eight
+#: integer parameter registers, and stack argument passing is not implemented,
+#: so a longer parameter list is rejected rather than silently truncated.
+#: Arguments a target can pass. ARM64 implements the AAPCS64 memory
+#: argument area; the x86 encoders stop at their register count.
+_MAXIMUM_ARGUMENTS = 8
+#: Every target now implements its convention's memory argument area.
+_STACK_ARGUMENT_TARGETS = frozenset(
+    {
+        "darwin-arm64",
+        "linux-arm64",
+        "windows-arm64",
+        "darwin-x86_64",
+        "linux-x86_64",
+        "windows-x86_64",
+    }
+)
+_ARGUMENT_CEILING = 64
+
+
+# The C math functions the target implements as a single instruction. No
+# library is linked and no libm is bundled: py2bin emits the hardware
+# operation, which is why these work with no linker at all. Anything needing a
+# software implementation (sin, cos, exp, log, pow) is deliberately absent.
+_MATH_BUILTINS = {
+    "sqrt": "sqrt",
+    "fabs": "abs",
+    "floor": "floor",
+    "ceil": "ceil",
+    "trunc": "trunc",
+    "round": "round",
+}
+
+
+class Lowerer:
+    """Lowers a parsed translation unit to py2bin's native IR."""
+
+    def __init__(self, unit: TranslationUnit, filename: str, target: str):
+        self.enumerators = dict(getattr(unit, "enumerators", {}) or {})
+        self.unit = unit
+        self.filename = filename
+        self.target = target
+        self.operations: list[Operation] = []
+        self.stack_slots = 0
+        self.scopes: list[dict[str, Local]] = []
+        self.counter = 0
+        self.break_targets: list[str] = []
+        self.continue_targets: list[str] = []
+        self.switches: list[SwitchContext] = []
+        self.functions: list[FunctionContext] = []
+        self.active: list[str] = []
+        self.buffer_slot: int | None = None
+        self.digit_slot: int | None = None
+        self.text_slot: int | None = None
+        self.float_scratch: dict[str, int] = {}
+        # The shared floating formatter of the body being lowered: its entry
+        # label, the label its dispatch chain lives at, and every site that
+        # jumped into it and must be returned to.
+        self.float_entry: str | None = None
+        self.float_dispatch: str | None = None
+        self.float_returns: list[tuple[int, str]] = []
+        # Real calls: every function reached from main, lowered once into its
+        # own IR body, plus the set currently being lowered so a call that
+        # arrives while its own body is still open (that is, recursion) emits a
+        # call rather than trying to lower the body a second time.
+        self.calls_are_real = target in CALL_CAPABLE_TARGETS
+        self.lowered: dict[str, IRFunction] = {}
+        self.lowering: set[str] = set()
+        # File-scope objects. They live in the module's static storage block
+        # rather than any frame, which is what lets one object be the same
+        # object in the entry point and in every function body.
+        self.statics: dict[str, Local] = {}
+        self.static_bytes = 0
+
+    # --- bookkeeping ---
+
+    def error(self, message: str, token: Token):
+        raise CCompileError(
+            token.origin or self.filename, token.line, token.column, message
+        )
+
+    def emit(self, operation: Operation) -> None:
+        self.operations.append(operation)
+
+    def allocate(self, size: int) -> int:
+        slots = max(1, (size + 7) // 8)
+        base = self.stack_slots
+        self.stack_slots += slots
+        if self.stack_slots > _MAXIMUM_SLOTS:
+            raise CCompileError(
+                self.filename,
+                1,
+                1,
+                f"this translation unit needs more than {_MAXIMUM_SLOTS * 8} bytes "
+                "of stack frame; py2bin's native frames are a single fixed "
+                "allocation, so reduce the size of the local arrays",
+            )
+        return base
+
+    def new_temp(self) -> int:
+        return self.allocate(8)
+
+    def new_label(self, prefix: str) -> str:
+        self.counter += 1
+        return f"c_{prefix}_{self.counter}"
+
+    def declare(self, name: str, ctype: CType, token: Token) -> Local:
+        scope = self.scopes[-1]
+        if name in scope:
+            self.error(f"{name!r} is already declared in this scope", token)
+        if isinstance(ctype, FunctionType):
+            self.error(
+                f"{name!r} is declared as a function inside a block; py2bin "
+                "accepts a function declaration only at file scope. Write "
+                f"'{ctype.result} (*{name})(...)' for a pointer to a function",
+                token,
+            )
+        size = size_of(ctype)
+        if size is None:
+            self.error(
+                f"cannot declare {name!r} with the incomplete type {ctype}", token
+            )
+        local = Local(ctype, self.allocate(size))
+        scope[name] = local
+        return local
+
+    def lookup(self, name: str) -> Local | None:
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        # File scope is the outermost scope, so a local of the same name wins.
+        return self.statics.get(name)
+
+    def allocate_static(self, ctype: CType, token: Token) -> int:
+        """Reserve aligned space for one file-scope object and return its offset."""
+
+        size = size_of(ctype)
+        if size is None:
+            self.error(
+                f"a file-scope object cannot have the incomplete type {ctype}", token
+            )
+        alignment = align_of(ctype)
+        offset = (self.static_bytes + alignment - 1) & ~(alignment - 1)
+        self.static_bytes = offset + size
+        if self.static_bytes > _MAXIMUM_STATIC_BYTES:
+            self.error(
+                f"this translation unit declares more than "
+                f"{_MAXIMUM_STATIC_BYTES} bytes of file-scope objects, which is "
+                "more static storage than py2bin reserves",
+                token,
+            )
+        return offset
+
+    def address_of(self, local: Local) -> IntExpression:
+        """Where an object lives: a frame slot, or the static storage block."""
+
+        if local.static:
+            return GlobalAddress(local.slot)
+        return SlotAddress(local.slot)
+
+    # --- conversions ---
+
+    def fit(self, expression: IntExpression, ctype: CType) -> IntExpression:
+        """Reduce ``expression`` to the canonical 64-bit form of ``ctype``."""
+
+        if ctype == BOOL:
+            return _compare("ne", expression, IntConstant(0))
+        size = size_of(ctype)
+        constant = _value_of(expression)
+        if size is None or size == 8:
+            # Widening to 64 bits is a no-op on the value, but a constant that
+            # came in as an unsigned quantity still has to be renormalized so
+            # the folder keeps seeing the signed reading of the bit pattern.
+            return expression if constant is None else _constant(constant)
+        signed = is_signed(ctype)
+        if constant is not None:
+            return _constant(_wrap(constant, size, signed))
+        bits = size * 8
+        if signed:
+            shift = IntConstant(64 - bits)
+            return _binary("rshift", _binary("lshift", expression, shift), shift)
+        return _binary("and", expression, IntConstant((1 << bits) - 1))
+
+    # --- floating conversions ---
+    #
+    # Every floating value in flight is a binary64 double, whatever its C type.
+    # These four helpers are the only places that cross between the integer and
+    # floating worlds, so the rules live in one place instead of at each use.
+
+    def widen(self, value: Value) -> FloatExpression:
+        """The double a floating or integer arithmetic value stands for."""
+
+        if is_floating(value.ctype):
+            return value.expr
+        assert isinstance(value.ctype, IntegerType)
+        # A canonical unsigned value narrower than 64 bits is already a
+        # non-negative i64, so only the 64-bit unsigned types need the unsigned
+        # conversion -- but they really need it, or 2**64-1 converts to -1.0.
+        signed = value.ctype.signed or value.ctype.size < 8
+        return IntToFloat(self.fit(value.expr, value.ctype), signed=signed)
+
+    def narrow(self, expression: FloatExpression, target: FloatingType) -> FloatExpression:
+        """Remove the extra precision C requires a conversion to remove."""
+
+        if target.size == 4:
+            return BitsFloat(FloatBits(expression, 4), 4)
+        return expression
+
+    def to_integer(self, expression: FloatExpression, target: IntegerType) -> IntExpression:
+        """C's conversion of a floating value to an integer type: truncate."""
+
+        if target == BOOL:
+            return FloatCompare("ne", expression, FloatConstant(0.0))
+        # A destination whose range runs past 2**63-1 needs the unsigned
+        # instruction; everything narrower fits in a signed 64-bit result and is
+        # then reduced by fit() exactly as an integer conversion is.
+        signed = target.signed or target.size < 8
+        return self.fit(FloatToInt(expression, signed=signed), target)
+
+    def stored_bits(self, expression: object, ctype: CType) -> IntExpression:
+        """The integer image an object of ``ctype`` holds in memory.
+
+        A C floating object is its IEEE-754 bit pattern, four bytes wide for a
+        ``float`` and eight for a ``double``, so every store goes through the
+        same ``HeapStore`` every other C object uses.
+        """
+
+        if is_floating(ctype):
+            return FloatBits(expression, ctype.size)
+        return expression
+
+    def from_bits(self, expression: IntExpression, ctype: CType) -> object:
+        """Read back what :meth:`stored_bits` wrote."""
+
+        if is_floating(ctype):
+            return BitsFloat(expression, ctype.size)
+        return self.fit(expression, ctype)
+
+    def truth(self, value: Value) -> IntExpression:
+        """The 0/1 an ``if``, ``while`` or ``&&`` tests a scalar with."""
+
+        if is_floating(value.ctype):
+            return FloatCompare("ne", value.expr, FloatConstant(0.0))
+        return value.expr
+
+    def assign_convert(
+        self, value: Value, target: CType, token: Token, what: str
+    ) -> IntExpression | FloatExpression:
+        if isinstance(target, FloatingType):
+            if is_arithmetic(value.ctype):
+                return self.narrow(self.widen(value), target)
+            if isinstance(value.ctype, PointerType):
+                self.error(
+                    f"{what} needs {target}, but this is a pointer; C has no "
+                    "conversion between a pointer and a floating type at all",
+                    token,
+                )
+            self.error(f"{what} needs {target}, but this is {value.ctype}", token)
+        if isinstance(target, IntegerType):
+            if isinstance(value.ctype, FloatingType):
+                return self.to_integer(value.expr, target)
+            if isinstance(value.ctype, IntegerType):
+                return self.fit(value.expr, target)
+            if isinstance(value.ctype, PointerType):
+                self.error(
+                    f"{what} needs {target}, but this is a pointer; C requires an "
+                    "explicit cast to convert one to an integer",
+                    token,
+                )
+            self.error(f"{what} needs {target}, but this expression has no value", token)
+        if isinstance(target, PointerType):
+            if value.null:
+                return IntConstant(0)
+            if isinstance(value.ctype, PointerType) and compatible(target, value.ctype):
+                return value.expr
+            if isinstance(value.ctype, PointerType):
+                self.error(
+                    f"{what} needs {target}, but this is {value.ctype}; C requires "
+                    "an explicit cast between incompatible pointer types",
+                    token,
+                )
+            self.error(f"{what} needs {target}, but this is {value.ctype}", token)
+        self.error(f"{what} cannot be given a value of type {value.ctype}", token)
+
+    # --- lvalues and loads ---
+
+    def load(self, ctype: CType, address: IntExpression) -> Value:
+        if isinstance(ctype, ArrayType):
+            # An array used as a value decays to a pointer to its first element.
+            return Value(PointerType(ctype.element), address)
+        if isinstance(ctype, FunctionType):
+            # A function designator used as a value decays to a pointer to the
+            # function (C11 6.3.2.1p4); its "address" already IS that pointer.
+            return Value(PointerType(ctype), address)
+        if isinstance(ctype, StructType):
+            # A struct value is carried as the address of the object. Only
+            # assignment, member access and & consume one, and each of those
+            # wants the address rather than a word-sized load.
+            return Value(ctype, address)
+        size = size_of(ctype)
+        if size is None:
+            raise AssertionError("incomplete lvalue reached the loader")
+        if isinstance(ctype, FloatingType):
+            # The object's bytes ARE its IEEE bit pattern, so an ordinary
+            # integer load reaches it and BitsFloat reinterprets the result.
+            return Value(ctype, BitsFloat(HeapLoad(address, size, False), size))
+        return Value(ctype, HeapLoad(address, size, is_signed(ctype)))
+
+    def lvalue(self, node: Node) -> tuple[CType, IntExpression]:
+        if isinstance(node, Identifier):
+            local = self.lookup(node.name)
+            if local is None:
+                if node.name == "NULL":
+                    self.error("the null pointer constant is not an lvalue", node.token)
+                if node.name in self.unit.functions:
+                    # A function designator. It is not an lvalue in C either,
+                    # but '&' and a call both want exactly this pair, and every
+                    # other use goes through load(), which decays it.
+                    return self.function_designator(node.name, node.token)
+                self.error(
+                    f"{node.name!r} is not a declared local or parameter", node.token
+                )
+            return local.ctype, self.address_of(local)
+        if isinstance(node, Unary) and node.operator == "*":
+            pointer = self.rvalue(node.operand)
+            if not isinstance(pointer.ctype, PointerType):
+                self.error(
+                    f"cannot dereference a value of type {pointer.ctype}", node.token
+                )
+            target = pointer.ctype.target
+            if isinstance(target, FunctionType):
+                # *fp is the function itself, which decays straight back to the
+                # pointer -- which is why (*fp)(x) and fp(x) are the same call,
+                # and why **fp is still legal C.
+                return target, pointer.expr
+            if size_of(target) is None:
+                self.error(
+                    f"cannot dereference {pointer.ctype}: {target} is an incomplete "
+                    "type whose layout py2bin deliberately does not model",
+                    node.token,
+                )
+            return target, pointer.expr
+        if isinstance(node, Index):
+            return self.lvalue(
+                Unary(
+                    node.token,
+                    "*",
+                    Binary(node.token, "+", node.base, node.offset),
+                )
+            )
+        if isinstance(node, MemberAccess):
+            # `a.m` needs the address of a, and `p->m` the value of p. Both
+            # then add the member's constant offset.
+            if node.through_pointer:
+                pointer = self.rvalue(node.base)
+                if not isinstance(pointer.ctype, PointerType):
+                    self.error(
+                        f"'->' needs a pointer to a struct or union, not "
+                        f"{pointer.ctype}",
+                        node.token,
+                    )
+                owner = pointer.ctype.target
+                address = pointer.expr
+            else:
+                owner, address = self.lvalue(node.base)
+            if not isinstance(owner, StructType):
+                self.error(
+                    f"{'->' if node.through_pointer else '.'} needs a struct or "
+                    f"union, not {owner}",
+                    node.token,
+                )
+            if owner.members is None:
+                self.error(
+                    f"{owner} is incomplete here, so its members are unknown",
+                    node.token,
+                )
+            member = owner.member(node.name)
+            if member is None:
+                self.error(
+                    f"{owner} has no member named {node.name!r}", node.token
+                )
+            if member.offset == 0:
+                return member.ctype, address
+            return member.ctype, IntBinary(
+                "add", address, IntConstant(member.offset)
+            )
+        self.error("this expression is not an lvalue", node.token)
+
+    def stabilize(self, expression: IntExpression) -> IntExpression:
+        """Pin a value in a slot when re-emitting it would repeat a call."""
+
+        if isinstance(expression, (IntConstant, IntLoad, SlotAddress, GlobalAddress)):
+            return expression
+        if not _contains_call(expression):
+            return expression
+        slot = self.new_temp()
+        self.emit(Store(slot, expression))
+        return IntLoad(slot)
+
+    def materialize(self, expression: IntExpression) -> IntExpression:
+        """Pin a value in a slot so later stores cannot change what it reads."""
+
+        if isinstance(expression, (IntConstant, IntLoad)):
+            return expression
+        slot = self.new_temp()
+        self.emit(Store(slot, expression))
+        return IntLoad(slot)
+
+    def materialize_float(self, expression: FloatExpression) -> FloatExpression:
+        """The floating counterpart of :meth:`materialize`.
+
+        The slot holds the full binary64 value, not the object's storage
+        format, so pinning a ``float`` expression here does not round it -- C
+        rounds at the assignment itself, which happens after this.
+        """
+
+        if isinstance(expression, (FloatConstant, FloatLoad)):
+            return expression
+        slot = self.new_temp()
+        self.emit(FloatStore(slot, expression))
+        return FloatLoad(slot)
+
+    def pin(self, value: Value) -> Value:
+        """Pin either flavour of value in a slot, keeping its C type."""
+
+        if is_floating(value.ctype):
+            return Value(value.ctype, self.materialize_float(value.expr))
+        return Value(value.ctype, self.materialize(value.expr), value.null)
+
+    # --- expressions ---
+
+    def rvalue(self, node: Node) -> Value:
+        if isinstance(node, IntLiteral):
+            return Value(
+                node.ctype,
+                _constant(node.value),
+                null=node.value == 0 and node.ctype in {INT, LONG, LLONG},
+            )
+        if isinstance(node, FloatLiteral):
+            return Value(node.ctype, FloatConstant(node.value))
+        if isinstance(node, StringLiteral):
+            if self.target != "darwin-arm64":
+                self.error(
+                    "using a string literal as a pointer value needs the constant "
+                    "blob the darwin-arm64 image writer emits; it is not "
+                    f"implemented for {self.target!r} (printf of a literal is)",
+                    node.token,
+                )
+            return Value(PointerType(CHAR), CStringConstant(node.data + b"\0"))
+        if isinstance(node, Identifier):
+            local = self.lookup(node.name)
+            if local is None:
+                if node.name == "NULL":
+                    return Value(PointerType(VOID), IntConstant(0), null=True)
+                if node.name in self.enumerators:
+                    return Value(INT, IntConstant(self.enumerators[node.name]))
+                if node.name in self.unit.functions:
+                    ctype, address = self.function_designator(node.name, node.token)
+                    return self.load(ctype, address)
+                self.error(
+                    f"{node.name!r} is not a declared local or parameter", node.token
+                )
+            return self.load(local.ctype, self.address_of(local))
+        if isinstance(node, (Index, MemberAccess)):
+            ctype, address = self.lvalue(node)
+            return self.load(ctype, address)
+        if isinstance(node, Unary):
+            return self.unary(node)
+        if isinstance(node, IncDec):
+            return self.increment(node)
+        if isinstance(node, Binary):
+            return self.binary(node)
+        if isinstance(node, Logical):
+            return self.logical(node)
+        if isinstance(node, Conditional):
+            return self.conditional(node)
+        if isinstance(node, Assignment):
+            return self.assignment(node)
+        if isinstance(node, Comma):
+            self.discard(node.left)
+            return self.rvalue(node.right)
+        if isinstance(node, Cast):
+            return self.cast(node)
+        if isinstance(node, SizeofType):
+            size = size_of(node.ctype)
+            if size is None:
+                self.error(
+                    f"sizeof({node.ctype}) needs a complete type", node.token
+                )
+            return Value(ULONG, IntConstant(size))
+        if isinstance(node, SizeofExpression):
+            return Value(ULONG, IntConstant(self.sizeof_expression(node.operand)))
+        if isinstance(node, Call):
+            return self.call(node)
+        if isinstance(node, CallThrough):
+            return self.call_through(node.target, node.arguments, node.token)
+        self.error("unsupported expression", node.token)
+
+    def discard(self, node: Node) -> None:
+        """Evaluate an expression for its side effects only."""
+
+        self.rvalue(node)
+
+    def scalar(self, node: Node, what: str) -> Value:
+        value = self.rvalue(node)
+        if not is_scalar(value.ctype):
+            self.error(f"{what} needs an integer or pointer value", node.token)
+        return value
+
+    def sizeof_expression(self, node: Node) -> int:
+        """``sizeof e`` does not evaluate ``e``; it needs only its type."""
+
+        if isinstance(node, StringLiteral):
+            return len(node.data) + 1
+        if isinstance(node, Identifier):
+            local = self.lookup(node.name)
+            if local is not None:
+                size = size_of(local.ctype)
+                if size is None:
+                    self.error(
+                        f"sizeof({node.name}) needs a complete type", node.token
+                    )
+                return size
+            if node.name in self.unit.functions:
+                # C11 6.5.3.4p1: sizeof may not be applied to a function type.
+                # Without this the designator would decay and quietly answer 8.
+                self.error(
+                    f"sizeof({node.name}) applies sizeof to a function, which C "
+                    f"does not define; write sizeof(&{node.name}) for the size "
+                    "of a pointer to it",
+                    node.token,
+                )
+        saved_operations = self.operations
+        saved_slots = self.stack_slots
+        self.operations = []
+        try:
+            if isinstance(node, (Index, MemberAccess)) or (
+                isinstance(node, Unary) and node.operator == "*"
+            ):
+                ctype, _address = self.lvalue(node)
+            else:
+                ctype = self.rvalue(node).ctype
+        finally:
+            self.operations = saved_operations
+            self.stack_slots = saved_slots
+        size = size_of(ctype)
+        if size is None:
+            self.error(f"sizeof needs a complete type, not {ctype}", node.token)
+        return size
+
+    def unary(self, node: Unary) -> Value:
+        if node.operator == "&":
+            ctype, address = self.lvalue(node.operand)
+            return Value(PointerType(ctype), address)
+        if node.operator == "*":
+            ctype, address = self.lvalue(node)
+            return self.load(ctype, address)
+        if node.operator == "!":
+            value = self.scalar(node.operand, "the operand of '!'")
+            if is_floating(value.ctype):
+                return Value(INT, FloatCompare("eq", value.expr, FloatConstant(0.0)))
+            return Value(INT, _compare("eq", value.expr, IntConstant(0)))
+        value = self.rvalue(node.operand)
+        if not is_arithmetic(value.ctype):
+            self.error(
+                f"unary {node.operator!r} needs an arithmetic operand, not "
+                f"{value.ctype}",
+                node.token,
+            )
+        if is_floating(value.ctype):
+            if node.operator == "~":
+                self.error(
+                    f"unary '~' needs an integer operand, not {value.ctype}",
+                    node.token,
+                )
+            if node.operator == "+":
+                return value
+            return Value(value.ctype, FloatUnary("neg", value.expr))
+        ctype = promote(value.ctype)
+        expression = self.fit(value.expr, ctype)
+        if node.operator == "+":
+            return Value(ctype, expression)
+        if node.operator == "-":
+            if isinstance(expression, IntConstant):
+                return Value(ctype, self.fit(IntConstant(_s64(-expression.value)), ctype))
+            return Value(ctype, self.fit(IntUnary("neg", expression), ctype))
+        if isinstance(expression, IntConstant):
+            return Value(ctype, self.fit(IntConstant(_s64(~expression.value)), ctype))
+        return Value(ctype, self.fit(IntUnary("invert", expression), ctype))
+
+    def increment(self, node: IncDec) -> Value:
+        ctype, address = self.lvalue(node.operand)
+        if isinstance(ctype, ArrayType):
+            self.error("an array cannot be incremented", node.token)
+        address = self.stabilize(address)
+        step = 1
+        if isinstance(ctype, FloatingType):
+            # C's ++ adds 1 to a floating object too, and the result is rounded
+            # back into the object exactly as an assignment would round it.
+            old_slot = self.new_temp()
+            self.emit(FloatStore(old_slot, self.load(ctype, address).expr))
+            operator = "add" if node.operator == "++" else "sub"
+            updated = self.narrow(
+                FloatBinary(operator, FloatLoad(old_slot), FloatConstant(1.0)), ctype
+            )
+            new_slot = self.new_temp()
+            self.emit(FloatStore(new_slot, updated))
+            self.emit(
+                HeapStore(
+                    address,
+                    FloatBits(FloatLoad(new_slot), ctype.size),
+                    ctype.size,
+                )
+            )
+            return Value(ctype, FloatLoad(old_slot if not node.prefix else new_slot))
+        if isinstance(ctype, PointerType):
+            element = size_of(ctype.target)
+            if element is None:
+                self.error(
+                    f"cannot step a {ctype}: {ctype.target} is an incomplete type",
+                    node.token,
+                )
+            step = element
+        elif not is_arithmetic(ctype):
+            self.error(f"{ctype} cannot be incremented", node.token)
+        old_slot = self.new_temp()
+        self.emit(Store(old_slot, self.load(ctype, address).expr))
+        operator = "add" if node.operator == "++" else "sub"
+        updated = self.fit(
+            _binary(operator, IntLoad(old_slot), IntConstant(step)), ctype
+        )
+        new_slot = self.new_temp()
+        self.emit(Store(new_slot, updated))
+        self.emit(HeapStore(address, IntLoad(new_slot), size_of(ctype)))
+        return Value(ctype, IntLoad(old_slot if not node.prefix else new_slot))
+
+    def binary(self, node: Binary) -> Value:
+        if node.operator in {"==", "!=", "<", "<=", ">", ">="}:
+            return self.comparison(node)
+        left = self.rvalue(node.left)
+        right = self.rvalue(node.right)
+        return self.apply(node.operator, left, right, node.token)
+
+    def apply(self, operator: str, left: Value, right: Value, token: Token) -> Value:
+        if operator in {"+", "-"} and (
+            isinstance(left.ctype, PointerType) or isinstance(right.ctype, PointerType)
+        ):
+            return self.pointer_arithmetic(operator, left, right, token)
+        if not is_arithmetic(left.ctype) or not is_arithmetic(right.ctype):
+            self.error(
+                f"{operator!r} needs arithmetic operands, not {left.ctype} and "
+                f"{right.ctype}",
+                token,
+            )
+        if is_floating(left.ctype) or is_floating(right.ctype):
+            names = {"+": "add", "-": "sub", "*": "mul", "/": "div"}
+            if operator not in names:
+                self.error(
+                    f"{operator!r} needs integer operands; C does not define it for "
+                    f"{left.ctype} and {right.ctype}",
+                    token,
+                )
+            ctype = arithmetic_conversions(left.ctype, right.ctype)
+            # No rounding here: C11 6.3.1.8p2 lets an implementation keep the
+            # extra range and precision of a wider evaluation format, which is
+            # what py2bin does (FLT_EVAL_METHOD == 1). The rounding happens
+            # where C requires it -- assignment, cast, argument and return.
+            return Value(
+                ctype, FloatBinary(names[operator], self.widen(left), self.widen(right))
+            )
+        if operator in {"<<", ">>"}:
+            ctype = promote(left.ctype)
+            value = self.fit(left.expr, ctype)
+            count = self.fit(right.expr, promote(right.ctype))
+            if operator == "<<":
+                name = "lshift"
+            else:
+                name = "rshift" if ctype.signed else "urshift"
+            return Value(ctype, self.fit(_binary(name, value, count), ctype))
+        ctype = usual_conversions(left.ctype, right.ctype)
+        first = self.fit(left.expr, ctype)
+        second = self.fit(right.expr, ctype)
+        names = {
+            "+": "add",
+            "-": "sub",
+            "*": "mul",
+            "&": "and",
+            "|": "or",
+            "^": "xor",
+        }
+        if operator in names:
+            return Value(ctype, self.fit(_binary(names[operator], first, second), ctype))
+        if operator in {"/", "%"}:
+            if _value_of(second) == 0:
+                self.error("division by zero", token)
+            signed = ctype.signed
+            name = {
+                ("/", True): "sdiv",
+                ("/", False): "udiv",
+                ("%", True): "smod",
+                ("%", False): "umod",
+            }[(operator, signed)]
+            return Value(ctype, self.fit(_binary(name, first, second), ctype))
+        self.error(f"unsupported binary operator {operator!r}", token)
+
+    def pointer_arithmetic(
+        self, operator: str, left: Value, right: Value, token: Token
+    ) -> Value:
+        if isinstance(left.ctype, PointerType) and isinstance(
+            right.ctype, PointerType
+        ):
+            if operator != "-":
+                self.error("two pointers cannot be added", token)
+            if not compatible(left.ctype, right.ctype):
+                self.error(
+                    f"cannot subtract {right.ctype} from {left.ctype}", token
+                )
+            element = size_of(left.ctype.target)
+            if not element:
+                self.error(
+                    "pointer subtraction needs a complete element type", token
+                )
+            difference = _binary("sub", left.expr, right.expr)
+            return Value(LLONG, _binary("sdiv", difference, IntConstant(element)))
+        pointer, count = (left, right)
+        if not isinstance(pointer.ctype, PointerType):
+            pointer, count = right, left
+            if operator == "-":
+                self.error("an integer minus a pointer is not valid C", token)
+        if not is_integer(count.ctype):
+            self.error(
+                f"a pointer can only be offset by an integer, not {count.ctype}",
+                token,
+            )
+        element = size_of(pointer.ctype.target)
+        if element is None:
+            self.error(
+                f"cannot do arithmetic on {pointer.ctype}: {pointer.ctype.target} is "
+                "an incomplete type whose size py2bin does not know",
+                token,
+            )
+        scaled = _binary("mul", count.expr, IntConstant(element))
+        name = "add" if operator == "+" else "sub"
+        return Value(pointer.ctype, _binary(name, pointer.expr, scaled))
+
+    def comparison(self, node: Binary) -> Value:
+        left = self.rvalue(node.left)
+        right = self.rvalue(node.right)
+        names = {"==": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
+        name = names[node.operator]
+        if isinstance(left.ctype, PointerType) or isinstance(right.ctype, PointerType):
+            first, second = left, right
+            if left.null and isinstance(right.ctype, PointerType):
+                first = Value(right.ctype, IntConstant(0))
+            elif right.null and isinstance(left.ctype, PointerType):
+                second = Value(left.ctype, IntConstant(0))
+            elif not (
+                isinstance(left.ctype, PointerType)
+                and isinstance(right.ctype, PointerType)
+                and compatible(left.ctype, right.ctype)
+            ):
+                self.error(
+                    f"cannot compare {left.ctype} with {right.ctype}; a pointer "
+                    "compares with a compatible pointer or with NULL",
+                    node.token,
+                )
+            if name not in {"eq", "ne"}:
+                name = "u" + name  # addresses are unsigned
+            return Value(INT, _compare(name, first.expr, second.expr))
+        if not is_arithmetic(left.ctype) or not is_arithmetic(right.ctype):
+            self.error(
+                f"cannot compare {left.ctype} with {right.ctype}", node.token
+            )
+        if is_floating(left.ctype) or is_floating(right.ctype):
+            # An IEEE comparison has four outcomes, and the backends give the
+            # unordered one its own handling: every ordering below is false
+            # when either operand is a NaN, and only '!=' is true.
+            return Value(
+                INT, FloatCompare(name, self.widen(left), self.widen(right))
+            )
+        ctype = usual_conversions(left.ctype, right.ctype)
+        if not ctype.signed and ctype.size == 8 and name not in {"eq", "ne"}:
+            # Only a 64-bit unsigned type needs the unsigned condition codes:
+            # everything narrower is zero-extended into a non-negative i64.
+            name = "u" + name
+        return Value(
+            INT,
+            _compare(name, self.fit(left.expr, ctype), self.fit(right.expr, ctype)),
+        )
+
+    def logical(self, node: Logical) -> Value:
+        slot = self.new_temp()
+        end = self.new_label("logic_end")
+        left = self.scalar(node.left, f"the left operand of {node.operator!r}")
+        if node.operator == "&&":
+            self.emit(Store(slot, IntConstant(0)))
+            self.emit(JumpIfFalse(self.truth(left), end))
+            right = self.scalar(node.right, "the right operand of '&&'")
+            self.emit(JumpIfFalse(self.truth(right), end))
+            self.emit(Store(slot, IntConstant(1)))
+        else:
+            taken = self.new_label("logic_true")
+            other = self.new_label("logic_right")
+            self.emit(Store(slot, IntConstant(0)))
+            self.emit(JumpIfFalse(self.truth(left), other))
+            self.emit(Jump(taken))
+            self.emit(Label(other))
+            right = self.scalar(node.right, "the right operand of '||'")
+            self.emit(JumpIfFalse(self.truth(right), end))
+            self.emit(Label(taken))
+            self.emit(Store(slot, IntConstant(1)))
+        self.emit(Label(end))
+        return Value(INT, IntLoad(slot))
+
+    def conditional(self, node: Conditional) -> Value:
+        """``a ? b : c``, with only the selected arm evaluated.
+
+        Each arm stores its own canonical value into one slot and the common
+        type is applied once at the merge point. That is equivalent to
+        converting each arm separately -- the common type is never narrower
+        than either arm -- and it means the arms can be lowered in the order C
+        requires instead of both being evaluated to pick between them.
+
+        Whether the slot holds an integer or a double is only known once BOTH
+        arms have been lowered, so each arm's store is emitted as a placeholder
+        and rewritten in place afterwards. Rewriting rather than re-lowering is
+        what keeps each arm evaluated exactly once.
+        """
+
+        test = self.scalar(node.test, "the condition of '?:'")
+        otherwise = self.new_label("select_else")
+        end = self.new_label("select_end")
+        slot = self.new_temp()
+        self.emit(JumpIfFalse(self.truth(test), otherwise))
+        body = self.rvalue(node.body)
+        body_store = len(self.operations)
+        self.emit(Store(slot, IntConstant(0)))
+        self.emit(Jump(end))
+        self.emit(Label(otherwise))
+        alternative = self.rvalue(node.alternative)
+        alternative_store = len(self.operations)
+        self.emit(Store(slot, IntConstant(0)))
+        self.emit(Label(end))
+        if isinstance(body.ctype, VoidType) or isinstance(alternative.ctype, VoidType):
+            if not (
+                isinstance(body.ctype, VoidType)
+                and isinstance(alternative.ctype, VoidType)
+            ):
+                self.error(
+                    "one arm of '?:' has a value and the other does not", node.token
+                )
+            return Value(VOID, IntConstant(0))
+        if is_arithmetic(body.ctype) and is_arithmetic(alternative.ctype):
+            result: CType = arithmetic_conversions(body.ctype, alternative.ctype)
+        elif isinstance(body.ctype, PointerType) and alternative.null:
+            result = body.ctype
+        elif isinstance(alternative.ctype, PointerType) and body.null:
+            result = alternative.ctype
+        elif (
+            isinstance(body.ctype, PointerType)
+            and isinstance(alternative.ctype, PointerType)
+            and compatible(body.ctype, alternative.ctype)
+        ):
+            result = (
+                alternative.ctype
+                if isinstance(body.ctype.target, VoidType)
+                else body.ctype
+            )
+        else:
+            self.error(
+                f"the arms of '?:' have incompatible types {body.ctype} and "
+                f"{alternative.ctype}",
+                node.token,
+            )
+        # Now that the common type is known, give each arm's placeholder store
+        # the form that type needs. A floating result keeps the full binary64
+        # value in the slot, so an integer arm is converted here and a 'float'
+        # arm is not rounded -- the extra precision is removed later, where C
+        # says it must be.
+        for index, arm in ((body_store, body), (alternative_store, alternative)):
+            if is_floating(result):
+                self.operations[index] = FloatStore(slot, self.widen(arm))
+            else:
+                self.operations[index] = Store(slot, arm.expr)
+        if is_floating(result):
+            return Value(result, FloatLoad(slot))
+        return Value(result, self.fit(IntLoad(slot), result))
+
+    def cast(self, node: Cast) -> Value:
+        value = self.rvalue(node.operand)
+        target = node.ctype
+        if isinstance(target, VoidType):
+            return Value(VOID, IntConstant(0))
+        if isinstance(target, ArrayType):
+            self.error("a cast cannot name an array type", node.token)
+        if isinstance(target, OpaqueType):
+            self.error(f"a cast cannot name the incomplete type {target}", node.token)
+        if not is_scalar(value.ctype):
+            self.error(
+                f"cannot cast a value of type {value.ctype} to {target}", node.token
+            )
+        if isinstance(target, FloatingType):
+            if not is_arithmetic(value.ctype):
+                self.error(
+                    f"cannot cast {value.ctype} to {target}; C has no conversion "
+                    "between a pointer and a floating type",
+                    node.token,
+                )
+            # A cast is one of the places C requires the extra precision to go.
+            return Value(target, self.narrow(self.widen(value), target))
+        if isinstance(target, IntegerType):
+            if isinstance(value.ctype, FloatingType):
+                return Value(target, self.to_integer(value.expr, target))
+            return Value(target, self.fit(value.expr, target))
+        if isinstance(value.ctype, FloatingType):
+            self.error(
+                f"cannot cast {value.ctype} to {target}; C has no conversion "
+                "between a floating type and a pointer",
+                node.token,
+            )
+        return Value(target, value.expr, null=value.null)
+
+    def copy_struct(
+        self, ctype: "StructType", address: IntExpression, node: Assignment
+    ) -> Value:
+        """Copy a whole struct or union, one aligned word at a time.
+
+        C assigns aggregates by value. The source and destination are distinct
+        objects here (C leaves overlapping assignment through pointers to
+        memmove), so a straight forward copy is correct. Both are aligned to
+        the type's own alignment, so the copy uses the widest unit that
+        alignment allows and finishes any remainder with narrower stores.
+        """
+
+        source = self.rvalue(node.value)
+        if not isinstance(source.ctype, StructType) or source.ctype is not ctype:
+            self.error(
+                f"this assignment needs {ctype}, but this is {source.ctype}",
+                node.token,
+            )
+        destination = self.stabilize(address)
+        origin = self.stabilize(source.expr)
+        remaining = ctype.size
+        offset = 0
+        while remaining:
+            unit = 8 if remaining >= 8 and ctype.alignment >= 8 else (
+                4 if remaining >= 4 and ctype.alignment >= 4 else (
+                    2 if remaining >= 2 and ctype.alignment >= 2 else 1
+                )
+            )
+            self.emit(
+                HeapStore(
+                    IntBinary("add", destination, IntConstant(offset)),
+                    HeapLoad(
+                        IntBinary("add", origin, IntConstant(offset)), unit, False
+                    ),
+                    unit,
+                )
+            )
+            offset += unit
+            remaining -= unit
+        return Value(ctype, destination)
+
+    def assignment(self, node: Assignment) -> Value:
+        ctype, address = self.lvalue(node.target)
+        if isinstance(ctype, ArrayType):
+            self.error("an array is not assignable", node.token)
+        address = self.stabilize(address)
+        if isinstance(ctype, StructType):
+            if node.operator != "=":
+                self.error(
+                    f"{node.operator} is not defined for {ctype}", node.token
+                )
+            return self.copy_struct(ctype, address, node)
+        if node.operator == "=":
+            value = self.rvalue(node.value)
+            stored = self.assign_convert(
+                value, ctype, node.token, "this assignment"
+            )
+        else:
+            current = self.load(ctype, address)
+            operand = self.rvalue(node.value)
+            combined = self.apply(node.operator[:-1], current, operand, node.token)
+            stored = self.assign_convert(
+                combined, ctype, node.token, "this compound assignment"
+            )
+        # The stored expression may read the very object about to be written, so
+        # it has to be pinned before the store rather than recomputed after it.
+        if is_floating(ctype):
+            stored = self.materialize_float(stored)
+        else:
+            stored = self.materialize(stored)
+        self.emit(HeapStore(address, self.stored_bits(stored, ctype), size_of(ctype)))
+        return Value(ctype, stored)
+
+    # --- calls ---
+
+    def function_designator(
+        self, name: str, token: Token
+    ) -> tuple[CType, IntExpression]:
+        """The type and the runtime entry address of the function ``name``.
+
+        Naming a function without calling it is what makes a function pointer,
+        so this is also where the body is lowered: nothing else would have
+        pulled it into the module, and the address of a body that was never
+        emitted would point at whatever followed it.
+        """
+
+        function = self.unit.functions[name]
+        if not self.calls_are_real:
+            self.error(
+                f"taking the address of {name!r} needs a real machine call, and "
+                f"the call ABI is not implemented for target {self.target!r}; "
+                "the compiler inlines calls there instead",
+                token,
+            )
+        if function.body is None:
+            self.error(
+                f"{name!r} is declared but never defined, so it has no address; "
+                "py2bin has no linker, and every function a program uses has to "
+                "be defined in this translation unit",
+                token,
+            )
+        if name == "main":
+            self.error(
+                "main() is the process entry point and its 'return' exits the "
+                "process, so py2bin does not let a program take its address",
+                token,
+            )
+        limit = self.argument_limit()
+        if len(function.parameters) > limit:
+            self.error(
+                f"{name}() takes {len(function.parameters)} parameters; py2bin's "
+                f"call ABI passes at most {limit} arguments in "
+                "registers and does not implement stack arguments",
+                token,
+            )
+        self.lower_callee(function)
+        ctype = FunctionType(
+            function.result, tuple(item for item, _name in function.parameters)
+        )
+        return ctype, FunctionAddress(name)
+
+
+    def math_builtin(self, node: Call) -> Value:
+        """Lower a one-instruction C math function.
+
+        These are not library calls. Each maps to a single floating-point
+        instruction the CPU already has, so the result is exact for the
+        operations IEEE-754 defines exactly (sqrt is correctly rounded, and the
+        rounding functions are exact), and nothing has to be linked.
+        """
+
+        if len(node.arguments) != 1:
+            self.error(
+                f"{node.name}() takes exactly one argument", node.token
+            )
+        if node.name == "round" and not self.target.endswith("-arm64"):
+            self.error(
+                "round() breaks ties away from zero, which x86-64's roundsd "
+                "cannot do in one instruction and py2bin will not approximate; "
+                "use trunc(), floor() or ceil(), or target arm64",
+                node.token,
+            )
+        value = self.rvalue(node.arguments[0])
+        if not is_arithmetic(value.ctype):
+            self.error(
+                f"{node.name}() needs a number, not {value.ctype}", node.token
+            )
+        return Value(DOUBLE, FloatUnary(_MATH_BUILTINS[node.name], self.widen(value)))
+
+    def argument_limit(self) -> int:
+        """How many arguments this target can pass.
+
+        ARM64 implements the AAPCS64 memory argument area, so it is bounded
+        only by the frame; the x86 encoders still stop at their register
+        count and reject the rest rather than truncating.
+        """
+
+        if self.target in _STACK_ARGUMENT_TARGETS:
+            return _ARGUMENT_CEILING
+        return _MAXIMUM_ARGUMENTS
+
+    def call(self, node: Call) -> Value:
+        if node.name in _MATH_BUILTINS and self.lookup(node.name) is None:
+            if node.name not in self.unit.functions:
+                return self.math_builtin(node)
+        if node.name == "printf":
+            self.error(
+                "printf's return value is not implemented; call it as a statement",
+                node.token,
+            )
+        if self.lookup(node.name) is not None:
+            # An object of function-pointer type shadows any function of the
+            # same name, exactly as C's scoping says it does.
+            return self.call_through(
+                Identifier(node.token, node.name), node.arguments, node.token
+            )
+        if node.name in self.unit.externs:
+            return self.extern_call(node, discarded=False)
+        function = self.unit.functions.get(node.name)
+        if function is None:
+            self.error(
+                f"call to {node.name!r}, which is not a function declared in this "
+                "translation unit or a declared extern",
+                node.token,
+            )
+        if function.body is None:
+            self.error(
+                f"call to {node.name!r}, which is declared but never defined; "
+                "py2bin has no linker, so the body of every function a program "
+                "calls has to be in this translation unit",
+                node.token,
+            )
+        if function.name == "main":
+            self.error(
+                "py2bin's C compiler does not support calling main(): it is the "
+                "process entry point, and its 'return' exits the process",
+                node.token,
+            )
+        if self.calls_are_real:
+            return self.direct_call(function, node)
+        return self.inline(function, node)
+
+    # --- calls through a pointer -------------------------------------------
+    #
+    # The callee is not known until the program runs, so there is nothing to
+    # inline and nothing to check at the call site beyond the POINTER's own
+    # prototype -- which is precisely why C makes the prototype part of the
+    # type. A target that is not a pointer to a function is rejected here.
+
+    def call_through(
+        self, target: Node, arguments: list[Node], token: Token
+    ) -> Value:
+        pointer = self.rvalue(target)
+        ctype = pointer.ctype
+        if not (
+            isinstance(ctype, PointerType) and isinstance(ctype.target, FunctionType)
+        ):
+            self.error(
+                f"this call needs a function or a pointer to one, not {ctype}",
+                token,
+            )
+        signature = ctype.target
+        if not self.calls_are_real:
+            self.error(
+                "a call through a function pointer needs a real machine call, "
+                f"and the call ABI is not implemented for target {self.target!r}",
+                token,
+            )
+        limit = self.argument_limit()
+        if len(signature.parameters) > limit:
+            self.error(
+                f"{signature} takes {len(signature.parameters)} parameters; "
+                f"py2bin's call ABI passes at most {limit} arguments "
+                "in registers and does not implement stack arguments",
+                token,
+            )
+        if len(arguments) != len(signature.parameters):
+            self.error(
+                f"a call through {ctype} takes {len(signature.parameters)} "
+                f"argument(s), got {len(arguments)}",
+                token,
+            )
+        # The pointer is evaluated first and pinned. Lowering an argument may
+        # emit stores, and re-emitting the target expression after them would
+        # both repeat any call inside it and let it read the wrong memory.
+        address = self.materialize(pointer.expr)
+        prepared = [
+            self.stored_bits(
+                self.assign_convert(
+                    self.rvalue(argument),
+                    parameter,
+                    argument.token,
+                    f"argument {position} of a call through {ctype}",
+                ),
+                parameter,
+            )
+            for position, (argument, parameter) in enumerate(
+                zip(arguments, signature.parameters), 1
+            )
+        ]
+        slot = self.new_temp()
+        self.emit(Store(slot, IndirectCall(address, tuple(prepared))))
+        if isinstance(signature.result, VoidType):
+            return Value(VOID, IntConstant(0))
+        return Value(
+            signature.result, self.from_bits(IntLoad(slot), signature.result)
+        )
+
+    def extern_call(self, node: Call, *, discarded: bool) -> Value:
+        name = node.name
+        symbol, signature = _CABI_SYMBOLS[name]
+        result_kind = _CABI_RESULTS[name]
+        if result_kind == "void" and not discarded:
+            self.error(
+                f"extern call {name}() returns void; its result is not a value and "
+                "can only be discarded",
+                node.token,
+            )
+        if len(node.arguments) != len(signature):
+            self.error(
+                f"{name}() takes {len(signature)} argument(s), got "
+                f"{len(node.arguments)}",
+                node.token,
+            )
+        arguments: list[IntExpression] = []
+        for position, (argument, kind) in enumerate(
+            zip(node.arguments, signature), 1
+        ):
+            what = f"argument {position} of {name}()"
+            if kind in {"cstr", "cfmt"}:
+                if not isinstance(argument, StringLiteral):
+                    self.error(
+                        f"{what} must be a literal C string: py2bin materializes it "
+                        "in the image, and a runtime pointer would need a lifetime "
+                        "this compiler cannot verify",
+                        argument.token,
+                    )
+                if b"\0" in argument.data:
+                    self.error(
+                        f"{what} contains an embedded NUL the callee would truncate",
+                        argument.token,
+                    )
+                if kind == "cfmt" and b"%" in argument.data:
+                    self.error(
+                        f"{name}() is variadic and py2bin passes no variadic "
+                        "arguments, so its format string must not contain '%'",
+                        argument.token,
+                    )
+                arguments.append(CStringConstant(argument.data + b"\0"))
+                continue
+            value = self.rvalue(argument)
+            if kind == "ptr":
+                if value.null:
+                    arguments.append(IntConstant(0))
+                elif isinstance(value.ctype, PointerType):
+                    arguments.append(value.expr)
+                else:
+                    self.error(
+                        f"{what} needs a pointer handle; pass a handle or NULL",
+                        argument.token,
+                    )
+            else:
+                if not is_integer(value.ctype):
+                    self.error(
+                        f"{what} needs an integer, not {value.ctype}", argument.token
+                    )
+                arguments.append(self.fit(value.expr, LLONG))
+        call = ExternCall(
+            symbol, tuple(arguments), _CABI_RESULT_WIDTH.get(symbol, "i64")
+        )
+        if discarded or result_kind == "void":
+            self.emit(Store(self.new_temp(), call))
+            return Value(VOID, IntConstant(0))
+        slot = self.new_temp()
+        self.emit(Store(slot, call))
+        declared = self.unit.externs[name]
+        return Value(declared, self.fit(IntLoad(slot), declared))
+
+    def prepare_arguments(
+        self, function: Function, node: Call
+    ) -> list[IntExpression]:
+        """Check the argument count and convert each argument to its parameter.
+
+        Every argument comes back as an INTEGER expression, because py2bin's
+        internal call ABI passes a floating argument as the object's IEEE bit
+        pattern in an integer register. That ABI is py2bin's own -- a compiled C
+        function here is never called by anything but py2bin's own code -- and
+        it means a double argument needs no new register class in either
+        encoder while still delivering the exact value. Passing the bit pattern
+        of the PARAMETER's type is what makes a 'float' parameter arrive as the
+        four bytes its object holds.
+        """
+
+        if len(node.arguments) != len(function.parameters):
+            self.error(
+                f"{function.name}() takes {len(function.parameters)} argument(s), "
+                f"got {len(node.arguments)}",
+                node.token,
+            )
+        prepared: list[IntExpression] = []
+        for position, (argument, (parameter_type, _name)) in enumerate(
+            zip(node.arguments, function.parameters), 1
+        ):
+            converted = self.assign_convert(
+                self.rvalue(argument),
+                parameter_type,
+                argument.token,
+                f"argument {position} of {function.name}()",
+            )
+            prepared.append(self.stored_bits(converted, parameter_type))
+        return prepared
+
+    # --- real calls --------------------------------------------------------
+    #
+    # On a target whose encoder implements the call ABI, a call is a call: the
+    # callee is lowered once into its own IR Function with its own frame, and
+    # the call site branches to it. Recursion then costs nothing special -- the
+    # body being lowered simply refers to itself by name.
+
+    def direct_call(self, function: Function, node: Call) -> Value:
+        limit = self.argument_limit()
+        if len(function.parameters) > limit:
+            self.error(
+                f"{function.name}() takes {len(function.parameters)} parameters; "
+                f"py2bin's call ABI passes at most {limit} arguments "
+                "in registers and does not implement stack arguments",
+                node.token,
+            )
+        prepared = self.prepare_arguments(function, node)
+        self.lower_callee(function)
+        call = IRCall(function.name, tuple(prepared))
+        # Pin the result in a slot at once. Everything downstream may re-read a
+        # value any number of times, and re-emitting a call expression would
+        # make the call happen again -- the defect this backend has produced
+        # more often than any other.
+        slot = self.new_temp()
+        self.emit(Store(slot, call))
+        if isinstance(function.result, VoidType):
+            return Value(VOID, IntConstant(0))
+        # A floating result came back as its bit pattern in the integer result
+        # register, the mirror image of how prepare_arguments passed one in.
+        return Value(function.result, self.from_bits(IntLoad(slot), function.result))
+
+    def lower_callee(self, function: Function) -> None:
+        """Lower ``function`` into its own IR body, once.
+
+        A call that arrives while the callee's own body is still being lowered
+        is exactly what recursion is; the name is already reserved, so it just
+        returns and the call site emits its branch.
+        """
+
+        if function.name in self.lowered or function.name in self.lowering:
+            return
+        assert function.body is not None
+        self.lowering.add(function.name)
+        saved = (
+            self.operations,
+            self.stack_slots,
+            self.scopes,
+            self.buffer_slot,
+            self.digit_slot,
+            self.text_slot,
+            self.float_scratch,
+            self.float_entry,
+            self.float_dispatch,
+            self.float_returns,
+            self.break_targets,
+            self.continue_targets,
+            self.switches,
+            self.functions,
+        )
+        self.operations = []
+        self.stack_slots = 0
+        self.scopes = [{}]
+        self.buffer_slot = None
+        self.digit_slot = None
+        self.text_slot = None
+        self.float_scratch = {}
+        self.float_entry = None
+        self.float_dispatch = None
+        self.float_returns = []
+        self.break_targets = []
+        self.continue_targets = []
+        self.switches = []
+        self.functions = []
+        try:
+            for parameter_type, name in function.parameters:
+                local = self.declare(name, parameter_type, function.token)
+                if local.slot != self.stack_slots - 1:
+                    raise AssertionError(
+                        "a parameter must occupy exactly one stack slot"
+                    )
+            if self.stack_slots != len(function.parameters):
+                raise AssertionError("parameter slots must be slots 0..n-1")
+            context = FunctionContext(
+                function,
+                None,
+                self.new_label(f"return_{function.name}"),
+                False,
+                call_body=True,
+            )
+            self.functions.append(context)
+            self.block(function.body)
+            self.functions.pop()
+            self.check_labels(context)
+            # Falling off the end of a non-void function is undefined in C.
+            # Returning a defined 0 is the one choice that cannot surprise:
+            # nothing is left to run off the end of the body into.
+            self.emit(
+                IRReturn(
+                    None if isinstance(function.result, VoidType) else IntConstant(0)
+                )
+            )
+            # After the return, so nothing can fall into it.
+            self.emit_float_dispatch()
+            body = IRFunction(
+                function.name,
+                len(function.parameters),
+                self.stack_slots,
+                self.operations,
+            )
+        finally:
+            (
+                self.operations,
+                self.stack_slots,
+                self.scopes,
+                self.buffer_slot,
+                self.digit_slot,
+                self.text_slot,
+                self.float_scratch,
+                self.float_entry,
+                self.float_dispatch,
+                self.float_returns,
+                self.break_targets,
+                self.continue_targets,
+                self.switches,
+                self.functions,
+            ) = saved
+            self.lowering.discard(function.name)
+        self.lowered[function.name] = body
+
+    def inline(self, function: Function, node: Call) -> Value:
+        if function.name in self.active:
+            self.error(
+                f"recursive call to {function.name}(): py2bin's call ABI is not "
+                f"implemented for target {self.target!r}, so every function is "
+                "inlined there and recursion cannot be expressed; the targets "
+                f"that do support it are {', '.join(sorted(CALL_CAPABLE_TARGETS))}",
+                node.token,
+            )
+        prepared = self.prepare_arguments(function, node)
+        self.scopes.append({})
+        for (parameter_type, name), expression in zip(function.parameters, prepared):
+            local = self.declare(name, parameter_type, node.token)
+            self.emit(
+                HeapStore(
+                    SlotAddress(local.slot), expression, size_of(parameter_type)
+                )
+            )
+        result_slot = None
+        if not isinstance(function.result, VoidType):
+            result_slot = self.new_temp()
+            self.emit(Store(result_slot, IntConstant(0)))
+        return_label = self.new_label(f"return_{function.name}")
+        context = FunctionContext(function, result_slot, return_label, False)
+        self.functions.append(context)
+        self.active.append(function.name)
+        saved_breaks, self.break_targets = self.break_targets, []
+        saved_continues, self.continue_targets = self.continue_targets, []
+        saved_switches, self.switches = self.switches, []
+        self.block(function.body)
+        self.break_targets = saved_breaks
+        self.continue_targets = saved_continues
+        self.switches = saved_switches
+        self.active.pop()
+        self.functions.pop()
+        self.check_labels(context)
+        self.emit(Label(return_label))
+        self.scopes.pop()
+        if result_slot is None:
+            return Value(VOID, IntConstant(0))
+        return Value(function.result, self.from_bits(IntLoad(result_slot), function.result))
+
+    def check_labels(self, context: FunctionContext) -> None:
+        for name, token in context.pending:
+            if name not in context.defined:
+                self.error(
+                    f"goto {name}: there is no label {name!r} in "
+                    f"{context.function.name}()",
+                    token,
+                )
+
+    # --- statements ---
+
+    def block(self, node: Compound) -> None:
+        self.scopes.append({})
+        for statement in node.body:
+            self.statement(statement)
+        self.scopes.pop()
+
+    def statement(self, node: Node) -> None:
+        if isinstance(node, Compound):
+            self.block(node)
+            return
+        if isinstance(node, ExpressionStatement):
+            if node.expression is not None:
+                self.expression_statement(node.expression)
+            return
+        if isinstance(node, Declaration):
+            self.declaration(node)
+            return
+        if isinstance(node, If):
+            self.if_statement(node)
+            return
+        if isinstance(node, While):
+            self.while_statement(node)
+            return
+        if isinstance(node, DoWhile):
+            self.do_while_statement(node)
+            return
+        if isinstance(node, For):
+            self.for_statement(node)
+            return
+        if isinstance(node, Switch):
+            self.switch_statement(node)
+            return
+        if isinstance(node, Labeled):
+            self.labeled_statement(node)
+            return
+        if isinstance(node, Goto):
+            context = self.functions[-1]
+            target = context.labels.setdefault(
+                node.name, self.new_label(f"goto_{node.name}")
+            )
+            context.pending.append((node.name, node.token))
+            self.emit(Jump(target))
+            return
+        if isinstance(node, Break):
+            if not self.break_targets:
+                self.error("'break' is not inside a loop or switch", node.token)
+            self.emit(Jump(self.break_targets[-1]))
+            return
+        if isinstance(node, Continue):
+            if not self.continue_targets:
+                self.error("'continue' is not inside a loop", node.token)
+            self.emit(Jump(self.continue_targets[-1]))
+            return
+        if isinstance(node, Return):
+            self.return_statement(node)
+            return
+        self.error("unsupported statement", node.token)
+
+    def expression_statement(self, node: Node) -> None:
+        """A full expression evaluated for its effect, with its value discarded."""
+
+        if isinstance(node, Call):
+            if node.name == "printf":
+                self.printf(node)
+                return
+            if node.name in self.unit.externs:
+                self.extern_call(node, discarded=True)
+                return
+        if isinstance(node, Comma):
+            self.expression_statement(node.left)
+            self.expression_statement(node.right)
+            return
+        self.rvalue(node)
+
+    def declaration(self, node: Declaration) -> None:
+        for ctype, name, initializer in node.entries:
+            if isinstance(ctype, VoidType):
+                self.error(f"{name!r} cannot have type void", node.token)
+            if isinstance(ctype, ArrayType) and ctype.count is None:
+                ctype = self.deduce_array(ctype, initializer, node.token)
+            local = self.declare(name, ctype, node.token)
+            if initializer is None:
+                continue
+            if isinstance(ctype, ArrayType):
+                self.array_initializer(
+                    self.address_of(local), ctype, initializer, node.token
+                )
+                continue
+            if isinstance(initializer, tuple):
+                token, items = initializer
+                if len(items) != 1 or isinstance(items[0], tuple):
+                    self.error(
+                        "a braced initializer for a scalar needs exactly one value",
+                        token,
+                    )
+                initializer = items[0]
+            value = self.rvalue(initializer)
+            stored = self.assign_convert(
+                value, ctype, node.token, f"the initializer for {name!r}"
+            )
+            self.emit(
+                HeapStore(
+                    self.address_of(local),
+                    self.stored_bits(stored, ctype),
+                    size_of(ctype),
+                )
+            )
+
+    # --- file-scope objects ------------------------------------------------
+    #
+    # An object with static storage duration is initialized before the program
+    # starts, so its initializer has to be a constant expression: there is
+    # nothing running yet that could evaluate anything else. py2bin honours
+    # that literally -- it lowers the initializer, then requires the result to
+    # be a value the compiler already knows, and rejects anything else with a
+    # file:line:col error rather than quietly running it at start-up.
+
+    def declare_globals(self) -> None:
+        """Give every file-scope object its storage, then its initial value."""
+
+        entries = list(self.unit.globals.values())
+        for entry in entries:
+            ctype = entry.ctype
+            if isinstance(ctype, VoidType):
+                self.error(f"{entry.name!r} cannot have type void", entry.token)
+            if isinstance(ctype, ArrayType) and ctype.count is None:
+                ctype = self.deduce_array(ctype, entry.initializer, entry.token)
+                entry.ctype = ctype
+            self.statics[entry.name] = Local(
+                ctype, self.allocate_static(ctype, entry.token), static=True
+            )
+        # Every offset is fixed before any initializer is lowered, so one
+        # object's initializer may take the address of another.
+        for entry in entries:
+            self.initialize_global(entry)
+
+    def initialize_global(self, entry: GlobalObject) -> None:
+        local = self.statics[entry.name]
+        ctype = local.ctype
+        base = GlobalAddress(local.slot)
+        initializer = entry.initializer
+        if initializer is None:
+            # C gives a static object with no initializer the value zero, and
+            # the block already holds zero everywhere.
+            return
+        if isinstance(ctype, ArrayType):
+            self.array_initializer(base, ctype, initializer, entry.token, static=True)
+            return
+        if isinstance(ctype, StructType):
+            self.error(
+                "initializing a file-scope struct or union is not implemented; "
+                "declare it and assign its members in main()",
+                entry.token,
+            )
+        if isinstance(initializer, tuple):
+            token, items = initializer
+            if len(items) != 1 or isinstance(items[0], tuple):
+                self.error(
+                    "a braced initializer for a scalar needs exactly one value",
+                    token,
+                )
+            initializer = items[0]
+        stored = self.static_value(
+            initializer, ctype, entry.token, f"the initializer for {entry.name!r}"
+        )
+        bits = self.stored_bits(stored, ctype)
+        if bits == IntConstant(0):
+            return  # already zero
+        self.emit(HeapStore(base, bits, size_of(ctype)))
+
+    def static_value(
+        self, node: Node, ctype: CType, token: Token, what: str
+    ) -> IntExpression | FloatExpression:
+        """Lower a static-storage initializer and insist that it be constant."""
+
+        saved_operations = self.operations
+        self.operations = []
+        try:
+            value = self.rvalue(node)
+            converted = self.assign_convert(value, ctype, token, what)
+        finally:
+            emitted = self.operations
+            self.operations = saved_operations
+        if emitted or not _is_link_constant(converted):
+            self.error(
+                f"{what} must be a constant expression: it initializes an object "
+                "with static storage duration, which C gives its value before "
+                "the program starts running",
+                token,
+            )
+        return converted
+
+    def deduce_array(
+        self, ctype: ArrayType, initializer: object, token: Token
+    ) -> ArrayType:
+        if isinstance(initializer, tuple):
+            return ArrayType(ctype.element, max(1, len(initializer[1])))
+        if isinstance(initializer, StringLiteral) and _is_character(ctype.element):
+            return ArrayType(ctype.element, len(initializer.data) + 1)
+        self.error(
+            "an array without a length needs a braced initializer (or a string "
+            "literal for a character array) to deduce it from",
+            token,
+        )
+
+    def array_initializer(
+        self,
+        base: IntExpression,
+        ctype: ArrayType,
+        initializer: object,
+        token: Token,
+        *,
+        static: bool = False,
+    ) -> None:
+        element = ctype.element
+        size = size_of(element)
+        if size is None or isinstance(element, ArrayType):
+            self.error(
+                "only a one-dimensional array of scalars can be initialized; "
+                "assign the elements instead",
+                token,
+            )
+        if isinstance(initializer, StringLiteral):
+            if not _is_character(element):
+                self.error(
+                    "a string literal can only initialize a character array", token
+                )
+            data = initializer.data + b"\0"
+            if len(data) > ctype.count:
+                self.error(
+                    f"the initializer is {len(data)} bytes but the array holds "
+                    f"{ctype.count}",
+                    token,
+                )
+            self.emit_bytes(
+                base,
+                0,
+                data + b"\0" * (ctype.count - len(data)),
+                skip_zero=static,
+            )
+            return
+        if not isinstance(initializer, tuple):
+            self.error(
+                "an array needs a braced initializer, not a single value", token
+            )
+        _brace, items = initializer
+        if len(items) > ctype.count:
+            self.error(
+                f"the initializer has {len(items)} values but the array holds "
+                f"{ctype.count}",
+                token,
+            )
+        for position, item in enumerate(items):
+            if isinstance(item, tuple):
+                self.error("nested braced initializers are not implemented", token)
+            what = f"initializer element {position}"
+            if static:
+                stored = self.static_value(item, element, token, what)
+            else:
+                stored = self.assign_convert(
+                    self.rvalue(item), element, token, what
+                )
+            bits = self.stored_bits(stored, element)
+            if static and bits == IntConstant(0):
+                # The static block arrives zero-filled from the kernel.
+                continue
+            self.emit(
+                HeapStore(
+                    _binary("add", base, IntConstant(position * size)),
+                    bits,
+                    size,
+                )
+            )
+        # C zero-fills whatever the braces leave out. A static object is
+        # already zero everywhere, so only an automatic one needs the fill.
+        filled = len(items) * size
+        if not static:
+            self.emit_bytes(base, filled, b"\0" * (ctype.count * size - filled))
+
+    def emit_bytes(
+        self,
+        base: IntExpression,
+        offset: int,
+        data: bytes,
+        *,
+        skip_zero: bool = False,
+    ) -> None:
+        """Store a constant byte image, using the widest aligned store each time.
+
+        A byte-at-a-time fill of ``char page[2048] = {0}`` would be two thousand
+        instructions. Both architectures py2bin emits for are little-endian, so
+        a chunk of the image packs into one store in source order.
+
+        ``skip_zero`` drops the stores that would write zero, which is what the
+        static storage block already holds; it must not be used for an
+        automatic object, whose bytes start out as whatever the frame held.
+        """
+
+        start = offset
+        end = offset + len(data)
+        while offset < end:
+            for width in (8, 4, 2, 1):
+                if offset % width == 0 and offset + width <= end:
+                    chunk = data[offset - start : offset - start + width]
+                    if skip_zero and not any(chunk):
+                        offset += width
+                        break
+                    self.emit(
+                        HeapStore(
+                            _binary("add", base, IntConstant(offset)),
+                            _constant(int.from_bytes(chunk, "little")),
+                            width,
+                        )
+                    )
+                    offset += width
+                    break
+
+    def if_statement(self, node: If) -> None:
+        test = self.scalar(node.test, "an 'if' condition")
+        otherwise = self.new_label("else")
+        self.emit(JumpIfFalse(self.truth(test), otherwise))
+        self.statement(node.body)
+        if node.alternative is None:
+            self.emit(Label(otherwise))
+            return
+        end = self.new_label("endif")
+        self.emit(Jump(end))
+        self.emit(Label(otherwise))
+        self.statement(node.alternative)
+        self.emit(Label(end))
+
+    def while_statement(self, node: While) -> None:
+        top = self.new_label("while")
+        end = self.new_label("while_end")
+        self.emit(Label(top))
+        test = self.scalar(node.test, "a 'while' condition")
+        self.emit(JumpIfFalse(self.truth(test), end))
+        self.break_targets.append(end)
+        self.continue_targets.append(top)
+        self.statement(node.body)
+        self.break_targets.pop()
+        self.continue_targets.pop()
+        self.emit(Jump(top))
+        self.emit(Label(end))
+
+    def do_while_statement(self, node: DoWhile) -> None:
+        top = self.new_label("do")
+        again = self.new_label("do_test")
+        end = self.new_label("do_end")
+        self.emit(Label(top))
+        self.break_targets.append(end)
+        self.continue_targets.append(again)
+        self.statement(node.body)
+        self.break_targets.pop()
+        self.continue_targets.pop()
+        self.emit(Label(again))
+        test = self.scalar(node.test, "a 'do while' condition")
+        self.emit(JumpIfFalse(self.truth(test), end))
+        self.emit(Jump(top))
+        self.emit(Label(end))
+
+    def for_statement(self, node: For) -> None:
+        """A C ``for`` is a ``while`` with an initializer and a step.
+
+        It is emphatically not Python's ``for``: the initializer runs even when
+        the body never does, the body may change the counter, and the counter
+        keeps the first value that failed the test.
+        """
+
+        self.scopes.append({})  # C99 scope for a declaration in the initializer
+        if node.initializer is not None:
+            self.statement(node.initializer)
+        top = self.new_label("for")
+        step = self.new_label("for_step")
+        end = self.new_label("for_end")
+        self.emit(Label(top))
+        if node.test is not None:
+            test = self.scalar(node.test, "a 'for' condition")
+            self.emit(JumpIfFalse(self.truth(test), end))
+        self.break_targets.append(end)
+        self.continue_targets.append(step)
+        self.statement(node.body)
+        self.break_targets.pop()
+        self.continue_targets.pop()
+        self.emit(Label(step))
+        if node.step is not None:
+            self.expression_statement(node.step)
+        self.emit(Jump(top))
+        self.emit(Label(end))
+        self.scopes.pop()
+
+    def switch_statement(self, node: Switch) -> None:
+        control = self.rvalue(node.control)
+        if not is_integer(control.ctype):
+            self.error(
+                f"a 'switch' needs an integer control expression, not "
+                f"{control.ctype}",
+                node.token,
+            )
+        ctype = promote(control.ctype)
+        slot = self.new_temp()
+        self.emit(Store(slot, self.fit(control.expr, ctype)))
+        mark = len(self.operations)
+        end = self.new_label("switch_end")
+        context = SwitchContext(ctype, [], None, set())
+        self.switches.append(context)
+        self.break_targets.append(end)
+        self.statement(node.body)
+        self.break_targets.pop()
+        self.switches.pop()
+        dispatch: list[Operation] = [
+            JumpIfFalse(IntCompare("ne", IntLoad(slot), IntConstant(value)), label)
+            for value, label in context.cases
+        ]
+        dispatch.append(Jump(context.default or end))
+        self.operations[mark:mark] = dispatch
+        self.emit(Label(end))
+
+    def labeled_statement(self, node: Labeled) -> None:
+        if node.kind == "label":
+            context = self.functions[-1]
+            name = str(node.value)
+            if name in context.defined:
+                self.error(f"label {name!r} is defined twice", node.token)
+            context.defined.add(name)
+            target = context.labels.setdefault(name, self.new_label(f"goto_{name}"))
+            self.emit(Label(target))
+        elif node.kind == "case":
+            if not self.switches:
+                self.error("'case' is not inside a switch", node.token)
+            context = self.switches[-1]
+            raw = ConstantEvaluator(self.filename).value(node.value)
+            value = _s64(_wrap(raw, context.ctype.size, context.ctype.signed))
+            if value in context.seen:
+                self.error(f"duplicate case value {raw}", node.token)
+            context.seen.add(value)
+            label = self.new_label("case")
+            context.cases.append((value, label))
+            self.emit(Label(label))
+        else:
+            if not self.switches:
+                self.error("'default' is not inside a switch", node.token)
+            context = self.switches[-1]
+            if context.default is not None:
+                self.error("a switch has at most one 'default'", node.token)
+            label = self.new_label("default")
+            context.default = label
+            self.emit(Label(label))
+        if node.statement is not None:
+            self.statement(node.statement)
+
+    def return_statement(self, node: Return) -> None:
+        context = self.functions[-1]
+        if node.value is None:
+            if not isinstance(context.function.result, VoidType):
+                self.error(
+                    f"{context.function.name}() returns "
+                    f"{context.function.result}, so 'return' needs a value",
+                    node.token,
+                )
+            if context.call_body:
+                self.emit(IRReturn(None))
+                return
+            self.emit(Jump(context.return_label))
+            return
+        if isinstance(context.function.result, VoidType):
+            self.error(
+                f"{context.function.name}() returns void and cannot return a value",
+                node.token,
+            )
+        value = self.rvalue(node.value)
+        result = context.function.result
+        stored = self.assign_convert(value, result, node.token, "this 'return'")
+        if context.is_main:
+            self.emit(ExitValue(stored))
+            return
+        # A floating result travels back in the integer result register as the
+        # bit pattern of the declared result type, which is what direct_call
+        # and inline() both read it back as.
+        stored = self.stored_bits(stored, result)
+        if context.call_body:
+            self.emit(IRReturn(stored))
+            return
+        assert context.result_slot is not None
+        self.emit(Store(context.result_slot, stored))
+        self.emit(Jump(context.return_label))
+
+    # --- printf ---
+
+    def print_buffer(self) -> int:
+        if self.buffer_slot is None:
+            self.buffer_slot = self.allocate(32)
+        return self.buffer_slot
+
+    def printf(self, node: Call) -> None:
+        if not node.arguments or not isinstance(node.arguments[0], StringLiteral):
+            self.error(
+                "printf needs a literal format string; py2bin reads the format at "
+                "compile time and emits the formatting code itself",
+                node.token,
+            )
+        segments = self.parse_format(node.arguments[0])
+        arguments = node.arguments[1:]
+        expected = sum(1 for kind, _ in segments if kind != "text")
+        if expected != len(arguments):
+            self.error(
+                f"printf has {expected} conversion(s) but {len(arguments)} "
+                "argument(s)",
+                node.token,
+            )
+        if expected and self.target.startswith("windows-"):
+            self.error(
+                "printf with a runtime conversion needs the write syscall py2bin "
+                f"only emits for POSIX targets, not {self.target!r}; a format with "
+                "no conversions works everywhere",
+                node.token,
+            )
+        # C11 6.5.2.2p10 puts a sequence point after every argument is
+        # evaluated and before the call, so printf may produce no output until
+        # all of its arguments have been computed. Evaluating them while
+        # emitting the format text would let an argument that writes to stdout
+        # interleave with the literal parts. Evaluate everything first, hold
+        # each result in a slot, then emit the output.
+        prepared: list[object] = []
+        for position, argument in enumerate(arguments):
+            style, ctype, precision = segments[
+                [i for i, (kind, _) in enumerate(segments) if kind != "text"][position]
+            ][1]
+            value = self.rvalue(argument)
+            prepared.append((style, ctype, precision, value, argument))
+        held: list[object] = []
+        for style, ctype, precision, value, argument in prepared:
+            if style == "string":
+                held.append((style, precision, value, argument))
+                continue
+            if style in _FLOAT_CONVERSIONS:
+                if not is_floating(value.ctype):
+                    self.error(
+                        f"a %{style} conversion needs a floating value, not "
+                        f"{value.ctype}; C's printf reads a double here, and an "
+                        "integer argument is undefined -- write a cast if that is "
+                        "what you meant",
+                        argument.token,
+                    )
+                # materialize_float() pins the double in a slot for the same
+                # reason the integer path pins its value: a later argument must
+                # not be able to change what this one formats.
+                held.append(
+                    (style, precision, self.materialize_float(value.expr), argument)
+                )
+                continue
+            if not is_integer(value.ctype):
+                self.error(
+                    f"this conversion needs an integer, not {value.ctype}",
+                    argument.token,
+                )
+            # materialize() pins the value in a slot, so evaluating a later
+            # argument cannot change what this one reads.
+            held.append(
+                (style, precision, self.materialize(self.fit(value.expr, ctype)), argument)
+            )
+
+        index = 0
+        for kind, payload in segments:
+            if kind == "text":
+                self.emit(Write(payload))
+                continue
+            style, precision, value, argument = held[index]
+            index += 1
+            if style in _FLOAT_CONVERSIONS:
+                self.emit_floating(value, style, precision)
+                continue
+            if style == "string":
+                if value.null or not isinstance(value.ctype, PointerType):
+                    self.error(
+                        "a %s conversion needs a character pointer", argument.token
+                    )
+                if not _is_character(value.ctype.target):
+                    self.error(
+                        f"a %s conversion needs a character pointer, not "
+                        f"{value.ctype}",
+                        argument.token,
+                    )
+                self.emit_string(value.expr)
+                continue
+            expression = value
+            if style == "char":
+                self.emit_character(expression)
+            elif style == "signed":
+                self.emit_number(expression, signed=True, base=10, upper=False)
+            elif style == "unsigned":
+                self.emit_number(expression, signed=False, base=10, upper=False)
+            else:
+                self.emit_number(
+                    expression, signed=False, base=16, upper=style == "HEX"
+                )
+
+    def parse_format(self, literal: StringLiteral) -> list[tuple[str, object]]:
+        segments: list[tuple[str, object]] = []
+        text = bytearray()
+        data = literal.data
+        position = 0
+        while position < len(data):
+            byte = data[position]
+            if byte != 0x25:  # '%'
+                text.append(byte)
+                position += 1
+                continue
+            position += 1
+            if position < len(data) and data[position] == 0x25:
+                text.append(0x25)
+                position += 1
+                continue
+            if position < len(data) and (
+                chr(data[position]) in "-+ #" or chr(data[position]).isdigit()
+            ):
+                self.error(
+                    "printf flags and field widths are not implemented; py2bin "
+                    "emits the formatting itself and pads nothing",
+                    literal.token,
+                )
+            precision: int | None = None
+            if position < len(data) and data[position] == 0x2E:  # '.'
+                position += 1
+                figures = ""
+                while position < len(data) and chr(data[position]).isdigit():
+                    figures += chr(data[position])
+                    position += 1
+                # C reads an omitted precision after the period as zero.
+                precision = int(figures) if figures else 0
+            length = ""
+            while position < len(data) and chr(data[position]) in "hlzjtL":
+                length += chr(data[position])
+                position += 1
+            if position >= len(data):
+                self.error("printf format ends inside a conversion", literal.token)
+            specifier = chr(data[position])
+            position += 1
+            if specifier in _FLOAT_CONVERSIONS:
+                if length == "L":
+                    self.error(
+                        f"printf conversion %L{specifier} names a long double, "
+                        "which py2bin's C compiler does not implement",
+                        literal.token,
+                    )
+                if length not in {"", "l"}:
+                    # C11 7.21.6.1: 'l' before a floating conversion has no
+                    # effect, because the argument is a double either way.
+                    self.error(
+                        f"printf conversion %{length}{specifier} is not valid",
+                        literal.token,
+                    )
+                if precision is None:
+                    precision = 6
+                if precision > _MAXIMUM_PRECISION:
+                    self.error(
+                        f"printf precision {precision} is beyond the "
+                        f"{_MAXIMUM_PRECISION} py2bin implements; the formatter "
+                        "writes into a fixed frame buffer",
+                        literal.token,
+                    )
+                if text:
+                    segments.append(("text", bytes(text)))
+                    text.clear()
+                segments.append(("conversion", (specifier, DOUBLE, precision)))
+                continue
+            if specifier not in _CONVERSIONS:
+                self.error(
+                    f"printf conversion %{length}{specifier} is not implemented; "
+                    "py2bin emits the formatting itself and supports "
+                    "%d %i %u %x %X %c %s %f %F %e %E %g %G and %% with the "
+                    "h/hh/l/ll/z length modifiers, and a precision on the "
+                    "floating conversions (no flags or field widths)",
+                    literal.token,
+                )
+            if precision is not None:
+                self.error(
+                    f"a precision on %{specifier} is not implemented; py2bin "
+                    "implements one only on the floating conversions",
+                    literal.token,
+                )
+            if length == "L":
+                self.error(
+                    f"printf conversion %L{specifier} is not valid", literal.token
+                )
+            style, default = _CONVERSIONS[specifier]
+            table = _LENGTHS.get(length)
+            if table is None:
+                self.error(
+                    f"printf length modifier {length!r} is not implemented",
+                    literal.token,
+                )
+            if length and specifier not in table:
+                self.error(
+                    f"printf conversion %{length}{specifier} is not valid",
+                    literal.token,
+                )
+            ctype = table.get(specifier, default) if length else default
+            if text:
+                segments.append(("text", bytes(text)))
+                text.clear()
+            segments.append(("conversion", (style, ctype, None)))
+        if text:
+            segments.append(("text", bytes(text)))
+        return segments
+
+    #: The working variables the floating formatter needs. They are allocated
+    #: once per function body and REUSED by every conversion in it: each one is
+    #: live only inside the formatter's own straight-line code, and a program
+    #: printing a dozen doubles would otherwise need a dozen copies of them.
+    _FLOAT_SCRATCH = (
+        "argument",
+        "mode",
+        "given",
+        "figures_asked",
+        "upper",
+        "back",
+        "bits",
+        "sign",
+        "exponent",
+        "mantissa",
+        "significand",
+        "scale",
+        "power",
+        "length",
+        "index",
+        "carry",
+        "term",
+        "repeats",
+        "step",
+        "cut",
+        "guard",
+        "sticky",
+        "keep",
+        "roundup",
+        "surviving",
+        "written",
+        "decimal_exponent",
+        "count",
+        "position",
+        "digit",
+        "form",
+        "figures",
+        "zero",
+    )
+
+    def float_buffers(self) -> tuple[int, int, dict[str, int]]:
+        """The frame the floating formatter works in, allocated once."""
+
+        if self.digit_slot is None:
+            self.digit_slot = self.allocate(_DIGIT_BYTES)
+            self.text_slot = self.allocate(_TEXT_BYTES)
+            self.float_scratch = {
+                name: self.new_temp() for name in self._FLOAT_SCRATCH
+            }
+        assert self.text_slot is not None
+        return self.digit_slot, self.text_slot, self.float_scratch
+
+    def emit_floating(
+        self, value: FloatExpression, style: str, precision: int
+    ) -> None:
+        """Format one double for %f/%e/%g and write it.
+
+        The formatter itself is emitted ONCE per function body and reached by a
+        jump, because it is some hundreds of IR operations and a program that
+        prints a table of numbers would otherwise carry a copy of it per
+        conversion. The shape, precision and case are passed in slots, and a
+        return identifier picks the site to jump back to -- a subroutine call
+        built out of the jumps the IR has, since it has no indirect branch.
+        """
+
+        _digits, _text, scratch = self.float_buffers()
+        if self.float_entry is None:
+            self.emit_float_formatter()
+        assert self.float_entry is not None
+        kind = style.lower()
+        self.emit(Store(scratch["argument"], FloatBits(value, 8)))
+        self.emit(
+            Store(scratch["mode"], IntConstant({"f": 0, "e": 1, "g": 2}[kind]))
+        )
+        self.emit(Store(scratch["given"], IntConstant(precision)))
+        # C reads a %g precision of zero as one significant digit.
+        self.emit(
+            Store(scratch["figures_asked"], IntConstant(max(1, precision)))
+        )
+        self.emit(
+            Store(
+                scratch["upper"],
+                IntConstant(1 if style in {"F", "E", "G"} else 0),
+            )
+        )
+        identifier = len(self.float_returns)
+        back = self.new_label("fp_back")
+        self.emit(Store(scratch["back"], IntConstant(identifier)))
+        self.emit(Jump(self.float_entry))
+        self.emit(Label(back))
+        self.float_returns.append((identifier, back))
+
+    def emit_float_dispatch(self) -> None:
+        """Close a body's shared formatter by returning to each of its sites.
+
+        This goes after the body's own exit or return, so nothing falls into
+        it, and every path into the formatter set ``back`` to one of the
+        identifiers below.
+        """
+
+        if self.float_entry is None or not self.float_returns:
+            return
+        assert self.float_dispatch is not None
+        back = self.float_scratch["back"]
+        self.emit(Label(self.float_dispatch))
+        for identifier, target in self.float_returns:
+            self.emit(
+                JumpIfFalse(
+                    IntCompare("ne", IntLoad(back), IntConstant(identifier)),
+                    target,
+                )
+            )
+        # Unreachable: every site above stored one of those identifiers.
+        self.emit(Jump(self.float_returns[-1][1]))
+
+    def emit_float_formatter(self) -> None:
+        """Emit the shared formatter, jumped over so it is only ever entered."""
+
+        skip = self.new_label("fp_skip")
+        self.emit(Jump(skip))
+        self.float_entry = self.new_label("fp_formatter")
+        self.float_dispatch = self.new_label("fp_dispatch")
+        self.emit(Label(self.float_entry))
+        self.float_formatter()
+        self.emit(Jump(self.float_dispatch))
+        self.emit(Label(skip))
+
+    def float_formatter(self) -> None:
+        """Format the double in the ``argument`` slot, with no library at all.
+
+        The conversion is EXACT, not approximate. Every finite double is
+        ``M * 2**E`` with M below 2**53, and every such number has a finite
+        decimal expansion: for E >= 0 it is the integer ``M * 2**E``, and for
+        E < 0 it is ``M * 5**-E`` scaled by ``10**E``. So the emitted code
+        builds that expansion digit by digit in a base-10 array -- doubling it E
+        times, or multiplying it by five -E times -- and then rounds the decimal
+        digits themselves. No logarithm, no repeated division of the double, and
+        no accumulated error: the digits printed are the digits the value has.
+
+        The rounding is round-half-to-even ON THE EXACT VALUE, which is what
+        C11 7.21.6.1p13 recommends and what makes %.0f of 0.5 print 0, of 1.5
+        print 2, and of 2.5 print 2 again.
+
+        The cost is a loop of up to 1074 multiplications over up to 767 digits
+        for the smallest subnormals; a value near 1 needs a few dozen. That is
+        the price of being exact without a bignum library, and it is paid only
+        where a program actually prints a floating value.
+        """
+
+        digit_slot, text_slot, scratch = self.float_buffers()
+        digits = SlotAddress(digit_slot)
+        text = SlotAddress(text_slot)
+
+        argument = scratch["argument"]
+        mode = scratch["mode"]
+        given = scratch["given"]
+        significant = scratch["figures_asked"]
+        uppercase = scratch["upper"]
+        bits = scratch["bits"]
+        sign = scratch["sign"]
+        exponent = scratch["exponent"]
+        mantissa = scratch["mantissa"]
+        significand = scratch["significand"]
+        scale = scratch["scale"]
+        power = scratch["power"]
+        length = scratch["length"]
+        index = scratch["index"]
+        carry = scratch["carry"]
+        term = scratch["term"]
+        repeats = scratch["repeats"]
+        step = scratch["step"]
+        cut = scratch["cut"]
+        guard = scratch["guard"]
+        sticky = scratch["sticky"]
+        keep = scratch["keep"]
+        roundup = scratch["roundup"]
+        surviving = scratch["surviving"]
+        written = scratch["written"]
+        decimal_exponent = scratch["decimal_exponent"]
+        count = scratch["count"]
+        position = scratch["position"]
+        digit = scratch["digit"]
+        form = scratch["form"]
+        figures = scratch["figures"]
+        zero = scratch["zero"]
+
+        def store(slot: int, expression: IntExpression) -> None:
+            self.emit(Store(slot, expression))
+
+        def label(name: str) -> str:
+            return self.new_label(f"fp_{name}")
+
+        def at(name: str) -> str:
+            target = label(name)
+            self.emit(Label(target))
+            return target
+
+        def put(character: IntExpression) -> None:
+            """Append one byte to the output buffer."""
+
+            self.emit(
+                HeapStore(_binary("add", text, IntLoad(written)), character, 1)
+            )
+            store(written, _binary("add", IntLoad(written), IntConstant(1)))
+
+        def put_word(data: bytes) -> None:
+            """Append a word, lower-cased unless the conversion was uppercase.
+
+            ASCII sets bit 5 on the lower-case letters, so one runtime OR turns
+            the same constants into "inf"/"INF" and "nan"/"NAN".
+            """
+
+            fold = IntBinary(
+                "mul",
+                IntCompare("eq", IntLoad(uppercase), IntConstant(0)),
+                IntConstant(0x20),
+            )
+            for byte in data:
+                put(_binary("or", IntConstant(byte), fold))
+
+        def unless(condition: IntExpression, target: str) -> None:
+            """Jump to ``target`` when ``condition`` is false."""
+
+            self.emit(JumpIfFalse(condition, target))
+
+        def byte_at(where: IntExpression) -> IntExpression:
+            return HeapLoad(where, 1, False)
+
+        # --- take the value apart --------------------------------------
+        store(bits, IntLoad(argument))
+        store(sign, IntBinary("urshift", IntLoad(bits), IntConstant(63)))
+        store(
+            exponent,
+            IntBinary(
+                "and",
+                IntBinary("urshift", IntLoad(bits), IntConstant(52)),
+                IntConstant(0x7FF),
+            ),
+        )
+        store(
+            mantissa,
+            IntBinary("and", IntLoad(bits), IntConstant((1 << 52) - 1)),
+        )
+        store(written, IntConstant(0))
+        positive = label("positive")
+        unless(IntLoad(sign), positive)
+        put(IntConstant(0x2D))  # '-'
+        self.emit(Label(positive))
+
+        # Infinities and NaNs have no digits; C prints them as words.
+        finite = label("finite")
+        emit_text = label("emit")
+        unless(IntCompare("eq", IntLoad(exponent), IntConstant(0x7FF)), finite)
+        not_a_number = label("nan")
+        unless(IntCompare("eq", IntLoad(mantissa), IntConstant(0)), not_a_number)
+        put_word(b"INF")
+        self.emit(Jump(emit_text))
+        self.emit(Label(not_a_number))
+        put_word(b"NAN")
+        self.emit(Jump(emit_text))
+        self.emit(Label(finite))
+
+        # value == significand * 2**power, exactly.
+        subnormal = label("subnormal")
+        ready = label("ready")
+        unless(IntLoad(exponent), subnormal)
+        store(
+            significand,
+            IntBinary("add", IntLoad(mantissa), IntConstant(1 << 52)),
+        )
+        store(power, IntBinary("sub", IntLoad(exponent), IntConstant(1075)))
+        self.emit(Jump(ready))
+        self.emit(Label(subnormal))
+        store(significand, IntLoad(mantissa))
+        store(power, IntConstant(-1074))
+        self.emit(Label(ready))
+
+        # --- the exact decimal expansion -------------------------------
+        # digits[0] is the LEAST significant digit, and the value is
+        # sum(digits[i] * 10**i) * 10**-scale.
+        store(zero, IntCompare("eq", IntLoad(significand), IntConstant(0)))
+        store(length, IntConstant(0))
+        split = at("split")
+        split_end = label("split_end")
+        unless(IntLoad(significand), split_end)
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(length)),
+                IntBinary("umod", IntLoad(significand), IntConstant(10)),
+                1,
+            )
+        )
+        store(length, _binary("add", IntLoad(length), IntConstant(1)))
+        store(
+            significand, IntBinary("udiv", IntLoad(significand), IntConstant(10))
+        )
+        self.emit(Jump(split))
+        self.emit(Label(split_end))
+        nonzero = label("nonzero")
+        unless(IntCompare("eq", IntLoad(length), IntConstant(0)), nonzero)
+        self.emit(HeapStore(digits, IntConstant(0), 1))
+        store(length, IntConstant(1))
+        self.emit(Label(nonzero))
+
+        # A positive binary exponent doubles the integer; a negative one turns
+        # 2**-n into 5**n over 10**n, which is where the scale comes from.
+        nonnegative = label("nonnegative")
+        scaled = label("scaled")
+        # A zero has an exact expansion of 0 * 10**1074, but C gives it the
+        # decimal exponent 0, so it takes no scaling at all -- which is also
+        # what stops %e from printing "0.000000e-1074".
+        store(scale, IntConstant(0))
+        store(repeats, IntConstant(0))
+        store(step, IntConstant(2))
+        unless(IntCompare("eq", IntLoad(zero), IntConstant(0)), scaled)
+        unless(IntCompare("lt", IntLoad(power), IntConstant(0)), nonnegative)
+        store(step, IntConstant(5))
+        store(repeats, IntUnary("neg", IntLoad(power)))
+        store(scale, IntUnary("neg", IntLoad(power)))
+        self.emit(Jump(scaled))
+        self.emit(Label(nonnegative))
+        store(step, IntConstant(2))
+        store(repeats, IntLoad(power))
+        store(scale, IntConstant(0))
+        self.emit(Label(scaled))
+
+        outer = at("scale")
+        outer_end = label("scale_end")
+        unless(IntLoad(repeats), outer_end)
+        store(carry, IntConstant(0))
+        store(index, IntConstant(0))
+        inner = at("multiply")
+        inner_end = label("multiply_end")
+        unless(IntCompare("lt", IntLoad(index), IntLoad(length)), inner_end)
+        store(
+            term,
+            IntBinary(
+                "add",
+                IntBinary(
+                    "mul",
+                    byte_at(_binary("add", digits, IntLoad(index))),
+                    IntLoad(step),
+                ),
+                IntLoad(carry),
+            ),
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(index)),
+                IntBinary("umod", IntLoad(term), IntConstant(10)),
+                1,
+            )
+        )
+        store(carry, IntBinary("udiv", IntLoad(term), IntConstant(10)))
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(inner))
+        self.emit(Label(inner_end))
+        spill = at("spill")
+        spill_end = label("spill_end")
+        unless(IntLoad(carry), spill_end)
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(length)),
+                IntBinary("umod", IntLoad(carry), IntConstant(10)),
+                1,
+            )
+        )
+        store(length, _binary("add", IntLoad(length), IntConstant(1)))
+        store(carry, IntBinary("udiv", IntLoad(carry), IntConstant(10)))
+        self.emit(Jump(spill))
+        self.emit(Label(spill_end))
+        store(repeats, _binary("sub", IntLoad(repeats), IntConstant(1)))
+        self.emit(Jump(outer))
+        self.emit(Label(outer_end))
+
+        # --- round the decimal digits ----------------------------------
+        # 'cut' is how many of the least significant digits are dropped. %f
+        # keeps a fixed number of them after the point; %e and %g keep a fixed
+        # number of significant digits.
+        fixed_cut = label("fixed_cut")
+        exponent_cut = label("exponent_cut")
+        chose_cut = label("chose_cut")
+        unless(IntCompare("eq", IntLoad(mode), IntConstant(0)), exponent_cut)
+        self.emit(Label(fixed_cut))
+        store(cut, _binary("sub", IntLoad(scale), IntLoad(given)))
+        self.emit(Jump(chose_cut))
+        self.emit(Label(exponent_cut))
+        unless(IntCompare("eq", IntLoad(mode), IntConstant(1)), general_cut := label("general_cut"))
+        store(
+            cut,
+            _binary(
+                "sub",
+                _binary("sub", IntLoad(length), IntLoad(given)),
+                IntConstant(1),
+            ),
+        )
+        self.emit(Jump(chose_cut))
+        self.emit(Label(general_cut))
+        store(cut, _binary("sub", IntLoad(length), IntLoad(significant)))
+        self.emit(Label(chose_cut))
+        exact = label("exact")
+        unless(IntCompare("gt", IntLoad(cut), IntConstant(0)), exact)
+
+        store(guard, IntConstant(0))
+        have_guard = label("have_guard")
+        unless(
+            IntCompare(
+                "lt", _binary("sub", IntLoad(cut), IntConstant(1)), IntLoad(length)
+            ),
+            have_guard,
+        )
+        store(
+            guard,
+            byte_at(
+                _binary(
+                    "add", digits, _binary("sub", IntLoad(cut), IntConstant(1))
+                )
+            ),
+        )
+        self.emit(Label(have_guard))
+
+        # 'sticky' says whether anything below the guard digit was nonzero,
+        # which is what separates an exact tie from a value just above one.
+        store(sticky, IntConstant(0))
+        store(index, IntConstant(0))
+        tail = at("tail")
+        tail_end = label("tail_end")
+        unless(
+            IntCompare(
+                "lt", IntLoad(index), _binary("sub", IntLoad(cut), IntConstant(1))
+            ),
+            tail_end,
+        )
+        unless(IntCompare("lt", IntLoad(index), IntLoad(length)), tail_end)
+        store(
+            sticky,
+            IntBinary(
+                "or",
+                IntLoad(sticky),
+                IntCompare(
+                    "ne",
+                    byte_at(_binary("add", digits, IntLoad(index))),
+                    IntConstant(0),
+                ),
+            ),
+        )
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(tail))
+        self.emit(Label(tail_end))
+
+        store(keep, IntConstant(0))
+        have_keep = label("have_keep")
+        unless(IntCompare("lt", IntLoad(cut), IntLoad(length)), have_keep)
+        store(keep, byte_at(_binary("add", digits, IntLoad(cut))))
+        self.emit(Label(have_keep))
+        # Round half to even: up when the guard is above five, and on an exact
+        # five only when something below it was set or the surviving digit is
+        # odd.
+        store(
+            roundup,
+            IntBinary(
+                "or",
+                IntCompare("gt", IntLoad(guard), IntConstant(5)),
+                IntBinary(
+                    "and",
+                    IntCompare("eq", IntLoad(guard), IntConstant(5)),
+                    IntBinary(
+                        "or",
+                        IntCompare("ne", IntLoad(sticky), IntConstant(0)),
+                        IntBinary("and", IntLoad(keep), IntConstant(1)),
+                    ),
+                ),
+            ),
+        )
+
+        store(surviving, _binary("sub", IntLoad(length), IntLoad(cut)))
+        nonempty = label("nonempty")
+        unless(IntCompare("lt", IntLoad(surviving), IntConstant(0)), nonempty)
+        store(surviving, IntConstant(0))
+        self.emit(Label(nonempty))
+        store(index, IntConstant(0))
+        shift = at("shift")
+        shift_end = label("shift_end")
+        unless(IntCompare("lt", IntLoad(index), IntLoad(surviving)), shift_end)
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(index)),
+                byte_at(
+                    _binary(
+                        "add", digits, _binary("add", IntLoad(index), IntLoad(cut))
+                    )
+                ),
+                1,
+            )
+        )
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(shift))
+        self.emit(Label(shift_end))
+        store(scale, _binary("sub", IntLoad(scale), IntLoad(cut)))
+        store(length, IntLoad(surviving))
+        survived = label("survived")
+        unless(IntCompare("eq", IntLoad(length), IntConstant(0)), survived)
+        self.emit(HeapStore(digits, IntConstant(0), 1))
+        store(length, IntConstant(1))
+        self.emit(Label(survived))
+
+        rounded = label("rounded")
+        unless(IntLoad(roundup), rounded)
+        store(carry, IntConstant(1))
+        store(index, IntConstant(0))
+        bump = at("bump")
+        bump_end = label("bump_end")
+        unless(IntCompare("lt", IntLoad(index), IntLoad(length)), bump_end)
+        unless(IntLoad(carry), bump_end)
+        store(
+            term,
+            IntBinary(
+                "add",
+                byte_at(_binary("add", digits, IntLoad(index))),
+                IntLoad(carry),
+            ),
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", digits, IntLoad(index)),
+                IntBinary("umod", IntLoad(term), IntConstant(10)),
+                1,
+            )
+        )
+        store(carry, IntBinary("udiv", IntLoad(term), IntConstant(10)))
+        store(index, _binary("add", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(bump))
+        self.emit(Label(bump_end))
+        settled = label("settled")
+        unless(IntLoad(carry), settled)
+        self.emit(
+            HeapStore(_binary("add", digits, IntLoad(length)), IntLoad(carry), 1)
+        )
+        store(length, _binary("add", IntLoad(length), IntConstant(1)))
+        self.emit(Label(settled))
+        self.emit(Label(rounded))
+        self.emit(Label(exact))
+
+        # --- pick the shape and the number of fraction digits ----------
+        store(
+            decimal_exponent,
+            _binary(
+                "sub",
+                _binary("sub", IntLoad(length), IntConstant(1)),
+                IntLoad(scale),
+            ),
+        )
+        chosen = label("chosen")
+        general = label("general")
+        unless(IntCompare("ne", IntLoad(mode), IntConstant(2)), general)
+        # %f and %e keep the shape and precision they were written with.
+        store(form, IntLoad(mode))
+        store(figures, IntLoad(given))
+        self.emit(Jump(chosen))
+        self.emit(Label(general))
+        # C11 7.21.6.1p8: %g uses %e when the exponent is below -4 or at least
+        # the precision, and %f otherwise, then drops trailing zeros.
+        fixed_form = label("fixed_form")
+        unless(
+            IntBinary(
+                "or",
+                IntCompare("lt", IntLoad(decimal_exponent), IntConstant(-4)),
+                IntCompare("ge", IntLoad(decimal_exponent), IntLoad(significant)),
+            ),
+            fixed_form,
+        )
+        store(form, IntConstant(1))
+        store(figures, _binary("sub", IntLoad(significant), IntConstant(1)))
+        self.emit(Jump(chosen))
+        self.emit(Label(fixed_form))
+        store(form, IntConstant(0))
+        store(
+            figures,
+            _binary(
+                "sub",
+                _binary("sub", IntLoad(significant), IntConstant(1)),
+                IntLoad(decimal_exponent),
+            ),
+        )
+        self.emit(Label(chosen))
+
+        def fraction(index_of: object) -> None:
+            """Emit '.' and the fraction digits, reading 0 outside the array."""
+
+            done = label("fraction_done")
+            unless(IntCompare("gt", IntLoad(figures), IntConstant(0)), done)
+            put(IntConstant(0x2E))  # '.'
+            store(count, IntConstant(1))
+            top = at("fraction")
+            stop = label("fraction_end")
+            unless(IntCompare("le", IntLoad(count), IntLoad(figures)), stop)
+            store(position, index_of())
+            store(digit, IntConstant(0))
+            outside = label("outside")
+            unless(IntCompare("ge", IntLoad(position), IntConstant(0)), outside)
+            unless(IntCompare("lt", IntLoad(position), IntLoad(length)), outside)
+            store(digit, byte_at(_binary("add", digits, IntLoad(position))))
+            self.emit(Label(outside))
+            put(_binary("add", IntLoad(digit), IntConstant(48)))
+            store(count, _binary("add", IntLoad(count), IntConstant(1)))
+            self.emit(Jump(top))
+            self.emit(Label(stop))
+            self.emit(Label(done))
+
+        exponential = label("exponential")
+        after = label("after_mantissa")
+        unless(IntCompare("eq", IntLoad(form), IntConstant(0)), exponential)
+        # Fixed form: digits at or above the point, then the fraction.
+        empty = label("no_integer")
+        integer_done = label("integer_done")
+        unless(
+            IntCompare(
+                "ge",
+                _binary("sub", IntLoad(length), IntConstant(1)),
+                IntLoad(scale),
+            ),
+            empty,
+        )
+        store(index, _binary("sub", IntLoad(length), IntConstant(1)))
+        walk = at("integer")
+        walk_end = label("integer_end")
+        unless(IntCompare("ge", IntLoad(index), IntLoad(scale)), walk_end)
+        put(
+            _binary(
+                "add",
+                byte_at(_binary("add", digits, IntLoad(index))),
+                IntConstant(48),
+            )
+        )
+        store(index, _binary("sub", IntLoad(index), IntConstant(1)))
+        self.emit(Jump(walk))
+        self.emit(Label(walk_end))
+        self.emit(Jump(integer_done))
+        self.emit(Label(empty))
+        put(IntConstant(48))  # a value below one still shows its leading '0'
+        self.emit(Label(integer_done))
+        fraction(lambda: _binary("sub", IntLoad(scale), IntLoad(count)))
+        self.emit(Jump(after))
+        self.emit(Label(exponential))
+        put(
+            _binary(
+                "add",
+                byte_at(
+                    _binary(
+                        "add", digits, _binary("sub", IntLoad(length), IntConstant(1))
+                    )
+                ),
+                IntConstant(48),
+            )
+        )
+        fraction(
+            lambda: _binary(
+                "sub",
+                _binary("sub", IntLoad(length), IntConstant(1)),
+                IntLoad(count),
+            )
+        )
+        self.emit(Label(after))
+
+        # %g drops the trailing zeros, and the point when nothing follows
+        # it. There is always a digit before the point, so this cannot run
+        # off the front of the buffer.
+        kept = label("kept")
+        unless(IntCompare("eq", IntLoad(mode), IntConstant(2)), kept)
+        unless(IntCompare("gt", IntLoad(figures), IntConstant(0)), kept)
+        zeros = at("zeros")
+        zeros_end = label("zeros_end")
+        unless(
+            IntCompare(
+                "eq",
+                byte_at(
+                    _binary(
+                        "add", text, _binary("sub", IntLoad(written), IntConstant(1))
+                    )
+                ),
+                IntConstant(48),
+            ),
+            zeros_end,
+        )
+        store(written, _binary("sub", IntLoad(written), IntConstant(1)))
+        self.emit(Jump(zeros))
+        self.emit(Label(zeros_end))
+        point = label("point")
+        unless(
+            IntCompare(
+                "eq",
+                byte_at(
+                    _binary(
+                        "add", text, _binary("sub", IntLoad(written), IntConstant(1))
+                    )
+                ),
+                IntConstant(0x2E),
+            ),
+            point,
+        )
+        store(written, _binary("sub", IntLoad(written), IntConstant(1)))
+        self.emit(Label(point))
+        self.emit(Label(kept))
+
+        # The exponent suffix, on the exponential form only. C requires at
+        # least two digits, and a double never needs more than three.
+        plain = label("plain")
+        unless(IntLoad(form), plain)
+        put_word(b"E")  # 'E' or 'e', by the conversion's case
+        above = label("above")
+        signed_done = label("exponent_signed")
+        unless(
+            IntCompare("lt", IntLoad(decimal_exponent), IntConstant(0)), above
+        )
+        put(IntConstant(0x2D))  # '-'
+        store(count, IntUnary("neg", IntLoad(decimal_exponent)))
+        self.emit(Jump(signed_done))
+        self.emit(Label(above))
+        put(IntConstant(0x2B))  # '+'
+        store(count, IntLoad(decimal_exponent))
+        self.emit(Label(signed_done))
+        two_digits = label("two_digits")
+        unless(IntCompare("ge", IntLoad(count), IntConstant(100)), two_digits)
+        put(
+            _binary(
+                "add",
+                IntBinary("udiv", IntLoad(count), IntConstant(100)),
+                IntConstant(48),
+            )
+        )
+        store(count, IntBinary("umod", IntLoad(count), IntConstant(100)))
+        self.emit(Label(two_digits))
+        put(
+            _binary(
+                "add",
+                IntBinary("udiv", IntLoad(count), IntConstant(10)),
+                IntConstant(48),
+            )
+        )
+        put(
+            _binary(
+                "add",
+                IntBinary("umod", IntLoad(count), IntConstant(10)),
+                IntConstant(48),
+            )
+        )
+        self.emit(Label(plain))
+
+        self.emit(Label(emit_text))
+        self.emit(WriteRuntime(text, IntLoad(written)))
+
+    def emit_character(self, expression: IntExpression) -> None:
+        base = SlotAddress(self.print_buffer())
+        self.emit(HeapStore(base, expression, 1))
+        self.emit(WriteRuntime(base, IntConstant(1)))
+
+    def emit_string(self, pointer: IntExpression) -> None:
+        pointer_slot = self.new_temp()
+        length_slot = self.new_temp()
+        self.emit(Store(pointer_slot, pointer))
+        self.emit(Store(length_slot, IntConstant(0)))
+        top = self.new_label("strlen")
+        end = self.new_label("strlen_end")
+        self.emit(Label(top))
+        self.emit(
+            JumpIfFalse(
+                HeapLoad(
+                    _binary("add", IntLoad(pointer_slot), IntLoad(length_slot)), 1
+                ),
+                end,
+            )
+        )
+        self.emit(
+            Store(length_slot, _binary("add", IntLoad(length_slot), IntConstant(1)))
+        )
+        self.emit(Jump(top))
+        self.emit(Label(end))
+        self.emit(WriteRuntime(IntLoad(pointer_slot), IntLoad(length_slot)))
+
+    def emit_number(
+        self, expression: IntExpression, *, signed: bool, base: int, upper: bool
+    ) -> None:
+        """Format one integer into the scratch buffer and write it to stdout.
+
+        Digits are produced least-significant first into the end of a 32-byte
+        frame buffer, which is why the index walks backwards; 20 digits plus a
+        sign is the widest a 64-bit value can be.
+        """
+
+        buffer = SlotAddress(self.print_buffer())
+        value_slot = self.new_temp()
+        index_slot = self.new_temp()
+        negative_slot = self.new_temp()
+        self.emit(Store(value_slot, expression))
+        if signed:
+            self.emit(
+                Store(
+                    negative_slot,
+                    IntCompare("lt", IntLoad(value_slot), IntConstant(0)),
+                )
+            )
+            # |v| without a branch, and correct for the most negative value,
+            # whose magnitude is not representable as a signed 64-bit integer:
+            # (v ^ (v>>63)) - (v>>63) leaves the 0x8000... bit pattern alone,
+            # which is exactly 2**63 read as unsigned.
+            sign = IntBinary("rshift", IntLoad(value_slot), IntConstant(63))
+            self.emit(
+                Store(
+                    value_slot,
+                    IntBinary("sub", IntBinary("xor", IntLoad(value_slot), sign), sign),
+                )
+            )
+        self.emit(Store(index_slot, IntConstant(32)))
+        digit_slot = self.new_temp()
+        top = self.new_label("digits")
+        self.emit(Label(top))
+        self.emit(
+            Store(index_slot, _binary("sub", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.emit(
+            Store(
+                digit_slot,
+                IntBinary("umod", IntLoad(value_slot), IntConstant(base)),
+            )
+        )
+        character = _binary("add", IntLoad(digit_slot), IntConstant(48))
+        if base == 16:
+            # 'a'-'0'-10 == 39, 'A'-'0'-10 == 7; the compare yields 1 or 0.
+            character = _binary(
+                "add",
+                character,
+                _binary(
+                    "mul",
+                    IntCompare("gt", IntLoad(digit_slot), IntConstant(9)),
+                    IntConstant(7 if upper else 39),
+                ),
+            )
+        self.emit(
+            HeapStore(
+                _binary("add", buffer, IntLoad(index_slot)), character, 1
+            )
+        )
+        self.emit(
+            Store(
+                value_slot,
+                IntBinary("udiv", IntLoad(value_slot), IntConstant(base)),
+            )
+        )
+        self.emit(
+            JumpIfFalse(
+                IntCompare("eq", IntLoad(value_slot), IntConstant(0)), top
+            )
+        )
+        if signed:
+            done = self.new_label("no_sign")
+            self.emit(JumpIfFalse(IntLoad(negative_slot), done))
+            self.emit(
+                Store(index_slot, _binary("sub", IntLoad(index_slot), IntConstant(1)))
+            )
+            self.emit(
+                HeapStore(
+                    _binary("add", buffer, IntLoad(index_slot)), IntConstant(45), 1
+                )
+            )
+            self.emit(Label(done))
+        self.emit(
+            WriteRuntime(
+                _binary("add", buffer, IntLoad(index_slot)),
+                _binary("sub", IntConstant(32), IntLoad(index_slot)),
+            )
+        )
+
+    # --- entry point ---
+
+    def compile(self) -> Module:
+        main = self.unit.functions.get("main")
+        if main is None:
+            raise CCompileError(
+                self.filename, 1, 1, "this translation unit has no int main(void)"
+            )
+        if main.result != INT or main.parameters:
+            self.error(
+                "the entry point must have the exact form int main(void)", main.token
+            )
+        if main.body is None:
+            self.error(
+                "main() is declared but never defined in this translation unit",
+                main.token,
+            )
+        self.scopes.append({})
+        # Before main's first statement: C11 5.1.2p1 gives every object with
+        # static storage duration its initial value before the program starts.
+        self.declare_globals()
+        context = FunctionContext(main, None, self.new_label("return_main"), True)
+        self.functions.append(context)
+        self.active.append("main")
+        self.block(main.body)
+        self.active.pop()
+        self.functions.pop()
+        self.check_labels(context)
+        self.emit(Label(context.return_label))
+        # C99: falling off the end of main returns 0.
+        self.emit(Exit(0))
+        # After the exit, so nothing can fall into it.
+        self.emit_float_dispatch()
+        self.scopes.pop()
+        return Module(
+            self.operations,
+            self.stack_slots,
+            list(self.lowered.values()),
+            static_bytes=self.static_bytes,
+        )
+
+
+def _is_character(ctype: CType) -> bool:
+    return ctype in {CHAR, SCHAR, UCHAR}
+
+
+def compile_c_to_ir(
+    source: str,
+    filename: str,
+    target: str,
+    *,
+    include_dirs: tuple[str, ...] = (),
+    defines: tuple[str, ...] = (),
+) -> Module:
+    """Compile C source text to a py2bin native IR module.
+
+    ``include_dirs`` is the ``-I`` search path the preprocessor uses, and
+    ``defines`` the ``-D`` macros (``NAME`` or ``NAME=value``) it starts with.
+    """
+
+    # Imported here rather than at the top because the preprocessor is written
+    # in terms of this module's tokens and lexer, and would otherwise close an
+    # import cycle.
+    from .c_preprocessor import preprocess
+
+    tokens = preprocess(
+        source,
+        filename,
+        target=target,
+        include_dirs=include_dirs,
+        defines=defines,
+    )
+    unit = Parser(tokens, filename).translation_unit()
+    return Lowerer(unit, filename, target).compile()

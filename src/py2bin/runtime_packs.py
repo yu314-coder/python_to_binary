@@ -19,6 +19,21 @@ SUPPORTED_TARGETS = {
     "windows-arm64",
 }
 _ENVIRONMENT_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_COMPACT_PARTS = {
+    "__pycache__",
+    ".pytest_cache",
+    "ensurepip",
+    "idlelib",
+    "lib2to3",
+    "pydoc_data",
+    "pyobjctest",
+    "test",
+    "tests",
+    "tkinter",
+    "turtledemo",
+    "unittest",
+}
+_COMPACT_SUFFIXES = {".a", ".exp", ".lib", ".pdb"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +109,59 @@ def _safe_archive_member(name: str) -> Path | None:
     return Path(*path.parts)
 
 
-def install_runtime_pack(source: Path, destination: Path) -> RuntimePackInfo:
+def _compact_runtime_path(relative: Path) -> bool:
+    lowered = tuple(part.lower() for part in relative.parts)
+    return (
+        any(
+            part in _COMPACT_PARTS or part.startswith("config-")
+            for part in lowered
+        )
+        or (lowered and lowered[0] in {"include", "libs"})
+        or relative.suffix.lower() in _COMPACT_SUFFIXES
+        or relative.name.lower() == "python.cat"
+    )
+
+
+def _compact_stdlib_member(relative: Path) -> bool:
+    lowered = tuple(part.lower() for part in relative.parts)
+    return any(
+        part in _COMPACT_PARTS or part.startswith("config-")
+        for part in lowered
+    )
+
+
+def _compact_stdlib_archive(archive_path: Path) -> None:
+    temporary = archive_path.with_name(f".{archive_path.name}.py2bin-compact")
+    try:
+        with (
+            zipfile.ZipFile(archive_path) as source,
+            zipfile.ZipFile(temporary, "w", allowZip64=True) as destination,
+        ):
+            for member in source.infolist():
+                relative = _safe_archive_member(member.filename)
+                if (
+                    relative is None
+                    or member.is_dir()
+                    or _compact_stdlib_member(relative)
+                ):
+                    continue
+                with (
+                    source.open(member) as input_stream,
+                    destination.open(member, "w", force_zip64=True) as output,
+                ):
+                    shutil.copyfileobj(input_stream, output)
+        temporary.replace(archive_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def install_runtime_pack(
+    source: Path,
+    destination: Path,
+    *,
+    compact: bool = False,
+) -> RuntimePackInfo:
     """Copy a validated runtime pack into a bundle staging root."""
 
     info = inspect_runtime_pack(source)
@@ -106,6 +173,8 @@ def install_runtime_pack(source: Path, destination: Path) -> RuntimePackInfo:
                 continue
             if source_path.is_symlink():
                 raise ValueError(f"runtime pack symlinks are not accepted: {relative}")
+            if compact and _compact_runtime_path(relative):
+                continue
             target = destination / relative
             if source_path.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
@@ -124,6 +193,7 @@ def install_runtime_pack(source: Path, destination: Path) -> RuntimePackInfo:
                     or relative == Path(MANIFEST_NAME)
                     or member.is_dir()
                     or stat.S_ISLNK(unix_mode)
+                    or (compact and _compact_runtime_path(relative))
                 ):
                     continue
                 target = destination / relative
@@ -136,6 +206,17 @@ def install_runtime_pack(source: Path, destination: Path) -> RuntimePackInfo:
                     shutil.copyfileobj(input_stream, output)
                 if unix_mode:
                     target.chmod(unix_mode & 0o777)
+    if compact:
+        for archive_path in destination.rglob("*"):
+            if (
+                archive_path.is_file()
+                and re.fullmatch(
+                    r"python\d+\.zip",
+                    archive_path.name.lower(),
+                )
+                and zipfile.is_zipfile(archive_path)
+            ):
+                _compact_stdlib_archive(archive_path)
     executable = destination / info.executable
     if not executable.is_file():
         raise ValueError(

@@ -48,9 +48,15 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
             if not operation.data:
                 removed_operations += 1
                 continue
-            if optimized and isinstance(optimized[-1], Write):
+            if (
+                optimized
+                and isinstance(optimized[-1], Write)
+                and optimized[-1].fd == operation.fd
+            ):
+                # Only merge writes going to the same file descriptor; stdout
+                # and stderr must stay separate streams.
                 previous = optimized[-1]
-                optimized[-1] = Write(previous.data + operation.data)
+                optimized[-1] = Write(previous.data + operation.data, operation.fd)
                 merged_writes += 1
                 removed_operations += 1
                 continue
@@ -67,4 +73,10 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
         merged_writes=merged_writes,
         removed_operations=removed_operations,
     )
-    return Module(optimized, module.stack_slots), report
+    # Callable bodies are carried through untouched: they have their own
+    # control flow and their own terminator (Return), so none of the rules
+    # above -- which all reason about the entry point's single exit -- apply.
+    return (
+        Module(optimized, module.stack_slots, module.functions, module.static_bytes),
+        report,
+    )

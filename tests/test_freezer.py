@@ -11,10 +11,38 @@ import zipfile
 
 from py2bin.freezer import _frozen_macos_app, _shell_launcher, extract_wheel
 from py2bin.native.launcher import macos_shell_launcher
-from py2bin.onefile import create_onefile
+from py2bin.onefile import _powershell_script, create_onefile
 
 
 class FreezerTests(unittest.TestCase):
+    def test_windows_onefile_script_uses_launcher_environment_without_wmi(self):
+        script = _powershell_script(
+            offset=1234,
+            digest="0" * 64,
+            launcher="Demo.exe",
+        )
+        self.assertIn("$env:PY2BIN_ONEFILE_SELF", script)
+        self.assertIn("$env:PY2BIN_ONEFILE_COMMAND", script)
+        self.assertNotIn("Get-CimInstance", script)
+        self.assertNotIn("Win32_Process", script)
+        self.assertNotIn("Join-Path", script)
+        self.assertNotIn("Test-Path", script)
+        self.assertNotIn("Remove-Item", script)
+        self.assertNotIn("Move-Item", script)
+        self.assertNotIn("New-Object", script)
+        self.assertEqual(
+            script.count("if(![IO.File]::Exists($m))"),
+            2,
+        )
+        self.assertLess(
+            script.index("if(![IO.File]::Exists($m))"),
+            script.index("[Threading.Mutex]::new"),
+        )
+        self.assertIn(
+            "$si=[Diagnostics.ProcessStartInfo]::new()",
+            script,
+        )
+
     @unittest.skipUnless(
         platform.system() == "Darwin" and platform.machine() == "arm64",
         "self-extracting Mach-O runs only on Apple Silicon",
@@ -66,6 +94,39 @@ class FreezerTests(unittest.TestCase):
         image = macos_shell_launcher("exit 0", machine="arm64")
         self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
 
+    def test_x86_64_macos_launcher_reads_the_initial_stack(self):
+        # The x86-64 Mach-O writer uses LC_UNIXTHREAD, which starts execution
+        # at the raw entry point with argc/argv on the initial process stack.
+        # Only the arm64 image uses LC_MAIN, where they arrive in registers.
+        # Reading rdi/rsi/rdx here would read uninitialised registers, and the
+        # launcher would exit 64 instead of running the program.
+        image = macos_shell_launcher("exit 0", machine="x86_64")
+        prologue = (
+            b"\x49\x89\xe5"  # mov r13, rsp
+            b"\x4d\x8b\x65\x00"  # mov r12, [r13]  (argc)
+            b"\x4d\x8d\x75\x08"  # lea r14, [r13+8] (argv)
+        )
+        self.assertIn(prologue, image)
+        # The LC_MAIN register convention must not be used for this target.
+        self.assertNotIn(b"\x49\x89\xfc\x49\x89\xf6\x49\x89\xd7", image)
+
+    def test_x86_64_app_launcher_is_emitted_unsigned(self):
+        # arm64 macOS requires a code signature, so that launcher embeds an
+        # ad-hoc one sealing Info.plist/CodeResources. Intel macOS still loads
+        # unsigned executables, so the same request must produce a valid
+        # x86-64 Mach-O rather than being refused.
+        image = macos_shell_launcher(
+            "exit 0",
+            machine="x86_64",
+            info_plist=b"<plist/>",
+            code_resources=b"<plist/>",
+        )
+        self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
+        # cputype in the Mach-O header: CPU_TYPE_X86_64 is 0x01000007.
+        self.assertEqual(
+            int.from_bytes(image[4:8], "little"), 0x01000007
+        )
+
     @unittest.skipUnless(
         platform.system() == "Darwin" and platform.machine() == "arm64",
         "native launcher execution requires Apple Silicon",
@@ -112,6 +173,48 @@ class FreezerTests(unittest.TestCase):
             self.assertTrue((destination / "demo-1.0.dist-info" / "METADATA").exists())
             self.assertTrue((destination / "plugin.py").exists())
             self.assertFalse((root / "escape").exists())
+
+    def test_compact_wheel_keeps_runtime_payload_and_omits_tests_and_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "demo-1.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("demo/__init__.py", "value = 42\n")
+                archive.writestr("demo/data/schema.json", "{}")
+                archive.writestr("demo/native.pyd", b"native")
+                archive.writestr("demo/compiled_only.pyc", b"runtime")
+                archive.writestr("demo/tests/test_api.py", "assert True\n")
+                archive.writestr(
+                    "demo/__pycache__/module.pyc",
+                    b"bytecode",
+                )
+                archive.writestr(
+                    "demo-1.0.dist-info/METADATA",
+                    "Name: demo\nVersion: 1.0\n",
+                )
+            destination = root / "packages"
+            destination.mkdir()
+            count = extract_wheel(wheel, destination, compact=True)
+            self.assertEqual(count, 5)
+            self.assertTrue((destination / "demo" / "__init__.py").is_file())
+            self.assertTrue(
+                (destination / "demo" / "data" / "schema.json").is_file()
+            )
+            self.assertTrue((destination / "demo" / "native.pyd").is_file())
+            self.assertTrue(
+                (destination / "demo" / "compiled_only.pyc").is_file()
+            )
+            self.assertTrue(
+                (
+                    destination
+                    / "demo-1.0.dist-info"
+                    / "METADATA"
+                ).is_file()
+            )
+            self.assertFalse((destination / "demo" / "tests").exists())
+            self.assertFalse(
+                (destination / "demo" / "__pycache__").exists()
+            )
 
     def test_frozen_macos_app_wraps_payload_and_icon(self):
         with tempfile.TemporaryDirectory() as directory:

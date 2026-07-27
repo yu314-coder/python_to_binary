@@ -37,6 +37,7 @@ def assemble(
     compact: bool = False,
     clean: bool = False,
     onefile: bool = True,
+    experimental_kernels: bool = False,
 ) -> AssemblyResult:
     """Choose real native compilation or a compatible embedded-runtime bundle."""
 
@@ -57,6 +58,8 @@ def assemble(
                 target=target,
                 clean=clean,
                 app=app,
+                source_roots=(source_root,) if source_root is not None else (),
+                experimental_kernels=experimental_kernels,
             )
         except NativeCompileError as error:
             if mode == "native":

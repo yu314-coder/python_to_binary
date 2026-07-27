@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# local build/test scratch on disk D
+.py2bin-work/

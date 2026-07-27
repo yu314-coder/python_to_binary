@@ -3,9 +3,18 @@
 ## Product contract
 
 The end goal is a pure-Python toolchain that writes target executables without
-calling an assembler or linker. A generated native program must not require
-Python on its target computer. The compiler never describes an ABI-specific
-binary as “universal”: each artifact declares its OS and CPU target.
+calling an assembler or linker. A program from the direct-native path must not
+require Python on its target computer. The compiler never describes an
+ABI-specific binary as “universal”: each artifact declares its OS and CPU
+target.
+
+One path is deliberately exempt from the no-Python-on-target rule and says so
+in its own output: the CPython C-API tier links an already-compiled interpreter
+rather than replacing it. Its binary contains py2bin-encoded instructions for
+the program's own logic and an `LC_LOAD_DYLIB` naming the CPython shared
+library, so it needs that interpreter present. It still calls no assembler,
+linker, or C compiler at build time, which is the invariant that actually
+matters here.
 
 The build-host contract is equally strict: Python plus py2bin is sufficient.
 Cross-compilation never probes for or executes a target assembler, linker,
@@ -28,24 +37,62 @@ checksummed `.py2cbin` container. The container is an interchange artifact, not
 machine code. This keeps C generation usable on hosts with only Python while
 leaving final C compilation to an explicitly supplied platform toolchain.
 
+A fourth path closes that loop: `c_frontend.py` is py2bin's own C compiler. It
+lexes and parses C into a C syntax tree, applies C's type rules, and lowers the
+result straight to native IR. It deliberately does not reuse Python's `ast`:
+C and Python are different languages, and the earlier bridge that reused the
+Python tree miscompiled a C `for` by giving it `range` semantics. Nothing in a
+Python tree can express a narrow integer type, the address of a local, or
+`goto`, so C gets its own front end and its own lowering.
+
+`c_native.py` keeps the older canonical-C bridge, which round-trips the C that
+py2bin's *own* generator emits back into a Python AST. That path exists to
+prove `emit-c` output means what the Python meant, not to compile C in general.
+
+Because py2bin both generates and parses C, it never reads `Python.h` or any
+other system header. Every `PyObject *` is an opaque 64-bit handle: an
+incomplete type the compiler refuses to dereference or offset. py2bin has its
+own preprocessor (`c_preprocessor.py`) and could include a header it can parse,
+but a real system header is macros, `static inline` functions and struct
+layouts that this compiler does not implement; writing the `extern` prototypes
+out instead is what keeps a handwritten C compiler tractable.
+
 ## Pipeline
 
 ```text
-Python source
-    |
+Python source                       C source
+    |                                     |
+    |                        c_frontend.py lexer/parser
+    |                                     |
+    |                            C syntax tree + C types
+    |                                     |
+    |                        C-specific lowering (no Python AST)
+    |                                     |
+Python AST                                |
+    |                                     |
     +-- AST validation, planning, and type/constant discovery
-    |      |
+    |      |                              |
     |      +-- portable C source / .py2cbin
     |      +-- CPython freeze plan for imports or unsupported semantics
+    |                                     |
+    +-- py2bin portable IR <--------------+
+    |      Int*/Float*/Heap*/SlotAddress/ExternCall/CStringConstant/Write/
+    |      WriteRuntime/Store/FloatStore/Label/Jump/JumpIfFalse/Exit/ExitValue
     |
-    +-- py2bin portable IR (currently Write and Exit)
+    +-- target-independent optimizer
     |
     +-- target instruction encoder
-    |      x86-64                 arm64
+    |      x86-64                 arm64 (+ dyld extern binding)
     |
     +-- executable image writer
            ELF       Mach-O + ad-hoc signature       PE32+
 ```
+
+An `ExternCall` is the single node behind both the libc adapter ABI and the
+CPython C-API tier. On `darwin-arm64` the Mach-O writer emits one
+`LC_LOAD_DYLIB` per referenced library with the correct two-level namespace
+ordinals, and `cabi.symbol_library` decides which library owns each symbol.
+Every other target rejects the node rather than emitting an unbound call.
 
 Every layer consumes structured objects and returns text or bytes. No layer
 emits assembly text or invokes a platform toolchain. The C backend emits source

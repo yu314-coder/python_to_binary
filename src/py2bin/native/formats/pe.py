@@ -57,8 +57,26 @@ def _imports(section_rva: int, image_base: int) -> tuple[bytes, dict[str, int], 
     return _imports_for(
         section_rva,
         image_base,
-        ("GetStdHandle", "WriteFile", "ExitProcess"),
+        # VirtualAlloc supplies the writable block that holds file-scope
+        # variables, the way an anonymous mmap does on POSIX.
+        (
+            "GetStdHandle",
+            "WriteFile",
+            "ExitProcess",
+            "VirtualAlloc",
+            # File access. CreateFileA takes the same narrow path bytes a
+            # native string already holds, so nothing has to be widened to
+            # UTF-16 on the way in.
+            "CreateFileA",
+            "ReadFile",
+            "CloseHandle",
+        ),
     )
+
+
+# A thread stack past this is a runaway rather than a program, and committing
+# it up front would be a real cost to every process that runs the image.
+_MAXIMUM_STACK_RESERVE = 16 * 1024 * 1024
 
 
 def _pe_image(
@@ -70,7 +88,30 @@ def _pe_image(
     iat_size: int,
     writable_rdata: bool = False,
     subsystem: int = 3,
+    stack_bytes: int = 0,
 ) -> bytes:
+    # Windows grows a thread stack one page at a time, by faulting on the
+    # guard page that sits just below the committed region. Both prologues here
+    # move the stack pointer down by the whole frame and then write at the new
+    # low end, so a frame larger than a page steps clean over the guard page and
+    # the write lands in reserved-but-uncommitted memory - an access violation
+    # rather than a stack that grows. Committing enough up front for the largest
+    # frame in the image means every such write lands inside committed memory
+    # and no guard page is ever involved. The alternative, a probe loop in each
+    # prologue touching one byte per page, is what MSVC emits; it is also
+    # machine code for two architectures that cannot be run or tested here,
+    # where this is a header field with exactly this purpose.
+    page = 0x1000
+    guard_slack = 4 * page  # room for the guard pages Windows keeps below it
+    stack_commit = max(page, _align(stack_bytes + guard_slack, page))
+    stack_reserve = max(0x100000, _align(stack_commit + guard_slack, page))
+    if stack_reserve > _MAXIMUM_STACK_RESERVE:
+        raise ValueError(
+            f"a frame of {stack_bytes} bytes would need a "
+            f"{stack_reserve}-byte thread stack, past the "
+            f"{_MAXIMUM_STACK_RESERVE}-byte ceiling this writer commits; split "
+            "the code into smaller functions"
+        )
     image_base = 0x140000000
     section_alignment = 0x1000
     file_alignment = 0x200
@@ -95,7 +136,15 @@ def _pe_image(
     struct.pack_into("<HHHHHH", optional, 40, 6, 0, 0, 1, 6, 0)
     struct.pack_into("<III", optional, 52, 0, image_size, headers_size)
     struct.pack_into("<IHH", optional, 64, 0, subsystem, 0x8160)
-    struct.pack_into("<QQQQ", optional, 72, 0x100000, 0x1000, 0x100000, 0x1000)
+    struct.pack_into(
+        "<QQQQ",
+        optional,
+        72,
+        stack_reserve,
+        stack_commit,
+        0x100000,
+        0x1000,
+    )
     struct.pack_into("<II", optional, 104, 0, 16)
     struct.pack_into("<II", optional, 120, rdata_rva, 40)
     struct.pack_into("<II", optional, 208, rdata_rva + iat_offset, iat_size)
@@ -149,17 +198,34 @@ def _write_pe(module: Module, machine: int, arm64: bool) -> bytes:
     rdata, imports, iat_offset, iat_size = _imports(rdata_rva, image_base)
     encoder = encode_windows_arm64 if arm64 else encode_windows
     code = encoder(module, image_base + text_rva, imports)
+    # An upper bound on how much stack the program can be using at once. The
+    # largest single frame is not enough: the C front end emits real calls, so
+    # frames nest, and a deep chain lands below the committed region exactly the
+    # way one oversized frame does. Summing every body bounds any non-recursive
+    # nesting - conservative, since most of those bodies never share the stack,
+    # but the cost is committed pages and the alternative is a fault.
+    #
+    # Recursion deeper than this still walks off the end. That is stack
+    # exhaustion rather than this bug, and it behaved the same way before.
+    slots = module.stack_slots + sum(
+        function.stack_slots for function in module.functions
+    )
+    stack_bytes = slots * 8 + 0x200 * (1 + len(module.functions))
     return _pe_image(
         code,
         rdata,
         machine=machine,
         iat_offset=iat_offset,
         iat_size=iat_size,
+        stack_bytes=stack_bytes,
     )
 
 
 _LAUNCHER_IMPORTS = (
     "lstrcpyA",
+    "GetModuleFileNameW",
+    "GetCommandLineW",
+    "SetEnvironmentVariableW",
     "CreateProcessA",
     "WaitForSingleObject",
     "GetExitCodeProcess",
@@ -170,7 +236,7 @@ _LAUNCHER_IMPORTS = (
 
 def _launcher_rdata(
     command_prefix: bytes,
-) -> tuple[bytes, dict[str, int], int, int, int, int]:
+) -> tuple[bytes, dict[str, int], int, int, int, int, int, int, int]:
     image_base = 0x140000000
     rdata_rva = 0x2000
     raw, imports, iat_offset, iat_size = _imports_for(
@@ -186,8 +252,24 @@ def _launcher_rdata(
     buffer_offset = len(data)
     # CreateProcess may modify its command-line buffer in place.
     data.extend(b"\0" * (len(command_prefix) + 1))
+    while len(data) % 16:
+        data.append(0)
+    self_environment_offset = len(data)
+    data.extend("PY2BIN_ONEFILE_SELF".encode("utf-16-le") + b"\0\0")
+    command_environment_offset = len(data)
+    data.extend("PY2BIN_ONEFILE_COMMAND".encode("utf-16-le") + b"\0\0")
+    while len(data) % 16:
+        data.append(0)
+    module_path_offset = len(data)
+    # GetModuleFileNameW accepts the extended Windows path limit in WCHARs.
+    data.extend(b"\0" * (32768 * 2))
     prefix_address = image_base + rdata_rva + prefix_offset
     buffer_address = image_base + rdata_rva + buffer_offset
+    self_environment_address = image_base + rdata_rva + self_environment_offset
+    command_environment_address = (
+        image_base + rdata_rva + command_environment_offset
+    )
+    module_path_address = image_base + rdata_rva + module_path_offset
     return (
         bytes(data),
         imports,
@@ -195,6 +277,9 @@ def _launcher_rdata(
         iat_size,
         prefix_address,
         buffer_address,
+        self_environment_address,
+        command_environment_address,
+        module_path_address,
     )
 
 
@@ -203,6 +288,9 @@ def _x86_64_launcher_code(
     imports: dict[str, int],
     prefix_address: int,
     buffer_address: int,
+    self_environment_address: int,
+    command_environment_address: int,
+    module_path_address: int,
 ) -> bytes:
     code = bytearray()
     calls: list[tuple[int, str]] = []
@@ -223,6 +311,25 @@ def _x86_64_launcher_code(
 
     code.extend(b"\x48\x81\xec\xe8\0\0\0")  # sub rsp, 0xe8
     code.extend(b"\x31\xc0\x48\x8d\x7c\x24\x20\xb9\x19\0\0\0\xf3\x48\xab")
+    code.extend(b"\x31\xc9")
+    lea(b"\x48\x8d\x15", module_path_address)
+    code.extend(b"\x41\xb8\0\x80\0\0")
+    call("GetModuleFileNameW")
+    code.extend(b"\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
+    lea(b"\x48\x8d\x0d", self_environment_address)
+    lea(b"\x48\x8d\x15", module_path_address)
+    call("SetEnvironmentVariableW")
+    code.extend(b"\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
+    call("GetCommandLineW")
+    code.extend(b"\x48\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
+    code.extend(b"\x48\x89\xc2")
+    lea(b"\x48\x8d\x0d", command_environment_address)
+    call("SetEnvironmentVariableW")
+    code.extend(b"\x85\xc0\x0f\x84\0\0\0\0")
+    branches.append((len(code) - 4, "failure"))
     lea(b"\x48\x8d\x0d", buffer_address)
     lea(b"\x48\x8d\x15", prefix_address)
     call("lstrcpyA")
@@ -270,6 +377,9 @@ def _arm64_launcher_code(
     imports: dict[str, int],
     prefix_address: int,
     buffer_address: int,
+    self_environment_address: int,
+    command_environment_address: int,
+    module_path_address: int,
 ) -> bytes:
     words: list[int] = [_sub_sp(160)]
     calls: list[tuple[int, str]] = []
@@ -287,6 +397,23 @@ def _arm64_launcher_code(
 
     for offset in range(0, 160, 8):
         words.append(0xF90003FF | ((offset // 8) << 10))  # str xzr,[sp,#offset]
+    words.append(0xAA1F03E0)  # x0 = NULL
+    address(1, module_path_address)
+    words.extend(_mov(2, 32768))
+    call("GetModuleFileNameW")
+    failure_branches = [len(words)]
+    words.append(0)
+    address(0, self_environment_address)
+    address(1, module_path_address)
+    call("SetEnvironmentVariableW")
+    failure_branches.append(len(words))
+    words.append(0)
+    call("GetCommandLineW")
+    words.append(0xAA0003E1)  # x1 = returned command line
+    address(0, command_environment_address)
+    call("SetEnvironmentVariableW")
+    failure_branches.append(len(words))
+    words.append(0)
     address(0, buffer_address)
     address(1, prefix_address)
     call("lstrcpyA")
@@ -306,7 +433,7 @@ def _arm64_launcher_code(
         )
     )
     call("CreateProcessA")
-    failure_branch = len(words)
+    failure_branches.append(len(words))
     words.append(0)
     words.append(0xF94043E0)  # thread handle at process-info + 8
     call("CloseHandle")
@@ -325,10 +452,11 @@ def _arm64_launcher_code(
     words.extend(_mov(0, 111))
     words.append(0x910283FF)
     call("ExitProcess")
-    words[failure_branch] = (
-        0xB4000000
-        | (((failure_index - failure_branch) & 0x7FFFF) << 5)
-    )
+    for failure_branch in failure_branches:
+        words[failure_branch] = (
+            0x34000000
+            | (((failure_index - failure_branch) & 0x7FFFF) << 5)
+        )
 
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
     for index, register, target in addresses:
@@ -374,16 +502,31 @@ def write_pe_shell_launcher(
         iat_size,
         prefix_address,
         buffer_address,
+        self_environment_address,
+        command_environment_address,
+        module_path_address,
     ) = _launcher_rdata(command_prefix)
     code_address = 0x140001000
     if machine == "x86_64":
         code = _x86_64_launcher_code(
-            code_address, imports, prefix_address, buffer_address
+            code_address,
+            imports,
+            prefix_address,
+            buffer_address,
+            self_environment_address,
+            command_environment_address,
+            module_path_address,
         )
         machine_id = 0x8664
     elif machine == "arm64":
         code = _arm64_launcher_code(
-            code_address, imports, prefix_address, buffer_address
+            code_address,
+            imports,
+            prefix_address,
+            buffer_address,
+            self_environment_address,
+            command_environment_address,
+            module_path_address,
         )
         machine_id = 0xAA64
     else:

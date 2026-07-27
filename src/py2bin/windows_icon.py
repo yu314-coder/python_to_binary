@@ -7,6 +7,7 @@ from pathlib import Path
 
 RT_ICON = 3
 RT_GROUP_ICON = 14
+RT_VERSION = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,108 @@ def _ico_resources(icon: bytes) -> dict[tuple[int, int, int], ResourceBlob]:
     return resources
 
 
+def _version_block(
+    key: str,
+    *,
+    value: bytes = b"",
+    value_length: int = 0,
+    value_type: int = 0,
+    children: tuple[bytes, ...] = (),
+) -> bytes:
+    output = bytearray(b"\0" * 6)
+    output.extend(key.encode("utf-16-le") + b"\0\0")
+    while len(output) % 4:
+        output.append(0)
+    output.extend(value)
+    while len(output) % 4:
+        output.append(0)
+    for child in children:
+        output.extend(child)
+        while len(output) % 4:
+            output.append(0)
+    struct.pack_into("<HHH", output, 0, len(output), value_length, value_type)
+    return bytes(output)
+
+
+def _version_string(key: str, value: str) -> bytes:
+    encoded = value.encode("utf-16-le") + b"\0\0"
+    return _version_block(
+        key,
+        value=encoded,
+        value_length=len(encoded) // 2,
+        value_type=1,
+    )
+
+
+def _version_resources(
+    name: str,
+    version: str,
+) -> dict[tuple[int, int, int], ResourceBlob]:
+    parts = []
+    for value in version.split(".")[:4]:
+        match = ""
+        for character in value:
+            if not character.isdigit():
+                break
+            match += character
+        parts.append(min(int(match or 0), 0xFFFF))
+    parts.extend([0] * (4 - len(parts)))
+    version_ms = (parts[0] << 16) | parts[1]
+    version_ls = (parts[2] << 16) | parts[3]
+    fixed = struct.pack(
+        "<13I",
+        0xFEEF04BD,
+        0x00010000,
+        version_ms,
+        version_ls,
+        version_ms,
+        version_ls,
+        0x3F,
+        0,
+        0x00040004,
+        1,
+        0,
+        0,
+        0,
+    )
+    strings = (
+        _version_string("CompanyName", "python-to-binary"),
+        _version_string("FileDescription", name),
+        _version_string("FileVersion", version),
+        _version_string("InternalName", name),
+        _version_string("OriginalFilename", f"{name}.exe"),
+        _version_string("ProductName", name),
+        _version_string("ProductVersion", version),
+    )
+    string_table = _version_block(
+        "040904B0",
+        value_type=1,
+        children=strings,
+    )
+    string_file_info = _version_block(
+        "StringFileInfo",
+        value_type=1,
+        children=(string_table,),
+    )
+    translation = _version_block(
+        "Translation",
+        value=struct.pack("<HH", 0x0409, 1200),
+        value_length=4,
+    )
+    var_file_info = _version_block(
+        "VarFileInfo",
+        value_type=1,
+        children=(translation,),
+    )
+    root = _version_block(
+        "VS_VERSION_INFO",
+        value=fixed,
+        value_length=len(fixed),
+        children=(string_file_info, var_file_info),
+    )
+    return {(RT_VERSION, 1, 0x0409): ResourceBlob(root, 1200)}
+
+
 def _resource_section(
     resources: dict[tuple[int, int, int], ResourceBlob],
     section_rva: int,
@@ -201,21 +304,20 @@ def _resource_section(
     return bytes(output)
 
 
-def install_windows_icon(executable: Path, icon: Path) -> None:
-    """Replace PE icon resources without invoking a Windows resource compiler."""
-
+def _install_windows_resources(
+    executable: Path,
+    replacements: dict[tuple[int, int, int], ResourceBlob],
+    replace_types: set[int],
+) -> None:
     executable = executable.expanduser().resolve()
-    icon = icon.expanduser().resolve()
-    if icon.suffix.lower() != ".ico":
-        raise ValueError("Windows executable icons must be .ico files")
     image = bytearray(executable.read_bytes())
     layout = _pe_layout(image)
     resources = {
         key: value
         for key, value in _existing_resources(image, layout).items()
-        if key[0] not in {RT_ICON, RT_GROUP_ICON}
+        if key[0] not in replace_types
     }
-    resources.update(_ico_resources(icon.read_bytes()))
+    resources.update(replacements)
 
     sections = list(layout["sections"])
     section_alignment = int(layout["section_alignment"])
@@ -264,3 +366,38 @@ def install_windows_icon(executable: Path, icon: Path) -> None:
     struct.pack_into("<I", image, optional + 64, 0)  # checksum
     struct.pack_into("<II", image, optional + 112 + 32, 0, 0)  # certificate table
     executable.write_bytes(image)
+
+
+def install_windows_icon(executable: Path, icon: Path) -> None:
+    """Replace PE icon resources without invoking a Windows resource compiler."""
+
+    icon = icon.expanduser().resolve()
+    if icon.suffix.lower() != ".ico":
+        raise ValueError("Windows executable icons must be .ico files")
+    _install_windows_resources(
+        executable,
+        _ico_resources(icon.read_bytes()),
+        {RT_ICON, RT_GROUP_ICON},
+    )
+
+
+def install_windows_identity(
+    executable: Path,
+    name: str,
+    *,
+    version: str,
+    icon: Path | None = None,
+) -> None:
+    """Give an app-host PE its own icon and version-resource identity."""
+
+    replacements = _version_resources(name, version)
+    if icon is not None:
+        icon = icon.expanduser().resolve()
+        if icon.suffix.lower() != ".ico":
+            raise ValueError("Windows executable icons must be .ico files")
+        replacements.update(_ico_resources(icon.read_bytes()))
+    _install_windows_resources(
+        executable,
+        replacements,
+        {RT_ICON, RT_GROUP_ICON, RT_VERSION},
+    )

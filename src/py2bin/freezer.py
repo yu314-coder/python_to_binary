@@ -28,7 +28,11 @@ from .runtime_packs import (
     inspect_runtime_pack,
     write_runtime_manifest,
 )
-from .windows_icon import install_windows_icon
+from .windows_icon import install_windows_icon, install_windows_identity
+
+# CPython version fetched for a cross-target bundle when none is requested.
+# It is pinned rather than "latest" so an unattended build is reproducible.
+_DEFAULT_FETCH_PYTHON = "3.12.9"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +68,15 @@ class WheelInfo:
 
 
 _REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_WEB_ASSET_KINDS = {
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".wasm": "webassembly",
+}
 
 
 def _required_suffix(path: Path, suffix: str) -> Path:
@@ -74,6 +87,49 @@ def _required_suffix(path: Path, suffix: str) -> Path:
 
 def _canonical_distribution(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _web_assets(
+    bundle_root: Path,
+    content_roots: tuple[Path, ...],
+) -> list[dict[str, object]]:
+    assets: list[dict[str, object]] = []
+    files = (
+        candidate
+        for content_root in content_roots
+        for candidate in content_root.rglob("*")
+        if candidate.is_file()
+    )
+    for path in sorted(
+        files,
+        key=lambda candidate: candidate.relative_to(bundle_root).as_posix(),
+    ):
+        kind = _WEB_ASSET_KINDS.get(path.suffix.lower())
+        if kind is None:
+            continue
+        assets.append(
+            {
+                "path": path.relative_to(bundle_root).as_posix(),
+                "kind": kind,
+                "bytes": path.stat().st_size,
+                "sha256": _file_sha256(path),
+            }
+        )
+    return assets
+
+
+def _windows_app_user_model_id(name: str) -> str:
+    parts = re.findall(r"[A-Za-z0-9]+", name)
+    product = "".join(part[:1].upper() + part[1:] for part in parts) or "App"
+    return f"PythonToBinary.{product}"[:128]
 
 
 def inspect_wheel(wheel: Path) -> WheelInfo:
@@ -195,14 +251,37 @@ def _safe_wheel_member(name: str) -> Path | None:
     return Path(*parts)
 
 
-def extract_wheel(wheel: Path, destination: Path) -> int:
+def extract_wheel(
+    wheel: Path,
+    destination: Path,
+    *,
+    compact: bool = False,
+) -> int:
     """Install a wheel as data, without pip or executing package code."""
     count = 0
     with zipfile.ZipFile(wheel) as archive:
         for info in archive.infolist():
             relative = _safe_wheel_member(info.filename)
             unix_mode = (info.external_attr >> 16) & 0xFFFF
-            if relative is None or info.is_dir() or stat.S_ISLNK(unix_mode):
+            if (
+                relative is None
+                or info.is_dir()
+                or stat.S_ISLNK(unix_mode)
+                or (
+                    compact
+                    and any(
+                        part.lower()
+                        in {
+                            "__pycache__",
+                            ".pytest_cache",
+                            "pyobjctest",
+                            "test",
+                            "tests",
+                        }
+                        for part in relative.parts
+                    )
+                )
+            ):
                 continue
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -536,6 +615,141 @@ def _frozen_macos_onefile_app(
     return launcher
 
 
+def default_fetch_cache() -> Path:
+    """Where verified downloads are cached between builds."""
+
+    override = os.environ.get("PY2BIN_CACHE_DIR")
+    root = Path(override) if override else Path.home() / ".cache" / "py2bin"
+    return root / "fetch"
+
+
+def _auto_fetch_runtime(
+    target: str,
+    fetch_cache: Path | None,
+    fetch_lock: Path | None,
+    fetch_python: str | None,
+) -> Path:
+    """Download and verify a target CPython runtime pack."""
+
+    from .runtime_fetch import FetchError, FetchLock, fetch_windows_runtime
+
+    cache = (fetch_cache or default_fetch_cache()).expanduser().resolve()
+    version = fetch_python or _DEFAULT_FETCH_PYTHON
+    destination = cache / "runtimes" / f"cpython-{version}-{target}"
+    lock = FetchLock.load(fetch_lock)
+    lock.path = fetch_lock
+    if destination.is_dir() and (destination / "py2bin-runtime.json").is_file():
+        return destination
+    try:
+        fetch_windows_runtime(
+            version,
+            target,
+            destination,
+            cache=cache / "blobs",
+            lock=lock,
+            clean=True,
+        )
+    except FetchError as error:
+        raise ValueError(
+            f"could not fetch a {target} CPython runtime: {error}"
+        ) from error
+    return destination
+
+
+def _auto_fetch_wheels(
+    missing: set[str],
+    target: str,
+    python_version: str,
+    fetch_cache: Path | None,
+    fetch_lock: Path | None,
+) -> tuple[Path, ...]:
+    """Download verified target wheels for every missing distribution."""
+
+    from .runtime_fetch import FetchError, FetchLock, fetch_wheel
+
+    cache = (fetch_cache or default_fetch_cache()).expanduser().resolve()
+    output = cache / "wheels" / target
+    lock = FetchLock.load(fetch_lock)
+    lock.path = fetch_lock
+    fetched: list[Path] = []
+    failures: list[str] = []
+    short_version = ".".join(python_version.split(".")[:2])
+    for project in sorted(missing):
+        try:
+            result = fetch_wheel(
+                project,
+                target,
+                short_version,
+                output,
+                cache=cache / "blobs",
+                lock=lock,
+            )
+        except FetchError as error:
+            failures.append(f"{project}: {error}")
+            continue
+        fetched.append(result.path)
+    lock.save()
+    if failures:
+        raise ValueError(
+            "could not fetch every target wheel:\n  " + "\n  ".join(failures)
+        )
+    return tuple(fetched)
+
+
+def _missing_pack_wheels(analysis, wheels: tuple[WheelInfo, ...]) -> set[str]:
+    """Distributions a runtime-pack build still needs a target wheel for.
+
+    This mirrors :func:`_validate_pack_wheel_closure`, which reports the same
+    set as an error. Unresolved imports are included by their import name so a
+    project that is only reachable as a bare import can still be fetched.
+    """
+
+    by_name = {_canonical_distribution(wheel.name) for wheel in wheels}
+    by_top_level = {
+        top_level: wheel for wheel in wheels for top_level in wheel.top_levels
+    }
+    required = {_canonical_distribution(name) for name in analysis.distributions}
+    for module in analysis.modules:
+        wheel = by_top_level.get(module.partition(".")[0])
+        if wheel is not None:
+            required.add(_canonical_distribution(wheel.name))
+    missing = {name for name in required if name not in by_name}
+    return missing
+
+
+def _unmapped_imports(analysis, wheels: tuple[WheelInfo, ...]) -> set[str]:
+    """Bare imports with no wheel and no distribution behind them."""
+
+    by_top_level = {
+        top_level for wheel in wheels for top_level in wheel.top_levels
+    }
+    return {
+        unresolved
+        for unresolved in analysis.unresolved
+        if unresolved not in by_top_level
+    }
+
+
+def _missing_wheel_requirements(wheels: tuple[WheelInfo, ...]) -> set[str]:
+    """Unsatisfied unconditional requirements of the supplied wheels."""
+
+    by_name = {_canonical_distribution(wheel.name) for wheel in wheels}
+    missing: set[str] = set()
+    for wheel in wheels:
+        for requirement in wheel.requirements:
+            # Requirements carrying an environment marker are conditional and
+            # are left to the caller, matching the validator below.
+            if ";" in requirement:
+                continue
+            match = _REQUIREMENT_NAME.match(requirement)
+            if not match:
+                continue
+            dependency = _canonical_distribution(match.group(1))
+            if dependency not in by_name:
+                missing.add(dependency)
+    return missing
+
+
 def _validate_pack_wheel_closure(
     analysis,
     wheels: tuple[WheelInfo, ...],
@@ -614,8 +828,14 @@ def freeze(
     runtime_pack: Path | None = None,
     target: str | None = None,
     onefile: bool = True,
+    auto_fetch: bool = False,
+    fetch_cache: Path | None = None,
+    fetch_lock: Path | None = None,
+    fetch_python: str | None = None,
+    fetch_map: dict[str, str] | None = None,
 ) -> FreezeResult:
     """Create a no-installed-Python bundle for a compatible target runtime."""
+    fetch_map = dict(fetch_map or {})
     entry = entry.expanduser().resolve()
     output = output.expanduser().resolve()
     source_root = (source_root or entry.parent).expanduser().resolve()
@@ -624,6 +844,17 @@ def freeze(
         if output.suffix.lower() in {".app", ".bin", ".exe"}
         else output.name
     )
+    if (
+        auto_fetch
+        and runtime_pack is None
+        and target is not None
+        and target != host_target()
+    ):
+        # The build machine has no runtime for this target, but the target's
+        # CPython is published, so retrieve and verify it instead of failing.
+        runtime_pack = _auto_fetch_runtime(
+            target, fetch_cache, fetch_lock, fetch_python
+        )
     runtime_pack_info = (
         inspect_runtime_pack(runtime_pack) if runtime_pack is not None else None
     )
@@ -645,18 +876,16 @@ def freeze(
         if runtime_pack_info is not None
         else f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     )
-    macos_app = app and bundle_target == "darwin-arm64"
+    macos_app = app and bundle_target.startswith("darwin-")
     windows_app = app and bundle_target.startswith("windows-")
     if app:
         if not (macos_app or windows_app):
             raise ValueError(
-                "--app currently requires a darwin-arm64 or Windows runtime"
+                "--app currently requires a macOS or Windows runtime"
             )
-        if windows_app and not onefile:
-            raise ValueError("Windows --app currently requires --onefile")
         if macos_app:
             output = _required_suffix(output, ".app")
-        elif windows_app:
+        elif windows_app and onefile:
             output = _required_suffix(output, ".exe")
     elif onefile:
         required_suffix = ".exe" if bundle_target.startswith("windows-") else ".bin"
@@ -694,6 +923,45 @@ def freeze(
     )
     analysis = analyze(entry, source_root, includes, excludes, analysis_mode)
     if runtime_pack_info is not None:
+        if auto_fetch:
+            missing = _missing_pack_wheels(analysis, wheel_infos)
+            # An import name is not a PyPI project name, and the two namespaces
+            # are not even close for common packages ("webview" is pywebview,
+            # "PIL" is pillow). Fetching a project guessed from an import name
+            # could install an unrelated or hostile package, so require an
+            # explicit mapping instead of guessing.
+            unmapped = _unmapped_imports(analysis, wheel_infos)
+            for module in sorted(unmapped):
+                project = fetch_map.get(module)
+                if project is None:
+                    raise ValueError(
+                        f"cannot auto-fetch a wheel for the bare import {module!r}: "
+                        "an import name is not a PyPI project name. Supply "
+                        f"--fetch-map {module}=PROJECT, or provide the wheel with "
+                        "--wheel/--wheel-dir."
+                    )
+                missing.add(_canonical_distribution(project))
+            # Fetch, then follow each new wheel's own requirements, until the
+            # closure is satisfied. The round limit stops a dependency cycle or
+            # a mis-resolving index from looping forever.
+            for _round in range(16):
+                if not missing:
+                    break
+                extra = _auto_fetch_wheels(
+                    missing,
+                    bundle_target,
+                    runtime_python_version,
+                    fetch_cache,
+                    fetch_lock,
+                )
+                wheel_infos = (
+                    *wheel_infos,
+                    *(inspect_wheel(path) for path in extra),
+                )
+                wheels = (*wheels, *extra)
+                missing = _missing_pack_wheels(analysis, wheel_infos)
+                if dependency_mode == "closure":
+                    missing |= _missing_wheel_requirements(wheel_infos)
         _validate_pack_wheel_closure(analysis, wheel_infos, dependency_mode)
         analysis.distributions = {wheel.name for wheel in wheel_infos}
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -711,10 +979,18 @@ def freeze(
             for distribution in sorted(analysis.distributions, key=str.lower):
                 _copy_distribution(distribution, packages, compact=compact)
         for wheel in wheels:
-            extract_wheel(wheel.expanduser().resolve(), packages)
+            extract_wheel(
+                wheel.expanduser().resolve(),
+                packages,
+                compact=compact,
+            )
 
         if runtime_pack is not None:
-            installed_pack = install_runtime_pack(runtime_pack, stage)
+            installed_pack = install_runtime_pack(
+                runtime_pack,
+                stage,
+                compact=compact,
+            )
             runtime_executable = stage / installed_pack.executable
             runtime_environment = installed_pack.environment
         else:
@@ -726,6 +1002,9 @@ def freeze(
             )
         runtime_relative = runtime_executable.relative_to(stage)
         entry_relative = entry.relative_to(source_root).as_posix()
+        windows_app_id = (
+            _windows_app_user_model_id(name) if windows_app else None
+        )
         manifest = {
             "schema": 1,
             "entry": entry_relative,
@@ -734,32 +1013,51 @@ def freeze(
             "distributions": sorted(analysis.distributions, key=str.lower),
             "wheels": [path.name for path in wheels],
             "compact": compact,
+            "web_assets": _web_assets(
+                stage,
+                (stage / "app", packages),
+            ),
+            "windows_app_user_model_id": windows_app_id,
         }
         (stage / "py2bin-freeze.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n"
         )
+        bootstrap_entry = repr(entry_relative)
+        bootstrap_app_id = repr(windows_app_id)
         (stage / "py2bin_bootstrap.py").write_text(
-            "import json, os, runpy, sys, traceback\n"
-            "from pathlib import Path\n"
+            "import os, runpy, sys\n"
+            f"_ENTRY = {bootstrap_entry}\n"
+            f"_WINDOWS_APP_ID = {bootstrap_app_id}\n"
             "def main(from_site=False):\n"
-            "    root = Path(__file__).resolve().parent\n"
-            "    manifest = json.loads((root / 'py2bin-freeze.json').read_text())\n"
-            "    sys.path[:0] = [str(root / 'app'), str(root / 'site-packages')]\n"
-            "    entry = root / 'app' / manifest['entry']\n"
-            "    sys.argv[0] = str(entry)\n"
-            "    os.environ['PY2BIN_BUNDLE_ROOT'] = str(root)\n"
+            "    root = os.path.dirname(os.path.abspath(__file__))\n"
+            "    if _WINDOWS_APP_ID and sys.platform == 'win32':\n"
+            "        try:\n"
+            "            import ctypes\n"
+            "            setter = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID\n"
+            "            setter.argtypes = [ctypes.c_wchar_p]\n"
+            "            setter.restype = ctypes.c_long\n"
+            "            setter(_WINDOWS_APP_ID)\n"
+            "        except BaseException:\n"
+            "            pass\n"
+            "    app_root = os.path.join(root, 'app')\n"
+            "    sys.path[:0] = [app_root, os.path.join(root, 'site-packages')]\n"
+            "    entry = os.path.join(app_root, *_ENTRY.split('/'))\n"
+            "    sys.argv[0] = entry\n"
+            "    os.environ['PY2BIN_BUNDLE_ROOT'] = root\n"
             "    if not from_site:\n"
-            "        runpy.run_path(str(entry), run_name='__main__')\n"
+            "        runpy.run_path(entry, run_name='__main__')\n"
             "        return\n"
             "    status = 0\n"
             "    try:\n"
-            "        runpy.run_path(str(entry), run_name='__main__')\n"
+            "        runpy.run_path(entry, run_name='__main__')\n"
             "    except SystemExit as error:\n"
             "        status = error.code if isinstance(error.code, int) else 1\n"
             "    except BaseException:\n"
+            "        import traceback\n"
             "        report = traceback.format_exc()\n"
             "        try:\n"
-            "            (root / 'py2bin-error.log').write_text(report, encoding='utf-8')\n"
+            "            with open(os.path.join(root, 'py2bin-error.log'), 'w', encoding='utf-8') as stream:\n"
+            "                stream.write(report)\n"
             "        except BaseException:\n"
             "            pass\n"
             "        try:\n"
@@ -784,7 +1082,15 @@ def freeze(
             runtime_path_files = tuple(
                 runtime_executable.parent.glob("python*._pth")
             )
-            runtime_executable.replace(launcher)
+            launcher_source = runtime_executable
+            if windows_app:
+                windowed_runtime = runtime_executable.with_name("pythonw.exe")
+                if not windowed_runtime.is_file():
+                    raise ValueError(
+                        "Windows --app requires pythonw.exe in the runtime pack"
+                    )
+                launcher_source = windowed_runtime
+            launcher_source.replace(launcher)
             major, minor = runtime_python_version.split(".")[:2]
             isolated_path = (
                 f"python{major}{minor}.zip\n"
@@ -800,7 +1106,14 @@ def freeze(
                 encoding="utf-8",
                 newline="\n",
             )
-            if icon is not None and not onefile:
+            if windows_app:
+                install_windows_identity(
+                    launcher,
+                    name,
+                    version="1.0.0.0",
+                    icon=icon,
+                )
+            elif icon is not None:
                 install_windows_icon(launcher, icon)
         else:
             launcher = stage / f"{name}.bin"

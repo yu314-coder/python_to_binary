@@ -52,10 +52,53 @@ else:
             self.assertEqual(result.operations, 2)
 
     def test_identity_comparison_rejects_non_singletons(self):
+        # The fold found the real fault, so it stays the reported one even
+        # though the runtime path was tried afterwards and also failed. The
+        # message is reported once: it is not wrapped in a second location.
         with self.assertRaisesRegex(
-            NativeCompileError, "identity comparison is limited"
+            NativeCompileError,
+            r"^identity\.py:1:4: identity comparison is limited to None, True, "
+            r"or False$",
         ):
             lower(Path("identity.py"), 'if "value" is "value":\n    print("bad")\n')
+
+    def test_runtime_condition_reports_the_lowering_failure(self):
+        # A runtime condition never folds, so "not a compile-time constant"
+        # would be true of every one of these and name nothing.
+        # A float, a list and a string in a condition used to be here too.
+        # They lower now - each is true when it is non-zero or non-empty, as
+        # Python says - so what is left is the conditions that still cannot be
+        # lowered at all.
+        cases = [
+            (
+                # `x is None` is settled by kinds now, so it is no longer a
+                # condition that cannot be lowered. A name that may be unbound
+                # still is.
+                "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    b = [1]\n",
+                "b",
+                r"'b' may be unbound here",
+            ),
+            (
+                "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    a = [1]\n",
+                "a",
+                r"'a' may be unbound here",
+            ),
+        ]
+        for setup, test, expected in cases:
+            with self.subTest(test=test):
+                source = f'{setup}if {test}:\n    print("y")\n'
+                with self.assertRaisesRegex(NativeCompileError, expected):
+                    lower(Path("cond.py"), source)
+
+    def test_runtime_condition_failure_survives_a_boolean_operator(self):
+        source = (
+            "n = 0\nfor i in range(0, 3):\n    n += 1\nif n > 5:\n    b = [1]\n"
+            'if b and True:\n    print("y")\n'
+        )
+        with self.assertRaisesRegex(
+            NativeCompileError, r"'b' may be unbound here"
+        ):
+            lower(Path("cond.py"), source)
 
 
 if __name__ == "__main__":
