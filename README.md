@@ -634,8 +634,9 @@ comparisons, `if`, `while`, `for NAME in range(...)`, `break`, `continue`,
 loop `else` bodies,
 `print()` of compile-time values, pure integer function inlining across
 local/pinned modules, and integer-expression exit status. On POSIX targets it
-additionally supports runtime integer lists, runtime ASCII strings, and
-user-defined classes over a bump-arena (anonymous `mmap`); on `darwin-arm64` it
+additionally supports runtime lists, dicts, sets, tuples, runtime UTF-8
+strings, exceptions, and user-defined classes over a bump-arena (anonymous
+`mmap`); on `darwin-arm64` it
 can call vetted libc symbols and vetted CPython C-API entry points through the
 `py2bin.cabi` adapter ABI. It rejects everything else with a source location
 rather than producing a subtly incorrect executable.
@@ -671,8 +672,10 @@ external compiler, or Python runtime is involved. Runtime `float` division is
 accepted only with a nonzero numeric constant divisor, because a runtime
 divisor can be zero and Python raises `ZeroDivisionError` there; honoring that
 exception needs the object runtime, so it is rejected rather than silently
-emitting IEEE infinity/NaN. Formatting a runtime double back to text (`print`
-of a computed `float`) also needs that runtime and is not yet supported.
+emitting IEEE infinity/NaN. Formatting a runtime double back to text is supported and is the compiler's
+own work: shortest round-trip conversion (Burger-Dybvig over fixed-width
+bignums in the arena) that reproduces CPython's `repr` exactly, including its
+tie-breaking toward the even digit.
 
 The word “supports” is intentionally narrow:
 
@@ -697,13 +700,17 @@ The word “supports” is intentionally narrow:
 | Runtime list index inside `A if C else B` or `and`/`or` | No | Both arms are lowered eagerly, so a bounds check would run even when Python would not evaluate that branch; rejected with a source location. Use an `if` statement, which is supported |
 | Float `A if C else B`, and a function returning a float from a branching body | Restricted | Lowered as a real branch, so an arm that can trap is only evaluated on the path Python takes. Both arms must have the same kind: one `int` arm and one `float` arm share a slot and one slot cannot print both `1` and `2.5`, so the mix is rejected. A body whose branches all end in a return is folded into one conditional expression before the call site picks a lowering, so the returned kind is known in time; a body with a loop is inlined statement by statement instead |
 | Runtime float divisor inside `A if C else B` or `and`/`or` | No | The integer conditional lowers both arms eagerly, so the divisor's zero check would raise on the branch Python never takes; rejected with a source location. Use an `if` statement |
-| Runtime `str` | Restricted | `""` seed, `+` concatenation, slicing, `==`, `in`, `len()`, `print()`, and use as a dict key, via the same arena. Holds any UTF-8 text: the header counts bytes, which is what a write needs, and `len()` counts code points by skipping continuation bytes, which is what CPython reports |
+| Runtime `str` | Restricted | `""` seed, `+` concatenation, slicing, `s[i]`, `for ch in s`, `==`/`!=`, `<`/`<=`/`>`/`>=`, `in`, `len()`, `ord()`/`chr()`, `print()`, sorting a list of them, and use as a dict key, via the same arena. Holds any UTF-8 text: the header counts bytes, which is what a write needs, and both `len()` and indexing count code points, which is what CPython reports. Ordering walks the bytes, which UTF-8 makes the same order as walking the code points |
+| Runtime `dict`, `set`, `tuple` | Restricted, POSIX only | Open-addressed table in the arena with linear probing, doubling past half full, and tombstones for `del`; iteration follows insertion order. Keys are `int` or `str`, values `int` or `float`. `d.get(k, default)` requires the default, because the one-argument form answers `None` and there is no `None` here. A set cannot be iterated: CPython's order is unspecified and would differ |
+| List methods | Restricted, POSIX only | `append()`, `sort()`, `pop()`, `pop(i)`, `insert()`, `remove()`, `index()`, `count()`. `insert()` clamps its index as CPython's does; the others raise CPython's own messages. Sorting is in-place insertion sort over integers, floats or strings |
+| `zip()`, `round()`, `divmod()` | Restricted | `for a, b in zip(xs, ys)` over any number of lists, stopping with the shortest. `round(x)` breaks ties toward the even number; `round(x, n)` is refused because it rounds in decimal and answers a float. `divmod()` is only `q, r = divmod(a, b)`, since a tuple here is a block built from a literal |
+| A name bound on only some paths | No | CPython raises `NameError`; there is no run-time bit recording whether a slot was written, so reading one is refused at build time rather than answering with whatever preceded it. An arm that leaves by `raise` or `return` does not count against this |
 | User-defined `class` | Restricted | Construction, integer attributes, attribute load/store, and methods (including a method calling another method) over the same bump arena. Every attribute must be assigned unconditionally in `__init__`, which fixes the layout and guarantees no read hits a slot Python would treat as unset. Dispatch is static, so calls inline. A `float` attribute is declared by annotating it in `__init__` (`self.x: float = ...`); an integer stored into one is refused rather than widened, because CPython keeps the integer. Class attributes, decorated methods (`property`, `staticmethod`, `classmethod`), special methods other than `__enter__`/`__exit__`, recursion, attributes created outside `__init__`, a name that is both an attribute and a method, and rebinding a variable to another class are rejected. Single inheritance is supported: the subclass's layout is the base's attributes followed by its own, methods are inherited unless overridden, and `super().__init__(...)` is accepted as a bare statement in the subclass's `__init__`. Multiple bases, a base that is not a class defined earlier in the same module, `super()` anywhere else, a subclass `__init__` that leaves an inherited attribute unassigned, and an inherited attribute whose `float`/integer kind disagrees between the two classes are rejected. |
 | Adapter-ABI extern call | Restricted, `darwin-arm64` only | `from py2bin.cabi import NAME` binds a vetted libc symbol (e.g. `abs`, `strlen`, `getpid`) through real dyld; integer and compile-time-constant C-string arguments only. Rejected for every non-`darwin-arm64` target and for unknown symbols |
 | CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI also exposes 31 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You write the calls; py2bin never generates them from ordinary Python, never manages reference counts, and never propagates a C-API error. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
 | `print(...)` | Yes | Constant UTF-8 bytes, or (POSIX only) a runtime ASCII string, emitted through an OS write API/syscall |
 | `SystemExit(integer)` / `sys.exit(integer)` | Yes | Constant or runtime integer expression becomes the OS process-exit value |
-| Runtime input/arguments, dynamic printing, general containers (dicts, sets, nested/float lists), general exceptions, multiple inheritance and dynamic attribute access | No | Rejected by `compile` with a source location; compatible mode needs CPython. Only the integer-list, ASCII-string, and static-layout class cases above are supported |
+| Runtime input and command-line arguments, multiple inheritance, dynamic attribute access, `set` iteration, and a `def` under a run-time condition | No | Rejected by `compile` with a source location; compatible mode needs CPython |
 | Imports | Restricted local/pinned source plus `sys` | Static constants and supported functions can cross nested local module boundaries; native extensions and dynamic modules are not translated |
 
 The bundle-format `bin` uses Python; `py2bin compile` produces actual machine

@@ -207,11 +207,44 @@ runtime:
 - a native function may take a runtime string and return one. A string is its
   block pointer, so the value crosses like any integer; what the call has to
   carry alongside it is the kind, because a pointer and a number are the same
-  thing once they are only a value. An f-string body over a string parameter is
-  still rejected: the builder resolves sub-expressions without the call's
-  substitutions in reach;
+  thing once they are only a value. Its *numeric* parameters cross the same
+  way, which is what lets `def tag(n): return f"n{n}"` render one. A bool
+  argument keeps its identity across the call - nothing at run time tells a
+  bool from an integer, so which one was passed is read from the source at the
+  call site and carried in, and without that `f"{flag}"` wrote `1`. A parameter
+  shadows an outer name of its own spelling, so a folded constant for that name
+  is dropped on the way in;
+- a string may also be returned from a body with branches, a loop, or a method.
+  The result of an inlined call lives in one slot, so the call site has to know
+  before the body is inlined whether it is holding an address or a number. It
+  reads the body to find out: parameters get stand-ins of the right kind,
+  locals are typed by a walk over the assignments in source order, and every
+  return has to agree. A body that answers a string on one path and a number on
+  another is refused, because one slot cannot be both;
 - `==` and `!=` between runtime strings, comparing length then bytes: the same
-  comparison a string-keyed dict already makes when it probes;
+  comparison a string-keyed dict already makes when it probes. `<`, `<=`, `>`
+  and `>=` walk the bytes, which is also a walk over code points - UTF-8 was
+  built so that ordering two sequences by their bytes gives the same answer as
+  ordering them by their code points, which is what CPython compares, so
+  nothing has to be decoded. The bytes are read unsigned; read as signed, a
+  lead byte is negative and `"é"` would sort before `"z"`. Where one string is
+  a prefix of the other the lengths decide. A chain (`"0" <= ch <= "9"`) lowers
+  each operand once and ands the comparisons;
+- `s[i]` is the one-code-point string at that position. Indexing is not slicing
+  with a narrower window: a slice clamps, so `s[99:100]` is `""`, while `s[99]`
+  raises `IndexError`, and the bound is checked against the code-point count
+  because that is what Python indexes by. `for ch in s` walks the same way. A
+  string never moves and never changes length, so its block and count are read
+  once - unlike a list, whose length is re-read every step because an append
+  inside the loop extends the walk;
+- `ord(s)` and `chr(n)`. The decoder branches on the lead byte rather than
+  reading four bytes and masking, because a one-byte code point at the end of a
+  string has no second byte and the block is only as long as its contents.
+  Nothing validates the encoding, which is sound for a narrow reason: every
+  string here was written by the compiler from source text or built by joining
+  ones that were. `chr()` of a lone surrogate is refused - CPython hands one
+  back and fails later, when it is written out, and a native string is its
+  UTF-8 bytes with nowhere to keep one;
 - string methods on any runtime string expression: `.startswith()`,
   `.endswith()`, `.find()`, `.index()`, `.count()`, `.replace()`, `.strip()`,
   `.lstrip()`, `.rstrip()`, `.zfill()`, `.center()`, `.ljust()`, `.rjust()`,
@@ -238,17 +271,53 @@ runtime:
   instead. Because that check can stop the program, those methods and
   `.index()` are refused inside a conditional expression or a short-circuited
   Boolean operand, where both arms are lowered eagerly;
-- `for index, item in enumerate(xs)` and `enumerate(xs, start)`;
+- `for index, item in enumerate(xs)` and `enumerate(xs, start)`, and
+  `for a, b in zip(xs, ys)` over any number of lists. Each list's length is
+  read from its own header at every step, so the walk stops with the shortest
+  and an append inside the body lengthens it, both as CPython's does;
+- `xs.pop()`, `xs.pop(i)`, `xs.insert(i, v)`, `xs.remove(v)`, `xs.index(v)` and
+  `xs.count(v)`. pop() answers the element word and closes the gap; insert()
+  appends and then rotates the tail up, because append is the only path that
+  knows how to grow a block and write the moved address back, and it clamps its
+  index the way CPython's does rather than raising. remove() and index() share
+  one scan that stops at the first match, comparing floats as numbers rather
+  than as their bits so that `-0.0` finds `0.0`. The wording of the exceptions
+  is CPython's: "pop from empty list", "pop index out of range",
+  "list.remove(x): x not in list", "list.index(x): x not in list";
+- `d.get(k, default)`. The default is required: the one-argument form answers
+  `None` when the key is absent, and there is no `None` here to answer with;
+- `round(x)`, with ties going to the even number as Python's does, so
+  `round(2.5)` is 2 and `round(3.5)` is 4. The fraction is the value minus its
+  floor, which is exact for every double. `round(x, n)` is refused - it rounds
+  in decimal and answers a float rather than an int;
+- `q, r = divmod(a, b)`, and nothing else: divmod() answers a tuple, and a
+  tuple here is a block built from a literal, so the general form would
+  allocate a pair that is always taken apart on the next line. Each operand is
+  bound to a hidden name first, so a side-effecting one runs once and not once
+  per half;
+- a name bound on only some of the paths reaching a point is refused where it
+  is read. CPython raises `NameError` there; there is no run-time bit recording
+  whether a slot was written, so the alternative is reading whatever preceded
+  it - a stale folded constant for an integer, and for anything on the heap an
+  address that is not a block. An arm that leaves by `raise` or `return` does
+  not count against this, and an `elif` chain that binds the name everywhere is
+  accepted. A `def` under a run-time condition is refused for the same reason
+  in reverse: a call is inlined from one body chosen at build time, so the
+  branch that ran could not decide which body that is;
 - `global` inside a native function names the module's variable rather than a
   local. Such a name is kept in a slot rather than folded, because inlining
   swaps the build-time constant map and a constant written inside the body
   would be dropped when the module's map came back;
 - `sum()`, `min()`, `max()`, `any()` and `all()` over a runtime integer list or
-  over a generator expression, and `abs()`. `min()` and `max()` of an empty
+  over a generator expression, and `abs()`. `sum(xs, start)` adds the start to
+  the walk - integers only, because the walk adds integers and a float start
+  would make the result a float after the fact. `min()` and `max()` of an empty
   iterable raise a catchable `ValueError`, as CPython does; `any()` of an empty
   one is `False` and `all()` of it is `True`;
 - `sorted(xs)`, `xs.sort()` and `for v in reversed(xs)` over a runtime list of
-  integers or of floats, with `reverse=True` accepted when it is a constant.
+  integers, floats or strings, with `reverse=True` accepted when it is a
+  constant. Strings are compared through the text they point at rather than by
+  their block addresses, which would be allocation order.
   The sort is an insertion sort, in place and stable, because the arena never
   reclaims and a merge sort's scratch buffer would be abandoned once per call;
   `sorted()` costs one block of `16 + 8n` bytes and the other two allocate
