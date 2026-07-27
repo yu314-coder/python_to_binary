@@ -6136,6 +6136,60 @@ class Frontend:
             self.possibly_unbound.add(name)
         self.close_loop_else(node, broke)
 
+    def emit_print_list(self, node: ast.expr, element_kind: str) -> None:
+        """Write a whole list the way CPython's repr does.
+
+        Unlike a tuple, the length is only known at run time, so the elements
+        are walked rather than unrolled and the separator needs a branch: a
+        comma goes before every element except the first.
+        """
+
+        pointer = self.materialize_int(self.list_pointer(node))
+        length = self.materialize_int(
+            HeapLoad(IntBinary("add", pointer, IntConstant(8)), 8)
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        self.operations.append(Write(b"["))
+        start = self.new_label("print_list")
+        end = self.new_label("print_list_end")
+        first = self.new_label("print_list_first")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(IntCompare("lt", IntLoad(index_slot), length), end)
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("gt", IntLoad(index_slot), IntConstant(0)), first
+            )
+        )
+        self.operations.append(Write(b", "))
+        self.operations.append(Label(first))
+        word = HeapLoad(
+            IntBinary(
+                "add",
+                IntBinary("add", pointer, IntConstant(self.LIST_HEADER_BYTES)),
+                IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+            ),
+            8,
+        )
+        if element_kind == "bool":
+            text = self.emit_bool_to_string(word)
+        elif element_kind == "float":
+            text = self.emit_float_to_string(BitsFloat(word))
+        else:
+            text = self.emit_int_to_string(word)
+        text = self.materialize_int(text)
+        self.operations.append(
+            WriteRuntime(IntBinary("add", text, IntConstant(8)), HeapLoad(text, 8))
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        self.operations.append(Write(b"]"))
+
     def emit_print_tuple(self, node: ast.expr, kinds: tuple[str, ...]) -> None:
         """Write a whole tuple the way CPython's repr does."""
 
@@ -7786,6 +7840,15 @@ class Frontend:
             if self.renders_as_bool(node):
                 return self.emit_bool_to_string(self.integer(node))
             return self.emit_int_to_string(self.integer(node))
+        if self.list_kind(kind) in {"int", "float", "bool"}:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"a native f-string cannot render a {kind} yet, though print() "
+                "can: an f-string has to build the text in memory rather than "
+                "write it out, and that is not implemented. Print the list on "
+                "its own, or format the elements individually",
+            )
         raise NativeCompileError(
             self.path, node, f"a native f-string cannot render a {kind} yet"
         )
@@ -13722,6 +13785,23 @@ class Frontend:
         elif self.tuple_kinds(kind) is not None:
             self.emit_print_tuple(node, self.tuple_kinds(kind))
             return
+        elif self.list_kind(kind) in {"int", "float", "bool"}:
+            self.emit_print_list(node, self.list_kind(kind))
+            return
+        elif self.list_kind(kind) is not None:
+            # A string or a nested list would need the repr of each element,
+            # and choosing the quote character and the backslash escapes for a
+            # string built at run time is not implemented. The same limit
+            # applies to a tuple's string elements.
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native print() renders a list of integers, floats or bools; "
+                f"this one holds {self.kind_noun(self.list_kind(kind))}, and "
+                "CPython prints the repr of every element, which for a runtime "
+                "string means picking its quotes and escapes. Print the "
+                "elements one at a time instead",
+            )
         elif self.set_kind(kind) is not None:
             # Rendering a set means choosing an order to render it in, and no
             # order here matches CPython's.

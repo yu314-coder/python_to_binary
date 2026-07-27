@@ -1544,10 +1544,25 @@ class NestedListTests(unittest.TestCase):
         self._reject("xs = [[2], 1]\nprint(len(xs))\n", "one list holds one kind")
         self._reject('xs = ["a", 1]\nprint(len(xs))\n', "one list holds one kind")
 
-    def test_printing_a_list_is_still_rejected(self):
-        self._reject("xs = [[1, 2]]\nprint(xs)\n", "cannot render a runtime")
-        self._reject("xs = [[1, 2]]\nprint(xs[0])\n", "cannot render a runtime")
-        self._reject('parts = ["a"]\nprint(parts[0:1])\n', "cannot render a runtime")
+    def test_printing_a_list_of_numbers(self):
+        # CPython prints the repr of every element, which for integers, floats
+        # and bools is the same text they print on their own.
+        self._run("xs = [1, 2, 3]\nprint(xs)\n", b"[1, 2, 3]\n")
+        self._run("xs = [1.5, 2.0, -0.0]\nprint(xs)\n", b"[1.5, 2.0, -0.0]\n")
+        self._run("xs: list[int] = []\nprint(xs)\n", b"[]\n")
+        self._run("xs = [7]\nprint(xs)\n", b"[7]\n")
+
+    def test_printing_a_list_of_strings_or_lists_is_rejected(self):
+        # The repr of a runtime string means choosing its quote character and
+        # its backslash escapes, which is not implemented.
+        self._reject("xs = [[1, 2]]\nprint(xs)\n", "renders a list of integers")
+        self._reject('parts = ["a"]\nprint(parts[0:1])\n', "renders a list of integers")
+
+    def test_printing_an_inner_list_of_numbers(self):
+        # The outer list cannot be printed, because its elements are lists; one
+        # of those elements can, because its own elements are numbers.
+        self._run("xs = [[1, 2], [3]]\nprint(xs[0])\nprint(xs[1])\n",
+                  b"[1, 2]\n[3]\n")
 
     def test_reordering_and_reducing_strings_or_lists_is_rejected(self):
         self._reject('parts = ["b", "a"]\nparts.sort()\n', "compare block addresses")
