@@ -296,6 +296,11 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "PyObject_GetAttrString": ("PyObject_GetAttrString", ("ptr", "cstr")),
     "PyObject_CallNoArgs": ("PyObject_CallNoArgs", ("ptr",)),
     "PyObject_CallOneArg": ("PyObject_CallOneArg", ("ptr", "ptr")),
+    # Calls of any arity: the arguments go in a tuple, which PyObject_Call
+    # takes. PyTuple_SetItem steals the reference it is handed.
+    "PyObject_Call": ("PyObject_Call", ("ptr", "ptr", "ptr")),
+    "PyTuple_New": ("PyTuple_New", ("int",)),
+    "PyTuple_SetItem": ("PyTuple_SetItem", ("ptr", "int", "ptr")),
     "PyImport_ImportModule": ("PyImport_ImportModule", ("cstr",)),
     "PyList_New": ("PyList_New", ("int",)),
     "PyList_Append": ("PyList_Append", ("ptr", "ptr")),
@@ -357,6 +362,9 @@ _CABI_RESULTS: dict[str, str] = {
     "PyObject_GetAttrString": "ptr",
     "PyObject_CallNoArgs": "ptr",
     "PyObject_CallOneArg": "ptr",
+    "PyObject_Call": "ptr",
+    "PyTuple_New": "ptr",
+    "PyTuple_SetItem": "int",
     "PyImport_ImportModule": "ptr",
     "PyList_New": "ptr",
     "PyList_Append": "int",

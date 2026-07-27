@@ -64,6 +64,9 @@ extern PyObject *PyObject_GetAttrString(PyObject *object, const char *name);
 extern PyObject *PyObject_CallNoArgs(PyObject *callable);
 extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *argument);
 extern long long PyObject_Size(PyObject *object);
+extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+extern PyObject *PyTuple_New(long long length);
+extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
 """
 
 #: CPython's comparison opcodes, in the order Py_LT..Py_GE.
@@ -293,24 +296,38 @@ class CApiEmitter:
         """
 
         assert isinstance(node.func, ast.Attribute)
-        if len(node.args) > 1:
-            raise self.fail(
-                node,
-                "a method call takes no more than one argument here; the "
-                "vetted C-API set has CallNoArgs and CallOneArg and no way to "
-                "build an argument tuple",
-            )
         callable_value = self.attribute(node.func, indent)
+        target = self.invoke(callable_value, node.args, indent)
+        self.emit(f"Py_DecRef({callable_value});", indent)
+        return target
+
+    def invoke(self, callable_value: str, args: list, indent: int) -> str:
+        """Call something with any number of arguments.
+
+        Nought and one have their own entry points; beyond that the arguments
+        go into a tuple. PyTuple_SetItem *steals* the reference it is given,
+        which is why nothing is released after it - releasing again would be a
+        second drop of a reference this code no longer owns.
+        """
+
         target = self.temporary()
-        if node.args:
-            argument = self.expression(node.args[0], indent)
+        if not args:
+            self.emit(f"{target} = PyObject_CallNoArgs({callable_value});", indent)
+            return target
+        if len(args) == 1:
+            argument = self.expression(args[0], indent)
             self.emit(
                 f"{target} = PyObject_CallOneArg({callable_value}, {argument});", indent
             )
             self.emit(f"Py_DecRef({argument});", indent)
-        else:
-            self.emit(f"{target} = PyObject_CallNoArgs({callable_value});", indent)
-        self.emit(f"Py_DecRef({callable_value});", indent)
+            return target
+        values = [self.expression(item, indent) for item in args]
+        holder = self.temporary()
+        self.emit(f"{holder} = PyTuple_New({len(values)}LL);", indent)
+        for position, value in enumerate(values):
+            self.emit(f"PyTuple_SetItem({holder}, {position}LL, {value});", indent)
+        self.emit(f"{target} = PyObject_Call({callable_value}, {holder}, 0);", indent)
+        self.emit(f"Py_DecRef({holder});", indent)
         return target
 
     # --- statements ------------------------------------------------------

@@ -38,6 +38,10 @@ __all__ = [
     "PyNumber_TrueDivide", "PyObject_RichCompare", "PyObject_IsTrue",
     "PyObject_Str", "PyObject_Repr", "PyObject_Size", "PyObject_GetAttrString",
     "PyObject_CallNoArgs", "PyObject_CallOneArg", "PyImport_ImportModule",
+    # Calls of any arity: the arguments go in a tuple, which is what
+    # PyObject_Call takes. PyTuple_SetItem steals its reference, which the
+    # callers here account for.
+    "PyObject_Call", "PyTuple_New", "PyTuple_SetItem",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -745,6 +749,9 @@ _PyObject_GetAttrString = _bind(
 _PyObject_CallNoArgs = _bind("PyObject_CallNoArgs", _HANDLE, _HANDLE)
 _PyObject_CallOneArg = _bind("PyObject_CallOneArg", _HANDLE, _HANDLE, _HANDLE)
 _PyImport_ImportModule = _bind("PyImport_ImportModule", _HANDLE, ctypes.c_char_p)
+_PyObject_Call = _bind("PyObject_Call", _HANDLE, _HANDLE, _HANDLE, _HANDLE)
+_PyTuple_New = _bind("PyTuple_New", _HANDLE, _SSIZE)
+_PyTuple_SetItem = _bind("PyTuple_SetItem", ctypes.c_int, _HANDLE, _SSIZE, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -845,6 +852,20 @@ def PyObject_CallOneArg(callable_handle: int, argument: int) -> int:
 
 def PyImport_ImportModule(name: bytes | str) -> int:
     return _handle(_PyImport_ImportModule(_cstring(name)))
+
+
+def PyObject_Call(callable_handle: int, arguments: int, keywords: int) -> int:
+    return _handle(_PyObject_Call(callable_handle, arguments, keywords))
+
+
+def PyTuple_New(length: int) -> int:
+    return _handle(_PyTuple_New(length))
+
+
+def PyTuple_SetItem(tuple_handle: int, index: int, value: int) -> int:
+    """Put ``value`` in the tuple. This *steals* the reference to it."""
+
+    return _returned(_PyTuple_SetItem(tuple_handle, index, value))
 
 
 def PyList_New(length: int) -> int:

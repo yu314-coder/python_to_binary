@@ -140,12 +140,22 @@ class CApiEmitTests(unittest.TestCase):
     def test_len_goes_through_the_object_protocol(self):
         self._run('print(len("hello"))\n', b"5\n")
 
-    def test_a_method_call_with_too_many_arguments_says_why(self):
-        # The vetted C-API set has CallNoArgs and CallOneArg and no way to
-        # build an argument tuple, so this is refused rather than approximated.
-        self._reject(
-            'import math\nprint(math.pow(2, 3))\n',
-            "no more than one argument",
+    def test_a_call_with_several_arguments(self):
+        # Nought and one arguments have their own entry points; beyond that the
+        # arguments go into a tuple. PyTuple_SetItem steals the reference it is
+        # handed, so nothing is released after it.
+        self._run("import math\nprint(math.pow(2, 10))\n", b"1024.0\n")
+        self._run('s = "a-b-c"\nprint(s.replace("-", "+"))\n', b"a+b+c\n")
+        self._run(
+            "import math\nprint(math.gcd(math.factorial(10), 48))\n", b"48\n"
+        )
+
+    def test_a_loop_calling_into_a_module_does_not_leak(self):
+        self._run(
+            "import math\ni = 0\ntotal = 0\n"
+            "while i < 50000:\n    total = total + math.gcd(i, 12)\n    i = i + 1\n"
+            "print(total)\n",
+            b"166670\n",
         )
 
     def test_what_is_not_translated_says_so(self):

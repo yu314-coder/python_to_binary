@@ -205,15 +205,16 @@ present and its import machinery runs, so a compiled program reaches anything
 installed beside it. That includes modules which are themselves C extensions -
 `import math; print(math.factorial(30))` gives the exact 33-digit answer -
 because those extensions are loaded by the interpreter exactly as they always
-are. Attribute access and method calls follow, though a method call takes no
-more than one argument: the vetted C-API set has `PyObject_CallNoArgs` and
-`PyObject_CallOneArg` and no way to build an argument tuple, so more is refused
-by name rather than approximated.
+are. Attribute access and method calls follow, with any number of arguments: nought
+and one have their own entry points, and beyond that the arguments go into a
+tuple that `PyObject_Call` takes. `PyTuple_SetItem` *steals* the reference it
+is handed, so nothing is released after it - releasing again would drop a
+reference this code no longer owns.
 
 Translated so far: integer and string literals, names, `+ - * /`, the six
 comparisons, `if`/`else`, `while`, `print()` with any number of values,
-`str()`, `len()`, `import`, attribute access, method calls of no more than one
-argument, and functions with positional parameters, including recursive ones.
+`str()`, `len()`, `import`, attribute access, method calls of any arity, and
+functions with positional parameters, including recursive ones.
 Everything else says which construct it is and that it has no translation yet.
 Text outside ASCII goes into the C as octal escapes so the source stays ASCII,
 and the embedded interpreter's stdout is set to UTF-8 on the way in - without
@@ -1140,7 +1141,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 31 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 34 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the
