@@ -6136,6 +6136,143 @@ class Frontend:
             self.possibly_unbound.add(name)
         self.close_loop_else(node, broke)
 
+    def emit_word_to_string(self, word: IntExpression, kind: str) -> IntExpression:
+        """The text CPython's repr gives one stored word of this kind."""
+
+        if kind == "bool":
+            return self.emit_bool_to_string(word)
+        if kind == "float":
+            return self.emit_float_to_string(BitsFloat(word))
+        return self.emit_int_to_string(word)
+
+    def emit_dict_to_string(self, node: ast.expr) -> IntExpression:
+        """Build the text CPython's repr gives a dict; returns a string block.
+
+        The walk is the insertion-order key list, the same one `for k in d`
+        uses, which is what makes the printed order CPython's. The value is
+        found by probing rather than by remembering an address, because growth
+        moves entries and nothing here pins them.
+        """
+
+        assert isinstance(node, ast.Name)
+        name = node.id
+        key_kind, value_kind = self.dict_kinds_of(name)
+        if self.container_bool.get(self.dict_keys_name(name)) is True:
+            key_kind = "bool"
+        if self.container_bool.get(name) is True:
+            value_kind = "bool"
+        dict_slot = self.slot(name)
+        pointer = IntLoad(dict_slot)
+        keys_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                keys_slot,
+                HeapLoad(
+                    IntBinary("add", pointer, IntConstant(self.DICT_KEYS_OFFSET)), 8
+                ),
+            )
+        )
+        result_slot = self.new_temp()
+        self.operations.append(
+            Store(result_slot, self.materialize_string_constant(b"{"))
+        )
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        start = self.new_label("print_dict")
+        end = self.new_label("print_dict_end")
+        first = self.new_label("print_dict_first")
+        self.operations.append(Label(start))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    IntLoad(index_slot),
+                    HeapLoad(
+                        IntBinary("add", IntLoad(keys_slot), IntConstant(8)), 8
+                    ),
+                ),
+                end,
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("gt", IntLoad(index_slot), IntConstant(0)), first
+            )
+        )
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot), self.materialize_string_constant(b", ")
+                ),
+            )
+        )
+        self.operations.append(Label(first))
+        key_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                key_slot,
+                HeapLoad(
+                    IntBinary(
+                        "add",
+                        IntBinary(
+                            "add",
+                            IntLoad(keys_slot),
+                            IntConstant(self.LIST_HEADER_BYTES),
+                        ),
+                        IntBinary("mul", IntLoad(index_slot), IntConstant(8)),
+                    ),
+                    8,
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot),
+                    self.emit_word_to_string(IntLoad(key_slot), key_kind),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot), self.materialize_string_constant(b": ")
+                ),
+            )
+        )
+        address_slot, _found, _key, _state = self.dict_probe(
+            dict_slot, IntLoad(key_slot), self.dict_kinds_of(name)[0]
+        )
+        value = HeapLoad(
+            IntBinary("add", IntLoad(address_slot), IntConstant(16)), 8
+        )
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot),
+                    self.emit_word_to_string(value, value_kind),
+                ),
+            )
+        )
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start))
+        self.operations.append(Label(end))
+        self.operations.append(
+            Store(
+                result_slot,
+                self.emit_concat(
+                    IntLoad(result_slot), self.materialize_string_constant(b"}")
+                ),
+            )
+        )
+        return IntLoad(result_slot)
+
     def emit_print_list(self, node: ast.expr, element_kind: str) -> None:
         """Write a whole list the way CPython's repr does."""
 
@@ -7875,6 +8012,13 @@ class Frontend:
             return self.emit_int_to_string(self.integer(node))
         if self.list_kind(kind) in {"int", "float", "bool"}:
             return self.emit_list_to_string(node, self.list_kind(kind))
+        if (
+            self.dict_kinds(kind) is not None
+            and isinstance(node, ast.Name)
+            and self.dict_kinds(kind)[0] == "int"
+            and self.dict_kinds(kind)[1] in {"int", "float"}
+        ):
+            return self.emit_dict_to_string(node)
         raise NativeCompileError(
             self.path, node, f"a native f-string cannot render a {kind} yet"
         )
@@ -13813,6 +13957,19 @@ class Frontend:
             return
         elif self.list_kind(kind) in {"int", "float", "bool"}:
             self.emit_print_list(node, self.list_kind(kind))
+            return
+        elif (
+            self.dict_kinds(kind) is not None
+            and isinstance(node, ast.Name)
+            and self.dict_kinds(kind)[0] == "int"
+            and self.dict_kinds(kind)[1] in {"int", "float"}
+        ):
+            text = self.materialize_int(self.emit_dict_to_string(node))
+            self.operations.append(
+                WriteRuntime(
+                    IntBinary("add", text, IntConstant(8)), HeapLoad(text, 8)
+                )
+            )
             return
         elif self.list_kind(kind) is not None:
             # A string or a nested list would need the repr of each element,
