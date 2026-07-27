@@ -271,6 +271,18 @@ runtime:
   instead. Because that check can stop the program, those methods and
   `.index()` are refused inside a conditional expression or a short-circuited
   Boolean operand, where both arms are lowered eagerly;
+- `x // y` and `x % y` on doubles. Both go through a remainder found by
+  repeated subtraction of a scaled divisor: `x - trunc(x / y) * y` is the
+  obvious way and is wrong once the quotient is large enough to round, and
+  flooring `x / y` directly is wrong when the quotient rounds to just under or
+  just over a whole number. Doubling and halving a double are exact, and the
+  scaled divisor never goes below the divisor itself, so every value the loop
+  handles is representable and no step introduces an error. C's remainder takes
+  the dividend's sign and Python's takes the divisor's, so the divisor is added
+  once where they disagree, and a zero remainder takes the divisor's sign.
+  An infinity or a NaN on the left answers NaN rather than scaling forever. The
+  divisor is checked for zero, which is why neither may appear in a conditional
+  expression or a short-circuited operand;
 - a container is true when it is not empty, so `if xs:`, `while queue:`,
   `not s` and `bool(d)` all work, and so does a runtime float, which is true
   when it is not zero. This used to be refused, and for a good reason: a

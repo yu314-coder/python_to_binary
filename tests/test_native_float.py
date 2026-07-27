@@ -775,3 +775,95 @@ class FloatSortingTests(unittest.TestCase):
             b"1\n",
             matches_cpython=False,
         )
+
+
+class FloatFloorDivisionAndModuloTests(unittest.TestCase):
+    """`x // y` and `x % y` on doubles.
+
+    Both go through a remainder computed by repeated subtraction of a scaled
+    divisor. `x - trunc(x / y) * y` is the obvious way and is wrong once the
+    quotient is large enough to round, and flooring `x / y` directly is wrong
+    when the quotient rounds to just under or just over a whole number.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in ("darwin-arm64", "linux-x86_64", "linux-arm64"):
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    @staticmethod
+    def _runtime(name: str, value: str) -> str:
+        return f"{name} = 0.0\nfor _i in range(0, 1):\n    {name} = {name} + {value}\n"
+
+    def test_the_sign_follows_the_divisor_as_pythons_does(self):
+        # C's remainder takes the dividend's sign and Python's takes the
+        # divisor's, so three of these four disagree with fmod.
+        self._run(
+            self._runtime("a", "7.5")
+            + self._runtime("b", "-7.5")
+            + "print(a // 2.0, a % 2.0)\n"
+            + "print(b // 2.0, b % 2.0)\n"
+            + "print(a // -2.0, a % -2.0)\n"
+            + "print(b // -2.0, b % -2.0)\n",
+            b"3.0 1.5\n-4.0 0.5\n-4.0 -0.5\n3.0 -1.5\n",
+        )
+
+    def test_an_exact_multiple_leaves_no_remainder(self):
+        self._run(
+            self._runtime("a", "8.0") + "print(a // 2.0, a % 2.0)\n", b"4.0 0.0\n"
+        )
+
+    def test_a_quotient_too_large_to_round_through(self):
+        # 1e17 // 3.0 has a quotient far past the point where a double can
+        # hold every integer, which is where the naive formula gives way.
+        self._run(
+            self._runtime("a", "1e17") + "print(a // 3.0, a % 3.0)\n",
+            b"3.3333333333333332e+16 1.0\n",
+        )
+
+    def test_a_divisor_that_is_not_representable(self):
+        # 0.1 is not exactly a tenth, so the remainder is not exactly zero and
+        # every bit of it has to match.
+        self._run(
+            self._runtime("a", "1.0") + "print(a // 0.1, a % 0.1)\n",
+            b"9.0 0.09999999999999995\n",
+        )
+
+    def test_an_integer_operand_is_widened(self):
+        self._run(self._runtime("a", "7.5") + "print(a // 2, a % 2)\n", b"3.0 1.5\n")
+
+    def test_dividing_by_zero_raises(self):
+        self._run(
+            self._runtime("a", "7.5") + "z = 0.0\nprint(a % z)\n", b"", expected_exit=1
+        )
+
+    def test_the_vtt_timestamp_helper_from_a_real_application(self):
+        # Taken from manim_app's narration_addon.py. It is here because it is
+        # what asked for this: floor division and modulo on a duration, then
+        # an f-string with a zero-padded integer and a fixed-point float.
+        self._run(
+            "def format_vtt_time(seconds):\n"
+            "    hours = int(seconds // 3600)\n"
+            "    minutes = int(seconds % 3600 // 60)\n"
+            "    secs = seconds % 60\n"
+            '    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"\n'
+            "print(format_vtt_time(3725.5))\n"
+            "print(format_vtt_time(0.0))\n"
+            "print(format_vtt_time(86399.999))\n",
+            b"01:02:05.500\n00:00:00.000\n23:59:59.999\n",
+        )

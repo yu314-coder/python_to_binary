@@ -16727,9 +16727,11 @@ class Frontend:
                 if "str" in (left, right):
                     return "str"
                 return "float" if "float" in (left, right) else "int"
-            if isinstance(node.op, (ast.Sub, ast.Mult)):
+            if isinstance(node.op, (ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)):
                 left = self.expression_type(node.left, bindings)
                 right = self.expression_type(node.right, bindings)
+                # `7.5 // 2` is 3.0 and not 3: floor division answers with a
+                # float when either side is one, as every other operator does.
                 return "float" if "float" in (left, right) else "int"
             return "int"
         if isinstance(node, ast.IfExp):
@@ -16822,10 +16824,294 @@ class Frontend:
             )
         )
         self.raise_exception(
-            "ZeroDivisionError", b"ZeroDivisionError: float division by zero\n"
+            "ZeroDivisionError", b"ZeroDivisionError: division by zero\n"
         )
         self.operations.append(Label(ok))
         return FloatLoad(slot)
+
+    def select_float(
+        self,
+        condition: IntExpression,
+        when_true: FloatExpression,
+        when_false: FloatExpression,
+    ) -> FloatExpression:
+        """One of two doubles, chosen by a real branch.
+
+        A branch and not an evaluate-both, because an arm can hold a division
+        whose zero check must not run on the path Python does not take.
+        """
+
+        slot = self.new_temp()
+        otherwise = self.new_label("pick_float_else")
+        done = self.new_label("pick_float_done")
+        self.operations.append(JumpIfFalse(condition, otherwise))
+        self.operations.append(FloatStore(slot, when_true))
+        self.operations.append(Jump(done))
+        self.operations.append(Label(otherwise))
+        self.operations.append(FloatStore(slot, when_false))
+        self.operations.append(Label(done))
+        return FloatLoad(slot)
+
+    def emit_refuse_float_zero_divisor(self, slot: int, node: ast.AST) -> None:
+        """Stop with ZeroDivisionError when the divisor in ``slot`` is zero."""
+
+        ok = self.new_label("float_divisor_nonzero")
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare("eq", FloatLoad(slot), FloatConstant(0.0)), ok
+            )
+        )
+        self.raise_exception(
+            "ZeroDivisionError", b"ZeroDivisionError: division by zero\n"
+        )
+        self.operations.append(Label(ok))
+
+    _NAN_BITS = 0x7FF8000000000000
+    _SIGN_BIT = 0x8000000000000000
+
+    def emit_float_fmod(self, left: int, right: int) -> int:
+        """C's fmod in a slot: the remainder with the sign of the dividend.
+
+        By repeated subtraction of a scaled divisor rather than
+        ``x - trunc(x / y) * y``, which is not exact once the quotient is large
+        enough to round. Doubling and halving a double are exact, and the
+        scaled divisor never goes below the divisor itself, so every value the
+        loop handles is representable and no step introduces an error.
+        """
+
+        remainder = self.new_temp()
+        divisor = self.new_temp()
+        self.operations.append(
+            FloatStore(remainder, FloatUnary("abs", FloatLoad(left)))
+        )
+        self.operations.append(
+            FloatStore(divisor, FloatUnary("abs", FloatLoad(right)))
+        )
+        done = self.new_label("fmod_done")
+        # A remainder smaller than the divisor is already the answer, which is
+        # also what keeps an infinite divisor from being scaled.
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare("ge", FloatLoad(remainder), FloatLoad(divisor)), done
+            )
+        )
+        scaled = self.new_temp()
+        self.operations.append(FloatStore(scaled, FloatLoad(divisor)))
+        grow = self.new_label("fmod_grow")
+        grown = self.new_label("fmod_grown")
+        self.operations.append(Label(grow))
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare(
+                    "le",
+                    FloatBinary("mul", FloatLoad(scaled), FloatConstant(2.0)),
+                    FloatLoad(remainder),
+                ),
+                grown,
+            )
+        )
+        self.operations.append(
+            FloatStore(
+                scaled, FloatBinary("mul", FloatLoad(scaled), FloatConstant(2.0))
+            )
+        )
+        self.operations.append(Jump(grow))
+        self.operations.append(Label(grown))
+        shrink = self.new_label("fmod_shrink")
+        skip = self.new_label("fmod_skip")
+        self.operations.append(Label(shrink))
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare("ge", FloatLoad(scaled), FloatLoad(divisor)), done
+            )
+        )
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare("le", FloatLoad(scaled), FloatLoad(remainder)), skip
+            )
+        )
+        self.operations.append(
+            FloatStore(
+                remainder,
+                FloatBinary("sub", FloatLoad(remainder), FloatLoad(scaled)),
+            )
+        )
+        self.operations.append(Label(skip))
+        self.operations.append(
+            FloatStore(
+                scaled, FloatBinary("div", FloatLoad(scaled), FloatConstant(2.0))
+            )
+        )
+        self.operations.append(Jump(shrink))
+        self.operations.append(Label(done))
+        # fmod keeps the dividend's sign, including for a zero result.
+        result = self.new_temp()
+        self.operations.append(
+            Store(
+                result,
+                IntBinary(
+                    "or",
+                    IntBinary(
+                        "and",
+                        FloatBits(FloatLoad(remainder)),
+                        IntConstant(~self._SIGN_BIT & 0xFFFFFFFFFFFFFFFF),
+                    ),
+                    IntBinary(
+                        "and",
+                        FloatBits(FloatLoad(left)),
+                        IntConstant(self._SIGN_BIT),
+                    ),
+                ),
+            )
+        )
+        answer = self.new_temp()
+        self.operations.append(FloatStore(answer, BitsFloat(IntLoad(result))))
+        return answer
+
+    def emit_float_modulo(
+        self, left: FloatExpression, right: FloatExpression, node: ast.AST
+    ) -> int:
+        """`x % y` on doubles, in a slot, with Python's sign rule.
+
+        C's remainder takes the dividend's sign and Python's takes the
+        divisor's, so where they disagree the divisor is added once - which is
+        exactly what CPython does, on top of the same fmod.
+        """
+
+        x = self.new_temp()
+        y = self.new_temp()
+        self.operations.append(FloatStore(x, left))
+        self.operations.append(FloatStore(y, right))
+        self.emit_refuse_float_zero_divisor(y, node)
+        result = self.new_temp()
+        done = self.new_label("fmod_py_done")
+        # An infinity or a NaN on the left has no remainder to find, and the
+        # scaling loop would never terminate on one.
+        finite = self.new_label("fmod_finite")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq",
+                    IntBinary(
+                        "and",
+                        IntBinary("rshift", FloatBits(FloatLoad(x)), IntConstant(52)),
+                        IntConstant(0x7FF),
+                    ),
+                    IntConstant(0x7FF),
+                ),
+                finite,
+            )
+        )
+        self.operations.append(
+            FloatStore(result, BitsFloat(IntConstant(self._NAN_BITS)))
+        )
+        self.operations.append(Jump(done))
+        self.operations.append(Label(finite))
+        remainder = self.emit_float_fmod(x, y)
+        self.operations.append(FloatStore(result, FloatLoad(remainder)))
+        differ = self.new_label("fmod_signs_differ")
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "and",
+                    FloatCompare("ne", FloatLoad(result), FloatConstant(0.0)),
+                    IntCompare(
+                        "ne",
+                        IntBinary(
+                            "rshift", FloatBits(FloatLoad(result)), IntConstant(63)
+                        ),
+                        IntBinary(
+                            "rshift", FloatBits(FloatLoad(y)), IntConstant(63)
+                        ),
+                    ),
+                ),
+                differ,
+            )
+        )
+        self.operations.append(
+            FloatStore(
+                result, FloatBinary("add", FloatLoad(result), FloatLoad(y))
+            )
+        )
+        self.operations.append(Jump(done))
+        self.operations.append(Label(differ))
+        # A zero remainder takes the divisor's sign, so that -0.0 comes out of
+        # `-4.0 % 2.0` the way CPython writes it.
+        nonzero = self.new_label("fmod_nonzero")
+        self.operations.append(
+            JumpIfFalse(
+                FloatCompare("eq", FloatLoad(result), FloatConstant(0.0)), nonzero
+            )
+        )
+        self.operations.append(
+            Store(
+                result,
+                IntBinary(
+                    "and", FloatBits(FloatLoad(y)), IntConstant(self._SIGN_BIT)
+                ),
+            )
+        )
+        self.operations.append(Label(nonzero))
+        self.operations.append(Label(done))
+        return result
+
+    def emit_float_floor(self, value: int) -> FloatExpression:
+        """The largest whole double not above ``value``.
+
+        Truncation towards zero is what the hardware offers, so a negative
+        value that lost a fraction is stepped down by one. Anything at or above
+        2**52 is already whole, and would not survive the round trip through a
+        64-bit integer, so it is left alone.
+        """
+
+        truncated = self.new_temp()
+        self.operations.append(
+            FloatStore(truncated, IntToFloat(FloatToInt(FloatLoad(value))))
+        )
+        stepped = self.select_float(
+            FloatCompare("gt", FloatLoad(truncated), FloatLoad(value)),
+            FloatBinary("sub", FloatLoad(truncated), FloatConstant(1.0)),
+            FloatLoad(truncated),
+        )
+        return self.select_float(
+            FloatCompare(
+                "ge",
+                FloatUnary("abs", FloatLoad(value)),
+                FloatConstant(float(1 << 52)),
+            ),
+            FloatLoad(value),
+            stepped,
+        )
+
+    def emit_float_floordiv(
+        self, left: FloatExpression, right: FloatExpression, node: ast.AST
+    ) -> FloatExpression:
+        """`x // y` on doubles: the quotient floored, as a double.
+
+        Through the remainder rather than by flooring `x / y` directly. The
+        quotient can round to just under or just over a whole number, and
+        flooring that is off by one; `(x - x % y) / y` is exact.
+        """
+
+        x = self.new_temp()
+        self.operations.append(FloatStore(x, left))
+        remainder = self.emit_float_modulo(FloatLoad(x), right, node)
+        y = self.new_temp()
+        self.operations.append(FloatStore(y, right))
+        quotient = self.new_temp()
+        self.operations.append(
+            FloatStore(
+                quotient,
+                FloatBinary(
+                    "div",
+                    FloatBinary("sub", FloatLoad(x), FloatLoad(remainder)),
+                    FloatLoad(y),
+                ),
+            )
+        )
+        floored = self.new_temp()
+        self.operations.append(FloatStore(floored, self.emit_float_floor(quotient)))
+        return FloatLoad(floored)
 
     def pin_extern_arguments(self, arguments: tuple[object, ...]) -> tuple[object, ...]:
         """Store every extern-calling argument in a slot, so each runs once.
@@ -17009,12 +17295,31 @@ class Frontend:
             raise NativeCompileError(
                 self.path, node, "unsupported native float unary operator"
             )
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.FloorDiv, ast.Mod)
+        ):
+            if self.eager_depth:
+                raise NativeCompileError(
+                    self.path,
+                    node,
+                    "float // and % check their divisor for zero, so they "
+                    "cannot appear in a conditional expression or a "
+                    "short-circuited Boolean operand, whose arms are both "
+                    "lowered here; use an if statement",
+                )
+            left = self.float_expression(node.left, bindings, call_stack)
+            right = self.float_expression(node.right, bindings, call_stack)
+            if isinstance(node.op, ast.Mod):
+                return FloatLoad(self.emit_float_modulo(left, right, node))
+            return self.emit_float_floordiv(left, right, node)
         if isinstance(node, ast.BinOp):
             operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div"}
             operator = operators.get(type(node.op))
             if operator is None:
                 raise NativeCompileError(
-                    self.path, node, "native float arithmetic supports +, -, *, and /"
+                    self.path,
+                    node,
+                    "native float arithmetic supports +, -, *, /, // and %",
                 )
             left = self.float_expression(node.left, bindings, call_stack)
             if operator == "div":
@@ -17483,7 +17788,7 @@ class Frontend:
         self.operations.append(Label(bad_label))
         self.raise_exception(
             "ZeroDivisionError",
-            b"ZeroDivisionError: integer division or modulo by zero\n",
+            b"ZeroDivisionError: division by zero\n",
         )
         self.operations.append(Label(ok_label))
 
