@@ -3949,6 +3949,68 @@ class Frontend:
         self.operations.append(Jump(outer))
         self.operations.append(Label(outer_end))
 
+    def emit_round(self, node: ast.Call, bindings, call_stack) -> IntExpression:
+        """`round(x)` - to the nearest integer, ties to the even one.
+
+        Python rounds a tie to even rather than away from zero, so round(2.5)
+        is 2 and round(3.5) is 4. The fractional part is computed by
+        subtracting the floor, which is exact for every double: below 2**52 the
+        subtraction of two nearby values loses nothing, and above it there is no
+        fractional part left to lose.
+        """
+
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native round() takes one argument. round(x, n) rounds in "
+                "decimal, which means converting to decimal and back, and "
+                "answers a float rather than an int; use int(x * 100 + 0.5) / "
+                "100.0 if approximate decimal rounding will do",
+            )
+        argument = node.args[0]
+        if self.expression_type(argument, bindings) != "float":
+            # round(5) is 5. An integer is already round.
+            return self.integer(argument, bindings, call_stack)
+        bits = self.new_temp()
+        self.operations.append(
+            Store(bits, FloatBits(self.float_expression(argument, bindings, call_stack)))
+        )
+        value = BitsFloat(IntLoad(bits))
+        truncated = self.new_temp()
+        self.operations.append(Store(truncated, FloatToInt(value)))
+        # Truncation goes toward zero, so for a negative value with a fraction
+        # it lands one above the floor.
+        floor_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                floor_slot,
+                IntBinary(
+                    "sub",
+                    IntLoad(truncated),
+                    FloatCompare("lt", value, IntToFloat(IntLoad(truncated))),
+                ),
+            )
+        )
+        fraction = FloatBinary("sub", value, IntToFloat(IntLoad(floor_slot)))
+        fraction_slot = self.new_temp()
+        self.operations.append(Store(fraction_slot, FloatBits(fraction)))
+        part = BitsFloat(IntLoad(fraction_slot))
+        half = FloatConstant(0.5)
+        return IntBinary(
+            "add",
+            IntLoad(floor_slot),
+            IntBinary(
+                "or",
+                FloatCompare("gt", part, half),
+                IntBinary(
+                    "and",
+                    FloatCompare("eq", part, half),
+                    IntBinary("and", IntLoad(floor_slot), IntConstant(1)),
+                ),
+            ),
+        )
+
     def is_divmod_call(self, node: ast.expr) -> bool:
         return (
             isinstance(node, ast.Call)
@@ -11785,6 +11847,122 @@ class Frontend:
                 self.possibly_unbound.add(name)
         self.close_loop_else(node, broke)
 
+    def zip_sources(self, node: ast.expr) -> list[ast.expr] | None:
+        """The lists `zip(...)` walks together, or None."""
+
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id != "zip"
+            or node.func.id in self.functions
+            or node.keywords
+            or len(node.args) < 2
+        ):
+            return None
+        if any(
+            self.list_kind(self.expression_type(argument)) is None
+            for argument in node.args
+        ):
+            return None
+        return list(node.args)
+
+    def for_over_zip(self, node: ast.For) -> None:
+        """`for a, b in zip(xs, ys):` - one step along each list at a time.
+
+        The walk stops with the shortest, which is checked at every step rather
+        than once: an append inside the body lengthens the walk here exactly as
+        it does for a single list, because each length is read from its own
+        header each time round.
+        """
+
+        sources = self.zip_sources(node.iter)
+        assert sources is not None
+        if (
+            not isinstance(node.target, (ast.Tuple, ast.List))
+            or len(node.target.elts) != len(sources)
+            or not all(isinstance(item, ast.Name) for item in node.target.elts)
+        ):
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"this native zip() loop walks {len(sources)} lists, so it "
+                f"binds {len(sources)} names",
+            )
+        names = [item.id for item in node.target.elts]
+        if len(set(names)) != len(names):
+            raise NativeCompileError(
+                self.path,
+                node.target,
+                "a native zip() loop binds one name per list, and these repeat",
+            )
+        broke = self.open_loop_else(node)
+        was_bound = {name: name in self.bound_names for name in names}
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        walks = []
+        for source, name in zip(sources, names):
+            if isinstance(source, ast.Name) and self.list_kind_of(source.id) is not None:
+                # Through the variable's own slot, so that an append inside the
+                # body - which moves the block - is followed rather than lost.
+                pointer_slot = self.slot(source.id)
+            else:
+                pointer_slot = self.new_temp()
+                self.operations.append(
+                    Store(pointer_slot, self.list_pointer(source))
+                )
+            walks.append(
+                (pointer_slot, self.list_kind(self.expression_type(source)), source)
+            )
+        start_label = self.new_label("for_zip")
+        continue_label = self.new_label("for_zip_continue")
+        end_label = self.new_label("for_zip_end")
+        self.operations.append(Label(start_label))
+        for pointer_slot, _kind, _source in walks:
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare(
+                        "lt",
+                        IntLoad(index_slot),
+                        HeapLoad(
+                            IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+                            8,
+                        ),
+                    ),
+                    end_label,
+                )
+            )
+        for name, (pointer_slot, element_kind, source) in zip(names, walks):
+            self.bind_list_element(
+                name,
+                index_slot,
+                pointer_slot,
+                element_kind,
+                self.list_holds_bool(source),
+            )
+        self.break_targets.append(end_label if broke is None else broke)
+        self.continue_targets.append(continue_label)
+        walked = [name for name in (self.iterated_list_name(s) for s in sources) if name]
+        self.iterated_lists.extend(walked)
+        for statement in node.body:
+            self.statement(statement)
+        for _ in walked:
+            self.iterated_lists.pop()
+        self.continue_targets.pop()
+        self.break_targets.pop()
+        self.operations.append(Label(continue_label))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(start_label))
+        self.operations.append(Label(end_label))
+        for name in names:
+            if was_bound[name]:
+                self.bound_names.add(name)
+            else:
+                # Either list may be empty, and then nothing is bound.
+                self.possibly_unbound.add(name)
+        self.close_loop_else(node, broke)
+
     def reversed_source(self, node: ast.expr):
         """The list `reversed(...)` walks backwards, or None."""
 
@@ -12807,6 +12985,9 @@ class Frontend:
             self.for_over_dict(node)
             return
         self.refuse_set_iteration(node.iter)
+        if self.zip_sources(node.iter) is not None:
+            self.for_over_zip(node)
+            return
         if (
             isinstance(node.target, ast.Name)
             and self.expression_type(node.iter) == "str"
@@ -16815,6 +16996,13 @@ class Frontend:
             and node.func.id not in self.functions
         ):
             return self.emit_ord(node)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "round"
+            and node.func.id not in self.functions
+        ):
+            return self.emit_round(node, bindings, call_stack)
         if self.is_divmod_call(node):
             raise NativeCompileError(
                 self.path,

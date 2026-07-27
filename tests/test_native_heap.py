@@ -2352,3 +2352,118 @@ class StringOrderingTests(unittest.TestCase):
 
     def test_a_list_of_lists_still_has_no_order(self):
         self._reject("xs = [[1], [2]]\nxs.sort()\n", "compare block addresses")
+
+
+class ZipAndRoundTests(unittest.TestCase):
+    """`for a, b in zip(...)` and `round(x)`."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def test_zip_walks_two_lists_together(self):
+        self._run(
+            "a = [1, 2, 3]\nb = [10, 20, 30]\n"
+            "for x, y in zip(a, b):\n    print(x + y)\n",
+            b"11\n22\n33\n",
+        )
+
+    def test_zip_stops_with_the_shortest(self):
+        self._run(
+            "a = [1, 2, 3]\nb = [10, 20]\n"
+            "for x, y in zip(a, b):\n    print(x, y)\nprint('done')\n",
+            b"1 10\n2 20\ndone\n",
+        )
+
+    def test_zip_takes_more_than_two_lists(self):
+        self._run(
+            "a = [1, 2]\nb = [3, 4]\nc = [5, 6]\n"
+            "for x, y, z in zip(a, b, c):\n    print(x, y, z)\n",
+            b"1 3 5\n2 4 6\n",
+        )
+
+    def test_zip_over_different_element_kinds(self):
+        self._run(
+            'names = ["a", "b"]\nvals = [1.5, 2.5]\n'
+            "for n, v in zip(names, vals):\n    print(n, v)\n",
+            b"a 1.5\nb 2.5\n",
+        )
+
+    def test_zip_keeps_bools_printing_as_bools(self):
+        self._run(
+            "flags = [True, False]\nns = [1, 2]\n"
+            "for f, n in zip(flags, ns):\n    print(f, n)\n",
+            b"True 1\nFalse 2\n",
+        )
+
+    def test_an_empty_list_ends_the_walk_before_it_starts(self):
+        self._run(
+            "a: list[int] = []\nb = [1]\n"
+            "for x, y in zip(a, b):\n    print(x, y)\nprint('done')\n",
+            b"done\n",
+        )
+
+    def test_break_skips_the_else_body(self):
+        self._run(
+            "a = [1, 2, 3]\nb = [4, 5, 6]\n"
+            "for x, y in zip(a, b):\n    if x == 2:\n        break\n"
+            "else:\n    print('no two')\nprint('after')\n",
+            b"after\n",
+        )
+
+    def test_the_name_count_must_match_the_list_count(self):
+        self._reject(
+            "a = [1]\nb = [2]\nfor x in zip(a, b):\n    print(x)\n",
+            "walks 2 lists",
+        )
+
+    def test_round_breaks_ties_toward_the_even_number(self):
+        # 2.5 rounds down and 3.5 rounds up, which is Python and not the
+        # away-from-zero rule.
+        self._run(
+            "".join(
+                f"x = 0.0\nx = x + {value!r}\nprint(round(x))\n"
+                for value in (2.5, 3.5, -2.5, -1.5, 0.5, -0.5)
+            ),
+            b"2\n4\n-2\n-2\n0\n0\n",
+        )
+
+    def test_round_on_ordinary_values(self):
+        self._run(
+            "".join(
+                f"x = 0.0\nx = x + {value!r}\nprint(round(x))\n"
+                for value in (1.4999, 2.4999999, 123.456, -123.456, 7.0, -7.0)
+            ),
+            b"1\n2\n123\n-123\n7\n-7\n",
+        )
+
+    def test_round_of_an_integer_is_itself(self):
+        self._run("n = 0\nfor i in range(0, 5):\n    n = n + 1\nprint(round(n))\n", b"5\n")
+
+    def test_the_two_argument_form_says_what_it_would_take(self):
+        self._reject("x = 1.55\nprint(round(x, 1))\n", "rounds in decimal")
