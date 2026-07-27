@@ -3967,6 +3967,74 @@ class Frontend:
         self.operations.append(Label(end))
         return IntLoad(offset_slot)
 
+    def emit_string_index(
+        self, source: IntExpression, index: ast.expr
+    ) -> IntExpression:
+        """`s[i]` - the one-code-point string at position ``i``.
+
+        Indexing is not slicing with a narrower window: a slice clamps and
+        `s[99:100]` is empty, while `s[99]` raises IndexError. So the bound is
+        checked rather than clamped, and the check runs on the code-point count
+        because that is what CPython indexes by.
+        """
+
+        bump = self.ensure_heap()
+        source_slot = self.new_temp()
+        self.operations.append(Store(source_slot, source))
+        origin = IntLoad(source_slot)
+        length = self.materialize_int(self.emit_code_point_count(origin))
+        wanted = self.materialize_int(self.integer(index))
+        position_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                position_slot,
+                self.select_integer(
+                    IntCompare("lt", wanted, IntConstant(0)),
+                    IntBinary("add", wanted, length),
+                    wanted,
+                ),
+            )
+        )
+        ok = self.new_label("string_index_ok")
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "and",
+                    IntCompare("ge", IntLoad(position_slot), IntConstant(0)),
+                    IntCompare("lt", IntLoad(position_slot), length),
+                ),
+                ok + "_bad",
+            )
+        )
+        self.operations.append(Jump(ok))
+        self.operations.append(Label(ok + "_bad"))
+        self.raise_exception(
+            "IndexError", b"IndexError: string index out of range\n"
+        )
+        self.operations.append(Label(ok))
+        first = self.materialize_int(
+            self.emit_codepoint_offset(origin, IntLoad(position_slot))
+        )
+        last = self.materialize_int(
+            self.emit_codepoint_offset(
+                origin, IntBinary("add", IntLoad(position_slot), IntConstant(1))
+            )
+        )
+        span_slot = self.new_temp()
+        self.operations.append(Store(span_slot, IntBinary("sub", last, first)))
+        result_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(result_slot, self._aligned_size(IntLoad(span_slot)), bump)
+        )
+        result = IntLoad(result_slot)
+        self.operations.append(HeapStore(result, IntLoad(span_slot), 8))
+        self.emit_byte_copy(
+            IntBinary("add", result, IntConstant(8)),
+            IntBinary("add", IntBinary("add", origin, IntConstant(8)), first),
+            IntLoad(span_slot),
+        )
+        return result
+
     def emit_string_slice(
         self, source: IntExpression, node: ast.Slice
     ) -> IntExpression:
@@ -8075,6 +8143,14 @@ class Frontend:
             folded = None
         if isinstance(folded, str):
             return self.materialize_string_constant(folded.encode("utf-8"))
+        if (
+            isinstance(node, ast.Subscript)
+            and not isinstance(node.slice, ast.Slice)
+            and self.expression_type(node.value) == "str"
+        ):
+            return self.emit_string_index(
+                self.string_pointer(node.value), node.slice
+            )
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
             return self.emit_string_slice(
                 self.string_pointer(node.value), node.slice
@@ -14517,6 +14593,16 @@ class Frontend:
             return "float" if isinstance(value, float) else "int"
         if isinstance(node, ast.ListComp):
             return self.list_tag(self.comprehension_element_kind(node))
+        if (
+            isinstance(node, ast.Subscript)
+            and not isinstance(node.slice, ast.Slice)
+            and self.expression_type(node.value, bindings) == "str"
+        ):
+            # One code point of a string is a string, as it is in Python; there
+            # is no character type for it to be instead. Asked of the value
+            # rather than of value_types, because a string that folded at build
+            # time is not recorded there.
+            return "str"
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
             sliced = self.expression_type(node.value, bindings)
             if self.tuple_kinds(sliced) is not None:
