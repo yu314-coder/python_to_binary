@@ -1565,13 +1565,79 @@ class NestedListTests(unittest.TestCase):
                   b"[1, 2]\n[3]\n")
 
     def test_reordering_and_reducing_strings_or_lists_is_rejected(self):
-        # Sorting a list of strings used to be here too. It compares the text
-        # now rather than the block addresses, so it is a working feature and
-        # is covered by StringOrderingTests below; what is left rejected is
-        # what still has no order to compare by.
-        self._reject('parts = ["a"]\nprint(sum(parts))\n', "compare block addresses")
+        # Sorting a list of strings used to be here too, and min() and max()
+        # over one have since joined it: both compare the text rather than the
+        # block addresses. sum() stays rejected because adding strings up has
+        # no answer of the same kind - CPython raises TypeError there - so only
+        # the message it is rejected with has moved.
+        self._reject(
+            'parts = ["a"]\nprint(sum(parts))\n',
+            "only min() and max() have an answer",
+        )
         self._reject("xs = [[1], [2]]\nxs.sort()\n", "compare block addresses")
         self._reject("xs = [[1], [2]]\nprint([1] in xs)\n", "over a list of lists")
+
+
+class StringMinMaxTests(unittest.TestCase):
+    """`min()` and `max()` over a list of strings.
+
+    They answer with one of the elements, so over strings the answer is a
+    string. The comparison is the text one sorting already uses; comparing the
+    slots would order by where the arena put each block.
+    """
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def test_the_answer_is_one_of_the_strings(self):
+        self._run(
+            'xs = ["pear", "apple", "fig"]\nprint(max(xs), min(xs))\n',
+            b"pear apple\n",
+        )
+
+    def test_a_runtime_string_takes_part(self):
+        self._run(
+            's = ""\nfor _i in range(0, 1):\n    s = s + "zebra"\n'
+            'xs = ["apple", s, "mango"]\nprint(max(xs), min(xs))\n',
+            b"zebra apple\n",
+        )
+
+    def test_a_prefix_sorts_before_what_extends_it(self):
+        self._run('xs = ["ab", "a", "abc"]\nprint(min(xs), max(xs))\n', b"a abc\n")
+
+    def test_non_ascii_compares_by_code_point(self):
+        # Read as signed, a lead byte is negative and the accented letter would
+        # come out as the smallest of the three.
+        self._run(
+            'xs = ["\u00e9", "a", "z"]\nprint(max(xs), min(xs))\n',
+            "\u00e9 a\n".encode("utf-8"),
+        )
+
+    def test_an_empty_list_raises(self):
+        self._run("xs: list[str] = []\nprint(max(xs))\n", b"", expected_exit=1)
+
+    def test_the_result_is_a_string_and_behaves_like_one(self):
+        self._run(
+            'xs = ["b", "aa"]\nlongest = max(xs)\nprint(longest, len(longest))\n',
+            b"b 1\n",
+        )
 
 
 class SplitAndJoinTests(unittest.TestCase):

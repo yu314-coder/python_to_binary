@@ -5019,14 +5019,22 @@ class Frontend:
                 f"native {name}() takes a runtime list or a generator "
                 "expression over one",
             )
-        if element_kind not in {"int", "bool"}:
+        if element_kind == "str" and name not in {"min", "max"}:
+            raise NativeCompileError(
+                self.path,
+                node,
+                f"native {name}() works on integer lists; over strings only "
+                "min() and max() have an answer of the same kind as the "
+                "elements",
+            )
+        if element_kind not in {"int", "bool", "str"}:
             raise NativeCompileError(
                 self.path,
                 node,
                 f"native {name}() works on integer lists, and this one holds "
                 f"{self.kind_noun(element_kind)}; a float one would need a "
-                "float accumulator this call cannot return, and a string or a "
-                "list one would compare block addresses",
+                "float accumulator this call cannot return, and a list one "
+                "would compare block addresses",
             )
         pointer_slot = self.new_temp()
         self.operations.append(Store(pointer_slot, self.list_pointer(source)))
@@ -5067,7 +5075,7 @@ class Frontend:
             self.operations.append(Jump(start))
             self.operations.append(Label(end))
 
-        return self.emit_aggregate(name, walk)
+        return self.emit_aggregate(name, walk, element_kind)
 
     def aggregate_over_generator(
         self,
@@ -5109,7 +5117,7 @@ class Frontend:
 
         return self.emit_aggregate(name, walk)
 
-    def emit_aggregate(self, name: str, emit_loop):
+    def emit_aggregate(self, name: str, emit_loop, element_kind: str = "int"):
         """Fold every value ``emit_loop`` hands to the ``step`` it is given.
 
         Only the accumulator lives here, so walking a list and running a
@@ -5161,14 +5169,19 @@ class Frontend:
                     IntCompare("ne", IntLoad(seeded_slot), IntConstant(0)), take
                 )
             )
-            self.operations.append(
-                JumpIfFalse(
-                    IntCompare(
-                        self._AGGREGATES[name], item, IntLoad(result_slot)
-                    ),
-                    kept,
+            if element_kind == "str":
+                # The slots hold block addresses, so comparing them would order
+                # by where the arena put them. The text is what is compared.
+                wins: IntExpression = IntCompare(
+                    self._AGGREGATES[name],
+                    IntLoad(self.emit_string_order(item, IntLoad(result_slot))),
+                    IntConstant(0),
                 )
-            )
+            else:
+                wins = IntCompare(
+                    self._AGGREGATES[name], item, IntLoad(result_slot)
+                )
+            self.operations.append(JumpIfFalse(wins, kept))
             self.operations.append(Label(take))
             self.operations.append(Store(result_slot, item))
             self.operations.append(Store(seeded_slot, IntConstant(1)))
@@ -9764,6 +9777,17 @@ class Frontend:
             finally:
                 self.eager_depth -= 1
             return self.select_integer(condition, chosen, other)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"min", "max"}
+            and node.func.id not in self.functions
+            and len(node.args) == 1
+            and self.list_kind(self.expression_type(node.args[0])) == "str"
+        ):
+            # The answer is an element, and an element of this list is the
+            # address of a string block.
+            return self.integer(node)
         if self.list_method_shape(node, "pop") == "str":
             # The element word is the string's block address.
             assert isinstance(node, ast.Call)
@@ -16869,6 +16893,17 @@ class Frontend:
             and node.func.id not in self.functions
         ):
             return "str"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"min", "max"}
+            and node.func.id not in self.functions
+            and len(node.args) == 1
+        ):
+            # min() and max() answer with one of the elements, so over a list
+            # of strings the answer is a string.
+            if self.list_kind(self.expression_type(node.args[0], bindings)) == "str":
+                return "str"
         popped = self.list_method_shape(node, "pop")
         if popped is not None:
             return popped

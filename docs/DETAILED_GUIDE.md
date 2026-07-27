@@ -344,7 +344,11 @@ runtime:
 - `sum()`, `min()`, `max()`, `any()` and `all()` over a runtime integer list or
   over a generator expression, and `abs()`. `sum(xs, start)` adds the start to
   the walk - integers only, because the walk adds integers and a float start
-  would make the result a float after the fact. `min()` and `max()` of an empty
+  would make the result a float after the fact. `min()` and `max()` also work
+  over a list of strings, where they answer with one of the elements and so
+  answer with a string; the comparison is the text one, since comparing the
+  slots would order by where the arena put each block. `sum()` over strings
+  stays rejected, as CPython rejects it too. `min()` and `max()` of an empty
   iterable raise a catchable `ValueError`, as CPython does; `any()` of an empty
   one is `False` and `all()` of it is `True`;
 - `sorted(xs)`, `xs.sort()` and `for v in reversed(xs)` over a runtime list of
