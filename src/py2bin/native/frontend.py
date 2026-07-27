@@ -1499,6 +1499,13 @@ class Frontend:
         elif (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Tuple)
+            and self.is_divmod_call(node.value)
+        ):
+            self.divmod_assignment(node.targets[0], node.value)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
             and isinstance(node.targets[0], (ast.Tuple, ast.List))
             and self.unpacked_tuple_kinds(node.value) is not None
         ):
@@ -3933,6 +3940,263 @@ class Frontend:
         self.operations.append(Jump(outer))
         self.operations.append(Label(outer_end))
 
+    def is_divmod_call(self, node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "divmod"
+            and node.func.id not in self.functions
+        )
+
+    def divmod_assignment(self, target: ast.Tuple, node: ast.expr) -> None:
+        """`q, r = divmod(a, b)` - the quotient and remainder in one go.
+
+        Only this shape. divmod() answers a tuple, and a tuple here is a block
+        built from a literal; taking one apart again to get at the two numbers
+        would allocate for a pair that is always unpacked immediately.
+
+        Each operand is bound to a hidden name first, so that `divmod(f(), g())`
+        calls each once rather than once per half of the answer.
+        """
+
+        assert isinstance(node, ast.Call)
+        if len(node.args) != 2 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "native divmod() takes two integers"
+            )
+        if len(target.elts) != 2 or not all(
+            isinstance(element, ast.Name) for element in target.elts
+        ):
+            raise NativeCompileError(
+                self.path,
+                target,
+                "native divmod() answers two values, so it needs two names to "
+                "put them in",
+            )
+        for argument in node.args:
+            if self.expression_type(argument) == "float":
+                raise NativeCompileError(
+                    self.path,
+                    argument,
+                    "native divmod() takes integers; for floats the two halves "
+                    "are x // y and x % y, which are both in the subset",
+                )
+        operands = []
+        for argument in node.args:
+            name = f"__divmod_operand_{self.print_argument_count}"
+            self.print_argument_count += 1
+            self.assignment(name, argument)
+            operands.append(ast.copy_location(ast.Name(id=name, ctx=ast.Load()), argument))
+        for element, operator in zip(target.elts, (ast.FloorDiv(), ast.Mod())):
+            assert isinstance(element, ast.Name)
+            self.assignment(
+                element.id,
+                ast.copy_location(
+                    ast.BinOp(left=operands[0], op=operator, right=operands[1]),
+                    node,
+                ),
+            )
+
+    def emit_ord(self, node: ast.Call) -> IntExpression:
+        """`ord(s)` - the code point of a one-character string."""
+
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "native ord() takes exactly one argument"
+            )
+        if self.expression_type(node.args[0]) != "str":
+            raise NativeCompileError(
+                self.path,
+                node.args[0],
+                "native ord() takes a string; a bytes object is not in the "
+                "subset",
+            )
+        pointer = self.materialize_int(self.string_pointer(node.args[0]))
+        single = self.new_label("ord_single")
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare(
+                    "eq", self.emit_code_point_count(pointer), IntConstant(1)
+                ),
+                single + "_no",
+            )
+        )
+        self.operations.append(Jump(single))
+        self.operations.append(Label(single + "_no"))
+        self.raise_exception(
+            "TypeError", b"TypeError: ord() expected a character\n"
+        )
+        self.operations.append(Label(single))
+        return self.emit_decode_codepoint(pointer, IntConstant(0))
+
+    def emit_chr(self, node: ast.Call) -> IntExpression:
+        """`chr(n)` - the one-code-point string block for ``n``."""
+
+        if len(node.args) != 1 or node.keywords:
+            raise NativeCompileError(
+                self.path, node, "native chr() takes exactly one argument"
+            )
+        return self.emit_encode_codepoint(self.integer(node.args[0]))
+
+    def emit_decode_codepoint(
+        self, pointer: IntExpression, offset: IntExpression
+    ) -> IntExpression:
+        """The code point encoded at byte ``offset`` of a UTF-8 block.
+
+        Branching rather than reading all four bytes and masking: a one-byte
+        code point at the very end of a string has no second byte, and the
+        block is only as long as its contents, so the read would be outside it.
+
+        Nothing validates the encoding. Every string here was either written by
+        the compiler from source text or built by concatenating ones that were,
+        so a malformed sequence cannot arrive.
+        """
+
+        pointer_slot = self.new_temp()
+        self.operations.append(Store(pointer_slot, pointer))
+        offset_slot = self.new_temp()
+        self.operations.append(Store(offset_slot, offset))
+        first = IntBinary(
+            "add",
+            IntBinary("add", IntLoad(pointer_slot), IntConstant(8)),
+            IntLoad(offset_slot),
+        )
+
+        def byte(index: int) -> IntExpression:
+            return HeapLoad(IntBinary("add", first, IntConstant(index)), 1)
+
+        def tail(index: int) -> IntExpression:
+            return IntBinary("and", byte(index), IntConstant(0x3F))
+
+        lead_slot = self.new_temp()
+        self.operations.append(Store(lead_slot, byte(0)))
+        lead = IntLoad(lead_slot)
+        result = self.new_temp()
+        done = self.new_label("cp_decoded")
+        for limit, width, mask in ((0x80, 1, 0x7F), (0xE0, 2, 0x1F), (0xF0, 3, 0x0F)):
+            skip = self.new_label("cp_wider")
+            self.operations.append(
+                JumpIfFalse(IntCompare("lt", lead, IntConstant(limit)), skip)
+            )
+            value: IntExpression = IntBinary("and", lead, IntConstant(mask))
+            for index in range(1, width):
+                value = IntBinary(
+                    "or", IntBinary("lshift", value, IntConstant(6)), tail(index)
+                )
+            self.operations.append(Store(result, value))
+            self.operations.append(Jump(done))
+            self.operations.append(Label(skip))
+        four: IntExpression = IntBinary("and", lead, IntConstant(0x07))
+        for index in range(1, 4):
+            four = IntBinary(
+                "or", IntBinary("lshift", four, IntConstant(6)), tail(index)
+            )
+        self.operations.append(Store(result, four))
+        self.operations.append(Label(done))
+        return IntLoad(result)
+
+    def emit_encode_codepoint(self, value: IntExpression) -> IntExpression:
+        """A one-code-point string block holding ``value``, UTF-8 encoded."""
+
+        value_slot = self.new_temp()
+        self.operations.append(Store(value_slot, value))
+        code = IntLoad(value_slot)
+        in_range = self.new_label("chr_in_range")
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "and",
+                    IntCompare("ge", code, IntConstant(0)),
+                    IntCompare("le", code, IntConstant(0x10FFFF)),
+                ),
+                in_range + "_bad",
+            )
+        )
+        self.operations.append(Jump(in_range))
+        self.operations.append(Label(in_range + "_bad"))
+        self.raise_exception(
+            "ValueError", b"ValueError: chr() arg not in range(0x110000)\n"
+        )
+        self.operations.append(Label(in_range))
+        # A lone surrogate has no UTF-8 form. CPython's chr() hands one back and
+        # only fails when it is written out; a string here is its UTF-8 bytes
+        # and has nowhere to keep one, so this is where it has to be reported.
+        not_surrogate = self.new_label("chr_not_surrogate")
+        self.operations.append(
+            JumpIfFalse(
+                IntBinary(
+                    "and",
+                    IntCompare("ge", code, IntConstant(0xD800)),
+                    IntCompare("le", code, IntConstant(0xDFFF)),
+                ),
+                not_surrogate,
+            )
+        )
+        self.raise_exception(
+            "ValueError",
+            b"ValueError: chr() of a lone surrogate has no UTF-8 form, and a "
+            b"native string is its UTF-8 bytes\n",
+        )
+        self.operations.append(Label(not_surrogate))
+        width = self.new_temp()
+        self.operations.append(Store(width, IntConstant(1)))
+        for limit, size in ((0x80, 2), (0x800, 3), (0x10000, 4)):
+            narrower = self.new_label("chr_width")
+            self.operations.append(
+                JumpIfFalse(IntCompare("ge", code, IntConstant(limit)), narrower)
+            )
+            self.operations.append(Store(width, IntConstant(size)))
+            self.operations.append(Label(narrower))
+        bump = self.ensure_heap()
+        block = self.new_temp()
+        self.operations.append(
+            HeapAlloc(block, self._aligned_size(IntLoad(width)), bump)
+        )
+        self.operations.append(HeapStore(IntLoad(block), IntLoad(width), 8))
+        text = IntBinary("add", IntLoad(block), IntConstant(8))
+
+        def put(index: int, byte: IntExpression) -> None:
+            self.operations.append(
+                HeapStore(IntBinary("add", text, IntConstant(index)), byte, 1)
+            )
+
+        def low(shift: int) -> IntExpression:
+            return IntBinary(
+                "or",
+                IntConstant(0x80),
+                IntBinary("and", IntBinary("rshift", code, IntConstant(shift)), IntConstant(0x3F)),
+            )
+
+        written = self.new_label("chr_written")
+        for size, lead_mask, lead_shift in (
+            (1, 0x00, 0),
+            (2, 0xC0, 6),
+            (3, 0xE0, 12),
+            (4, 0xF0, 18),
+        ):
+            other = self.new_label("chr_size")
+            self.operations.append(
+                JumpIfFalse(
+                    IntCompare("eq", IntLoad(width), IntConstant(size)), other
+                )
+            )
+            put(
+                0,
+                IntBinary(
+                    "or",
+                    IntConstant(lead_mask),
+                    IntBinary("rshift", code, IntConstant(lead_shift)),
+                )
+                if size > 1
+                else code,
+            )
+            for index in range(1, size):
+                put(index, low(6 * (size - 1 - index)))
+            self.operations.append(Jump(written))
+            self.operations.append(Label(other))
+        self.operations.append(Label(written))
+        return IntLoad(block)
+
     def emit_codepoint_offset(
         self, pointer: IntExpression, count: IntExpression
     ) -> IntExpression:
@@ -4173,12 +4437,34 @@ class Frontend:
                 "lt" if name == "min" else "gt", right, left
             )
             return self.select_integer(keeps_left, right, left)
+        if name == "sum" and len(node.args) == 2 and not node.keywords:
+            # sum(xs, start) is the walk plus the start value, and the start
+            # decides the kind: sum([], 0.0) is 0.0 in CPython.
+            total = self.aggregate_call(
+                ast.copy_location(
+                    ast.Call(func=node.func, args=node.args[:1], keywords=[]), node
+                ),
+                bindings,
+                call_stack,
+            )
+            if self.expression_type(node.args[1], bindings) == "float":
+                raise NativeCompileError(
+                    self.path,
+                    node.args[1],
+                    "native sum() adds up integers, so its start must be one "
+                    "too; a float start would make the result a float, and the "
+                    "walk has already added the elements as integers",
+                )
+            return IntBinary(
+                "add", total, self.integer(node.args[1], bindings, call_stack)
+            )
         if len(node.args) != 1 or node.keywords:
             raise NativeCompileError(
                 self.path,
                 node,
                 f"native {name}() takes one iterable"
-                + (", or two values" if name in {"min", "max"} else ""),
+                + (", or two values" if name in {"min", "max"} else "")
+                + (", or an iterable and a start" if name == "sum" else ""),
             )
         source = node.args[0]
         if isinstance(source, ast.GeneratorExp):
@@ -8716,6 +9002,13 @@ class Frontend:
             # The element word is the string's block address.
             assert isinstance(node, ast.Call)
             return self.emit_list_pop(node)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "chr"
+            and node.func.id not in self.functions
+        ):
+            return self.emit_chr(node)
         if isinstance(node, ast.Name) and node.id in self.string_bindings:
             return self.string_bindings[node.id]
         if isinstance(node, ast.Name) and self.value_types.get(node.id) == "str":
@@ -15384,6 +15677,13 @@ class Frontend:
         shape = self.dict_get_shape(node)
         if shape is not None:
             return shape[2]
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "chr"
+            and node.func.id not in self.functions
+        ):
+            return "str"
         popped = self.list_method_shape(node, "pop")
         if popped is not None:
             return popped
@@ -16407,6 +16707,21 @@ class Frontend:
             if self.expression_type(argument, bindings) == "float":
                 return FloatToInt(self.float_expression(argument, bindings, call_stack))
             return self.integer(argument, bindings, call_stack)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ord"
+            and node.func.id not in self.functions
+        ):
+            return self.emit_ord(node)
+        if self.is_divmod_call(node):
+            raise NativeCompileError(
+                self.path,
+                node,
+                "native divmod() answers two values at once and is written "
+                "`q, r = divmod(a, b)`; there is no tuple here for it to be "
+                "held in otherwise",
+            )
         if self.dict_get_shape(node) is not None:
             return self.emit_dict_get(node, bindings)
         if self.list_method_shape(node, "pop") in {"int", "bool"}:

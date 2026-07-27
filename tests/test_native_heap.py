@@ -2112,3 +2112,128 @@ class DictGetAndListMethodsTests(unittest.TestCase):
         # earlier ones must not reorder these: len() has to see the shortened
         # list, because pop() is written first.
         self._run("xs = [1, 2, 3]\nprint(xs.pop(), len(xs))\n", b"3 2\n")
+
+
+class CodePointAndArithmeticBuiltinTests(unittest.TestCase):
+    """`ord()`, `chr()`, `divmod()` and `sum(xs, start)`."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    def _reject(self, source: str, needle: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            with self.assertRaises(NativeCompileError) as caught:
+                compile_native(entry, root / "bad.bin", "darwin-arm64")
+            self.assertIn(needle, str(caught.exception))
+
+    def _runtime(self, name: str, text: str) -> str:
+        return f'{name} = ""\n{name} = {name} + {text!r}\n'
+
+    def test_ord_reads_every_utf8_width(self):
+        self._run(
+            self._runtime("a", "A")
+            + self._runtime("b", "\u00e9")
+            + self._runtime("c", "\u4e2d")
+            + self._runtime("d", "\U0001f600")
+            + "print(ord(a), ord(b), ord(c), ord(d))\n",
+            b"65 233 20013 128512\n",
+        )
+
+    def test_ord_of_a_longer_string_reports_type_error(self):
+        self._run(self._runtime("s", "ab") + "print(ord(s))\n", b"", expected_exit=1)
+
+    def test_chr_writes_every_utf8_width(self):
+        self._run(
+            "print(chr(65))\nprint(chr(233))\nprint(chr(20013))\nprint(chr(128512))\n",
+            "A\n\u00e9\n\u4e2d\n\U0001f600\n".encode("utf-8"),
+        )
+
+    def test_chr_and_ord_round_trip_through_iteration(self):
+        # The decoder, the encoder and the code-point walk all have to agree
+        # on where one character ends and the next begins.
+        self._run(
+            self._runtime("s", "h\u00e9llo\u4e2d\U0001f600")
+            + "out = ''\nfor ch in s:\n    out = out + chr(ord(ch))\n"
+            + "print(out, out == s)\n",
+            "h\u00e9llo\u4e2d\U0001f600 True\n".encode("utf-8"),
+        )
+
+    def test_chr_out_of_range_reports_value_error(self):
+        self._run(
+            "n = 0\nfor i in range(0, 5):\n    n = n + 1\nprint(chr(1114112 + n))\n",
+            b"",
+            expected_exit=1,
+        )
+
+    def test_chr_of_a_lone_surrogate_is_reported(self):
+        # CPython hands back a string that fails later, when it is written out.
+        # A native string is its UTF-8 bytes, so there is nothing to hand back
+        # and the report happens here instead.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text("print(chr(55296))\n", encoding="utf-8")
+            compile_native(entry, root / "program.bin", "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(root / "program.bin")], capture_output=True)
+            self.assertEqual(native.returncode, 1)
+            self.assertIn(b"surrogate", native.stderr)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(reference.returncode, 1)
+
+    def test_divmod_answers_both_halves(self):
+        self._run("q, r = divmod(17, 5)\nprint(q, r)\n", b"3 2\n")
+
+    def test_divmod_follows_python_rounding_for_negatives(self):
+        # Python floors, so -17 // 5 is -4 and the remainder is positive.
+        self._run(
+            "n = 0\nfor i in range(0, 17):\n    n = n + 1\n"
+            "q, r = divmod(0 - n, 5)\nprint(q, r)\n",
+            b"-4 3\n",
+        )
+
+    def test_divmod_evaluates_each_operand_once(self):
+        # Both halves read the same operands, so a side-effecting one must not
+        # run twice: this pops a single element.
+        self._run("xs = [7]\nq, r = divmod(xs.pop(), 2)\nprint(q, r, len(xs))\n", b"3 1 0\n")
+
+    def test_divmod_by_zero_raises(self):
+        self._run(
+            "n = 0\nfor i in range(0, 3):\n    n = n + 1\n"
+            "q, r = divmod(10, n - 3)\nprint(q, r)\n",
+            b"",
+            expected_exit=1,
+        )
+
+    def test_divmod_outside_a_two_name_assignment_says_so(self):
+        self._reject("print(divmod(7, 2))\n", "q, r = divmod(a, b)")
+
+    def test_sum_takes_a_start_value(self):
+        self._run("xs = [1, 2]\nprint(sum(xs, 10))\n", b"13\n")
+        self._run("ys: list[int] = []\nprint(sum(ys, 5))\n", b"5\n")
+
+    def test_a_float_start_is_refused(self):
+        self._reject("xs = [1, 2]\nprint(sum(xs, 1.5))\n", "start must be one too")
