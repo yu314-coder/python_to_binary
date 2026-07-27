@@ -10040,6 +10040,10 @@ class Frontend:
         "endswith": "bool",
         "isdigit": "bool",
         "isalpha": "bool",
+        "isalnum": "bool",
+        "isspace": "bool",
+        "islower": "bool",
+        "isupper": "bool",
         "find": "int",
         "index": "int",
         "count": "int",
@@ -10051,6 +10055,8 @@ class Frontend:
         "lower": "str",
         "capitalize": "str",
         "title": "str",
+        "removeprefix": "str",
+        "removesuffix": "str",
         "zfill": "str",
         "center": "str",
         "ljust": "str",
@@ -10064,6 +10070,12 @@ class Frontend:
         "endswith": 1,
         "isdigit": 0,
         "isalpha": 0,
+        "isalnum": 0,
+        "isspace": 0,
+        "islower": 0,
+        "isupper": 0,
+        "removeprefix": 1,
+        "removesuffix": 1,
         "find": 1,
         "index": 1,
         "count": 1,
@@ -10085,7 +10097,18 @@ class Frontend:
     # Case and character-class answers come from Unicode tables that are not in
     # the binary, so these run only on text proven ASCII at run time.
     _ASCII_ONLY_STRING_METHODS = frozenset(
-        {"upper", "lower", "capitalize", "title", "isdigit", "isalpha"}
+        {
+            "upper",
+            "lower",
+            "capitalize",
+            "title",
+            "isdigit",
+            "isalpha",
+            "isalnum",
+            "isspace",
+            "islower",
+            "isupper",
+        }
     )
 
     def string_method_kind(
@@ -10564,6 +10587,10 @@ class Frontend:
 
         assert isinstance(node.func, ast.Attribute)
         name = self.check_string_method(node)
+        if name in {"removeprefix", "removesuffix"}:
+            # Its own entry point, because it needs both strings pinned before
+            # anything is allocated.
+            return self.emit_string_without_affix(node, name)
         receiver_slot = self.new_temp()
         self.operations.append(
             Store(receiver_slot, self.string_pointer(node.func.value))
@@ -10599,7 +10626,10 @@ class Frontend:
         self.operations.append(
             Store(receiver_slot, self.string_pointer(node.func.value))
         )
-        if name in {"isdigit", "isalpha"}:
+        if name in {"islower", "isupper"}:
+            self.emit_require_ascii(receiver_slot, name)
+            return self.emit_ascii_case_class(receiver_slot, name)
+        if name in {"isdigit", "isalpha", "isalnum", "isspace"}:
             self.emit_require_ascii(receiver_slot, name)
             return self.emit_ascii_class(receiver_slot, name)
         needle_slot = self.new_temp()
@@ -11205,11 +11235,25 @@ class Frontend:
             )
         )
         byte = IntLoad(byte_slot)
-        if name == "isdigit":
-            member = IntBinary(
+
+        def between(low: int, high: int) -> IntExpression:
+            return IntBinary(
                 "and",
-                IntCompare("ge", byte, IntConstant(0x30)),
-                IntCompare("le", byte, IntConstant(0x39)),
+                IntCompare("ge", byte, IntConstant(low)),
+                IntCompare("le", byte, IntConstant(high)),
+            )
+
+        digit = between(0x30, 0x39)
+        letter = IntBinary("or", between(0x41, 0x5A), between(0x61, 0x7A))
+        if name == "isdigit":
+            member = digit
+        elif name == "isalnum":
+            member = IntBinary("or", digit, letter)
+        elif name == "isspace":
+            # The six ASCII ones: space, tab, newline, carriage return,
+            # vertical tab and form feed.
+            member = IntBinary(
+                "or", between(0x09, 0x0D), IntCompare("eq", byte, IntConstant(0x20))
             )
         else:
             member = IntBinary(
@@ -11233,6 +11277,127 @@ class Frontend:
         self.operations.append(Label(miss))
         self.operations.append(Store(result_slot, IntConstant(0)))
         self.operations.append(Label(stop))
+        return IntLoad(result_slot)
+
+    def emit_ascii_case_class(self, pointer_slot: int, name: str) -> IntExpression:
+        """`.islower()` and `.isupper()` over text already proven ASCII.
+
+        Two facts rather than one: CPython answers True only when there is at
+        least one cased character and none of them is of the other case, so
+        "abc1" is lower but "123" is neither.
+        """
+
+        length_slot = self.new_temp()
+        self.operations.append(
+            Store(length_slot, HeapLoad(IntLoad(pointer_slot), 8))
+        )
+        seen_slot = self.new_temp()
+        wrong_slot = self.new_temp()
+        self.operations.append(Store(seen_slot, IntConstant(0)))
+        self.operations.append(Store(wrong_slot, IntConstant(0)))
+        base = IntBinary("add", IntLoad(pointer_slot), IntConstant(8))
+        index_slot = self.new_temp()
+        self.operations.append(Store(index_slot, IntConstant(0)))
+        loop = self.new_label("case_class")
+        stop = self.new_label("case_class_done")
+        self.operations.append(Label(loop))
+        self.operations.append(
+            JumpIfFalse(
+                IntCompare("lt", IntLoad(index_slot), IntLoad(length_slot)), stop
+            )
+        )
+        byte_slot = self.new_temp()
+        self.operations.append(
+            Store(
+                byte_slot,
+                HeapLoad(IntBinary("add", base, IntLoad(index_slot)), 1),
+            )
+        )
+        byte = IntLoad(byte_slot)
+
+        def between(low: int, high: int) -> IntExpression:
+            return IntBinary(
+                "and",
+                IntCompare("ge", byte, IntConstant(low)),
+                IntCompare("le", byte, IntConstant(high)),
+            )
+
+        lower, upper = between(0x61, 0x7A), between(0x41, 0x5A)
+        wanted, other = (lower, upper) if name == "islower" else (upper, lower)
+        for flag, test in ((seen_slot, wanted), (wrong_slot, other)):
+            skip = self.new_label("case_class_skip")
+            self.operations.append(JumpIfFalse(test, skip))
+            self.operations.append(Store(flag, IntConstant(1)))
+            self.operations.append(Label(skip))
+        self.operations.append(
+            Store(index_slot, IntBinary("add", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.operations.append(Jump(loop))
+        self.operations.append(Label(stop))
+        return IntBinary(
+            "and",
+            IntLoad(seen_slot),
+            IntCompare("eq", IntLoad(wrong_slot), IntConstant(0)),
+        )
+
+    def emit_string_without_affix(
+        self, node: ast.Call, name: str
+    ) -> IntExpression:
+        """`.removeprefix(p)` and `.removesuffix(p)` - the string, or a copy
+        without it.
+
+        The affix is a whole number of code points wherever it matches, because
+        a valid UTF-8 sequence cannot start in the middle of another, so the
+        copy is by byte and needs no decoding.
+        """
+
+        assert isinstance(node.func, ast.Attribute)
+        receiver_slot = self.new_temp()
+        affix_slot = self.new_temp()
+        self.operations.append(
+            Store(receiver_slot, self.string_pointer(node.func.value))
+        )
+        self.operations.append(
+            Store(affix_slot, self.string_pointer(node.args[0]))
+        )
+        length = HeapLoad(IntLoad(receiver_slot), 8)
+        affix_length = HeapLoad(IntLoad(affix_slot), 8)
+        offset = (
+            IntConstant(0)
+            if name == "removeprefix"
+            else IntBinary("sub", length, affix_length)
+        )
+        present = self.materialize_int(
+            self.emit_string_prefix(receiver_slot, affix_slot, offset)
+        )
+        result_slot = self.new_temp()
+        self.operations.append(Store(result_slot, IntLoad(receiver_slot)))
+        unchanged = self.new_label("affix_absent")
+        self.operations.append(
+            JumpIfFalse(IntCompare("ne", present, IntConstant(0)), unchanged)
+        )
+        span_slot = self.new_temp()
+        self.operations.append(
+            Store(span_slot, IntBinary("sub", length, affix_length))
+        )
+        bump = self.ensure_heap()
+        block_slot = self.new_temp()
+        self.operations.append(
+            HeapAlloc(block_slot, self._aligned_size(IntLoad(span_slot)), bump)
+        )
+        block = IntLoad(block_slot)
+        self.operations.append(HeapStore(block, IntLoad(span_slot), 8))
+        self.emit_byte_copy(
+            IntBinary("add", block, IntConstant(8)),
+            IntBinary(
+                "add",
+                IntBinary("add", IntLoad(receiver_slot), IntConstant(8)),
+                IntConstant(0) if name == "removesuffix" else affix_length,
+            ),
+            IntLoad(span_slot),
+        )
+        self.operations.append(Store(result_slot, block))
+        self.operations.append(Label(unchanged))
         return IntLoad(result_slot)
 
     def emit_string_prefix(

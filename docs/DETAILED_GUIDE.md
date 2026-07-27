@@ -249,7 +249,13 @@ runtime:
   `.endswith()`, `.find()`, `.index()`, `.count()`, `.replace()`, `.strip()`,
   `.lstrip()`, `.rstrip()`, `.zfill()`, `.center()`, `.ljust()`, `.rjust()`,
   `.upper()`, `.lower()`, `.capitalize()`, `.title()`, `.isdigit()`,
-  `.isalpha()`, `.split()` and `.join()`. `.split()` with no argument splits on
+  `.isalpha()`, `.isalnum()`, `.isspace()`, `.islower()`, `.isupper()`,
+  `.removeprefix()`, `.removesuffix()`, `.split()` and `.join()`.
+  `.islower()` and `.isupper()` need at least one cased character and none of
+  the other case, so `"123"` is neither. `.removeprefix()` and
+  `.removesuffix()` compare bytes and need no guard: a valid UTF-8 sequence
+  cannot start in the middle of another, so an affix that matches matches a
+  whole number of code points. `.split()` with no argument splits on
   runs of the same 29 Unicode whitespace code points `.strip()` uses and drops
   every empty piece; `.split(sep)` keeps them, so `",a,".split(",")` is three
   pieces and `"".split(",")` is one. An empty separator raises a catchable

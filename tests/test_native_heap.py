@@ -3064,3 +3064,118 @@ class AssertRepeatAndEnumerateTests(unittest.TestCase):
             's = ""\nfor i, ch in enumerate(s):\n    print(i, ch)\nprint("done")\n',
             b"done\n",
         )
+
+
+class MoreStringMethodTests(unittest.TestCase):
+    """`isalnum`, `isspace`, `islower`, `isupper`, `removeprefix`,
+    `removesuffix`."""
+
+    def _run(self, source: str, expected_stdout: bytes, expected_exit: int = 0) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            for target in _POSIX_TARGETS:
+                compile_native(entry, root / f"program-{target}.bin", target, clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run(
+                [str(root / "program-darwin-arm64.bin")], capture_output=True
+            )
+            self.assertEqual(native.stdout, expected_stdout)
+            self.assertEqual(native.returncode, expected_exit)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+            self.assertEqual(native.returncode, reference.returncode)
+
+    @staticmethod
+    def _runtime(name: str, text: str) -> str:
+        return f'{name} = ""\n{name} = {name} + {text!r}\n'
+
+    def test_isalnum_and_isspace(self):
+        self._run(
+            self._runtime("a", "abc123")
+            + self._runtime("b", " \t\n")
+            + self._runtime("c", "ab!")
+            + "print(a.isalnum(), b.isspace(), c.isalnum(), a.isspace())\n",
+            b"True True False False\n",
+        )
+
+    def test_islower_and_isupper_need_a_cased_character(self):
+        # "123" is neither: there is nothing cased in it to agree with.
+        self._run(
+            self._runtime("a", "abc1")
+            + self._runtime("b", "ABC1")
+            + self._runtime("c", "123")
+            + self._runtime("d", "aB")
+            + "print(a.islower(), b.isupper())\n"
+            + "print(c.islower(), c.isupper())\n"
+            + "print(d.islower(), d.isupper())\n",
+            b"True True\nFalse False\nFalse False\n",
+        )
+
+    def test_every_class_test_is_false_for_the_empty_string(self):
+        self._run(
+            'e = ""\n'
+            "print(e.isalnum(), e.isspace(), e.islower(), e.isupper())\n",
+            b"False False False False\n",
+        )
+
+    def test_a_non_ascii_receiver_stops_the_program(self):
+        # The same documented limit the other class tests have: the Unicode
+        # tables are not in the image, so a wrong answer is not offered.
+        # This is the one place these tests cannot hold the answer against
+        # CPython's, because the answers deliberately differ: CPython says
+        # True and the native program stops. Both halves are asserted, so the
+        # divergence is recorded rather than assumed.
+        #
+        # Built in a loop so it is not a build-time constant - a constant one
+        # is caught before the program runs, which is a different path.
+        source = (
+            's = ""\nfor _i in range(0, 1):\n    s = s + "café"\n'
+            "print(s.isalnum())\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            binary = root / "program.bin"
+            compile_native(entry, binary, "darwin-arm64", clean=True)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            native = subprocess.run([str(binary)], capture_output=True)
+            self.assertEqual(native.returncode, 1)
+            self.assertEqual(native.stdout, b"")
+            self.assertIn(b"limited to ASCII", native.stderr)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            self.assertEqual(reference.stdout, b"True\n")
+
+    def test_removeprefix_and_removesuffix(self):
+        self._run(
+            self._runtime("s", "prefix-body")
+            + self._runtime("t", "body.txt")
+            + 'print(s.removeprefix("prefix-"), s.removeprefix("nope"))\n'
+            + 'print(t.removesuffix(".txt"), t.removesuffix(".zip"))\n',
+            b"body prefix-body\nbody body.txt\n",
+        )
+
+    def test_an_affix_may_be_non_ascii(self):
+        # These compare bytes, and a valid UTF-8 sequence cannot start in the
+        # middle of another, so no decoding is needed and no guard applies.
+        self._run(
+            self._runtime("s", "héllo!")
+            + 'print(s.removesuffix("!"), s.removeprefix("hé"))\n',
+            "héllo llo!\n".encode("utf-8"),
+        )
+
+    def test_removing_the_whole_string_or_nothing(self):
+        self._run(
+            self._runtime("s", "ab")
+            + 'print(s.removeprefix("ab") == "", s.removesuffix("ab") == "")\n'
+            + 'print(s.removeprefix(""), s.removesuffix(""))\n',
+            b"True True\nab ab\n",
+        )
