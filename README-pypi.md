@@ -36,19 +36,43 @@ The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
 ## The paths through it
 
-**`compile-capi`** translates ordinary Python into C that drives the CPython
-C API, then compiles that C with py2bin's own C compiler. This is the tier
-Nuitka occupies, with Nuitka's dependency removed - Nuitka hands its generated
-C to clang, and this compiles it itself. Your logic becomes machine code;
-Python's object semantics stay in libpython, which the binary links.
+Three ways to turn a program into an artifact. They trade the same three things
+against each other, and which one you want depends on which you care about.
 
-**`compile`** removes CPython entirely: Python AST → py2bin IR → optimizer →
-handwritten x86-64/ARM64 instructions → ELF, PE or Mach-O. Nothing is
-interpreted and nothing is linked. The price is the smallest accepted subset.
+| | `compile` | `compile-capi` | `freeze` |
+|---|---|---|---|
+| **speed** on a 30M-iteration loop | **0.062 s** | 1.27 s | 0.66 s |
+| **artifact** | **48 KB** | 66 KB | tens of MB |
+| **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
+| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus | **everything** |
+| **third-party packages** | none | any the interpreter can import | **carried inside** |
+| what actually runs your logic | machine code | machine code | CPython, interpreting |
 
-**`freeze` / `bundle`** is compatibility packaging: your program shipped beside
-an interpreter that runs it, which is how a project with NumPy or a GUI gets an
-artifact at all. It is not translation.
+**`compile` is the fastest and the smallest.** Python AST → py2bin IR →
+optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
+interpreter in the artifact and none on the machine: 11× faster than CPython on
+that loop, in 48 KB that runs on a bare system. You pay for it in what it will
+accept - integers, floats, strings, control flow, your own functions - and it
+will not import a package at all.
+
+**`freeze` is the most complete.** It ships your program beside an interpreter
+that runs it, so NumPy, Torch and a GUI toolkit all work exactly as they do
+now. Nothing is translated, so nothing is faster; the artifact is the largest
+of the three because an interpreter and every dependency are inside it.
+
+**`compile-capi` is the middle, and the one under active work.** It translates
+ordinary Python into C that drives the CPython C API, then compiles that C with
+py2bin's own C compiler - the tier Nuitka occupies, with Nuitka's dependency on
+clang removed. Almost the whole language goes through, and anything the linked
+interpreter can import still works, so a real application with pywebview and
+Pillow compiles. Integer loops beat CPython because their locals are held in
+registers; most other operations are slower, because each one is a real C-API
+call where the interpreter has specialised bytecode. The per-feature table is below.
+
+The loop above is deliberately unkind to `compile-capi`: its accumulator is
+compared against a parameter, which the register analysis cannot claim, so the
+fast path is off. On a loop it can claim, the same tier is 1.67× faster than
+CPython.
 
 ## Using it
 
@@ -103,6 +127,84 @@ compiling in a fresh interpreter and listing what got loaded. `ctypes` is
 standard library and would pass an imports-only-stdlib check, but it pulls in
 `subprocess` - and there are Pythons where a subprocess is not something a
 program may have.
+
+## What `compile-capi` supports
+
+Every row is checked by compiling it, running it, running the same source under
+CPython, and requiring identical stdout and exit status.
+
+| feature | |
+|---|---|
+| int, float, str, bytes, bool, None | ✅ |
+| unbounded integers (`2 ** 200` exact) | ✅ |
+| f-strings, format specs, `!r`/`!s`/`!a` | ✅ |
+| list, tuple, dict, set, slicing, subscripts | ✅ |
+| comprehensions and generator expressions | ✅ |
+| `if` / `while` / `for` / `else`, `break`, `continue` | ✅ |
+| chained comparison, ternary, `and` / `or` | ✅ |
+| functions: defaults, `*args`, `**kwargs` | ✅ |
+| lambdas and closures | ✅ |
+| classes, `__init__`, methods, inheritance, `super()` | ✅ |
+| dunder methods (`__repr__`, `__eq__`, …) | ✅ |
+| decorators | ✅ |
+| `try` / `except` / `finally`, `with` | ✅ |
+| `import`, `from … import`, relative imports | ✅ |
+| `global` / `nonlocal`, tuple unpacking | ✅ |
+| the whole program: every `.py` beside the entry is compiled in | ✅ |
+| `__name__`, `__file__`, `inspect.signature` on compiled functions | ✅ |
+| `raise … from …` | ❌ |
+| starred unpacking (`a, *b = …`) | ❌ |
+| walrus (`:=`) | ❌ |
+| generators (`yield`) | ❌ |
+| `async` / `await` | ❌ |
+| `match` statement | ❌ |
+
+A refusal is a `file:line:col` error, never a silent approximation. On an
+889-program corpus, 878 programs produce byte-identical output to CPython; the
+7 that differ do so inherently (CPython's "Did you mean" needs a Python frame,
+`"v" is "v"` depends on interning) and 4 are refused outright.
+
+### How fast each one is
+
+300,000 iterations, median of 5, against the interpreter it links. Higher is
+better; `1.00×` means the same speed as CPython.
+
+| feature | py2bin | CPython | |
+|---|---|---|---|
+| integer arithmetic | **5.1 ms** | 8.5 ms | **1.67× faster** |
+| comparisons | **3.8 ms** | 4.7 ms | **1.24× faster** |
+| `while` loop | 7.5 ms | 6.5 ms | 0.87× |
+| direct function call | 7.9 ms | 6.4 ms | 0.81× |
+| comprehension | 5.2 ms | 4.0 ms | 0.77× |
+| dict store | 10.9 ms | 7.8 ms | 0.72× |
+| subscript | 7.1 ms | 3.9 ms | 0.55× |
+| attribute read | 7.5 ms | 3.8 ms | 0.51× |
+| exception raise/catch | 13.8 ms | 6.7 ms | 0.49× |
+| closure call | 14.0 ms | 6.5 ms | 0.46× |
+| f-string | 13.6 ms | 5.1 ms | 0.38× |
+| float arithmetic | 10.6 ms | 3.4 ms | 0.32× |
+| list append | 19.1 ms | 5.3 ms | 0.28× |
+| string concatenation | 24.3 ms | 3.3 ms | 0.14× |
+| instantiation | 177 ms | 16.3 ms | 0.09× |
+| method call | 142 ms | 6.7 ms | 0.05× |
+
+**Integer loops win** because a local the analysis picks out is held in a
+machine register, with an overflow check that falls back to unbounded
+arithmetic when the value leaves the word. That is what CPython's specialising
+interpreter does, and doing anything less was what made this tier slower than
+not compiling at all.
+
+**Everything else loses, by a factor that tracks how many C-API calls the
+operation costs.** Each one is a real call with the reference-count discipline
+around it, where the interpreter's specialised bytecode does the same work
+inline. Floats are not held in registers at all yet, which is the same job as
+the integers and not done.
+
+**Method calls and instantiation are far worse than the pattern predicts** -
+21× and 11× rather than the 2-4× everything else pays. That is not the C-API
+overhead; something in the class path is doing work per call that it should do
+once. It is the clearest thing to fix next and it is measured here rather than
+left out.
 
 ## Measured against Nuitka
 

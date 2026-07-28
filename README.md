@@ -12,28 +12,45 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 
 ## The paths through it
 
-**`compile-capi`** translates ordinary Python into C that drives the CPython
-C API, then compiles that C with py2bin's own C compiler. This is the tier
-Nuitka occupies, with Nuitka's dependency removed - Nuitka hands its generated
-C to clang, and this compiles it itself. Your logic becomes machine code;
-Python's object semantics stay in libpython, which the binary links.
+Three ways to turn a program into an artifact. They trade the same three things
+against each other, and which one you want depends on which you care about.
 
-**`compile`** removes CPython entirely: Python AST → py2bin IR → optimizer →
-handwritten x86-64/ARM64 instructions → ELF, PE or Mach-O. Nothing is
-interpreted and nothing is linked. The price is the smallest accepted subset of
-the three.
+| | `compile` | `compile-capi` | `freeze` |
+|---|---|---|---|
+| **speed** on a 30M-iteration loop | **0.062 s** | 1.27 s | 0.66 s |
+| **artifact** | **48 KB** | 66 KB | tens of MB |
+| **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
+| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus | **everything** |
+| **third-party packages** | none | any the interpreter can import | **carried inside** |
+| what actually runs your logic | machine code | machine code | CPython, interpreting |
 
-**`freeze` / `bundle`** is compatibility packaging: your program is shipped
-beside an interpreter that runs it, which is how a project with NumPy or a GUI
-gets an artifact at all. It is not translation, and this README does not
-pretend otherwise.
+**`compile` is the fastest and the smallest.** Python AST → py2bin IR →
+optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
+interpreter in the artifact and none on the machine: 11× faster than CPython on
+that loop, in 48 KB that runs on a bare system. You pay for it in what it will
+accept - integers, floats, strings, control flow, your own functions - and it
+will not import a package at all.
 
-Three supporting pieces are usable on their own: **`compile-c`**, py2bin's C
-compiler, which implements the integer and pointer language including
-recursion, function pointers, static storage and a real preprocessor;
-**`aot-plan` / `aot-build`**, which refuse to emit anything unless every
-reached operation has a CPython-free route; and **`py2bin.cabi`**, the vetted
-list of CPython entry points a program may bind.
+**`freeze` is the most complete.** It ships your program beside an interpreter
+that runs it, so NumPy, Torch and a GUI toolkit all work exactly as they do
+now. Nothing is translated, so nothing is faster; the artifact is the largest
+of the three because an interpreter and every dependency are inside it.
+
+**`compile-capi` is the middle, and the one under active work.** It translates
+ordinary Python into C that drives the CPython C API, then compiles that C with
+py2bin's own C compiler - the tier Nuitka occupies, with Nuitka's dependency on
+clang removed. Almost the whole language goes through, and anything the linked
+interpreter can import still works, so a real application with pywebview and
+Pillow compiles. Integer loops beat CPython because their locals are held in
+registers; most other operations are slower, because each one is a real C-API
+call where the interpreter has specialised bytecode. See
+[what it supports](#what-compile-capi-supports) for the per-feature table.
+
+The loop above is deliberately unkind to `compile-capi`: its accumulator is
+compared against a parameter, which the register analysis cannot claim, so the
+fast path is off. On a loop it can claim, the same tier is 1.67× faster than
+CPython.
+
 ## Platforms
 
 What `compile-capi` - the tier that turns your program into machine code that
@@ -215,306 +232,115 @@ bug leaves intact.
 An exe needs `pythonXY.dll` beside it or on the path. That is what you ship,
 not something the compiler can settle.
 
-## The three tiers, stated plainly
+## What `compile-capi` supports
 
-Three different things in this repository all end in "a file you can run". They
-give very different guarantees, and the difference matters more than the
-similarity.
+Every row is checked by compiling it, running it, running the same source under
+CPython, and requiring identical stdout and exit status.
 
-| | (a) `freeze` / `bundle` | (b) CPython C-API path | (c) `compile` native |
+| feature | |
+|---|---|
+| int, float, str, bytes, bool, None | ✅ |
+| unbounded integers (`2 ** 200` exact) | ✅ |
+| f-strings, format specs, `!r`/`!s`/`!a` | ✅ |
+| list, tuple, dict, set, slicing, subscripts | ✅ |
+| comprehensions and generator expressions | ✅ |
+| `if` / `while` / `for` / `else`, `break`, `continue` | ✅ |
+| chained comparison, ternary, `and` / `or` | ✅ |
+| functions: defaults, `*args`, `**kwargs` | ✅ |
+| lambdas and closures | ✅ |
+| classes, `__init__`, methods, inheritance, `super()` | ✅ |
+| dunder methods (`__repr__`, `__eq__`, …) | ✅ |
+| decorators | ✅ |
+| `try` / `except` / `finally`, `with` | ✅ |
+| `import`, `from … import`, relative imports | ✅ |
+| `global` / `nonlocal`, tuple unpacking | ✅ |
+| the whole program: every `.py` beside the entry is compiled in | ✅ |
+| `__name__`, `__file__`, `inspect.signature` on compiled functions | ✅ |
+| `raise … from …` | ❌ |
+| starred unpacking (`a, *b = …`) | ❌ |
+| walrus (`:=`) | ❌ |
+| generators (`yield`) | ❌ |
+| `async` / `await` | ❌ |
+| `match` statement | ❌ |
+
+A refusal is a `file:line:col` error, never a silent approximation. On an
+889-program corpus, 878 programs produce byte-identical output to CPython; the
+7 that differ do so inherently (CPython's "Did you mean" needs a Python frame,
+`"v" is "v"` depends on interning) and 4 are refused outright.
+
+### The interpreter surface it may use
+
+- A fixed table of 71 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+  `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
+  `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
+  `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
+  `PyFile_WriteString`, `PyFloat_AsDouble`, `PyFloat_FromDouble`,
+  `PyImport_AddModule`, `PyImport_ImportModule`, `PyIter_Next`,
+  `PyList_Append`, `PyList_New`, `PyLong_AsLongLong`, `PyLong_FromLongLong`,
+  `PyLong_FromString`, `PyNumber_Add`, `PyNumber_And`,
+  `PyNumber_FloorDivide`, `PyNumber_Invert`, `PyNumber_Lshift`,
+  `PyNumber_Multiply`, `PyNumber_Negative`, `PyNumber_Or`,
+  `PyNumber_Positive`, `PyNumber_Power`, `PyNumber_Remainder`,
+  `PyNumber_Rshift`, `PyNumber_Subtract`, `PyNumber_TrueDivide`,
+  `PyNumber_Xor`, `PyObject_Call`, `PyObject_CallNoArgs`,
+  `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_GetAttrString`,
+  `PyObject_GetItem`, `PyObject_GetIter`, `PyObject_IsTrue`,
+  `PyObject_Repr`, `PyObject_RichCompare`, `PyObject_SetAttrString`,
+  `PyObject_SetItem`, `PyObject_Size`, `PyObject_Str`,
+  `PyObject_Vectorcall`, `PyRun_SimpleString`, `PySequence_Contains`,
+  `PySlice_New`, `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`,
+  `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_DecodeUTF8`,
+  `PyUnicode_FromString`, `Py_DecRef`, `Py_EnterRecursiveCall`,
+  `Py_Finalize`, `Py_IncRef`, `Py_Initialize`, `Py_IsInitialized`,
+  `Py_LeaveRecursiveCall`
+- Every one is a real exported function - not a macro, not a `static inline` -
+  with a fixed count of word-sized arguments, and a test asserts each is
+  exported by the running interpreter's dylib. That is why this compiler never
+  reads `Python.h`: the preprocessor could include it, but what is inside is
+  macros, inline functions and struct layouts it does not implement, so the
+  table is written out instead.
+
+### How fast each one is
+
+300,000 iterations, median of 5, against the interpreter it links. Higher is
+better; `1.00×` means the same speed as CPython.
+
+| feature | py2bin | CPython | |
 |---|---|---|---|
-| Shape of the idea | PyInstaller-shaped | Nuitka-shaped | a small AOT compiler |
-| What executes your logic | CPython, interpreting your source/bytecode | machine code py2bin wrote | machine code py2bin wrote |
-| Is CPython present? | Yes, bundled inside the artifact | Yes, linked as an external shared library | No |
-| Accepts arbitrary Python? | Yes, in practice | Most of it: 878 of an 889-program corpus match CPython | No — a small explicit subset |
-| Third-party packages | Yes, carried as payload | Only whatever the linked interpreter can already import | No |
-| Targets | all implemented targets, given a runtime pack and target wheels | macOS (both) and Windows x86-64 | all implemented targets |
-| Artifact runs standalone? | Yes | **No** — needs that exact CPython installed | Yes |
+| integer arithmetic | **5.1 ms** | 8.5 ms | **1.67× faster** |
+| comparisons | **3.8 ms** | 4.7 ms | **1.24× faster** |
+| `while` loop | 7.5 ms | 6.5 ms | 0.87× |
+| direct function call | 7.9 ms | 6.4 ms | 0.81× |
+| comprehension | 5.2 ms | 4.0 ms | 0.77× |
+| dict store | 10.9 ms | 7.8 ms | 0.72× |
+| subscript | 7.1 ms | 3.9 ms | 0.55× |
+| attribute read | 7.5 ms | 3.8 ms | 0.51× |
+| exception raise/catch | 13.8 ms | 6.7 ms | 0.49× |
+| closure call | 14.0 ms | 6.5 ms | 0.46× |
+| f-string | 13.6 ms | 5.1 ms | 0.38× |
+| float arithmetic | 10.6 ms | 3.4 ms | 0.32× |
+| list append | 19.1 ms | 5.3 ms | 0.28× |
+| string concatenation | 24.3 ms | 3.3 ms | 0.14× |
+| instantiation | 177 ms | 16.3 ms | 0.09× |
+| method call | 142 ms | 6.7 ms | 0.05× |
 
-**(a) Freeze** is compatibility packaging. Your program is not translated; it
-is shipped next to an interpreter that runs it. This is the tier that handles
-real applications with NumPy, Torch, or a GUI.
+**Integer loops win** because a local the analysis picks out is held in a
+machine register, with an overflow check that falls back to unbounded
+arithmetic when the value leaves the word. That is what CPython's specialising
+interpreter does, and doing anything less was what made this tier slower than
+not compiling at all.
 
-**(b) The CPython C-API path** is the Nuitka-shaped tier, with Nuitka's
-essential dependency removed: Nuitka hands its generated C to clang, and py2bin
-compiles the C itself. `py2bin compile-capi` now goes the whole way from
-Python - it emits the C-API calls and compiles them, so the pipeline is
-Python → C → machine code with nothing outside the standard library in it.
-What survives that constraint is genuinely narrower than Nuitka. See
-[What the C-API path supports](#what-the-c-api-path-supports).
+**Everything else loses, by a factor that tracks how many C-API calls the
+operation costs.** Each one is a real call with the reference-count discipline
+around it, where the interpreter's specialised bytecode does the same work
+inline. Floats are not held in registers at all yet, which is the same job as
+the integers and not done.
 
-**(c) Native compile** removes CPython entirely. Nothing is interpreted and
-nothing is linked; the ELF/PE/Mach-O contains only instructions py2bin encoded.
-The price is the smallest subset of the three.
-
-None of these tiers invokes gcc, clang, `as`, `ld`, Xcode, or an SDK. py2bin
-cannot: the library does not import `subprocess` and never starts a process, and
-the test suite fails if that changes.
-
-## What the C-API path supports
-
-This is the honest boundary of tier (b). It is deliberately unflattering.
-
-**How you reach it.** Three entry points, all producing the same IR:
-
-```sh
-# 1. Ordinary Python, translated into C-API calls for you. This is the
-#    Nuitka-shaped route: Python -> C -> machine code, no clang. Every .py
-#    beside the entry that it imports is compiled into the same binary.
-PYTHONPATH=src python3 -m py2bin compile-capi program.py \
-  --target darwin-arm64 -o program.bin
-
-#    ...or as a macOS .app with an icon. What is inside the bundle is the
-#    compiled program, not an interpreter and a copy of the source. --site
-#    puts a directory on sys.path, which is how the binary finds packages
-#    the linked interpreter was never told about.
-PYTHONPATH=src python3 -m py2bin compile-capi app.py \
-  --target darwin-arm64 --app --name "My App" --icon icon.icns \
-  --site ~/venvs/myapp/lib/python3.12/site-packages -o MyApp.app
-
-#    --embed-python carries the interpreter inside the bundle and names it
-#    relative to the executable, so the .app starts on a Mac that does not
-#    have this exact CPython installed.
-PYTHONPATH=src python3 -m py2bin compile-capi app.py \
-  --target darwin-arm64 --app --name "My App" --icon icon.icns \
-  --embed-python --site Resources/site-packages \\
-  --bundle-site ~/venvs/myapp/lib/python3.12/site-packages --prune-unused \\
-  -o MyApp.app
-
-# 2. Python that imports vetted C-API names from py2bin.cabi.
-PYTHONPATH=src python3 -m py2bin compile program.py \
-  --target darwin-arm64 -o program.bin
-
-# 3. Canonical C that declares the same functions with `extern` prototypes.
-PYTHONPATH=src python3 -m py2bin compile-c program.c \
-  --target darwin-arm64 -o program.bin
-```
-
-The first is what `compile-capi` adds. It writes the C itself - `--emit-c PATH`
-keeps a copy to read - and every value in it is a `PyObject *`, so the
-interpreter's semantics apply rather than the native subset's:
-
-```python
-def fact(n):
-    if n < 2:
-        return 1
-    return n * fact(n - 1)
-
-print(fact(25))          # 15511210043330985984000000, exact
-```
-
-The native tier answers that one with a wrapped 64-bit integer. This tier hands
-the multiply to `PyNumber_Multiply` and gets Python's own answer. The price is
-the one this whole tier pays: the artifact needs libpython, so it is not
-standalone.
-
-Reference counting follows a single rule, chosen because it can be checked by
-reading rather than by trusting: **every expression yields a reference the
-caller owns**, and every statement releases what it finishes with. Reading a
-name therefore increments first. A 500,000-iteration loop peaks at 14 MB, which
-is what that rule holding looks like from outside.
-
-The two are interconvertible: py2bin's C frontend parses the C into a Python
-AST, so the same program can be run under `python3` (where `py2bin.cabi` makes
-the identical calls through `ctypes.pythonapi`) and diffed against the compiled
-binary. Every C-API feature below is verified that way — build, run natively,
-run the same program under CPython, require identical stdout and exit status.
-
-**What goes through.**
-
-- A fixed table of 71 exported CPython entry points: `Py_Initialize`,
-  `Py_Finalize`, `Py_IsInitialized`, `PyRun_SimpleString`,
-  `PyLong_FromLongLong`, `PyLong_AsLongLong`, `PyUnicode_FromString`,
-  `PyNumber_Add`/`Subtract`/`Multiply`/`TrueDivide`, `PyObject_RichCompare`,
-  `PyObject_IsTrue`, `PyObject_Str`, `PyObject_Repr`, `PyObject_Size`,
-  `PyObject_GetAttrString`, `PyObject_CallNoArgs`, `PyObject_CallOneArg`,
-  `PyObject_Call`, `PyTuple_New`, `PyTuple_SetItem`,
-  `PyObject_GetIter`, `PyIter_Next`, `PyFloat_FromDouble`,
-  `PyFloat_AsDouble`, `PyObject_GetItem`, `PyObject_SetItem`,
-  `PyNumber_Remainder`, `PyNumber_FloorDivide`, `PyNumber_Power`, `PyDict_New`,
-  `PyDict_SetItem`, `PyTuple_Pack`, `PySequence_Contains`,
-  `PyErr_ExceptionMatches`, `PyErr_SetObject`, `PySlice_New`,
-  `PyNumber_Or`, `PyNumber_And`, `PyNumber_Xor`,
-  `PyNumber_Lshift`, `PyNumber_Rshift`, `PyObject_DelItem`,
-  `PyErr_GetRaisedException`, `PyCFunction_New`, `PyTuple_GetItem`,
-  `PyObject_SetAttrString`, `PyErr_SetRaisedException`,
-  `PyBytes_FromStringAndSize`, `PyUnicode_DecodeUTF8`, `PyNumber_Negative`,
-  `PyNumber_Positive`, `PyNumber_Invert`, `Py_EnterRecursiveCall`,
-  `Py_LeaveRecursiveCall`, `PyLong_FromString`, `PyImport_AddModule`,
-  `PyObject_Vectorcall`,
-  `PyImport_ImportModule`, `PyList_New`, `PyList_Append`, `PySys_GetObject`,
-  `PySys_WriteStdout`, `PyFile_WriteObject`, `PyFile_WriteString`, `Py_IncRef`,
-  `Py_DecRef`, `PyErr_Occurred`, `PyErr_Print`, `PyErr_Clear`. Every one is a
-  real exported function — not a macro or a `static inline` — with a fixed
-  count of word-sized arguments. A test asserts each is exported by the running
-  interpreter's dylib.
-- Opaque `PyObject *` handles in locals, parameters, and return values.
-- `long long` locals, arithmetic, comparisons, `if`, `while`, and calls to
-  your own functions, which are inlined.
-- `NULL` checks: `handle == NULL` and `handle != NULL`.
-- Compile-time string literals as `const char *` arguments.
-- Because the interpreter is real, so is everything it does: importing `math`,
-  calling `math.isqrt`, building a `list` and printing `[2, 4, 6, 8]`, and
-  `str()` of a Python `int` all work, because CPython performs them.
-- `PyImport_ImportModule` reaches anything that interpreter can already import,
-  including third-party packages on its `sys.path`. Note what that does and
-  does not mean: py2bin neither translates nor packages those modules, and the
-  binary does not carry them. The same applies to `PyRun_SimpleString`, which
-  really does execute arbitrary Python — *interpreted from a string at runtime*.
-  Wrapping a program in `PyRun_SimpleString` would produce a launcher for
-  interpreted source, not compiled code, and this project does not count that
-  as compiling anything.
-
-**What is rejected, with a `file:line:col` error.**
-
-- Every target except `darwin-arm64`. There is no C-API path on Linux, on
-  Windows, or on x86-64 macOS.
-- Dereferencing a handle, pointer arithmetic on it, ordering comparisons
-  (`<`, `>`) between handles, or mixing a handle with a `long long`. Handles
-  are opaque 64-bit values and nothing else. This is why py2bin never needs to
-  read `Python.h`: its preprocessor could include the file, but what is inside
-  is macros, `static inline` functions and struct layouts that this compiler
-  does not implement, so the vetted table of entry points is written out
-  instead.
-- Any prototype that disagrees with the vetted ABI (wrong argument count, or a
-  non-`void` return for a `void` function).
-- Variadic C-API entry points such as `PyObject_CallFunctionObjArgs`. Apple's
-  arm64 ABI passes variadic arguments on the stack and this backend has no
-  stack-argument path, so they are absent from the table rather than
-  miscompiled. `PySys_WriteStdout` is allowed only with a literal containing
-  no `%`.
-- More than eight arguments — the AAPCS64 register budget. Refused, not
-  truncated.
-- An extern call inside `A ? B : C` or a short-circuited `&&`/`||`. Both arms
-  are lowered eagerly, so the call in the untaken arm would still run.
-- Using the result of a `void` function as a value.
-
-**What `compile-capi` translates from Python.** Everything here is verified by
-building it, running it, running the same source under CPython, and requiring
-identical stdout and exit status.
-
-- **The whole program, not just its entry file.** Every `.py` beside the entry
-  that it imports is compiled and linked into the same image, registered under
-  its own name before its body runs — so an `import` of it finds the compiled
-  module rather than reading source next to the binary. A three-module,
-  10,100-line application compiles to one 9.5 MB Mach-O that runs with none of
-  its own `.py` files present.
-- Every module has `__name__` and `__file__`, without which
-  `if __name__ == "__main__":` never fires and a program cannot find what sits
-  beside it. `__file__`, `sys.argv[0]` and any relative `--site` directory are
-  resolved from the running binary, so a bundle can be moved.
-- Compiled functions carry a signature, so `inspect.signature` describes them
-  and frameworks that introspect (pywebview binding a JS API, for one) accept
-  them. Defaults read as `None` — the format has no spelling for an arbitrary
-  expression.
-
-- Integers, floats, strings and f-strings, including format specifiers and
-  `!r`/`!s`/`!a` conversions — `f"{x:.{places}f}"` goes to the interpreter's
-  own `format()`, so the mini-language means what it means in Python.
-- `list`, `dict`, `tuple` and `set` literals and comprehensions; subscripting
-  and slices; every arithmetic, bitwise, boolean and comparison operator,
-  including chains such as `0 <= x < n`, which evaluate each operand once.
-- `if`/`while`/`for` with `break`, `continue` and tuple targets; unpacking;
-  `with`; `del`; `import` and `from`-`import`; attribute access and method
-  calls of any arity; keyword arguments; module-level globals.
-- Functions with defaults, **nested functions, and lambdas**, to any depth. A
-  closure is a real Python callable: the body is compiled to its own C
-  function and `PyCFunction_New` wraps it, with what it captured travelling as
-  the object CPython hands that function as `self`.
-- **Classes**, including inheritance, `__init__`, `__repr__` and other dunder
-  methods, class-level attributes, methods with defaults, and `isinstance`. A
-  class is what `type(name, bases, namespace)` answers, so the method
-  resolution order and attribute lookup are the interpreter's own. Each method
-  is a closure wrapped in `functools.partialmethod`, which is what makes it
-  bind — a raw `PyCFunction` is not a descriptor, so the instance would never
-  arrive. Zero-argument `super()` works: CPython supplies `__class__` and
-  `self` through a cell it makes for any method mentioning the name, and a
-  compiled method writes the same two values out instead.
-- Runaway recursion raises `RecursionError` rather than taking the process
-  down: compiled calls use the real stack, and a segfault is not something a
-  program can catch or report.
-- A call with the wrong number of arguments raises `TypeError` with CPython's
-  own message, qualified name included — `outer.<locals>.one() takes 1
-  positional argument but 2 were given`.
-- `try`/`except` (with `as name` and a tuple of classes), `raise`, and bare
-  `raise` to re-raise what a clause is handling. A function body that raises
-  with nothing to catch answers `NULL` with the exception still set, exactly
-  as a C-API function does, so a `try` around the *call* catches it.
-- `finally`, which runs on every way out of the region it protects: falling
-  off the end, an exception nothing caught, `return`, `break` and `continue`,
-  and through nested clauses in the right order. `with` is one of these: its
-  `__exit__` runs however the body ends, and receives the real exception so it
-  can suppress.
-- Assignment to an attribute or a subscript, and augmented assignment to
-  either. `xs[f()] += 1` calls `f` once, as Python does.
-- `*args` and `**kwargs` spread into a call, and `[*xs, 3]` /
-  `{**base, 'k': 1}` in a literal. A module-level `def` is also a value, so it
-  can be passed as a sort key or have arguments spread into it.
-- The whole parameter grammar: defaults, `*args`, `**kwargs`, keyword-only
-  parameters with their own defaults, and positional-only parameters after
-  `/`. Every compiled function takes keywords, so any parameter can be passed
-  by name — `show(1, c=9)` reaches `c`.
-- `for`/`while`/`try` with an `else` clause; `assert`; annotated assignment
-  (`x: int = 5`); chained assignment (`a = b = v`); `del` of a name, an
-  attribute or an item; and `print` with `sep=`, `end=`, `file=` or `flush=`.
-- **Decorators**, on functions, methods and classes, stacked and with
-  arguments — including `@staticmethod`, `@classmethod` and `@property`, which
-  are handed the plain callable so their own binding is not obstructed.
-- `global`, and dotted imports (`import a.b`, `import a.b as c`).
-- `bytes` literals, and dict comprehensions. Integers of any width, and text
-  or bytes carrying a zero byte — neither of which has a C type to arrive in.
-- Comprehensions have a scope of their own, so `[x * 2 for x in xs]` leaves an
-  enclosing `x` alone; unpacking checks how many values there were and raises
-  Python's `ValueError`; and a name that exists nowhere, or whose only binding
-  did not run, raises `NameError` or `UnboundLocalError` as Python does rather
-  than reading an empty slot.
-
-Two things it deliberately refuses rather than answering differently from
-Python. A closure captures the *value* a name holds when the closure is made,
-where Python captures the variable; where the enclosing scope moves that name
-afterwards the two disagree, so that case is a build-time refusal naming the
-variable. (At module level there is nothing to refuse: the name lives in the
-module's own storage, so `[f() for f in fs]` after a loop of lambdas gives
-Python's `[2, 2, 2]`.) `nonlocal`, `async` and generators are not translated
-yet, and `functools.wraps` cannot rename a compiled function — see below.
-
-**What py2bin does not do for you on the hand-written routes.** These apply to
-routes 2 and 3 above, where you write the C-API calls yourself; `compile-capi`
-generates all of this for you.
-
-- **No automatic reference counting.** You call `Py_IncRef`/`Py_DecRef`. py2bin
-  emits exactly the calls you wrote and does not verify ownership, so a leak or
-  a double-free in your program stays a leak or a double-free.
-- **No exception propagation.** A failing C-API call returns `NULL` and the
-  error stays pending. py2bin inserts no checks and generates no unwinding;
-  checking `PyErr_Occurred` is your program's job.
-- **The native subset still applies to what is not a C-API call.** In route 2,
-  constructs outside the native frontend's subset are rejected outright, and
-  those inside it compile the way tier (c) compiles them, straight to
-  instructions — `print` becomes a `write` syscall, not `PyObject_Print`.
-
-**What no route does.**
-
-- **The artifact is not standalone.** The Mach-O carries an `LC_LOAD_DYLIB` for
-  the *build host's* CPython at its absolute path (`otool -L` shows it next to
-  `libSystem`). Move the binary to a machine without that exact interpreter at
-  that exact path and dyld will refuse to start it. Tier (a) is what produces a
-  distributable artifact.
-- **Two divergences between compiled and interpreted runs.** Both are inherent
-  to embedding rather than bugs py2bin can fix, and both are silent, so they are
-  stated rather than hidden.
-  1. *A failing call.* Under CPython the shims go through `ctypes.pythonapi`,
-     which converts a set error indicator into a raised exception; a compiled
-     binary just receives `NULL`. The two runs therefore agree only while no
-     C-API call fails. `py2bin/cabi.py` states this in the source.
-  2. *Unflushed output when `Py_Finalize` is not called.* `sys.stdout` is
-     buffered inside the interpreter. Running the twin `.py` under `python3`
-     flushes it at interpreter shutdown, but a compiled binary that returns from
-     `main` without calling `Py_Finalize` exits before anything is flushed and
-     prints **nothing at all**. This is ordinary C-embedding behaviour — a
-     gcc-built program does the same — but it means a program that looks correct
-     under `python3` can produce empty output once compiled. Call `Py_Finalize`
-     before returning. Every shipped example and test does.
+**Method calls and instantiation are far worse than the pattern predicts** -
+21× and 11× rather than the 2-4× everything else pays. That is not the C-API
+overhead; something in the class path is doing work per call that it should do
+once. It is the clearest thing to fix next and it is measured here rather than
+left out.
 
 ## Measured against Nuitka
 
