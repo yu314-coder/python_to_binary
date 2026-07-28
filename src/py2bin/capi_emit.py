@@ -74,11 +74,12 @@ extern PyObject *PyObject_Vectorcall(
     PyObject *keyword_names);
 extern PyObject *PyTuple_New(long long length);
 extern PyObject *PyTuple_GetItem(PyObject *tuple, long long index);
-typedef PyObject *(*PyCFunctionWithKeywords)(
-    PyObject *self, PyObject *args, PyObject *kwargs);
+typedef PyObject *(*PyCFunctionFastWithKeywords)(
+    PyObject *self, PyObject **arguments, long long count,
+    PyObject *keyword_names);
 struct PyMethodDef {
     const char *ml_name;
-    PyCFunctionWithKeywords ml_meth;
+    PyCFunctionFastWithKeywords ml_meth;
     int ml_flags;
     const char *ml_doc;
 };
@@ -3125,7 +3126,12 @@ class CApiEmitter:
         # parameter nothing supplied stays NULL, which is how the callee is
         # asked for its default.
         self.bind_parameters(
-            node, indent=1, keyword_source=None, prefix="w_", missing_is_null=True
+            node,
+            indent=1,
+            keyword_source=None,
+            prefix="w_",
+            missing_is_null=True,
+            display=self.qualified(node.name),
         )
         answer = self.temporary()
         passed = ", ".join(f"w_{name}" for name in parameters)
@@ -3172,26 +3178,48 @@ class CApiEmitter:
         keyword_only = tuple(argument.arg for argument in arguments.kwonlyargs)
         defaults = list(arguments.defaults)
         required = len(positional) - len(defaults)
-        if keyword_source:
-            # A private copy: consuming a name from the caller's own dict would
-            # be a side effect on something this call does not own.
-            maker = self.builtin("dict", indent)
-            self.emit(f"if (_kwargs) {{", indent)
-            self.emit(
-                f"{prefix}{keyword_source} = PyObject_CallOneArg({maker}, _kwargs);",
-                indent + 1,
+        wants_names = bool(
+            keyword_source or arguments.kwonlyargs or positional[named_from:]
+        )
+        source = "0"
+        if wants_names:
+            # The names arrive as a tuple beside the values, which is the
+            # cheapest thing for a caller to hand over. A dict is built from
+            # them only when a call actually passed keywords - almost none do,
+            # and the ones that do pay for it here rather than every call
+            # paying for it at the boundary.
+            gathered = (
+                f"{prefix}{keyword_source}" if keyword_source else self.temporary()
             )
-            self.emit("} else {", indent)
-            self.emit(f"{prefix}{keyword_source} = PyDict_New();", indent + 1)
+            counter = self.temporary_flag()
+            span = self.temporary_flag()
+            key = self.temporary()
+            self.emit(f"{gathered} = 0;", indent)
+            self.emit("if (_kwnames) {", indent)
+            self.emit(f"{gathered} = PyDict_New();", indent + 1)
+            self.checked(gathered, indent + 1)
+            self.emit(f"{span} = (int)PyObject_Size(_kwnames);", indent + 1)
+            self.emit(f"for ({counter} = 0; {counter} < {span}; {counter} = {counter} + 1) {{", indent + 1)
+            self.emit(f"{key} = PyTuple_GetItem(_kwnames, {counter});", indent + 2)
+            self.emit(f"if (!{key}) {{ {self.failure()} }}", indent + 2)
+            self.emit(
+                f"PyDict_SetItem({gathered}, {key}, _args[_nargs + {counter}]);",
+                indent + 2,
+            )
+            self.emit("}", indent + 1)
             self.emit("}", indent)
-            self.emit(f"Py_DecRef({maker});", indent)
-            self.checked(f"{prefix}{keyword_source}", indent)
-            source = f"{prefix}{keyword_source}"
-        else:
-            source = "_kwargs"
+            if keyword_source:
+                # `**kwargs` must exist even when nothing was passed by name.
+                self.emit(f"if (!{gathered}) {{", indent)
+                self.emit(f"{gathered} = PyDict_New();", indent + 1)
+                self.checked(gathered, indent + 1)
+                self.emit("}", indent)
+            source = gathered
 
         def from_keywords(name: str, slot: str) -> None:
             key = self.temporary()
+            if source == "0":
+                return
             self.emit(f"if (!{slot} && {source}) {{", indent)
             self.emit(f"{key} = PyUnicode_FromString({_c_string(name)});", indent + 1)
             self.checked(key, indent + 1)
@@ -3207,12 +3235,14 @@ class CApiEmitter:
 
         for offset, name in enumerate(positional):
             slot = f"{prefix}{name}"
-            self.emit(f"{slot} = PyTuple_GetItem(_args, {offset});", indent)
-            # Borrowed from the tuple, so it is taken over here; one that came
-            # from the keywords is owned already, which is why the increment
-            # only guards this branch.
-            self.emit(f"if ({slot}) {{ Py_IncRef({slot}); }} else {{", indent)
-            self.emit("PyErr_Clear();", indent + 1)
+            # Straight out of the array the caller already had. Borrowed, so it
+            # is taken over here; one that came from the keywords is owned
+            # already, which is why the increment only guards this branch.
+            self.emit(f"if ({offset} < _nargs) {{", indent)
+            self.emit(f"{slot} = _args[{offset}];", indent + 1)
+            self.emit(f"Py_IncRef({slot});", indent + 1)
+            self.emit("} else {", indent)
+            self.emit(f"{slot} = 0;", indent + 1)
             self.emit("}", indent)
             if offset >= named_from:
                 from_keywords(name, slot)
@@ -3222,12 +3252,11 @@ class CApiEmitter:
                 missing_is_null,
                 display,
             )
-        if not arguments.vararg and not missing_is_null:
+        if not arguments.vararg:
             # Too many is as wrong as too few, and was accepted in silence:
-            # the extras simply sat unread in the tuple. Only a function with
-            # no `*args` can be too many for; the wrapper for a module-level
-            # `def` is exempt because the arity was already checked where the
-            # call was written.
+            # the extras simply sat unread. The wrapper needs this as much as
+            # the closure does - a module-level function reached *as a value*
+            # has no call site for the build-time check to look at.
             self.refuse_extra_arguments(
                 display, len(positional), len(defaults), required, indent
             )
@@ -3242,19 +3271,30 @@ class CApiEmitter:
                 display,
             )
         if arguments.vararg:
+            # Everything past the named parameters, gathered out of the array.
+            # There is no tuple to slice any more, so the tuple is built here -
+            # which is the one place a `*args` function pays for the shape its
+            # own signature asks for.
             slot = f"{prefix}{arguments.vararg.arg}"
-            nothing = self.builtin("None", indent)
-            start = self.temporary()
-            self.emit(f"{start} = PyLong_FromLongLong({len(positional)}LL);", indent)
-            self.checked(start, indent)
-            span = self.temporary()
-            self.emit(f"{span} = PySlice_New({start}, {nothing}, {nothing});", indent)
-            self.emit(f"Py_DecRef({start});", indent)
-            self.emit(f"Py_DecRef({nothing});", indent)
-            self.checked(span, indent)
-            self.emit(f"{slot} = PyObject_GetItem(_args, {span});", indent)
-            self.emit(f"Py_DecRef({span});", indent)
+            counter = self.temporary_flag()
+            extra = self.temporary_flag()
+            self.emit(f"{extra} = (int)(_nargs - {len(positional)});", indent)
+            self.emit(f"if ({extra} < 0) {{ {extra} = 0; }}", indent)
+            self.emit(f"{slot} = PyTuple_New((long long){extra});", indent)
             self.checked(slot, indent)
+            self.emit(
+                f"for ({counter} = 0; {counter} < {extra}; {counter} = {counter} + 1) {{",
+                indent,
+            )
+            held = self.temporary()
+            self.emit(f"{held} = _args[{len(positional)} + {counter}];", indent + 1)
+            # PyTuple_SetItem steals, and this reference is borrowed from the
+            # caller's array, so one is added for the tuple to consume.
+            self.emit(f"Py_IncRef({held});", indent + 1)
+            self.emit(
+                f"PyTuple_SetItem({slot}, (long long){counter}, {held});", indent + 1
+            )
+            self.emit("}", indent)
 
     def refuse_extra_arguments(
         self, display: str, accepted: int, defaulted: int, required: int, indent: int
@@ -3272,24 +3312,15 @@ class CApiEmitter:
             f"from {required} to {accepted}" if defaulted else f"{accepted}"
         )
         plural = "argument" if accepted == 1 else "arguments"
+        # A plain C comparison. This used to build two Python integers and
+        # ask the interpreter to compare them - six calls into libpython on
+        # every call a program makes, to answer a question the C argument
+        # count already knows. The objects are built only to *report* the
+        # failure, which almost never happens.
+        self.emit(f"if (_nargs > {accepted}) {{", indent)
         given = self.temporary()
-        self.emit(f"{given} = PyLong_FromLongLong(PyObject_Size(_args));", indent)
-        self.checked(given, indent)
-        limit = self.temporary()
-        self.emit(f"{limit} = PyLong_FromLongLong({accepted}LL);", indent)
-        self.checked(limit, indent)
-        outcome = self.temporary()
-        # Py_GT is 4 in the rich-comparison numbering.
-        self.emit(
-            f"{outcome} = PyObject_RichCompare({given}, {limit}, 4);", indent
-        )
-        self.emit(f"Py_DecRef({limit});", indent)
-        self.checked(outcome, indent)
-        verdict = self.temporary_flag()
-        self.emit(f"{verdict} = PyObject_IsTrue({outcome});", indent)
-        self.emit(f"Py_DecRef({outcome});", indent)
-        self.emit(f"if ({verdict} < 0) {{ {self.failure()} }}", indent)
-        self.emit(f"if ({verdict}) {{", indent)
+        self.emit(f"{given} = PyLong_FromLongLong(_nargs);", indent + 1)
+        self.checked(given, indent + 1)
         self.raise_counted(
             "TypeError",
             f"{display}() takes {span} positional {plural} but ",
@@ -3298,7 +3329,6 @@ class CApiEmitter:
             indent + 1,
         )
         self.emit("}", indent)
-        self.emit(f"Py_DecRef({given});", indent)
 
     def supply_missing(
         self,
@@ -3313,13 +3343,14 @@ class CApiEmitter:
         """What to do when neither the tuple nor the keywords had it."""
 
         if default is not None:
+            if missing_is_null:
+                # The callee has this default and NULL is how it is asked for,
+                # so it is filled there rather than twice.
+                return
             self.emit(f"if (!{slot}) {{", indent)
             value = self.expression(default, indent + 1)
             self.emit(f"{slot} = {value};", indent + 1)
             self.emit("}", indent)
-            return
-        if missing_is_null:
-            # The callee has the default and NULL is how it is asked for.
             return
         self.emit(f"if (!{slot}) {{", indent)
         self.raise_type_error(
@@ -3734,11 +3765,15 @@ class CApiEmitter:
     def render(self) -> str:
         def signature(function: _Function) -> str:
             if function.closure:
-                # What CPython calls a METH_VARARGS | METH_KEYWORDS function
-                # with: the object the callable holds, the positional
-                # arguments in a tuple, and the keywords in a dict - or NULL
-                # for that last one when the call passed none.
-                return "PyObject *_self, PyObject *_args, PyObject *_kwargs"
+                # What CPython calls a METH_FASTCALL | METH_KEYWORDS function
+                # with: the object the callable holds, the arguments in a
+                # plain array, how many of them are positional, and a tuple of
+                # the keyword names - or NULL when the call passed none. No
+                # tuple and no dict is built to reach this.
+                return (
+                    "PyObject *_self, PyObject **_args, long long _nargs, "
+                    "PyObject *_kwnames"
+                )
             return (
                 ", ".join(f"PyObject *p_{name}" for name in function.parameters)
                 or "void"
@@ -3817,11 +3852,13 @@ class CApiEmitter:
         for index, (c_name, label, signature) in enumerate(self.method_table):
             out.append(f"    _py2bin_methods[{index}].ml_name = {_c_string(label)};")
             out.append(f"    _py2bin_methods[{index}].ml_meth = f_{c_name};")
-            # METH_VARARGS | METH_KEYWORDS: a tuple and a dict. Keywords are
-            # taken by every compiled function, because Python lets any
-            # parameter be passed by name and a function that quietly ignored
-            # that would answer `show(1, c=9)` with c's default.
-            out.append(f"    _py2bin_methods[{index}].ml_flags = 3;")
+            # METH_FASTCALL | METH_KEYWORDS (0x80 | 0x02): the arguments
+            # arrive in the array the caller already had, rather than being
+            # packed into a tuple for the crossing and unpacked again. Keywords
+            # are taken by every compiled function, because Python lets any
+            # parameter be passed by name and one that quietly ignored that
+            # would answer `show(1, c=9)` with c's default.
+            out.append(f"    _py2bin_methods[{index}].ml_flags = 130;")
             # The signature goes in the doc slot, in the shape CPython reads
             # `__text_signature__` out of. Without it `inspect.signature` says
             # "unsupported callable" for every compiled function, and anything

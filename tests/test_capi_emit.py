@@ -1873,6 +1873,60 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2, 3)\n6 [1, 2, 3] 1\n(3, 1, 2)\n[0, 2, 4, 6]\n",
         )
 
+    def test_a_compiled_function_is_called_without_a_tuple(self):
+        """METH_FASTCALL: the arguments arrive in the caller's own array.
+
+        A compiled function was registered METH_VARARGS, so CPython packed the
+        arguments back into a tuple to call one - undoing at the boundary the
+        work the caller had just saved. That is why a nested function, which is
+        always reached that way, was the slowest thing a compiled program could
+        call.
+        """
+
+        generated = python_to_capi_c(
+            "def outer():\n"
+            "    def inner(a, b=2, *rest, key=None, **kw):\n"
+            "        return (a, b, rest, key, sorted(kw))\n"
+            "    return inner\n",
+            "program.py",
+        )
+        # METH_FASTCALL | METH_KEYWORDS
+        self.assertIn("ml_flags = 130;", generated)
+        self.assertIn("PyObject **_args, long long _nargs", generated)
+        # The count is a C integer, so asking whether there are too many is a
+        # C comparison. It used to build two Python integers and ask the
+        # interpreter to compare them, on every call.
+        self.assertIn("if (_nargs >", generated)
+
+    def test_a_function_reached_as_a_value_checks_its_own_arity(self):
+        """The wrapper had no check at all.
+
+        A call written in the source is checked at build time; one reached
+        through a variable has no call site to look at, so too many arguments
+        were accepted in silence and a missing required one was passed on as
+        NULL.
+        """
+
+        self._run(
+            "def show(a, b=2, c=3):\n"
+            "    return (a, b, c)\n"
+            "def via(f):\n"
+            "    try:\n"
+            "        f(1, 2, 3, 4)\n"
+            "    except TypeError as e:\n"
+            "        print('too many:', e)\n"
+            "    try:\n"
+            "        f()\n"
+            "    except TypeError as e:\n"
+            "        print('too few:', e)\n"
+            "    return f(1, c=9)\n"
+            "print(via(show))\n",
+            b"too many: show() takes from 1 to 3 positional arguments but 4 "
+            b"were given\n"
+            b"too few: show() missing 1 required positional argument: 'a'\n"
+            b"(1, 2, 9)\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

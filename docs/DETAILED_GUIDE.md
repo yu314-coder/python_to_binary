@@ -339,12 +339,37 @@ Measured, calling in a loop, against CPython on the same machine:
 | a module-level function | 0.018 s | 0.011 s |
 | a nested function | 0.047 s | 0.010 s |
 
-The builtin is now the better of the two. The rest is the *callee* side, which
-this did not touch: a compiled function is registered `METH_VARARGS`, and
-CPython has to pack the arguments back into a tuple to call one of those. Until
-those become `METH_FASTCALL`, a compiled function is the slowest thing a
-compiled program can call - which is the opposite of what it should be, and is
-where the next work goes.
+**And a compiled function is called without one.** Registering them
+`METH_VARARGS` meant CPython packed the arguments back into a tuple to call
+one, undoing at the boundary the work the caller had just saved.
+`METH_FASTCALL | METH_KEYWORDS` hands over the array and a count, and the
+parameters are read out of it by index. Keyword names arrive as a tuple beside
+the values; a dict is built from them only when a call actually passed
+keywords, which almost none do.
+
+Two things that were costing more than the convention:
+
+- *The argument-count check built two Python integers and asked the
+  interpreter to compare them* - six calls into libpython on every call a
+  program makes, to answer a question the C argument count already knew. It is
+  a C comparison now, and the objects are built only to report a failure.
+- *The wrapper that makes a module-level function into a value never checked
+  arity at all.* A call written in the source is checked at build time, but one
+  reached through a variable has no call site to look at: too many arguments
+  were accepted in silence, and a missing required one was passed on as NULL.
+
+Calling in a loop, against CPython on the same machine:
+
+| call | before | after | interpreted |
+| --- | --- | --- | --- |
+| a builtin | 0.011 s | 0.006 s | 0.005 s |
+| a module-level function | 0.018 s | 0.017 s | 0.010 s |
+| a nested function | 0.047 s | 0.031 s | 0.011 s |
+
+What remains is reference counting: reading a name increments it and the
+expression that consumes it decrements, so `return a + b` pays four calls into
+libpython that a borrowing rule would not. That rule is what makes ownership
+checkable by reading, so changing it is a design decision rather than a tweak.
 
 **What a self-contained bundle should not carry.** The first working one was
 293 MB against Nuitka's 73 MB for the same application, which is not a
