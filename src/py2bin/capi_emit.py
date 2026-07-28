@@ -69,6 +69,12 @@ extern PyObject *PyTuple_New(long long length);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
 extern PyObject *PyFloat_FromDouble(double value);
 extern PyObject *PyNumber_Remainder(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Or(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_And(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Xor(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Lshift(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Rshift(PyObject *left, PyObject *right);
+extern int PyObject_DelItem(PyObject *container, PyObject *key);
 extern PyObject *PyNumber_FloorDivide(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_Power(PyObject *base, PyObject *exp, PyObject *mod);
 extern PyObject *PyDict_New(void);
@@ -79,6 +85,7 @@ extern int PyErr_ExceptionMatches(PyObject *exception);
 extern void PyErr_SetObject(PyObject *exception, PyObject *value);
 extern PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
 extern void PyErr_Clear(void);
+extern PyObject *PyErr_GetRaisedException(void);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -101,6 +108,11 @@ _COMPARISONS = {
 }
 
 _BINARY = {
+    ast.BitOr: "PyNumber_Or",
+    ast.BitAnd: "PyNumber_And",
+    ast.BitXor: "PyNumber_Xor",
+    ast.LShift: "PyNumber_Lshift",
+    ast.RShift: "PyNumber_Rshift",
     ast.Add: "PyNumber_Add",
     ast.Sub: "PyNumber_Subtract",
     ast.Mult: "PyNumber_Multiply",
@@ -241,6 +253,10 @@ class CApiEmitter:
             return self.list_literal(node, indent)
         if isinstance(node, ast.Dict):
             return self.dict_literal(node, indent)
+        if isinstance(node, ast.Set):
+            return self.set_literal(node, indent)
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+            return self.comprehension(node, indent)
         if isinstance(node, ast.Tuple):
             return self.tuple_literal(node, indent)
         if isinstance(node, ast.Subscript):
@@ -305,7 +321,10 @@ class CApiEmitter:
         assert self.current is not None
         c_name = self.reference(node.id)
         if c_name is None:
-            raise self.fail(node, f"{node.id!r} is used before it is assigned")
+            # Local, then global, then builtins - the order Python looks in.
+            # `bytes` and `len` are names as much as they are callables, and a
+            # program may pass one around rather than call it.
+            return self.builtin(node.id, indent)
         target = self.temporary()
         # Handed back as an owned reference, like every other expression, so a
         # caller never has to ask where a value came from before releasing it.
@@ -520,6 +539,87 @@ class CApiEmitter:
             self.emit(f"PyList_Append({target}, {value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
         return target
+
+    def set_literal(self, node: ast.Set, indent: int) -> str:
+        """`{a, b}` - built as a list, then handed to the `set` builtin."""
+
+        listed = self.list_literal(
+            ast.copy_location(ast.List(elts=node.elts, ctx=ast.Load()), node), indent
+        )
+        maker = self.builtin("set", indent)
+        target = self.temporary()
+        self.emit(f"{target} = PyObject_CallOneArg({maker}, {listed});", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.emit(f"Py_DecRef({listed});", indent)
+        return self.checked(target, indent)
+
+    def comprehension(self, node, indent: int) -> str:
+        """`[e for x in it if c]` - the loop it stands for, written out.
+
+        A generator expression is built eagerly into a list here. That is not
+        lazy, so an infinite source would not terminate and the memory is spent
+        up front; every generator in the programs this targets is consumed
+        immediately, which is the case the trade is made for.
+        """
+
+        target = self.temporary()
+        self.emit(f"{target} = PyList_New(0LL);", indent)
+        self.checked(target, indent)
+        self.comprehension_clause(node, 0, target, indent)
+        if isinstance(node, ast.SetComp):
+            maker = self.builtin("set", indent)
+            gathered = self.temporary()
+            self.emit(
+                f"{gathered} = PyObject_CallOneArg({maker}, {target});", indent
+            )
+            self.emit(f"Py_DecRef({maker});", indent)
+            self.emit(f"Py_DecRef({target});", indent)
+            return self.checked(gathered, indent)
+        return target
+
+    def comprehension_clause(self, node, position: int, target: str, indent: int) -> None:
+        """One `for` clause of a comprehension, then whatever follows it."""
+
+        if position == len(node.generators):
+            value = self.expression(node.elt, indent)
+            self.emit(f"PyList_Append({target}, {value});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            return
+        clause = node.generators[position]
+        if clause.is_async:
+            raise self.fail(node, "an async comprehension is not translated here")
+        if not isinstance(clause.target, ast.Name):
+            raise self.fail(node, "a comprehension binds one name per clause here")
+        sequence = self.expression(clause.iter, indent)
+        iterator = self.temporary()
+        self.emit(f"{iterator} = PyObject_GetIter({sequence});", indent)
+        self.checked(iterator, indent)
+        self.emit(f"Py_DecRef({sequence});", indent)
+        item = self.temporary()
+        bound = self.declare(clause.target.id)
+        self.emit("while (1) {", indent)
+        self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
+        self.emit(
+            f"if (!{item}) {{ if (PyErr_Occurred()) {{ PyErr_Print(); exit(1); }} break; }}",
+            indent + 1,
+        )
+        self.emit(f"if ({bound}) Py_DecRef({bound});", indent + 1)
+        self.emit(f"{bound} = {item};", indent + 1)
+        inner = indent + 1
+        for condition in clause.ifs:
+            decision = self.temporary_flag()
+            test = self.expression(condition, inner)
+            self.emit(f"{decision} = PyObject_IsTrue({test});", inner)
+            self.emit(f"Py_DecRef({test});", inner)
+            self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", inner)
+            self.emit(f"if ({decision}) {{", inner)
+            inner += 1
+        self.comprehension_clause(node, position + 1, target, inner)
+        for _ in clause.ifs:
+            inner -= 1
+            self.emit("}", inner)
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({iterator});", indent)
 
     def dict_literal(self, node: ast.Dict, indent: int) -> str:
         """`{k: v}` - an empty dict, then each pair set into it."""
@@ -802,6 +902,8 @@ class CApiEmitter:
             self.import_module(node, indent)
         elif isinstance(node, ast.ImportFrom):
             self.import_names(node, indent)
+        elif isinstance(node, ast.Delete):
+            self.remove(node, indent)
         elif isinstance(node, ast.Raise):
             self.throw(node, indent)
         elif isinstance(node, ast.With):
@@ -905,6 +1007,32 @@ class CApiEmitter:
         # before it is overwritten, which is what keeps a loop from growing.
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+
+    def remove(self, node: ast.Delete, indent: int) -> None:
+        """`del xs[k]` - the only del shape with an object-protocol answer.
+
+        `del name` unbinds, and a C local has nothing that records being
+        unbound, so it is refused rather than turned into a store of None.
+        """
+
+        for target in node.targets:
+            if not isinstance(target, ast.Subscript):
+                raise self.fail(
+                    target,
+                    "only `del container[key]` is translated here; deleting a "
+                    "name has nothing to record being unbound",
+                )
+            container = self.expression(target.value, indent)
+            key = (
+                self.slice_object(target.slice, indent)
+                if isinstance(target.slice, ast.Slice)
+                else self.expression(target.slice, indent)
+            )
+            outcome = self.temporary_flag()
+            self.emit(f"{outcome} = PyObject_DelItem({container}, {key});", indent)
+            self.emit(f"Py_DecRef({container});", indent)
+            self.emit(f"Py_DecRef({key});", indent)
+            self.emit(f"if ({outcome} < 0) {{ PyErr_Print(); exit(1); }}", indent)
 
     def throw(self, node: ast.Raise, indent: int) -> None:
         """`raise E(...)` - set the exception, then take the failure path.
@@ -1027,13 +1155,9 @@ class CApiEmitter:
         self.emit(f"goto {done};", indent)
         self.emit(f"{handler}:", 0)
         for clause in node.handlers:
-            if clause.name is not None:
-                raise self.fail(
-                    clause, "`except E as name` is not translated here yet"
-                )
             if clause.type is None:
                 # A bare except catches whatever is set.
-                self.emit("PyErr_Clear();", indent)
+                self.bind_exception(clause, indent)
                 for statement in clause.body:
                     self.statement(statement, indent)
                 self.emit(f"goto {done};", indent)
@@ -1045,7 +1169,7 @@ class CApiEmitter:
             self.emit(f"{decision} = PyErr_ExceptionMatches({wanted});", indent)
             self.emit(f"Py_DecRef({wanted});", indent)
             self.emit(f"if ({decision}) {{", indent)
-            self.emit("    PyErr_Clear();", indent)
+            self.bind_exception(clause, indent + 1)
             for statement in clause.body:
                 self.statement(statement, indent + 1)
             self.emit(f"    goto {done};", indent)
@@ -1057,6 +1181,22 @@ class CApiEmitter:
             self.emit("PyErr_Print(); exit(1);", indent)
         self.emit(f"{done}:", 0)
         self.emit(";", indent)
+
+    def bind_exception(self, clause: ast.ExceptHandler, indent: int) -> None:
+        """Clear the exception, binding it first when the clause names it.
+
+        Taking it is what clears it, so `except E as name` and a bare `except`
+        differ only in whether the object is kept.
+        """
+
+        if clause.name is None:
+            self.emit("PyErr_Clear();", indent)
+            return
+        caught = self.temporary()
+        self.emit(f"{caught} = PyErr_GetRaisedException();", indent)
+        target = self.declare(clause.name)
+        self.emit(f"if ({target}) Py_DecRef({target});", indent)
+        self.emit(f"{target} = {caught};", indent)
 
     def augmented(self, node: ast.AugAssign, indent: int) -> None:
         """`x += 1` - the operation, then the assignment, as Python does it."""

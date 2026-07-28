@@ -415,7 +415,10 @@ class CApiEmitTests(unittest.TestCase):
         # work. One that does not exist fails then, with AttributeError rather
         # than the NameError CPython gives - the same exit status, a different
         # type, and worth recording rather than papering over.
-        self._reject("print(x)\n", "used before it is assigned")
+        # A name that is not local, not global and not a builtin is no longer
+        # a build-time refusal: it is looked up in builtins while the program
+        # runs, and fails there with AttributeError rather than NameError.
+        self._reject("import x.y\n", "dotted import is not translated")
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's

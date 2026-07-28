@@ -51,6 +51,9 @@ __all__ = [
     "PyNumber_Remainder", "PyNumber_FloorDivide", "PyNumber_Power",
     "PyDict_New", "PyDict_SetItem", "PyTuple_Pack", "PySequence_Contains",
     "PyErr_ExceptionMatches", "PyErr_SetObject", "PySlice_New",
+    "PyNumber_Or", "PyNumber_And", "PyNumber_Xor",
+    "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
+    "PyErr_GetRaisedException",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -790,6 +793,13 @@ _PySequence_Contains = _bind("PySequence_Contains", ctypes.c_int, _HANDLE, _HAND
 _PyErr_ExceptionMatches = _bind("PyErr_ExceptionMatches", ctypes.c_int, _HANDLE)
 _PyErr_SetObject = _bind("PyErr_SetObject", None, _HANDLE, _HANDLE)
 _PySlice_New = _bind("PySlice_New", _HANDLE, _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_Or = _bind("PyNumber_Or", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_And = _bind("PyNumber_And", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_Xor = _bind("PyNumber_Xor", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_Lshift = _bind("PyNumber_Lshift", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_Rshift = _bind("PyNumber_Rshift", _HANDLE, _HANDLE, _HANDLE)
+_PyObject_DelItem = _bind("PyObject_DelItem", ctypes.c_int, _HANDLE, _HANDLE)
+_PyErr_GetRaisedException = _bind("PyErr_GetRaisedException", _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -952,6 +962,30 @@ def PyErr_SetObject(exception: int, value: int) -> None:
 
 def PySlice_New(start: int, stop: int, step: int) -> int:
     return _handle(_PySlice_New(start, stop, step))
+
+def PyNumber_Or(left: int, right: int) -> int:
+    return _handle(_PyNumber_Or(left, right))
+
+def PyNumber_And(left: int, right: int) -> int:
+    return _handle(_PyNumber_And(left, right))
+
+def PyNumber_Xor(left: int, right: int) -> int:
+    return _handle(_PyNumber_Xor(left, right))
+
+def PyNumber_Lshift(left: int, right: int) -> int:
+    return _handle(_PyNumber_Lshift(left, right))
+
+def PyNumber_Rshift(left: int, right: int) -> int:
+    return _handle(_PyNumber_Rshift(left, right))
+
+def PyObject_DelItem(container: int, key: int) -> int:
+    return _returned(_PyObject_DelItem(container, key))
+
+
+def PyErr_GetRaisedException() -> int:
+    """Take the exception being handled, which also clears it."""
+
+    return _handle(_PyErr_GetRaisedException())
 
 
 def PyErr_ExceptionMatches(exception: int) -> int:
