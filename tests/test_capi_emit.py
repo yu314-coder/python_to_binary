@@ -406,8 +406,13 @@ class CApiEmitTests(unittest.TestCase):
 
     def test_what_is_not_translated_says_so(self):
         self._reject("class A:\n    pass\n", "has no C-API translation here yet")
+        # A format specifier is no longer a refusal - it goes to `format()`,
+        # whose mini-language is the interpreter's own. See
+        # test_f_string_format_specifiers_go_to_format for what it now does.
+        self._reject("raise\n", "nothing to re-raise")
         self._reject(
-            'print(f"{x:>3}")\n', "format specifier or conversion is not"
+            "def f(*rest):\n    def g():\n        return rest\n    return g\n",
+            "*args",
         )
 
         # An unknown name is no longer refused at build time: it is looked up
@@ -419,6 +424,188 @@ class CApiEmitTests(unittest.TestCase):
         # a build-time refusal: it is looked up in builtins while the program
         # runs, and fails there with AttributeError rather than NameError.
         self._reject("import x.y\n", "dotted import is not translated")
+
+    def test_a_nested_function_captures_from_the_scope_around_it(self):
+        """A closure is a real callable, backed by compiled C.
+
+        `PyCFunction_New` wraps the C function; what it captured travels as
+        the object CPython hands back as `self`, which is how a plain C
+        function comes to have state of its own.
+        """
+
+        self._run(
+            "def outer(n):\n"
+            "    def add(x):\n"
+            "        return x + n\n"
+            "    return add(5), add(50)\n"
+            "print(outer(3))\n",
+            b"(8, 53)\n",
+        )
+
+    def test_a_closure_outlives_the_call_that_made_it(self):
+        self._run(
+            "def make(n):\n"
+            "    def step(x):\n"
+            "        return x * n\n"
+            "    return step\n"
+            "fs = [make(2), make(3)]\n"
+            "print(fs[0](10), fs[1](10))\n",
+            b"20 30\n",
+        )
+
+    def test_a_lambda_is_a_value_like_any_other(self):
+        self._run(
+            "rows = [{'k': 3}, {'k': 1}, {'k': 2}]\n"
+            "print([r['k'] for r in sorted(rows, key=lambda r: r['k'])])\n"
+            "print([f(2) for f in [lambda x: x * x, lambda x: x + 100]])\n",
+            b"[1, 2, 3]\n[4, 102]\n",
+        )
+
+    def test_a_closure_takes_defaults_like_any_other_function(self):
+        self._run(
+            "def outer(n):\n"
+            "    def add(x, step=10):\n"
+            "        return x + n + step\n"
+            "    return add(1), add(1, 100)\n"
+            "print(outer(0))\n",
+            b"(11, 101)\n",
+        )
+
+    def test_closures_nest(self):
+        self._run(
+            "def outer(a):\n"
+            "    def middle(b):\n"
+            "        def inner(c):\n"
+            "            return a + b + c\n"
+            "        return inner\n"
+            "    return middle\n"
+            "print(outer(1)(2)(3))\n",
+            b"6\n",
+        )
+
+    def test_a_capture_the_scope_moves_afterwards_is_refused(self):
+        """Python closes over the variable, this closes over the value.
+
+        Where the captured name is settled by the time the closure is made the
+        two agree, and where it is not they do not - so the cases where they
+        would disagree are refused rather than quietly answered differently.
+        """
+
+        self._reject(
+            "def f():\n"
+            "    n = 1\n"
+            "    def g():\n"
+            "        return n\n"
+            "    n = 2\n"
+            "    return g()\n",
+            "binds again afterwards",
+        )
+        self._reject(
+            "def f():\n"
+            "    out = []\n"
+            "    for i in range(3):\n"
+            "        out.append(lambda: i)\n"
+            "    return out\n",
+            "binds again afterwards",
+        )
+
+    def test_a_module_level_capture_keeps_pythons_late_binding(self):
+        """Read from the module's own storage, so it moves when Python's does.
+
+        The trap this reproduces is the well-known one: every lambda made in
+        the loop sees the value the name ended on, not the one it had.
+        """
+
+        self._run(
+            "fs = []\n"
+            "for i in range(3):\n"
+            "    fs.append(lambda: i)\n"
+            "print([f() for f in fs])\n",
+            b"[2, 2, 2]\n",
+        )
+
+    def test_a_raising_function_hands_the_failure_to_its_caller(self):
+        """A body with nothing to catch answers NULL with the exception set.
+
+        That is what every C-API function does, and doing the same is what
+        lets a `try` around the *call* catch what the body raised. Ending the
+        process there instead made an exception uncatchable across a call.
+        """
+
+        self._run(
+            "def risky(n):\n"
+            "    return 10 // n\n"
+            "try:\n"
+            "    print(risky(0))\n"
+            "except ZeroDivisionError as e:\n"
+            "    print('caught', e)\n"
+            "print(risky(5))\n",
+            b"caught division by zero\n2\n",
+        )
+
+    def test_a_bare_raise_sets_the_exception_being_handled_again(self):
+        self._run(
+            "def risky(n):\n"
+            "    try:\n"
+            "        return 10 // n\n"
+            "    except ZeroDivisionError:\n"
+            "        print('logged')\n"
+            "        raise\n"
+            "try:\n"
+            "    risky(0)\n"
+            "except ZeroDivisionError as e:\n"
+            "    print('outer', e)\n",
+            b"logged\nouter division by zero\n",
+        )
+
+    def test_a_comparison_chain_evaluates_each_operand_once(self):
+        """`0 <= x < 10` is not `0 <= x and x < 10`: x is computed once.
+
+        A rewrite into `and` would call it twice, which anything with a side
+        effect notices, so the operands go into slots the links read.
+        """
+
+        self._run(
+            "def loud(v):\n"
+            "    print('evaluated', v)\n"
+            "    return v\n"
+            "print([0 <= x < 10 for x in [-1, 0, 5, 10]])\n"
+            "print(0 <= loud(3) < 10)\n"
+            "print(5 < loud(1) < loud(99))\n"
+            "print(1 < 2 < 3 < 4, 1 < 2 < 3 > 99)\n",
+            b"[False, True, True, False]\n"
+            b"evaluated 3\nTrue\n"
+            b"evaluated 1\nFalse\n"
+            b"True False\n",
+        )
+
+    def test_f_string_format_specifiers_go_to_format(self):
+        """The mini-language is the interpreter's, not a re-implementation."""
+
+        self._run(
+            "x = 3.14159\n"
+            "n = 42\n"
+            "places = 3\n"
+            'print(f"{x:.2f} {n:05d} {n:>6} {n:#x} {n:,}")\n'
+            'print(f"{x:.{places}f}")\n'
+            "print(f\"{'hi'!r} {'hi'!s}\")\n",
+            b"3.14 00042     42 0x2a 42\n3.142\n'hi' hi\n",
+        )
+
+    def test_print_evaluates_every_argument_before_writing_any(self):
+        """A call evaluates all of its arguments before any of it runs.
+
+        Interleaving let `print("x:", loud())` write "x: " before loud()
+        spoke, and let `print(7, 1 // 0)` write "7 " before raising.
+        """
+
+        self._run(
+            "def loud(v):\n"
+            "    print('side effect')\n"
+            "    return v\n"
+            "print('value:', loud(1))\n",
+            b"side effect\nvalue: 1\n",
+        )
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's

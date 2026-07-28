@@ -53,7 +53,7 @@ __all__ = [
     "PyErr_ExceptionMatches", "PyErr_SetObject", "PySlice_New",
     "PyNumber_Or", "PyNumber_And", "PyNumber_Xor",
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
-    "PyErr_GetRaisedException",
+    "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -800,6 +800,8 @@ _PyNumber_Lshift = _bind("PyNumber_Lshift", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_Rshift = _bind("PyNumber_Rshift", _HANDLE, _HANDLE, _HANDLE)
 _PyObject_DelItem = _bind("PyObject_DelItem", ctypes.c_int, _HANDLE, _HANDLE)
 _PyErr_GetRaisedException = _bind("PyErr_GetRaisedException", _HANDLE)
+_PyCFunction_New = _bind("PyCFunction_New", _HANDLE, _HANDLE, _HANDLE)
+_PyTuple_GetItem = _bind("PyTuple_GetItem", _HANDLE, _HANDLE, _SSIZE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -986,6 +988,23 @@ def PyErr_GetRaisedException() -> int:
     """Take the exception being handled, which also clears it."""
 
     return _handle(_PyErr_GetRaisedException())
+
+
+def PyCFunction_New(method_table: int, closure: int) -> int:
+    """A callable Python object backed by a C function.
+
+    ``closure`` becomes the ``self`` the C function receives, which is how a
+    compiled nested function carries the values it captured.
+    """
+
+    return _handle(_PyCFunction_New(method_table, closure))
+
+
+def PyTuple_GetItem(tuple_handle: int, index: int) -> int:
+    """The item at ``index``. This *borrows* the reference - the tuple still
+    owns it, so a caller keeping it must increment first."""
+
+    return _handle(_PyTuple_GetItem(tuple_handle, index))
 
 
 def PyErr_ExceptionMatches(exception: int) -> int:

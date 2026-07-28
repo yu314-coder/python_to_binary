@@ -206,7 +206,7 @@ run the same program under CPython, require identical stdout and exit status.
 
 **What goes through.**
 
-- A fixed table of 57 exported CPython entry points: `Py_Initialize`,
+- A fixed table of 59 exported CPython entry points: `Py_Initialize`,
   `Py_Finalize`, `Py_IsInitialized`, `PyRun_SimpleString`,
   `PyLong_FromLongLong`, `PyLong_AsLongLong`, `PyUnicode_FromString`,
   `PyNumber_Add`/`Subtract`/`Multiply`/`TrueDivide`, `PyObject_RichCompare`,
@@ -220,7 +220,7 @@ run the same program under CPython, require identical stdout and exit status.
   `PyErr_ExceptionMatches`, `PyErr_SetObject`, `PySlice_New`,
   `PyNumber_Or`, `PyNumber_And`, `PyNumber_Xor`,
   `PyNumber_Lshift`, `PyNumber_Rshift`, `PyObject_DelItem`,
-  `PyErr_GetRaisedException`,
+  `PyErr_GetRaisedException`, `PyCFunction_New`, `PyTuple_GetItem`,
   `PyImport_ImportModule`, `PyList_New`, `PyList_Append`, `PySys_GetObject`,
   `PySys_WriteStdout`, `PyFile_WriteObject`, `PyFile_WriteString`, `Py_IncRef`,
   `Py_DecRef`, `PyErr_Occurred`, `PyErr_Print`, `PyErr_Clear`. Every one is a
@@ -268,23 +268,54 @@ run the same program under CPython, require identical stdout and exit status.
   are lowered eagerly, so the call in the untaken arm would still run.
 - Using the result of a `void` function as a value.
 
-**What py2bin does not do for you, and will not pretend to.**
+**What `compile-capi` translates from Python.** Everything here is verified by
+building it, running it, running the same source under CPython, and requiring
+identical stdout and exit status.
 
-- **No automatic translation of Python into C-API calls.** This is the largest
-  gap versus Nuitka. A list comprehension, a `dict`, a `for` over a list, and
-  `import json` are all rejected outright by the native frontend's own subset,
-  which still applies here. Constructs that *are* in that subset — `print("hi")`,
-  integer and float arithmetic, `while`, a `class` — compile the way tier (c)
-  compiles them, straight to instructions; `print` becomes a `write` syscall,
-  not `PyObject_Print`. Either way nothing becomes a `PyObject` operation on
-  your behalf. If you want a Python object built, you call
-  `PyLong_FromLongLong` yourself.
+- Integers, floats, strings and f-strings, including format specifiers and
+  `!r`/`!s`/`!a` conversions — `f"{x:.{places}f}"` goes to the interpreter's
+  own `format()`, so the mini-language means what it means in Python.
+- `list`, `dict`, `tuple` and `set` literals and comprehensions; subscripting
+  and slices; every arithmetic, bitwise, boolean and comparison operator,
+  including chains such as `0 <= x < n`, which evaluate each operand once.
+- `if`/`while`/`for` with `break`, `continue` and tuple targets; unpacking;
+  `with`; `del`; `import` and `from`-`import`; attribute access and method
+  calls of any arity; keyword arguments; module-level globals.
+- Functions with defaults, **nested functions, and lambdas**, to any depth. A
+  closure is a real Python callable: the body is compiled to its own C
+  function and `PyCFunction_New` wraps it, with what it captured travelling as
+  the object CPython hands that function as `self`.
+- `try`/`except` (with `as name` and a tuple of classes), `raise`, and bare
+  `raise` to re-raise what a clause is handling. A function body that raises
+  with nothing to catch answers `NULL` with the exception still set, exactly
+  as a C-API function does, so a `try` around the *call* catches it.
+
+Two things it deliberately refuses rather than answering differently from
+Python. A closure captures the *value* a name holds when the closure is made,
+where Python captures the variable; where the enclosing scope moves that name
+afterwards the two disagree, so that case is a build-time refusal naming the
+variable. (At module level there is nothing to refuse: the name lives in the
+module's own storage, so `[f() for f in fs]` after a loop of lambdas gives
+Python's `[2, 2, 2]`.) Classes, `finally`, `while`/`else` and starred
+arguments are not translated yet.
+
+**What py2bin does not do for you on the hand-written routes.** These apply to
+routes 2 and 3 above, where you write the C-API calls yourself; `compile-capi`
+generates all of this for you.
+
 - **No automatic reference counting.** You call `Py_IncRef`/`Py_DecRef`. py2bin
   emits exactly the calls you wrote and does not verify ownership, so a leak or
   a double-free in your program stays a leak or a double-free.
 - **No exception propagation.** A failing C-API call returns `NULL` and the
   error stays pending. py2bin inserts no checks and generates no unwinding;
   checking `PyErr_Occurred` is your program's job.
+- **The native subset still applies to what is not a C-API call.** In route 2,
+  constructs outside the native frontend's subset are rejected outright, and
+  those inside it compile the way tier (c) compiles them, straight to
+  instructions — `print` becomes a `write` syscall, not `PyObject_Print`.
+
+**What no route does.**
+
 - **The artifact is not standalone.** The Mach-O carries an `LC_LOAD_DYLIB` for
   the *build host's* CPython at its absolute path (`otool -L` shows it next to
   `libSystem`). Move the binary to a machine without that exact interpreter at
@@ -522,7 +553,7 @@ target” is not the same claim as “the application does not use CPython.”
 | A complete frozen application does not use CPython | No | `freeze` embeds and starts CPython; only the documented native subsets replace Python execution with generated machine code. |
 | Third-party packages do not need a Python runtime | No | NumPy, Torch, `bpy`, Manim, and similar packages are imported by the embedded CPython runtime in `freeze` mode. |
 | Arbitrary Python is translated completely to machine code | No | `compile` accepts the documented static subset and rejects everything else with a source location. Third-party numerical packages such as NumPy/Torch are rejected outright, never reimplemented. |
-| py2bin compiles C that calls the CPython C-API, without gcc | Yes, for a vetted subset on `darwin-arm64` | py2bin's own C parser and ARM64 encoder produce a Mach-O that dyld-binds the interpreter and calls 57 vetted entry points. Verified by running the binary and diffing stdout and exit status against the same program under CPython. |
+| py2bin compiles C that calls the CPython C-API, without gcc | Yes, for a vetted subset on `darwin-arm64` | py2bin's own C parser and ARM64 encoder produce a Mach-O that dyld-binds the interpreter and calls 59 vetted entry points. Verified by running the binary and diffing stdout and exit status against the same program under CPython. |
 | py2bin is a Nuitka replacement | No | Nuitka translates ordinary Python into C-API calls. py2bin does not generate those calls at all — you write them. Tier (b) is an embedding surface, not an automatic compiler for the Python language. |
 | A C-API artifact runs on a machine without Python | No | It records an `LC_LOAD_DYLIB` for the build host's CPython at an absolute path. Only tier (c) `compile` output and `freeze` output are standalone. |
 | py2bin itself has no third-party Python dependency | Yes | The package imports only Python standard-library modules, and its build/runtime dependency lists are empty. Tests enforce both properties. |
@@ -755,7 +786,7 @@ The word “supports” is intentionally narrow:
 | A name bound on only some paths | No | CPython raises `NameError`; there is no run-time bit recording whether a slot was written, so reading one is refused at build time rather than answering with whatever preceded it. An arm that leaves by `raise` or `return` does not count against this |
 | User-defined `class` | Restricted | Construction, integer attributes, attribute load/store, and methods (including a method calling another method) over the same bump arena. Every attribute must be assigned unconditionally in `__init__`, which fixes the layout and guarantees no read hits a slot Python would treat as unset. Dispatch is static, so calls inline. A `float` attribute is declared by annotating it in `__init__` (`self.x: float = ...`); an integer stored into one is refused rather than widened, because CPython keeps the integer. Class attributes, decorated methods (`property`, `staticmethod`, `classmethod`), special methods other than `__enter__`/`__exit__`, recursion, attributes created outside `__init__`, a name that is both an attribute and a method, and rebinding a variable to another class are rejected. Single inheritance is supported: the subclass's layout is the base's attributes followed by its own, methods are inherited unless overridden, and `super().__init__(...)` is accepted as a bare statement in the subclass's `__init__`. Multiple bases, a base that is not a class defined earlier in the same module, `super()` anywhere else, a subclass `__init__` that leaves an inherited attribute unassigned, and an inherited attribute whose `float`/integer kind disagrees between the two classes are rejected. |
 | Adapter-ABI extern call | Restricted, `darwin-arm64` only | `from py2bin.cabi import NAME` binds a vetted libc symbol (e.g. `abs`, `strlen`, `getpid`) through real dyld; integer and compile-time-constant C-string arguments only. Rejected for every non-`darwin-arm64` target and for unknown symbols |
-| CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI exposes 57 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You may write those calls yourself, or let `py2bin compile-capi` generate them from Python - see the row below. A failing C-API call prints the interpreter's own exception and leaves with status 1. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
+| CPython C-API call | Restricted, `darwin-arm64` only | The same adapter ABI exposes 59 vetted CPython entry points, so a compiled binary can drive an embedded interpreter through opaque `PyObject *` handles. You may write those calls yourself, or let `py2bin compile-capi` generate them from Python - see the row below. A failing C-API call prints the interpreter's own exception and leaves with status 1. The artifact links the build host's CPython by absolute path and is not standalone. See [What the C-API path supports](#what-the-c-api-path-supports) |
 | `compile-capi`: Python → C-API → machine code | Restricted, `darwin-arm64` only | Translates Python into C that drives the interpreter, then compiles that C with py2bin's own compiler - the strategy Nuitka uses, without Nuitka's clang. Every value is a `PyObject *`, so **Python's own semantics apply**: `2 ** 100` is exact where the native tier wraps at 64 bits. **`import` works**, so a compiled program reaches anything installed beside the interpreter - including numpy, scipy, scikit-learn and matplotlib, none of which is translated: the interpreter loads them exactly as it always does. A compiled binary does numpy's LAPACK-backed linear algebra, fits a scikit-learn model, and renders a matplotlib figure to a PNG. Reference counting follows one rule - every expression yields an owned reference, every statement releases what it finishes with - and a 500,000-iteration loop peaks at 14 MB. `for` goes through the iterator protocol, and a name that is not local is looked up in `builtins`, so `range`, `sum`, `sorted` and the rest are the interpreter's own. Currently integers, floats, strings, f-strings, list/dict/tuple literals, `True`/`False`/`None`, `+ - * / % // **`, unary `-`/`not`, `and`/`or` with short-circuiting, comparisons, subscripting, `if`/`elif`/`else`, `while`, `for`, `break`, `continue`, augmented assignment, `in`/`not in`, subscript assignment, `try`/`except`, `print()`, `str()`, `len()`, imports, attribute access, builtins, method calls of any arity, and functions with positional parameters. The artifact needs libpython, so it is not standalone |
 | `print(...)` | Yes | Constant UTF-8 bytes, or (POSIX only) a runtime ASCII string, emitted through an OS write API/syscall |
 | `SystemExit(integer)` / `sys.exit(integer)` | Yes | Constant or runtime integer expression becomes the OS process-exit value |

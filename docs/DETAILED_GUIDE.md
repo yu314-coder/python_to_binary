@@ -194,11 +194,60 @@ declares them itself.
 
 A C-API call that fails answers NULL and leaves an exception set, and every
 result is checked for it. Letting a NULL travel is how `1 + "x"` came to print
-`<NULL>` and exit 0 where CPython raises TypeError - so on failure the
-exception is printed and the process leaves with status 1, which is what the
-interpreter does with one that nothing catches, and nothing here can catch one
-yet. `1 / 0`, a missing module, a missing attribute and a wrong argument type
-all give CPython's own message and CPython's own exit status.
+`<NULL>` and exit 0 where CPython raises TypeError. Where the failure goes
+depends on what is in reach: a `try` around it takes its handler; a function
+body with no handler *hands the failure back to its caller* - answering NULL
+with the exception still set, exactly as every C-API function does - so a `try`
+around the **call** catches what the body raised; and only at module level,
+where there is no caller left, is the exception printed and the process left
+with status 1, which is what the interpreter does with one nothing catches.
+Ending the process at the first raise instead was what made an exception
+uncatchable across a call. `1 / 0`, a missing module, a missing attribute and a
+wrong argument type all give CPython's own message and CPython's own exit
+status.
+
+A bare `raise` re-raises what the enclosing clause is handling. Taking the
+exception is what clears it, so a clause keeps the object it took even when it
+does not name it - clearing instead would have thrown away the only thing a
+bare `raise` could have set again.
+
+**Nested functions and lambdas are real Python callables backed by compiled
+C.** A closure's body becomes its own C function with the `(self, args)` shape
+CPython calls, and `PyCFunction_New` wraps it in an object; what the closure
+captured travels as the `self` that object holds, which is how a plain C
+function comes to have state of its own. Parameters arrive in the argument
+tuple, defaults included - a missing one leaves `PyTuple_GetItem` with
+IndexError, which is cleared and the default put in. Captures nest: an inner
+closure resolves a name against the enclosing closure's own captures, so
+`outer(1)(2)(3)` works three levels down. The `PyMethodDef` table is declared
+at file scope and filled at startup, because this C front end does not
+initialise a file-scope struct and the address has to stay put for as long as
+a callable made from it can be called.
+
+Where this differs from Python is worth stating precisely: Python closes over
+the *variable*, and this closes over the *value* the name holds when the
+closure is made. Wherever the name is settled by then the two agree. Where the
+enclosing scope binds it again afterwards - including a `for` target, the
+classic late-binding trap - they would not, so that is a build-time refusal
+naming the variable rather than a quiet disagreement. At module level there is
+nothing to refuse: the name lives in the module's own storage and is read when
+the closure runs, so a loop of lambdas over `range(3)` answers `[2, 2, 2]` just
+as Python does.
+
+A comparison chain such as `0 <= x < n` is not rewritten into `0 <= x and
+x < n`: `x` is the right of one link and the left of the next, and Python
+evaluates it once however many links it appears in, so the operands go into
+slots that the links read. The slots are cleared first, or a chain inside a
+loop would still hold the previous turn's values and release them twice.
+
+An f-string format specifier goes to the interpreter's own `format()`, so
+`{x:.2f}` and the nested `{x:.{places}f}` mean here exactly what they mean in
+Python rather than a re-implementation of the mini-language; `!r`, `!s` and
+`!a` are `repr`, `str` and `ascii` for the same reason.
+
+`print` evaluates every argument before writing any of them, because a call
+evaluates all of its arguments before any of it runs. Interleaving the two let
+`print("value:", loud())` write `value: ` before `loud()` spoke.
 
 Reference counting follows one rule, chosen so that it can be checked by
 reading: **every expression yields a reference the caller owns**, and every
@@ -1201,7 +1250,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 57 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 59 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

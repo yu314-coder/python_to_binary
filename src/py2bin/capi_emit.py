@@ -66,6 +66,15 @@ extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *argument);
 extern long long PyObject_Size(PyObject *object);
 extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
 extern PyObject *PyTuple_New(long long length);
+extern PyObject *PyTuple_GetItem(PyObject *tuple, long long index);
+typedef PyObject *(*PyCFunction)(PyObject *self, PyObject *args);
+struct PyMethodDef {
+    const char *ml_name;
+    PyCFunction ml_meth;
+    int ml_flags;
+    const char *ml_doc;
+};
+extern PyObject *PyCFunction_New(struct PyMethodDef *table, PyObject *self);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
 extern PyObject *PyFloat_FromDouble(double value);
 extern PyObject *PyNumber_Remainder(PyObject *left, PyObject *right);
@@ -149,10 +158,25 @@ class _Function:
     """One Python function being written out as a C function."""
 
     def __init__(
-        self, name: str, parameters: tuple[str, ...], defaults: int = 0
+        self,
+        name: str,
+        parameters: tuple[str, ...],
+        defaults: int = 0,
+        captures: tuple[str, ...] = (),
+        closure: bool = False,
     ) -> None:
         self.name = name
         self.parameters = parameters
+        #: Names read from an enclosing function. A closure receives them in
+        #: the tuple CPython hands back as `self`, which is how a compiled C
+        #: function carries state that a plain C function cannot.
+        self.captures = captures
+        #: True for a nested `def` or a `lambda`. It is written with the
+        #: `(self, args)` shape CPython calls, rather than as a direct call.
+        self.closure = closure
+        #: True once something in the body takes the failure path, which is
+        #: what puts the `_unwind` label at the end of the C function.
+        self.unwinds = False
         #: How many trailing parameters have defaults. A call that leaves one
         #: out passes NULL and the body fills it in.
         self.defaults = defaults
@@ -177,6 +201,16 @@ class CApiEmitter:
         #: The label a failing C-API call jumps to. Empty outside a `try`,
         #: where a failure ends the process instead.
         self.handlers: list[str] = []
+        #: One entry per nested function or lambda: the C function's name and
+        #: the name Python knows it by. They become a file-scope array of
+        #: PyMethodDef filled in at startup, because the C front end does not
+        #: initialise a file-scope struct.
+        self.method_table: list[tuple[str, str]] = []
+        #: The body of the scope being written, for the late-binding check.
+        self.scope: list[ast.stmt] = []
+        #: The exception each enclosing `except` clause is handling, innermost
+        #: last. A bare `raise` sets the last one again.
+        self.handling: list[str] = []
 
     # --- helpers ---------------------------------------------------------
 
@@ -189,6 +223,25 @@ class CApiEmitter:
         assert self.current is not None
         self.current.body.append("    " * indent + line)
 
+    def failure(self) -> str:
+        """What to do where a C-API call has just failed.
+
+        Inside a `try`, jump to its handler. Inside a function with no handler
+        in reach, hand the failure back to the caller the way every C-API
+        function does - answer NULL with the exception still set - so a `try`
+        around the *call* catches what the body raised. Only at module level,
+        where there is no caller left, is an uncaught exception printed and the
+        process ended, which is what the interpreter does with one.
+        """
+
+        assert self.current is not None
+        if self.handlers:
+            return f"goto {self.handlers[-1]};"
+        if self.current.name == "main":
+            return "PyErr_Print(); exit(1);"
+        self.current.unwinds = True
+        return "goto _unwind;"
+
     def checked(self, target: str, indent: int) -> str:
         """Stop if the C-API call failed.
 
@@ -199,12 +252,7 @@ class CApiEmitter:
         catches, and nothing here can catch one yet.
         """
 
-        if self.handlers:
-            # Inside a `try`, a failure is the handler's business rather than
-            # the end of the process.
-            self.emit(f"if (!{target}) goto {self.handlers[-1]};", indent)
-        else:
-            self.emit(f"if (!{target}) {{ PyErr_Print(); exit(1); }}", indent)
+        self.emit(f"if (!{target}) {{ {self.failure()} }}", indent)
         return target
 
     def temporary(self) -> str:
@@ -273,6 +321,8 @@ class CApiEmitter:
             return self.attribute(node, indent)
         if isinstance(node, ast.Call):
             return self.call(node, indent)
+        if isinstance(node, ast.Lambda):
+            return self.make_closure(node, "lambda", indent)
         raise self.fail(
             node, f"{type(node).__name__} has no C-API translation here yet"
         )
@@ -304,8 +354,8 @@ class CApiEmitter:
     def reference(self, name: str) -> str | None:
         """The C name a Python name reads from, or None if nothing binds it.
 
-        Local first, then parameter, then module global - the order Python
-        looks in, minus the closures this does not have.
+        Local first, then parameter, then captured, then module global - the
+        order Python looks in.
         """
 
         assert self.current is not None
@@ -313,6 +363,8 @@ class CApiEmitter:
             return f"p_{name}"
         if f"v_{name}" in self.current.locals:
             return f"v_{name}"
+        if name in self.current.captures:
+            return f"c_{name}"
         if name in self.globals:
             return f"g_{name}"
         return None
@@ -357,7 +409,7 @@ class CApiEmitter:
 
     def comparison(self, node: ast.Compare, indent: int) -> str:
         if len(node.ops) != 1:
-            raise self.fail(node, "a comparison chain is not translated here yet")
+            return self.chained(node, indent)
         if isinstance(node.ops[0], (ast.In, ast.NotIn)):
             return self.membership(node, indent)
         if isinstance(node.ops[0], (ast.Is, ast.IsNot)):
@@ -375,6 +427,61 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({right});", indent)
         return self.checked(target, indent)
 
+    def chained(self, node: ast.Compare, indent: int) -> str:
+        """`0 <= x < n` - each operand once, and it stops at the first false.
+
+        `x` is the right of one link and the left of the next, and Python
+        evaluates it once however many links it appears in; a rewrite into
+        `0 <= x and x < n` would evaluate it twice, which a call or an index
+        with a side effect would notice. So the operands are computed into
+        slots and the links read them from there.
+        """
+
+        for operation in node.ops:
+            if type(operation) not in _COMPARISONS:
+                raise self.fail(
+                    node,
+                    f"a chain containing {type(operation).__name__} is not "
+                    "translated here yet",
+                )
+        operands = [node.left, *node.comparators]
+        # Cleared first: a link that short-circuits leaves the later slots
+        # unfilled, and inside a loop they would otherwise still hold the
+        # previous turn's values and be released twice.
+        slots = [self.temporary() for _ in operands]
+        for slot in slots:
+            self.emit(f"{slot} = 0;", indent)
+        target = self.temporary()
+        self.emit(f"{target} = 0;", indent)
+        depth = 0
+        for index, operation in enumerate(node.ops):
+            inner = indent + depth
+            for position in (index, index + 1):
+                if position == index and index > 0:
+                    continue  # already computed as the previous link's right
+                value = self.expression(operands[position], inner)
+                self.emit(f"{slots[position]} = {value};", inner)
+            self.emit(f"if ({target}) Py_DecRef({target});", inner)
+            self.emit(
+                f"{target} = PyObject_RichCompare({slots[index]}, "
+                f"{slots[index + 1]}, {_COMPARISONS[type(operation)]});",
+                inner,
+            )
+            self.checked(target, inner)
+            if index + 1 == len(node.ops):
+                break
+            decision = self.temporary_flag()
+            self.emit(f"{decision} = PyObject_IsTrue({target});", inner)
+            self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", inner)
+            self.emit(f"if ({decision}) {{", inner)
+            depth += 1
+        while depth:
+            depth -= 1
+            self.emit("}", indent + depth)
+        for slot in slots:
+            self.emit(f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent)
+        return target
+
     def conditional_expression(self, node: ast.IfExp, indent: int) -> str:
         """`a if c else b` - a real branch, so only one arm is evaluated."""
 
@@ -382,7 +489,7 @@ class CApiEmitter:
         test = self.expression(node.test, indent)
         self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
         self.emit(f"Py_DecRef({test});", indent)
-        self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+        self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
         target = self.temporary()
         self.emit(f"if ({decision}) {{", indent)
         taken = self.expression(node.body, indent + 1)
@@ -396,8 +503,10 @@ class CApiEmitter:
     def joined(self, node: ast.JoinedStr, indent: int) -> str:
         """An f-string: each piece rendered, then joined by concatenation.
 
-        A format specifier is not translated - that is `format()` with its own
-        mini-language, and doing half of it would be worse than saying so.
+        A format specifier goes to `format()`, whose mini-language is the
+        interpreter's own, so `{x:.2f}` means here exactly what it means in
+        Python rather than a re-implementation of it. `!r` and `!a` are
+        `repr()` and `ascii()` for the same reason.
         """
 
         target = self.temporary()
@@ -407,17 +516,48 @@ class CApiEmitter:
             if isinstance(piece, ast.Constant):
                 rendered = self.constant(piece, indent)
             elif isinstance(piece, ast.FormattedValue):
-                if piece.format_spec is not None or piece.conversion not in (-1, 115):
-                    raise self.fail(
-                        node,
-                        "an f-string format specifier or conversion is not "
-                        "translated here yet",
-                    )
                 value = self.expression(piece.value, indent)
-                rendered = self.temporary()
-                self.emit(f"{rendered} = PyObject_Str({value});", indent)
-                self.emit(f"Py_DecRef({value});", indent)
-                self.checked(rendered, indent)
+                # `!r`, `!s`, `!a` - and no conversion, which for a value with
+                # no specifier is str() as well.
+                shaped = {114: "repr", 115: "str", 97: "ascii"}.get(
+                    piece.conversion, "" if piece.format_spec is not None else "str"
+                )
+                if shaped:
+                    caller = self.builtin(shaped, indent)
+                    converted = self.temporary()
+                    self.emit(
+                        f"{converted} = PyObject_CallOneArg({caller}, {value});",
+                        indent,
+                    )
+                    self.emit(f"Py_DecRef({caller});", indent)
+                    self.emit(f"Py_DecRef({value});", indent)
+                    self.checked(converted, indent)
+                    value = converted
+                if piece.format_spec is None:
+                    rendered = value
+                else:
+                    # The specifier is itself an f-string, which is how
+                    # `{x:.{places}f}` names the width it wants.
+                    specifier = self.joined(piece.format_spec, indent)
+                    caller = self.builtin("format", indent)
+                    arguments = self.temporary()
+                    # Built a slot at a time rather than with PyTuple_Pack:
+                    # that one is variadic, and on Apple's arm64 a variadic
+                    # argument goes on the stack where this call puts it in a
+                    # register. PyTuple_SetItem steals, which is what to do
+                    # with the two references this is finished with anyway.
+                    self.emit(f"{arguments} = PyTuple_New(2);", indent)
+                    self.checked(arguments, indent)
+                    self.emit(f"PyTuple_SetItem({arguments}, 0, {value});", indent)
+                    self.emit(f"PyTuple_SetItem({arguments}, 1, {specifier});", indent)
+                    rendered = self.temporary()
+                    self.emit(
+                        f"{rendered} = PyObject_Call({caller}, {arguments}, 0);",
+                        indent,
+                    )
+                    self.emit(f"Py_DecRef({caller});", indent)
+                    self.emit(f"Py_DecRef({arguments});", indent)
+                    self.checked(rendered, indent)
             else:
                 raise self.fail(node, "unsupported f-string piece")
             joined = self.temporary()
@@ -439,7 +579,7 @@ class CApiEmitter:
         self.emit(f"{target} = {first};", indent)
         for operand in node.values[1:]:
             self.emit(f"{decision} = PyObject_IsTrue({target});", indent)
-            self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+            self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
             # `and` goes on to the next operand when this one is true;
             # `or` goes on when it is false. Getting this the wrong way round
             # makes `0 and boom()` call boom.
@@ -472,7 +612,7 @@ class CApiEmitter:
             decision = self.temporary_flag()
             self.emit(f"{decision} = PyObject_IsTrue({value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
-            self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+            self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
             # A conditional expression cannot be a C-API argument here, so
             # the two names are fetched on their own branches.
             target = self.temporary()
@@ -600,7 +740,7 @@ class CApiEmitter:
         self.emit("while (1) {", indent)
         self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
         self.emit(
-            f"if (!{item}) {{ if (PyErr_Occurred()) {{ PyErr_Print(); exit(1); }} break; }}",
+            f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
             indent + 1,
         )
         self.emit(f"if ({bound}) Py_DecRef({bound});", indent + 1)
@@ -611,7 +751,7 @@ class CApiEmitter:
             test = self.expression(condition, inner)
             self.emit(f"{decision} = PyObject_IsTrue({test});", inner)
             self.emit(f"Py_DecRef({test});", inner)
-            self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", inner)
+            self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", inner)
             self.emit(f"if ({decision}) {{", inner)
             inner += 1
         self.comprehension_clause(node, position + 1, target, inner)
@@ -723,7 +863,7 @@ class CApiEmitter:
         self.emit(f"{decision} = PySequence_Contains({container}, {value});", indent)
         self.emit(f"Py_DecRef({value});", indent)
         self.emit(f"Py_DecRef({container});", indent)
-        self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+        self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
         if isinstance(node.ops[0], ast.NotIn):
             self.emit(f"{decision} = !{decision};", indent)
         target = self.temporary()
@@ -742,7 +882,13 @@ class CApiEmitter:
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):
-            raise self.fail(node, "only a call to a named function is translated here")
+            # `fs[0](10)`, `(lambda x: x)(2)` - the thing being called is an
+            # ordinary expression. Now that a closure is a value like any
+            # other, this is how one held in a list gets called.
+            callable_value = self.expression(node.func, indent)
+            target = self.invoke(callable_value, node.args, indent, node.keywords)
+            self.emit(f"Py_DecRef({callable_value});", indent)
+            return target
         if node.func.id == "len":
             if len(node.args) != 1:
                 raise self.fail(node, "len() takes one argument")
@@ -924,7 +1070,10 @@ class CApiEmitter:
         elif isinstance(node, ast.Pass):
             pass
         elif isinstance(node, ast.FunctionDef):
-            raise self.fail(node, "a nested function is not translated here yet")
+            value = self.make_closure(node, node.name, indent)
+            target = self.declare(node.name)
+            self.emit(f"if ({target}) Py_DecRef({target});", indent)
+            self.emit(f"{target} = {value};", indent)
         else:
             raise self.fail(
                 node, f"{type(node).__name__} has no C-API translation here yet"
@@ -1032,7 +1181,7 @@ class CApiEmitter:
             self.emit(f"{outcome} = PyObject_DelItem({container}, {key});", indent)
             self.emit(f"Py_DecRef({container});", indent)
             self.emit(f"Py_DecRef({key});", indent)
-            self.emit(f"if ({outcome} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+            self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
 
     def throw(self, node: ast.Raise, indent: int) -> None:
         """`raise E(...)` - set the exception, then take the failure path.
@@ -1044,8 +1193,17 @@ class CApiEmitter:
         if node.cause is not None:
             raise self.fail(node, "`raise ... from ...` is not translated here yet")
         if node.exc is None:
-            raise self.fail(node, "a bare re-raise is not translated here yet")
-        value = self.expression(node.exc, indent)
+            if not self.handling:
+                raise self.fail(
+                    node,
+                    "a bare `raise` outside an except clause has nothing to "
+                    "re-raise",
+                )
+            # The object the enclosing clause caught. The reference belongs to
+            # that clause, so this sets it again without giving it away.
+            value, owned = self.handling[-1], False
+        else:
+            value, owned = self.expression(node.exc, indent), True
         # PyErr_SetObject wants the class as well as the value, and a NULL
         # there sets nothing at all - the raise then vanished without a trace.
         # `type(value)` is the class whether the source named a class or built
@@ -1057,11 +1215,12 @@ class CApiEmitter:
         self.checked(classified, indent)
         self.emit(f"PyErr_SetObject({classified}, {value});", indent)
         self.emit(f"Py_DecRef({classified});", indent)
-        self.emit(f"Py_DecRef({value});", indent)
+        if owned:
+            self.emit(f"Py_DecRef({value});", indent)
         if self.handlers:
             self.emit(f"goto {self.handlers[-1]};", indent)
         else:
-            self.emit("PyErr_Print(); exit(1);", indent)
+            self.emit(self.failure(), indent)
 
     def with_block(self, node: ast.With, indent: int) -> None:
         """`with a as b:` - __enter__, the body, then __exit__.
@@ -1166,9 +1325,12 @@ class CApiEmitter:
         for clause, wanted in zip(node.handlers, caught):
             if clause.type is None:
                 # A bare except catches whatever is set.
-                self.bind_exception(clause, indent)
+                held = self.bind_exception(clause, indent)
+                self.handling.append(held)
                 for statement in clause.body:
                     self.statement(statement, indent)
+                self.handling.pop()
+                self.emit(f"Py_DecRef({held});", indent)
                 self.emit(f"goto {done};", indent)
                 continue
             # PyErr_ExceptionMatches takes a tuple as readily as a class.
@@ -1176,34 +1338,40 @@ class CApiEmitter:
             self.emit(f"{decision} = PyErr_ExceptionMatches({wanted});", indent)
             self.emit(f"Py_DecRef({wanted});", indent)
             self.emit(f"if ({decision}) {{", indent)
-            self.bind_exception(clause, indent + 1)
+            held = self.bind_exception(clause, indent + 1)
+            self.handling.append(held)
             for statement in clause.body:
                 self.statement(statement, indent + 1)
+            self.handling.pop()
+            self.emit(f"Py_DecRef({held});", indent + 1)
             self.emit(f"    goto {done};", indent)
             self.emit("}", indent)
         # Nothing matched, so the exception carries on outward.
         if self.handlers:
             self.emit(f"goto {self.handlers[-1]};", indent)
         else:
-            self.emit("PyErr_Print(); exit(1);", indent)
+            self.emit(self.failure(), indent)
         self.emit(f"{done}:", 0)
         self.emit(";", indent)
 
-    def bind_exception(self, clause: ast.ExceptHandler, indent: int) -> None:
-        """Clear the exception, binding it first when the clause names it.
+    def bind_exception(self, clause: ast.ExceptHandler, indent: int) -> str:
+        """Take the exception, binding it too when the clause names it.
 
         Taking it is what clears it, so `except E as name` and a bare `except`
-        differ only in whether the object is kept.
+        differ only in whether the object also gets a name.
         """
 
-        if clause.name is None:
-            self.emit("PyErr_Clear();", indent)
-            return
         caught = self.temporary()
+        # Taken rather than cleared even when the clause does not name it: a
+        # bare `raise` in the body sets this same object again, and clearing
+        # would have thrown away the only thing it could re-raise.
         self.emit(f"{caught} = PyErr_GetRaisedException();", indent)
-        target = self.declare(clause.name)
-        self.emit(f"if ({target}) Py_DecRef({target});", indent)
-        self.emit(f"{target} = {caught};", indent)
+        if clause.name is not None:
+            target = self.declare(clause.name)
+            self.emit(f"if ({target}) Py_DecRef({target});", indent)
+            self.emit(f"Py_IncRef({caught});", indent)
+            self.emit(f"{target} = {caught};", indent)
+        return caught
 
     def augmented(self, node: ast.AugAssign, indent: int) -> None:
         """`x += 1` - the operation, then the assignment, as Python does it."""
@@ -1274,7 +1442,7 @@ class CApiEmitter:
         )
         for held in (container, key, value):
             self.emit(f"Py_DecRef({held});", indent)
-        self.emit(f"if ({outcome} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+        self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
 
     def expression_statement(self, node: ast.Expr, indent: int) -> None:
         if (
@@ -1292,12 +1460,16 @@ class CApiEmitter:
 
         if node.keywords:
             raise self.fail(node, "print() keyword arguments are not translated here")
+        # Every argument first, then the writing. print is a call, and a call
+        # evaluates all of its arguments before any of it runs: interleaving
+        # them let `print("x:", loud())` write "x: " before loud() spoke, and
+        # let `print(7, 1 // 0)` write "7 " before raising.
+        values = [self.expression(argument, indent) for argument in node.args]
         stream = self.temporary()
         self.emit(f'{stream} = PySys_GetObject("stdout");', indent)
-        for position, argument in enumerate(node.args):
+        for position, value in enumerate(values):
             if position:
                 self.emit(f'PyFile_WriteString(" ", {stream});', indent)
-            value = self.expression(argument, indent)
             # Py_PRINT_RAW is 1: str() of the object rather than its repr,
             # which is what print writes.
             self.emit(f"PyFile_WriteObject({value}, {stream}, 1);", indent)
@@ -1360,7 +1532,7 @@ class CApiEmitter:
         # NULL means the sequence ended, or that producing the next item
         # failed. Asking whether an exception is set is what tells them apart.
         self.emit(
-            f"if (!{item}) {{ if (PyErr_Occurred()) {{ PyErr_Print(); exit(1); }} break; }}",
+            f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
             indent + 1,
         )
         if target is None:
@@ -1395,7 +1567,7 @@ class CApiEmitter:
         self.release_locals(indent)
         self.emit(f"return {value};", indent)
 
-    def release_locals(self, indent: int) -> None:
+    def release_locals(self, indent: int, guarded: bool = False) -> None:
         """Give back what the body still holds, on the way out.
 
         Every name the body bound owns a reference, and leaving without
@@ -1406,7 +1578,18 @@ class CApiEmitter:
 
         assert self.current is not None
         for name in self.current.parameters:
-            self.emit(f"Py_DecRef(p_{name});", indent)
+            # On the failure path a parameter may not have been filled in yet
+            # - a default whose expression raised leaves the ones after it
+            # NULL - so that path tests before it releases.
+            if guarded:
+                self.emit(f"if (p_{name}) Py_DecRef(p_{name});", indent)
+            else:
+                self.emit(f"Py_DecRef(p_{name});", indent)
+        for name in self.current.captures:
+            if guarded:
+                self.emit(f"if (c_{name}) Py_DecRef(c_{name});", indent)
+            else:
+                self.emit(f"Py_DecRef(c_{name});", indent)
         for name in self.current.locals:
             # Only the names the program bound. A temporary was released where
             # it was consumed, so releasing it again here would be a second
@@ -1414,6 +1597,247 @@ class CApiEmitter:
             if not name.startswith("v_"):
                 continue
             self.emit(f"if ({name}) Py_DecRef({name});", indent)
+
+    # --- closures --------------------------------------------------------
+
+    @classmethod
+    def scope_names(cls, node: ast.AST) -> tuple[set[str], set[str]]:
+        """The names a nested function binds, and the names it reads.
+
+        Everything under the node counts, including the body of a `for` or a
+        `try`, because Python has no block scope: a name bound anywhere in a
+        function is local to the whole of it. A function *inside* this one is
+        a scope of its own, so what it binds stays there and only the names it
+        could not resolve for itself are read from here - which is how a
+        capture reaches through two levels.
+        """
+
+        arguments = node.args
+        bound = {argument.arg for argument in arguments.args}
+        bound.update(argument.arg for argument in arguments.posonlyargs)
+        bound.update(argument.arg for argument in arguments.kwonlyargs)
+        if arguments.vararg:
+            bound.add(arguments.vararg.arg)
+        if arguments.kwarg:
+            bound.add(arguments.kwarg.arg)
+        read: set[str] = set()
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for statement in body:
+            cls.gather_names(statement, bound, read)
+        return bound, read
+
+    @classmethod
+    def gather_names(cls, node: ast.AST, bound: set[str], read: set[str]) -> None:
+        """Add what this node binds and reads, not descending into a scope."""
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if not isinstance(node, ast.Lambda):
+                bound.add(node.name)
+            inner_bound, inner_read = cls.scope_names(node)
+            read.update(inner_read - inner_bound)
+            # A default is evaluated where the `def` is, not where it is
+            # called, so its names belong to this scope.
+            for default in node.args.defaults:
+                cls.gather_names(default, bound, read)
+            return
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                read.add(node.id)
+            else:
+                bound.add(node.id)
+            return
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.alias):
+            bound.add(node.asname or node.name.split(".")[0])
+        for child in ast.iter_child_nodes(node):
+            cls.gather_names(child, bound, read)
+
+    @staticmethod
+    def bindings_in(statements: list[ast.stmt]) -> list[tuple[str, int]]:
+        """Every name these statements bind, with the line that binds it."""
+
+        found: list[tuple[str, int]] = []
+        for statement in statements:
+            for inner in ast.walk(statement):
+                line = getattr(inner, "lineno", 0)
+                if isinstance(inner, ast.Name) and not isinstance(
+                    inner.ctx, ast.Load
+                ):
+                    found.append((inner.id, line))
+                elif isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    found.append((inner.name, line))
+                elif isinstance(inner, ast.ExceptHandler) and inner.name:
+                    found.append((inner.name, line))
+                elif isinstance(inner, ast.alias):
+                    found.append((inner.asname or inner.name.split(".")[0], line))
+        return found
+
+    def refuse_late_binding(self, node: ast.AST, captures: tuple[str, ...]) -> None:
+        """Refuse a capture whose value would still be moving.
+
+        Python closes over the *variable*, so a lambda made in a loop sees the
+        loop's last value, not the value at the moment it was made. This
+        captures by value at that moment, which is the same answer whenever the
+        captured name is settled by then and a different one when it is not.
+        Rather than quietly disagree, the cases where it would are refused:
+        a name the enclosing scope binds again after this line, and a name
+        bound inside a loop that this definition sits in.
+        """
+
+        line = getattr(node, "lineno", 0)
+        moving: set[str] = set()
+        for name, bound_at in self.bindings_in(self.scope):
+            if bound_at > line and name in captures:
+                moving.add(name)
+        for statement in self.scope:
+            for inner in ast.walk(statement):
+                if not isinstance(inner, (ast.For, ast.While)):
+                    continue
+                start = getattr(inner, "lineno", 0)
+                end = getattr(inner, "end_lineno", start) or start
+                if not start <= line <= end:
+                    continue
+                # The `for` target counts as much as anything the body binds:
+                # it is the name that moves on every turn of the loop.
+                inside = list(inner.body)
+                if isinstance(inner, ast.For):
+                    inside.append(inner.target)
+                for name, _ in self.bindings_in(inside):
+                    if name in captures:
+                        moving.add(name)
+        if moving:
+            spelled = ", ".join(sorted(moving))
+            raise self.fail(
+                node,
+                f"this closure captures {spelled}, which the enclosing scope "
+                "binds again afterwards; Python would see the later value and "
+                "this captures the one in hand, so it is refused rather than "
+                "quietly disagreeing",
+            )
+
+    def make_closure(self, node: ast.AST, label: str, indent: int) -> str:
+        """A nested `def` or a `lambda`, as a real Python callable.
+
+        The body becomes a C function with the `(self, args)` shape CPython
+        calls, and `PyCFunction_New` wraps it in an object. What it captured
+        travels as the `self` that object holds, which is exactly how CPython
+        gives a C function state of its own.
+        """
+
+        assert self.current is not None
+        arguments = node.args
+        if (
+            arguments.vararg
+            or arguments.kwarg
+            or arguments.kwonlyargs
+            or arguments.posonlyargs
+        ):
+            raise self.fail(
+                node,
+                "a nested function taking *args, **kwargs, keyword-only or "
+                "positional-only parameters is not translated here yet",
+            )
+        if getattr(node, "decorator_list", []):
+            raise self.fail(
+                node, "a decorated nested function is not translated here yet"
+            )
+        bound, read = self.scope_names(node)
+        captures = tuple(
+            sorted(
+                name
+                for name in read - bound
+                if name not in self.globals
+                and name not in self.known_functions
+                and self.reference(name) is not None
+            )
+        )
+        self.refuse_late_binding(node, captures)
+
+        index = len(self.method_table)
+        c_name = f"_closure{index}_{label}"
+        self.method_table.append((c_name, label))
+
+        held = self.temporary()
+        self.emit(f"{held} = PyTuple_New({len(captures)});", indent)
+        self.checked(held, indent)
+        for offset, name in enumerate(captures):
+            source = self.reference(name)
+            # PyTuple_SetItem steals, and the enclosing scope still needs its
+            # own reference, so one is added for the tuple to consume.
+            self.emit(f"Py_IncRef({source});", indent)
+            self.emit(f"PyTuple_SetItem({held}, {offset}, {source});", indent)
+        target = self.temporary()
+        self.emit(
+            f"{target} = PyCFunction_New(&_py2bin_methods[{index}], {held});",
+            indent,
+        )
+        self.emit(f"Py_DecRef({held});", indent)
+        self.checked(target, indent)
+
+        self.write_closure(node, c_name, captures)
+        return target
+
+    def write_closure(
+        self, node: ast.AST, c_name: str, captures: tuple[str, ...]
+    ) -> None:
+        """Write the closure's body out as its own C function."""
+
+        parameters = tuple(argument.arg for argument in node.args.args)
+        defaults = node.args.defaults
+        function = _Function(
+            c_name, parameters, len(defaults), captures, closure=True
+        )
+        outer, outer_handlers, outer_scope = (
+            self.current,
+            self.handlers,
+            self.scope,
+        )
+        self.current, self.handlers = function, []
+        self.scope = node.body if isinstance(node.body, list) else []
+        # The parameters arrive in a tuple rather than as C arguments, so they
+        # are locals here and are declared alongside the rest.
+        for name in parameters:
+            function.locals.append(f"p_{name}")
+        for name in captures:
+            function.locals.append(f"c_{name}")
+        required = len(parameters) - len(defaults)
+        for offset, name in enumerate(parameters):
+            self.emit(f"p_{name} = PyTuple_GetItem(_args, {offset});", 1)
+            if offset < required:
+                # Too few arguments: CPython has already set IndexError, which
+                # is the same failure by a different name.
+                self.emit(f"if (!p_{name}) {{ {self.failure()} }}", 1)
+                self.emit(f"Py_IncRef(p_{name});", 1)
+            else:
+                self.emit(f"if (!p_{name}) {{", 1)
+                self.emit("PyErr_Clear();", 2)
+                value = self.expression(defaults[offset - required], 2)
+                self.emit(f"p_{name} = {value};", 2)
+                self.emit("} else {", 1)
+                self.emit(f"Py_IncRef(p_{name});", 2)
+                self.emit("}", 1)
+        for offset, name in enumerate(captures):
+            # Borrowed from the tuple the callable holds, so it is taken over
+            # for the length of the call like every other name here.
+            self.emit(f"c_{name} = PyTuple_GetItem(_self, {offset});", 1)
+            self.emit(f"if (!c_{name}) {{ {self.failure()} }}", 1)
+            self.emit(f"Py_IncRef(c_{name});", 1)
+        if isinstance(node.body, list):
+            for statement in node.body:
+                self.statement(statement, 1)
+            tail = self.builtin("None", 1)
+        else:
+            tail = self.expression(node.body, 1)
+        self.release_locals(1)
+        self.emit(f"return {tail};", 1)
+        self.write_unwind(function)
+        self.functions.append(function)
+        self.current, self.handlers, self.scope = (
+            outer,
+            outer_handlers,
+            outer_scope,
+        )
 
     # --- assembly --------------------------------------------------------
 
@@ -1449,6 +1873,7 @@ class CApiEmitter:
 
         entry = _Function("main", ())
         self.current = entry
+        self.scope = tree.body
         self.at_module_level = True
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -1462,6 +1887,13 @@ class CApiEmitter:
     def note_module_bindings(self, node: ast.stmt) -> None:
         """Record every name this module-level statement binds."""
 
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # The name it binds is a module name; what its body binds is not.
+            # Descending would make a function's own locals look like globals,
+            # which is how `total` inside one came to be read from a file-scope
+            # static that nothing ever wrote.
+            self.globals.add(node.name)
+            return
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 for element in (
@@ -1496,6 +1928,7 @@ class CApiEmitter:
         defaults = node.args.defaults
         function = _Function(node.name, parameters, len(defaults))
         self.current = function
+        self.scope = node.body
         # A parameter the call left out arrives as NULL and takes its default
         # here, before the increments below, so there is one rule for what the
         # body owns.
@@ -1517,32 +1950,58 @@ class CApiEmitter:
         tail = self.builtin("None", 1)
         self.release_locals(1)
         self.emit(f"return {tail};", 1)
+        self.write_unwind(function)
         self.functions.append(function)
         self.current = None
+        self.scope = []
+
+    def write_unwind(self, function: _Function) -> None:
+        """The tail a raising body leaves by: give everything back, answer NULL.
+
+        The exception stays set, so the caller sees exactly what a failing
+        C-API call looks like and its own `try` gets the chance to catch it.
+        """
+
+        if not function.unwinds:
+            return
+        self.current.body.append("_unwind:")
+        self.release_locals(1, guarded=True)
+        self.emit("return 0;", 1)
 
     def render(self) -> str:
+        def signature(function: _Function) -> str:
+            if function.closure:
+                # What CPython calls a METH_VARARGS function with: the object
+                # the callable holds, then the arguments in a tuple.
+                return "PyObject *_self, PyObject *_args"
+            return (
+                ", ".join(f"PyObject *p_{name}" for name in function.parameters)
+                or "void"
+            )
+
         out = [_PROTOTYPES]
         for function in self.functions:
             if function.name == "main":
                 continue
-            arguments = ", ".join(
-                f"PyObject *p_{name}" for name in function.parameters
-            ) or "void"
-            out.append(f"static PyObject *f_{function.name}({arguments});")
+            out.append(f"static PyObject *f_{function.name}({signature(function)});")
         out.append("")
         for function in self.functions:
             if function.name == "main":
                 continue
-            arguments = ", ".join(
-                f"PyObject *p_{name}" for name in function.parameters
-            ) or "void"
-            out.append(f"static PyObject *f_{function.name}({arguments}) {{")
+            out.append(f"static PyObject *f_{function.name}({signature(function)}) {{")
             out.extend(self.declarations(function, 1))
             out.extend(function.body)
             out.append("}")
             out.append("")
         entry = self.functions[-1]
         out.append("static PyObject *_py2bin_builtins = 0;")
+        if self.method_table:
+            # Declared empty and filled at startup: the C front end does not
+            # initialise a file-scope struct, and the address has to be stable
+            # for as long as a callable made from it can be called.
+            out.append(
+                f"static struct PyMethodDef _py2bin_methods[{len(self.method_table)}];"
+            )
         for name in sorted(self.globals):
             out.append(f"static PyObject *g_{name} = 0;")
         out.append("")
@@ -1557,6 +2016,12 @@ class CApiEmitter:
         # with a UnicodeEncodeError that has nothing to do with the program.
         setup = "import sys; sys.stdout.reconfigure(encoding='utf-8')"
         out.append(f"    PyRun_SimpleString({_c_string(setup)});")
+        for index, (c_name, label) in enumerate(self.method_table):
+            out.append(f"    _py2bin_methods[{index}].ml_name = {_c_string(label)};")
+            out.append(f"    _py2bin_methods[{index}].ml_meth = f_{c_name};")
+            # METH_VARARGS: the arguments arrive as a tuple.
+            out.append(f"    _py2bin_methods[{index}].ml_flags = 1;")
+            out.append(f"    _py2bin_methods[{index}].ml_doc = 0;")
         out.append("    {")
         out.extend(self.declarations(entry, 2))
         out.extend(entry.body)
