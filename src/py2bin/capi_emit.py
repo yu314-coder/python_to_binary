@@ -1146,6 +1146,15 @@ class CApiEmitter:
         number = self.current.temporaries
         handler = f"_handler{number}"
         done = f"_after{number}"
+        # The classes each clause catches are evaluated here, before the body
+        # runs. Building them inside the handler calls into Python while an
+        # exception is set, which CPython refuses - `except (A, B)` failed with
+        # "returned a result with an exception set" until this moved out.
+        caught: list[str | None] = []
+        for clause in node.handlers:
+            caught.append(
+                None if clause.type is None else self.expression(clause.type, indent)
+            )
         self.handlers.append(handler)
         try:
             for statement in node.body:
@@ -1154,7 +1163,7 @@ class CApiEmitter:
             self.handlers.pop()
         self.emit(f"goto {done};", indent)
         self.emit(f"{handler}:", 0)
-        for clause in node.handlers:
+        for clause, wanted in zip(node.handlers, caught):
             if clause.type is None:
                 # A bare except catches whatever is set.
                 self.bind_exception(clause, indent)
@@ -1162,9 +1171,7 @@ class CApiEmitter:
                     self.statement(statement, indent)
                 self.emit(f"goto {done};", indent)
                 continue
-            if not isinstance(clause.type, ast.Name):
-                raise self.fail(clause, "an except clause names one class here")
-            wanted = self.builtin(clause.type.id, indent)
+            # PyErr_ExceptionMatches takes a tuple as readily as a class.
             decision = self.temporary_flag()
             self.emit(f"{decision} = PyErr_ExceptionMatches({wanted});", indent)
             self.emit(f"Py_DecRef({wanted});", indent)
@@ -1230,6 +1237,15 @@ class CApiEmitter:
             if not isinstance(element, ast.Name):
                 raise self.fail(target, "unpacking binds plain names here")
         value = self.expression(value_node, indent)
+        self.unpack_value(target, value, indent)
+        self.emit(f"Py_DecRef({value});", indent)
+
+    def unpack_value(self, target, value: str, indent: int) -> None:
+        """Take ``value`` apart into the names of ``target``."""
+
+        for element in target.elts:
+            if not isinstance(element, ast.Name):
+                raise self.fail(target, "unpacking binds plain names here")
         for position, element in enumerate(target.elts):
             index = self.temporary()
             self.emit(f"{index} = PyLong_FromLongLong({position}LL);", indent)
@@ -1241,7 +1257,6 @@ class CApiEmitter:
             name = self.declare(element.id)
             self.emit(f"if ({name}) Py_DecRef({name});", indent)
             self.emit(f"{name} = {item};", indent)
-        self.emit(f"Py_DecRef({value});", indent)
 
     def store_item(
         self, target: ast.Subscript, value_node: ast.expr, indent: int
@@ -1327,15 +1342,19 @@ class CApiEmitter:
 
         if node.orelse:
             raise self.fail(node, "a for-else is not translated here yet")
-        if not isinstance(node.target, ast.Name):
-            raise self.fail(node, "a for loop binds one name here")
+        if not isinstance(node.target, (ast.Name, ast.Tuple, ast.List)):
+            raise self.fail(node, "a for loop binds a name or a tuple of names")
         sequence = self.expression(node.iter, indent)
         iterator = self.temporary()
         self.emit(f"{iterator} = PyObject_GetIter({sequence});", indent)
         self.checked(iterator, indent)
         self.emit(f"Py_DecRef({sequence});", indent)
         item = self.temporary()
-        target = self.declare(node.target.id)
+        target = (
+            self.declare(node.target.id)
+            if isinstance(node.target, ast.Name)
+            else None
+        )
         self.emit("while (1) {", indent)
         self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
         # NULL means the sequence ended, or that producing the next item
@@ -1344,8 +1363,14 @@ class CApiEmitter:
             f"if (!{item}) {{ if (PyErr_Occurred()) {{ PyErr_Print(); exit(1); }} break; }}",
             indent + 1,
         )
-        self.emit(f"if ({target}) Py_DecRef({target});", indent + 1)
-        self.emit(f"{target} = {item};", indent + 1)
+        if target is None:
+            # `for a, b in pairs` - the item is taken apart the way an
+            # assignment to the same target would take it apart.
+            self.unpack_value(node.target, item, indent + 1)
+            self.emit(f"Py_DecRef({item});", indent + 1)
+        else:
+            self.emit(f"if ({target}) Py_DecRef({target});", indent + 1)
+            self.emit(f"{target} = {item};", indent + 1)
         for statement in node.body:
             self.statement(statement, indent + 1)
         self.emit("}", indent)
@@ -1360,9 +1385,13 @@ class CApiEmitter:
         return name
 
     def give_back(self, node: ast.Return, indent: int) -> None:
-        if node.value is None:
-            raise self.fail(node, "a bare return is not translated here yet")
-        value = self.expression(node.value, indent)
+        # A bare return is `return None`, which is what falling off the end
+        # gives too.
+        value = (
+            self.builtin("None", indent)
+            if node.value is None
+            else self.expression(node.value, indent)
+        )
         self.release_locals(indent)
         self.emit(f"return {value};", indent)
 
