@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-from py2bin.freezer import zip_bytecode, _frozen_macos_app, _shell_launcher, extract_wheel
+from py2bin.freezer import drop_debug_symbols, zip_bytecode, _frozen_macos_app, _shell_launcher, extract_wheel
 from py2bin.native.launcher import macos_shell_launcher
 from py2bin.onefile import _powershell_script, create_onefile
 
@@ -349,3 +349,41 @@ class ZipBytecodeTests(unittest.TestCase):
             (bundle / "Contents" / "MacOS").mkdir(parents=True)
             self.assertEqual(zip_bytecode(bundle), 0)
             self.assertEqual(list(bundle.rglob("*.zip")), [])
+
+
+class DebugSymbolTests(unittest.TestCase):
+    """The DWARF companions some wheels ship, which nothing loads."""
+
+    def test_a_debug_companion_is_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "App.app"
+            packages = bundle / "Contents" / "Resources" / "site-packages"
+            dwarf = (
+                packages / "objc" / "_objc.so.dSYM" / "Contents" / "Resources"
+                / "DWARF"
+            )
+            dwarf.mkdir(parents=True)
+            (dwarf / "_objc.so").write_bytes(b"\xcf\xfa\xed\xfe" + b"d" * 5000)
+            (packages / "objc" / "_objc.so").write_bytes(b"\xcf\xfa\xed\xfe" * 8)
+            freed = drop_debug_symbols(bundle)
+        self.assertGreater(freed, 5000)
+
+    def test_the_extension_itself_is_left_alone(self):
+        # The companion holds a copy of the binary's name; deleting by name
+        # rather than by the `.dSYM` directory would take the real one too.
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "App.app"
+            packages = bundle / "Contents" / "Resources" / "site-packages"
+            (packages / "objc" / "_objc.so.dSYM").mkdir(parents=True)
+            (packages / "objc" / "_objc.so.dSYM" / "x").write_bytes(b"d" * 100)
+            extension = packages / "objc" / "_objc.so"
+            extension.write_bytes(b"\xcf\xfa\xed\xfe" * 8)
+            drop_debug_symbols(bundle)
+            self.assertTrue(extension.is_file())
+            self.assertFalse((packages / "objc" / "_objc.so.dSYM").exists())
+
+    def test_a_bundle_without_any_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "App.app"
+            (bundle / "Contents" / "MacOS").mkdir(parents=True)
+            self.assertEqual(drop_debug_symbols(bundle), 0)

@@ -681,15 +681,34 @@ A whole application, manim_app (10,100 lines, pywebview + PIL + pyobjc):
 | | py2bin | Nuitka |
 |---|---|---|
 | main binary | **9.2 MB** | 29.6 MB |
-| whole `.app` | 74 MB | 74 MB |
+| whole `.app` | **68.4 MB** | 72.6 MB |
 | bare interpreter start | **9.5 ms** | 16.2 ms |
 | start with the app's imports | 53.4 ms | **45.8 ms** |
 
 The binary is a third the size because Nuitka compiles every module it reaches,
 including the third-party tree, while this compiles the program and ships its
-dependencies as bytecode. The bundles come out level: `--zip-stdlib` packs the
-carried library into the `pythonXY.zip` an interpreter already has on
-`sys.path`, which took 8.4 MB to 3.5 MB and closed the difference.
+dependencies as bytecode. That does not make the bundle smaller by 20 MB,
+because the bytecode has to go somewhere - and asking where the difference
+went, category by category, is what found the rest:
+
+| | py2bin | Nuitka |
+|---|---|---|
+| main binary | 9.2M | 29.6M |
+| the interpreter | 6.9M | 7.6M |
+| native extensions and their libraries | 30.0M | 22.6M |
+| bytecode | 7.8M | - |
+| the application's own web assets | 15.8M | 15.8M |
+
+Both carry an interpreter; Nuitka's is `Contents/MacOS/Python` rather than a
+framework. The 20 MB the binary saves comes back as 7.8 MB of bytecode and
+7.4 MB of native libraries, and the rest was waste this found and now removes:
+`--zip-stdlib` took the library from 8.4 MB to 3.5, and `--prune-unused` drops
+the `.dSYM` debug companions that some wheels ship - pyobjc alone carries
+3.6 MB of DWARF beside a 1 MB extension.
+
+The native-library gap is what is left. Nuitka ships fewer of PIL's codecs,
+having decided the program cannot reach them; this keeps them all, because
+`Image.init()` can import any plugin and a static walk cannot rule that out.
 
 The two startup rows say where the remaining work is. Getting the interpreter
 up is faster here - there is no bundle to bootstrap, just `Py_Initialize`. The

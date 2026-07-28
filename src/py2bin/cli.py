@@ -1013,9 +1013,16 @@ def main(argv: list[str] | None = None) -> int:
                 carried = embed_cpython_in_app(output)
                 freed = 0
                 if args.prune_unused:
-                    from .freezer import drop_unused_libraries, prune_unreachable
+                    from .freezer import (
+                        drop_debug_symbols,
+                        drop_unused_libraries,
+                        prune_unreachable,
+                    )
 
                     freed = prune_unreachable(output, entry)
+                    # Debug companions are nobody's dependency, so the order
+                    # against the other two does not matter.
+                    freed += drop_debug_symbols(output)
                     # After the modules, not before: the library closure is
                     # computed from the extensions present, and pruning
                     # removes extensions.

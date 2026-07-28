@@ -473,6 +473,28 @@ def drop_unused_libraries(bundle: Path) -> int:
     return before - sum(f.stat().st_size for f in libraries.glob("*.dylib"))
 
 
+def drop_debug_symbols(bundle: Path) -> int:
+    """Discard the debug companions that ship beside some wheels.
+
+    A `.dSYM` is a separate bundle holding the DWARF a debugger needs to turn
+    an address in a `.so` back into a line of C. Nothing loads it: dyld does
+    not look at it, and the import system does not know it exists. A debugger
+    finds it by the binary's UUID, on the machine where the debugging happens.
+
+    Wheels that were built with symbols and packed without stripping carry one
+    anyway - pyobjc's `_objc` ships 3.6 MB of DWARF beside a 1 MB extension -
+    and a bundle that copies site-packages copies it too.
+    """
+
+    freed = 0
+    for companion in sorted(bundle.rglob("*.dSYM"), key=lambda p: -len(p.parts)):
+        if not companion.is_dir():
+            continue
+        freed += sum(f.stat().st_size for f in companion.rglob("*") if f.is_file())
+        shutil.rmtree(companion)
+    return freed
+
+
 def zip_bytecode(bundle: Path, compress: bool = True) -> int:
     """Move the carried stdlib's bytecode into the zip CPython already looks for.
 
