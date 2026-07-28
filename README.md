@@ -256,12 +256,19 @@ CPython, and requiring identical stdout and exit status.
 | `global` / `nonlocal`, tuple unpacking | ✅ |
 | the whole program: every `.py` beside the entry is compiled in | ✅ |
 | `__name__`, `__file__`, `inspect.signature` on compiled functions | ✅ |
-| `raise … from …` | ❌ |
-| starred unpacking (`a, *b = …`) | ❌ |
-| walrus (`:=`) | ❌ |
+| walrus (`:=`) | ✅ |
+| `raise … from …` | ✅ |
+| starred unpacking (`a, *b, c = …`) | ✅ |
+| `match`: values, `\|` alternatives, captures, sequences, guards | ✅ |
+| `match`: mapping and class patterns | ❌ |
 | generators (`yield`) | ❌ |
 | `async` / `await` | ❌ |
-| `match` statement | ❌ |
+
+What is left needs machinery this tier does not have rather than more
+translation. A generator has to suspend and resume, which means a frame to
+suspend into; `async` needs the same thing and a scheduler besides. A mapping
+or class pattern needs the match protocol (`__match_args__`) walked, which is
+tractable and simply not written.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
 889-program corpus, 878 programs produce byte-identical output to CPython; the

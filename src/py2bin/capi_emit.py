@@ -992,6 +992,8 @@ class CApiEmitter:
             return self.call(node, indent)
         if isinstance(node, ast.Lambda):
             return self.make_closure(node, "lambda", indent)
+        if isinstance(node, ast.NamedExpr):
+            return self.named(node, indent)
         raise self.fail(
             node, f"{type(node).__name__} has no C-API translation here yet"
         )
@@ -1140,6 +1142,19 @@ class CApiEmitter:
         self.emit(f"Py_IncRef({c_name});", indent)
         self.emit(f"{target} = {c_name};", indent)
         return target
+
+    def named(self, node: ast.NamedExpr, indent: int) -> str:
+        """`(n := value)` - bind the name, and be the value as well.
+
+        Two references are needed and only one is produced: the binding takes
+        one and the surrounding expression takes the other, so the value is
+        incremented once before either gets it.
+        """
+
+        value = self.expression(node.value, indent)
+        self.emit(f"Py_IncRef({value});", indent)
+        self.bind_target(node.target, value, indent)
+        return value
 
     def binary(self, node: ast.BinOp, indent: int) -> str:
         if isinstance(node.op, ast.Pow):
@@ -2205,6 +2220,8 @@ class CApiEmitter:
                     ),
                     indent,
                 )
+        elif isinstance(node, ast.Match):
+            self.match_statement(node, indent)
         elif isinstance(node, ast.Assert):
             self.check(node, indent)
         elif isinstance(node, ast.Pass):
@@ -2530,8 +2547,10 @@ class CApiEmitter:
         and here that is the same `goto` a failing call takes.
         """
 
-        if node.cause is not None:
-            raise self.fail(node, "`raise ... from ...` is not translated here yet")
+        if node.cause is not None and node.exc is None:
+            raise self.fail(
+                node, "`raise ... from ...` needs something to raise"
+            )
         if node.exc is None:
             if not self.handling:
                 raise self.fail(
@@ -2544,6 +2563,9 @@ class CApiEmitter:
             value, owned = self.handling[-1], False
         else:
             value, owned = self.expression(node.exc, indent), True
+        if node.cause is not None:
+            value = self.with_cause(node, value, owned, indent)
+            owned = True
         # PyErr_SetObject wants the class as well as the value, and a NULL
         # there sets nothing at all - the raise then vanished without a trace.
         # `type(value)` is the class whether the source named a class or built
@@ -2561,6 +2583,300 @@ class CApiEmitter:
             self.emit(f"goto {self.handlers[-1]};", indent)
         else:
             self.emit(self.failure(), indent)
+
+    def match_statement(self, node: ast.Match, indent: int) -> None:
+        """`match` - the cases in order, the first one that fits.
+
+        Lowered to a chain of tests rather than to anything clever, because
+        that is what it is: each case asks whether the subject fits its
+        pattern, binds whatever the pattern captures, and runs its body. A
+        `case` that has matched stops the rest from being tried, which the
+        flag carries - a `goto` past the chain would do as well but would need
+        a label per statement.
+        """
+
+        subject = self.expression(node.subject, indent)
+        done = self.temporary_flag()
+        self.emit(f"{done} = 0;", indent)
+        for case in node.cases:
+            self.emit(f"if (!{done}) {{", indent)
+            fits = self.pattern_test(case.pattern, subject, indent + 1)
+            self.emit(f"if ({fits}) {{", indent + 1)
+            inner = indent + 2
+            if case.guard is not None:
+                # The guard runs only once the pattern has bound its names,
+                # because a guard is allowed to mention them.
+                verdict = self.truth(case.guard, inner)
+                self.emit(f"if ({verdict}) {{", inner)
+                inner += 1
+            self.emit(f"{done} = 1;", inner)
+            for statement in case.body:
+                self.statement(statement, inner)
+            if case.guard is not None:
+                self.emit("}", indent + 2)
+            self.emit("}", indent + 1)
+            self.emit("}", indent)
+        self.emit(f"Py_DecRef({subject});", indent)
+
+    def pattern_test(self, pattern, subject: str, indent: int) -> str:
+        """Emit a test of `subject` against `pattern`; answer a C int flag.
+
+        Whatever the pattern captures is bound as a side effect, before the
+        flag is read - a capture that matched is visible to the guard and to
+        the body, which is what `case [x, y] if x < y` needs.
+        """
+
+        fits = self.temporary_flag()
+        if isinstance(pattern, ast.MatchValue):
+            wanted = self.expression(pattern.value, indent)
+            outcome = self.temporary()
+            self.emit(
+                f"{outcome} = PyObject_RichCompare({subject}, {wanted}, 2);", indent
+            )
+            self.emit(f"Py_DecRef({wanted});", indent)
+            self.checked(outcome, indent)
+            self.emit(f"{fits} = PyObject_IsTrue({outcome});", indent)
+            self.emit(f"Py_DecRef({outcome});", indent)
+            self.emit(f"if ({fits} < 0) {{ {self.failure()} }}", indent)
+            return fits
+        if isinstance(pattern, ast.MatchSingleton):
+            # `case None` is an identity test, not an equality one, which is
+            # the difference between it and `case 0` for a value that is both
+            # falsey and not None.
+            wanted = self.builtin(repr(pattern.value), indent)
+            self.emit(f"{fits} = ({subject} == {wanted});", indent)
+            self.emit(f"Py_DecRef({wanted});", indent)
+            return fits
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is None:
+                # `case _` and `case name` both always fit; the second binds.
+                self.emit(f"{fits} = 1;", indent)
+            else:
+                inner = self.pattern_test(pattern.pattern, subject, indent)
+                self.emit(f"{fits} = {inner};", indent)
+            if pattern.name is not None:
+                self.emit(f"if ({fits}) {{", indent)
+                self.emit(f"Py_IncRef({subject});", indent + 1)
+                self.bind_target(
+                    ast.Name(id=pattern.name, ctx=ast.Store()), subject, indent + 1
+                )
+                self.emit("}", indent)
+            return fits
+        if isinstance(pattern, ast.MatchOr):
+            self.emit(f"{fits} = 0;", indent)
+            for alternative in pattern.patterns:
+                self.emit(f"if (!{fits}) {{", indent)
+                inner = self.pattern_test(alternative, subject, indent + 1)
+                self.emit(f"{fits} = {inner};", indent + 1)
+                self.emit("}", indent)
+            return fits
+        if isinstance(pattern, ast.MatchSequence):
+            return self.sequence_pattern(pattern, subject, fits, indent)
+        raise self.fail(
+            pattern,
+            f"a {type(pattern).__name__[5:].lower()} pattern is not translated "
+            "here yet",
+        )
+
+    def sequence_pattern(self, pattern, subject: str, fits: str, indent: int) -> str:
+        """`case [a, b]` - a list or a tuple of the right length, taken apart.
+
+        Only a list or a tuple. Python matches any sequence except `str` and
+        `bytes`, which is a wider test than this makes, so a pattern that would
+        have matched some other sequence type does not fit here rather than
+        fitting wrongly.
+        """
+
+        if any(isinstance(part, ast.MatchStar) for part in pattern.patterns):
+            raise self.fail(pattern, "a starred sequence pattern is not translated here yet")
+        kinds = self.temporary()
+        # A slot at a time, not PyTuple_Pack: that one is variadic, and Apple's
+        # arm64 ABI puts variadic arguments on the stack where this backend
+        # passes registers. Called with a fixed prototype it reads two
+        # addresses that were never written, which is a segfault rather than a
+        # wrong answer. PyTuple_SetItem steals, so neither builtin is released.
+        self.emit(f"{kinds} = PyTuple_New(2LL);", indent)
+        self.checked(kinds, indent)
+        as_list = self.builtin("list", indent)
+        as_tuple = self.builtin("tuple", indent)
+        self.emit(f"PyTuple_SetItem({kinds}, 0LL, {as_list});", indent)
+        self.emit(f"PyTuple_SetItem({kinds}, 1LL, {as_tuple});", indent)
+        checker = self.builtin("isinstance", indent)
+        array = self.argument_array(2)
+        self.emit(f"{array}[0] = {subject};", indent)
+        self.emit(f"{array}[1] = {kinds};", indent)
+        answer = self.temporary()
+        self.emit(f"{answer} = PyObject_Vectorcall({checker}, {array}, 2, 0);", indent)
+        self.emit(f"Py_DecRef({checker});", indent)
+        self.emit(f"Py_DecRef({kinds});", indent)
+        self.checked(answer, indent)
+        self.emit(f"{fits} = PyObject_IsTrue({answer});", indent)
+        self.emit(f"Py_DecRef({answer});", indent)
+        self.emit(f"if ({fits} < 0) {{ {self.failure()} }}", indent)
+        self.emit(f"if ({fits}) {{", indent)
+        self.emit(
+            f"{fits} = (PyObject_Size({subject}) == {len(pattern.patterns)});",
+            indent + 1,
+        )
+        self.emit("}", indent)
+        for position, part in enumerate(pattern.patterns):
+            self.emit(f"if ({fits}) {{", indent)
+            index = self.temporary()
+            self.emit(f"{index} = PyLong_FromLongLong({position}LL);", indent + 1)
+            self.checked(index, indent + 1)
+            picked = self.temporary()
+            self.emit(f"{picked} = PyObject_GetItem({subject}, {index});", indent + 1)
+            self.emit(f"Py_DecRef({index});", indent + 1)
+            self.checked(picked, indent + 1)
+            inner = self.pattern_test(part, picked, indent + 1)
+            self.emit(f"Py_DecRef({picked});", indent + 1)
+            self.emit(f"{fits} = {inner};", indent + 1)
+            self.emit("}", indent)
+        return fits
+
+    def unpack_with_star(self, target, value: str, indent: int) -> None:
+        """`a, *rest, b = xs` - the fixed names, and a list for the rest.
+
+        The star's share is whatever is left once the names on either side
+        have taken theirs, so the length has to be known before anything is
+        bound - which is why this goes through a list rather than pulling from
+        an iterator. It is also the only unpacking whose failure is one-sided:
+        there can never be *too many* values, only too few.
+        """
+
+        star = next(
+            index
+            for index, element in enumerate(target.elts)
+            if isinstance(element, ast.Starred)
+        )
+        if any(
+            isinstance(element, ast.Starred)
+            for element in target.elts[star + 1 :]
+        ):
+            raise self.fail(target, "two starred names in one unpacking")
+        for element in target.elts:
+            plain = element.value if isinstance(element, ast.Starred) else element
+            if not isinstance(plain, ast.Name):
+                raise self.fail(target, "unpacking binds plain names here")
+        before, after = star, len(target.elts) - star - 1
+        maker = self.builtin("list", indent)
+        items = self.temporary()
+        self.emit(f"{items} = PyObject_CallOneArg({maker}, {value});", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.checked(items, indent)
+        length = self.temporary_flag()
+        self.emit(f"{length} = (int)PyObject_Size({items});", indent)
+        self.emit(f"if ({length} < 0) {{ {self.failure()} }}", indent)
+        self.emit(f"if ({length} < {before + after}) {{", indent)
+        counted = self.temporary()
+        self.emit(
+            f"{counted} = PyLong_FromLongLong((long long){length});", indent + 1
+        )
+        self.checked(counted, indent + 1)
+        self.raise_value_error(
+            f"not enough values to unpack (expected at least "
+            f"{before + after}, got ",
+            counted,
+            indent + 1,
+        )
+        self.emit("}", indent)
+        for position in range(before):
+            self.bind_index(target.elts[position], items, str(position), indent)
+        # The star's slice runs from where the leading names stopped to where
+        # the trailing ones begin, counted from the end so it does not matter
+        # how long the middle is.
+        rest = self.temporary()
+        start = self.temporary()
+        stop = self.temporary()
+        self.emit(f"{start} = PyLong_FromLongLong({before}LL);", indent)
+        self.checked(start, indent)
+        self.emit(
+            f"{stop} = PyLong_FromLongLong((long long)({length} - {after}));", indent
+        )
+        self.checked(stop, indent)
+        none = self.builtin("None", indent)
+        cut = self.temporary()
+        self.emit(f"{cut} = PySlice_New({start}, {stop}, {none});", indent)
+        self.emit(f"Py_DecRef({start});", indent)
+        self.emit(f"Py_DecRef({stop});", indent)
+        self.emit(f"Py_DecRef({none});", indent)
+        self.checked(cut, indent)
+        self.emit(f"{rest} = PyObject_GetItem({items}, {cut});", indent)
+        self.emit(f"Py_DecRef({cut});", indent)
+        self.checked(rest, indent)
+        self.bind_target(target.elts[star].value, rest, indent)
+        for offset in range(after):
+            self.bind_index(
+                target.elts[star + 1 + offset],
+                items,
+                f"{length} - {after - offset}",
+                indent,
+            )
+        self.emit(f"Py_DecRef({items});", indent)
+
+    def bind_index(self, element, items: str, position: str, indent: int) -> None:
+        """Bind one name to `items[position]`, where position is C, not Python."""
+
+        index = self.temporary()
+        self.emit(f"{index} = PyLong_FromLongLong((long long)({position}));", indent)
+        self.checked(index, indent)
+        picked = self.temporary()
+        self.emit(f"{picked} = PyObject_GetItem({items}, {index});", indent)
+        self.emit(f"Py_DecRef({index});", indent)
+        self.checked(picked, indent)
+        self.bind_target(element, picked, indent)
+
+    def with_cause(
+        self, node: ast.Raise, value: str, owned: bool, indent: int
+    ) -> str:
+        """`raise E from C` - the `from` half, which is one attribute.
+
+        `__cause__` has a setter that also sets `__suppress_context__`, so
+        assigning it is the whole of what the statement means; there is nothing
+        else for a `from` to do.
+
+        The awkward part is that `raise ValueError from C` names a class, and a
+        class has nowhere to keep a cause - the instance does. Python
+        instantiates before attaching, so this asks whether what it has is a
+        class and calls it when it is.
+        """
+
+        cause = self.expression(node.cause, indent)
+        is_class = self.temporary_flag()
+        kind = self.builtin("type", indent)
+        checker = self.builtin("isinstance", indent)
+        array = self.argument_array(2)
+        self.emit(f"{array}[0] = {value};", indent)
+        self.emit(f"{array}[1] = {kind};", indent)
+        answer = self.temporary()
+        self.emit(
+            f"{answer} = PyObject_Vectorcall({checker}, {array}, 2, 0);", indent
+        )
+        self.emit(f"Py_DecRef({checker});", indent)
+        self.emit(f"Py_DecRef({kind});", indent)
+        self.checked(answer, indent)
+        self.emit(f"{is_class} = PyObject_IsTrue({answer});", indent)
+        self.emit(f"Py_DecRef({answer});", indent)
+        instance = self.temporary()
+        self.emit(f"if ({is_class}) {{", indent)
+        self.emit(f"{instance} = PyObject_CallNoArgs({value});", indent + 1)
+        if owned:
+            self.emit(f"Py_DecRef({value});", indent + 1)
+        self.emit(f"if (!{instance}) {{ {self.failure()} }}", indent + 1)
+        self.emit("} else {", indent)
+        if not owned:
+            self.emit(f"Py_IncRef({value});", indent + 1)
+        self.emit(f"{instance} = {value};", indent + 1)
+        self.emit("}", indent)
+        outcome = self.temporary_flag()
+        self.emit(
+            f'{outcome} = PyObject_SetAttrString({instance}, "__cause__", '
+            f"{cause});",
+            indent,
+        )
+        self.emit(f"Py_DecRef({cause});", indent)
+        self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
+        return instance
 
     def with_block(self, node: ast.With, indent: int) -> None:
         """`with a as b:` - __enter__, the body, then __exit__ however it ends.
@@ -2961,6 +3277,9 @@ class CApiEmitter:
     def unpack_value(self, target, value: str, indent: int) -> None:
         """Take ``value`` apart into the names of ``target``."""
 
+        if any(isinstance(element, ast.Starred) for element in target.elts):
+            self.unpack_with_star(target, value, indent)
+            return
         for element in target.elts:
             if not isinstance(element, ast.Name):
                 raise self.fail(target, "unpacking binds plain names here")

@@ -2399,3 +2399,121 @@ class RelativeImportTests(unittest.TestCase):
     def test_an_absolute_import_is_unchanged(self):
         found = self._imports("pkg.mod", "/x/pkg/mod.py", "from json import loads\n")
         self.assertIn("json", found)
+
+
+class NewlyTranslatedSyntaxTests(unittest.TestCase):
+    """Constructs the tier used to refuse, each held against CPython."""
+
+    _run = CApiEmitTests._run
+
+    def test_the_walrus_binds_and_is_the_value(self):
+        self._run(
+            "if (n := 5) > 1:\n"
+            "    print(n)\n"
+            "print([y for x in [1, 2, 3] if (y := x * 2) > 2])\n",
+            b"5\n[4, 6]\n",
+        )
+
+    def test_raise_from_attaches_the_cause(self):
+        # `__cause__` has a setter that also sets `__suppress_context__`, so
+        # assigning it is the whole of what `from` means.
+        self._run(
+            "try:\n"
+            "    raise ValueError('outer') from KeyError('inner')\n"
+            "except ValueError as error:\n"
+            "    print(type(error.__cause__).__name__, error.__cause__)\n",
+            b"KeyError 'inner'\n",
+        )
+
+    def test_raise_from_instantiates_a_class_first(self):
+        # `raise TypeError from X` names a class, and a class has nowhere to
+        # keep a cause - Python instantiates before attaching.
+        self._run(
+            "try:\n"
+            "    raise TypeError from RuntimeError('r')\n"
+            "except TypeError as error:\n"
+            "    print(type(error).__name__, type(error.__cause__).__name__)\n",
+            b"TypeError RuntimeError\n",
+        )
+
+    def test_a_star_takes_what_the_names_leave(self):
+        self._run(
+            "a, *b = [1, 2, 3, 4]\n"
+            "*c, d = (1, 2, 3)\n"
+            "e, *f, g = [1, 2, 3, 4, 5]\n"
+            "h, *i = [9]\n"
+            "print(a, b, c, d, e, f, g, h, i)\n",
+            b"1 [2, 3, 4] [1, 2] 3 1 [2, 3, 4] 5 9 []\n",
+        )
+
+    def test_a_star_over_a_string_and_in_a_for_target(self):
+        self._run(
+            "j, *k, m = 'xyz'\n"
+            "print(j, k, m)\n"
+            "for p, *q in [[1, 2, 3], [4, 5]]:\n"
+            "    print(p, q)\n",
+            b"x ['y'] z\n1 [2, 3]\n4 [5]\n",
+        )
+
+    def test_a_star_says_how_many_it_needed(self):
+        # The only unpacking whose failure is one-sided: there can never be
+        # too many values for a star, only too few for the fixed names.
+        self._run(
+            "try:\n"
+            "    z, y, *x = [1]\n"
+            "except ValueError as error:\n"
+            "    print(error)\n",
+            b"not enough values to unpack (expected at least 2, got 1)\n",
+        )
+
+    def test_match_takes_the_first_case_that_fits(self):
+        self._run(
+            "def classify(v):\n"
+            "    match v:\n"
+            "        case 0:\n"
+            "            return 'zero'\n"
+            "        case 1 | 2 | 3:\n"
+            "            return 'small'\n"
+            "        case None:\n"
+            "            return 'none'\n"
+            "        case [a, b]:\n"
+            "            return f'pair {a},{b}'\n"
+            "        case [x] if x > 100:\n"
+            "            return f'big single {x}'\n"
+            "        case [x]:\n"
+            "            return f'single {x}'\n"
+            "        case n:\n"
+            "            return f'other {n}'\n"
+            "for v in (0, 2, None, [7, 8], [500], [4], 'hi'):\n"
+            "    print(classify(v))\n",
+            b"zero\nsmall\nnone\npair 7,8\nbig single 500\nsingle 4\nother hi\n",
+        )
+
+    def test_a_sequence_pattern_needs_the_right_length(self):
+        self._run(
+            "def f(v):\n"
+            "    match v:\n"
+            "        case [a, b]:\n"
+            "            return 'two'\n"
+            "        case _:\n"
+            "            return 'not two'\n"
+            "print(f([1, 2]), f([1]), f([1, 2, 3]), f('ab'))\n",
+            b"two not two not two not two\n",
+        )
+
+    def test_a_sequence_pattern_is_built_without_the_variadic_entry_point(self):
+        # PyTuple_Pack is variadic, and Apple's arm64 ABI puts variadic
+        # arguments on the stack where this backend passes registers. Calling
+        # it with a fixed prototype segfaults rather than answering wrongly.
+        written = python_to_capi_c(
+            "match [1]:\n    case [a]:\n        pass\n", "program.py"
+        )
+        self.assertNotIn("= PyTuple_Pack(", written)
+
+    def test_an_untranslated_pattern_is_refused_by_name(self):
+        self._reject = CApiEmitTests._reject
+        with self.assertRaises(CApiEmitError) as caught:
+            python_to_capi_c(
+                "match p:\n    case {'k': v}:\n        pass\n", "program.py"
+            )
+        self.assertIn("mapping pattern is not translated", str(caught.exception))

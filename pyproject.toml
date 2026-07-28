@@ -5,7 +5,7 @@ backend-path = ["src"]
 
 [project]
 name = "python-to-binary"
-version = "0.3.1"
+version = "0.4.0"
 description = "Pure-Python Python-to-C, native binary compiler, and CPython application bundler"
 readme = "README-pypi.md"
 requires-python = ">=3.10"
