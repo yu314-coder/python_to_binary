@@ -869,12 +869,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{result.target}: {result.artifact} ({result.bytes} bytes)")
             return 0
         if args.command == "compile-capi":
-            from .capi_emit import python_to_capi_c
+            from .capi_emit import python_program_to_capi_c
 
             target = _target_from_args(args)
-            generated = python_to_capi_c(
-                entry.read_text(encoding="utf-8"), str(entry)
-            )
+            generated, linked = python_program_to_capi_c(entry)
+            if linked:
+                print(
+                    f"linking {len(linked)} module(s) of the program itself: "
+                    + ", ".join(linked),
+                    file=sys.stderr,
+                )
             source = args.emit_c or args.output.with_suffix(".capi.c")
             source.parent.mkdir(parents=True, exist_ok=True)
             # newline pinned: the generated C has to be byte-identical

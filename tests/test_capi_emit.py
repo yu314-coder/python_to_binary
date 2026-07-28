@@ -16,7 +16,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from py2bin.capi_emit import CApiEmitError, python_to_capi_c
+from py2bin.capi_emit import (
+    CApiEmitError,
+    python_program_to_capi_c,
+    python_to_capi_c,
+)
 from py2bin.c_native import compile_c_native
 
 _HOST_IS_DARWIN_ARM64 = (
@@ -1428,6 +1432,114 @@ class CApiEmitTests(unittest.TestCase):
             self.assertEqual(native.returncode, 1)
             self.assertIn(b"AttributeError", native.stderr)
             self.assertIn(b"__name__", native.stderr)
+
+    def test_a_program_of_several_modules_is_linked_into_one_image(self):
+        """The entry's own imports are compiled, not read as source.
+
+        Compiling only the entry left the rest of a multi-file program to be
+        found as `.py` beside the binary - so most of it was never compiled.
+        Each module beside the entry is now compiled and registered under its
+        own name before its body runs, which is what makes an `import` of it
+        find the compiled one.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "helper.py").write_text(
+                "COUNT = 0\n"
+                "class Greeter:\n"
+                "    def __init__(self, who):\n"
+                "        self.who = who\n"
+                "    def hello(self):\n"
+                "        return 'hello ' + self.who\n"
+                "def bump():\n"
+                "    global COUNT\n"
+                "    COUNT += 1\n"
+                "    return COUNT\n",
+                encoding="utf-8",
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import helper\n"
+                "from helper import Greeter\n"
+                "print(Greeter('world').hello())\n"
+                "print(helper.bump(), helper.bump())\n"
+                "print(helper.COUNT, helper.__name__, __name__)\n",
+                encoding="utf-8",
+            )
+            generated, linked = python_program_to_capi_c(entry)
+            self.assertEqual(linked, ["helper"])
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            # Run it where none of the program's source can be found, which is
+            # what proves the modules travelled inside the binary. `helper.COUNT`
+            # is the part that catches a module object left holding stale values:
+            # bump() writes the slot, and the attribute has to follow.
+            (root / "helper.py").unlink()
+            (root / "program.py").unlink()
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(
+                native.stdout, b"hello world\n1 2\n2 helper __main__\n"
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_every_module_has_its_dunders(self):
+        """`if __name__ == '__main__':` is how a script says where it starts.
+
+        Without it the entry point of a program simply does not run, and
+        `os.path.abspath(__file__)` is how a program finds what sits beside it.
+        """
+
+        self._run(
+            "print(__name__)\n"
+            "print(__file__.endswith('.py'))\n"
+            "if __name__ == '__main__':\n"
+            "    print('entry point ran')\n",
+            b"__main__\nTrue\nentry point ran\n",
+        )
+
+    def test_a_compiled_function_has_a_signature(self):
+        """`inspect.signature` said "unsupported callable" for every one.
+
+        A compiled function is a builtin function object and carries no
+        signature unless its doc begins with one in the shape CPython reads
+        `__text_signature__` out of. Anything that introspects refused to work
+        with them - pywebview would not bind a single method of a compiled
+        application. Defaults read as None: the format has no spelling for an
+        arbitrary Python expression.
+        """
+
+        source = (
+            "import inspect\n"
+            "def plain(a, b=2, *rest, key=None, **kw):\n"
+            "    return a\n"
+            "class C:\n"
+            "    def method(self, x, y=1):\n"
+            "        return x\n"
+            "print(list(inspect.signature(plain).parameters))\n"
+            "print(list(inspect.signature(C().method).parameters))\n"
+            "print(inspect.ismethod(C().method))\n"
+        )
+        # The names and the binding agree with CPython exactly, which is what
+        # a caller and an introspecting framework act on.
+        self._run(
+            source,
+            b"['a', 'b', 'rest', 'key', 'kw']\n['x', 'y']\nTrue\n",
+        )
+        # What does not agree is pinned here rather than left to drift: the
+        # format has no spelling for an arbitrary Python expression, so every
+        # default reads as None.
+        self.assertIn(
+            '"plain(a, b=None, *rest, key=None, **kw)',
+            python_to_capi_c(source, "program.py"),
+        )
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's

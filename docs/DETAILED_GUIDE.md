@@ -320,6 +320,43 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**A program is more than its entry file.** Compiling only the module named on
+the command line left every other `.py` of the same program to be found as
+source beside the binary - so a three-file application was one file compiled
+and two interpreted, which is not what "compiled" should mean. Every `.py`
+beside the entry that it imports is now compiled into the same image.
+
+Each linked module gets a C name prefix, because two modules may each define a
+function or a global of the same name. Its body becomes a function of its own,
+and `main` creates the module object with `PyImport_AddModule` - which also
+registers it in `sys.modules` - *before* running that body, so an import of it
+from anywhere, including from inside itself, finds this object rather than
+going to look for a file.
+
+Its globals live in C statics, as the entry's do, and are published onto the
+module object as they are written rather than only when the body finishes.
+That matters: `helper.COUNT` read from another module has to follow a
+`global COUNT; COUNT += 1` inside `helper`, and a one-time copy would have
+answered with whatever the value was when the body ended.
+
+**Every module has `__name__` and `__file__`.** Without the first,
+`if __name__ == "__main__":` never fires and the entry point of a program
+simply does not run - the compiled binary did nothing at all. Without the
+second, `os.path.dirname(os.path.abspath(__file__))` raises, which is how most
+applications find what sits beside them. `__file__` is the path the module was
+compiled from; a compiled program has no other honest answer, since `main` in
+this tier takes no arguments and cannot see where it was run from.
+
+**A compiled function carries a signature.** `inspect.signature` answered
+"unsupported callable" for every one of them, because a builtin function object
+has no signature unless its doc begins with one in the shape CPython reads
+`__text_signature__` out of. Anything that introspects therefore refused them -
+pywebview would not bind a single method of a compiled application, reporting
+each in turn as an unsupported callable. The emitter knows every parameter name,
+so it writes that doc. Defaults read as `None` whatever they really are: the
+format has no spelling for an arbitrary Python expression, and the text is only
+ever parsed for the shape of the call.
+
 **Decorators** are `a(b(f))` applied from the bottom up, which needs nothing
 new: the function is already a value, so the decorator is a call. A decorated
 module-level `def` is compiled as a closure rather than as a C function taking
@@ -1500,7 +1537,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 69 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 70 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

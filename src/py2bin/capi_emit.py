@@ -62,6 +62,7 @@ extern void Py_IncRef(PyObject *object);
 extern void Py_DecRef(PyObject *object);
 extern int PyRun_SimpleString(const char *command);
 extern PyObject *PyImport_ImportModule(const char *name);
+extern PyObject *PyImport_AddModule(const char *name);
 extern PyObject *PyObject_GetAttrString(PyObject *object, const char *name);
 extern int PyObject_SetAttrString(PyObject *object, const char *name, PyObject *value);
 extern PyObject *PyObject_CallNoArgs(PyObject *callable);
@@ -143,6 +144,40 @@ _BINARY = {
     ast.Mod: "PyNumber_Remainder",
     ast.FloorDiv: "PyNumber_FloorDivide",
 }
+
+
+def _text_signature(name: str, arguments: ast.arguments) -> str:
+    """The doc string CPython reads `__text_signature__` out of.
+
+    A compiled function is a builtin function object, and a builtin carries no
+    signature unless its doc begins with one in this exact shape: the name, the
+    parameters in brackets, then a line of two dashes. Defaults are written as
+    `=None` whatever they really are - the text is only ever parsed for the
+    shape of the call, and an arbitrary Python expression has no spelling here.
+    """
+
+    parts: list[str] = []
+    positional = [*arguments.posonlyargs, *arguments.args]
+    required = len(positional) - len(arguments.defaults)
+    for offset, argument in enumerate(positional):
+        parts.append(
+            argument.arg if offset < required else f"{argument.arg}=None"
+        )
+        if arguments.posonlyargs and offset == len(arguments.posonlyargs) - 1:
+            parts.append("/")
+    if arguments.vararg:
+        parts.append(f"*{arguments.vararg.arg}")
+    elif arguments.kwonlyargs:
+        parts.append("*")
+    for offset, argument in enumerate(arguments.kwonlyargs):
+        parts.append(
+            argument.arg
+            if arguments.kw_defaults[offset] is None
+            else f"{argument.arg}=None"
+        )
+    if arguments.kwarg:
+        parts.append(f"**{arguments.kwarg.arg}")
+    return f"{name}({', '.join(parts)})\n--\n\n"
 
 
 def _c_bytes(data: bytes) -> str:
@@ -297,8 +332,22 @@ class CApiEmitter:
         #: Names bound at module level. They become file-scope statics so a
         #: function body can see them, which is what a Python global is.
         self.globals: set[str] = set()
+        #: Every module-level slot across every linked module, already
+        #: prefixed. `globals` holds the *current* module's bare names, which
+        #: is what the name lookups ask about; this is what render declares.
+        self.declared: set[str] = set()
         #: True while the module body itself is being written.
         self.at_module_level = False
+        #: What distinguishes one module's C names from another's when several
+        #: are linked into one image. Empty for the entry module, so a
+        #: single-module program's C reads exactly as it did.
+        self.prefix = ""
+        #: `(python name, C key)` for each module compiled alongside the entry,
+        #: in the order their bodies must run.
+        self.linked: list[tuple[str, str]] = []
+        #: The bare module-level names each linked module binds, so its module
+        #: object can be given them once its body has run.
+        self.module_globals: dict[str, set[str]] = {}
         #: The label a failing C-API call jumps to. Empty outside a `try`,
         #: where a failure ends the process instead.
         self.handlers: list[str] = []
@@ -420,6 +469,13 @@ class CApiEmitter:
             self.current.locals.append(name)
         return name
 
+    def note_global(self, name: str) -> str:
+        """Record a module-level name, for this module and for the image."""
+
+        self.globals.add(name)
+        self.declared.add(self.prefix + name)
+        return f"g_{self.prefix}{name}"
+
     def declare(self, name: str) -> str:
         """The C name for a Python local, declared on first use.
 
@@ -436,15 +492,15 @@ class CApiEmitter:
         if name in self.current.module_names:
             # Declared `global` here, so the assignment lands in the module's
             # storage and every other scope sees it.
-            self.globals.add(name)
-            return f"g_{name}"
+            self.note_global(name)
+            return f"g_{self.prefix}{name}"
         if name in self.current.parameters:
             return f"p_{name}"
         if self.at_module_level:
             # The module body's names are the program's globals, so they live
             # at file scope where a function can reach them.
-            self.globals.add(name)
-            return f"g_{name}"
+            self.note_global(name)
+            return f"g_{self.prefix}{name}"
         c_name = f"v_{name}"
         if c_name not in self.current.locals:
             self.current.locals.append(c_name)
@@ -578,7 +634,7 @@ class CApiEmitter:
         if name in self.current.module_names:
             # `global x` says this name is the module's, whatever a local of
             # the same spelling would otherwise have been.
-            return f"g_{name}"
+            return f"g_{self.prefix}{name}"
         if name in self.current.parameters:
             return f"p_{name}"
         if f"v_{name}" in self.current.locals:
@@ -586,7 +642,7 @@ class CApiEmitter:
         if name in self.current.captures:
             return f"c_{name}"
         if name in self.globals:
-            return f"g_{name}"
+            return f"g_{self.prefix}{name}"
         return None
 
     def name(self, node: ast.Name, indent: int) -> str:
@@ -1321,7 +1377,10 @@ class CApiEmitter:
         # expression exists once however many call sites there are.
         arguments.extend(["(PyObject *)0"] * (expected - len(node.args)))
         target = self.temporary()
-        self.emit(f"{target} = f_{node.func.id}({', '.join(arguments)});", indent)
+        self.emit(
+            f"{target} = f_{self.prefix}{node.func.id}({', '.join(arguments)});",
+            indent,
+        )
         for argument in arguments:
             # An omitted parameter went in as NULL, which is not a reference
             # and must not be released.
@@ -1612,7 +1671,7 @@ class CApiEmitter:
             assert self.current is not None
             for name in node.names:
                 self.current.module_names.add(name)
-                self.globals.add(name)
+                self.note_global(name)
         elif isinstance(node, ast.AnnAssign):
             # `x: int = 5` is an assignment with a note attached, and the note
             # is not something the program can observe here. `x: int` on its
@@ -1637,6 +1696,7 @@ class CApiEmitter:
             target = self.declare(node.name)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"{target} = {value};", indent)
+            self.publish(node.name, target, indent)
         else:
             raise self.fail(
                 node, f"{type(node).__name__} has no C-API translation here yet"
@@ -1674,6 +1734,7 @@ class CApiEmitter:
                 f'{target} = PyImport_ImportModule({_c_string(wanted)});', indent
             )
             self.checked(target, indent)
+            self.publish(bound, target, indent)
 
     def import_names(self, node: ast.ImportFrom, indent: int) -> None:
         """`from x import a, b` - import the module, then read the names off it.
@@ -1746,6 +1807,7 @@ class CApiEmitter:
             # growing.
             self.emit(f"if ({slot}) Py_DecRef({slot});", indent)
             self.emit(f"{slot} = {value};", indent)
+            self.publish(target.id, slot, indent)
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             self.unpack_value(target, value, indent)
@@ -1780,6 +1842,22 @@ class CApiEmitter:
             return
         raise self.fail(
             target, "only a name, an attribute or a subscript is assigned to here"
+        )
+
+    def publish(self, name: str, slot: str, indent: int) -> None:
+        """Show a linked module's global on the module object as well.
+
+        Another module reads it as an attribute, and the attribute has to
+        follow the slot or it would answer with whatever the value was when
+        the body finished. The entry module needs none of this: nothing
+        imports `__main__`.
+        """
+
+        if not self.prefix or not slot.startswith("g_"):
+            return
+        key = self.prefix[:-1]
+        self.emit(
+            f"PyObject_SetAttrString(m_{key}, {_c_string(name)}, {slot});", indent
         )
 
     def check(self, node: ast.Assert, indent: int) -> None:
@@ -1970,6 +2048,7 @@ class CApiEmitter:
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"Py_IncRef({entered});", indent)
             self.emit(f"{target} = {entered};", indent)
+            self.publish(item.optional_vars.id, target, indent)
         introduced = (
             {item.optional_vars.id} if item.optional_vars is not None else set()
         )
@@ -2240,6 +2319,7 @@ class CApiEmitter:
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"Py_IncRef({caught});", indent)
             self.emit(f"{target} = {caught};", indent)
+            self.publish(clause.name, target, indent)
         return caught
 
     def augmented(self, node: ast.AugAssign, indent: int) -> None:
@@ -2264,6 +2344,7 @@ class CApiEmitter:
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+        self.publish(node.target.id, target, indent)
 
     def augmented_place(self, node: ast.AugAssign, indent: int) -> None:
         """`xs[k] += v` and `a.b += v` - read, combine, write back.
@@ -2370,6 +2451,7 @@ class CApiEmitter:
             name = self.declare(element.id)
             self.emit(f"if ({name}) Py_DecRef({name});", indent)
             self.emit(f"{name} = {item};", indent)
+            self.publish(element.id, name, indent)
         self.emit(f"Py_DecRef({items});", indent)
 
     def expression_statement(self, node: ast.Expr, indent: int) -> None:
@@ -2803,7 +2885,7 @@ class CApiEmitter:
 
         index = len(self.method_table)
         c_name = f"_closure{index}_{label}"
-        self.method_table.append((c_name, label))
+        self.method_table.append((c_name, label, _text_signature(label, node.args)))
 
         held = self.temporary()
         self.emit(f"{held} = PyTuple_New({len(captures)});", indent)
@@ -2960,6 +3042,7 @@ class CApiEmitter:
         target = self.declare(node.name)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {made};", indent)
+        self.publish(node.name, target, indent)
 
     def write_wrapper(self, node: ast.FunctionDef) -> None:
         """A Python callable for a module-level `def`.
@@ -2984,8 +3067,10 @@ class CApiEmitter:
         )
         index = len(self.method_table)
         function = _Function(f"_value{index}_{node.name}", (), closure=True)
-        self.method_table.append((function.name, node.name))
-        self.value_functions.append((node.name, index))
+        self.method_table.append(
+            (function.name, node.name, _text_signature(node.name, node.args))
+        )
+        self.value_functions.append((self.prefix + node.name, index))
         outer = self.current
         self.current = function
         for name in parameters:
@@ -2999,7 +3084,7 @@ class CApiEmitter:
         )
         answer = self.temporary()
         passed = ", ".join(f"w_{name}" for name in parameters)
-        self.emit(f"{answer} = f_{node.name}({passed});", 1)
+        self.emit(f"{answer} = f_{self.prefix}{node.name}({passed});", 1)
         for name in parameters:
             self.emit(f"if (w_{name}) Py_DecRef(w_{name});", 1)
         self.leave(answer, 1)
@@ -3372,6 +3457,51 @@ class CApiEmitter:
     # --- assembly --------------------------------------------------------
 
     def module(self, tree: ast.Module) -> str:
+        """One module, compiled on its own. The shape a single file has."""
+
+        self.write_module(tree, entry=True, origin=str(self.path))
+        return self.render()
+
+    def program(self, modules) -> str:
+        """Several modules linked into one image.
+
+        ``modules`` is ``(python name, tree, source path)`` for each module the entry
+        imports, in the order their bodies must run, and the entry itself
+        last. Each becomes a module object registered under its own name
+        before its body runs, so an `import` of it finds the compiled one
+        rather than reading the source beside the binary.
+        """
+
+        *imported, entry_tree = modules
+        for name, tree, origin in imported:
+            key = name.replace(".", "_")
+            self.prefix = f"{key}_"
+            self.linked.append((name, key))
+            self.write_module(
+                tree, entry=False, key=key, name=name, origin=origin
+            )
+        self.prefix = ""
+        self.write_module(
+            entry_tree[1], entry=True, name="__main__", origin=entry_tree[2]
+        )
+        return self.render()
+
+    def write_module(
+        self,
+        tree: ast.Module,
+        entry: bool,
+        key: str = "",
+        name: str = "__main__",
+        origin: str = "",
+    ) -> None:
+        """Compile one module's functions, then its body."""
+
+        # Per-module state. A name is a global *of its own module*, and a
+        # function of one module is not callable by bare name from another.
+        self.globals = set()
+        self.known_functions = {}
+        self.certain_globals = set()
+
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 arguments = node.args
@@ -3403,33 +3533,48 @@ class CApiEmitter:
                 self.write_function(node)
                 self.write_wrapper(node)
 
-        entry = _Function("main", ())
-        self.current = entry
+        body = _Function("main" if entry else f"_module_{key}", ())
+        self.current = body
         self.scope = tree.body
         self.at_module_level = True
+        indent = 2 if entry else 1
+        # Every module has these, and a program notices when they are absent:
+        # `if __name__ == "__main__":` is how a script says where it starts,
+        # and `os.path.dirname(os.path.abspath(__file__))` is how it finds
+        # what sits beside it.
+        for dunder, text in (("__name__", name), ("__file__", origin)):
+            self.certain_globals.add(dunder)
+            slot = self.note_global(dunder)
+            self.emit(f"{slot} = PyUnicode_FromString({_c_string(text)});", indent)
+            self.checked(slot, indent)
+            self.publish(dunder, slot, indent)
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in self.known_functions:
                 continue
             # A `def` this could not give a fixed C shape is written here, as
             # a closure bound to its name like any other value.
-            self.statement(node, 2)
+            self.statement(node, indent)
         self.at_module_level = False
-        self.functions.append(entry)
+        if not entry:
+            nothing = self.builtin("None", 1)
+            self.leave(nothing, 1)
+            self.write_unwind(body)
+            self.module_globals[key] = set(self.globals)
+        self.functions.append(body)
         self.current = None
-        return self.render()
 
     def note_module_bindings(self, node: ast.stmt) -> None:
         """Record every name this module-level statement binds."""
 
         if isinstance(node, ast.ClassDef):
-            self.globals.add(node.name)
+            self.note_global(node.name)
             return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # The name it binds is a module name; what its body binds is not.
             # Descending would make a function's own locals look like globals,
             # which is how `total` inside one came to be read from a file-scope
             # static that nothing ever wrote.
-            self.globals.add(node.name)
+            self.note_global(node.name)
             return
         if isinstance(node, ast.AnnAssign):
             # `xs: list[float] = [...]` binds `xs` exactly as a plain
@@ -3437,7 +3582,7 @@ class CApiEmitter:
             # module body could not see the name at all, and looked for it in
             # builtins instead.
             if node.value is not None and isinstance(node.target, ast.Name):
-                self.globals.add(node.target.id)
+                self.note_global(node.target.id)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 for element in (
@@ -3446,19 +3591,19 @@ class CApiEmitter:
                     else [target]
                 ):
                     if isinstance(element, ast.Name):
-                        self.globals.add(element.id)
+                        self.note_global(element.id)
         elif isinstance(node, (ast.AugAssign, ast.For)) and isinstance(
             node.target, ast.Name
         ):
-            self.globals.add(node.target.id)
+            self.note_global(node.target.id)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 if alias.name != "*":
-                    self.globals.add(alias.asname or alias.name.split(".")[0])
+                    self.note_global(alias.asname or alias.name.split(".")[0])
         elif isinstance(node, ast.With):
             for item in node.items:
                 if isinstance(item.optional_vars, ast.Name):
-                    self.globals.add(item.optional_vars.id)
+                    self.note_global(item.optional_vars.id)
         # A name bound inside a module-level if/for/while/try is still global.
         for field in ("body", "orelse", "finalbody"):
             for inner in getattr(node, field, []) or []:
@@ -3473,7 +3618,9 @@ class CApiEmitter:
             for argument in (*node.args.posonlyargs, *node.args.args)
         )
         defaults = node.args.defaults
-        function = _Function(node.name, parameters, len(defaults))
+        # The C name carries the module's prefix, because two modules linked
+        # into one image may each define a function of the same name.
+        function = _Function(self.prefix + node.name, parameters, len(defaults))
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))
@@ -3550,8 +3697,10 @@ class CApiEmitter:
             out.append(
                 f"static struct PyMethodDef _py2bin_methods[{len(self.method_table)}];"
             )
-        for name in sorted(self.globals):
+        for name in sorted(self.declared):
             out.append(f"static PyObject *g_{name} = 0;")
+        for _name, key in self.linked:
+            out.append(f"static PyObject *m_{key} = 0;")
         if self.needs_unbound:
             out.append(_UNBOUND_HELPER)
         out.append("")
@@ -3575,7 +3724,7 @@ class CApiEmitter:
         # with a UnicodeEncodeError that has nothing to do with the program.
         setup = "import sys; sys.stdout.reconfigure(encoding='utf-8')"
         out.append(f"    PyRun_SimpleString({_c_string(setup)});")
-        for index, (c_name, label) in enumerate(self.method_table):
+        for index, (c_name, label, signature) in enumerate(self.method_table):
             out.append(f"    _py2bin_methods[{index}].ml_name = {_c_string(label)};")
             out.append(f"    _py2bin_methods[{index}].ml_meth = f_{c_name};")
             # METH_VARARGS | METH_KEYWORDS: a tuple and a dict. Keywords are
@@ -3583,12 +3732,42 @@ class CApiEmitter:
             # parameter be passed by name and a function that quietly ignored
             # that would answer `show(1, c=9)` with c's default.
             out.append(f"    _py2bin_methods[{index}].ml_flags = 3;")
-            out.append(f"    _py2bin_methods[{index}].ml_doc = 0;")
+            # The signature goes in the doc slot, in the shape CPython reads
+            # `__text_signature__` out of. Without it `inspect.signature` says
+            # "unsupported callable" for every compiled function, and anything
+            # that introspects - pywebview binding a JS API, and much else -
+            # refuses to work with them.
+            out.append(
+                f"    _py2bin_methods[{index}].ml_doc = {_c_string(signature)};"
+            )
         for name, index in self.value_functions:
             out.append(
                 f"    g_{name} = PyCFunction_New(&_py2bin_methods[{index}], 0);"
             )
             out.append(f"    if (!g_{name}) {{ PyErr_Print(); exit(1); }}")
+        for name, key in self.linked:
+            # Registered under its own name *before* the body runs, so an
+            # import of it - even from inside its own body - finds this object
+            # rather than going to look for a file beside the binary.
+            out.append(
+                f"    m_{key} = PyImport_AddModule({_c_string(name)});"
+            )
+            out.append(
+                f"    if (!m_{key}) {{ PyErr_Print(); Py_Finalize(); exit(1); }}"
+            )
+            # PyImport_AddModule borrows; sys.modules owns it, and this holds
+            # its own reference for as long as the program runs.
+            out.append(f"    Py_IncRef(m_{key});")
+        for name, key in self.linked:
+            out.append(f"    if (!f__module_{key}()) {{")
+            out.append("        PyErr_Print(); Py_Finalize(); exit(1);")
+            out.append("    }")
+            for bound in sorted(self.module_globals.get(key, ())):
+                slot = f"g_{key}_{bound}"
+                out.append(
+                    f"    if ({slot}) PyObject_SetAttrString("
+                    f"m_{key}, {_c_string(bound)}, {slot});"
+                )
         out.append("    {")
         out.extend(self.declarations(entry, 2))
         out.extend(entry.body)
@@ -3608,6 +3787,64 @@ class CApiEmitter:
             else:
                 lines.append(f"{pad}PyObject *{name} = 0;")
         return lines
+
+
+def local_modules(entry: Path) -> list[tuple[str, Path]]:
+    """The program's own modules, in the order their bodies must run.
+
+    A module is "the program's own" when a `.py` of that name sits beside the
+    entry. Everything else - the standard library, installed packages - is left
+    to the interpreter, which is the whole point of this tier. Depth first, so
+    a module is listed after anything it imports.
+    """
+
+    root = entry.parent
+    ordered: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+
+    def visit(path: Path) -> None:
+        for name in sorted(imported_names(path)):
+            candidate = root / f"{name}.py"
+            if name in seen or not candidate.exists() or candidate == entry:
+                continue
+            seen.add(name)
+            # Its own imports first: a module's body may use what it imported.
+            visit(candidate)
+            ordered.append((name, candidate))
+
+    visit(entry)
+    return ordered
+
+
+def imported_names(path: Path) -> set[str]:
+    """The top-level module names this file imports."""
+
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            found.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            found.add(node.module.split(".")[0])
+    return found
+
+
+def python_program_to_capi_c(entry: Path) -> tuple[str, list[str]]:
+    """Translate a program - the entry and the modules beside it - into one C.
+
+    Compiling only the entry left its own imports to be read as source beside
+    the binary, so most of a multi-file program was not compiled at all.
+    """
+
+    modules = local_modules(entry)
+    emitter = CApiEmitter(entry)
+    trees = [
+        (name, ast.parse(path.read_text(encoding="utf-8")), str(path))
+        for name, path in modules
+    ]
+    trees.append(
+        (entry.stem, ast.parse(entry.read_text(encoding="utf-8")), str(entry))
+    )
+    return emitter.program(trees), [name for name, _ in modules]
 
 
 def python_to_capi_c(source: str, path: Path | str = "<string>") -> str:

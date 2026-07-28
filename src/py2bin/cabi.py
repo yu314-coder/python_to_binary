@@ -57,7 +57,7 @@ __all__ = [
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
-    "PyLong_FromString", "PyUnicode_DecodeUTF8",
+    "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -826,6 +826,7 @@ _PyLong_FromString = _bind(
 _PyUnicode_DecodeUTF8 = _bind(
     "PyUnicode_DecodeUTF8", _HANDLE, ctypes.c_char_p, _SSIZE, _HANDLE
 )
+_PyImport_AddModule = _bind("PyImport_AddModule", _HANDLE, ctypes.c_char_p)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1035,6 +1036,17 @@ def PyNumber_Positive(value: int) -> int:
     """`+x`."""
 
     return _handle(_PyNumber_Positive(value))
+
+
+def PyImport_AddModule(name: bytes) -> int:
+    """The module of this name, created and registered if it is not there.
+
+    It *borrows* the reference - `sys.modules` owns it. Registering is the
+    point: an `import` of that name afterwards finds this object rather than
+    going to look for a file.
+    """
+
+    return _handle(_PyImport_AddModule(name))
 
 
 def PyUnicode_DecodeUTF8(text: bytes, length: int, errors: int) -> int:
