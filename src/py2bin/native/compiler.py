@@ -201,6 +201,7 @@ def compile_native_module(
     app: bool = False,
     app_name: str | None = None,
     icon: Path | None = None,
+    python_dylib: str | None = None,
 ) -> NativeResult:
     """Write a verified py2bin IR module with the handwritten binary backends."""
 
@@ -217,7 +218,7 @@ def compile_native_module(
     if output.exists() and not clean:
         raise FileExistsError(f"output already exists: {output} (use --clean)")
     return _emit_native_module(
-        entry, module, output, target, app, app_name, icon
+        entry, module, output, target, app, app_name, icon, python_dylib
     )
 
 
@@ -284,6 +285,7 @@ def _emit_native_module(
     app: bool,
     app_name: str | None = None,
     icon: Path | None = None,
+    python_dylib: str | None = None,
 ) -> NativeResult:
     if module.functions and target not in CALL_CAPABLE_TARGETS:
         # The call ABI (frame with a saved link register, arguments in the
@@ -347,11 +349,23 @@ def _emit_native_module(
             # two-level namespace ordinal.
             from ..cabi import symbol_library
 
+            from ..cabi import _cpython_library
+
+            interpreter = _cpython_library()
             symbol_libraries = {}
             for _offset, symbol in externs:
                 library = symbol_library(symbol)
-                if library is not None:
-                    symbol_libraries[symbol] = library
+                if library is None:
+                    continue
+                if python_dylib is not None and library == interpreter:
+                    # The build machine's absolute path is what makes an
+                    # artifact refuse to start anywhere else: dyld resolves
+                    # LC_LOAD_DYLIB before a line of the program runs, so a
+                    # Mac without that exact interpreter at that exact path
+                    # gets no error from the program, only a refusal to
+                    # launch. A path relative to the executable travels.
+                    library = python_dylib
+                symbol_libraries[symbol] = library
             from ..cabi import OBJC_FRAMEWORKS, _OBJC_SYMBOLS
 
             # A framework has to be loaded for its classes to exist, even when

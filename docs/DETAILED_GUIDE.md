@@ -320,6 +320,29 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**Carrying the interpreter, so the bundle starts on another Mac.** A compiled
+artifact names its interpreter in an `LC_LOAD_DYLIB`, and dyld resolves that
+before a line of the program runs. The build machine's absolute path is
+therefore a refusal to launch anywhere else - not an error from the program,
+which never starts, but a dyld message about a library that is not there.
+`--embed-python` compiles the reference as
+`@executable_path/../Frameworks/Python.framework/Versions/X.Y/Python` and puts
+the interpreter there.
+
+Two details decide whether it works:
+
+- *The framework layout, not the bare library.* The signature on that library
+  seals its neighbouring `Resources/Info.plist`; a dylib lifted out on its own
+  has identical bytes and is still refused, with "invalid Info.plist (plist or
+  signature have been modified)". Copying the version directory keeps the file
+  the seal names.
+- *The standard library goes to `Contents/lib/pythonX.Y`*, not inside the
+  framework, because CPython finds its prefix by walking up from the executable
+  looking for `lib/pythonX.Y/os.py` - and from `Contents/MacOS` the first place
+  it looks is `Contents`. A test moves such a bundle to a directory the build
+  never heard of, runs it from `/` with no PYTHONPATH, and requires `sys.prefix`
+  to be inside the bundle.
+
 **A compiled artifact finds itself.** `__file__` was the path the module was
 compiled from, so `os.path.dirname(__file__)` named a directory on the machine
 that built it - a bundle that was moved looked for its own files somewhere that

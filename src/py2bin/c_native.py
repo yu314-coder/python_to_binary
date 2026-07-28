@@ -1262,6 +1262,7 @@ def compile_c_native(
     app: bool = False,
     app_name: str | None = None,
     icon: Path | None = None,
+    python_dylib: str | None = None,
 ) -> NativeResult:
     """Compile a C file to machine code with only py2bin's own implementation.
 
@@ -1296,6 +1297,7 @@ def compile_c_native(
         app=app,
         app_name=app_name,
         icon=icon,
+        python_dylib=python_dylib,
     )
 
 

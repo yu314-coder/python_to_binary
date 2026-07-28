@@ -174,6 +174,13 @@ PYTHONPATH=src python3 -m py2bin compile-capi app.py \
   --target darwin-arm64 --app --name "My App" --icon icon.icns \
   --site ~/venvs/myapp/lib/python3.12/site-packages -o MyApp.app
 
+#    --embed-python carries the interpreter inside the bundle and names it
+#    relative to the executable, so the .app starts on a Mac that does not
+#    have this exact CPython installed.
+PYTHONPATH=src python3 -m py2bin compile-capi app.py \
+  --target darwin-arm64 --app --name "My App" --icon icon.icns \
+  --embed-python --site Resources/site-packages -o MyApp.app
+
 # 2. Python that imports vetted C-API names from py2bin.cabi.
 PYTHONPATH=src python3 -m py2bin compile program.py \
   --target darwin-arm64 -o program.bin

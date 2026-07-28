@@ -79,6 +79,75 @@ _WEB_ASSET_KINDS = {
 }
 
 
+def embed_cpython_in_app(bundle: Path) -> int:
+    """Put this CPython inside a compiled ``.app`` so the bundle can travel.
+
+    A compiled artifact names its interpreter in an ``LC_LOAD_DYLIB``, and dyld
+    resolves that before a line of the program runs - so an absolute path to
+    the build machine's CPython is a refusal to launch anywhere else, with no
+    message from the program at all. Compiled with
+    ``@executable_path/../Frameworks/Python``, the bundle needs that file to be
+    there, and the interpreter needs its standard library beside it.
+
+    The standard library goes to ``Contents/lib/python3.X`` rather than inside
+    the framework, because CPython finds its prefix by walking up from the
+    executable looking for ``lib/pythonX.Y/os.py`` - and from
+    ``Contents/MacOS`` the first place it looks up is ``Contents``.
+    """
+
+    import shutil
+    import sysconfig
+
+    from .cabi import _cpython_library
+
+    dylib = Path(_cpython_library())
+    if not dylib.is_file():
+        raise FileNotFoundError(f"no CPython shared library at {dylib}")
+    frameworks = bundle / "Contents" / "Frameworks"
+    frameworks.mkdir(parents=True, exist_ok=True)
+    version_directory = dylib.parent
+    # The framework *layout*, not the bare library: the signature on that
+    # library seals its neighbouring Resources/Info.plist, so a dylib lifted
+    # out on its own is reported as modified and dyld refuses it. The bytes are
+    # identical either way - what is missing is the file the seal names.
+    carried_version = (
+        frameworks / "Python.framework" / "Versions" / version_directory.name
+    )
+    if carried_version.exists():
+        shutil.rmtree(carried_version)
+    carried_version.mkdir(parents=True)
+    shutil.copy2(dylib, carried_version / dylib.name)
+    resources = version_directory / "Resources"
+    if resources.is_dir():
+        shutil.copytree(
+            resources,
+            carried_version / "Resources",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            symlinks=True,
+        )
+
+    version = sysconfig.get_config_var("py_version_short")
+    standard_library = Path(sysconfig.get_path("stdlib"))
+    destination = bundle / "Contents" / "lib" / f"python{version}"
+    if destination.exists():
+        shutil.rmtree(destination)
+    # site-packages is the application's business, not the interpreter's: it
+    # is what --site names, and copying it here would bury a second copy.
+    shutil.copytree(
+        standard_library,
+        destination,
+        ignore=shutil.ignore_patterns(
+            "site-packages", "test", "tests", "idlelib", "turtledemo",
+            "__pycache__", "*.pyc",
+        ),
+    )
+    return sum(
+        item.stat().st_size
+        for item in (*carried_version.rglob("*"), *destination.rglob("*"))
+        if item.is_file()
+    )
+
+
 def _required_suffix(path: Path, suffix: str) -> Path:
     """Append a required artifact suffix without discarding dotted names."""
 

@@ -191,6 +191,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     capi_parser.add_argument("--name", help="application display name")
     capi_parser.add_argument(
+        "--embed-python",
+        action="store_true",
+        help=(
+            "carry the interpreter inside the .app and load it by a path "
+            "relative to the executable, so the bundle starts on a Mac that "
+            "does not have this exact CPython installed"
+        ),
+    )
+    capi_parser.add_argument(
         "--site",
         action="append",
         default=[],
@@ -553,6 +562,21 @@ def _wheels_from_args(args) -> tuple[Path, ...]:
     return tuple(unique)
 
 
+def _embedded_python_path() -> str:
+    """Where the carried interpreter sits, relative to the executable."""
+
+    import sysconfig
+
+    from .cabi import _cpython_library
+
+    dylib = Path(_cpython_library())
+    version = dylib.parent.name
+    return (
+        f"@executable_path/../Frameworks/Python.framework/Versions/"
+        f"{version}/{dylib.name}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "targets":
@@ -907,6 +931,8 @@ def main(argv: list[str] | None = None) -> int:
             output = args.output
             if args.app and output.suffix != ".app":
                 output = output.with_suffix(".app")
+            if args.embed_python and not args.app:
+                parser.error("--embed-python needs --app: it fills the bundle")
             artifact = compile_c_native(
                 source,
                 output,
@@ -915,7 +941,19 @@ def main(argv: list[str] | None = None) -> int:
                 app=args.app,
                 app_name=args.name,
                 icon=args.icon,
+                python_dylib=(
+                    _embedded_python_path() if args.embed_python else None
+                ),
             )
+            if args.embed_python:
+                from .freezer import embed_cpython_in_app
+
+                carried = embed_cpython_in_app(output)
+                print(
+                    f"carried the interpreter into the bundle "
+                    f"({carried} bytes)",
+                    file=sys.stderr,
+                )
             print(
                 f"compiled {entry} through the CPython C API to "
                 f"{artifact.artifact} ({artifact.bytes} bytes, C at {source})"

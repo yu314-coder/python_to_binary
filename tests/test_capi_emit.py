@@ -1718,6 +1718,81 @@ class CApiEmitTests(unittest.TestCase):
             )
             self.assertEqual(ran.stdout, b"carried along\nTrue\nTrue\n")
 
+    def test_an_embedded_interpreter_makes_the_bundle_portable(self):
+        """The interpreter inside the bundle, named relative to the executable.
+
+        A compiled artifact names its interpreter in an LC_LOAD_DYLIB, and dyld
+        resolves that before a line of the program runs - so the build
+        machine's absolute path is a refusal to launch anywhere else, with no
+        message from the program at all.
+
+        The framework *layout* has to be carried, not the bare library: the
+        signature on that library seals its neighbouring Resources/Info.plist,
+        and a dylib lifted out on its own is reported as modified.
+        """
+
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("the C-API path is darwin-arm64 only")
+        from py2bin.c_native import compile_c_native
+        from py2bin.cli import _embedded_python_path
+        from py2bin.freezer import embed_cpython_in_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(
+                "import json, sys\n"
+                "print(json.dumps({'ok': True}))\n"
+                "print(sys.prefix)\n",
+                encoding="utf-8",
+            )
+            source = root / "program.c"
+            source.write_text(
+                python_to_capi_c(entry.read_text(), str(entry)),
+                encoding="utf-8",
+                newline="\n",
+            )
+            bundle = root / "Program.app"
+            compile_c_native(
+                source,
+                bundle,
+                target="darwin-arm64",
+                clean=True,
+                app=True,
+                app_name="Program",
+                python_dylib=_embedded_python_path(),
+            )
+            embed_cpython_in_app(bundle)
+
+            executable = bundle / "Contents" / "MacOS" / "Program"
+            loaded = subprocess.run(
+                ["otool", "-L", str(executable)], capture_output=True, text=True
+            ).stdout
+            self.assertIn("@executable_path/../Frameworks/Python.framework", loaded)
+            self.assertNotIn("/Library/Frameworks/Python.framework", loaded)
+
+            # Somewhere the build never heard of, with nothing helping it.
+            moved = root / "elsewhere"
+            moved.mkdir()
+            shutil.copytree(bundle, moved / "Program.app", symlinks=True)
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "PYTHONPATH"
+            }
+            ran = subprocess.run(
+                [str(moved / "Program.app" / "Contents" / "MacOS" / "Program")],
+                capture_output=True,
+                cwd="/",
+                env=environment,
+            )
+            lines = ran.stdout.decode().splitlines()
+            self.assertEqual(lines[0], '{"ok": true}')
+            # The standard library it used is the one inside the bundle.
+            self.assertTrue(
+                lines[1].endswith("Program.app/Contents"), lines[1]
+            )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen
