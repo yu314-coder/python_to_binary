@@ -604,7 +604,7 @@ def _embedded_python_path() -> str:
 
     import sysconfig
 
-    from .cabi import _cpython_library
+    from .cabi_tables import _cpython_library
 
     dylib = Path(_cpython_library())
     version = dylib.parent.name

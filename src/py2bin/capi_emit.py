@@ -55,17 +55,15 @@ def _shadowed_builtins(tree: ast.Module) -> set[str]:
             bound.add(node.id)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             bound.add(node.name)
+        elif isinstance(node, ast.arguments):
+            # A parameter named `range` shadows the builtin for its whole
+            # body, and `ast.walk` reaches every parameter list there is.
             bound.update(
                 argument.arg
                 for argument in (
-                    *getattr(node, "args", ast.arguments(
-                        posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
-                        defaults=[],
-                    )).posonlyargs,
-                    *getattr(node, "args", ast.arguments(
-                        posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
-                        defaults=[],
-                    )).args,
+                    *node.posonlyargs, *node.args, *node.kwonlyargs,
+                    *([node.vararg] if node.vararg else []),
+                    *([node.kwarg] if node.kwarg else []),
                 )
             )
         elif isinstance(node, (ast.Import, ast.ImportFrom)):

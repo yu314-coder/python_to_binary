@@ -1,4 +1,5 @@
 import ast
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -126,6 +127,51 @@ class NoExternalToolchainTests(unittest.TestCase):
                             f"{source.relative_to(root)}:{node.lineno}: {node.value!r}"
                         )
         self.assertEqual(offenders, [], "an external toolchain name is used as a value")
+
+    def test_compiling_needs_nothing_but_python(self):
+        """Python in, machine code out, with no FFI and no child process.
+
+        The point of the whole project is that a build asks for an interpreter
+        and nothing else. `ctypes` is the interesting one to keep out: it is
+        stdlib, so it would not fail the import checks above, but it pulls in
+        `ctypes.util` and through it `subprocess`, and there are Pythons - the
+        one on a phone, for instance - where a subprocess is not something a
+        program may have. So the check is not "does it import" but "what did
+        importing it drag in", which only a fresh interpreter can answer.
+        """
+
+        import subprocess
+        import sys
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            probe = (
+                "import sys, pathlib\n"
+                "from py2bin.capi_emit import python_to_capi_c\n"
+                "from py2bin.c_native import compile_c_native\n"
+                f"root = pathlib.Path({directory!r})\n"
+                "source = 'def f():\\n    n = 0\\n"
+                "    for i in range(5):\\n        n = n + i\\n"
+                "    return n\\nprint(f())\\n'\n"
+                "(root / 'p.c').write_text("
+                "python_to_capi_c(source, str(root / 'p.py')))\n"
+                "compile_c_native(root / 'p.c', root / 'p.bin', "
+                "target='darwin-arm64', clean=True)\n"
+                "print(sorted(name for name in sys.modules "
+                "if name.split('.')[0] in {'ctypes', '_ctypes', 'subprocess'}))\n"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(
+                Path(__file__).resolve().parents[1] / "src"
+            )
+            finished = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(finished.stdout.strip(), "[]", finished.stdout)
 
 
 if __name__ == "__main__":

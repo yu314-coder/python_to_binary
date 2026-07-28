@@ -627,6 +627,16 @@ them. That is compatibility packaging, not native translation.
 Same machine (arm64 macOS), same CPython 3.14, same source. Nuitka 2.x with
 `--standalone`, driving Apple's clang; this driving its own C compiler.
 
+Run time, median of 5 runs, seconds:
+
+| | this | CPython | Nuitka |
+|---|---|---|---|
+| integer arithmetic | **0.054** | 0.089 | 0.098 |
+| `while` loop | **0.048** | 0.071 | 0.046 |
+| nested loops | **0.023** | 0.037 | 0.043 |
+| function calls | 0.069 | 0.024 | **0.021** |
+| string building | 0.026 | 0.011 | **0.010** |
+
 Startup, `print("x")`, median of 13 runs:
 
 | | startup | on disk |
@@ -636,43 +646,60 @@ Startup, `print("x")`, median of 13 runs:
 | Nuitka `--standalone` | 17.1 ms | 15 MB |
 
 A `compile-capi` binary links the interpreter it was built against and starts
-by calling `Py_Initialize`. It skips the interpreter's own startup path -
-scanning `sys.path`, finding and unmarshalling `__main__` - which is what buys
-the 3.6 ms over CPython. Nuitka's standalone bundle pays to bootstrap its own
-tree first.
+by calling `Py_Initialize`, skipping the interpreter's own startup path -
+scanning `sys.path`, finding and unmarshalling `__main__`. Nuitka's standalone
+bundle pays to bootstrap its own tree first.
 
-Run time, median of 5 runs, seconds:
+**Loops are faster than the interpreter; calls are not.** The reason is worth
+stating rather than hiding, because it explains both halves.
 
-| | arithmetic | calls | strings |
-|---|---|---|---|
-| this, `compile-capi` | 0.140 | 0.067 | 0.026 |
-| CPython | 0.085 | 0.024 | 0.011 |
-| Nuitka | 0.098 | 0.021 | 0.010 |
+Since 3.11 CPython does not run the bytecode you wrote: it rewrites hot
+instructions into specialised forms, so a `+` between two ints becomes an add
+on two machine words with a type guard and never reaches `PyNumber_Add`.
+Emitting a call to the generic entry point for every operation therefore
+produces exactly the code the interpreter has learned to *avoid* - which is why
+this tier was once 0.140 s against the interpreter's 0.089 on the first row of
+that table.
 
-**This tier is slower than the interpreter it compiles for, and the reason is
-worth stating rather than hiding.** Since 3.11 CPython does not run the
-bytecode you wrote; it rewrites hot instructions into specialised forms. A
-`+` between two ints becomes an add on two machine words with a type guard,
-never reaching `PyNumber_Add`. Compiling each operation to its generic C API
-entry point produces exactly the code the interpreter has learned to *avoid*.
-Nuitka loses the same way on arithmetic and wins on calls, where it can bypass
-the frame setup a Python call needs.
+So it now does what CPython does. A local the analysis picks out is held as a
+machine integer, in a register, and arithmetic over such names is emitted twice:
+once as machine instructions guarded on a flag, once as the C-API calls it
+always was. Only the second arm can produce an integer wider than the word, so
+every operation that can leave 64 bits carries the check that says it did and
+falls back rather than answering wrongly - `3 ** 200` compiled this way is
+still exact. `for i in range(...)` counts in a register, with one copy of the
+loop body and a branch inside it rather than two loops, so the binary does not
+grow in proportion to how much this helped. It grew 2%.
 
-So the honest summary of what compiling buys here is: a single file that starts
-faster and carries no source, not a faster loop. Making the loop faster means
-type inference and unboxing - emitting `long long` arithmetic with a guard,
-the way the native `compile` tier already does - not more C API calls.
+Calls still lose, and will until there is a calling convention that passes a
+machine integer as a machine integer. Today an argument is boxed at the call
+and unboxed inside, which costs two allocations where the interpreter's
+specialised call costs none.
 
 A whole application, manim_app (10,100 lines, pywebview + PIL + pyobjc):
 
 | | py2bin | Nuitka |
 |---|---|---|
-| main binary | **9.0 MB** | 29.6 MB |
+| main binary | **9.2 MB** | 29.6 MB |
 | whole `.app` | 80 MB | 74 MB |
 
 The binary is a third the size because Nuitka compiles every module it reaches,
 including the third-party tree, while this compiles the program and ships its
 dependencies as bytecode. That trade runs the other way for the bundle total.
+
+## Compiling asks for an interpreter and nothing else
+
+There is no `import ctypes` anywhere on the path from Python source to machine
+code, which a test asserts by compiling a program in a fresh interpreter and
+listing what got loaded. `ctypes` is stdlib and so would pass an
+imports-only-the-standard-library check, but it pulls in `ctypes.util` and
+through it `subprocess` - and there are Pythons, the one on a phone among them,
+where a subprocess is not something a program may have.
+
+`py2bin.cabi` does use `ctypes`, because calling a C-API entry point from
+Python is what it is for. What the compiler needs from it is only the table
+saying which library each symbol lives in, and that table lives in
+`py2bin.cabi_tables`, which imports nothing at all.
 
 ## Claims audit
 

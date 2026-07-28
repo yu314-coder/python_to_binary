@@ -347,9 +347,11 @@ def _emit_native_module(
             # always loaded; any other library (for example the CPython
             # runtime) is added as a further LC_LOAD_DYLIB with its own
             # two-level namespace ordinal.
-            from ..cabi import symbol_library
-
-            from ..cabi import _cpython_library
+            # The tables, not `cabi` itself: knowing which library a symbol
+            # lives in is a lookup, and going through the module that calls
+            # them would pull `ctypes` - and with it `subprocess` - into a
+            # build that needs neither.
+            from ..cabi_tables import _cpython_library, symbol_library
 
             interpreter = _cpython_library()
             symbol_libraries = {}
@@ -366,7 +368,7 @@ def _emit_native_module(
                     # launch. A path relative to the executable travels.
                     library = python_dylib
                 symbol_libraries[symbol] = library
-            from ..cabi import OBJC_FRAMEWORKS, _OBJC_SYMBOLS
+            from ..cabi_tables import OBJC_FRAMEWORKS, _OBJC_SYMBOLS
 
             # A framework has to be loaded for its classes to exist, even when
             # no symbol is taken from it directly: the runtime looks classes up

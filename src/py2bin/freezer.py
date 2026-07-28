@@ -378,7 +378,7 @@ def embed_cpython_in_app(bundle: Path) -> int:
     import shutil
     import sysconfig
 
-    from .cabi import _cpython_library
+    from .cabi_tables import _cpython_library
 
     dylib = Path(_cpython_library())
     if not dylib.is_file():
