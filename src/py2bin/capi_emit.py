@@ -76,6 +76,8 @@ extern int PyDict_SetItem(PyObject *mapping, PyObject *key, PyObject *value);
 extern PyObject *PyTuple_Pack(long long length, PyObject *a, PyObject *b);
 extern int PySequence_Contains(PyObject *container, PyObject *value);
 extern int PyErr_ExceptionMatches(PyObject *exception);
+extern void PyErr_SetObject(PyObject *exception, PyObject *value);
+extern PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
 extern void PyErr_Clear(void);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
@@ -230,6 +232,8 @@ class CApiEmitter:
             return self.subscript(node, indent)
         if isinstance(node, ast.UnaryOp):
             return self.unary(node, indent)
+        if isinstance(node, ast.IfExp):
+            return self.conditional_expression(node, indent)
         if isinstance(node, ast.JoinedStr):
             return self.joined(node, indent)
         if isinstance(node, ast.BoolOp):
@@ -308,6 +312,8 @@ class CApiEmitter:
             raise self.fail(node, "a comparison chain is not translated here yet")
         if isinstance(node.ops[0], (ast.In, ast.NotIn)):
             return self.membership(node, indent)
+        if isinstance(node.ops[0], (ast.Is, ast.IsNot)):
+            return self.identity(node, indent)
         operation = _COMPARISONS.get(type(node.ops[0]))
         if operation is None:
             raise self.fail(node, f"{type(node.ops[0]).__name__} is not translated here yet")
@@ -320,6 +326,24 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({left});", indent)
         self.emit(f"Py_DecRef({right});", indent)
         return self.checked(target, indent)
+
+    def conditional_expression(self, node: ast.IfExp, indent: int) -> str:
+        """`a if c else b` - a real branch, so only one arm is evaluated."""
+
+        decision = self.temporary_flag()
+        test = self.expression(node.test, indent)
+        self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
+        self.emit(f"Py_DecRef({test});", indent)
+        self.emit(f"if ({decision} < 0) {{ PyErr_Print(); exit(1); }}", indent)
+        target = self.temporary()
+        self.emit(f"if ({decision}) {{", indent)
+        taken = self.expression(node.body, indent + 1)
+        self.emit(f"    {target} = {taken};", indent)
+        self.emit("} else {", indent)
+        other = self.expression(node.orelse, indent + 1)
+        self.emit(f"    {target} = {other};", indent)
+        self.emit("}", indent)
+        return target
 
     def joined(self, node: ast.JoinedStr, indent: int) -> str:
         """An f-string: each piece rendered, then joined by concatenation.
@@ -422,14 +446,34 @@ class CApiEmitter:
         """`xs[k]` - the object protocol, so a list, a dict and a string all
         work without any of them being known about here."""
 
-        if isinstance(node.slice, ast.Slice):
-            raise self.fail(node, "a slice is not translated here yet")
         container = self.expression(node.value, indent)
-        key = self.expression(node.slice, indent)
+        key = (
+            self.slice_object(node.slice, indent)
+            if isinstance(node.slice, ast.Slice)
+            else self.expression(node.slice, indent)
+        )
         target = self.temporary()
         self.emit(f"{target} = PyObject_GetItem({container}, {key});", indent)
         self.emit(f"Py_DecRef({container});", indent)
         self.emit(f"Py_DecRef({key});", indent)
+        return self.checked(target, indent)
+
+    def slice_object(self, node: ast.Slice, indent: int) -> str:
+        """`a:b:c` as the slice object the subscript protocol expects."""
+
+        parts = []
+        for piece in (node.lower, node.upper, node.step):
+            parts.append(
+                self.builtin("None", indent)
+                if piece is None
+                else self.expression(piece, indent)
+            )
+        target = self.temporary()
+        self.emit(
+            f"{target} = PySlice_New({parts[0]}, {parts[1]}, {parts[2]});", indent
+        )
+        for part in parts:
+            self.emit(f"Py_DecRef({part});", indent)
         return self.checked(target, indent)
 
     def list_literal(self, node: ast.List, indent: int) -> str:
@@ -509,6 +553,32 @@ class CApiEmitter:
             indent,
         )
         self.emit(f"Py_DecRef({value});", indent)
+        return self.checked(target, indent)
+
+    def identity(self, node: ast.Compare, indent: int) -> str:
+        """`a is b` - the same object, which is the same pointer.
+
+        No C-API call is needed or wanted: identity is what the pointers say,
+        and asking RichCompare would answer a different question.
+        """
+
+        left = self.expression(node.left, indent)
+        right = self.expression(node.comparators[0], indent)
+        decision = self.temporary_flag()
+        operator = "==" if isinstance(node.ops[0], ast.Is) else "!=";
+        self.emit(f"{decision} = ({left} {operator} {right});", indent)
+        self.emit(f"Py_DecRef({left});", indent)
+        self.emit(f"Py_DecRef({right});", indent)
+        target = self.temporary()
+        self.emit(f"if ({decision}) {{", indent)
+        self.emit(
+            f'    {target} = PyObject_GetAttrString(_py2bin_builtins, "True");', indent
+        )
+        self.emit("} else {", indent)
+        self.emit(
+            f'    {target} = PyObject_GetAttrString(_py2bin_builtins, "False");', indent
+        )
+        self.emit("}", indent)
         return self.checked(target, indent)
 
     def membership(self, node: ast.Compare, indent: int) -> str:
@@ -701,6 +771,15 @@ class CApiEmitter:
             self.import_module(node, indent)
         elif isinstance(node, ast.ImportFrom):
             self.import_names(node, indent)
+        elif isinstance(node, ast.Raise):
+            self.throw(node, indent)
+        elif isinstance(node, ast.With):
+            self.with_block(node, indent)
+        elif isinstance(node, ast.Global):
+            # Every name lives in one C scope per function here, and the module
+            # body is its own function, so a `global` declaration names storage
+            # that is already shared. Nothing to emit.
+            pass
         elif isinstance(node, ast.Try):
             self.guarded(node, indent)
         elif isinstance(node, ast.AugAssign):
@@ -795,6 +874,100 @@ class CApiEmitter:
         # before it is overwritten, which is what keeps a loop from growing.
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+
+    def throw(self, node: ast.Raise, indent: int) -> None:
+        """`raise E(...)` - set the exception, then take the failure path.
+
+        Setting it is all the C API does; unwinding is the caller's business,
+        and here that is the same `goto` a failing call takes.
+        """
+
+        if node.cause is not None:
+            raise self.fail(node, "`raise ... from ...` is not translated here yet")
+        if node.exc is None:
+            raise self.fail(node, "a bare re-raise is not translated here yet")
+        value = self.expression(node.exc, indent)
+        # PyErr_SetObject wants the class as well as the value, and a NULL
+        # there sets nothing at all - the raise then vanished without a trace.
+        # `type(value)` is the class whether the source named a class or built
+        # an instance, so it answers both shapes.
+        kind = self.builtin("type", indent)
+        classified = self.temporary()
+        self.emit(f"{classified} = PyObject_CallOneArg({kind}, {value});", indent)
+        self.emit(f"Py_DecRef({kind});", indent)
+        self.checked(classified, indent)
+        self.emit(f"PyErr_SetObject({classified}, {value});", indent)
+        self.emit(f"Py_DecRef({classified});", indent)
+        self.emit(f"Py_DecRef({value});", indent)
+        if self.handlers:
+            self.emit(f"goto {self.handlers[-1]};", indent)
+        else:
+            self.emit("PyErr_Print(); exit(1);", indent)
+
+    def with_block(self, node: ast.With, indent: int) -> None:
+        """`with a as b:` - __enter__, the body, then __exit__.
+
+        __exit__ is called on the way out of the body. It is *not* called when
+        the body raises, because that needs the exception threaded into the
+        three arguments it takes, and pretending otherwise would silently skip
+        a close. A body that raises inside a `with` is refused rather than
+        mishandled.
+        """
+
+        if len(node.items) > 1:
+            inner = ast.copy_location(
+                ast.With(items=node.items[1:], body=node.body, type_comment=None),
+                node,
+            )
+            ast.fix_missing_locations(inner)
+            node = ast.copy_location(
+                ast.With(items=node.items[:1], body=[inner], type_comment=None),
+                node,
+            )
+        item = node.items[0]
+        manager = self.expression(item.context_expr, indent)
+        entered = self.temporary()
+        enter = self.temporary()
+        self.emit(
+            f'{enter} = PyObject_GetAttrString({manager}, "__enter__");', indent
+        )
+        self.checked(enter, indent)
+        self.emit(f"{entered} = PyObject_CallNoArgs({enter});", indent)
+        self.emit(f"Py_DecRef({enter});", indent)
+        self.checked(entered, indent)
+        if item.optional_vars is not None:
+            if not isinstance(item.optional_vars, ast.Name):
+                raise self.fail(node, "`with ... as` binds one name here")
+            target = self.declare(item.optional_vars.id)
+            self.emit(f"if ({target}) Py_DecRef({target});", indent)
+            self.emit(f"Py_IncRef({entered});", indent)
+            self.emit(f"{target} = {entered};", indent)
+        for statement in node.body:
+            self.statement(statement, indent)
+        exit_call = self.temporary()
+        self.emit(
+            f'{exit_call} = PyObject_GetAttrString({manager}, "__exit__");', indent
+        )
+        self.checked(exit_call, indent)
+        none = self.builtin("None", indent)
+        arguments = self.temporary()
+        self.emit(f"{arguments} = PyTuple_New(3LL);", indent)
+        self.checked(arguments, indent)
+        for position in range(3):
+            self.emit(f"Py_IncRef({none});", indent)
+            self.emit(f"PyTuple_SetItem({arguments}, {position}LL, {none});", indent)
+        outcome = self.temporary()
+        self.emit(
+            f"{outcome} = PyObject_Call({exit_call}, {arguments}, (PyObject *)0);",
+            indent,
+        )
+        self.emit(f"Py_DecRef({exit_call});", indent)
+        self.emit(f"Py_DecRef({arguments});", indent)
+        self.emit(f"Py_DecRef({none});", indent)
+        self.checked(outcome, indent)
+        self.emit(f"Py_DecRef({outcome});", indent)
+        self.emit(f"Py_DecRef({entered});", indent)
+        self.emit(f"Py_DecRef({manager});", indent)
 
     def guarded(self, node: ast.Try, indent: int) -> None:
         """`try: ... except E: ...` - the body, then a handler it jumps to.

@@ -50,7 +50,7 @@ __all__ = [
     "PyObject_GetItem", "PyObject_SetItem",
     "PyNumber_Remainder", "PyNumber_FloorDivide", "PyNumber_Power",
     "PyDict_New", "PyDict_SetItem", "PyTuple_Pack", "PySequence_Contains",
-    "PyErr_ExceptionMatches",
+    "PyErr_ExceptionMatches", "PyErr_SetObject", "PySlice_New",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -788,6 +788,8 @@ _PyDict_SetItem = _bind("PyDict_SetItem", ctypes.c_int, _HANDLE, _HANDLE, _HANDL
 _PyTuple_Pack = _bind("PyTuple_Pack", _HANDLE, _SSIZE, _HANDLE, _HANDLE)
 _PySequence_Contains = _bind("PySequence_Contains", ctypes.c_int, _HANDLE, _HANDLE)
 _PyErr_ExceptionMatches = _bind("PyErr_ExceptionMatches", ctypes.c_int, _HANDLE)
+_PyErr_SetObject = _bind("PyErr_SetObject", None, _HANDLE, _HANDLE)
+_PySlice_New = _bind("PySlice_New", _HANDLE, _HANDLE, _HANDLE, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -939,6 +941,17 @@ def PyTuple_Pack(length: int, first: int, second: int) -> int:
     a variadic C function and py2bin passes no variadic arguments."""
 
     return _handle(_PyTuple_Pack(length, first, second))
+
+
+def PyErr_SetObject(exception: int, value: int) -> None:
+    """Set the exception that is being raised. Nothing unwinds here; the
+    caller is expected to return to its own error path immediately."""
+
+    _PyErr_SetObject(exception, value)
+
+
+def PySlice_New(start: int, stop: int, step: int) -> int:
+    return _handle(_PySlice_New(start, stop, step))
 
 
 def PyErr_ExceptionMatches(exception: int) -> int:
