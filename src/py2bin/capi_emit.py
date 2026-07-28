@@ -26,6 +26,8 @@ more here than one that saves an increment in places.
 from __future__ import annotations
 
 import ast
+import builtins
+import contextlib
 from pathlib import Path
 
 
@@ -210,6 +212,35 @@ class _Protected:
         self.reasons: set[int] = set()
 
 
+#: Raising an unbound-name error, written into the generated C once. Each site
+#: is then a single call rather than a dozen lines of construction, which for a
+#: module with a thousand of them is the difference between a third more C and
+#: none. Every early return here leaves an exception set - a failed attribute
+#: lookup sets AttributeError, a failed allocation sets MemoryError - so the
+#: caller never answers NULL with nothing pending.
+_UNBOUND_HELPER = """
+static void _py2bin_unbound(int local, PyObject *message, PyObject *named) {
+    /* The strings arrive already built. A `const char *` parameter could not
+       be passed on: this C front end materializes a literal in the image and
+       will not take a runtime pointer, whose lifetime it cannot verify. */
+    if (!message || !named) { Py_DecRef(message); Py_DecRef(named); return; }
+    PyObject *kind = local
+        ? PyObject_GetAttrString(_py2bin_builtins, "UnboundLocalError")
+        : PyObject_GetAttrString(_py2bin_builtins, "NameError");
+    if (!kind) { Py_DecRef(message); Py_DecRef(named); return; }
+    PyObject *raised = PyObject_CallOneArg(kind, message);
+    Py_DecRef(message);
+    if (!raised) { Py_DecRef(kind); Py_DecRef(named); return; }
+    /* `name` is where CPython's display looks for "Did you mean". */
+    PyObject_SetAttrString(raised, "name", named);
+    Py_DecRef(named);
+    PyErr_SetObject(kind, raised);
+    Py_DecRef(kind);
+    Py_DecRef(raised);
+}
+"""
+
+
 class _Function:
     """One Python function being written out as a C function."""
 
@@ -236,6 +267,9 @@ class _Function:
         #: Names this body declared `global`. They read and write the module's
         #: own storage rather than a local of the same spelling.
         self.module_names: set[str] = set()
+        #: Names an unconditional statement of this body has already bound, so
+        #: a later read of one cannot find its slot empty and needs no test.
+        self.certain: set[str] = set()
         #: Label names must stay unique for the whole function, so this counter
         #: is never wound back the way the temporaries are.
         self.labels = 0
@@ -288,6 +322,13 @@ class CApiEmitter:
         #: a comprehension has its own, so its target must not be the
         #: enclosing name of the same spelling.
         self.shadowed: list[dict[str, str]] = []
+        #: True once a name read needs the unbound-name helper, which is then
+        #: written into the C once rather than at each of a thousand sites.
+        self.needs_unbound = False
+        #: Module names an unconditional top-level statement binds. A function
+        #: body runs after the module body in every arrangement this compiles,
+        #: so one of these is bound by the time any function can read it.
+        self.certain_globals: set[str] = set()
         #: ``(python name, method-table index)`` for each module-level `def`,
         #: which also gets a Python callable so the name can be *used* and
         #: not only called - as a sort key, or with `*args` spread into it.
@@ -506,6 +547,36 @@ class CApiEmitter:
             # there is nowhere else to look, so a failure here is a NameError.
             return self.program_name(node.id, indent)
         target = self.temporary()
+        settled = node.id in self.current.certain or (
+            c_name.startswith("g_") and node.id in self.certain_globals
+        )
+        if c_name[:2] in ("v_", "g_") and not settled:
+            # A slot the program binds may never have been written to: `d` is
+            # a name of this module even when the only `d = ...` sits in an
+            # `if` that did not run. Reading it then found NULL, and
+            # `Py_IncRef(NULL)` turned into `SystemError: null argument to
+            # internal routine` - which says nothing about `d`. Parameters and
+            # captures are always bound, so they are not tested.
+            self.needs_unbound = True
+            if c_name.startswith("g_"):
+                kind, message = "NameError", f"name {node.id!r} is not defined"
+            else:
+                kind, message = (
+                    "UnboundLocalError",
+                    f"cannot access local variable {node.id!r} where it is not "
+                    "associated with a value",
+                )
+            # One call rather than the whole construction. py2bin's C compiler
+            # does not inline, so the helper stays one copy - and a large
+            # module has well over a thousand of these.
+            self.emit(
+                f"if (!{c_name}) {{ _py2bin_unbound("
+                f"{1 if kind == 'UnboundLocalError' else 0}, "
+                f"PyUnicode_FromString({_c_string(message)}), "
+                f"PyUnicode_FromString({_c_string(node.id)})); "
+                f"{self.failure()} }}",
+                indent,
+            )
         # Handed back as an owned reference, like every other expression, so a
         # caller never has to ask where a value came from before releasing it.
         self.emit(f"Py_IncRef({c_name});", indent)
@@ -998,13 +1069,23 @@ class CApiEmitter:
         for a lookup that cannot fail.
         """
 
+        if hasattr(builtins, name):
+            # It is a builtin, so the lookup cannot fail and there is nothing
+            # to report. This is the common case by a long way - `Exception`,
+            # `open`, `len` - and giving each of them the whole NameError
+            # construction added forty thousand lines of C to a large module.
+            # The interpreter this asks is the one the artifact links, so the
+            # answer holds at run time.
+            return self.checked(self.builtin_raw(name, indent), indent)
+        self.needs_unbound = True
         target = self.builtin_raw(name, indent)
-        self.emit(f"if (!{target}) {{", indent)
-        self.emit("PyErr_Clear();", indent + 1)
-        self.raise_named(
-            "NameError", f"name {name!r} is not defined", indent + 1
+        self.emit(
+            f"if (!{target}) {{ PyErr_Clear(); _py2bin_unbound(0, "
+            f"PyUnicode_FromString({_c_string(f'name {name!r} is not defined')}), "
+            f"PyUnicode_FromString({_c_string(name)})); "
+            f"{self.failure()} }}",
+            indent,
         )
-        self.emit("}", indent)
         return target
 
     def builtin_raw(self, name: str, indent: int) -> str:
@@ -1331,6 +1412,10 @@ class CApiEmitter:
         mark = self.current.temporaries
         try:
             self.write_statement(node, indent)
+            if self.depth == 1:
+                # Directly in the body, so it ran: anything it bound is
+                # settled from here on and a later read needs no test.
+                self.current.certain.update(self.settles(node))
         finally:
             self.depth -= 1
             if self.depth == 0:
@@ -1340,6 +1425,53 @@ class CApiEmitter:
                 # classes it catches, a `finally` keeping what it will return -
                 # is at a greater depth and is not wound back under it.
                 self.current.temporaries = mark
+
+    @contextlib.contextmanager
+    def settled_within(self, names):
+        """Treat these names as bound for the duration of a nested body.
+
+        A `for` target may leave the loop unbound - the sequence can be empty -
+        but *inside* the body it has just been assigned, and so has the name a
+        `with ... as` or an `except ... as` introduced. Testing those would put
+        an unbound-name check on the most common read in the language.
+        """
+
+        assert self.current is not None
+        fresh = {name for name in names if name not in self.current.certain}
+        self.current.certain.update(fresh)
+        try:
+            yield
+        finally:
+            self.current.certain.difference_update(fresh)
+
+    @staticmethod
+    def settles(node: ast.stmt) -> set[str]:
+        """Names this statement binds whenever it runs at all.
+
+        A `for` target is not among them: the loop may run no times. Nor is
+        anything inside an `if`, a `try` or a loop body - those are what the
+        depth test outside this already excludes.
+        """
+
+        bound: set[str] = set()
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for element in (
+                    target.elts
+                    if isinstance(target, (ast.Tuple, ast.List))
+                    else [target]
+                ):
+                    if isinstance(element, ast.Name):
+                        bound.add(element.id)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            bound.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        return bound
 
     def write_statement(self, node: ast.stmt, indent: int) -> None:
         if isinstance(node, ast.Assign):
@@ -1604,8 +1736,12 @@ class CApiEmitter:
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"Py_IncRef({entered});", indent)
             self.emit(f"{target} = {entered};", indent)
-        for statement in node.body:
-            self.statement(statement, indent)
+        introduced = (
+            {item.optional_vars.id} if item.optional_vars is not None else set()
+        )
+        with self.settled_within(introduced):
+            for statement in node.body:
+                self.statement(statement, indent)
         exit_call = self.temporary()
         self.emit(
             f'{exit_call} = PyObject_GetAttrString({manager}, "__exit__");', indent
@@ -1672,8 +1808,9 @@ class CApiEmitter:
                 # A bare except catches whatever is set.
                 held = self.bind_exception(clause, indent)
                 self.handling.append(held)
-                for statement in clause.body:
-                    self.statement(statement, indent)
+                with self.settled_within({clause.name} if clause.name else set()):
+                    for statement in clause.body:
+                        self.statement(statement, indent)
                 self.handling.pop()
                 self.emit(f"Py_DecRef({held});", indent)
                 self.emit(f"goto {done};", indent)
@@ -1685,8 +1822,9 @@ class CApiEmitter:
             self.emit(f"if ({decision}) {{", indent)
             held = self.bind_exception(clause, indent + 1)
             self.handling.append(held)
-            for statement in clause.body:
-                self.statement(statement, indent + 1)
+            with self.settled_within({clause.name} if clause.name else set()):
+                for statement in clause.body:
+                    self.statement(statement, indent + 1)
             self.handling.pop()
             self.emit(f"Py_DecRef({held});", indent + 1)
             self.emit(f"    goto {done};", indent)
@@ -2088,8 +2226,18 @@ class CApiEmitter:
             self.emit(f"{target} = {item};", indent + 1)
         self.loop_depth += 1
         try:
-            for statement in node.body:
-                self.statement(statement, indent + 1)
+            targets = (
+                {node.target.id}
+                if isinstance(node.target, ast.Name)
+                else {
+                    element.id
+                    for element in getattr(node.target, "elts", [])
+                    if isinstance(element, ast.Name)
+                }
+            )
+            with self.settled_within(targets):
+                for statement in node.body:
+                    self.statement(statement, indent + 1)
         finally:
             self.loop_depth -= 1
         self.emit("}", indent)
@@ -2658,12 +2806,19 @@ class CApiEmitter:
 
         self.raise_named("TypeError", message, indent)
 
-    def raise_named(self, kind_name: str, message: str, indent: int) -> None:
+    def raise_named(
+        self, kind_name: str, message: str, indent: int, named: str | None = None
+    ) -> None:
         """Set ``kind_name(message)``, then take the failure path.
 
         The class comes through ``builtin_raw``: fetching it with the ordinary
         lookup would turn *its* failure into a NameError, which needs a class
         to build - the lookup that just failed.
+
+        ``named`` sets the exception's ``name`` attribute, which is where
+        CPython's display gets the material for "Did you mean: 'id'?". Without
+        it the message is right and the suggestion is missing, which is a
+        visible difference from the same program run under CPython.
         """
 
         kind = self.builtin_raw(kind_name, indent)
@@ -2675,6 +2830,16 @@ class CApiEmitter:
         self.emit(f"{raised} = PyObject_CallOneArg({kind}, {text});", indent)
         self.emit(f"Py_DecRef({text});", indent)
         self.checked(raised, indent)
+        if named is not None:
+            spelled = self.temporary()
+            self.emit(
+                f"{spelled} = PyUnicode_FromString({_c_string(named)});", indent
+            )
+            self.checked(spelled, indent)
+            self.emit(
+                f'PyObject_SetAttrString({raised}, "name", {spelled});', indent
+            )
+            self.emit(f"Py_DecRef({spelled});", indent)
         self.emit(f"PyErr_SetObject({kind}, {raised});", indent)
         self.emit(f"Py_DecRef({kind});", indent)
         self.emit(f"Py_DecRef({raised});", indent)
@@ -2766,6 +2931,9 @@ class CApiEmitter:
                     len(arguments.posonlyargs) + len(arguments.args),
                     len(arguments.defaults),
                 )
+
+        for node in tree.body:
+            self.certain_globals.update(self.settles(node))
 
         # What the module body binds, gathered before any function is written:
         # a function may read a global defined further down the file, exactly
@@ -2915,6 +3083,8 @@ class CApiEmitter:
             )
         for name in sorted(self.globals):
             out.append(f"static PyObject *g_{name} = 0;")
+        if self.needs_unbound:
+            out.append(_UNBOUND_HELPER)
         out.append("")
         for function in self.functions:
             if function.name == "main":

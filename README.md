@@ -315,8 +315,9 @@ identical stdout and exit status.
 - `bytes` literals, and dict comprehensions.
 - Comprehensions have a scope of their own, so `[x * 2 for x in xs]` leaves an
   enclosing `x` alone; unpacking checks how many values there were and raises
-  Python's `ValueError`; and a name that exists nowhere raises `NameError`
-  rather than the AttributeError the builtins lookup would leave behind.
+  Python's `ValueError`; and a name that exists nowhere, or whose only binding
+  did not run, raises `NameError` or `UnboundLocalError` as Python does rather
+  than reading an empty slot.
 
 Two things it deliberately refuses rather than answering differently from
 Python. A closure captures the *value* a name holds when the closure is made,

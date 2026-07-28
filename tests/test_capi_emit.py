@@ -955,6 +955,82 @@ class CApiEmitTests(unittest.TestCase):
             b"caught: name 'missing_function' is not defined\n",
         )
 
+    def test_a_name_whose_only_binding_did_not_run(self):
+        """A slot the program binds may never have been written to.
+
+        `d` is a name of the module even when the only `d = ...` sits in an
+        `if` that did not run. Reading it found NULL, and `Py_IncRef(NULL)`
+        became `SystemError: null argument to internal routine`, which says
+        nothing about `d`.
+        """
+
+        self._run_failing(
+            "n = 0\nif n > 5:\n    d = {1: 2}\nprint(len(d))\n",
+            b"NameError: name 'd' is not defined",
+        )
+        self._run(
+            "def f(flag):\n"
+            "    if flag:\n"
+            "        v = 1\n"
+            "    return v\n"
+            "print(f(True))\n"
+            "try:\n"
+            "    f(False)\n"
+            "except UnboundLocalError as e:\n"
+            "    print('caught:', e)\n",
+            b"1\ncaught: cannot access local variable 'v' where it is not "
+            b"associated with a value\n",
+        )
+
+    def test_an_unbound_name_error_carries_the_name(self):
+        """`e.name` is what CPython sets, and what its display reads.
+
+        The compiled binary cannot produce CPython's "Did you mean: 'id'?" -
+        that suggestion is computed by searching a Python *frame*, and a
+        compiled program has none. The attribute itself is set, so a program
+        that catches the error and reads it gets what Python gives.
+        """
+
+        self._run(
+            "try:\n"
+            "    print(nope)\n"
+            "except NameError as e:\n"
+            "    print(repr(e.name), str(e))\n",
+            b"'nope' name 'nope' is not defined\n",
+        )
+
+    def test_the_unbound_check_is_not_emitted_where_it_cannot_fire(self):
+        """A name a statement of this body has already bound needs no test.
+
+        Testing every read put a third more C into a large module. A read is
+        left alone when an unconditional statement above it bound the name,
+        when it is a `for`/`with`/`except` target inside its own body, or when
+        it is a builtin - and the check that remains is one call to a helper
+        written once rather than a dozen lines at each of a thousand sites.
+        """
+
+        settled = python_to_capi_c(
+            "import os\n"
+            "total = 0\n"
+            "for item in [1, 2]:\n"
+            "    total = total + item\n"
+            "print(total, os, Exception)\n",
+            "program.py",
+        )
+        self.assertNotIn("_py2bin_unbound", settled)
+
+        # And it is emitted where the name really can be unbound: reading the
+        # loop target *after* the loop finds nothing when the sequence was
+        # empty, which is a NameError in Python too.
+        after = python_to_capi_c(
+            "for item in []:\n    pass\nprint(item)\n", "program.py"
+        )
+        self.assertIn("_py2bin_unbound", after)
+        self._run_failing(
+            "for item in []:\n    pass\nprint(item)\n",
+            b"NameError: name 'item' is not defined",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

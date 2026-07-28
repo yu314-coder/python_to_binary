@@ -320,6 +320,33 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**A name whose only binding did not run.** `d` is a name of the module even
+when the only `d = ...` sits in an `if` that did not run, so its slot can be
+empty when something reads it. `Py_IncRef(NULL)` followed, and the program
+stopped with `SystemError: null argument to internal routine` - which names
+neither `d` nor anything the programmer wrote. A read of a slot the program
+binds now tests it and raises what Python raises: `NameError` for a module
+name, `UnboundLocalError` for a function's own, with Python's wording and with
+the `name` attribute set. (CPython's "Did you mean: 'id'?" cannot follow: that
+suggestion is computed by searching a Python *frame* for near misses, and a
+compiled program has none.)
+
+The cost of testing *every* read was a third more C in a large module, so two
+things narrow it. A read is left alone when the name is settled - an
+unconditional statement above it in the same body bound it, or it is a
+`for`/`with`/`except` target inside its own body, or it is a builtin, which is
+known at build time because the interpreter answering the question is the one
+the artifact links. And the check that remains is a single call to a helper
+written into the C once, rather than a dozen lines of exception construction at
+each of a thousand-odd sites. That the helper stays one copy is worth checking
+rather than assuming: six calls to a function cost 22 IR operations where one
+costs 7, so this C compiler does not inline. The helper takes its strings
+already built as Python objects, because a `const char *` parameter cannot be
+passed on - the front end materializes a literal in the image and will not take
+a runtime pointer whose lifetime it cannot verify.
+
+Net: 117,658 lines of C for app.py against 113,344 with no checking at all.
+
 **What compiling a 7,000-line program broke, and it was never the language.**
 Once app.py's last construct went through, three limits showed up in a row,
 each of them a number chosen when modules were small:
