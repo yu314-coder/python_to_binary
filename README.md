@@ -76,6 +76,97 @@ Python source, and nothing here changes that. An application written against
 this bridge is written against it directly, in the native subset - it is not a
 translation of an existing PyObjC program.
 
+## Install
+
+```sh
+pip install python-to-binary
+```
+
+or from a checkout, which needs nothing installed at all:
+
+```sh
+git clone https://github.com/yu314-coder/python_to_binary.git
+cd python_to_binary
+PYTHONPATH=src python3 -m py2bin --help
+```
+
+The only requirement is Python 3.10 or newer. There are no dependencies, and
+compiling imports neither `ctypes` nor `subprocess` - a build asks for an
+interpreter and nothing else, which a test asserts by compiling in a fresh
+interpreter and listing what got loaded.
+
+## Bundling an application
+
+One command turns a Python program into a macOS `.app` that carries its own
+interpreter and its own packages:
+
+```sh
+py2bin compile-capi app.py --target darwin-arm64 \
+  --app --name "My App" --icon icon.icns \
+  --embed-python --site ../Resources/site-packages \
+  --bundle-site /path/to/venv/lib/python3.14/site-packages \
+  --prune-unused --zip-stdlib \
+  -o dist/MyApp.app --clean
+```
+
+What each part does:
+
+| flag | effect |
+|---|---|
+| `--app` | write a `.app` bundle rather than a bare executable |
+| `--embed-python` | carry the interpreter, so the result runs on a Mac without Python |
+| `--bundle-site DIR` | copy a virtualenv's packages into the bundle |
+| `--site DIR` | where the program looks for them, relative to the executable |
+| `--prune-unused` | drop modules the program cannot import, plus `.dSYM` debug companions |
+| `--zip-stdlib` | pack the carried library into the `pythonXY.zip` the interpreter already reads |
+| `--exclude MODULE` | drop something the static walk had to keep - see below |
+
+`--exclude` is for what the walk cannot work out. Pillow is the case that
+matters: `Image.init()` imports whatever plugin sits beside it, so a static
+walk keeps them all, and each optional codec holds its native library alive.
+Naming both halves drops the plugin, the extension, and the library behind it:
+
+```sh
+  --exclude PIL.AvifImagePlugin --exclude PIL._avif \
+  --exclude PIL.ImageFont --exclude PIL._imagingft
+```
+
+That took 7 MB off the bundle below. What the program can then no longer do is
+the caller's to judge - dropping `_avif` means an AVIF file stops opening.
+
+### Measured on a real application
+
+manim_app: 10,100 lines, pywebview + Pillow + pyobjc, built both ways on the
+same machine and interleaved so that drift falls on both equally.
+
+| | py2bin | Nuitka |
+|---|---|---|
+| whole `.app` | **61.2 MB** | 72.6 MB |
+| main binary | **9.2 MB** | 29.6 MB |
+| bare interpreter start | **9.5 ms** | 16.2 ms |
+| start with the app's imports | 52.1 ms | **44.8 ms** |
+| compile time | **16.7 s** | minutes |
+
+Verified from a copy moved elsewhere on disk: every module the program imports
+resolves, a pty opens and echoes, Pillow still round-trips PNG/JPEG/GIF/BMP/
+WEBP/TIFF, and the app starts with no traceback.
+
+### What this tier cannot do yet
+
+`compile-capi` targets **`darwin-arm64` only**. Every other target is refused
+at the point where the program would need external symbols bound, because the
+dynamic-linking half of the backend exists for arm64 Mach-O and nowhere else:
+`encode_darwin_extern` is in `native/arm64.py`, and the Mach-O writer has
+`write_macho_x86_64` but no dynamic variant of it. So there is no x86-64 `.app`,
+no Windows `.exe` and no Linux binary from this tier. Adding one means writing
+that backend half - GOT-relative addressing, `__DATA` statics, load commands -
+for the target in question.
+
+The bundle is also a **directory**, not one file. `--embed-python` needs
+somewhere to put the interpreter, the extensions and the packages, and a `.app`
+is that somewhere; a single-file build would have to unpack itself at startup,
+which this tier does not do.
+
 ## The three tiers, stated plainly
 
 Three different things in this repository all end in "a file you can run". They
