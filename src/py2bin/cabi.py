@@ -58,6 +58,7 @@ __all__ = [
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",
+    "PyObject_Vectorcall",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -827,6 +828,9 @@ _PyUnicode_DecodeUTF8 = _bind(
     "PyUnicode_DecodeUTF8", _HANDLE, ctypes.c_char_p, _SSIZE, _HANDLE
 )
 _PyImport_AddModule = _bind("PyImport_AddModule", _HANDLE, ctypes.c_char_p)
+_PyObject_Vectorcall = _bind(
+    "PyObject_Vectorcall", _HANDLE, _HANDLE, _HANDLE, _SSIZE, _HANDLE
+)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1036,6 +1040,22 @@ def PyNumber_Positive(value: int) -> int:
     """`+x`."""
 
     return _handle(_PyNumber_Positive(value))
+
+
+def PyObject_Vectorcall(
+    callable_handle: int, arguments: int, count: int, keyword_names: int
+) -> int:
+    """Call something with its arguments in a plain array.
+
+    The arguments are *borrowed*: unlike the tuple protocol, nothing is stolen
+    and nothing is allocated to hold them. That missing allocation is the whole
+    point - building a tuple for every call is what made a compiled call four
+    times slower than the interpreted one.
+    """
+
+    return _handle(
+        _PyObject_Vectorcall(callable_handle, arguments, count, keyword_names)
+    )
 
 
 def PyImport_AddModule(name: bytes) -> int:

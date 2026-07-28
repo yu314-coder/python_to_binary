@@ -320,6 +320,32 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**A call passes its arguments in an array, not a tuple built for the purpose.**
+Every call used to allocate a tuple, fill it, and free it. The interpreter
+stopped using the tuple protocol years ago, and the cost was measurable: a
+compiled program calling `len()` in a loop was *slower* than the same loop
+interpreted. `PyObject_Vectorcall` takes a plain array, so nothing is
+allocated. One array per arity per C function is enough - every argument is
+computed before any of them is stored, so a nested call has finished with the
+array before the outer one starts filling it. Vectorcall *borrows* its
+arguments where `PyTuple_SetItem` steals, so each is released after the call
+rather than given away.
+
+Measured, calling in a loop, against CPython on the same machine:
+
+| call | compiled | interpreted |
+| --- | --- | --- |
+| a builtin | 0.006 s | 0.011 s |
+| a module-level function | 0.018 s | 0.011 s |
+| a nested function | 0.047 s | 0.010 s |
+
+The builtin is now the better of the two. The rest is the *callee* side, which
+this did not touch: a compiled function is registered `METH_VARARGS`, and
+CPython has to pack the arguments back into a tuple to call one of those. Until
+those become `METH_FASTCALL`, a compiled function is the slowest thing a
+compiled program can call - which is the opposite of what it should be, and is
+where the next work goes.
+
 **What a self-contained bundle should not carry.** The first working one was
 293 MB against Nuitka's 73 MB for the same application, which is not a
 defensible ratio. Four things accounted for nearly all of it, and none of them
@@ -1618,7 +1644,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 70 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 71 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

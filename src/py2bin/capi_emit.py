@@ -69,6 +69,9 @@ extern PyObject *PyObject_CallNoArgs(PyObject *callable);
 extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *argument);
 extern long long PyObject_Size(PyObject *object);
 extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+extern PyObject *PyObject_Vectorcall(
+    PyObject *callable, PyObject **arguments, long long count,
+    PyObject *keyword_names);
 extern PyObject *PyTuple_New(long long length);
 extern PyObject *PyTuple_GetItem(PyObject *tuple, long long index);
 typedef PyObject *(*PyCFunctionWithKeywords)(
@@ -304,6 +307,11 @@ class _Function:
         #: True once something in the body takes the failure path, which is
         #: what puts the `_unwind` label at the end of the C function.
         self.unwinds = False
+        #: `arity -> C name` for the argument arrays a call passes. One per
+        #: arity per function is enough: the arguments are all computed before
+        #: any of them is stored, so a nested call has finished with the array
+        #: before the outer one begins to fill it.
+        self.argument_arrays: dict[int, str] = {}
         #: Names this body declared `global`. They read and write the module's
         #: own storage rather than a local of the same spelling.
         self.module_names: set[str] = set()
@@ -1559,13 +1567,34 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({argument});", indent)
             return self.checked(target, indent)
         values = [self.expression(item, indent) for item in args]
-        holder = self.temporary()
-        self.emit(f"{holder} = PyTuple_New({len(values)}LL);", indent)
+        # A plain array rather than a tuple. Building a tuple meant an
+        # allocation, a fill and a free for every call a program makes, which
+        # measured four times slower than the same call under the interpreter -
+        # the interpreter has not used the tuple protocol for years.
+        # Vectorcall *borrows* its arguments, so each is released here rather
+        # than being given away as PyTuple_SetItem would.
+        holder = self.argument_array(len(values))
         for position, value in enumerate(values):
-            self.emit(f"PyTuple_SetItem({holder}, {position}LL, {value});", indent)
-        self.emit(f"{target} = PyObject_Call({callable_value}, {holder}, 0);", indent)
-        self.emit(f"Py_DecRef({holder});", indent)
+            self.emit(f"{holder}[{position}] = {value};", indent)
+        self.emit(
+            f"{target} = PyObject_Vectorcall({callable_value}, {holder}, "
+            f"{len(values)}LL, 0);",
+            indent,
+        )
+        for value in values:
+            self.emit(f"Py_DecRef({value});", indent)
         return self.checked(target, indent)
+
+    def argument_array(self, arity: int) -> str:
+        """The array a call of this many arguments passes."""
+
+        assert self.current is not None
+        existing = self.current.argument_arrays.get(arity)
+        if existing is None:
+            existing = f"_args{arity}"
+            self.current.argument_arrays[arity] = existing
+            self.current.locals.append(f"{existing}[{arity}]")
+        return existing
 
     # --- statements ------------------------------------------------------
 
@@ -3845,6 +3874,8 @@ class CApiEmitter:
         for name in function.locals:
             if name.startswith("int "):
                 lines.append(f"{pad}{name} = 0;")
+            elif "[" in name:
+                lines.append(f"{pad}PyObject *{name};")
             else:
                 lines.append(f"{pad}PyObject *{name} = 0;")
         return lines

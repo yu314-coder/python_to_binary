@@ -1837,6 +1837,42 @@ class CApiEmitTests(unittest.TestCase):
             b"bb\nfallback\n2 4 [6]\n6 9\n",
         )
 
+    def test_a_call_passes_its_arguments_in_an_array(self):
+        """Not in a tuple built for the purpose.
+
+        Every call allocated a tuple, filled it, and freed it. The interpreter
+        stopped using the tuple protocol years ago, and calling a builtin from
+        compiled code measured slower than the same call interpreted. The array
+        is reused per arity within a function: the arguments are all computed
+        before any is stored, so a nested call has finished with it before the
+        outer one begins to fill it.
+
+        Vectorcall *borrows* its arguments, where PyTuple_SetItem steals - so
+        each is released after the call rather than given away.
+        """
+
+        generated = python_to_capi_c(
+            "def f(a, b, c):\n    return a + b + c\n"
+            "print(f(1, 2, 3), max(4, 5, 6))\n",
+            "program.py",
+        )
+        self.assertIn("PyObject_Vectorcall", generated)
+        self.assertIn("_args3[3]", generated)
+        self._run(
+            "xs = [3, 1, 2]\n"
+            "def three(a, b, c):\n"
+            "    return (a, b, c)\n"
+            "print(three(1, 2, 3))\n"
+            "print(max(4, 5, 6), sorted(xs), min(1, 2, 3))\n"
+            "print(three(*xs))\n"
+            "def outer():\n"
+            "    def inner(a, b):\n"
+            "        return a * b\n"
+            "    return [inner(i, 2) for i in range(4)]\n"
+            "print(outer())\n",
+            b"(1, 2, 3)\n6 [1, 2, 3] 1\n(3, 1, 2)\n[0, 2, 4, 6]\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen
