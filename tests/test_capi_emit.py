@@ -373,6 +373,37 @@ class CApiEmitTests(unittest.TestCase):
             b"ZeroDivisionError",
         )
 
+    def test_from_imports_including_a_submodule(self):
+        # `from matplotlib import pyplot` names a submodule that has not been
+        # imported yet, so an attribute lookup alone finds nothing. Python's
+        # import system tries the submodule at that point and so does this.
+        self._run("from math import sqrt, pi\nprint(sqrt(2), pi)\n",
+                  b"1.4142135623730951 3.141592653589793\n")
+        self._run("import numpy as np\nprint(np.arange(5).sum())\n", b"10\n")
+
+    def test_keyword_arguments(self):
+        # The positional part goes in a tuple and the keywords in a dict, for
+        # PyObject_Call. PyDict_SetItem does not steal, so both go back.
+        self._run("print(sorted([3, 1, 2], reverse=True))\n", b"[3, 2, 1]\n")
+
+    def test_tuple_unpacking(self):
+        self._run("a, b = (1, 2)\nprint(a, b)\n", b"1 2\n")
+
+    def test_the_scientific_stack_runs_from_a_compiled_binary(self):
+        # numpy is a thin Python layer over C and Fortran, and none of it is
+        # translated here - the interpreter loads it exactly as it always
+        # does. That is what the tier buys.
+        self._run(
+            "import numpy\na = numpy.arange(10)\nprint(a.sum(), a.mean())\n",
+            b"45 4.5\n",
+        )
+        self._run(
+            "import numpy\n"
+            "m = numpy.array([[4.0, 7.0], [2.0, 6.0]])\n"
+            "print(round(numpy.linalg.det(m), 6))\n",
+            b"10.0\n",
+        )
+
     def test_what_is_not_translated_says_so(self):
         self._reject("class A:\n    pass\n", "has no C-API translation here yet")
         self._reject(

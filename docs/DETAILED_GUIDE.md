@@ -240,6 +240,17 @@ A tuple literal is built through a list and handed to the `tuple` builtin:
 arity is fixed at two and cannot serve a general tuple. The extra allocation
 buys any length.
 
+**The scientific stack runs from a compiled binary.** numpy, scipy and
+scikit-learn are a thin Python layer over C and Fortran, and none of that is
+translated here - the interpreter loads it exactly as it always does, which is
+the whole point of paying for libpython. A compiled program does numpy's
+LAPACK-backed linear algebra, its FFT, scipy's sparse matrices and statistics,
+fits a scikit-learn model, and renders a matplotlib figure to a PNG. What made
+the last one work was `from matplotlib import pyplot` naming a *submodule*
+rather than an attribute: an attribute lookup alone finds nothing there, so the
+submodule import Python's own machinery performs at that point is performed
+here too.
+
 `try`/`except` works by turning a failing call into a jump. Outside a `try` a
 NULL result ends the process; inside one it goes to the handler, where
 `PyErr_ExceptionMatches` asks whether the exception is the class that clause

@@ -540,8 +540,6 @@ class CApiEmitter:
         return self.checked(target, indent)
 
     def call(self, node: ast.Call, indent: int) -> str:
-        if node.keywords:
-            raise self.fail(node, "keyword arguments are not translated here yet")
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):
@@ -563,9 +561,26 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({value});", indent)
             return self.checked(target, indent)
         if node.func.id not in self.known_functions:
-            # Not one of ours, so ask the interpreter for it.
-            callable_value = self.builtin(node.func.id, indent)
-            target = self.invoke(callable_value, node.args, indent)
+            assert self.current is not None
+            local = (
+                f"p_{node.func.id}"
+                if node.func.id in self.current.parameters
+                else f"v_{node.func.id}"
+            )
+            if local in self.current.locals or node.func.id in self.current.parameters:
+                # A name the program bound - an imported one, or a value
+                # holding something callable. It wins over the builtin of the
+                # same spelling, exactly as it does in Python.
+                callable_value = self.name(
+                    ast.copy_location(
+                        ast.Name(id=node.func.id, ctx=ast.Load()), node
+                    ),
+                    indent,
+                )
+            else:
+                # Not one of ours, so ask the interpreter for it.
+                callable_value = self.builtin(node.func.id, indent)
+            target = self.invoke(callable_value, node.args, indent, node.keywords)
             self.emit(f"Py_DecRef({callable_value});", indent)
             return target
         expected = self.known_functions[node.func.id]
@@ -582,6 +597,42 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({argument});", indent)
         return self.checked(target, indent)
 
+    def invoke_with_keywords(
+        self, callable_value: str, args: list, keywords: list, indent: int
+    ) -> str:
+        """`f(a, key=b)` - a tuple for the positional part, a dict for the rest."""
+
+        values = [self.expression(item, indent) for item in args]
+        holder = self.temporary()
+        self.emit(f"{holder} = PyTuple_New({len(values)}LL);", indent)
+        self.checked(holder, indent)
+        for position, value in enumerate(values):
+            # Steals the reference, so the value is not released after this.
+            self.emit(f"PyTuple_SetItem({holder}, {position}LL, {value});", indent)
+        mapping = self.temporary()
+        self.emit(f"{mapping} = PyDict_New();", indent)
+        self.checked(mapping, indent)
+        for keyword in keywords:
+            if keyword.arg is None:
+                raise self.fail(
+                    keyword.value, "`**kwargs` at a call is not translated here yet"
+                )
+            key = self.temporary()
+            self.emit(f"{key} = PyUnicode_FromString({_c_string(keyword.arg)});", indent)
+            self.checked(key, indent)
+            value = self.expression(keyword.value, indent)
+            self.emit(f"PyDict_SetItem({mapping}, {key}, {value});", indent)
+            # Does not steal either reference, so both go back.
+            self.emit(f"Py_DecRef({key});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+        target = self.temporary()
+        self.emit(
+            f"{target} = PyObject_Call({callable_value}, {holder}, {mapping});", indent
+        )
+        self.emit(f"Py_DecRef({holder});", indent)
+        self.emit(f"Py_DecRef({mapping});", indent)
+        return self.checked(target, indent)
+
     def method_call(self, node: ast.Call, indent: int) -> str:
         """`x.f()` and `x.f(a)` - the two arities the vetted set can call.
 
@@ -592,19 +643,25 @@ class CApiEmitter:
 
         assert isinstance(node.func, ast.Attribute)
         callable_value = self.attribute(node.func, indent)
-        target = self.invoke(callable_value, node.args, indent)
+        target = self.invoke(callable_value, node.args, indent, node.keywords)
         self.emit(f"Py_DecRef({callable_value});", indent)
         return self.checked(target, indent)
 
-    def invoke(self, callable_value: str, args: list, indent: int) -> str:
+    def invoke(
+        self, callable_value: str, args: list, indent: int, keywords: list = ()
+    ) -> str:
         """Call something with any number of arguments.
 
-        Nought and one have their own entry points; beyond that the arguments
-        go into a tuple. PyTuple_SetItem *steals* the reference it is given,
-        which is why nothing is released after it - releasing again would be a
-        second drop of a reference this code no longer owns.
+        Nought and one positional arguments have their own entry points; beyond
+        that, and whenever there are keywords, the arguments go into a tuple and
+        the keywords into a dict for PyObject_Call. PyTuple_SetItem *steals* the
+        reference it is given, which is why nothing is released after it -
+        releasing again would be a second drop of a reference this code no
+        longer owns. PyDict_SetItem does not steal, so those are released.
         """
 
+        if keywords:
+            return self.invoke_with_keywords(callable_value, args, keywords, indent)
         target = self.temporary()
         if not args:
             self.emit(f"{target} = PyObject_CallNoArgs({callable_value});", indent)
@@ -642,6 +699,8 @@ class CApiEmitter:
             self.give_back(node, indent)
         elif isinstance(node, ast.Import):
             self.import_module(node, indent)
+        elif isinstance(node, ast.ImportFrom):
+            self.import_names(node, indent)
         elif isinstance(node, ast.Try):
             self.guarded(node, indent)
         elif isinstance(node, ast.AugAssign):
@@ -677,11 +736,56 @@ class CApiEmitter:
             )
             self.checked(target, indent)
 
+    def import_names(self, node: ast.ImportFrom, indent: int) -> None:
+        """`from x import a, b` - import the module, then read the names off it.
+
+        A dotted module works because the import machinery is the
+        interpreter's: `from scipy import optimize` imports `scipy` and takes
+        the attribute, exactly as the statement means.
+        """
+
+        if node.level:
+            raise self.fail(node, "a relative import is not translated here yet")
+        if node.module is None:
+            raise self.fail(node, "this import form is not translated here yet")
+        module = self.temporary()
+        self.emit(
+            f"{module} = PyImport_ImportModule({_c_string(node.module)});", indent
+        )
+        self.checked(module, indent)
+        for alias in node.names:
+            if alias.name == "*":
+                raise self.fail(node, "`import *` is not translated here yet")
+            target = self.declare(alias.asname or alias.name)
+            self.emit(f"if ({target}) Py_DecRef({target});", indent)
+            self.emit(
+                f"{target} = PyObject_GetAttrString({module}, "
+                f"{_c_string(alias.name)});",
+                indent,
+            )
+            # A name that is not an attribute may be a submodule that has not
+            # been imported yet - `from matplotlib import pyplot` is exactly
+            # that. Python's import system tries the submodule at this point,
+            # so this does too, and the failed lookup is cleared first because
+            # an exception left set would surface at the next call.
+            dotted = f"{node.module}.{alias.name}"
+            self.emit(f"if (!{target}) {{", indent)
+            self.emit("    PyErr_Clear();", indent)
+            self.emit(
+                f"    {target} = PyImport_ImportModule({_c_string(dotted)});", indent
+            )
+            self.emit("}", indent)
+            self.checked(target, indent)
+        self.emit(f"Py_DecRef({module});", indent)
+
     def assignment(self, node: ast.Assign, indent: int) -> None:
         if len(node.targets) != 1:
             raise self.fail(node, "only one assignment target is translated here")
         if isinstance(node.targets[0], ast.Subscript):
             self.store_item(node.targets[0], node.value, indent)
+            return
+        if isinstance(node.targets[0], (ast.Tuple, ast.List)):
+            self.unpack(node.targets[0], node.value, indent)
             return
         if not isinstance(node.targets[0], ast.Name):
             raise self.fail(node, "only a name or a subscript is assigned to here")
@@ -769,6 +873,31 @@ class CApiEmitter:
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+
+    def unpack(self, target, value_node: ast.expr, indent: int) -> None:
+        """`a, b = pair` - the value once, then each name from its position.
+
+        Indexed rather than iterated, which is not what Python does for an
+        arbitrary iterable but is right for the sequences this is written for
+        and does not need the iterator threaded through the assignment.
+        """
+
+        for element in target.elts:
+            if not isinstance(element, ast.Name):
+                raise self.fail(target, "unpacking binds plain names here")
+        value = self.expression(value_node, indent)
+        for position, element in enumerate(target.elts):
+            index = self.temporary()
+            self.emit(f"{index} = PyLong_FromLongLong({position}LL);", indent)
+            self.checked(index, indent)
+            item = self.temporary()
+            self.emit(f"{item} = PyObject_GetItem({value}, {index});", indent)
+            self.emit(f"Py_DecRef({index});", indent)
+            self.checked(item, indent)
+            name = self.declare(element.id)
+            self.emit(f"if ({name}) Py_DecRef({name});", indent)
+            self.emit(f"{name} = {item};", indent)
+        self.emit(f"Py_DecRef({value});", indent)
 
     def store_item(
         self, target: ast.Subscript, value_node: ast.expr, indent: int
