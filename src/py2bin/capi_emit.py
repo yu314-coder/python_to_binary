@@ -68,14 +68,15 @@ extern long long PyObject_Size(PyObject *object);
 extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
 extern PyObject *PyTuple_New(long long length);
 extern PyObject *PyTuple_GetItem(PyObject *tuple, long long index);
-typedef PyObject *(*PyCFunction)(PyObject *self, PyObject *args);
+typedef PyObject *(*PyCFunctionWithKeywords)(
+    PyObject *self, PyObject *args, PyObject *kwargs);
 struct PyMethodDef {
     const char *ml_name;
-    PyCFunction ml_meth;
+    PyCFunctionWithKeywords ml_meth;
     int ml_flags;
     const char *ml_doc;
 };
-extern PyObject *PyCFunction_New(struct PyMethodDef *table, PyObject *self);
+extern PyObject *PyCFunction_New(void *table, PyObject *self);
 extern int PyTuple_SetItem(PyObject *tuple, long long index, PyObject *value);
 extern PyObject *PyFloat_FromDouble(double value);
 extern PyObject *PyNumber_Remainder(PyObject *left, PyObject *right);
@@ -97,6 +98,7 @@ extern PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
 extern void PyErr_Clear(void);
 extern PyObject *PyErr_GetRaisedException(void);
 extern void PyErr_SetRaisedException(PyObject *exception);
+extern PyObject *PyBytes_FromStringAndSize(const char *text, long long length);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -131,6 +133,27 @@ _BINARY = {
     ast.Mod: "PyNumber_Remainder",
     ast.FloorDiv: "PyNumber_FloorDivide",
 }
+
+
+def _c_bytes(data: bytes) -> str:
+    """A C string literal holding exactly these bytes.
+
+    Everything outside printable ASCII goes in as an octal escape, so the
+    literal itself stays ASCII and the runtime still sees the bytes.
+    """
+
+    out = ['"']
+    for byte in data:
+        if byte == 0x22:
+            out.append('\\"')
+        elif byte == 0x5C:
+            out.append("\\\\")
+        elif 0x20 <= byte < 0x7F:
+            out.append(chr(byte))
+        else:
+            out.append(f"\\{byte:03o}")
+    out.append('"')
+    return "".join(out)
 
 
 def _c_string(text: str) -> str:
@@ -207,6 +230,9 @@ class _Function:
         #: True once something in the body takes the failure path, which is
         #: what puts the `_unwind` label at the end of the C function.
         self.unwinds = False
+        #: Names this body declared `global`. They read and write the module's
+        #: own storage rather than a local of the same spelling.
+        self.module_names: set[str] = set()
         #: How many trailing parameters have defaults. A call that leaves one
         #: out passes NULL and the body fills it in.
         self.defaults = defaults
@@ -313,6 +339,11 @@ class CApiEmitter:
         """
 
         assert self.current is not None
+        if name in self.current.module_names:
+            # Declared `global` here, so the assignment lands in the module's
+            # storage and every other scope sees it.
+            self.globals.add(name)
+            return f"g_{name}"
         if name in self.current.parameters:
             return f"p_{name}"
         if self.at_module_level:
@@ -390,6 +421,21 @@ class CApiEmitter:
                 f"{target} = PyUnicode_FromString({_c_string(node.value)});", indent
             )
             return self.checked(target, indent)
+        if isinstance(node.value, bytes):
+            if b"\0" in node.value:
+                raise self.fail(
+                    node,
+                    "a bytes literal containing a zero byte is not translated "
+                    "here yet; it travels as a C string literal, which ends at "
+                    "the first one",
+                )
+            target = self.temporary()
+            self.emit(
+                f"{target} = PyBytes_FromStringAndSize("
+                f"{_c_bytes(node.value)}, {len(node.value)}LL);",
+                indent,
+            )
+            return self.checked(target, indent)
         raise self.fail(node, f"a {type(node.value).__name__} constant is not translated here yet")
 
     def reference(self, name: str) -> str | None:
@@ -400,6 +446,10 @@ class CApiEmitter:
         """
 
         assert self.current is not None
+        if name in self.current.module_names:
+            # `global x` says this name is the module's, whatever a local of
+            # the same spelling would otherwise have been.
+            return f"g_{name}"
         if name in self.current.parameters:
             return f"p_{name}"
         if f"v_{name}" in self.current.locals:
@@ -957,10 +1007,14 @@ class CApiEmitter:
             self.emit(f"{target} = PyObject_Str({value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
             return self.checked(target, indent)
-        spread = any(isinstance(item, ast.Starred) for item in node.args) or any(
-            keyword.arg is None for keyword in node.keywords
+        # A spread, or any keyword, has to go through the callable form: the
+        # direct C call passes arguments by position and has nowhere to put a
+        # name, which is how `show(1, c=9)` came to answer with c's default.
+        indirect = (
+            any(isinstance(item, ast.Starred) for item in node.args)
+            or bool(node.keywords)
         )
-        if node.func.id not in self.known_functions or spread:
+        if node.func.id not in self.known_functions or indirect:
             assert self.current is not None
             if self.reference(node.func.id) is not None:
                 # A name the program bound - an imported one, or a value
@@ -1187,11 +1241,6 @@ class CApiEmitter:
             self.throw(node, indent)
         elif isinstance(node, ast.With):
             self.with_block(node, indent)
-        elif isinstance(node, ast.Global):
-            # Every name lives in one C scope per function here, and the module
-            # body is its own function, so a `global` declaration names storage
-            # that is already shared. Nothing to emit.
-            pass
         elif isinstance(node, ast.Try):
             self.guarded(node, indent)
         elif isinstance(node, ast.AugAssign):
@@ -1206,6 +1255,17 @@ class CApiEmitter:
                 self.leave_through_finally(_CONTINUING, indent)
             else:
                 self.emit("continue;", indent)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            if isinstance(node, ast.Nonlocal):
+                raise self.fail(
+                    node,
+                    "`nonlocal` is not translated here yet; a closure captures "
+                    "by value, so there is no cell to rebind",
+                )
+            assert self.current is not None
+            for name in node.names:
+                self.current.module_names.add(name)
+                self.globals.add(name)
         elif isinstance(node, ast.Pass):
             pass
         elif isinstance(node, ast.ClassDef):
@@ -1229,12 +1289,27 @@ class CApiEmitter:
         """
 
         for alias in node.names:
-            if "." in alias.name:
-                raise self.fail(node, "a dotted import is not translated here yet")
-            target = self.declare(alias.asname or alias.name)
+            # `import a.b` imports a.b and binds *a*; `import a.b as c` binds
+            # the submodule itself. PyImport_ImportModule answers the tail
+            # module either way, so the plain form asks for the package again
+            # - which costs nothing, the first import having put both in
+            # sys.modules.
+            bound = alias.asname or alias.name.split(".")[0]
+            if alias.asname is None and "." in alias.name:
+                loaded = self.temporary()
+                self.emit(
+                    f"{loaded} = PyImport_ImportModule({_c_string(alias.name)});",
+                    indent,
+                )
+                self.checked(loaded, indent)
+                self.emit(f"Py_DecRef({loaded});", indent)
+                wanted = alias.name.split(".")[0]
+            else:
+                wanted = alias.name
+            target = self.declare(bound)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(
-                f'{target} = PyImport_ImportModule({_c_string(alias.name)});', indent
+                f'{target} = PyImport_ImportModule({_c_string(wanted)});', indent
             )
             self.checked(target, indent)
 
@@ -1942,6 +2017,7 @@ class CApiEmitter:
         arguments = node.args
         bound = {argument.arg for argument in arguments.args}
         bound.update(argument.arg for argument in arguments.posonlyargs)
+        bound.update(argument.arg for argument in arguments.posonlyargs)
         bound.update(argument.arg for argument in arguments.kwonlyargs)
         if arguments.vararg:
             bound.add(arguments.vararg.arg)
@@ -2054,17 +2130,6 @@ class CApiEmitter:
 
         assert self.current is not None
         arguments = node.args
-        if (
-            arguments.vararg
-            or arguments.kwarg
-            or arguments.kwonlyargs
-            or arguments.posonlyargs
-        ):
-            raise self.fail(
-                node,
-                "a nested function taking *args, **kwargs, keyword-only or "
-                "positional-only parameters is not translated here yet",
-            )
         if getattr(node, "decorator_list", []):
             raise self.fail(
                 node, "a decorated nested function is not translated here yet"
@@ -2224,38 +2289,206 @@ class CApiEmitter:
         how the callee knows to put its default in.
         """
 
-        parameters = tuple(argument.arg for argument in node.args.args)
-        required = len(parameters) - len(node.args.defaults)
+        parameters = tuple(
+            argument.arg
+            for argument in (*node.args.posonlyargs, *node.args.args)
+        )
         index = len(self.method_table)
         function = _Function(f"_value{index}_{node.name}", (), closure=True)
         self.method_table.append((function.name, node.name))
         self.value_functions.append((node.name, index))
         outer = self.current
         self.current = function
-        for position, name in enumerate(parameters):
-            slot = f"w_{name}"
-            function.locals.append(slot)
-            self.emit(f"{slot} = PyTuple_GetItem(_args, {position});", 1)
-            if position < required:
-                self.emit(f"if (!{slot}) {{ return 0; }}", 1)
-            else:
-                # Out of range, which is not an error here: the callee has a
-                # default for it and NULL is how it is asked for.
-                self.emit(f"if (!{slot}) PyErr_Clear();", 1)
+        for name in parameters:
+            function.locals.append(f"w_{name}")
+        # The same binding a closure does - by position, then by name - so a
+        # keyword reaches the body whichever spelling the call used. A
+        # parameter nothing supplied stays NULL, which is how the callee is
+        # asked for its default.
+        self.bind_parameters(
+            node, indent=1, keyword_source=None, prefix="w_", missing_is_null=True
+        )
+        answer = self.temporary()
         passed = ", ".join(f"w_{name}" for name in parameters)
-        self.emit(f"return f_{node.name}({passed});", 1)
+        self.emit(f"{answer} = f_{node.name}({passed});", 1)
+        for name in parameters:
+            self.emit(f"if (w_{name}) Py_DecRef(w_{name});", 1)
+        self.emit(f"return {answer};", 1)
+        self.write_unwind(function)
         self.functions.append(function)
         self.current = outer
+
+    def bind_parameters(
+        self,
+        node: ast.AST,
+        indent: int,
+        keyword_source: str | None,
+        prefix: str = "p_",
+        missing_is_null: bool = False,
+    ) -> None:
+        """Fill each parameter from the argument tuple, then from the keywords.
+
+        Python lets any parameter be passed by name, so reading the tuple alone
+        is not enough: `show(1, c=9)` puts nothing at position 2 and `c` in the
+        keywords. A function that only looked at the tuple answered with c's
+        default and said nothing, which is the worst way to be wrong.
+
+        Where the function has a `**` parameter the keywords are copied first
+        and each named parameter is *removed* from the copy as it is taken, so
+        what is left is exactly what `**` should see. Without one there is
+        nothing to remove them from, and the dict the caller owns is only read.
+        """
+
+        arguments = node.args
+        # A positional-only parameter is positional and cannot be named, so
+        # it is filled from the tuple and never looked for in the keywords -
+        # a caller may legitimately pass a keyword of the same spelling, and
+        # it belongs to `**kwargs`.
+        named_from = len(arguments.posonlyargs)
+        positional = tuple(
+            argument.arg
+            for argument in (*arguments.posonlyargs, *arguments.args)
+        )
+        keyword_only = tuple(argument.arg for argument in arguments.kwonlyargs)
+        defaults = list(arguments.defaults)
+        required = len(positional) - len(defaults)
+        if keyword_source:
+            # A private copy: consuming a name from the caller's own dict would
+            # be a side effect on something this call does not own.
+            maker = self.builtin("dict", indent)
+            self.emit(f"if (_kwargs) {{", indent)
+            self.emit(
+                f"{prefix}{keyword_source} = PyObject_CallOneArg({maker}, _kwargs);",
+                indent + 1,
+            )
+            self.emit("} else {", indent)
+            self.emit(f"{prefix}{keyword_source} = PyDict_New();", indent + 1)
+            self.emit("}", indent)
+            self.emit(f"Py_DecRef({maker});", indent)
+            self.checked(f"{prefix}{keyword_source}", indent)
+            source = f"{prefix}{keyword_source}"
+        else:
+            source = "_kwargs"
+
+        def from_keywords(name: str, slot: str) -> None:
+            key = self.temporary()
+            self.emit(f"if (!{slot} && {source}) {{", indent)
+            self.emit(f"{key} = PyUnicode_FromString({_c_string(name)});", indent + 1)
+            self.checked(key, indent + 1)
+            self.emit(f"{slot} = PyObject_GetItem({source}, {key});", indent + 1)
+            self.emit(f"if (!{slot}) {{", indent + 1)
+            self.emit("PyErr_Clear();", indent + 2)
+            self.emit("} else {", indent + 1)
+            if keyword_source:
+                self.emit(f"PyObject_DelItem({source}, {key});", indent + 2)
+            self.emit("}", indent + 1)
+            self.emit(f"Py_DecRef({key});", indent + 1)
+            self.emit("}", indent)
+
+        for offset, name in enumerate(positional):
+            slot = f"{prefix}{name}"
+            self.emit(f"{slot} = PyTuple_GetItem(_args, {offset});", indent)
+            # Borrowed from the tuple, so it is taken over here; one that came
+            # from the keywords is owned already, which is why the increment
+            # only guards this branch.
+            self.emit(f"if ({slot}) {{ Py_IncRef({slot}); }} else {{", indent)
+            self.emit("PyErr_Clear();", indent + 1)
+            self.emit("}", indent)
+            if offset >= named_from:
+                from_keywords(name, slot)
+            self.supply_missing(
+                node, name, slot, indent,
+                None if offset < required else defaults[offset - required],
+                missing_is_null,
+            )
+        for offset, name in enumerate(keyword_only):
+            # Never read from the tuple: that is what keyword-only means.
+            slot = f"{prefix}{name}"
+            from_keywords(name, slot)
+            self.supply_missing(
+                node, name, slot, indent,
+                arguments.kw_defaults[offset],
+                missing_is_null,
+            )
+        if arguments.vararg:
+            slot = f"{prefix}{arguments.vararg.arg}"
+            nothing = self.builtin("None", indent)
+            start = self.temporary()
+            self.emit(f"{start} = PyLong_FromLongLong({len(positional)}LL);", indent)
+            self.checked(start, indent)
+            span = self.temporary()
+            self.emit(f"{span} = PySlice_New({start}, {nothing}, {nothing});", indent)
+            self.emit(f"Py_DecRef({start});", indent)
+            self.emit(f"Py_DecRef({nothing});", indent)
+            self.checked(span, indent)
+            self.emit(f"{slot} = PyObject_GetItem(_args, {span});", indent)
+            self.emit(f"Py_DecRef({span});", indent)
+            self.checked(slot, indent)
+
+    def supply_missing(
+        self,
+        node: ast.AST,
+        name: str,
+        slot: str,
+        indent: int,
+        default: ast.expr | None,
+        missing_is_null: bool,
+    ) -> None:
+        """What to do when neither the tuple nor the keywords had it."""
+
+        if default is not None:
+            self.emit(f"if (!{slot}) {{", indent)
+            value = self.expression(default, indent + 1)
+            self.emit(f"{slot} = {value};", indent + 1)
+            self.emit("}", indent)
+            return
+        if missing_is_null:
+            # The callee has the default and NULL is how it is asked for.
+            return
+        self.emit(f"if (!{slot}) {{", indent)
+        self.raise_type_error(
+            f"{getattr(node, 'name', '<lambda>')}() missing a required "
+            f"argument: {name!r}",
+            indent + 1,
+        )
+        self.emit("}", indent)
+
+    def raise_type_error(self, message: str, indent: int) -> None:
+        """Set a TypeError with this message, then take the failure path."""
+
+        kind = self.builtin("TypeError", indent)
+        text = self.temporary()
+        self.emit(f"{text} = PyUnicode_FromString({_c_string(message)});", indent)
+        self.checked(text, indent)
+        raised = self.temporary()
+        self.emit(f"{raised} = PyObject_CallOneArg({kind}, {text});", indent)
+        self.emit(f"Py_DecRef({text});", indent)
+        self.checked(raised, indent)
+        self.emit(f"PyErr_SetObject({kind}, {raised});", indent)
+        self.emit(f"Py_DecRef({kind});", indent)
+        self.emit(f"Py_DecRef({raised});", indent)
+        self.emit(self.failure(), indent)
 
     def write_closure(
         self, node: ast.AST, c_name: str, captures: tuple[str, ...]
     ) -> None:
         """Write the closure's body out as its own C function."""
 
-        parameters = tuple(argument.arg for argument in node.args.args)
-        defaults = node.args.defaults
+        arguments = node.args
+        parameters = tuple(
+            argument.arg
+            for argument in (*arguments.posonlyargs, *arguments.args)
+        )
+        keyword_only = tuple(argument.arg for argument in arguments.kwonlyargs)
+        rest = arguments.vararg.arg if arguments.vararg else None
+        named_rest = arguments.kwarg.arg if arguments.kwarg else None
+        held = parameters + keyword_only
+        if rest:
+            held += (rest,)
+        if named_rest:
+            held += (named_rest,)
         function = _Function(
-            c_name, parameters, len(defaults), captures, closure=True
+            c_name, held, len(arguments.defaults), captures, closure=True
         )
         outer, outer_handlers, outer_scope = (
             self.current,
@@ -2266,26 +2499,11 @@ class CApiEmitter:
         self.scope = node.body if isinstance(node.body, list) else []
         # The parameters arrive in a tuple rather than as C arguments, so they
         # are locals here and are declared alongside the rest.
-        for name in parameters:
+        for name in held:
             function.locals.append(f"p_{name}")
         for name in captures:
             function.locals.append(f"c_{name}")
-        required = len(parameters) - len(defaults)
-        for offset, name in enumerate(parameters):
-            self.emit(f"p_{name} = PyTuple_GetItem(_args, {offset});", 1)
-            if offset < required:
-                # Too few arguments: CPython has already set IndexError, which
-                # is the same failure by a different name.
-                self.emit(f"if (!p_{name}) {{ {self.failure()} }}", 1)
-                self.emit(f"Py_IncRef(p_{name});", 1)
-            else:
-                self.emit(f"if (!p_{name}) {{", 1)
-                self.emit("PyErr_Clear();", 2)
-                value = self.expression(defaults[offset - required], 2)
-                self.emit(f"p_{name} = {value};", 2)
-                self.emit("} else {", 1)
-                self.emit(f"Py_IncRef(p_{name});", 2)
-                self.emit("}", 1)
+        self.bind_parameters(node, indent=1, keyword_source=named_rest)
         for offset, name in enumerate(captures):
             # Borrowed from the tuple the callable holds, so it is taken over
             # for the length of the call like every other name here.
@@ -2320,19 +2538,19 @@ class CApiEmitter:
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 arguments = node.args
-                if (
-                    node.decorator_list
-                    or arguments.vararg
-                    or arguments.kwarg
-                    or arguments.kwonlyargs
-                ):
+                if node.decorator_list:
                     raise self.fail(
-                        node,
-                        "a decorated function, or one taking *args, **kwargs "
-                        "or keyword-only parameters, is not translated here yet",
+                        node, "a decorated function is not translated here yet"
                     )
+                if arguments.vararg or arguments.kwarg or arguments.kwonlyargs:
+                    # A C function takes a fixed number of arguments in
+                    # registers and cannot express these, so the whole function
+                    # is compiled as a closure instead and every call to it
+                    # goes through the callable. Nothing is lost but the direct
+                    # call, which needs a count known here.
+                    continue
                 self.known_functions[node.name] = (
-                    len(arguments.args),
+                    len(arguments.posonlyargs) + len(arguments.args),
                     len(arguments.defaults),
                 )
 
@@ -2343,7 +2561,7 @@ class CApiEmitter:
             self.note_module_bindings(node)
 
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, ast.FunctionDef) and node.name in self.known_functions:
                 self.write_function(node)
                 self.write_wrapper(node)
 
@@ -2352,8 +2570,10 @@ class CApiEmitter:
         self.scope = tree.body
         self.at_module_level = True
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, ast.FunctionDef) and node.name in self.known_functions:
                 continue
+            # A `def` this could not give a fixed C shape is written here, as
+            # a closure bound to its name like any other value.
             self.statement(node, 2)
         self.at_module_level = False
         self.functions.append(entry)
@@ -2403,7 +2623,10 @@ class CApiEmitter:
                 self.note_module_bindings(inner)
 
     def write_function(self, node: ast.FunctionDef) -> None:
-        parameters = tuple(argument.arg for argument in node.args.args)
+        parameters = tuple(
+            argument.arg
+            for argument in (*node.args.posonlyargs, *node.args.args)
+        )
         defaults = node.args.defaults
         function = _Function(node.name, parameters, len(defaults))
         self.current = function
@@ -2450,9 +2673,11 @@ class CApiEmitter:
     def render(self) -> str:
         def signature(function: _Function) -> str:
             if function.closure:
-                # What CPython calls a METH_VARARGS function with: the object
-                # the callable holds, then the arguments in a tuple.
-                return "PyObject *_self, PyObject *_args"
+                # What CPython calls a METH_VARARGS | METH_KEYWORDS function
+                # with: the object the callable holds, the positional
+                # arguments in a tuple, and the keywords in a dict - or NULL
+                # for that last one when the call passed none.
+                return "PyObject *_self, PyObject *_args, PyObject *_kwargs"
             return (
                 ", ".join(f"PyObject *p_{name}" for name in function.parameters)
                 or "void"
@@ -2501,8 +2726,11 @@ class CApiEmitter:
         for index, (c_name, label) in enumerate(self.method_table):
             out.append(f"    _py2bin_methods[{index}].ml_name = {_c_string(label)};")
             out.append(f"    _py2bin_methods[{index}].ml_meth = f_{c_name};")
-            # METH_VARARGS: the arguments arrive as a tuple.
-            out.append(f"    _py2bin_methods[{index}].ml_flags = 1;")
+            # METH_VARARGS | METH_KEYWORDS: a tuple and a dict. Keywords are
+            # taken by every compiled function, because Python lets any
+            # parameter be passed by name and a function that quietly ignored
+            # that would answer `show(1, c=9)` with c's default.
+            out.append(f"    _py2bin_methods[{index}].ml_flags = 3;")
             out.append(f"    _py2bin_methods[{index}].ml_doc = 0;")
         for name, index in self.value_functions:
             out.append(

@@ -409,10 +409,11 @@ class CApiEmitTests(unittest.TestCase):
         # whose mini-language is the interpreter's own. See
         # test_f_string_format_specifiers_go_to_format for what it now does.
         self._reject("raise\n", "nothing to re-raise")
-        self._reject(
-            "def f(*rest):\n    def g():\n        return rest\n    return g\n",
-            "*args",
-        )
+        # `*args` and `**kwargs` in a parameter list are no longer refused;
+        # see test_a_function_takes_star_args_and_keywords for what they do.
+        self._reject("nonlocal x\n", "`nonlocal` is not translated")
+        self._reject("@dec\ndef f():\n    pass\n", "decorated function")
+        self._reject("async def f():\n    pass\n", "no C-API translation")
 
         # An unknown name is no longer refused at build time: it is looked up
         # in builtins while the program runs, which is how range() and sum()
@@ -422,7 +423,8 @@ class CApiEmitTests(unittest.TestCase):
         # A name that is not local, not global and not a builtin is no longer
         # a build-time refusal: it is looked up in builtins while the program
         # runs, and fails there with AttributeError rather than NameError.
-        self._reject("import x.y\n", "dotted import is not translated")
+        # `import x.y` is no longer refused: a dotted import binds what
+        # Python binds. See test_a_dotted_import_binds_what_python_binds.
 
     def test_a_nested_function_captures_from_the_scope_around_it(self):
         """A closure is a real callable, backed by compiled C.
@@ -748,6 +750,92 @@ class CApiEmitTests(unittest.TestCase):
             "print(list(map(weight, rows)))\n"
             "print(weight(*[{'k': 9}]))\n",
             b"[1, 3]\n[3, 1]\n9\n",
+        )
+
+    def test_a_function_takes_star_args_and_keywords(self):
+        """`*args`, `**kwargs`, and keyword-only parameters with defaults."""
+
+        self._run(
+            "def total(*values, scale=1, **named):\n"
+            "    return sum(values) * scale, sorted(named.items())\n"
+            "print(total(1, 2, 3))\n"
+            "print(total(1, 2, scale=10, tag='x'))\n"
+            "print(total())\n",
+            b"(6, [])\n(30, [('tag', 'x')])\n(0, [])\n",
+        )
+
+    def test_a_parameter_can_be_passed_by_name(self):
+        """Python lets any parameter be passed by name.
+
+        A compiled function that only read the argument *tuple* answered
+        `show(1, c=9)` with c's default and said nothing about it, which is the
+        worst way to be wrong. Every compiled function now takes keywords and
+        binds by position first, then by name.
+        """
+
+        self._run(
+            "def show(a, b=2, c=3):\n"
+            "    return (a, b, c)\n"
+            "print(show(1, c=9), show(c=1, a=2), show(1, 2, 3))\n",
+            b"(1, 2, 9) (2, 2, 1) (1, 2, 3)\n",
+        )
+
+    def test_global_binds_the_modules_own_name(self):
+        """`global` used to be accepted and ignored.
+
+        The assignment bound a local of the same spelling, so the module never
+        saw the change - accepted, silent, and wrong.
+        """
+
+        self._run(
+            "count = 0\n"
+            "def bump(n):\n"
+            "    global count\n"
+            "    count = count + n\n"
+            "    return count\n"
+            "def shadow():\n"
+            "    count = 99\n"
+            "    return count\n"
+            "print(bump(3), bump(4), count)\n"
+            "print(shadow(), count)\n",
+            b"3 7 7\n99 7\n",
+        )
+
+    def test_a_dotted_import_binds_what_python_binds(self):
+        self._run(
+            "import os.path\n"
+            "import xml.etree.ElementTree as ET\n"
+            "print(os.path.basename('/a/b/c.txt'))\n"
+            "print(ET.fromstring(\"<r><c v='1'/></r>\")[0].get('v'))\n",
+            b"c.txt\n1\n",
+        )
+
+    def test_bytes_literals(self):
+        self._run(
+            "data = b'hello'\n"
+            "print(data, len(data), data[0])\n"
+            "print(b'caf\\xc3\\xa9'.decode('utf-8'))\n"
+            "print(data + b' world', data.hex())\n",
+            "b'hello' 5 104\ncaf\u00e9\nb'hello world' 68656c6c6f\n".encode("utf-8"),
+        )
+
+    def test_positional_only_parameters(self):
+        """`/` means the name is not a keyword, so it can be one for `**kw`.
+
+        `write_function` read only `args.args`, which leaves the
+        positional-only ones out entirely - so `def f(a, /, b)` bound `b` from
+        the first argument and dropped `a`, accepted and silently wrong.
+        """
+
+        self._run(
+            "def f(a, b, /, c, d=4, *, e=5):\n"
+            "    return (a, b, c, d, e)\n"
+            "def g(a, /, **kw):\n"
+            "    return (a, sorted(kw.items()))\n"
+            "print(f(1, 2, 3))\n"
+            "print(f(1, 2, c=3, d=9, e=8))\n"
+            "print(g(1, a=2, z=3))\n",
+            b"(1, 2, 3, 4, 5)\n(1, 2, 3, 9, 8)\n(1, [('a', 2), ('z', 3)])\n",
         )
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):

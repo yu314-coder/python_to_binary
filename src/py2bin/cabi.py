@@ -55,6 +55,7 @@ __all__ = [
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
+    "PyBytes_FromStringAndSize",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -807,6 +808,9 @@ _PyObject_SetAttrString = _bind(
     "PyObject_SetAttrString", ctypes.c_int, _HANDLE, ctypes.c_char_p, _HANDLE
 )
 _PyErr_SetRaisedException = _bind("PyErr_SetRaisedException", None, _HANDLE)
+_PyBytes_FromStringAndSize = _bind(
+    "PyBytes_FromStringAndSize", _HANDLE, ctypes.c_char_p, _SSIZE
+)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1003,6 +1007,12 @@ def PyCFunction_New(method_table: int, closure: int) -> int:
     """
 
     return _handle(_PyCFunction_New(method_table, closure))
+
+
+def PyBytes_FromStringAndSize(text: bytes, length: int) -> int:
+    """A bytes object of exactly ``length`` bytes, copied from ``text``."""
+
+    return _handle(_PyBytes_FromStringAndSize(text, length))
 
 
 def PyErr_SetRaisedException(exception: int) -> None:

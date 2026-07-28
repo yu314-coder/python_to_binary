@@ -275,6 +275,28 @@ function; both spellings reach the same body. The arguments are borrowed from
 the tuple and passed on as they are, which nets to zero because a callee
 increments what it is given on entry and releases it on the way out.
 
+**Every compiled function takes keywords**, because Python lets any parameter
+be passed by name. A function that read only the argument *tuple* answered
+`show(1, c=9)` with c's default and said nothing about it, which is the worst
+way to be wrong; each parameter is now filled from the tuple first and then
+looked for by name. Where the function has a `**` parameter the keywords are
+copied first and each named parameter removed from the copy as it is taken, so
+what is left is exactly what `**` should see - and the caller's own dict is
+never touched. A positional-only parameter is filled from the tuple and never
+looked for in the keywords, which is what lets `def g(a, /, **kw)` accept
+`g(1, a=2)` and put that `a` in `kw`.
+
+A `def` whose parameters cannot be given a fixed C shape - `*args`, `**kwargs`
+or keyword-only - is compiled as a closure bound to its name instead of as a
+C function taking registers. Nothing is lost but the direct call, which needs
+a count known at build time.
+
+`global` was previously *accepted and ignored*: the comment reasoned that every
+name lives in one C scope per function so the storage was already shared, which
+is not so - a function body assigning to the name declared a local of the same
+spelling, and the module never saw the change. It now names the module's own
+storage for both reading and writing.
+
 **A class is `type(name, bases, namespace)`**, so inheritance, the method
 resolution order, `isinstance`, `__init__` and every other dunder are the
 interpreter's own machinery rather than a re-implementation. Each method is a
@@ -1307,7 +1329,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 61 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 62 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the
