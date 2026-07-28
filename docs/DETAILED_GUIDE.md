@@ -297,6 +297,33 @@ is not so - a function body assigning to the name declared a local of the same
 spelling, and the module never saw the change. It now names the module's own
 storage for both reading and writing.
 
+**What compiling a 7,000-line program broke, and it was never the language.**
+Once app.py's last construct went through, three limits showed up in a row,
+each of them a number chosen when modules were small:
+
+- *A slot per subexpression.* Every intermediate value got its own C local, so
+  the module's entry frame wanted more than py2bin gives a frame at all. A
+  temporary is dead once the statement that made it has finished, so the count
+  is now wound back at each statement boundary; anything a construct holds
+  across the statements *inside* it - a `try` keeping the classes it catches,
+  a `finally` keeping what it will return - is at a greater depth and is not
+  wound back under it. Label names come from a separate counter, because those
+  must stay unique for the whole function.
+- *Two budgets for one limit.* The C front end kept its own 32 KB cap on the
+  frame while the backend was prepared to give 512 KB, so a program could be
+  refused with a message naming a restriction that was not the real one. The
+  IR's figure is now the only one.
+- *ADR reaches a megabyte.* String literals and function addresses were each
+  one `adr`, which is fine until the code between the instruction and the
+  literal is larger than that. Both are now `adrp`/`add`, which reaches the
+  whole address space these images occupy; both halves stay PC-relative, so a
+  slid image is still fine - ADRP works in pages and a slide is page-aligned.
+
+The result compiles: 7,000 lines of Python to a 5.8 MB Mach-O, which then
+stops at exactly the point CPython stops at on the same machine - an
+uninstalled dependency, which is the program's environment and not the
+compiler's business.
+
 **A class is `type(name, bases, namespace)`**, so inheritance, the method
 resolution order, `isinstance`, `__init__` and every other dunder are the
 interpreter's own machinery rather than a re-implementation. Each method is a

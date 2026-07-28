@@ -1627,8 +1627,17 @@ class RejectionTests(CProgramTestCase):
         )
 
     def test_a_frame_larger_than_the_native_one_is_refused(self):
+        """Past the budget the backend will actually give a frame.
+
+        The size here tracks `MAXIMUM_STACK_SLOTS`, which is the one number
+        that says how much of the thread stack one frame may take. The C front
+        end used to keep a second, tighter figure of its own, so a program
+        could be told its frame was too large while the backend was prepared
+        to give it sixteen times as much.
+        """
+
         self.reject(
-            "int main(void) { long long huge[5000]; return 0; }\n", "stack frame"
+            "int main(void) { long long huge[70000]; return 0; }\n", "stack frame"
         )
 
 

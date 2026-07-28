@@ -89,6 +89,7 @@ import struct
 from .native.frontend import _CABI_RESULT_WIDTH, _CABI_RESULTS, _CABI_SYMBOLS
 from .native.compiler import CALL_CAPABLE_TARGETS
 from .native.ir import (
+    MAXIMUM_STACK_SLOTS,
     BitsFloat,
     Call as IRCall,
     CStringConstant,
@@ -2707,7 +2708,12 @@ _LENGTHS = {
     "j": {"d": LLONG, "i": LLONG, "u": ULLONG, "x": ULLONG, "X": ULLONG},
 }
 
-_MAXIMUM_SLOTS = 4000
+#: How many stack slots one translation unit's frame may take. This is the
+#: same budget the IR enforces rather than a second, tighter one: two numbers
+#: for the same limit meant a program could be rejected here at 32 KB while
+#: the backend was prepared to give it 512 KB, and the message named a
+#: restriction that was not the real one.
+_MAXIMUM_SLOTS = MAXIMUM_STACK_SLOTS
 
 #: Bytes of static storage one translation unit may declare. The block is a
 #: single mapping obtained at start-up, so the limit is a sanity bound rather

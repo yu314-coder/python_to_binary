@@ -9,6 +9,7 @@ own semantics - most visibly integers that do not stop at 64 bits.
 from __future__ import annotations
 
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -836,6 +837,26 @@ class CApiEmitTests(unittest.TestCase):
             "print(f(1, 2, c=3, d=9, e=8))\n"
             "print(g(1, a=2, z=3))\n",
             b"(1, 2, 3, 4, 5)\n(1, 2, 3, 9, 8)\n(1, [('a', 2), ('z', 3)])\n",
+        )
+
+    def test_temporary_slots_are_reused_between_statements(self):
+        """One slot per live value, not one per subexpression ever written.
+
+        A temporary is dead once the statement that made it has finished, so
+        the count is wound back at each statement boundary. Without that, a
+        7,000-line module wanted a larger entry frame than py2bin gives a
+        frame at all - the failure was a build-time refusal naming the stack,
+        which said nothing about the real cause.
+        """
+
+        source = "".join(f"print({n} + {n} * 2 - 1, [{n}, {n} + 1])\n" for n in range(200))
+        generated = python_to_capi_c(source, "program.py")
+        slots = len(re.findall(r"^\s+PyObject \*_t\d+ = 0;$", generated, re.M))
+        self.assertLess(slots, 30, "temporaries are not being reused")
+        # And it still runs: reuse must not hand a slot out while it is live.
+        self._run(
+            "".join(f"print({n} + {n} * 2 - 1, [{n}, {n} + 1])\n" for n in range(3)),
+            b"-1 [0, 1]\n2 [1, 2]\n5 [2, 3]\n",
         )
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):

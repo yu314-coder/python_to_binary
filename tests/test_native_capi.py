@@ -888,6 +888,50 @@ _ROOT = Path(__file__).resolve().parent.parent
 _EXAMPLES = _ROOT / "examples"
 
 
+class Arm64ReachTests(unittest.TestCase):
+    """A literal or a function address further away than ADR reaches.
+
+    ADR carries a signed 21-bit *byte* displacement, so it reaches about a
+    megabyte. A 113,000-line translation unit puts its string literals well
+    past that, and the build stopped with "arm64 literal is outside ADR
+    range". The ADRP/ADD pair reaches +/-4 GB, which is the whole address
+    space these images occupy.
+    """
+
+    def _decode(self, adrp: int, add: int, instruction: int) -> int:
+        """Recover the address the pair computes, straight from the encoding."""
+
+        immlo = (adrp >> 29) & 3
+        immhi = (adrp >> 5) & 0x7FFFF
+        pages = (immhi << 2) | immlo
+        if pages >= (1 << 20):
+            pages -= 1 << 21
+        offset = (add >> 10) & 0xFFF
+        return (instruction & ~0xFFF) + (pages << 12) + offset
+
+    def test_the_pair_reaches_what_adr_cannot(self):
+        from py2bin.native.arm64 import _adrp_add
+
+        instruction = 0x100004000
+        for distance in (0x10, 0x100000, 0x400000, 0x10000000, -0x8000000):
+            target = instruction + distance
+            adrp, add = _adrp_add(0, instruction, target)
+            self.assertEqual(
+                self._decode(adrp, add, instruction),
+                target,
+                f"distance {distance:#x} does not round-trip",
+            )
+
+    def test_the_registers_are_encoded(self):
+        from py2bin.native.arm64 import _adrp_add
+
+        for register in (0, 1, 9):
+            adrp, add = _adrp_add(register, 0x100004000, 0x100104010)
+            self.assertEqual(adrp & 0x1F, register)
+            self.assertEqual(add & 0x1F, register)
+            self.assertEqual((add >> 5) & 0x1F, register)
+
+
 class DocumentedSurfaceTests(unittest.TestCase):
     """The prose states a number and a list; both have to be the real ones."""
 

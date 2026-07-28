@@ -81,6 +81,29 @@ def _mov(register: int, value: int) -> list[int]:
     return instructions
 
 
+def _adrp_add(register: int, instruction_address: int, target: int) -> tuple[int, int]:
+    """``adrp Xd, page(target)`` then ``add Xd, Xd, #offset-in-page``.
+
+    ADR alone carries a signed 21-bit byte displacement, so it reaches about a
+    megabyte. A module of any size puts its literals further away than that -
+    a 113,000-line translation unit did - and the pair reaches +/-4 GB, which
+    is the whole address space these images occupy.
+    """
+
+    pages = ((target & ~0xFFF) - (instruction_address & ~0xFFF)) >> 12
+    if not -(1 << 20) <= pages < (1 << 20):
+        raise ValueError("arm64 literal is outside ADRP range")
+    encoded = pages & 0x1FFFFF
+    adrp = (
+        0x90000000
+        | ((encoded & 3) << 29)
+        | (((encoded >> 2) & 0x7FFFF) << 5)
+        | register
+    )
+    add = 0x91000000 | ((target & 0xFFF) << 10) | (register << 5) | register
+    return adrp, add
+
+
 def _adr(register: int, distance: int) -> int:
     if not -(1 << 20) <= distance < (1 << 20):
         raise ValueError("arm64 literal is outside ADR range")
@@ -521,7 +544,9 @@ def _expression(
                 "and encode_linux"
             )
         refs.addresses.append((len(words), expression.name))
-        words.append(0)  # adr x0, <function> (patched with the body's offset)
+        # Two words: adrp then add. A single ADR reaches about a megabyte,
+        # which a module with a few hundred functions in it outgrows.
+        words.extend((0, 0))
         return
     if isinstance(expression, CStringConstant):
         if refs is None:
@@ -529,7 +554,8 @@ def _expression(
                 "ARM64 C-string constants require the darwin dynamic encoder"
             )
         index = len(words)
-        words.append(0)  # adr x0, <cstring> (patched with the data address)
+        # Two words: adrp then add, patched once the data address is known.
+        words.extend((0, 0))
         refs.strings.append((index, expression.data, 0))
         return
     if isinstance(expression, ExternCall):
@@ -1204,7 +1230,7 @@ def _emit_operations(
         if isinstance(operation, Write):
             words.extend(_mov(0, operation.fd))
             adr_index = len(words)
-            words.append(0)
+            words.extend((0, 0))
             refs.strings.append((adr_index, operation.data, 1))
             words.extend(_mov(2, len(operation.data)))
             words.extend(_mov(syscall_register, system.write_number))
@@ -1416,10 +1442,15 @@ def _encode(
             raise ValueError(
                 f"address taken of undefined native IR function {name!r}"
             )
-        # ADR is PC-relative in BYTES, so the image may still be slid.
-        words[instruction_index] = _adr(
-            0, (offsets[name] - instruction_index) * 4
+        # Both halves are PC-relative, so the image may still be slid: ADRP
+        # works in pages and a slide is page-aligned.
+        adrp, add = _adrp_add(
+            0,
+            code_address + instruction_index * 4,
+            code_address + offsets[name] * 4,
         )
+        words[instruction_index] = adrp
+        words[instruction_index + 1] = add
     externs = [(index * 4, symbol) for index, symbol in refs.externs]
     statics = [(index * 4, offset) for index, offset in refs.statics]
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
@@ -1427,10 +1458,10 @@ def _encode(
         instruction_address = code_address + instruction_index * 4
         data_address = code_address + len(image)
         struct.pack_into(
-            "<I",
+            "<II",
             image,
             instruction_index * 4,
-            _adr(register, data_address - instruction_address),
+            *_adrp_add(register, instruction_address, data_address),
         )
         image.extend(data)
     return bytes(image), externs, statics

@@ -233,6 +233,9 @@ class _Function:
         #: Names this body declared `global`. They read and write the module's
         #: own storage rather than a local of the same spelling.
         self.module_names: set[str] = set()
+        #: Label names must stay unique for the whole function, so this counter
+        #: is never wound back the way the temporaries are.
+        self.labels = 0
         #: How many trailing parameters have defaults. A call that leaves one
         #: out passes NULL and the body fills it in.
         self.defaults = defaults
@@ -274,6 +277,10 @@ class CApiEmitter:
         self.finallys: list[_Protected] = []
         #: How many loops enclose what is being written.
         self.loop_depth = 0
+        #: How deeply statements are nested in the body being written. Zero
+        #: between the statements of a body, which is where a temporary slot
+        #: stops being live.
+        self.depth = 0
         #: ``(python name, method-table index)`` for each module-level `def`,
         #: which also gets a Python callable so the name can be *used* and
         #: not only called - as a sort key, or with `*args` spread into it.
@@ -323,10 +330,20 @@ class CApiEmitter:
         return target
 
     def temporary(self) -> str:
+        """A slot for one intermediate value.
+
+        The count is wound back at the end of each top-level statement, so the
+        same slot serves every statement that needs one - a temporary is dead
+        once the statement that made it has finished. A fresh slot per
+        subexpression made the entry frame of a 7,000-line module larger than
+        py2bin's whole stack allowance.
+        """
+
         assert self.current is not None
         self.current.temporaries += 1
         name = f"_t{self.current.temporaries}"
-        self.current.locals.append(name)
+        if name not in self.current.locals:
+            self.current.locals.append(name)
         return name
 
     def declare(self, name: str) -> str:
@@ -1219,6 +1236,22 @@ class CApiEmitter:
     # --- statements ------------------------------------------------------
 
     def statement(self, node: ast.stmt, indent: int) -> None:
+        assert self.current is not None
+        self.depth += 1
+        mark = self.current.temporaries
+        try:
+            self.write_statement(node, indent)
+        finally:
+            self.depth -= 1
+            if self.depth == 0:
+                # Back at the top of a body: everything this statement needed
+                # is finished with, so the slots go back. Anything a construct
+                # holds across the statements *inside* it - a `try` keeping the
+                # classes it catches, a `finally` keeping what it will return -
+                # is at a greater depth and is not wound back under it.
+                self.current.temporaries = mark
+
+    def write_statement(self, node: ast.stmt, indent: int) -> None:
         if isinstance(node, ast.Assign):
             self.assignment(node, indent)
         elif isinstance(node, ast.Expr):
@@ -1523,8 +1556,8 @@ class CApiEmitter:
         if node.orelse:
             raise self.fail(node, "a try-else is not translated here yet")
         assert self.current is not None
-        self.current.temporaries += 1
-        number = self.current.temporaries
+        self.current.labels += 1
+        number = self.current.labels
         handler = f"_handler{number}"
         done = f"_after{number}"
         # The classes each clause catches are evaluated here, before the body
@@ -1594,8 +1627,8 @@ class CApiEmitter:
         """
 
         assert self.current is not None
-        self.current.temporaries += 1
-        number = self.current.temporaries
+        self.current.labels += 1
+        number = self.current.labels
         clause = f"_finally{number}"
         landing = f"_finally_raise{number}"
         protection = _Protected(
@@ -1937,8 +1970,11 @@ class CApiEmitter:
         assert self.current is not None
         self.current.temporaries += 1
         name = f"_c{self.current.temporaries}"
-        if name not in self.current.locals:
-            self.current.locals.append("int " + name)
+        # Declared as `int <name>`, so the membership test has to look for that
+        # spelling: comparing the bare name never matched, and a reused slot
+        # was declared a second time.
+        if f"int {name}" not in self.current.locals:
+            self.current.locals.append(f"int {name}")
         return name
 
     def give_back(self, node: ast.Return, indent: int) -> None:
@@ -2497,6 +2533,7 @@ class CApiEmitter:
         )
         self.current, self.handlers = function, []
         self.scope = node.body if isinstance(node.body, list) else []
+        outer_depth, self.depth = self.depth, 0
         # The parameters arrive in a tuple rather than as C arguments, so they
         # are locals here and are declared alongside the rest.
         for name in held:
@@ -2531,6 +2568,7 @@ class CApiEmitter:
                 outer_handlers,
                 outer_scope,
             )
+            self.depth = outer_depth
 
     # --- assembly --------------------------------------------------------
 
