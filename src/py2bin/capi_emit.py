@@ -136,9 +136,14 @@ def _c_string(text: str) -> str:
 class _Function:
     """One Python function being written out as a C function."""
 
-    def __init__(self, name: str, parameters: tuple[str, ...]) -> None:
+    def __init__(
+        self, name: str, parameters: tuple[str, ...], defaults: int = 0
+    ) -> None:
         self.name = name
         self.parameters = parameters
+        #: How many trailing parameters have defaults. A call that leaves one
+        #: out passes NULL and the body fills it in.
+        self.defaults = defaults
         self.locals: list[str] = []
         self.body: list[str] = []
         self.temporaries = 0
@@ -653,18 +658,25 @@ class CApiEmitter:
             target = self.invoke(callable_value, node.args, indent, node.keywords)
             self.emit(f"Py_DecRef({callable_value});", indent)
             return target
-        expected = self.known_functions[node.func.id]
-        if len(node.args) != expected:
+        expected, defaulted = self.known_functions[node.func.id]
+        if not expected - defaulted <= len(node.args) <= expected:
             raise self.fail(
                 node,
-                f"{node.func.id}() takes {expected} argument(s), "
-                f"{len(node.args)} given",
+                f"{node.func.id}() takes {expected - defaulted} to {expected} "
+                f"argument(s), {len(node.args)} given",
             )
         arguments = [self.expression(item, indent) for item in node.args]
+        # A parameter the call leaves out is passed as NULL and the callee puts
+        # its default in - evaluated there rather than here, so the default
+        # expression exists once however many call sites there are.
+        arguments.extend(["(PyObject *)0"] * (expected - len(node.args)))
         target = self.temporary()
         self.emit(f"{target} = f_{node.func.id}({', '.join(arguments)});", indent)
         for argument in arguments:
-            self.emit(f"Py_DecRef({argument});", indent)
+            # An omitted parameter went in as NULL, which is not a reference
+            # and must not be released.
+            if argument != "(PyObject *)0":
+                self.emit(f"Py_DecRef({argument});", indent)
         return self.checked(target, indent)
 
     def invoke_with_keywords(
@@ -1226,14 +1238,16 @@ class CApiEmitter:
                     or arguments.vararg
                     or arguments.kwarg
                     or arguments.kwonlyargs
-                    or arguments.defaults
                 ):
                     raise self.fail(
                         node,
-                        "a decorated function, or one with defaults or "
-                        "*args/**kwargs, is not translated here yet",
+                        "a decorated function, or one taking *args, **kwargs "
+                        "or keyword-only parameters, is not translated here yet",
                     )
-                self.known_functions[node.name] = len(arguments.args)
+                self.known_functions[node.name] = (
+                    len(arguments.args),
+                    len(arguments.defaults),
+                )
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -1251,8 +1265,20 @@ class CApiEmitter:
 
     def write_function(self, node: ast.FunctionDef) -> None:
         parameters = tuple(argument.arg for argument in node.args.args)
-        function = _Function(node.name, parameters)
+        defaults = node.args.defaults
+        function = _Function(node.name, parameters, len(defaults))
         self.current = function
+        # A parameter the call left out arrives as NULL and takes its default
+        # here, before the increments below, so there is one rule for what the
+        # body owns.
+        for offset, default in enumerate(defaults):
+            name = parameters[len(parameters) - len(defaults) + offset]
+            self.emit(f"if (!p_{name}) {{", 1)
+            value = self.expression(default, 2)
+            self.emit(f"    Py_IncRef({value});", 1)
+            self.emit(f"    p_{name} = {value};", 1)
+            self.emit(f"    Py_DecRef({value});", 1)
+            self.emit("}", 1)
         # The body owns its parameters, so rebinding one releases what it held
         # rather than dropping a reference the caller still owns.
         for name in parameters:
