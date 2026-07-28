@@ -1293,3 +1293,54 @@ class WindowsImageReferenceTests(unittest.TestCase):
             position += 1
         self.assertGreater(seen, 0, "no rip-relative references found at all")
         self.assertEqual(outside, 0, f"{outside} references land outside every section")
+
+
+class WindowsCallingConventionTests(unittest.TestCase):
+    """Microsoft x64 hands arguments in a different order, not a shorter one.
+
+    The register table was System V's, and the Windows path took the first
+    four entries of it. That puts the first argument in rdi where a Windows
+    callee reads rcx, so every argument is off by two registers - which shows
+    up as a callee reading whatever happened to be in rcx and, once a pointer
+    lands in rdx, as an instruction pointer somewhere in the heap.
+
+    Tested against the emitted bytes rather than by running anything, because
+    the machine that runs the suite is not the machine that runs the image.
+    """
+
+    #: `mov <register>, [rsp+disp32]`, the instruction that delivers a spilled
+    #: argument to its register.
+    RCX = b"\x48\x8b\x8c\x24"
+    RDX = b"\x48\x8b\x94\x24"
+    RDI = b"\x48\x8b\xbc\x24"
+    RSI = b"\x48\x8b\xb4\x24"
+
+    def _delivered(self, registers: int, shadow: int, count: int) -> bytes:
+        from py2bin.native.ir import IntConstant
+        from py2bin.native.x86_64 import _push_arguments, _X86Refs
+
+        code = bytearray()
+        _push_arguments(
+            code,
+            tuple(IntConstant(index + 1) for index in range(count)),
+            0,
+            _X86Refs(registers=registers, shadow=shadow),
+        )
+        return bytes(code)
+
+    def test_windows_delivers_the_first_two_in_rcx_and_rdx(self):
+        code = self._delivered(registers=4, shadow=32, count=2)
+        self.assertIn(self.RCX, code)
+        self.assertIn(self.RDX, code)
+        self.assertNotIn(self.RDI, code, "rdi is System V's first argument")
+        self.assertNotIn(self.RSI, code, "rsi is System V's second")
+
+    def test_system_v_delivers_the_first_two_in_rdi_and_rsi(self):
+        code = self._delivered(registers=6, shadow=0, count=2)
+        self.assertIn(self.RDI, code)
+        self.assertIn(self.RSI, code)
+
+    def test_windows_reserves_shadow_space(self):
+        # The callee may spill rcx-r9 into it whether or not it has anything
+        # to spill, so the caller allocates it regardless.
+        self.assertIn(b"\x48\x81\xec", self._delivered(4, 32, 1))

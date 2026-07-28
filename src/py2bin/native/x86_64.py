@@ -467,11 +467,22 @@ _LOAD_ARGUMENT = (
 )
 _SPILL = b"\x48\x83\xec\x10\x48\x89\x04\x24"  # sub rsp,16; mov [rsp],rax
 # mov <reg>, [rsp + disp32] for each argument register, in order.
+#: `mov <argument register>, [rsp+disp32]`, in System V's order.
 _LOAD_ARGUMENT_AT = (
     b"\x48\x8b\xbc\x24",  # rdi
     b"\x48\x8b\xb4\x24",  # rsi
     b"\x48\x8b\x94\x24",  # rdx
     b"\x48\x8b\x8c\x24",  # rcx
+    b"\x4c\x8b\x84\x24",  # r8
+    b"\x4c\x8b\x8c\x24",  # r9
+)
+#: The same, in Microsoft x64's order, which is a different order and not just
+#: a shorter one. Taking the first four of the System V table would put the
+#: first argument in rdi, where a Windows callee reads rcx - so the callee gets
+#: whatever happened to be in rcx, and every value is off by two registers.
+_LOAD_ARGUMENT_AT_MS = (
+    b"\x48\x8b\x8c\x24",  # rcx
+    b"\x48\x8b\x94\x24",  # rdx
     b"\x4c\x8b\x84\x24",  # r8
     b"\x4c\x8b\x8c\x24",  # r9
 )
@@ -495,6 +506,9 @@ def _push_arguments(
     count = len(arguments)
     registers = refs.registers
     shadow = refs.shadow
+    # Which convention, by how many registers it hands arguments in. Microsoft
+    # x64 takes four and System V six, and they disagree about which four.
+    loads = _LOAD_ARGUMENT_AT_MS if registers == 4 else _LOAD_ARGUMENT_AT
     for argument in arguments:
         _expression(code, argument, slot_base, refs)
         code.extend(_SPILL)
@@ -512,7 +526,7 @@ def _push_arguments(
             code.extend(b"\x4c\x89\x9c\x24" + struct.pack("<I", destination))
     for index in range(min(count, registers)):
         offset = area + (count - 1 - index) * 16
-        code.extend(_LOAD_ARGUMENT_AT[index] + struct.pack("<I", offset))
+        code.extend(loads[index] + struct.pack("<I", offset))
     return area + count * 16
 
 
