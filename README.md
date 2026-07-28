@@ -681,9 +681,9 @@ A whole application, manim_app (10,100 lines, pywebview + PIL + pyobjc):
 | | py2bin | Nuitka |
 |---|---|---|
 | main binary | **9.2 MB** | 29.6 MB |
-| whole `.app` | **68.4 MB** | 72.6 MB |
+| whole `.app` | **61.2 MB** | 72.6 MB |
 | bare interpreter start | **9.5 ms** | 16.2 ms |
-| start with the app's imports | 53.4 ms | **45.8 ms** |
+| start with the app's imports | 52.1 ms | **44.8 ms** |
 
 The binary is a third the size because Nuitka compiles every module it reaches,
 including the third-party tree, while this compiles the program and ships its
@@ -706,9 +706,41 @@ framework. The 20 MB the binary saves comes back as 7.8 MB of bytecode and
 the `.dSYM` debug companions that some wheels ship - pyobjc alone carries
 3.6 MB of DWARF beside a 1 MB extension.
 
-The native-library gap is what is left. Nuitka ships fewer of PIL's codecs,
-having decided the program cannot reach them; this keeps them all, because
-`Image.init()` can import any plugin and a static walk cannot rule that out.
+The native libraries were the last of it, and two things were wrong. A wheel
+with native dependencies vendors them beside its extension rather than in the
+bundle's library directory - Pillow puts nineteen in `PIL/.dylibs` - and the
+closure only looked in `Contents/lib`, so it never considered them at all.
+And a static walk has to keep every Pillow plugin, because `Image.init()`
+imports whatever is beside it, so each optional codec kept its library.
+`--exclude` is how a caller says what the walk cannot work out: naming
+`PIL.AvifImagePlugin` and `PIL._avif` drops the plugin, the extension, and
+then - now that vendored directories are closed over too - the 2.9 MB library
+behind it. What the program can no longer do is the caller's to judge.
+
+## Compiling the dependency tree does not pay, and it is worth saying why
+
+Nuitka's startup lead is entirely in the import phase: 29.6 ms against 43.9,
+because it runs a module body as compiled C where this unmarshals bytecode and
+interprets it. The obvious answer is to compile the dependencies too, and the
+machinery is already here - a program's own modules are compiled and linked.
+
+Measured, on a 238 KB pure-Python module from site-packages:
+
+| | wall time | on disk |
+|---|---|---|
+| shipped as bytecode | **13.9 ms** | 0.05 MB binary + 0.30 MB `.pyc` |
+| compiled into the binary | 16.2 ms | 10.8 MB binary |
+
+Slower, and 36 times larger. The C this emits for a module body is far bulkier
+than the bytecode it replaces, and executing it is not faster than the
+specialising interpreter - which is the same finding as the call benchmark
+above, in a different place. Matching Nuitka here needs a better code
+generator, not more modules put through this one.
+
+Relative imports are translated now regardless, since they were what stopped
+most real packages from compiling at all: of 120 site-packages modules, 24
+went through before and 74 do now. The remaining refusals are generators,
+`raise ... from`, and starred unpacking.
 
 The two startup rows say where the remaining work is. Getting the interpreter
 up is faster here - there is no bundle to bootstrap, just `Py_Initialize`. The

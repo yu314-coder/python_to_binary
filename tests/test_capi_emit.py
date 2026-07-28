@@ -8,6 +8,7 @@ own semantics - most visibly integers that do not stop at 64 bits.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import os
@@ -22,6 +23,7 @@ import unittest
 from pathlib import Path
 
 from py2bin.capi_emit import (
+    CApiEmitter,
     CApiEmitError,
     python_program_to_capi_c,
     python_to_capi_c,
@@ -2338,3 +2340,62 @@ class CApiCommandLineTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--embed-python needs --app", errors.getvalue())
         self.assertNotIn("Traceback", errors.getvalue())
+
+
+class RelativeImportTests(unittest.TestCase):
+    """`from . import x`, with the dots counted at compile time.
+
+    A relative import is relative to where the importing module *is*, and that
+    is settled once it has been compiled - so the dots need not be carried into
+    the binary. Resolving them here also means no new entry point: asking the
+    interpreter would need `PyImport_ImportModuleLevelObject` and a globals
+    mapping to read `__package__` from, where spelling the answer out needs
+    only the `PyImport_ImportModule` every absolute import already uses.
+    """
+
+    def _imports(self, name: str, origin: str, source: str) -> set[str]:
+        emitter = CApiEmitter(Path("/x/main.py"))
+        written = emitter.program(
+            [
+                (name, ast.parse(source), origin),
+                ("__main__", ast.parse("pass\n"), "/x/main.py"),
+            ]
+        )
+        return set(re.findall(r'PyImport_ImportModule\("([^"]+)"\)', written))
+
+    def test_one_dot_is_the_package_the_module_is_in(self):
+        found = self._imports("pkg.sub.mod", "/x/pkg/sub/mod.py", "from . import helper\n")
+        self.assertIn("pkg.sub", found)
+        # `helper` is read off the package, and imported as a submodule if it
+        # is not an attribute - which is what Python does here too.
+        self.assertIn("pkg.sub.helper", found)
+
+    def test_two_dots_go_one_package_up(self):
+        found = self._imports("pkg.sub.mod", "/x/pkg/sub/mod.py", "from .. import top\n")
+        self.assertIn("pkg", found)
+        self.assertNotIn("pkg.sub", found)
+
+    def test_a_named_module_is_joined_to_the_resolved_package(self):
+        found = self._imports("pkg.sub.mod", "/x/pkg/sub/mod.py", "from .thing import a\n")
+        self.assertIn("pkg.sub.thing", found)
+
+    def test_a_packages_own_init_counts_from_itself(self):
+        # `__package__` for `pkg/sub/__init__.py` is `pkg.sub`, not `pkg`, so
+        # one dot means the package itself rather than its parent.
+        found = self._imports("pkg.sub", "/x/pkg/sub/__init__.py", "from . import inner\n")
+        self.assertIn("pkg.sub", found)
+        self.assertIn("pkg.sub.inner", found)
+
+    def test_a_relative_import_in_a_script_is_refused_as_python_refuses_it(self):
+        with self.assertRaises(CApiEmitError) as caught:
+            self._imports("top", "/x/top.py", "from . import nope\n")
+        self.assertIn("no known parent package", str(caught.exception))
+
+    def test_climbing_past_the_top_is_refused(self):
+        with self.assertRaises(CApiEmitError) as caught:
+            self._imports("pkg.mod", "/x/pkg/mod.py", "from ... import far\n")
+        self.assertIn("beyond top-level package", str(caught.exception))
+
+    def test_an_absolute_import_is_unchanged(self):
+        found = self._imports("pkg.mod", "/x/pkg/mod.py", "from json import loads\n")
+        self.assertIn("json", found)

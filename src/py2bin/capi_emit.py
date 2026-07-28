@@ -438,6 +438,9 @@ class CApiEmitter:
         #: were installed - so a binary that is otherwise complete stops at
         #: `ModuleNotFoundError` for a package that is plainly present.
         self.extra_paths: list[str] = []
+        #: The package the module being compiled belongs to, which is what a
+        #: relative import counts its dots from.
+        self.module_package = ""
         #: Builtin names this module binds for itself. A counted loop is only
         #: written where `range` is certainly the interpreter's own.
         self.shadowed_builtins: set[str] = set()
@@ -2254,6 +2257,39 @@ class CApiEmitter:
             self.checked(target, indent)
             self.publish(bound, target, indent)
 
+    def absolute_module(self, node: ast.ImportFrom) -> str:
+        """The module `from ... import` names, with any dots resolved away.
+
+        A relative import is relative to where the importing module *is*, and
+        that is fixed once it has been compiled - so the dots can be counted
+        here rather than carried into the binary. This is the arithmetic the
+        import system does at run time from `__package__`: one dot means the
+        package the module is in, and each further dot means one package up.
+
+        Resolving it at compile time also means no new entry point. Asking the
+        interpreter to do it needs `PyImport_ImportModuleLevelObject`, with a
+        globals mapping to read `__package__` out of; spelling the answer out
+        needs only the `PyImport_ImportModule` already used by every absolute
+        import.
+        """
+
+        if not node.level:
+            if node.module is None:
+                raise self.fail(node, "this import form is not translated here yet")
+            return node.module
+        if not self.module_package:
+            # The message CPython gives, because the situation is the same one.
+            raise self.fail(
+                node, "attempted relative import with no known parent package"
+            )
+        parts = self.module_package.split(".")
+        if node.level - 1 > len(parts) - 1:
+            raise self.fail(
+                node, "attempted relative import beyond top-level package"
+            )
+        base = ".".join(parts[: len(parts) - (node.level - 1)])
+        return f"{base}.{node.module}" if node.module else base
+
     def import_names(self, node: ast.ImportFrom, indent: int) -> None:
         """`from x import a, b` - import the module, then read the names off it.
 
@@ -2262,13 +2298,10 @@ class CApiEmitter:
         the attribute, exactly as the statement means.
         """
 
-        if node.level:
-            raise self.fail(node, "a relative import is not translated here yet")
-        if node.module is None:
-            raise self.fail(node, "this import form is not translated here yet")
+        spelled = self.absolute_module(node)
         module = self.temporary()
         self.emit(
-            f"{module} = PyImport_ImportModule({_c_string(node.module)});", indent
+            f"{module} = PyImport_ImportModule({_c_string(spelled)});", indent
         )
         self.checked(module, indent)
         for alias in node.names:
@@ -2286,7 +2319,7 @@ class CApiEmitter:
             # that. Python's import system tries the submodule at this point,
             # so this does too, and the failed lookup is cleared first because
             # an exception left set would surface at the next call.
-            dotted = f"{node.module}.{alias.name}"
+            dotted = f"{spelled}.{alias.name}"
             self.emit(f"if (!{target}) {{", indent)
             self.emit("    PyErr_Clear();", indent)
             self.emit(
@@ -4191,6 +4224,14 @@ class CApiEmitter:
         self.known_functions = {}
         self.certain_globals = set()
         self.shadowed_builtins = _shadowed_builtins(tree)
+        # What `__package__` would hold. A package's `__init__` is in itself;
+        # any other module is in the package above it. `__main__` is in none,
+        # which is why a relative import in a script is an error in Python too.
+        self.module_package = (
+            name
+            if origin.replace("\\", "/").endswith("__init__.py")
+            else name.rpartition(".")[0]
+        )
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):

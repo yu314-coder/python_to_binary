@@ -9,7 +9,15 @@ import unittest
 from unittest import mock
 import zipfile
 
-from py2bin.freezer import drop_debug_symbols, zip_bytecode, _frozen_macos_app, _shell_launcher, extract_wheel
+from py2bin.freezer import (
+    _drop_excluded,
+    _frozen_macos_app,
+    _shell_launcher,
+    drop_debug_symbols,
+    drop_unused_libraries,
+    extract_wheel,
+    zip_bytecode,
+)
 from py2bin.native.launcher import macos_shell_launcher
 from py2bin.onefile import _powershell_script, create_onefile
 
@@ -387,3 +395,80 @@ class DebugSymbolTests(unittest.TestCase):
             bundle = Path(directory) / "App.app"
             (bundle / "Contents" / "MacOS").mkdir(parents=True)
             self.assertEqual(drop_debug_symbols(bundle), 0)
+
+
+class VendoredLibraryTests(unittest.TestCase):
+    """A wheel's private `.dylibs`, closed over on its own.
+
+    A wheel with native dependencies ships them beside its extension rather
+    than in the bundle's library directory - Pillow puts nineteen in
+    `PIL/.dylibs`. They answer to the extensions of *their* package, so the
+    closure has to be computed there rather than over the bundle at large,
+    which is what the first version of this missed: it looked only in
+    `Contents/lib`, so excluding a codec removed the extension and left its
+    2.9 MB library sitting beside it.
+    """
+
+    def _package(self, root: Path) -> Path:
+        bundle = root / "App.app"
+        pil = bundle / "Contents" / "Resources" / "site-packages" / "PIL"
+        (pil / ".dylibs").mkdir(parents=True)
+        (pil / ".dylibs" / "libjpeg.62.dylib").write_bytes(b"j" * 4000)
+        (pil / ".dylibs" / "libavif.16.dylib").write_bytes(b"a" * 9000)
+        # The core extension names only the codec it really uses.
+        (pil / "_imaging.cpython-314-darwin.so").write_bytes(
+            b"\xcf\xfa\xed\xfe" + b"@loader_path/.dylibs/libjpeg.62.dylib\0"
+        )
+        (pil / "_avif.cpython-314-darwin.so").write_bytes(
+            b"\xcf\xfa\xed\xfe" + b"@loader_path/.dylibs/libavif.16.dylib\0"
+        )
+        return bundle
+
+    def test_a_vendored_library_still_wanted_is_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self._package(Path(directory))
+            drop_unused_libraries(bundle)
+            dylibs = (
+                bundle / "Contents" / "Resources" / "site-packages" / "PIL" / ".dylibs"
+            )
+            self.assertTrue((dylibs / "libjpeg.62.dylib").is_file())
+            self.assertTrue((dylibs / "libavif.16.dylib").is_file())
+
+    def test_a_vendored_library_whose_extension_went_is_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self._package(Path(directory))
+            pil = bundle / "Contents" / "Resources" / "site-packages" / "PIL"
+            (pil / "_avif.cpython-314-darwin.so").unlink()
+            freed = drop_unused_libraries(bundle)
+            self.assertFalse((pil / ".dylibs" / "libavif.16.dylib").exists())
+            self.assertTrue((pil / ".dylibs" / "libjpeg.62.dylib").is_file())
+        self.assertGreaterEqual(freed, 9000)
+
+
+class ExcludedModuleTests(unittest.TestCase):
+    """Reaching inside a package the walk had to keep whole."""
+
+    def _roots(self, root: Path) -> list[Path]:
+        packages = root / "site-packages"
+        (packages / "PIL").mkdir(parents=True)
+        (packages / "PIL" / "AvifImagePlugin.py").write_text("x = 1\n")
+        (packages / "PIL" / "Image.py").write_text("y = 2\n")
+        (packages / "PIL" / "_avif.cpython-314-darwin.so").write_bytes(b"so" * 50)
+        return [packages]
+
+    def test_both_halves_of_a_codec_can_be_named(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            roots = self._roots(root)
+            freed = _drop_excluded(roots, ("PIL.AvifImagePlugin", "PIL._avif"))
+            pil = root / "site-packages" / "PIL"
+            self.assertFalse((pil / "AvifImagePlugin.py").exists())
+            self.assertFalse(list(pil.glob("_avif.*.so")))
+            # Everything not named is untouched.
+            self.assertTrue((pil / "Image.py").is_file())
+        self.assertGreater(freed, 0)
+
+    def test_naming_something_absent_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots = self._roots(Path(directory))
+            self.assertEqual(_drop_excluded(roots, ("PIL.NotThere",)), 0)

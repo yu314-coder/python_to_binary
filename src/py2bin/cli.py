@@ -200,6 +200,19 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     capi_parser.add_argument(
+        "--exclude",
+        action="append",
+        metavar="MODULE",
+        help=(
+            "drop this module from the bundle even though the walk kept its "
+            "package, and with it anything only it referred to. Repeatable. "
+            "For an optional codec, name both halves - PIL.AvifImagePlugin "
+            "and PIL._avif - since the extension is what the library hangs "
+            "off. What the program can then no longer do is the caller's to "
+            "judge"
+        ),
+    )
+    capi_parser.add_argument(
         "--zip-stdlib",
         nargs="?",
         const="compress",
@@ -1019,7 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
                         prune_unreachable,
                     )
 
-                    freed = prune_unreachable(output, entry)
+                    freed = prune_unreachable(
+                        output, entry, tuple(args.exclude or ())
+                    )
                     # Debug companions are nobody's dependency, so the order
                     # against the other two does not matter.
                     freed += drop_debug_symbols(output)

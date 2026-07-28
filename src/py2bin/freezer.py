@@ -214,7 +214,9 @@ def _module_imports(source: str) -> set[str]:
     return found
 
 
-def prune_unreachable(bundle: Path, entry: Path) -> int:
+def prune_unreachable(
+    bundle: Path, entry: Path, excluded: tuple[str, ...] = ()
+) -> int:
     """Drop bundled modules the program cannot import.
 
     Only a fraction of a Python installation is ever reached: of nearly twelve
@@ -227,6 +229,15 @@ def prune_unreachable(bundle: Path, entry: Path) -> int:
     `_REACHED_BY_NAME` - and a whole package is kept as soon as anything in it
     is reached, because a package's modules routinely import their siblings in
     ways that only run-time knows about.
+
+    `excluded` is where a caller says what the walk cannot work out for itself.
+    Pillow is the case that matters: `Image.init()` imports every plugin beside
+    it, so a static walk has to keep them all, and each one that is a native
+    codec drags its library along - AVIF alone is 2.9 MB in a bundle whose
+    program only ever opens a PNG. Naming a module here drops it and anything
+    only it referred to. The consequence belongs to whoever passes it: a format
+    whose plugin is gone stops being readable, which for Pillow is an
+    `UnidentifiedImageError` rather than a crash.
     """
 
     import shutil
@@ -288,7 +299,7 @@ def prune_unreachable(bundle: Path, entry: Path) -> int:
                         settled = False
 
     keep_packages = {name.split(".")[0] for name in seen}
-    freed = 0
+    freed = _drop_excluded(roots, excluded)
     for root in roots:
         if not root.is_dir():
             continue
@@ -462,15 +473,37 @@ def drop_unused_libraries(bundle: Path) -> int:
     question was.
     """
 
-    libraries = bundle / "Contents" / "lib"
-    if not libraries.is_dir():
-        return 0
-    before = sum(f.stat().st_size for f in libraries.glob("*.dylib"))
-    wanted: set[str] = set()
-    for module in bundle.rglob("*.so"):
-        wanted |= _referenced_libraries(module, libraries)
-    _drop_unreferenced_libraries(libraries, None, wanted)
-    return before - sum(f.stat().st_size for f in libraries.glob("*.dylib"))
+    freed = 0
+    # The bundle's own carried libraries, and then every private directory a
+    # wheel brought its own along in. A wheel with native dependencies vendors
+    # them beside the extension - Pillow puts nineteen in `PIL/.dylibs` - and
+    # those answer to the extensions of *their* package rather than to the
+    # bundle at large, so each is closed over separately.
+    places = [bundle / "Contents" / "lib"]
+    places.extend(
+        sorted(
+            place
+            for place in bundle.rglob(".dylibs")
+            if place.is_dir()
+        )
+    )
+    for libraries in places:
+        if not libraries.is_dir():
+            continue
+        before = sum(f.stat().st_size for f in libraries.glob("*.dylib"))
+        wanted: set[str] = set()
+        # An extension inside the package the libraries belong to, or - for
+        # the bundle's own - anywhere in it.
+        holders = (
+            bundle.rglob("*.so")
+            if libraries.parent == bundle / "Contents" / "lib"
+            else libraries.parent.rglob("*.so")
+        )
+        for module in holders:
+            wanted |= _referenced_libraries(module, libraries)
+        _drop_unreferenced_libraries(libraries, None, wanted)
+        freed += before - sum(f.stat().st_size for f in libraries.glob("*.dylib"))
+    return freed
 
 
 def drop_debug_symbols(bundle: Path) -> int:
@@ -573,6 +606,49 @@ def zip_bytecode(bundle: Path, compress: bool = True) -> int:
         if directory.is_dir() and not any(directory.iterdir()):
             directory.rmdir()
     return before - archive.stat().st_size
+
+
+def _drop_excluded(roots: list[Path], excluded: tuple[str, ...]) -> int:
+    """Delete the modules a caller named, wherever in a kept package they are.
+
+    The walk keeps a package whole, which is right - its modules import their
+    siblings in ways only run-time knows - but it means the only way to reach
+    inside one is to be told. A name may be either half of a package: the
+    Python module `PIL.AvifImagePlugin` or the extension `PIL._avif` that it
+    loads, and dropping the codec needs both, since the extension is what the
+    2.9 MB library is attached to.
+    """
+
+    import shutil
+
+    freed = 0
+    for name in excluded:
+        parts = name.split(".")
+        for root in roots:
+            place = root.joinpath(*parts[:-1])
+            if not place.is_dir():
+                continue
+            last = parts[-1]
+            for found in (
+                place / last,
+                place / f"{last}.py",
+                place / f"{last}.pyc",
+                # An extension carries its interpreter and platform in the
+                # name, so it is matched by stem rather than spelled out.
+                *place.glob(f"{last}.*.so"),
+                *place.glob(f"{last}.so"),
+            ):
+                if not found.exists():
+                    continue
+                if found.is_dir():
+                    freed += sum(
+                        f.stat().st_size for f in found.rglob("*") if f.is_file()
+                    )
+                    shutil.rmtree(found, ignore_errors=True)
+                else:
+                    freed += found.stat().st_size
+                    found.unlink()
+    return freed
 
 
 def _referenced_libraries(binary: Path, libraries: Path) -> set[str]:
