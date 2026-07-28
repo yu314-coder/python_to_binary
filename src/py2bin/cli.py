@@ -200,6 +200,17 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     capi_parser.add_argument(
+        "--bundle-site",
+        action="append",
+        default=[],
+        metavar="DIR",
+        type=Path,
+        help=(
+            "copy DIR into the .app as Contents/Resources/site-packages, "
+            "leaving out what does not run: tests, build metadata, pip"
+        ),
+    )
+    capi_parser.add_argument(
         "--site",
         action="append",
         default=[],
@@ -962,10 +973,17 @@ def main(argv: list[str] | None = None) -> int:
                     _embedded_python_path() if args.embed_python else None
                 ),
             )
+            if args.bundle_site:
+                from .freezer import bundle_site_packages
+
+                bundle_site_packages(output, tuple(args.bundle_site))
             if args.embed_python:
                 from .freezer import embed_cpython_in_app
 
                 carried = embed_cpython_in_app(output)
+                from .freezer import compile_bundle_sources
+
+                compile_bundle_sources(output)
                 print(
                     f"carried the interpreter into the bundle "
                     f"({carried} bytes)",

@@ -79,6 +79,100 @@ _WEB_ASSET_KINDS = {
 }
 
 
+#: Parts of a CPython installation that exist to *build* things, to test
+#: itself, or to document itself. A compiled application runs none of them, and
+#: together they are the difference between a bundle that is four times the
+#: size of what other compilers produce and one that is comparable.
+_UNUSED_AT_RUNTIME = (
+    "site-packages",     # the application's own, added separately
+    "config-*",          # libpython.a and friends: for building extensions
+    "ensurepip",         # installing pip into a venv
+    "pydoc_data",        # topic text for the help() browser
+    "idlelib",           # the bundled editor
+    "turtledemo",
+    "test",
+    "tests",
+    "lib2to3",
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    "*.a",               # static libraries
+    "*.exe",
+)
+
+
+def bundle_site_packages(bundle: Path, sources: tuple[Path, ...]) -> None:
+    """Copy the application's packages into the bundle, without their baggage.
+
+    A site-packages directory carries the test suites, the build metadata and
+    pip itself. None of it runs; together, for one small application, it was
+    29 MB of 66.
+    """
+
+    import shutil
+
+    destination = bundle / "Contents" / "Resources" / "site-packages"
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        for item in source.iterdir():
+            if any(
+                item.match(pattern)
+                for pattern in (*_UNUSED_AT_RUNTIME, "pip", "*Test", "*.dist-info")
+            ):
+                continue
+            target = destination / item.name
+            if item.is_dir():
+                shutil.copytree(
+                    item,
+                    target,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(*_UNUSED_AT_RUNTIME),
+                    symlinks=True,
+                )
+            else:
+                shutil.copy2(item, target)
+
+
+def compile_bundle_sources(bundle: Path) -> int:
+    """Replace the bundled `.py` files with bytecode, in place.
+
+    Python imports a lone `.pyc` sitting where the `.py` would be, so nothing
+    needs to know this happened. It is smaller, and it means the first run does
+    not compile the standard library into a bundle it usually cannot write to.
+
+    The application's own modules are not here at all - they are machine code
+    inside the executable. This is only what the program *imports*.
+    """
+
+    import compileall
+    import py_compile
+
+    saved = 0
+    for directory in (bundle / "Contents" / "lib", bundle / "Contents" / "Resources"):
+        if not directory.is_dir():
+            continue
+        for source in list(directory.rglob("*.py")):
+            target = source.with_suffix(".pyc")
+            try:
+                py_compile.compile(
+                    str(source),
+                    cfile=str(target),
+                    doraise=True,
+                    optimize=2,
+                    invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+                )
+            except (py_compile.PyCompileError, SyntaxError, ValueError, OSError):
+                # A file this interpreter cannot compile - a Python 2 relic in
+                # a package's test data, say - is left as source rather than
+                # dropped, because something may still import it.
+                continue
+            saved += source.stat().st_size - target.stat().st_size
+            source.unlink()
+        for cache in list(directory.rglob("__pycache__")):
+            shutil.rmtree(cache, ignore_errors=True)
+    return saved
+
+
 def embed_cpython_in_app(bundle: Path) -> int:
     """Put this CPython inside a compiled ``.app`` so the bundle can travel.
 
@@ -117,14 +211,13 @@ def embed_cpython_in_app(bundle: Path) -> int:
         shutil.rmtree(carried_version)
     carried_version.mkdir(parents=True)
     shutil.copy2(dylib, carried_version / dylib.name)
-    resources = version_directory / "Resources"
-    if resources.is_dir():
-        shutil.copytree(
-            resources,
-            carried_version / "Resources",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-            symlinks=True,
-        )
+    # Only the file the signature seals. The framework's Resources directory
+    # is another 76 MB - a second copy of the standard library and the Tcl/Tk
+    # frameworks - and nothing loads it from here.
+    plist = version_directory / "Resources" / "Info.plist"
+    if plist.is_file():
+        (carried_version / "Resources").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(plist, carried_version / "Resources" / "Info.plist")
 
     version = sysconfig.get_config_var("py_version_short")
     standard_library = Path(sysconfig.get_path("stdlib"))
@@ -136,10 +229,7 @@ def embed_cpython_in_app(bundle: Path) -> int:
     shutil.copytree(
         standard_library,
         destination,
-        ignore=shutil.ignore_patterns(
-            "site-packages", "test", "tests", "idlelib", "turtledemo",
-            "__pycache__", "*.pyc",
-        ),
+        ignore=shutil.ignore_patterns(*_UNUSED_AT_RUNTIME),
     )
     # The shared libraries python.org's own extension modules link against -
     # OpenSSL for `ssl` and `hashlib`, and the compression libraries - are
@@ -153,8 +243,33 @@ def embed_cpython_in_app(bundle: Path) -> int:
     if source_libraries.is_dir():
         for library in source_libraries.glob("*.dylib"):
             shutil.copy2(library, carried_libraries / library.name)
+    wanted: set[str] = set()
     for module in bundle.rglob("*.so"):
-        _point_at_carried_libraries(module, prefix, carried_libraries)
+        wanted |= _point_at_carried_libraries(module, prefix, carried_libraries)
+    # A carried library may need another one - libssl needs libcrypto - so the
+    # closure is followed before deciding what to drop.
+    pending = list(wanted)
+    while pending:
+        library = carried_libraries / pending.pop()
+        if not library.is_file():
+            continue
+        found = _point_at_carried_libraries(library, prefix, carried_libraries)
+        pending.extend(found - wanted)
+        wanted |= found
+    for library in carried_libraries.glob("*.dylib"):
+        # The framework ships curses, ncurses, panel, a second copy of
+        # libpython and more. Nothing in a compiled application loads them,
+        # and together they were 18 of the 23 MB this was carrying.
+        if library.name not in wanted:
+            library.unlink()
+    # Thinned last, so the rewriting above worked on the file as shipped.
+    for binary in (
+        *bundle.rglob("*.so"),
+        *bundle.rglob("*.dylib"),
+        carried_version / dylib.name,
+    ):
+        if binary.is_file():
+            _thin_to_arm64(binary)
     return sum(
         item.stat().st_size
         for item in (
@@ -166,9 +281,45 @@ def embed_cpython_in_app(bundle: Path) -> int:
     )
 
 
+#: The architecture a darwin-arm64 bundle runs. CPU_TYPE_ARM64 is
+#: CPU_TYPE_ARM (12) with the 64-bit ABI bit set.
+_CPU_TYPE_ARM64 = 0x0100000C
+
+
+def _thin_to_arm64(binary: Path) -> bool:
+    """Keep only the arm64 slice of a universal file. True if it changed.
+
+    Every slice of a universal binary carries its own signature, so lifting one
+    out yields a thin file that is still signed - which is why this is safe on
+    the interpreter's own library, where an invalid signature is refused.
+
+    Half of what a Mach-O universal binary weighs is an architecture this
+    bundle will never execute.
+    """
+
+    import struct
+
+    data = binary.read_bytes()
+    if len(data) < 8 or data[:4] not in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        return False
+    wide = data[:4] == b"\xca\xfe\xba\xbf"
+    count = struct.unpack_from(">I", data, 4)[0]
+    entry = 32 if wide else 20
+    for index in range(count):
+        at = 8 + index * entry
+        if wide:
+            cpu, _sub, offset, size = struct.unpack_from(">IIQQ", data, at)
+        else:
+            cpu, _sub, offset, size = struct.unpack_from(">IIII", data, at)
+        if cpu == _CPU_TYPE_ARM64:
+            binary.write_bytes(data[offset : offset + size])
+            return True
+    return False
+
+
 def _point_at_carried_libraries(
     module: Path, prefix: str, libraries: Path
-) -> None:
+) -> set[str]:
     """Rewrite absolute library references in one extension module.
 
     The path is patched *in place*, which is what makes this possible at all:
@@ -184,20 +335,21 @@ def _point_at_carried_libraries(
 
     data = bytearray(module.read_bytes())
     if prefix.encode() not in data:
-        return
+        return set()
     depth = len(module.parent.relative_to(libraries.parent).parts)
     reach = "/".join([".."] * depth) or "."
-    changed = False
+    referenced: set[str] = set()
     for library in libraries.glob("*.dylib"):
         old = f"{prefix}{library.name}".encode()
         new = f"@loader_path/{reach}/lib/{library.name}".encode()
-        if len(new) > len(old):
+        if len(new) > len(old) or old not in data:
             continue
         while (at := data.find(old)) >= 0:
             data[at : at + len(old)] = new + b"\0" * (len(old) - len(new))
-            changed = True
-    if changed:
+        referenced.add(library.name)
+    if referenced:
         module.write_bytes(bytes(data))
+    return referenced
 
 
 def _required_suffix(path: Path, suffix: str) -> Path:

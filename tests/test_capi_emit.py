@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import sysconfig
 import re
 import subprocess
 import sys
@@ -1772,6 +1773,20 @@ class CApiEmitTests(unittest.TestCase):
                 python_dylib=_embedded_python_path(),
             )
             embed_cpython_in_app(bundle)
+            # What is carried is what runs: no build-time pieces, no dead
+            # architecture, no libraries nothing references.
+            carried = bundle / "Contents" / "lib" / f"python{sysconfig.get_config_var('py_version_short')}"
+            self.assertFalse(list(carried.glob("config-*")))
+            self.assertFalse((carried / "ensurepip").exists())
+            interpreter = (
+                bundle / "Contents" / "Frameworks" / "Python.framework"
+            )
+            thin = subprocess.run(
+                ["file", *[str(x) for x in interpreter.rglob("Python")]],
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertNotIn("universal binary", thin)
 
             executable = bundle / "Contents" / "MacOS" / "Program"
             loaded = subprocess.run(

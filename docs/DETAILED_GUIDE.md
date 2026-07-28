@@ -320,6 +320,32 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**What a self-contained bundle should not carry.** The first working one was
+293 MB against Nuitka's 73 MB for the same application, which is not a
+defensible ratio. Four things accounted for nearly all of it, and none of them
+run:
+
+- *The framework's `Resources` directory*, 76 MB - a second copy of the
+  standard library and the Tcl/Tk frameworks. Only `Info.plist` is needed,
+  because that is the file the interpreter's signature seals.
+- *`config-*`*, 29 MB of static library and headers for building extensions.
+- *The dead architecture.* 260 of the carried binaries were universal, and
+  half of every one of them is x86_64 that an arm64 bundle never executes.
+  Each slice of a universal file carries its own signature, so lifting the
+  arm64 one out gives a thin file that is still signed.
+- *Libraries nothing references.* The framework ships ncurses, panel, form,
+  menu and a second copy of libpython; only the closure actually named by some
+  extension is kept - libssl pulls in libcrypto, and the rest go.
+
+The `.py` files are replaced by bytecode in place, which is smaller and means
+the first run does not try to compile the standard library into a bundle it
+cannot write to.
+
+That lands at 86 MB against Nuitka's 73. The remaining difference is
+structural rather than waste: Nuitka compiles the *dependency tree* as well, so
+it carries PIL in 872 KB where this carries 13 MB of source. Closing it means
+compiling third-party packages, not deleting more.
+
 **A generator expression is gathered eagerly but handed back as an iterator.**
 The gathering is a deliberate trade, stated where it is made. Handing back the
 *list* was not a trade, it was a mistake: a list answers `for` and `sum()`
