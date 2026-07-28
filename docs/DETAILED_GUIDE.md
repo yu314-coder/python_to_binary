@@ -249,6 +249,32 @@ Python rather than a re-implementation of the mini-language; `!r`, `!s` and
 evaluates all of its arguments before any of it runs. Interleaving the two let
 `print("value:", loud())` write `value: ` before `loud()` spoke.
 
+**`finally` runs on every way out of the region it protects**, and there are
+five: falling off the end, an exception nothing caught, `return`, `break` and
+`continue`. Writing the clause out at each of them would put five copies of it
+in the C, so each exit instead records *why* it is leaving in an int and jumps
+to the one clause, which runs and then does what the reason says. A `return`
+crossing two clauses forwards through both in order. A `break` routes through
+the clause only when the loop it leaves is outside the protected region - one
+opened inside it is a loop the break can leave directly.
+
+The exception is **taken** before the clause runs. CPython refuses to build
+anything Python-side while one is set, so a clause that so much as called a
+method would fail with "returned a result with an exception set".
+`PyErr_SetRaisedException` puts the same object back afterwards, traceback
+intact, which is why it is the right partner for `PyErr_GetRaisedException`
+rather than reconstructing the exception from its type and value.
+
+**A module-level `def` is also a value.** The `def` itself compiles to a plain
+C function taking its arguments in registers, which is the fast shape and the
+one an ordinary call uses - but a C function is not a Python object, so
+`sorted(xs, key=weight)` had nothing to pass and `weight(*row)` had no way to
+say how many arguments it was passing. Each `def` therefore also gets a thin
+wrapper of the shape CPython calls, which unpacks the tuple and calls the real
+function; both spellings reach the same body. The arguments are borrowed from
+the tuple and passed on as they are, which nets to zero because a callee
+increments what it is given on entry and releases it on the way out.
+
 **A class is `type(name, bases, namespace)`**, so inheritance, the method
 resolution order, `isinstance`, `__init__` and every other dunder are the
 interpreter's own machinery rather than a re-implementation. Each method is a
@@ -1281,7 +1307,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 60 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 61 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

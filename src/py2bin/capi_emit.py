@@ -96,6 +96,7 @@ extern void PyErr_SetObject(PyObject *exception, PyObject *value);
 extern PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
 extern void PyErr_Clear(void);
 extern PyObject *PyErr_GetRaisedException(void);
+extern void PyErr_SetRaisedException(PyObject *exception);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -155,6 +156,34 @@ def _c_string(text: str) -> str:
     return "".join(out)
 
 
+#: Why a protected region is being left. `finally` runs the same clause for
+#: every one of them and then does what the reason says.
+_RETURNING = 1
+_PROPAGATING = 2
+_BREAKING = 3
+_CONTINUING = 4
+
+
+class _Protected:
+    """One `finally` clause and the storage its region leaves through."""
+
+    def __init__(self, label: str, why: str, answer: str, loop_depth: int) -> None:
+        self.label = label
+        #: The C int holding why the region is being left.
+        self.why = why
+        #: Where a `return` inside the region puts its value until the clause
+        #: has run.
+        self.answer = answer
+        #: How many loops were open when the region started. A `break` inside
+        #: it belongs to this clause only when no loop opened since - one that
+        #: did is a loop the break can leave directly.
+        self.loop_depth = loop_depth
+        #: Which reasons the region actually uses, so the clause tests for
+        #: those and no others. `break;` written where no loop encloses it is
+        #: not valid C.
+        self.reasons: set[int] = set()
+
+
 class _Function:
     """One Python function being written out as a C function."""
 
@@ -212,6 +241,17 @@ class CApiEmitter:
         #: The exception each enclosing `except` clause is handling, innermost
         #: last. A bare `raise` sets the last one again.
         self.handling: list[str] = []
+        #: One entry per enclosing `finally`, innermost last. Every way out of
+        #: the region it protects goes through it first, so `return`, `break`
+        #: and `continue` record why they are leaving and jump to it rather
+        #: than leaving directly.
+        self.finallys: list[_Protected] = []
+        #: How many loops enclose what is being written.
+        self.loop_depth = 0
+        #: ``(python name, method-table index)`` for each module-level `def`,
+        #: which also gets a Python callable so the name can be *used* and
+        #: not only called - as a sort key, or with `*args` spread into it.
+        self.value_functions: list[tuple[str, int]] = []
 
     # --- helpers ---------------------------------------------------------
 
@@ -676,8 +716,14 @@ class CApiEmitter:
         self.emit(f"{target} = PyList_New(0LL);", indent)
         self.checked(target, indent)
         for element in node.elts:
-            value = self.expression(element, indent)
-            self.emit(f"PyList_Append({target}, {value});", indent)
+            if isinstance(element, ast.Starred):
+                # `[*xs, 3]` - extend rather than append, which is the same
+                # iteration Python does over whatever the object offers.
+                value = self.expression(element.value, indent)
+                self.call_method(target, "extend", [value], indent)
+            else:
+                value = self.expression(element, indent)
+                self.emit(f"PyList_Append({target}, {value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
         return target
 
@@ -770,7 +816,12 @@ class CApiEmitter:
         self.checked(target, indent)
         for key_node, value_node in zip(node.keys, node.values):
             if key_node is None:
-                raise self.fail(node, "`**` in a dict literal is not translated here")
+                # `{**base, "k": 1}` - update, so a later key wins, as in
+                # Python.
+                value = self.expression(value_node, indent)
+                self.call_method(target, "update", [value], indent)
+                self.emit(f"Py_DecRef({value});", indent)
+                continue
             key = self.expression(key_node, indent)
             value = self.expression(value_node, indent)
             self.emit(f"PyDict_SetItem({target}, {key}, {value});", indent)
@@ -906,7 +957,10 @@ class CApiEmitter:
             self.emit(f"{target} = PyObject_Str({value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
             return self.checked(target, indent)
-        if node.func.id not in self.known_functions:
+        spread = any(isinstance(item, ast.Starred) for item in node.args) or any(
+            keyword.arg is None for keyword in node.keywords
+        )
+        if node.func.id not in self.known_functions or spread:
             assert self.current is not None
             if self.reference(node.func.id) is not None:
                 # A name the program bound - an imported one, or a value
@@ -944,6 +998,80 @@ class CApiEmitter:
             if argument != "(PyObject *)0":
                 self.emit(f"Py_DecRef({argument});", indent)
         return self.checked(target, indent)
+
+    def invoke_spread(
+        self, callable_value: str, args: list, keywords: list, indent: int
+    ) -> str:
+        """`f(a, *rest, k=1, **more)` - the argument count is not known here.
+
+        The positional part is gathered in a list, because a list is the thing
+        that grows: `*rest` extends it with whatever the object yields, which
+        is the same iteration Python does. `tuple()` of it is what
+        `PyObject_Call` wants. The keywords are a dict for the same reason -
+        `**more` updates it, and a later key wins, as it does in Python.
+        """
+
+        gathered = self.temporary()
+        self.emit(f"{gathered} = PyList_New(0LL);", indent)
+        self.checked(gathered, indent)
+        for item in args:
+            if isinstance(item, ast.Starred):
+                value = self.expression(item.value, indent)
+                self.call_method(gathered, "extend", [value], indent)
+            else:
+                value = self.expression(item, indent)
+                self.emit(f"PyList_Append({gathered}, {value});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+        maker = self.builtin("tuple", indent)
+        holder = self.temporary()
+        self.emit(f"{holder} = PyObject_CallOneArg({maker}, {gathered});", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.emit(f"Py_DecRef({gathered});", indent)
+        self.checked(holder, indent)
+        mapping = self.temporary()
+        self.emit(f"{mapping} = PyDict_New();", indent)
+        self.checked(mapping, indent)
+        for keyword in keywords:
+            value = self.expression(keyword.value, indent)
+            if keyword.arg is None:
+                self.call_method(mapping, "update", [value], indent)
+            else:
+                key = self.temporary()
+                self.emit(
+                    f"{key} = PyUnicode_FromString({_c_string(keyword.arg)});", indent
+                )
+                self.checked(key, indent)
+                self.emit(f"PyDict_SetItem({mapping}, {key}, {value});", indent)
+                self.emit(f"Py_DecRef({key});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+        target = self.temporary()
+        self.emit(
+            f"{target} = PyObject_Call({callable_value}, {holder}, {mapping});", indent
+        )
+        self.emit(f"Py_DecRef({holder});", indent)
+        self.emit(f"Py_DecRef({mapping});", indent)
+        return self.checked(target, indent)
+
+    def call_method(
+        self, owner: str, name: str, arguments: list[str], indent: int
+    ) -> None:
+        """Call a method of an already-evaluated object for its effect."""
+
+        method = self.temporary()
+        self.emit(
+            f"{method} = PyObject_GetAttrString({owner}, {_c_string(name)});", indent
+        )
+        self.checked(method, indent)
+        outcome = self.temporary()
+        if len(arguments) == 1:
+            self.emit(
+                f"{outcome} = PyObject_CallOneArg({method}, {arguments[0]});", indent
+            )
+        else:
+            self.emit(f"{outcome} = PyObject_CallNoArgs({method});", indent)
+        self.emit(f"Py_DecRef({method});", indent)
+        self.checked(outcome, indent)
+        self.emit(f"Py_DecRef({outcome});", indent)
 
     def invoke_with_keywords(
         self, callable_value: str, args: list, keywords: list, indent: int
@@ -1008,6 +1136,10 @@ class CApiEmitter:
         longer owns. PyDict_SetItem does not steal, so those are released.
         """
 
+        if any(isinstance(item, ast.Starred) for item in args) or any(
+            keyword.arg is None for keyword in keywords
+        ):
+            return self.invoke_spread(callable_value, args, keywords, indent)
         if keywords:
             return self.invoke_with_keywords(callable_value, args, keywords, indent)
         target = self.temporary()
@@ -1065,9 +1197,15 @@ class CApiEmitter:
         elif isinstance(node, ast.AugAssign):
             self.augmented(node, indent)
         elif isinstance(node, ast.Break):
-            self.emit("break;", indent)
+            if self.finallys and self.finallys[-1].loop_depth == self.loop_depth:
+                self.leave_through_finally(_BREAKING, indent)
+            else:
+                self.emit("break;", indent)
         elif isinstance(node, ast.Continue):
-            self.emit("continue;", indent)
+            if self.finallys and self.finallys[-1].loop_depth == self.loop_depth:
+                self.leave_through_finally(_CONTINUING, indent)
+            else:
+                self.emit("continue;", indent)
         elif isinstance(node, ast.Pass):
             pass
         elif isinstance(node, ast.ClassDef):
@@ -1305,7 +1443,8 @@ class CApiEmitter:
         """
 
         if node.finalbody:
-            raise self.fail(node, "a finally clause is not translated here yet")
+            self.protected(node, indent)
+            return
         if node.orelse:
             raise self.fail(node, "a try-else is not translated here yet")
         assert self.current is not None
@@ -1361,6 +1500,91 @@ class CApiEmitter:
             self.emit(self.failure(), indent)
         self.emit(f"{done}:", 0)
         self.emit(";", indent)
+
+    def protected(self, node: ast.Try, indent: int) -> None:
+        """`try: ... finally: ...` - every way out goes through the clause.
+
+        There are four ways out of the protected region and the clause runs
+        for all of them: falling off the end, an exception nothing caught,
+        `return`, and `break`/`continue`. Each records *why* it is leaving in
+        an int and jumps to the clause, which runs once and then does what the
+        reason says. Writing the clause out at each exit instead would put a
+        copy of it in four places.
+
+        The exception is **taken** before the clause runs. CPython refuses to
+        build anything Python-side while one is set, so a clause that so much
+        as calls a method would fail with "returned a result with an exception
+        set". `PyErr_SetRaisedException` puts the same object back afterwards,
+        traceback intact.
+        """
+
+        assert self.current is not None
+        self.current.temporaries += 1
+        number = self.current.temporaries
+        clause = f"_finally{number}"
+        landing = f"_finally_raise{number}"
+        protection = _Protected(
+            clause, self.temporary_flag(), self.temporary(), self.loop_depth
+        )
+        held = self.temporary()
+        self.emit(f"{protection.why} = 0;", indent)
+        self.emit(f"{protection.answer} = 0;", indent)
+        self.emit(f"{held} = 0;", indent)
+        # Anything failing inside the region lands here, which is also where
+        # the `except` clauses send what they did not match.
+        self.handlers.append(landing)
+        self.finallys.append(protection)
+        try:
+            if node.handlers or node.orelse:
+                inner = ast.copy_location(
+                    ast.Try(
+                        body=node.body,
+                        handlers=node.handlers,
+                        orelse=node.orelse,
+                        finalbody=[],
+                    ),
+                    node,
+                )
+                self.guarded(inner, indent)
+            else:
+                for statement in node.body:
+                    self.statement(statement, indent)
+        finally:
+            self.finallys.pop()
+            self.handlers.pop()
+        self.emit(f"goto {clause};", indent)
+        self.emit(f"{landing}:", 0)
+        self.emit(f"{held} = PyErr_GetRaisedException();", indent)
+        self.emit(f"{protection.why} = {_PROPAGATING};", indent)
+        protection.reasons.add(_PROPAGATING)
+        # Falls straight into the clause, which is the point: the exception
+        # path and the ordinary path run the same code.
+        self.emit(f"{clause}:", 0)
+        for statement in node.finalbody:
+            self.statement(statement, indent)
+        if _PROPAGATING in protection.reasons:
+            self.emit(f"if ({protection.why} == {_PROPAGATING}) {{", indent)
+            # It steals the reference, so nothing is released after it.
+            self.emit(f"PyErr_SetRaisedException({held});", indent + 1)
+            self.emit(self.failure(), indent + 1)
+            self.emit("}", indent)
+        if _RETURNING in protection.reasons:
+            self.emit(f"if ({protection.why} == {_RETURNING}) {{", indent)
+            if self.finallys:
+                # Another clause encloses this one, and it has to run too.
+                outer = self.finallys[-1]
+                outer.reasons.add(_RETURNING)
+                self.emit(f"{outer.answer} = {protection.answer};", indent + 1)
+                self.emit(f"{outer.why} = {_RETURNING};", indent + 1)
+                self.emit(f"goto {outer.label};", indent + 1)
+            else:
+                self.release_locals(indent + 1)
+                self.emit(f"return {protection.answer};", indent + 1)
+            self.emit("}", indent)
+        if _BREAKING in protection.reasons:
+            self.emit(f"if ({protection.why} == {_BREAKING}) break;", indent)
+        if _CONTINUING in protection.reasons:
+            self.emit(f"if ({protection.why} == {_CONTINUING}) continue;", indent)
 
     def bind_exception(self, clause: ast.ExceptHandler, indent: int) -> str:
         """Take the exception, binding it too when the clause names it.
@@ -1577,8 +1801,12 @@ class CApiEmitter:
         self.emit(f"{decision} = PyObject_IsTrue({test});", indent + 1)
         self.emit(f"Py_DecRef({test});", indent + 1)
         self.emit(f"if (!{decision}) break;", indent + 1)
-        for statement in node.body:
-            self.statement(statement, indent + 1)
+        self.loop_depth += 1
+        try:
+            for statement in node.body:
+                self.statement(statement, indent + 1)
+        finally:
+            self.loop_depth -= 1
         self.emit("}", indent)
 
     def for_loop(self, node: ast.For, indent: int) -> None:
@@ -1621,8 +1849,12 @@ class CApiEmitter:
         else:
             self.emit(f"if ({target}) Py_DecRef({target});", indent + 1)
             self.emit(f"{target} = {item};", indent + 1)
-        for statement in node.body:
-            self.statement(statement, indent + 1)
+        self.loop_depth += 1
+        try:
+            for statement in node.body:
+                self.statement(statement, indent + 1)
+        finally:
+            self.loop_depth -= 1
         self.emit("}", indent)
         self.emit(f"Py_DecRef({iterator});", indent)
 
@@ -1642,8 +1874,25 @@ class CApiEmitter:
             if node.value is None
             else self.expression(node.value, indent)
         )
+        if self.finallys:
+            # Leaving through a `finally` is not leaving yet: the value is put
+            # aside, the reason recorded, and the clause runs first.
+            self.leave_through_finally(_RETURNING, indent, value)
+            return
         self.release_locals(indent)
         self.emit(f"return {value};", indent)
+
+    def leave_through_finally(
+        self, why: int, indent: int, value: str | None = None
+    ) -> None:
+        """Record why the region is being left, and go run the clause."""
+
+        protection = self.finallys[-1]
+        if value is not None:
+            self.emit(f"{protection.answer} = {value};", indent)
+        self.emit(f"{protection.why} = {why};", indent)
+        protection.reasons.add(why)
+        self.emit(f"goto {protection.label};", indent)
 
     def release_locals(self, indent: int, guarded: bool = False) -> None:
         """Give back what the body still holds, on the way out.
@@ -1958,6 +2207,46 @@ class CApiEmitter:
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {made};", indent)
 
+    def write_wrapper(self, node: ast.FunctionDef) -> None:
+        """A Python callable for a module-level `def`.
+
+        The `def` itself compiles to a plain C function taking its arguments in
+        registers, which is the fast shape and the one an ordinary call uses.
+        It is not a Python object, though, so `sorted(xs, key=weight)` had
+        nothing to pass and `f(*rest)` had no way to say how many arguments it
+        was passing. This wrapper is the object: it unpacks the tuple and calls
+        the real function, so both spellings reach the same body.
+
+        The arguments are *borrowed* from the tuple and passed on as they are.
+        A callee increments what it is given on entry and releases it on the
+        way out, so a borrowed reference nets to zero and the tuple keeps
+        owning it. An argument the call left out is passed as NULL, which is
+        how the callee knows to put its default in.
+        """
+
+        parameters = tuple(argument.arg for argument in node.args.args)
+        required = len(parameters) - len(node.args.defaults)
+        index = len(self.method_table)
+        function = _Function(f"_value{index}_{node.name}", (), closure=True)
+        self.method_table.append((function.name, node.name))
+        self.value_functions.append((node.name, index))
+        outer = self.current
+        self.current = function
+        for position, name in enumerate(parameters):
+            slot = f"w_{name}"
+            function.locals.append(slot)
+            self.emit(f"{slot} = PyTuple_GetItem(_args, {position});", 1)
+            if position < required:
+                self.emit(f"if (!{slot}) {{ return 0; }}", 1)
+            else:
+                # Out of range, which is not an error here: the callee has a
+                # default for it and NULL is how it is asked for.
+                self.emit(f"if (!{slot}) PyErr_Clear();", 1)
+        passed = ", ".join(f"w_{name}" for name in parameters)
+        self.emit(f"return f_{node.name}({passed});", 1)
+        self.functions.append(function)
+        self.current = outer
+
     def write_closure(
         self, node: ast.AST, c_name: str, captures: tuple[str, ...]
     ) -> None:
@@ -2056,6 +2345,7 @@ class CApiEmitter:
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self.write_function(node)
+                self.write_wrapper(node)
 
         entry = _Function("main", ())
         self.current = entry
@@ -2214,6 +2504,11 @@ class CApiEmitter:
             # METH_VARARGS: the arguments arrive as a tuple.
             out.append(f"    _py2bin_methods[{index}].ml_flags = 1;")
             out.append(f"    _py2bin_methods[{index}].ml_doc = 0;")
+        for name, index in self.value_functions:
+            out.append(
+                f"    g_{name} = PyCFunction_New(&_py2bin_methods[{index}], 0);"
+            )
+            out.append(f"    if (!g_{name}) {{ PyErr_Print(); exit(1); }}")
         out.append("    {")
         out.extend(self.declarations(entry, 2))
         out.extend(entry.body)

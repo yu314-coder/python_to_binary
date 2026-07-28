@@ -670,6 +670,86 @@ class CApiEmitTests(unittest.TestCase):
             b"[3, 2, 1]\n[30, 10, 20]\n1\n",
         )
 
+    def test_finally_runs_on_every_way_out(self):
+        """Falling off the end, an exception, a return, a break, a continue.
+
+        Each records *why* it is leaving and jumps to the clause, which runs
+        once and then does what the reason says. The exception is taken before
+        the clause runs, because CPython refuses to build anything Python-side
+        while one is set, and put back after with its traceback intact.
+        """
+
+        self._run(
+            "def plain(n):\n"
+            "    try:\n"
+            "        return 10 // n\n"
+            "    finally:\n"
+            "        print('clean', n)\n"
+            "print(plain(5))\n"
+            "try:\n"
+            "    plain(0)\n"
+            "except ZeroDivisionError as e:\n"
+            "    print('caught', e)\n"
+            "def looped(items):\n"
+            "    out = []\n"
+            "    for v in items:\n"
+            "        try:\n"
+            "            if v < 0:\n"
+            "                continue\n"
+            "            if v > 10:\n"
+            "                break\n"
+            "            out.append(v)\n"
+            "        finally:\n"
+            "            print('saw', v)\n"
+            "    return out\n"
+            "print(looped([1, -2, 3, 99, 4]))\n",
+            b"clean 5\n2\nclean 0\ncaught division by zero\n"
+            b"saw 1\nsaw -2\nsaw 3\nsaw 99\n[1, 3]\n",
+        )
+
+    def test_nested_finally_clauses_both_run(self):
+        self._run(
+            "def nested():\n"
+            "    try:\n"
+            "        try:\n"
+            "            return 'value'\n"
+            "        finally:\n"
+            "            print('inner')\n"
+            "    finally:\n"
+            "        print('outer')\n"
+            "print(nested())\n",
+            b"inner\nouter\nvalue\n",
+        )
+
+    def test_arguments_and_keywords_spread_into_a_call(self):
+        self._run(
+            "rest = [1, 2]\n"
+            "more = {'reverse': True}\n"
+            "print(max(*[3, 1, 2]))\n"
+            "print(sorted(*[[3, 1, 2]], **more))\n"
+            "print(dict(**{'x': 1}, y=2))\n"
+            "print([*rest, 3], {**more, 'reverse': False})\n",
+            b"3\n[3, 2, 1]\n{'x': 1, 'y': 2}\n[1, 2, 3] {'reverse': False}\n",
+        )
+
+    def test_a_module_level_def_is_also_a_value(self):
+        """The `def` compiles to a plain C function, which is not an object.
+
+        A wrapper makes it one, so `sorted(xs, key=weight)` has something to
+        pass and `weight(*row)` has a way to say how many arguments it is
+        passing. Both spellings reach the same body.
+        """
+
+        self._run(
+            "def weight(row):\n"
+            "    return row['k']\n"
+            "rows = [{'k': 3}, {'k': 1}]\n"
+            "print([r['k'] for r in sorted(rows, key=weight)])\n"
+            "print(list(map(weight, rows)))\n"
+            "print(weight(*[{'k': 9}]))\n",
+            b"[1, 3]\n[3, 1]\n9\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

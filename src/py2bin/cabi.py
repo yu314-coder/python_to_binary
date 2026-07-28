@@ -54,7 +54,7 @@ __all__ = [
     "PyNumber_Or", "PyNumber_And", "PyNumber_Xor",
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
-    "PyObject_SetAttrString",
+    "PyObject_SetAttrString", "PyErr_SetRaisedException",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -806,6 +806,7 @@ _PyTuple_GetItem = _bind("PyTuple_GetItem", _HANDLE, _HANDLE, _SSIZE)
 _PyObject_SetAttrString = _bind(
     "PyObject_SetAttrString", ctypes.c_int, _HANDLE, ctypes.c_char_p, _HANDLE
 )
+_PyErr_SetRaisedException = _bind("PyErr_SetRaisedException", None, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1002,6 +1003,17 @@ def PyCFunction_New(method_table: int, closure: int) -> int:
     """
 
     return _handle(_PyCFunction_New(method_table, closure))
+
+
+def PyErr_SetRaisedException(exception: int) -> None:
+    """Set an exception again, exactly as it was - traceback included.
+
+    It *steals* the reference, which is what makes it the right partner for
+    ``PyErr_GetRaisedException``: a `finally` takes the exception so that the
+    clause can run Python at all, then gives the same object back.
+    """
+
+    _PyErr_SetRaisedException(exception)
 
 
 def PyObject_SetAttrString(object_handle: int, name: bytes, value: int) -> int:
