@@ -158,7 +158,11 @@ class VettedSymbolTableTests(unittest.TestCase):
             with self.subTest(symbol=name):
                 for kind in signature:
                     self.assertIn(
-                        kind, {"int", "ptr", "bool", "cstr", "cfmt", "f64", "imp"}
+                        kind,
+                        {
+                            "int", "ptr", "bool", "cstr", "cdata", "cfmt",
+                            "f64", "imp",
+                        },
                     )
                 doubles = sum(1 for kind in signature if kind == "f64")
                 self.assertLessEqual(len(signature) - doubles, _CABI_MAX_ARGUMENTS)
@@ -954,7 +958,9 @@ class DocumentedSurfaceTests(unittest.TestCase):
         start = text.index("A fixed table of")
         bullet = text[start : text.index("\n- ", start)]
         # `PyNumber_Add`/`Subtract`/`Multiply`/`TrueDivide` is a shorthand.
-        listed = set(re.findall(r"`(Py[A-Za-z_]+)`", bullet))
+        # Digits count: PyUnicode_DecodeUTF8 has one, and a pattern without
+        # them reported the README as missing a symbol that was on the page.
+        listed = set(re.findall(r"`(Py[A-Za-z_0-9]+)`", bullet))
         listed |= {
             "PyNumber_" + suffix
             for suffix in ("Subtract", "Multiply", "TrueDivide")

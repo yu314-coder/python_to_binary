@@ -119,6 +119,9 @@ _KERNEL_EXPORTS = {
 #             callee will dereference a pointer.
 #   "cstr" -- a compile-time string constant, materialized as a NUL-terminated
 #             blob whose pointer is passed.
+#   "cdata" -- like "cstr", but the callee is told the length separately and so
+#             reads every byte. A NUL in the middle is data rather than an end,
+#             which is what lets a Python string or bytes object carry one.
 #   "cfmt" -- like "cstr", but the fixed format argument of a *variadic* callee
 #             that py2bin only ever calls with ZERO variadic arguments. Apple's
 #             arm64 ABI passes variadic arguments on the stack rather than in
@@ -331,12 +334,14 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "PyTuple_GetItem": ("PyTuple_GetItem", ("ptr", "int")),
     "PyObject_SetAttrString": ("PyObject_SetAttrString", ("ptr", "cstr", "ptr")),
     "PyErr_SetRaisedException": ("PyErr_SetRaisedException", ("ptr",)),
-    "PyBytes_FromStringAndSize": ("PyBytes_FromStringAndSize", ("cstr", "int")),
+    "PyBytes_FromStringAndSize": ("PyBytes_FromStringAndSize", ("cdata", "int")),
+    "PyUnicode_DecodeUTF8": ("PyUnicode_DecodeUTF8", ("cdata", "int", "ptr")),
     "PyNumber_Negative": ("PyNumber_Negative", ("ptr",)),
     "PyNumber_Positive": ("PyNumber_Positive", ("ptr",)),
     "PyNumber_Invert": ("PyNumber_Invert", ("ptr",)),
     "Py_EnterRecursiveCall": ("Py_EnterRecursiveCall", ("cstr",)),
     "Py_LeaveRecursiveCall": ("Py_LeaveRecursiveCall", ()),
+    "PyLong_FromString": ("PyLong_FromString", ("cstr", "ptr", "int")),
     "PyImport_ImportModule": ("PyImport_ImportModule", ("cstr",)),
     "PyList_New": ("PyList_New", ("int",)),
     "PyList_Append": ("PyList_Append", ("ptr", "ptr")),
@@ -430,11 +435,13 @@ _CABI_RESULTS: dict[str, str] = {
     "PyObject_SetAttrString": "int",
     "PyErr_SetRaisedException": "void",
     "PyBytes_FromStringAndSize": "ptr",
+    "PyUnicode_DecodeUTF8": "ptr",
     "PyNumber_Negative": "ptr",
     "PyNumber_Positive": "ptr",
     "PyNumber_Invert": "ptr",
     "Py_EnterRecursiveCall": "int",
     "Py_LeaveRecursiveCall": "void",
+    "PyLong_FromString": "ptr",
     "PyImport_ImportModule": "ptr",
     "PyList_New": "ptr",
     "PyList_Append": "int",

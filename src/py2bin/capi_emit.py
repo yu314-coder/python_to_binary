@@ -105,6 +105,9 @@ extern PyObject *PyNumber_Negative(PyObject *value);
 extern PyObject *PyNumber_Positive(PyObject *value);
 extern PyObject *PyNumber_Invert(PyObject *value);
 extern int Py_EnterRecursiveCall(const char *where);
+extern PyObject *PyLong_FromString(const char *text, void *end, int base);
+extern PyObject *PyUnicode_DecodeUTF8(
+    const char *text, long long length, void *errors);
 extern void Py_LeaveRecursiveCall(void);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
@@ -492,6 +495,33 @@ class CApiEmitter:
             node, f"{type(node).__name__} has no C-API translation here yet"
         )
 
+    #: What a C `long long` holds. A Python integer has no width, so a literal
+    #: outside this has no C type to arrive in - its digits do.
+    _SIGNED_64 = range(-(1 << 63), 1 << 63)
+
+    def integer(self, value: int, indent: int) -> str:
+        """An integer literal of any size."""
+
+        target = self.temporary()
+        if value in self._SIGNED_64:
+            if value == -(1 << 63):
+                # C has no literal for this one. `-9223372036854775808` is a
+                # minus applied to `9223372036854775808`, which is one past
+                # what the type holds, so it is written as a subtraction that
+                # never leaves the range.
+                spelled = "(-9223372036854775807LL - 1LL)"
+            else:
+                spelled = f"{value}LL"
+            self.emit(f"{target} = PyLong_FromLongLong({spelled});", indent)
+        else:
+            # Read from its decimal text, which is the only shape wide enough
+            # for a number Python is happy to write down and C is not.
+            self.emit(
+                f"{target} = PyLong_FromString({_c_string(str(value))}, 0, 10);",
+                indent,
+            )
+        return self.checked(target, indent)
+
     def constant(self, node: ast.Constant, indent: int) -> str:
         target = self.temporary()
         if isinstance(node.value, bool) or node.value is None:
@@ -505,23 +535,26 @@ class CApiEmitter:
             self.emit(f"{target} = PyFloat_FromDouble({node.value!r});", indent)
             return self.checked(target, indent)
         if isinstance(node.value, int):
-            self.emit(
-                f"{target} = PyLong_FromLongLong({node.value}LL);", indent
-            )
-            return self.checked(target, indent)
+            self.current.temporaries -= 1
+            self.current.locals.remove(target)
+            return self.integer(node.value, indent)
         if isinstance(node.value, str):
-            self.emit(
-                f"{target} = PyUnicode_FromString({_c_string(node.value)});", indent
-            )
+            encoded = node.value.encode("utf-8")
+            if b"\0" in encoded:
+                # A zero byte is a character in Python and an end in C, so the
+                # text goes through the decoder that is told how long it is.
+                self.emit(
+                    f"{target} = PyUnicode_DecodeUTF8("
+                    f"{_c_bytes(encoded)}, {len(encoded)}LL, 0);",
+                    indent,
+                )
+            else:
+                self.emit(
+                    f"{target} = PyUnicode_FromString({_c_string(node.value)});",
+                    indent,
+                )
             return self.checked(target, indent)
         if isinstance(node.value, bytes):
-            if b"\0" in node.value:
-                raise self.fail(
-                    node,
-                    "a bytes literal containing a zero byte is not translated "
-                    "here yet; it travels as a C string literal, which ends at "
-                    "the first one",
-                )
             target = self.temporary()
             self.emit(
                 f"{target} = PyBytes_FromStringAndSize("
@@ -812,6 +845,17 @@ class CApiEmitter:
         return target
 
     def unary(self, node: ast.UnaryOp, indent: int) -> str:
+        if (
+            isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+            and not isinstance(node.operand.value, bool)
+        ):
+            # `-9223372036854775808` is one literal in Python and two nodes in
+            # the tree. Negating afterwards means the positive half has to
+            # exist first, and that one is exactly one past what a signed
+            # 64-bit integer holds.
+            return self.integer(-node.operand.value, indent)
         """`-x`, `+x`, `~x` and `not x`.
 
         A negation was `0 - x` for want of an entry point, on the reasoning

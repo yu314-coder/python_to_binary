@@ -1286,6 +1286,44 @@ class CApiEmitTests(unittest.TestCase):
             b"a-b\nno newline|\nx+y\n\n",
         )
 
+    def test_an_integer_of_any_width(self):
+        """A Python integer has no width; a C literal does.
+
+        `-9223372036854775808` is one literal in Python and two nodes in the
+        tree, so negating afterwards needs the positive half to exist first -
+        and that is exactly one past what a signed 64-bit integer holds. C has
+        no literal for the most negative value either, so it is written as a
+        subtraction that never leaves the range.
+        """
+
+        self._run(
+            "print(-9223372036854775808, 9223372036854775807)\n"
+            "print(9223372036854775808, -9223372036854775809)\n"
+            "print(10 ** 30, 2 ** 100)\n"
+            "print(123456789012345678901234567890 + 1)\n",
+            b"-9223372036854775808 9223372036854775807\n"
+            b"9223372036854775808 -9223372036854775809\n"
+            b"1000000000000000000000000000000 "
+            b"1267650600228229401496703205376\n"
+            b"123456789012345678901234567891\n",
+        )
+
+    def test_text_and_bytes_carrying_a_zero_byte(self):
+        """A zero byte is a character in Python and an end in C.
+
+        A literal with one went through `PyUnicode_FromString`, which stops
+        there, so the string arrived truncated. The decoder that is told how
+        long it is reads every byte.
+        """
+
+        self._run(
+            "s = 'a\\0b'\n"
+            "print(len(s), s.split('\\0'))\n"
+            "b = b'x\\0y\\0z'\n"
+            "print(len(b), b.split(b'\\0'))\n",
+            b"3 ['a', 'b']\n5 [b'x', b'y', b'z']\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

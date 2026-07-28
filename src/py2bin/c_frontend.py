@@ -2338,7 +2338,7 @@ def _matches_abi(ctype: CType, kind: str, *, result: bool = False) -> bool:
         # class but is half the width, so accepting it would hand the callee
         # a value it reads as twice the bits it was given.
         return isinstance(ctype, FloatingType) and ctype.size == 8
-    if kind in {"cstr", "cfmt"}:
+    if kind in {"cstr", "cfmt", "cdata"}:
         return not result and isinstance(ctype, PointerType) and ctype.target in {
             CHAR,
             SCHAR,
@@ -3932,7 +3932,7 @@ class Lowerer:
             zip(node.arguments, signature), 1
         ):
             what = f"argument {position} of {name}()"
-            if kind in {"cstr", "cfmt"}:
+            if kind in {"cstr", "cfmt", "cdata"}:
                 if not isinstance(argument, StringLiteral):
                     self.error(
                         f"{what} must be a literal C string: py2bin materializes it "
@@ -3940,7 +3940,9 @@ class Lowerer:
                         "this compiler cannot verify",
                         argument.token,
                     )
-                if b"\0" in argument.data:
+                if kind != "cdata" and b"\0" in argument.data:
+                    # A "cdata" callee is given the length separately, so it
+                    # reads every byte rather than stopping at the first zero.
                     self.error(
                         f"{what} contains an embedded NUL the callee would truncate",
                         argument.token,

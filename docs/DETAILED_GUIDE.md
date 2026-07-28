@@ -320,6 +320,32 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**Values C has no shape for.** Two of Python's ordinary literals have no C
+type to arrive in, and both were build-time refusals until the vetted set grew
+a way to carry them:
+
+- *An integer of any width.* `PyLong_FromLongLong` covers what a signed 64-bit
+  integer holds and nothing beyond, so `2 ** 100` written out had nowhere to
+  go. Its digits do: `PyLong_FromString` reads it from decimal text. Two edges
+  came with it - `-9223372036854775808` is one literal in Python and two nodes
+  in the tree, so negating afterwards needs the positive half to exist first
+  and that is one past the type; and C has no literal for the most negative
+  value at all, so it is written as a subtraction that never leaves the range.
+- *A zero byte inside text.* It is a character in Python and an end in C, so a
+  literal carrying one arrived truncated through `PyUnicode_FromString`. The
+  vetted ABI grew a `cdata` argument kind for a callee that is told the length
+  separately and therefore reads every byte, which is what lets
+  `PyUnicode_DecodeUTF8` and `PyBytes_FromStringAndSize` take one.
+
+**What is still refused, and why.** Of the 889 demo programs, four ask for a
+frame larger than the 512 KB budget. One of them, `hugef.py`, genuinely does:
+67,001 named locals is 536 KB before anything else. The other three do not -
+`big.py` uses ten temporary slots - and are refused because the *C front end*
+allocates a stack slot per expression temporary across the whole translation
+unit without reusing any, which is the same defect that was fixed one level up
+in the Python-to-C emitter. Recorded rather than fixed: it needs liveness in
+the C lowerer.
+
 **`with` closes however the body ends.** `__exit__` was written after the body,
 so it ran only when the body fell off the end - a `break`, a `return` or an
 exception left without it, and the thing the `with` exists to close was not
@@ -1454,7 +1480,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 67 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 69 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

@@ -57,6 +57,7 @@ __all__ = [
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
+    "PyLong_FromString", "PyUnicode_DecodeUTF8",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -819,6 +820,12 @@ _Py_EnterRecursiveCall = _bind(
     "Py_EnterRecursiveCall", ctypes.c_int, ctypes.c_char_p
 )
 _Py_LeaveRecursiveCall = _bind("Py_LeaveRecursiveCall", None)
+_PyLong_FromString = _bind(
+    "PyLong_FromString", _HANDLE, ctypes.c_char_p, _HANDLE, ctypes.c_int
+)
+_PyUnicode_DecodeUTF8 = _bind(
+    "PyUnicode_DecodeUTF8", _HANDLE, ctypes.c_char_p, _SSIZE, _HANDLE
+)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1028,6 +1035,26 @@ def PyNumber_Positive(value: int) -> int:
     """`+x`."""
 
     return _handle(_PyNumber_Positive(value))
+
+
+def PyUnicode_DecodeUTF8(text: bytes, length: int, errors: int) -> int:
+    """A str decoded from exactly ``length`` bytes of UTF-8.
+
+    The length is what lets the text carry a NUL, which
+    ``PyUnicode_FromString`` would read as the end of it.
+    """
+
+    return _handle(_PyUnicode_DecodeUTF8(text, length, errors))
+
+
+def PyLong_FromString(text: bytes, end: int, base: int) -> int:
+    """An integer read from its decimal text.
+
+    Python's integers have no width, so a literal like 2**63 has no C type to
+    arrive in. Its digits do.
+    """
+
+    return _handle(_PyLong_FromString(text, end, base))
 
 
 def Py_EnterRecursiveCall(where: bytes) -> int:
