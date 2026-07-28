@@ -23,6 +23,34 @@ from py2bin.capi_emit import (
 )
 from py2bin.c_native import compile_c_native
 
+def _square_png(size: int = 16) -> bytes:
+    """A plain opaque square, built here so the test carries no binary blob.
+
+    An icon must be square and one of the sizes macOS keeps in an `.icns`.
+    """
+
+    import binascii
+    import struct
+    import zlib
+
+    raw = b"".join(b"\0" + b"\x40\x80\xc0\xff" * size for _ in range(size))
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", binascii.crc32(kind + payload))
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
 _HOST_IS_DARWIN_ARM64 = (
     platform.system() == "Darwin" and platform.machine() == "arm64"
 )
@@ -1540,6 +1568,56 @@ class CApiEmitTests(unittest.TestCase):
             '"plain(a, b=None, *rest, key=None, **kw)',
             python_to_capi_c(source, "program.py"),
         )
+
+    def test_a_compiled_program_can_be_a_macos_app_with_an_icon(self):
+        """The compiled binary, in the bundle macOS expects, with its icon.
+
+        The `.app` is only a directory shape and a plist - what is inside it
+        here is the compiled program itself, not an interpreter and a copy of
+        the source.
+        """
+
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("the C-API path is darwin-arm64 only")
+        import plistlib
+
+        from py2bin.c_native import compile_c_native
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text("print('windowed')\n", encoding="utf-8")
+            source = root / "program.c"
+            source.write_text(
+                python_to_capi_c(entry.read_text(), str(entry)),
+                encoding="utf-8",
+                newline="\n",
+            )
+            icon = root / "icon.png"
+            icon.write_bytes(_square_png())
+            bundle = root / "Program.app"
+            compile_c_native(
+                source,
+                bundle,
+                target="darwin-arm64",
+                clean=True,
+                app=True,
+                app_name="My Program",
+                icon=icon,
+            )
+            executable = bundle / "Contents" / "MacOS" / "My Program"
+            self.assertTrue(executable.is_file())
+            plist = plistlib.loads(
+                (bundle / "Contents" / "Info.plist").read_bytes()
+            )
+            self.assertEqual(plist["CFBundleName"], "My Program")
+            self.assertEqual(plist["CFBundleExecutable"], "My Program")
+            self.assertEqual(plist["CFBundleIconFile"], "AppIcon.icns")
+            icns = bundle / "Contents" / "Resources" / "AppIcon.icns"
+            self.assertTrue(icns.is_file())
+            self.assertEqual(icns.read_bytes()[:4], b"icns")
+            ran = subprocess.run([str(executable)], capture_output=True)
+            self.assertEqual(ran.stdout, b"windowed\n")
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's

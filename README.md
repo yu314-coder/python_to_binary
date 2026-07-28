@@ -161,9 +161,15 @@ This is the honest boundary of tier (b). It is deliberately unflattering.
 
 ```sh
 # 1. Ordinary Python, translated into C-API calls for you. This is the
-#    Nuitka-shaped route: Python -> C -> machine code, no clang.
+#    Nuitka-shaped route: Python -> C -> machine code, no clang. Every .py
+#    beside the entry that it imports is compiled into the same binary.
 PYTHONPATH=src python3 -m py2bin compile-capi program.py \
   --target darwin-arm64 -o program.bin
+
+#    ...or as a macOS .app with an icon. What is inside the bundle is the
+#    compiled program, not an interpreter and a copy of the source.
+PYTHONPATH=src python3 -m py2bin compile-capi app.py \
+  --target darwin-arm64 --app --name "My App" --icon icon.icns -o MyApp.app
 
 # 2. Python that imports vetted C-API names from py2bin.cabi.
 PYTHONPATH=src python3 -m py2bin compile program.py \

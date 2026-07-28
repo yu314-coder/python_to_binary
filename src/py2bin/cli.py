@@ -186,6 +186,11 @@ def _parser() -> argparse.ArgumentParser:
     capi_parser.add_argument("--target", choices=supported_targets())
     capi_parser.add_argument("--os", dest="target_os")
     capi_parser.add_argument("--arch")
+    capi_parser.add_argument(
+        "--app", action="store_true", help="wrap the binary in a macOS .app"
+    )
+    capi_parser.add_argument("--name", help="application display name")
+    capi_parser.add_argument("--icon", type=Path, help="app icon (.icns, .ico, .png)")
     capi_parser.add_argument("--clean", action="store_true")
     via_c_parser = commands.add_parser(
         "compile-via-c",
@@ -884,8 +889,17 @@ def main(argv: list[str] | None = None) -> int:
             # newline pinned: the generated C has to be byte-identical
             # whatever host wrote it.
             source.write_text(generated, encoding="utf-8", newline="\n")
+            output = args.output
+            if args.app and output.suffix != ".app":
+                output = output.with_suffix(".app")
             artifact = compile_c_native(
-                source, args.output, target=target, clean=args.clean
+                source,
+                output,
+                target=target,
+                clean=args.clean,
+                app=args.app,
+                app_name=args.name,
+                icon=args.icon,
             )
             print(
                 f"compiled {entry} through the CPython C API to "

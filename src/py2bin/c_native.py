@@ -1259,6 +1259,9 @@ def compile_c_native(
     clean: bool = False,
     include_dirs: tuple[str, ...] = (),
     defines: tuple[str, ...] = (),
+    app: bool = False,
+    app_name: str | None = None,
+    icon: Path | None = None,
 ) -> NativeResult:
     """Compile a C file to machine code with only py2bin's own implementation.
 
@@ -1290,6 +1293,9 @@ def compile_c_native(
         output,
         target=resolved,
         clean=clean,
+        app=app,
+        app_name=app_name,
+        icon=icon,
     )
 
 

@@ -93,15 +93,18 @@ def host_target() -> str:
         ) from error
 
 
-def _app_metadata(executable_name: str) -> tuple[bytes, bytes]:
-    info = plistlib.dumps(
-        {
-            "CFBundleExecutable": executable_name,
-            "CFBundleName": executable_name,
-            "CFBundleIdentifier": "local.py2bin.native",
-            "CFBundlePackageType": "APPL",
-        },
-        sort_keys=False,
+def _app_metadata(
+    executable_name: str,
+    display_name: str | None = None,
+    icon_filename: str | None = None,
+) -> tuple[bytes, bytes]:
+    from ..icons import macos_info_plist
+
+    # The same plist the freeze path writes, so a compiled .app and a frozen
+    # one are described to macOS in the same terms - including the icon, which
+    # a bundle without one simply does not show.
+    info = macos_info_plist(
+        display_name or executable_name, executable_name, icon_filename
     )
     resources = plistlib.dumps(
         {
@@ -196,6 +199,8 @@ def compile_native_module(
     target: str | None = None,
     clean: bool = False,
     app: bool = False,
+    app_name: str | None = None,
+    icon: Path | None = None,
 ) -> NativeResult:
     """Write a verified py2bin IR module with the handwritten binary backends."""
 
@@ -211,7 +216,9 @@ def compile_native_module(
             output = output.with_suffix(".app")
     if output.exists() and not clean:
         raise FileExistsError(f"output already exists: {output} (use --clean)")
-    return _emit_native_module(entry, module, output, target, app)
+    return _emit_native_module(
+        entry, module, output, target, app, app_name, icon
+    )
 
 
 def _contains_extern(value: object) -> bool:
@@ -275,6 +282,8 @@ def _emit_native_module(
     output: Path,
     target: str,
     app: bool,
+    app_name: str | None = None,
+    icon: Path | None = None,
 ) -> NativeResult:
     if module.functions and target not in CALL_CAPABLE_TARGETS:
         # The call ABI (frame with a saved link register, arguments in the
@@ -308,7 +317,20 @@ def _emit_native_module(
             f"target 'darwin-arm64' so far, not {target!r}; the dynamic-link "
             "adapter for this platform is design-only",
         )
-    info_plist, code_resources = _app_metadata(entry.stem) if app else (None, None)
+    executable_name = app_name or entry.stem
+    # Written before the plist that names it, because the plist is embedded in
+    # the arm64 image's own signature and cannot be revised afterwards.
+    icon_filename = None
+    if app and icon is not None:
+        from ..icons import icon_to_icns
+
+        icon_to_icns(icon)  # refuse an unreadable icon before anything is built
+        icon_filename = "AppIcon.icns"
+    info_plist, code_resources = (
+        _app_metadata(executable_name, app_name, icon_filename)
+        if app
+        else (None, None)
+    )
     if target == "windows-x86_64":
         image = write_pe_x86_64(module)
     elif target == "windows-arm64":
@@ -375,12 +397,16 @@ def _emit_native_module(
             output.unlink()
     output.parent.mkdir(parents=True, exist_ok=True)
     if app:
-        executable = output / "Contents" / "MacOS" / entry.stem
+        executable = output / "Contents" / "MacOS" / executable_name
         executable.parent.mkdir(parents=True)
         executable.write_bytes(image)
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         assert info_plist is not None and code_resources is not None
         (output / "Contents" / "Info.plist").write_bytes(info_plist)
+        if icon is not None:
+            from ..icons import install_macos_icon
+
+            install_macos_icon(icon, output / "Contents" / "Resources")
         signature_directory = output / "Contents" / "_CodeSignature"
         signature_directory.mkdir()
         (signature_directory / "CodeResources").write_bytes(code_resources)
