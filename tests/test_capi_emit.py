@@ -2034,3 +2034,274 @@ class CApiEmitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MachineIntegerTests(unittest.TestCase):
+    """Integers held in a register rather than on the heap.
+
+    The tier's reason for being slower than the interpreter was that it wrote
+    one generic C-API call per operation, which is precisely what CPython's
+    specialising interpreter learned to skip. These cover the fast path that
+    closes that gap, and - more importantly - the run-time checks that make it
+    give up rather than answer wrongly.
+    """
+
+    # The same build-and-compare helper, without inheriting the whole suite
+    # along with it - a subclass would run every one of its tests again.
+    _run = CApiEmitTests._run
+
+    def test_an_accumulator_is_added_in_a_register(self):
+        source = (
+            "def total():\n"
+            "    n = 0\n"
+            "    for i in range(5):\n"
+            "        n = n + i * 2 - 1\n"
+            "    return n\n"
+            "print(total())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        # The accumulator is three C variables, and the loop advances a
+        # counter rather than asking an iterator for an object.
+        self.assertIn("long long n_n", written)
+        self.assertIn("int s_n", written)
+        self.assertIn("n_n = ", written)
+        self._run(source, b"15\n")
+
+    def test_overflow_falls_back_to_unbounded_integers(self):
+        # Python's integers do not stop at 64 bits. The fast path has to
+        # notice that it left the word and hand the work back, or a program
+        # that counts past 2**63 answers something no Python would.
+        self._run(
+            "def big():\n"
+            "    n = 1\n"
+            "    for i in range(200):\n"
+            "        n = n * 3\n"
+            "    return n\n"
+            "print(big())\n",
+            str(3 ** 200).encode() + b"\n",
+        )
+
+    def test_a_wide_accumulator_comes_back_from_the_slow_path(self):
+        self._run(
+            "def mixed():\n"
+            "    n = 2 ** 70\n"
+            "    n = n + 1\n"
+            "    n = n - 2 ** 70\n"
+            "    return n\n"
+            "print(mixed())\n",
+            b"1\n",
+        )
+
+    def test_a_range_wider_than_the_word_still_iterates(self):
+        # `range(2**70, 2**70 + 3)` is ordinary Python. The counter cannot
+        # hold those bounds, so the loop takes the iterator protocol instead.
+        self._run(
+            "def wide():\n"
+            "    out = 0\n"
+            "    for i in range(2 ** 70, 2 ** 70 + 3):\n"
+            "        out = out + (i - 2 ** 70)\n"
+            "    return out\n"
+            "print(wide())\n",
+            b"3\n",
+        )
+
+    def test_a_name_that_stops_holding_an_integer_still_works(self):
+        # The same name holds an int on one pass and a string on the next.
+        # Nothing about the representation forbids that; the arithmetic simply
+        # takes the long way round when the flag says it is an object.
+        self._run(
+            "def swing(flip):\n"
+            "    n = 1\n"
+            "    if flip:\n"
+            "        n = 'a'\n"
+            "    return n + n\n"
+            "print(swing(0), swing(1))\n",
+            b"2 aa\n",
+        )
+
+    def test_a_counted_loop_is_declined_when_range_is_rebound(self):
+        source = (
+            "def range(n):\n"
+            "    return [10, 20]\n"
+            "def use():\n"
+            "    out = 0\n"
+            "    for i in range(2):\n"
+            "        out = out + i\n"
+            "    return out\n"
+            "print(use())\n"
+        )
+        # The counter is what would call it; the extern declaration is
+        # always there, so the call is what the test has to look for.
+        self.assertNotIn("= PyLong_AsLongLong(", python_to_capi_c(source, "p.py"))
+        self._run(source, b"30\n")
+
+    def test_a_negative_step_counts_down(self):
+        self._run(
+            "def down():\n"
+            "    out = 0\n"
+            "    for i in range(5, 0, -1):\n"
+            "        out = out * 10 + i\n"
+            "    return out\n"
+            "print(down())\n",
+            b"54321\n",
+        )
+
+    def test_an_empty_range_runs_its_else(self):
+        self._run(
+            "def none():\n"
+            "    seen = 0\n"
+            "    for i in range(0):\n"
+            "        seen = seen + 1\n"
+            "    else:\n"
+            "        seen = seen + 100\n"
+            "    return seen\n"
+            "print(none())\n",
+            b"100\n",
+        )
+
+    def test_break_leaves_a_counted_loop(self):
+        self._run(
+            "def stop():\n"
+            "    seen = 0\n"
+            "    for i in range(100):\n"
+            "        if i == 4:\n"
+            "            break\n"
+            "        seen = seen + i\n"
+            "    else:\n"
+            "        seen = seen + 1000\n"
+            "    return seen\n"
+            "print(stop())\n",
+            b"6\n",
+        )
+
+    def test_a_step_of_zero_raises_the_way_range_does(self):
+        source = (
+            "def bad():\n"
+            "    for i in range(0, 5, 0):\n"
+            "        print(i)\n"
+            "try:\n"
+            "    bad()\n"
+            "except ValueError as error:\n"
+            "    print(error)\n"
+        )
+        self._run(source, b"range() arg 3 must not be zero\n")
+
+    def test_a_comparison_of_two_integers_needs_no_object(self):
+        source = (
+            "def count():\n"
+            "    i = 0\n"
+            "    hits = 0\n"
+            "    while i < 20:\n"
+            "        if i > 15:\n"
+            "            hits = hits + 100\n"
+            "        i = i + 1\n"
+            "    return hits\n"
+            "print(count())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("n_i < 20", written)
+        self._run(source, b"400\n")
+
+    def test_a_comparison_against_a_wide_value_is_still_right(self):
+        self._run(
+            "def wide():\n"
+            "    n = 2 ** 70\n"
+            "    i = 5\n"
+            "    return [i < n, n < i, i == 5]\n"
+            "print(wide())\n",
+            b"[True, False, True]\n",
+        )
+
+    def test_an_unbound_local_is_still_refused(self):
+        source = (
+            "def early():\n"
+            "    if 0:\n"
+            "        n = 1\n"
+            "    return n + 1\n"
+            "try:\n"
+            "    early()\n"
+            "except UnboundLocalError as error:\n"
+            "    print('caught')\n"
+        )
+        self._run(source, b"caught\n")
+
+    def test_the_loop_variable_survives_the_loop(self):
+        self._run(
+            "def after():\n"
+            "    for i in range(4):\n"
+            "        pass\n"
+            "    return i\n"
+            "print(after())\n",
+            b"3\n",
+        )
+
+    def test_a_counted_loop_variable_can_be_reassigned_inside(self):
+        # Rebinding the target does not disturb the counter: Python's `for`
+        # takes the next value from the sequence, not from the name.
+        self._run(
+            "def clobber():\n"
+            "    seen = 0\n"
+            "    for i in range(4):\n"
+            "        seen = seen + i\n"
+            "        i = 100\n"
+            "    return seen\n"
+            "print(clobber())\n",
+            b"6\n",
+        )
+
+    def test_floor_division_floors_the_way_python_does(self):
+        # C truncates toward zero and takes the remainder's sign from the
+        # dividend; Python floors and takes it from the divisor. Every sign
+        # combination, held against the interpreter.
+        self._run(
+            "def f():\n"
+            "    out = []\n"
+            "    for a in range(-9, 10):\n"
+            "        for b in range(-4, 5):\n"
+            "            if b == 0:\n"
+            "                continue\n"
+            "            out.append((a // b, a % b))\n"
+            "    return out\n"
+            "print(f() == [(a // b, a % b)\n"
+            "              for a in range(-9, 10)\n"
+            "              for b in range(-4, 5) if b != 0])\n",
+            b"True\n",
+        )
+
+    def test_dividing_by_zero_raises_where_it_should(self):
+        self._run(
+            "def f():\n"
+            "    n = 3\n"
+            "    d = 0\n"
+            "    try:\n"
+            "        return n // d\n"
+            "    except ZeroDivisionError as error:\n"
+            "        return str(error)\n"
+            "print(f())\n",
+            b"division by zero\n",
+        )
+
+    def test_a_bitwise_operation_on_negative_values_agrees(self):
+        self._run(
+            "def f():\n"
+            "    out = []\n"
+            "    for a in range(-4, 5):\n"
+            "        for b in range(-4, 5):\n"
+            "            out.append((a & b, a | b, a ^ b))\n"
+            "    return out\n"
+            "print(f() == [(a & b, a | b, a ^ b)\n"
+            "              for a in range(-4, 5) for b in range(-4, 5)])\n",
+            b"True\n",
+        )
+
+    def test_a_bool_is_not_quietly_turned_into_an_integer(self):
+        # `True` is an `int` as far as `isinstance` is concerned, and a fast
+        # path that narrowed it would hand back `1` where Python says `True`.
+        self._run(
+            "def f():\n"
+            "    flag = True\n"
+            "    n = 2\n"
+            "    return [flag + n, flag, flag is True]\n"
+            "print(f())\n",
+            b"[3, True, True]\n",
+        )

@@ -30,6 +30,77 @@ import builtins
 import contextlib
 from pathlib import Path
 
+from .capi_ints import (
+    ARITHMETIC as _MACHINE_OPS,
+    COMPARISONS as _MACHINE_TESTS,
+    LIMIT as _MACHINE_LIMIT,
+    is_machine_integer,
+    narrow_range,
+    unboxable_locals,
+)
+
+
+def _shadowed_builtins(tree: ast.Module) -> set[str]:
+    """Every name this module binds anywhere, at any depth.
+
+    A counted `for` loop is only correct if `range` means what the interpreter
+    means by it. Rather than reason about where a rebinding could reach, this
+    asks whether the module rebinds the name at all - anywhere, including
+    inside a function - and declines the whole optimisation if it does.
+    """
+
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            bound.update(
+                argument.arg
+                for argument in (
+                    *getattr(node, "args", ast.arguments(
+                        posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
+                        defaults=[],
+                    )).posonlyargs,
+                    *getattr(node, "args", ast.arguments(
+                        posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
+                        defaults=[],
+                    )).args,
+                )
+            )
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+            # `builtins.range = ...` reaches every module at once, so any
+            # assignment to an attribute of something called `builtins` is
+            # taken as putting every builtin out of reach.
+            if isinstance(node.value, ast.Name) and node.value.id == "builtins":
+                bound.add(node.attr)
+    return bound
+
+
+class _Machine:
+    """An expression the fast path computed, or gave up on.
+
+    `flag` is the C name of an `int` that is 1 when `value` - a `long long` -
+    holds the answer. It is None when narrowness is certain without a test,
+    which is the case for a literal. A caller that needs an object has to emit
+    both arms: the boxed value when the flag is set, and the ordinary C-API
+    translation of the same expression when it is not.
+
+    Recomputing the expression on the slow arm is only sound because the fast
+    path is offered for trees whose leaves are literals and unboxed locals -
+    nothing there can have a side effect, so evaluating it twice is the same
+    as evaluating it once. That restriction is what keeps this simple.
+    """
+
+    __slots__ = ("flag", "value")
+
+    def __init__(self, flag: str | None, value: str) -> None:
+        self.flag = flag
+        self.value = value
+
 
 class CApiEmitError(SyntaxError):
     """Something in the program has no C-API translation here yet."""
@@ -328,6 +399,12 @@ class _Function:
         self.locals: list[str] = []
         self.body: list[str] = []
         self.temporaries = 0
+        #: Locals held as a machine integer whenever they contain one. Each
+        #: becomes three C variables rather than one - see `narrow_slots`.
+        self.unboxed: set[str] = set()
+        #: Counter for the `long long` scratch the fast path computes in, wound
+        #: back at the end of each statement as the object temporaries are.
+        self.machines = 0
 
 
 class CApiEmitter:
@@ -363,6 +440,12 @@ class CApiEmitter:
         #: were installed - so a binary that is otherwise complete stops at
         #: `ModuleNotFoundError` for a package that is plainly present.
         self.extra_paths: list[str] = []
+        #: Builtin names this module binds for itself. A counted loop is only
+        #: written where `range` is certainly the interpreter's own.
+        self.shadowed_builtins: set[str] = set()
+        #: Non-zero while emitting the slow arm of a fast path, where the
+        #: fast path must not be offered a second time.
+        self.boxing = 0
         #: The label a failing C-API call jumps to. Empty outside a `try`,
         #: where a failure ends the process instead.
         self.handlers: list[str] = []
@@ -526,6 +609,347 @@ class CApiEmitter:
             self.current.locals.append(c_name)
         return c_name
 
+    # --- machine integers ---------------------------------------------------
+    #
+    # A local the analysis picked out is three C variables rather than one:
+    #
+    #     long long n_x;   the value, when it is a machine integer
+    #     PyObject  *v_x;  the value, when it is an object
+    #     int        s_x;  1 when the first of those holds it
+    #
+    # with the invariant that at most one of `v_x` and `s_x` is set. Both clear
+    # is the third state the name can be in - never assigned - which is what
+    # the unbound test looks for.
+    #
+    # A name only ever *becomes* a machine integer from somewhere the value is
+    # certainly an `int`: a `range` counter, an integer literal, or arithmetic
+    # on values already narrow. Nothing is ever narrowed by inspecting an
+    # object at run time. That is what keeps the representation honest without
+    # a type check: `PyLong_AsLongLong` would happily convert `True` to 1, and
+    # a `True` that came back out as `1` would be a wrong program, not a fast
+    # one.
+
+    def is_unboxed(self, name: str) -> bool:
+        """True when this name is held in the three-variable form."""
+
+        if self.current is None or name not in self.current.unboxed:
+            return False
+        # A comprehension puts its own scope in front; a name of that scope is
+        # a different name that happens to be spelled the same.
+        return not any(name in scope for scope in self.shadowed)
+
+    def narrow_slots(self, name: str) -> tuple[str, str, str]:
+        """Declare the three variables, and answer with their C names."""
+
+        assert self.current is not None
+        value, obj, flag = f"n_{name}", f"v_{name}", f"s_{name}"
+        for spelling in (f"long long {value}", obj, f"int {flag}"):
+            if spelling not in self.current.locals:
+                self.current.locals.append(spelling)
+        return value, obj, flag
+
+    def machine_slot(self) -> str:
+        """Scratch for one intermediate machine integer."""
+
+        assert self.current is not None
+        self.current.machines += 1
+        name = f"_m{self.current.machines}"
+        if f"long long {name}" not in self.current.locals:
+            self.current.locals.append(f"long long {name}")
+        return name
+
+    def store_object(self, name: str, value: str, indent: int) -> None:
+        """Bind an unboxed name to an object, consuming the reference."""
+
+        held, obj, flag = self.narrow_slots(name)
+        self.emit(f"if ({obj}) Py_DecRef({obj});", indent)
+        self.emit(f"{obj} = {value};", indent)
+        self.emit(f"{flag} = 0;", indent)
+
+    def store_machine(self, name: str, value: str, indent: int) -> None:
+        """Bind an unboxed name to a machine integer.
+
+        Nothing is allocated. This is the whole point of the exercise: an
+        accumulator around a loop costs an add and a store, where the same
+        line through `PyNumber_Add` costs a call, an allocation and two
+        reference-count updates.
+        """
+
+        held, obj, flag = self.narrow_slots(name)
+        self.emit(f"if ({obj}) {{ Py_DecRef({obj}); {obj} = 0; }}", indent)
+        self.emit(f"{held} = {value};", indent)
+        self.emit(f"{flag} = 1;", indent)
+
+    def unbound_test(self, name: str, indent: int) -> None:
+        """Refuse to read an unboxed name that nothing has written."""
+
+        held, obj, flag = self.narrow_slots(name)
+        self.needs_unbound = True
+        message = (
+            f"cannot access local variable {name!r} where it is not "
+            "associated with a value"
+        )
+        self.emit(
+            f"if (!{obj} && !{flag}) {{ _py2bin_unbound(1, "
+            f"PyUnicode_FromString({_c_string(message)}), "
+            f"PyUnicode_FromString({_c_string(name)})); {self.failure()} }}",
+            indent,
+        )
+
+    def read_unboxed(self, node: ast.Name, indent: int) -> str:
+        """An unboxed name as an owned reference, boxing it if it has to.
+
+        Every use that is not arithmetic comes through here, which is what
+        lets the representation be invisible to the rest of the emitter.
+        """
+
+        assert self.current is not None
+        held, obj, flag = self.narrow_slots(node.id)
+        target = self.temporary()
+        if node.id not in self.current.certain:
+            self.unbound_test(node.id, indent)
+        self.emit(f"if ({flag}) {{", indent)
+        self.emit(f"{target} = PyLong_FromLongLong({held});", indent + 1)
+        self.emit(f"if (!{target}) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"}} else {{", indent)
+        self.emit(f"Py_IncRef({obj});", indent + 1)
+        self.emit(f"{target} = {obj};", indent + 1)
+        self.emit("}", indent)
+        return target
+
+    @contextlib.contextmanager
+    def boxed_only(self):
+        """Emit the plain C-API translation, however narrow the tree looks.
+
+        The slow arm of a fast path is the plain translation of the very tree
+        the fast path gave up on. Without this it would be offered the fast
+        path again and emit its own pair of arms, and the arms would nest as
+        deep as the expression.
+        """
+
+        self.boxing += 1
+        try:
+            yield
+        finally:
+            self.boxing -= 1
+
+    def narrow_tree(self, node: ast.expr) -> bool:
+        """True when every leaf of this expression is already a machine int."""
+
+        if self.boxing:
+            return False
+        if isinstance(node, ast.Constant):
+            return is_machine_integer(node)
+        if isinstance(node, ast.Name):
+            return self.is_unboxed(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, _MACHINE_OPS):
+            return self.narrow_tree(node.left) and self.narrow_tree(node.right)
+        return False
+
+    def machine_expression(self, node: ast.expr, indent: int) -> _Machine:
+        """Compute a narrow tree in registers. Only call it on one.
+
+        Overflow is where this has to be careful. Python integers do not stop
+        at 64 bits, so every operation that can leave the word carries the
+        check that says it did, and clears the flag rather than answering
+        wrongly. The caller's slow arm then produces the true value through
+        `PyNumber_Add` and friends, which is where the unbounded arithmetic
+        lives. Nothing is lost but speed, and only for the values that need it.
+        """
+
+        assert self.current is not None
+        if isinstance(node, ast.Constant):
+            return _Machine(None, str(node.value))
+        if isinstance(node, ast.Name):
+            held, _, state = self.narrow_slots(node.id)
+            if node.id not in self.current.certain:
+                self.unbound_test(node.id, indent)
+            return _Machine(state, held)
+        assert isinstance(node, ast.BinOp)
+        left = self.machine_expression(node.left, indent)
+        right = self.machine_expression(node.right, indent)
+        known = [side.flag for side in (left, right) if side.flag is not None]
+        flag = self.temporary_flag()
+        self.emit(f"{flag} = {' && '.join(known) if known else '1'};", indent)
+        slot = self.machine_slot()
+        self.emit(f"if ({flag}) {{", indent)
+        self.machine_operation(node.op, slot, left.value, right.value, flag, indent + 1)
+        self.emit("}", indent)
+        return _Machine(flag, slot)
+
+    def machine_operation(
+        self, op: ast.operator, slot: str, left: str, right: str,
+        flag: str, indent: int,
+    ) -> None:
+        """One operation on two machine integers, with its overflow test."""
+
+        if isinstance(op, ast.Add):
+            self.emit(f"{slot} = {left} + {right};", indent)
+            # Two values with the same sign that produced the other sign left
+            # the word. Signed overflow wraps here rather than being undefined:
+            # py2bin's C compiler lowers this to the machine's own add, which
+            # is where the wrapping comes from.
+            self.emit(
+                f"if ((({left} ^ {slot}) & ({right} ^ {slot})) < 0) {flag} = 0;",
+                indent,
+            )
+        elif isinstance(op, ast.Sub):
+            self.emit(f"{slot} = {left} - {right};", indent)
+            self.emit(
+                f"if ((({left} ^ {right}) & ({left} ^ {slot})) < 0) {flag} = 0;",
+                indent,
+            )
+        elif isinstance(op, ast.Mult):
+            # Checked before rather than after: recovering the operands from a
+            # wrapped product needs a division, and dividing the smallest
+            # negative value by -1 overflows in its own right. Two operands
+            # that each fit 32 bits have a product that certainly fits 64.
+            tests = [
+                f"{side} > 2147483647 || {side} < -2147483647"
+                for side in (left, right)
+                # A literal already known to fit needs no test at run time.
+                if not (side.lstrip("-").isdigit() and abs(int(side)) <= 2147483647)
+            ]
+            if tests:
+                self.emit(f"if ({' || '.join(tests)}) {flag} = 0;", indent)
+                self.emit(f"else {slot} = {left} * {right};", indent)
+            else:
+                self.emit(f"{slot} = {left} * {right};", indent)
+        elif isinstance(op, (ast.FloorDiv, ast.Mod)):
+            # Python floors, C truncates: -7 // 2 is -4 in Python and -3 in C,
+            # and the remainder takes the sign of the divisor rather than of
+            # the dividend. One correction after the fact fixes both, and it
+            # is only taken when the division was not exact and the signs
+            # disagree - which is the case C got wrong.
+            quotient, remainder = self.machine_slot(), self.machine_slot()
+            # A zero divisor is a ZeroDivisionError, which the C API raises
+            # with the right message; -1 is the one divisor that can overflow,
+            # against the most negative value there is.
+            self.emit(f"if ({right} == 0 || {right} == -1) {flag} = 0;", indent)
+            self.emit(f"if ({flag}) {{", indent)
+            self.emit(f"{quotient} = {left} / {right};", indent + 1)
+            self.emit(f"{remainder} = {left} - {quotient} * {right};", indent + 1)
+            self.emit(
+                f"if ({remainder} != 0 && (({remainder} < 0) != ({right} < 0))) {{",
+                indent + 1,
+            )
+            self.emit(f"{quotient} = {quotient} - 1;", indent + 2)
+            self.emit(f"{remainder} = {remainder} + {right};", indent + 2)
+            self.emit("}", indent + 1)
+            self.emit(
+                f"{slot} = "
+                f"{quotient if isinstance(op, ast.FloorDiv) else remainder};",
+                indent + 1,
+            )
+            self.emit("}", indent)
+        else:
+            # The bitwise three. Python defines them on integers of unbounded
+            # length in two's complement, which for two values that fit the
+            # word is exactly what the machine does - and the result cannot be
+            # wider than the wider operand, so there is nothing to check.
+            spelling = {ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^"}
+            self.emit(f"{slot} = {left} {spelling[type(op)]} {right};", indent)
+
+    def box_machine(self, machine: _Machine, slow, indent: int) -> str:
+        """The value as an object: the fast arm boxed, or `slow()` emitted."""
+
+        target = self.temporary()
+        self.emit(f"if ({machine.flag}) {{", indent)
+        self.emit(f"{target} = PyLong_FromLongLong({machine.value});", indent + 1)
+        self.emit(f"if (!{target}) {{ {self.failure()} }}", indent + 1)
+        self.emit("} else {", indent)
+        with self.boxed_only():
+            spelled = slow(indent + 1)
+        self.emit(f"{target} = {spelled};", indent + 1)
+        self.emit("}", indent)
+        return target
+
+    def narrow_comparison(self, node: ast.expr) -> bool:
+        """True for a comparison of two machine integers."""
+
+        return (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], _MACHINE_TESTS)
+            and self.narrow_tree(node.left)
+            and self.narrow_tree(node.comparators[0])
+            and any(isinstance(part, ast.Name) for part in ast.walk(node))
+        )
+
+    def machine_comparison(
+        self, node: ast.Compare, indent: int
+    ) -> tuple[str, str]:
+        """`(flag, answer)`: the C ints saying whether it ran, and what it said.
+
+        Two integers compare with one machine instruction. Doing it through
+        `PyObject_RichCompare` costs a call that dispatches on both types and
+        then hands back one of two singletons for `PyObject_IsTrue` to take
+        apart again.
+        """
+
+        spelling = {
+            ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+            ast.Eq: "==", ast.NotEq: "!=",
+        }[type(node.ops[0])]
+        left = self.machine_expression(node.left, indent)
+        right = self.machine_expression(node.comparators[0], indent)
+        known = [side.flag for side in (left, right) if side.flag is not None]
+        flag = self.temporary_flag()
+        self.emit(f"{flag} = {' && '.join(known) if known else '1'};", indent)
+        answer = self.temporary_flag()
+        self.emit(
+            f"if ({flag}) {answer} = ({left.value} {spelling} {right.value});",
+            indent,
+        )
+        return flag, answer
+
+    def truth(self, node: ast.expr, indent: int) -> str:
+        """A C int that is 1 when this expression is true, -1 on failure.
+
+        The point of having it separate from `expression` is that a condition
+        never needs the value, only the verdict - and for two integers the
+        verdict is a machine comparison with no object built at all. Every
+        `if` and every `while` comes through here.
+        """
+
+        if self.narrow_comparison(node):
+            flag, answer = self.machine_comparison(node, indent)
+            self.emit(f"if (!{flag}) {{", indent)
+            with self.boxed_only():
+                spelled = self.expression(node, indent + 1)
+            self.emit(f"{answer} = PyObject_IsTrue({spelled});", indent + 1)
+            self.emit(f"Py_DecRef({spelled});", indent + 1)
+            self.emit("}", indent)
+            return answer
+        decision = self.temporary_flag()
+        test = self.expression(node, indent)
+        self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
+        self.emit(f"Py_DecRef({test});", indent)
+        return decision
+
+    def narrow_assign(self, name: str, value: ast.expr, indent: int) -> bool:
+        """Bind a name straight from a register, if both ends allow it.
+
+        This is where the saving actually lands. An accumulator around a loop
+        becomes an add and a store; the same line through the C API is a call,
+        a heap allocation and two reference counts, every iteration.
+        """
+
+        if not self.is_unboxed(name) or not self.narrow_tree(value):
+            return False
+        machine = self.machine_expression(value, indent)
+        if machine.flag is None:
+            self.store_machine(name, machine.value, indent)
+            return True
+        self.emit(f"if ({machine.flag}) {{", indent)
+        self.store_machine(name, machine.value, indent + 1)
+        self.emit("} else {", indent)
+        with self.boxed_only():
+            spelled = self.expression(value, indent + 1)
+        self.store_object(name, spelled, indent + 1)
+        self.emit("}", indent)
+        return True
+
     # --- expressions -----------------------------------------------------
 
     def expression(self, node: ast.expr, indent: int) -> str:
@@ -659,6 +1083,9 @@ class CApiEmitter:
             return f"p_{name}"
         if f"v_{name}" in self.current.locals:
             return f"v_{name}"
+        if name in self.current.unboxed:
+            # Declared as three variables; the object half is still `v_`.
+            return f"v_{name}"
         if name in self.current.captures:
             return f"c_{name}"
         if name in self.globals:
@@ -667,6 +1094,8 @@ class CApiEmitter:
 
     def name(self, node: ast.Name, indent: int) -> str:
         assert self.current is not None
+        if self.is_unboxed(node.id):
+            return self.read_unboxed(node, indent)
         c_name = self.reference(node.id)
         if c_name is None:
             # Local, then global, then builtins - the order Python looks in.
@@ -726,6 +1155,17 @@ class CApiEmitter:
         function = _BINARY.get(type(node.op))
         if function is None:
             raise self.fail(node, f"{type(node.op).__name__} is not translated here yet")
+        if isinstance(node.op, _MACHINE_OPS) and self.narrow_tree(node):
+            # Worth the two arms only when a local is involved; a tree of
+            # literals is folded into one constant elsewhere.
+            if any(isinstance(part, ast.Name) for part in ast.walk(node)):
+                machine = self.machine_expression(node, indent)
+                return self.box_machine(
+                    machine, lambda inner: self.boxed_binary(node, function, inner), indent
+                )
+        return self.boxed_binary(node, function, indent)
+
+    def boxed_binary(self, node: ast.BinOp, function: str, indent: int) -> str:
         left = self.expression(node.left, indent)
         right = self.expression(node.right, indent)
         target = self.temporary()
@@ -744,6 +1184,26 @@ class CApiEmitter:
         operation = _COMPARISONS.get(type(node.ops[0]))
         if operation is None:
             raise self.fail(node, f"{type(node.ops[0]).__name__} is not translated here yet")
+        if self.narrow_comparison(node):
+            flag, answer = self.machine_comparison(node, indent)
+            target = self.temporary()
+            self.emit(f"if ({flag}) {{", indent)
+            self.emit(f"if ({answer}) {{", indent + 1)
+            true_value = self.builtin("True", indent + 2)
+            self.emit(f"{target} = {true_value};", indent + 2)
+            self.emit("} else {", indent + 1)
+            false_value = self.builtin("False", indent + 2)
+            self.emit(f"{target} = {false_value};", indent + 2)
+            self.emit("}", indent + 1)
+            self.emit("} else {", indent)
+            with self.boxed_only():
+                spelled = self.boxed_comparison(node, operation, indent + 1)
+            self.emit(f"{target} = {spelled};", indent + 1)
+            self.emit("}", indent)
+            return target
+        return self.boxed_comparison(node, operation, indent)
+
+    def boxed_comparison(self, node: ast.Compare, operation: int, indent: int) -> str:
         left = self.expression(node.left, indent)
         right = self.expression(node.comparators[0], indent)
         target = self.temporary()
@@ -812,10 +1272,7 @@ class CApiEmitter:
     def conditional_expression(self, node: ast.IfExp, indent: int) -> str:
         """`a if c else b` - a real branch, so only one arm is evaluated."""
 
-        decision = self.temporary_flag()
-        test = self.expression(node.test, indent)
-        self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
-        self.emit(f"Py_DecRef({test});", indent)
+        decision = self.truth(node.test, indent)
         self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
         target = self.temporary()
         self.emit(f"if ({decision}) {{", indent)
@@ -1618,6 +2075,7 @@ class CApiEmitter:
         assert self.current is not None
         self.depth += 1
         mark = self.current.temporaries
+        machined = self.current.machines
         try:
             self.write_statement(node, indent)
             if self.depth == 1:
@@ -1633,6 +2091,7 @@ class CApiEmitter:
                 # classes it catches, a `finally` keeping what it will return -
                 # is at a greater depth and is not wound back under it.
                 self.current.temporaries = mark
+                self.current.machines = machined
 
     @contextlib.contextmanager
     def settled_within(self, names):
@@ -1847,6 +2306,9 @@ class CApiEmitter:
         right. One value however many names it is given to.
         """
 
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if self.narrow_assign(node.targets[0].id, node.value, indent):
+                return
         value = self.expression(node.value, indent)
         for position, target in enumerate(node.targets):
             if position + 1 < len(node.targets):
@@ -1862,6 +2324,9 @@ class CApiEmitter:
         """
 
         if isinstance(target, ast.Name):
+            if self.is_unboxed(target.id):
+                self.store_object(target.id, value, indent)
+                return
             slot = self.declare(target.id)
             # The name may already hold something; that reference is released
             # before it is overwritten, which is what keeps a loop from
@@ -2401,7 +2866,12 @@ class CApiEmitter:
             ),
             node,
         )
+        if self.narrow_assign(node.target.id, rewritten, indent):
+            return
         value = self.expression(rewritten, indent)
+        if self.is_unboxed(node.target.id):
+            self.store_object(node.target.id, value, indent)
+            return
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
@@ -2558,10 +3028,7 @@ class CApiEmitter:
         self.emit(f'PyFile_WriteString("\\n", {stream});', indent)
 
     def conditional(self, node: ast.If, indent: int) -> None:
-        test = self.expression(node.test, indent)
-        decision = self.temporary_flag()
-        self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
-        self.emit(f"Py_DecRef({test});", indent)
+        decision = self.truth(node.test, indent)
         self.emit(f"if ({decision}) {{", indent)
         for statement in node.body:
             self.statement(statement, indent + 1)
@@ -2580,11 +3047,8 @@ class CApiEmitter:
         """
 
         broke = self.begin_loop(node, indent)
-        decision = self.temporary_flag()
         self.emit("while (1) {", indent)
-        test = self.expression(node.test, indent + 1)
-        self.emit(f"{decision} = PyObject_IsTrue({test});", indent + 1)
-        self.emit(f"Py_DecRef({test});", indent + 1)
+        decision = self.truth(node.test, indent + 1)
         self.emit(f"if (!{decision}) break;", indent + 1)
         self.loop_depth += 1
         try:
@@ -2631,6 +3095,11 @@ class CApiEmitter:
 
         if not isinstance(node.target, (ast.Name, ast.Tuple, ast.List)):
             raise self.fail(node, "a for loop binds a name or a tuple of names")
+        if isinstance(node.target, ast.Name) and self.is_unboxed(node.target.id):
+            bounds = narrow_range(node.iter)
+            if bounds is not None and "range" not in self.shadowed_builtins:
+                self.counted_loop(node, bounds, indent)
+                return
         sequence = self.expression(node.iter, indent)
         iterator = self.temporary()
         self.emit(f"{iterator} = PyObject_GetIter({sequence});", indent)
@@ -2678,6 +3147,135 @@ class CApiEmitter:
         self.emit("}", indent)
         self.emit(f"Py_DecRef({iterator});", indent)
         self.finish_loop(node, broke, indent)
+
+    def counted_loop(
+        self, node: ast.For, bounds: list[ast.expr], indent: int
+    ) -> None:
+        """`for i in range(...)` with the counting done in a register.
+
+        The interpreter builds one integer object per iteration and throws it
+        away again; a counted loop builds none. That is the single largest
+        saving this tier has, because a `range` loop is how most Python
+        arithmetic gets written.
+
+        There is still exactly one copy of the body. The choice between
+        counting and the iterator protocol is a branch *inside* the loop, not
+        two loops - a duplicated body would grow the binary in proportion to
+        how much of the program this helped, which is the wrong trade. The
+        branch itself costs nothing worth measuring: it goes the same way
+        every iteration, which is the case branch prediction is built for.
+
+        The counting is declined at run time, not refused at compile time,
+        whenever the arguments are not ordinary machine integers - `range` over
+        a value too wide for a machine word is perfectly legal Python, and so
+        is `range` over anything with an `__index__`. Both then go the long way
+        round and behave exactly as they did.
+        """
+
+        assert self.current is not None
+        name = node.target.id
+        held, obj, state = self.narrow_slots(name)
+        # Evaluated once, here, whatever path the loop then takes: these are
+        # arbitrary expressions and Python evaluates each exactly once.
+        spelled = [self.expression(argument, indent) for argument in bounds]
+        start, stop, step = self.machine_slot(), self.machine_slot(), self.machine_slot()
+        counting = self.temporary_flag()
+        self.emit(f"{counting} = 1;", indent)
+        order = (
+            [(start, spelled[0]), (stop, spelled[1])]
+            if len(spelled) > 1
+            else [(stop, spelled[0])]
+        )
+        if len(spelled) > 2:
+            order.append((step, spelled[2]))
+        if len(spelled) < 2:
+            self.emit(f"{start} = 0;", indent)
+        if len(spelled) < 3:
+            self.emit(f"{step} = 1;", indent)
+        for slot, value in order:
+            self.emit(f"{slot} = PyLong_AsLongLong({value});", indent)
+            # A value that does not fit, or that is not an integer at all, is
+            # not an error here - the generic path will call `range` with it
+            # and let the interpreter say what it thinks.
+            self.emit(
+                f"if ({slot} == -1 && PyErr_Occurred()) "
+                f"{{ PyErr_Clear(); {counting} = 0; }}",
+                indent,
+            )
+        # A zero step is a ValueError, and the bounds are kept clear of the
+        # edge of the word so that advancing the counter cannot itself
+        # overflow. Both are left for `range` itself to handle.
+        self.emit(f"if ({step} == 0) {counting} = 0;", indent)
+        for slot in (start, stop, step):
+            self.emit(
+                f"if ({slot} > {_MACHINE_LIMIT} || {slot} < -{_MACHINE_LIMIT}) "
+                f"{counting} = 0;",
+                indent,
+            )
+        iterator = self.temporary()
+        self.emit(f"{iterator} = 0;", indent)
+        self.emit(f"if (!{counting}) {{", indent)
+        built = self.call_range(spelled, indent + 1)
+        self.emit(f"{iterator} = PyObject_GetIter({built});", indent + 1)
+        self.emit(f"Py_DecRef({built});", indent + 1)
+        self.emit(f"if (!{iterator}) {{ {self.failure()} }}", indent + 1)
+        self.emit("}", indent)
+        for value in spelled:
+            self.emit(f"Py_DecRef({value});", indent)
+        counter = self.machine_slot()
+        self.emit(f"{counter} = {start};", indent)
+        item = self.temporary()
+        self.emit("while (1) {", indent)
+        self.emit(f"if ({counting}) {{", indent + 1)
+        self.emit(f"if ({step} > 0) {{", indent + 2)
+        self.emit(f"if ({counter} >= {stop}) break;", indent + 3)
+        self.emit("} else {", indent + 2)
+        self.emit(f"if ({counter} <= {stop}) break;", indent + 3)
+        self.emit("}", indent + 2)
+        self.emit(f"if ({obj}) {{ Py_DecRef({obj}); {obj} = 0; }}", indent + 2)
+        self.emit(f"{held} = {counter};", indent + 2)
+        self.emit(f"{state} = 1;", indent + 2)
+        self.emit(f"{counter} = {counter} + {step};", indent + 2)
+        self.emit("} else {", indent + 1)
+        self.emit(f"{item} = PyIter_Next({iterator});", indent + 2)
+        self.emit(
+            f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
+            indent + 2,
+        )
+        self.store_object(name, item, indent + 2)
+        self.emit("}", indent + 1)
+        broke = self.begin_loop(node, indent)
+        self.loop_depth += 1
+        try:
+            with self.settled_within({name}):
+                for statement in node.body:
+                    self.statement(statement, indent + 1)
+        finally:
+            self.loop_depth -= 1
+        self.emit("}", indent)
+        self.emit(f"if ({iterator}) Py_DecRef({iterator});", indent)
+        self.finish_loop(node, broke, indent)
+
+    def call_range(self, arguments: list[str], indent: int) -> str:
+        """Call the builtin `range` with values already in hand.
+
+        Only reached when the counting was declined, so this is not on any
+        path that matters for speed - it is here so that a program whose
+        bounds are wider than a machine word behaves exactly as before.
+        """
+
+        callable_ = self.builtin("range", indent)
+        array = self.argument_array(len(arguments))
+        for offset, value in enumerate(arguments):
+            self.emit(f"{array}[{offset}] = {value};", indent)
+        built = self.temporary()
+        self.emit(
+            f"{built} = PyObject_Vectorcall({callable_}, {array}, "
+            f"{len(arguments)}, 0);",
+            indent,
+        )
+        self.emit(f"Py_DecRef({callable_});", indent)
+        return self.checked(built, indent)
 
     def temporary_flag(self) -> str:
         assert self.current is not None
@@ -3492,6 +4090,8 @@ class CApiEmitter:
         function = _Function(
             c_name, held, len(arguments.defaults), captures, closure=True
         )
+        if isinstance(node.body, list):
+            function.unboxed = unboxable_locals(node.body, set(held) | set(captures))
         outer, outer_handlers, outer_scope = (
             self.current,
             self.handlers,
@@ -3592,6 +4192,7 @@ class CApiEmitter:
         self.globals = set()
         self.known_functions = {}
         self.certain_globals = set()
+        self.shadowed_builtins = _shadowed_builtins(tree)
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -3731,6 +4332,7 @@ class CApiEmitter:
         # The C name carries the module's prefix, because two modules linked
         # into one image may each define a function of the same name.
         function = _Function(self.prefix + node.name, parameters, len(defaults))
+        function.unboxed = unboxable_locals(node.body, set(parameters))
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))
@@ -3934,7 +4536,9 @@ class CApiEmitter:
         lines = []
         pad = "    " * depth
         for name in function.locals:
-            if name.startswith("int "):
+            if name.startswith("long long "):
+                lines.append(f"{pad}{name} = 0;")
+            elif name.startswith("int "):
                 lines.append(f"{pad}{name} = 0;")
             elif "[" in name:
                 lines.append(f"{pad}PyObject *{name};")
