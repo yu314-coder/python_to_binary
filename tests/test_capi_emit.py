@@ -8,6 +8,7 @@ own semantics - most visibly integers that do not stop at 64 bits.
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import subprocess
@@ -1618,6 +1619,48 @@ class CApiEmitTests(unittest.TestCase):
             self.assertEqual(icns.read_bytes()[:4], b"icns")
             ran = subprocess.run([str(executable)], capture_output=True)
             self.assertEqual(ran.stdout, b"windowed\n")
+
+    def test_extra_search_paths_are_baked_in(self):
+        """The linked interpreter's search path is the build machine's.
+
+        A compiled binary carries the program but not its dependencies, and
+        the interpreter it links knows nothing of where they were installed -
+        so an application that is otherwise complete stops at
+        ModuleNotFoundError for a package plainly present on the machine.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            elsewhere = root / "packages"
+            elsewhere.mkdir()
+            (elsewhere / "only_here.py").write_text(
+                "VALUE = 'found it'\n", encoding="utf-8"
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import only_here\nprint(only_here.VALUE)\n", encoding="utf-8"
+            )
+            generated, _linked = python_program_to_capi_c(
+                entry, (str(elsewhere),)
+            )
+            self.assertIn("sys.path.insert", generated)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            # Run somewhere else entirely, with nothing helping it along: the
+            # path has to have travelled inside the binary.
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "PYTHONPATH"
+            }
+            ran = subprocess.run(
+                [str(binary)], capture_output=True, cwd="/", env=environment
+            )
+            self.assertEqual(ran.stdout, b"found it\n")
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's

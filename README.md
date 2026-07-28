@@ -167,9 +167,12 @@ PYTHONPATH=src python3 -m py2bin compile-capi program.py \
   --target darwin-arm64 -o program.bin
 
 #    ...or as a macOS .app with an icon. What is inside the bundle is the
-#    compiled program, not an interpreter and a copy of the source.
+#    compiled program, not an interpreter and a copy of the source. --site
+#    puts a directory on sys.path, which is how the binary finds packages
+#    the linked interpreter was never told about.
 PYTHONPATH=src python3 -m py2bin compile-capi app.py \
-  --target darwin-arm64 --app --name "My App" --icon icon.icns -o MyApp.app
+  --target darwin-arm64 --app --name "My App" --icon icon.icns \
+  --site ~/venvs/myapp/lib/python3.12/site-packages -o MyApp.app
 
 # 2. Python that imports vetted C-API names from py2bin.cabi.
 PYTHONPATH=src python3 -m py2bin compile program.py \

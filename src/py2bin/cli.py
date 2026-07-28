@@ -190,6 +190,18 @@ def _parser() -> argparse.ArgumentParser:
         "--app", action="store_true", help="wrap the binary in a macOS .app"
     )
     capi_parser.add_argument("--name", help="application display name")
+    capi_parser.add_argument(
+        "--site",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help=(
+            "put DIR on sys.path before the program runs; repeatable. The "
+            "interpreter a compiled binary links is the build machine's, and "
+            "its search path does not know where this program's dependencies "
+            "were installed"
+        ),
+    )
     capi_parser.add_argument("--icon", type=Path, help="app icon (.icns, .ico, .png)")
     capi_parser.add_argument("--clean", action="store_true")
     via_c_parser = commands.add_parser(
@@ -877,7 +889,10 @@ def main(argv: list[str] | None = None) -> int:
             from .capi_emit import python_program_to_capi_c
 
             target = _target_from_args(args)
-            generated, linked = python_program_to_capi_c(entry)
+            generated, linked = python_program_to_capi_c(
+                entry,
+                tuple(str(Path(d).expanduser().resolve()) for d in args.site),
+            )
             if linked:
                 print(
                     f"linking {len(linked)} module(s) of the program itself: "

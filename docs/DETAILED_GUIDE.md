@@ -320,6 +320,15 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**A compiled binary carries the program, not its dependencies.** The
+interpreter it links is whichever one the build machine had, and that
+interpreter's search path knows nothing about where the application's packages
+were installed - so a `.app` that is otherwise complete dies instantly on
+`ModuleNotFoundError` for something plainly present, and from Finder it does so
+silently. `--site DIR` puts a directory on `sys.path` before anything runs; it
+is repeatable, and the entries go in front so a directory named at build time
+wins over whatever the linked interpreter happens to have.
+
 **A program is more than its entry file.** Compiling only the module named on
 the command line left every other `.py` of the same program to be found as
 source beside the binary - so a three-file application was one file compiled

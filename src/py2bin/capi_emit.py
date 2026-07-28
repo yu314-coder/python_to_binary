@@ -348,6 +348,12 @@ class CApiEmitter:
         #: The bare module-level names each linked module binds, so its module
         #: object can be given them once its body has run.
         self.module_globals: dict[str, set[str]] = {}
+        #: Directories put on `sys.path` before anything runs. The interpreter
+        #: a compiled program links is whichever one the build machine had, and
+        #: its search path knows nothing of where this program's dependencies
+        #: were installed - so a binary that is otherwise complete stops at
+        #: `ModuleNotFoundError` for a package that is plainly present.
+        self.extra_paths: list[str] = []
         #: The label a failing C-API call jumps to. Empty outside a `try`,
         #: where a failure ends the process instead.
         self.handlers: list[str] = []
@@ -3724,6 +3730,11 @@ class CApiEmitter:
         # with a UnicodeEncodeError that has nothing to do with the program.
         setup = "import sys; sys.stdout.reconfigure(encoding='utf-8')"
         out.append(f"    PyRun_SimpleString({_c_string(setup)});")
+        for directory in self.extra_paths:
+            # In front, so a directory named at build time wins over whatever
+            # the linked interpreter happens to have.
+            added = f"import sys; sys.path.insert(0, {directory!r})"
+            out.append(f"    PyRun_SimpleString({_c_string(added)});")
         for index, (c_name, label, signature) in enumerate(self.method_table):
             out.append(f"    _py2bin_methods[{index}].ml_name = {_c_string(label)};")
             out.append(f"    _py2bin_methods[{index}].ml_meth = f_{c_name};")
@@ -3828,7 +3839,9 @@ def imported_names(path: Path) -> set[str]:
     return found
 
 
-def python_program_to_capi_c(entry: Path) -> tuple[str, list[str]]:
+def python_program_to_capi_c(
+    entry: Path, extra_paths: tuple[str, ...] = ()
+) -> tuple[str, list[str]]:
     """Translate a program - the entry and the modules beside it - into one C.
 
     Compiling only the entry left its own imports to be read as source beside
@@ -3837,6 +3850,7 @@ def python_program_to_capi_c(entry: Path) -> tuple[str, list[str]]:
 
     modules = local_modules(entry)
     emitter = CApiEmitter(entry)
+    emitter.extra_paths = list(extra_paths)
     trees = [
         (name, ast.parse(path.read_text(encoding="utf-8")), str(path))
         for name, path in modules
