@@ -160,6 +160,17 @@ def _uleb(value: int) -> bytes:
             return bytes(out)
 
 
+#: What differs between the two darwin architectures, and nothing else does.
+#: Both dynamic images have the same segments, the same bind opcodes and the
+#: same link-edit layout; they disagree on the header's CPU, the page the
+#: segments align to, how a `__text` section states its alignment, and how a
+#: reference to the GOT or to static storage is spelled.
+_DARWIN_ARCHITECTURES = {
+    "arm64": {"cputype": 0x0100000C, "cpusubtype": 0, "page": 0x4000, "text_align": 2},
+    "x86_64": {"cputype": 0x01000007, "cpusubtype": 3, "page": 0x1000, "text_align": 0},
+}
+
+
 def write_macho_arm64_dynamic(
     code: bytes,
     externs: list[tuple[int, str]],
@@ -170,17 +181,63 @@ def write_macho_arm64_dynamic(
     libraries: tuple[str, ...] = ("/usr/lib/libSystem.B.dylib",),
     symbol_libraries: dict[str, str] | None = None,
 ) -> bytes:
-    """Return an arm64 Mach-O that binds external symbols through dyld.
+    """An arm64 Mach-O that binds external symbols through dyld."""
 
-    ``code`` is the ``.text`` produced by ``encode_darwin_extern`` and mapped at
-    ``base + page``. ``externs`` lists ``(byte_offset_in_code, symbol)`` GOT call
-    sites, where each site is ``adrp x16 / ldr x16,[x16,#off] / blr x16``. Every
-    unique symbol gets one 8-byte ``__got`` slot in a writable ``__DATA``
-    segment; classic ``LC_DYLD_INFO_ONLY`` bind opcodes tell dyld to store the
-    resolved libSystem address there before the entry point runs. This is real
-    dynamic linking, not a translation of the callee's source.
+    return _write_macho_dynamic(
+        "arm64", code, externs, statics, static_bytes, info_plist,
+        code_resources, libraries, symbol_libraries,
+    )
+
+
+def write_macho_x86_64_dynamic(
+    code: bytes,
+    externs: list[tuple[int, str]],
+    statics: list[tuple[int, int]] = (),
+    static_bytes: int = 0,
+    info_plist: bytes | None = None,
+    code_resources: bytes | None = None,
+    libraries: tuple[str, ...] = ("/usr/lib/libSystem.B.dylib",),
+    symbol_libraries: dict[str, str] | None = None,
+) -> bytes:
+    """The same image for x86-64, where a reference is one displacement.
+
+    arm64 reaches an address in two instructions - a page, then an offset into
+    it - because no single instruction carries 33 bits of displacement. x86-64
+    addresses memory relative to the instruction pointer directly, so a GOT
+    call is one `call *disp32(%rip)` and a static is one `lea`. That makes the
+    patching simpler, not different in kind: the same site list, resolved
+    against the same `__DATA` layout.
     """
-    page = 0x4000
+
+    return _write_macho_dynamic(
+        "x86_64", code, externs, statics, static_bytes, info_plist,
+        code_resources, libraries, symbol_libraries,
+    )
+
+
+def _write_macho_dynamic(
+    arch: str,
+    code: bytes,
+    externs: list[tuple[int, str]],
+    statics: list[tuple[int, int]] = (),
+    static_bytes: int = 0,
+    info_plist: bytes | None = None,
+    code_resources: bytes | None = None,
+    libraries: tuple[str, ...] = ("/usr/lib/libSystem.B.dylib",),
+    symbol_libraries: dict[str, str] | None = None,
+) -> bytes:
+    """Return a darwin Mach-O that binds external symbols through dyld.
+
+    ``code`` is the ``.text`` the architecture's ``encode_darwin_extern``
+    produced, mapped at ``base + page``. ``externs`` lists
+    ``(byte_offset_in_code, symbol)`` GOT reference sites. Every unique symbol
+    gets one 8-byte ``__got`` slot in a writable ``__DATA`` segment; classic
+    ``LC_DYLD_INFO_ONLY`` bind opcodes tell dyld to store the resolved address
+    there before the entry point runs. This is real dynamic linking, not a
+    translation of the callee's source.
+    """
+    shape = _DARWIN_ARCHITECTURES[arch]
+    page = shape["page"]
     base = 0x100000000
     code_fileoff = page
     code_vmaddr = base + code_fileoff
@@ -225,7 +282,24 @@ def write_macho_arm64_dynamic(
     data_used = _align(got_size, 16) + static_bytes if static_bytes else got_size
     data_filesize = _align(data_used, page) if data_used else page
 
-    # Patch each GOT call site now that the GOT address is fixed.
+    # Patch each reference site now that __DATA is fixed. On x86-64 both a GOT
+    # call and a static address are one rip-relative displacement, counted from
+    # the END of the instruction - and the recorded offset points at the
+    # displacement field, which is its last four bytes.
+    if arch == "x86_64":
+        for byte_offset, symbol in externs:
+            delta = (data_vmaddr + slot_of[symbol] * 8) - (
+                code_vmaddr + byte_offset + 4
+            )
+            if not -(1 << 31) <= delta < (1 << 31):
+                raise ValueError("x86-64 __got reference is out of rip-relative range")
+            struct.pack_into("<i", code, byte_offset, delta)
+        for byte_offset, static_offset in statics:
+            delta = (static_base + static_offset) - (code_vmaddr + byte_offset + 4)
+            if not -(1 << 31) <= delta < (1 << 31):
+                raise ValueError("x86-64 static reference is out of rip-relative range")
+            struct.pack_into("<i", code, byte_offset, delta)
+        externs, statics = [], []
     for byte_offset, symbol in externs:
         instruction_addr = code_vmaddr + byte_offset
         target = data_vmaddr + slot_of[symbol] * 8
@@ -344,7 +418,8 @@ def write_macho_arm64_dynamic(
     text_segment = segment(
         "__TEXT", base, text_filesize, 0, text_filesize, 5, 5, 1, 0
     ) + section(
-        "__text", "__TEXT", code_vmaddr, len(code), code_fileoff, 2, 0x80000400, 0
+        "__text", "__TEXT", code_vmaddr, len(code), code_fileoff,
+        shape["text_align"], 0x80000400, 0
     )
     data_segment = segment(
         "__DATA", data_vmaddr, data_filesize, data_fileoff, data_filesize, 3, 3, 1, 0
@@ -432,8 +507,8 @@ def write_macho_arm64_dynamic(
     header = struct.pack(
         "<IIIIIIII",
         0xFEEDFACF,
-        0x0100000C,
-        0,
+        shape["cputype"],
+        shape["cpusubtype"],
         2,
         command_count,
         len(commands),

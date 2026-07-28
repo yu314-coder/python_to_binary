@@ -218,6 +218,28 @@ class ExternRejectionTests(unittest.TestCase):
         message = self._compile_error("import numpy\nraise SystemExit(0)\n")
         self.assertIn("not in the native subset", message)
 
+    def test_extern_on_darwin_x86_64_is_accepted(self):
+        """The second architecture whose dynamic-link adapter is real.
+
+        It was refused until the x86-64 encoder learned to emit GOT reference
+        sites and the Mach-O writer learned to patch them, which is the same
+        pair of things the arm64 path has - spelled with one rip-relative
+        displacement rather than an ADRP and an offset.
+        """
+
+        entry, directory = _write(
+            "from py2bin.cabi import abs\n"
+            "raise SystemExit(abs(-1))\n"
+        )
+        output = directory / "out.bin"
+        compile_native(entry, output, "darwin-x86_64", clean=True)
+        image = output.read_bytes()
+        # A 64-bit little-endian Mach-O naming CPU_TYPE_X86_64.
+        self.assertEqual(image[:4], b"\xcf\xfa\xed\xfe")
+        self.assertEqual(
+            int.from_bytes(image[4:8], "little"), 0x01000007
+        )
+
     def test_extern_on_non_darwin_target_is_rejected(self):
         for target in ("linux-arm64", "linux-x86_64", "windows-x86_64"):
             message = self._compile_error(
@@ -225,7 +247,7 @@ class ExternRejectionTests(unittest.TestCase):
                 "raise SystemExit(abs(-1))\n",
                 target=target,
             )
-            self.assertIn("only supported for target 'darwin-arm64'", message)
+            self.assertIn("darwin-arm64, darwin-x86_64", message)
 
     def test_module_uses_extern_detects_nested_calls(self):
         entry, _directory = _write(

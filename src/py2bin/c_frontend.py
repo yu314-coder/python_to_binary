@@ -131,6 +131,12 @@ from .native.ir import (
 )
 
 
+#: Targets whose encoder can hand back the address of a string literal. Both
+#: darwin architectures place the bytes after the code and reach them with a
+#: PC-relative reference; the other back ends have nowhere to put them yet.
+_STRING_VALUE_TARGETS = frozenset({"darwin-arm64", "darwin-x86_64"})
+
+
 class CCompileError(ValueError):
     """A source-located rejection from py2bin's C compiler."""
 
@@ -3162,11 +3168,12 @@ class Lowerer:
         if isinstance(node, FloatLiteral):
             return Value(node.ctype, FloatConstant(node.value))
         if isinstance(node, StringLiteral):
-            if self.target != "darwin-arm64":
+            if self.target not in _STRING_VALUE_TARGETS:
                 self.error(
-                    "using a string literal as a pointer value needs the constant "
-                    "blob the darwin-arm64 image writer emits; it is not "
-                    f"implemented for {self.target!r} (printf of a literal is)",
+                    "using a string literal as a pointer value needs the "
+                    "constant bytes a darwin image writer places after the "
+                    f"code; it is not implemented for {self.target!r} "
+                    "(printf of a literal is)",
                     node.token,
                 )
             return Value(PointerType(CHAR), CStringConstant(node.data + b"\0"))

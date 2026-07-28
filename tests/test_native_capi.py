@@ -481,8 +481,10 @@ class ExternCallSafetyTests(unittest.TestCase):
                 _PROTOTYPES + "int main(void) { Py_Initialize(); return 0; }\n",
                 encoding="utf-8",
             )
+            # Both darwin architectures bind through dyld now; the other
+            # back ends have no dynamic-link adapter, so they still refuse.
             with self.assertRaisesRegex(
-                NativeCompileError, "only supported for target 'darwin-arm64'"
+                NativeCompileError, "darwin-arm64, darwin-x86_64"
             ):
                 compile_c_native(
                     entry, root / "program", target="linux-x86_64", clean=True
@@ -994,7 +996,7 @@ class ShippedCapiExampleTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
-                NativeCompileError, "only supported for target 'darwin-arm64'"
+                NativeCompileError, "darwin-arm64, darwin-x86_64"
             ):
                 compile_native(
                     _EXAMPLES / "capi_embedding.py",

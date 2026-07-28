@@ -153,14 +153,25 @@ WEBP/TIFF, and the app starts with no traceback.
 
 ### What this tier cannot do yet
 
-`compile-capi` targets **`darwin-arm64` only**. Every other target is refused
-at the point where the program would need external symbols bound, because the
-dynamic-linking half of the backend exists for arm64 Mach-O and nowhere else:
-`encode_darwin_extern` is in `native/arm64.py`, and the Mach-O writer has
-`write_macho_x86_64` but no dynamic variant of it. So there is no x86-64 `.app`,
-no Windows `.exe` and no Linux binary from this tier. Adding one means writing
-that backend half - GOT-relative addressing, `__DATA` statics, load commands -
-for the target in question.
+`compile-capi` targets **`darwin-arm64` and `darwin-x86_64`**. Both bind
+through dyld: each architecture's encoder emits the GOT and static reference
+sites, and one Mach-O writer lays out `__got`, the bind opcodes and `__DATA`
+and patches them. The two differ in four things and no more - the header's CPU,
+the page segments align to, how `__text` states its alignment, and how a
+reference is spelled. arm64 needs two instructions to reach an address (a page,
+then an offset into it); x86-64 needs one rip-relative displacement.
+
+Verified the same way: the 889-program corpus compiled for `darwin-x86_64`
+agrees with CPython on 878 and differs on the same 7 inherent cases as the
+arm64 build. That includes `sorted(key=lambda ...)`, which is the case that
+matters - a compiled closure called back from inside CPython cannot read its
+statics out of a callee-saved register, because while CPython's frame is live
+that register is CPython's. Statics live in the image on both.
+
+Windows and Linux are still refused. Windows needs a multi-DLL PE import table
+(the current one describes one, KERNEL32) and the same move of static storage
+out of `r15` and into the image. Linux needs an ELF `.got.plt` and its
+relocations. Neither is written.
 
 The bundle is also a **directory**, not one file. `--embed-python` needs
 somewhere to put the interpreter, the extensions and the packages, and a `.app`

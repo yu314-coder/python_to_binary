@@ -5,9 +5,11 @@ import struct
 
 from .ir import (
     BitsFloat,
+    CStringConstant,
     Call,
     Function,
     FunctionAddress,
+    ExternCall,
     GlobalAddress,
     IndirectCall,
     Return,
@@ -44,6 +46,7 @@ from .ir import (
     FileCall,
     EntryArguments,
     check_stack_slots,
+    is_float_expression,
 )
 
 
@@ -82,6 +85,18 @@ class _X86Refs:
     #: Bytes the caller reserves below the stack arguments. Microsoft x64
     #: requires 32 so a callee can spill rcx-r9; System V has none.
     shadow: int = 0
+    #: `(offset_of_disp32, symbol)` for each `call *disp32(%rip)` through the
+    #: GOT, filled in by the Mach-O writer once __DATA is placed.
+    externs: list = dataclasses.field(default_factory=list)
+    #: `(offset_of_disp32, static_offset)` for each `lea disp32(%rip)`.
+    statics: list = dataclasses.field(default_factory=list)
+    #: True when static storage lives in the image rather than in a mapping
+    #: whose base sits in a register - see `encode_darwin_extern`.
+    image_statics: bool = False
+    #: `(offset_of_disp32, bytes)` for a C string used as a value. The bytes
+    #: are laid down after the code and the displacement patched to reach them,
+    #: which is what the operation-level string mechanism already does.
+    strings: list = dataclasses.field(default_factory=list)
 
 
 def _mov_imm32(register_opcode: bytes, value: int) -> bytes:
@@ -277,7 +292,30 @@ def _expression(
         code.extend(b"\x48\x8d\x05\x00\x00\x00\x00")
         refs.addresses.append((len(code) - 4, expression.name))
         return
+    if isinstance(expression, CStringConstant):
+        if refs is None:
+            raise TypeError(
+                "x86-64 C-string constants require the darwin dynamic encoder"
+            )
+        # lea rax, [rip+disp32] to the bytes, which are placed after the code.
+        code.extend(b"\x48\x8d\x05\x00\x00\x00\x00")
+        refs.strings.append((len(code) - 4, expression.data))
+        return
+    if isinstance(expression, ExternCall):
+        if refs is None:
+            raise TypeError("x86-64 external calls require the darwin dynamic encoder")
+        _external_call_x86(code, expression, slot_base, refs)
+        return
     if isinstance(expression, GlobalAddress):
+        if refs is not None and refs.image_statics:
+            # lea rax, [rip+disp32]. PC-relative and register-free, so it
+            # reads the same object whoever's frame called this function.
+            # A register-held base cannot promise that once foreign code can
+            # call in: r15 is callee-saved, which means that while CPython's
+            # frame is live r15 is CPython's.
+            code.extend(b"\x48\x8d\x05\x00\x00\x00\x00")
+            refs.statics.append((len(code) - 4, expression.offset))
+            return
         # The static block's base lives in r15 for the whole run.
         code.extend(b"\x4c\x89\xf8")  # mov rax, r15
         if expression.offset:
@@ -475,6 +513,73 @@ def _direct_call(
     refs.calls.append((len(code) - 4, expression.name))
     if allocated:
         code.extend(b"\x48\x81\xc4" + struct.pack("<I", allocated))
+
+
+#: System V AMD64 integer argument registers, and the `mov reg,[rsp]` that
+#: reloads each from the spill slot the argument was evaluated into.
+_SYSV_INTEGER_RELOAD = (
+    b"\x48\x8b\x3c\x24",  # rdi
+    b"\x48\x8b\x34\x24",  # rsi
+    b"\x48\x8b\x14\x24",  # rdx
+    b"\x48\x8b\x0c\x24",  # rcx
+    b"\x4c\x8b\x04\x24",  # r8
+    b"\x4c\x8b\x0c\x24",  # r9
+)
+
+
+def _external_call_x86(
+    code: bytearray, expression, slot_base: int, refs: "_X86Refs"
+) -> None:
+    """Emit a System V AMD64 call to a dynamically bound external symbol.
+
+    Like AAPCS64, System V allocates the integer and the vector registers from
+    two INDEPENDENT counters: the first pointer goes in rdi however many
+    doubles precede it, and the first double goes in xmm0 however many words
+    precede it. `ldexp(double, int)` is the smallest call that shows it.
+
+    `al` carries the number of vector registers used. Only a variadic callee
+    reads it, and a non-variadic one ignores it, so it is always set rather
+    than reasoned about - getting it wrong for a variadic callee costs a crash
+    inside the callee's register save area, a long way from the cause.
+    """
+
+    plan: list[tuple[bool, int]] = []
+    integers = floats = 0
+    for argument in expression.arguments:
+        if is_float_expression(argument):
+            plan.append((True, floats))
+            floats += 1
+        else:
+            plan.append((False, integers))
+            integers += 1
+    if integers > 6 or floats > 8:
+        raise ValueError(
+            "x86-64 external calls support at most 6 integer and 8 float "
+            "arguments; there is no stack-argument path"
+        )
+    # Each argument is evaluated and spilled before any register is loaded, so
+    # that evaluating a later one cannot clobber an earlier one's register.
+    # Sixteen bytes a time keeps rsp 16-aligned, which is what the ABI requires
+    # at the point of the call.
+    for argument, (is_float, _register) in zip(expression.arguments, plan):
+        if is_float:
+            _float_expression(code, argument, slot_base, refs)  # -> xmm0
+            code.extend(b"\x48\x83\xec\x10")          # sub rsp, 16
+            code.extend(b"\xf2\x0f\x11\x04\x24")     # movsd [rsp], xmm0
+        else:
+            _expression(code, argument, slot_base, refs)   # -> rax
+            code.extend(b"\x48\x83\xec\x10")          # sub rsp, 16
+            code.extend(b"\x48\x89\x04\x24")          # mov [rsp], rax
+    for is_float, register in reversed(plan):
+        if is_float:
+            # movsd xmm<n>, [rsp]
+            code.extend(b"\xf2\x0f\x10" + bytes((0x04 | (register << 3), 0x24)))
+        else:
+            code.extend(_SYSV_INTEGER_RELOAD[register])
+        code.extend(b"\x48\x83\xc4\x10")              # add rsp, 16
+    code.extend(b"\xb0" + bytes((floats,)))              # mov al, <vector count>
+    code.extend(b"\xff\x15\x00\x00\x00\x00")        # call *disp32(rip)
+    refs.externs.append((len(code) - 4, expression.symbol))
 
 
 def _indirect_call_x86(
@@ -709,8 +814,35 @@ def _emit_function(
     code.extend(b"\xc3")  # ret
 
 
+def encode_darwin_extern(
+    module: Module, code_address: int, image_statics: bool = True
+) -> tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]:
+    """Encode a darwin x86-64 module that may call dyld-bound symbols.
+
+    The arm64 sibling's contract, unchanged: the `.text`, the ordered GOT
+    reference sites so the Mach-O writer can lay out `__got` and the bind
+    opcodes, and the static-address sites for it to point at `__DATA`.
+
+    Static storage goes in the image rather than in a mapping reached through
+    r15, for the reason the arm64 encoder gives about x28. An image that binds
+    CPython can hand it a function to call - that is what a compiled closure is
+    - and a callback entered from inside CPython's own frames finds CPython's
+    value in that callee-saved register, not this program's.
+    """
+
+    code, refs = _encode_x86(module, "darwin", code_address, image_statics)
+    return code, refs.externs, refs.statics
+
+
 def encode(module: Module, platform: str, code_address: int) -> bytes:
     """Encode native syscalls directly; no text assembly is produced."""
+
+    return _encode_x86(module, platform, code_address, image_statics=False)[0]
+
+
+def _encode_x86(
+    module: Module, platform: str, code_address: int, image_statics: bool = False
+) -> tuple[bytes, "_X86Refs"]:
     if platform == "linux":
         write_number, exit_number = 1, 60
         mmap_number, mmap_flags = 9, 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
@@ -750,7 +882,7 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
             code.extend(b"\x48\x89\x8d" + struct.pack("<i", capture.count_slot * 8))
             code.extend(b"\x48\x83\xc0\x08")  # add rax, 8
             code.extend(b"\x48\x89\x85" + struct.pack("<i", capture.vector_slot * 8))
-    if module.static_bytes:
+    if module.static_bytes and not image_statics:
         # One anonymous read/write mapping for every file-scope object, with
         # its base parked in r15 for the whole run. r15 is callee-saved and
         # this backend never writes it elsewhere, so a global keeps its address
@@ -765,7 +897,7 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
         code.extend(b"\x0f\x05")  # syscall
         code.extend(b"\x49\x89\xc7")  # mov r15, rax
 
-    refs = _X86Refs()
+    refs = _X86Refs(image_statics=image_statics)
     module = dataclasses.replace(module, operations=operations)
     pending_strings: list[tuple[int, bytes]] = []
     _emit_x86_operations(
@@ -792,12 +924,12 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
             )
         struct.pack_into("<i", code, position, offsets[name] - (position + 4))
 
-    for displacement_position, data in pending_strings:
+    for displacement_position, data in (*pending_strings, *refs.strings):
         data_offset = len(code)
         displacement = data_offset - (displacement_position + 4)
         struct.pack_into("<i", code, displacement_position, displacement)
         code += data
-    return bytes(code)
+    return bytes(code), refs
 
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:

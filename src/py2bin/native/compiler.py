@@ -16,12 +16,14 @@ from .formats.macho import (
     write_macho_arm64,
     write_macho_arm64_dynamic,
     write_macho_x86_64,
+    write_macho_x86_64_dynamic,
 )
 from .formats.pe import write_pe_arm64, write_pe_x86_64
 from .frontend import NativeCompileError, lower
 from .ir import CStringConstant, ExternCall, HeapInit, Module
 from .optimizer import optimize
 from .x86_64 import encode
+from .x86_64 import encode_darwin_extern as encode_darwin_extern_x86_64
 
 
 TARGETS = (
@@ -249,6 +251,11 @@ def _module_uses_extern(module: Module) -> bool:
 #: saved link register, arguments in the platform argument registers, and a
 #: direct branch-and-link). Everything else must reject a module that contains
 #: a ``Function`` rather than emit a binary that cannot make the call.
+#: Targets whose dynamic-link adapter is implemented rather than designed.
+#: Both are darwin: the Mach-O writer lays out `__got` and the bind opcodes,
+#: and each architecture's encoder emits the reference sites it patches.
+_EXTERN_CAPABLE_TARGETS = frozenset({"darwin-arm64", "darwin-x86_64"})
+
 CALL_CAPABLE_TARGETS = frozenset(
     {
         "darwin-arm64",
@@ -307,7 +314,7 @@ def _emit_native_module(
             f"targets {', '.join(sorted(STATIC_CAPABLE_TARGETS))} so far, not "
             f"{target!r}",
         )
-    if target != "darwin-arm64" and _module_uses_extern(module):
+    if target not in _EXTERN_CAPABLE_TARGETS and _module_uses_extern(module):
         # Extern (adapter-ABI) symbol calls are only wired through real dyld
         # binding on darwin-arm64 so far. Rather than emit a binary that would
         # not link its imports, reject with an exact message. The remaining
@@ -316,8 +323,9 @@ def _emit_native_module(
             entry,
             ast.parse("pass").body[0],
             f"external native symbol calls (py2bin.cabi) are only supported for "
-            f"target 'darwin-arm64' so far, not {target!r}; the dynamic-link "
-            "adapter for this platform is design-only",
+            f"targets {', '.join(sorted(_EXTERN_CAPABLE_TARGETS))} so far, not "
+            f"{target!r}; the dynamic-link adapter for this platform is "
+            "design-only",
         )
     executable_name = app_name or entry.stem
     # Written before the plist that names it, because the plist is embedded in
@@ -401,6 +409,44 @@ def _emit_native_module(
                 module, 0x100004000, image_statics=False
             )
             image = write_macho_arm64(code, info_plist, code_resources)
+    elif target == "darwin-x86_64" and _module_uses_extern(module):
+        code, externs, statics = encode_darwin_extern_x86_64(module, 0x100001000)
+        from ..cabi_tables import (
+            OBJC_FRAMEWORKS,
+            _OBJC_SYMBOLS,
+            _cpython_library,
+            symbol_library,
+        )
+
+        interpreter = _cpython_library()
+        symbol_libraries = {}
+        for _offset, symbol in externs:
+            library = symbol_library(symbol)
+            if library is None:
+                continue
+            if python_dylib is not None and library == interpreter:
+                library = python_dylib
+            symbol_libraries[symbol] = library
+        frameworks = (
+            OBJC_FRAMEWORKS
+            if any(symbol in _OBJC_SYMBOLS for symbol in symbol_libraries)
+            else ()
+        )
+        libraries = ("/usr/lib/libSystem.B.dylib", *dict.fromkeys(
+            library
+            for library in (*symbol_libraries.values(), *frameworks)
+            if library != "/usr/lib/libSystem.B.dylib"
+        ))
+        image = write_macho_x86_64_dynamic(
+            code,
+            externs,
+            statics,
+            module.static_bytes,
+            info_plist,
+            code_resources,
+            libraries=libraries,
+            symbol_libraries=symbol_libraries,
+        )
     else:
         code_address = 0x401000 if target == "linux-x86_64" else 0x100001000
         platform_name = target.partition("-")[0]
