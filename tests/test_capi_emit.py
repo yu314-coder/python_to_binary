@@ -8,6 +8,8 @@ own semantics - most visibly integers that do not stop at 64 bits.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import platform
 import shutil
@@ -2305,3 +2307,34 @@ class MachineIntegerTests(unittest.TestCase):
             "print(f())\n",
             b"[3, True, True]\n",
         )
+
+
+class CApiCommandLineTests(unittest.TestCase):
+    """What `compile-capi` refuses, and how it says so."""
+
+    def test_embedding_the_interpreter_needs_an_app_to_put_it_in(self):
+        """A refusal a user can act on, not a traceback.
+
+        `main` has no parser in scope, so reaching for one to report this
+        turned the refusal into a NameError - which tells a reader nothing
+        about the flag they passed.
+        """
+
+        from py2bin.cli import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "p.py").write_text("print(1)\n", encoding="utf-8")
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                code = main(
+                    [
+                        "compile-capi", str(root / "p.py"),
+                        "--target", "darwin-arm64",
+                        "--embed-python",
+                        "-o", str(root / "p.bin"),
+                    ]
+                )
+        self.assertEqual(code, 2)
+        self.assertIn("--embed-python needs --app", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())

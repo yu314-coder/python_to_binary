@@ -969,7 +969,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.app and output.suffix != ".app":
                 output = output.with_suffix(".app")
             if args.embed_python and not args.app:
-                parser.error("--embed-python needs --app: it fills the bundle")
+                # `main` does not hold the parser, and reaching for one that
+                # is not there turned a refusal a user should be able to act
+                # on into a NameError and a traceback.
+                print(
+                    "py2bin: error: --embed-python needs --app: "
+                    "it fills the bundle",
+                    file=sys.stderr,
+                )
+                return 2
             artifact = compile_c_native(
                 source,
                 output,
