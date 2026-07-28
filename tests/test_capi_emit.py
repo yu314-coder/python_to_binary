@@ -1031,6 +1031,84 @@ class CApiEmitTests(unittest.TestCase):
             b"NameError: name 'item' is not defined",
         )
 
+    def test_zero_argument_super(self):
+        """`super()` is `super(__class__, self)`.
+
+        CPython supplies those two through a cell it creates for any method
+        that mentions the name. A compiled method has no cell, so the two
+        values are written out - the same ones, named rather than implied. The
+        class is read when the method runs, by which time it exists.
+        """
+
+        self._run(
+            "class A:\n"
+            "    def __init__(self, v):\n"
+            "        self.v = v\n"
+            "    def describe(self):\n"
+            "        return 'A(' + str(self.v) + ')'\n"
+            "class B(A):\n"
+            "    def __init__(self, v, extra):\n"
+            "        super().__init__(v)\n"
+            "        self.extra = extra\n"
+            "    def describe(self):\n"
+            "        return 'B[' + super().describe() + ', ' + str(self.extra) + ']'\n"
+            "class C(B):\n"
+            "    def describe(self):\n"
+            "        return 'C{' + super().describe() + '}'\n"
+            "print(C(3, 4).describe())\n",
+            b"C{B[A(3), 4]}\n",
+        )
+
+    def test_too_many_arguments_is_refused_like_python(self):
+        """The extras used to sit unread in the tuple.
+
+        A call with the wrong shape ran anyway and answered - CPython's own
+        demo of this is `super().__init__(1, 2)` against an `__init__(self,
+        v)`, which raises there and returned here. The message follows
+        CPython's, including the qualified name, which is the one part a
+        compiled function cannot read off itself.
+        """
+
+        self._run(
+            "def outer():\n"
+            "    def one(a):\n"
+            "        return a\n"
+            "    def two(a, b=2):\n"
+            "        return (a, b)\n"
+            "    def rest(a, *more):\n"
+            "        return (a, more)\n"
+            "    for call, label in [\n"
+            "        (lambda: one(1, 2), 'one(1,2)'),\n"
+            "        (lambda: two(1, 2, 3), 'two(1,2,3)'),\n"
+            "        (lambda: one(), 'one()'),\n"
+            "    ]:\n"
+            "        try:\n"
+            "            print(label, '->', call())\n"
+            "        except TypeError as e:\n"
+            "            print(label, '->', e)\n"
+            "    print('ok:', rest(1, 2, 3), two(1))\n"
+            "outer()\n",
+            b"one(1,2) -> outer.<locals>.one() takes 1 positional argument "
+            b"but 2 were given\n"
+            b"two(1,2,3) -> outer.<locals>.two() takes from 1 to 2 positional "
+            b"arguments but 3 were given\n"
+            b"one() -> outer.<locals>.one() missing 1 required positional "
+            b"argument: 'a'\n"
+            b"ok: (1, (2, 3)) (1, 2)\n",
+        )
+
+    def test_a_method_is_named_for_its_class(self):
+        self._run(
+            "class A:\n"
+            "    def __init__(self, v):\n"
+            "        self.v = v\n"
+            "try:\n"
+            "    A(1, 2)\n"
+            "except TypeError as e:\n"
+            "    print(e)\n",
+            b"A.__init__() takes 2 positional arguments but 3 were given\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

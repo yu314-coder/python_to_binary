@@ -320,6 +320,23 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**Zero-argument `super()`.** `super()` is `super(__class__, self)`, and CPython
+supplies both through a cell it creates for any method that so much as mentions
+the name. A compiled method has no cell, so the emitter writes the two values
+out - the same ones, named rather than implied. The class is read when the
+method runs, by which time it exists; at the moment the method is written it
+does not.
+
+**A call with the wrong number of arguments.** Extra positional arguments used
+to sit unread in the tuple, so a call with the wrong shape ran anyway and
+answered - the demo that caught this was `super().__init__(1, 2)` against an
+`__init__(self, v)`, which raises under CPython and returned a value here. Both
+directions now raise `TypeError` with CPython's wording, including "from N to
+M" when some parameters have defaults. The qualified name in those messages -
+`outer.<locals>.one`, `A.__init__` - is the one part a compiled function cannot
+read off itself, so the emitter tracks the scopes it is inside: a function's
+own names sit under `<locals>`, a class's do not.
+
 **A name whose only binding did not run.** `d` is a name of the module even
 when the only `d = ...` sits in an `if` that did not run, so its slot can be
 empty when something reads it. `Py_IncRef(NULL)` followed, and the program

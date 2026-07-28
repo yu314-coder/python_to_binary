@@ -322,6 +322,15 @@ class CApiEmitter:
         #: a comprehension has its own, so its target must not be the
         #: enclosing name of the same spelling.
         self.shadowed: list[dict[str, str]] = []
+        #: The scopes enclosing what is being written, as `(name, is a
+        #: function)`. It is what builds the qualified name Python puts in a
+        #: TypeError - `outer.<locals>.one`, `C.method` - which is the only
+        #: part of those messages a compiled function cannot read off itself.
+        self.scope_path: list[tuple[str, bool]] = []
+        #: `(class name, first parameter)` for the method being written,
+        #: innermost last. It is what a zero-argument `super()` needs and has
+        #: no other way to reach.
+        self.methods_of: list[tuple[str, str]] = []
         #: True once a name read needs the unbound-name helper, which is then
         #: written into the C once rather than at each of a thousand sites.
         self.needs_unbound = False
@@ -1169,6 +1178,31 @@ class CApiEmitter:
         return self.checked(target, indent)
 
     def call(self, node: ast.Call, indent: int) -> str:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "super"
+            and not node.args
+            and not node.keywords
+            and self.methods_of
+        ):
+            # `super()` is `super(__class__, self)`, and CPython supplies those
+            # two through a cell it creates for any method that mentions the
+            # name. A compiled method has no cell, so the arguments are written
+            # out here instead - the same two values, named rather than
+            # implied. The class is read when the method runs, by which time it
+            # exists; at the moment the method is written it does not yet.
+            owner, first = self.methods_of[-1]
+            node = ast.copy_location(
+                ast.Call(
+                    func=node.func,
+                    args=[
+                        ast.copy_location(ast.Name(id=owner, ctx=ast.Load()), node),
+                        ast.copy_location(ast.Name(id=first, ctx=ast.Load()), node),
+                    ],
+                    keywords=[],
+                ),
+                node,
+            )
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):
@@ -2432,7 +2466,23 @@ class CApiEmitter:
                 "quietly disagreeing",
             )
 
-    def make_closure(self, node: ast.AST, label: str, indent: int) -> str:
+    def qualified(self, name: str) -> str:
+        """The name Python would show for something defined right here.
+
+        A function's own names sit under `<locals>`; a class's do not.
+        """
+
+        parts: list[str] = []
+        for scope, is_function in self.scope_path:
+            parts.append(scope)
+            if is_function:
+                parts.append("<locals>")
+        parts.append(name)
+        return ".".join(parts)
+
+    def make_closure(
+        self, node: ast.AST, label: str, indent: int, display: str | None = None
+    ) -> str:
         """A nested `def` or a `lambda`, as a real Python callable.
 
         The body becomes a C function with the `(self, args)` shape CPython
@@ -2480,7 +2530,9 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({held});", indent)
         self.checked(target, indent)
 
-        self.write_closure(node, c_name, captures)
+        self.write_closure(
+            node, c_name, captures, display or self.qualified(label), label
+        )
         return target
 
     def class_definition(self, node: ast.ClassDef, indent: int) -> None:
@@ -2507,6 +2559,7 @@ class CApiEmitter:
                 "a class with a metaclass or a decorator is not translated "
                 "here yet",
             )
+        self.scope_path.append((node.name, False))
         namespace = self.temporary()
         self.emit(f"{namespace} = PyDict_New();", indent)
         self.checked(namespace, indent)
@@ -2533,7 +2586,16 @@ class CApiEmitter:
                     )
                     self.emit(f"Py_DecRef({functools});", indent)
                     self.checked(binder, indent)
-                body = self.make_closure(statement, statement.name, indent)
+                first = (
+                    statement.args.posonlyargs or statement.args.args
+                )
+                self.methods_of.append(
+                    (node.name, first[0].arg if first else "")
+                )
+                try:
+                    body = self.make_closure(statement, statement.name, indent)
+                finally:
+                    self.methods_of.pop()
                 value = self.temporary()
                 self.emit(
                     f"{value} = PyObject_CallOneArg({binder}, {body});", indent
@@ -2581,6 +2643,7 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({maker});", indent)
         self.emit(f"Py_DecRef({arguments});", indent)
         self.checked(made, indent)
+        self.scope_path.pop()
         target = self.declare(node.name)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {made};", indent)
@@ -2638,6 +2701,7 @@ class CApiEmitter:
         keyword_source: str | None,
         prefix: str = "p_",
         missing_is_null: bool = False,
+        display: str = "<lambda>",
     ) -> None:
         """Fill each parameter from the argument tuple, then from the keywords.
 
@@ -2713,6 +2777,16 @@ class CApiEmitter:
                 node, name, slot, indent,
                 None if offset < required else defaults[offset - required],
                 missing_is_null,
+                display,
+            )
+        if not arguments.vararg and not missing_is_null:
+            # Too many is as wrong as too few, and was accepted in silence:
+            # the extras simply sat unread in the tuple. Only a function with
+            # no `*args` can be too many for; the wrapper for a module-level
+            # `def` is exempt because the arity was already checked where the
+            # call was written.
+            self.refuse_extra_arguments(
+                display, len(positional), len(defaults), required, indent
             )
         for offset, name in enumerate(keyword_only):
             # Never read from the tuple: that is what keyword-only means.
@@ -2722,6 +2796,7 @@ class CApiEmitter:
                 node, name, slot, indent,
                 arguments.kw_defaults[offset],
                 missing_is_null,
+                display,
             )
         if arguments.vararg:
             slot = f"{prefix}{arguments.vararg.arg}"
@@ -2738,6 +2813,50 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({span});", indent)
             self.checked(slot, indent)
 
+    def refuse_extra_arguments(
+        self, display: str, accepted: int, defaulted: int, required: int, indent: int
+    ) -> None:
+        """Stop when the call passed more positional arguments than there are.
+
+        The extras used to sit unread in the tuple, so a call with the wrong
+        shape ran anyway and answered - `super().__init__(1, 2)` against an
+        `__init__(self, v)` gave a result where CPython raises. The wording
+        follows CPython's, which says "from N to M" when some of the
+        parameters have defaults and a single number when none do.
+        """
+
+        span = (
+            f"from {required} to {accepted}" if defaulted else f"{accepted}"
+        )
+        plural = "argument" if accepted == 1 else "arguments"
+        given = self.temporary()
+        self.emit(f"{given} = PyLong_FromLongLong(PyObject_Size(_args));", indent)
+        self.checked(given, indent)
+        limit = self.temporary()
+        self.emit(f"{limit} = PyLong_FromLongLong({accepted}LL);", indent)
+        self.checked(limit, indent)
+        outcome = self.temporary()
+        # Py_GT is 4 in the rich-comparison numbering.
+        self.emit(
+            f"{outcome} = PyObject_RichCompare({given}, {limit}, 4);", indent
+        )
+        self.emit(f"Py_DecRef({limit});", indent)
+        self.checked(outcome, indent)
+        verdict = self.temporary_flag()
+        self.emit(f"{verdict} = PyObject_IsTrue({outcome});", indent)
+        self.emit(f"Py_DecRef({outcome});", indent)
+        self.emit(f"if ({verdict} < 0) {{ {self.failure()} }}", indent)
+        self.emit(f"if ({verdict}) {{", indent)
+        self.raise_counted(
+            "TypeError",
+            f"{display}() takes {span} positional {plural} but ",
+            given,
+            " were given",
+            indent + 1,
+        )
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({given});", indent)
+
     def supply_missing(
         self,
         node: ast.AST,
@@ -2746,6 +2865,7 @@ class CApiEmitter:
         indent: int,
         default: ast.expr | None,
         missing_is_null: bool,
+        display: str = "<lambda>",
     ) -> None:
         """What to do when neither the tuple nor the keywords had it."""
 
@@ -2760,8 +2880,7 @@ class CApiEmitter:
             return
         self.emit(f"if (!{slot}) {{", indent)
         self.raise_type_error(
-            f"{getattr(node, 'name', '<lambda>')}() missing a required "
-            f"argument: {name!r}",
+            f"{display}() missing 1 required positional argument: {name!r}",
             indent + 1,
         )
         self.emit("}", indent)
@@ -2769,6 +2888,19 @@ class CApiEmitter:
     def raise_value_error(self, message: str, count: str, indent: int) -> None:
         """A ValueError whose message ends with a number only known at runtime."""
 
+        self.raise_counted("ValueError", message, count, ")", indent)
+
+    def raise_counted(
+        self, kind: str, before: str, count: str, after: str, indent: int
+    ) -> None:
+        """`before` + str(count) + `after`, raised as `kind`.
+
+        The count is only known while the program runs - how many values were
+        unpacked, how many arguments a call passed - so the message is built
+        rather than written out.
+        """
+
+        message, closing = before, after
         text = self.temporary()
         self.emit(f"{text} = PyUnicode_FromString({_c_string(message)});", indent)
         self.checked(text, indent)
@@ -2780,17 +2912,17 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({text});", indent)
         self.emit(f"Py_DecRef({spelled});", indent)
         self.checked(joined, indent)
-        closing = self.temporary()
-        self.emit(f'{closing} = PyUnicode_FromString(")");', indent)
-        self.checked(closing, indent)
+        tail = self.temporary()
+        self.emit(f"{tail} = PyUnicode_FromString({_c_string(closing)});", indent)
+        self.checked(tail, indent)
         whole = self.temporary()
-        self.emit(f"{whole} = PyNumber_Add({joined}, {closing});", indent)
+        self.emit(f"{whole} = PyNumber_Add({joined}, {tail});", indent)
         self.emit(f"Py_DecRef({joined});", indent)
-        self.emit(f"Py_DecRef({closing});", indent)
+        self.emit(f"Py_DecRef({tail});", indent)
         self.checked(whole, indent)
         # Fetched raw for the same reason raise_named does: an exception class
         # whose lookup failed cannot be reported as a missing *program* name.
-        kind = self.builtin_raw("ValueError", indent)
+        kind = self.builtin_raw(kind, indent)
         self.checked(kind, indent)
         raised = self.temporary()
         self.emit(f"{raised} = PyObject_CallOneArg({kind}, {whole});", indent)
@@ -2846,7 +2978,12 @@ class CApiEmitter:
         self.emit(self.failure(), indent)
 
     def write_closure(
-        self, node: ast.AST, c_name: str, captures: tuple[str, ...]
+        self,
+        node: ast.AST,
+        c_name: str,
+        captures: tuple[str, ...],
+        display: str = "<lambda>",
+        simple: str = "<lambda>",
     ) -> None:
         """Write the closure's body out as its own C function."""
 
@@ -2874,13 +3011,16 @@ class CApiEmitter:
         self.current, self.handlers = function, []
         self.scope = node.body if isinstance(node.body, list) else []
         outer_depth, self.depth = self.depth, 0
+        self.scope_path.append((simple, True))
         # The parameters arrive in a tuple rather than as C arguments, so they
         # are locals here and are declared alongside the rest.
         for name in held:
             function.locals.append(f"p_{name}")
         for name in captures:
             function.locals.append(f"c_{name}")
-        self.bind_parameters(node, indent=1, keyword_source=named_rest)
+        self.bind_parameters(
+            node, indent=1, keyword_source=named_rest, display=display
+        )
         for offset, name in enumerate(captures):
             # Borrowed from the tuple the callable holds, so it is taken over
             # for the length of the call like every other name here.
@@ -2909,6 +3049,7 @@ class CApiEmitter:
                 outer_scope,
             )
             self.depth = outer_depth
+            self.scope_path.pop()
 
     # --- assembly --------------------------------------------------------
 
@@ -3012,6 +3153,7 @@ class CApiEmitter:
         function = _Function(node.name, parameters, len(defaults))
         self.current = function
         self.scope = node.body
+        self.scope_path.append((node.name, True))
         # A parameter the call left out arrives as NULL and takes its default
         # here, before the increments below, so there is one rule for what the
         # body owns.
@@ -3035,6 +3177,7 @@ class CApiEmitter:
         self.emit(f"return {tail};", 1)
         self.write_unwind(function)
         self.functions.append(function)
+        self.scope_path.pop()
         self.current = None
         self.scope = []
 

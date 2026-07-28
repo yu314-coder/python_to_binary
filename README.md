@@ -294,7 +294,12 @@ identical stdout and exit status.
   resolution order and attribute lookup are the interpreter's own. Each method
   is a closure wrapped in `functools.partialmethod`, which is what makes it
   bind — a raw `PyCFunction` is not a descriptor, so the instance would never
-  arrive.
+  arrive. Zero-argument `super()` works: CPython supplies `__class__` and
+  `self` through a cell it makes for any method mentioning the name, and a
+  compiled method writes the same two values out instead.
+- A call with the wrong number of arguments raises `TypeError` with CPython's
+  own message, qualified name included — `outer.<locals>.one() takes 1
+  positional argument but 2 were given`.
 - `try`/`except` (with `as name` and a tuple of classes), `raise`, and bare
   `raise` to re-raise what a clause is handling. A function body that raises
   with nothing to catch answers `NULL` with the exception still set, exactly
