@@ -1693,6 +1693,15 @@ class CApiEmitTests(unittest.TestCase):
                 "print(sys.argv[0] == sys.executable)\n",
                 encoding="utf-8",
             )
+            # A relative --site is kept relative all the way through: the CLI
+            # once resolved it against the build directory, which produced an
+            # absolute path to somewhere that never existed, and the bundle
+            # failed to import what was sitting inside it.
+            from py2bin.cli import _site_paths
+
+            relative, absolute = _site_paths(["pkgs", str(root)])
+            self.assertEqual(relative, "pkgs")
+            self.assertTrue(Path(absolute).is_absolute())
             generated, _linked = python_program_to_capi_c(entry, ("pkgs",))
             source = built / "program.c"
             source.write_text(generated, encoding="utf-8", newline="\n")

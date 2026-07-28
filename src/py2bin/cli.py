@@ -562,6 +562,23 @@ def _wheels_from_args(args) -> tuple[Path, ...]:
     return tuple(unique)
 
 
+def _site_paths(values: list[str]) -> tuple[str, ...]:
+    """What `--site` hands the emitter.
+
+    A relative one stays relative: it is resolved against the *running* binary,
+    which is what lets a bundle carry its own packages. Resolving it here
+    against the build directory produced an absolute path to somewhere that
+    never existed, and the bundle failed to import what was sitting inside it.
+    """
+
+    return tuple(
+        str(Path(value).expanduser().resolve())
+        if value.startswith("~") or Path(value).is_absolute()
+        else value
+        for value in values
+    )
+
+
 def _embedded_python_path() -> str:
     """Where the carried interpreter sits, relative to the executable."""
 
@@ -915,7 +932,7 @@ def main(argv: list[str] | None = None) -> int:
             target = _target_from_args(args)
             generated, linked = python_program_to_capi_c(
                 entry,
-                tuple(str(Path(d).expanduser().resolve()) for d in args.site),
+                _site_paths(args.site),
             )
             if linked:
                 print(
