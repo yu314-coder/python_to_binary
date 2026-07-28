@@ -157,6 +157,11 @@ class CApiEmitter:
         self.functions: list[_Function] = []
         self.known_functions: dict[str, int] = {}
         self.current: _Function | None = None
+        #: Names bound at module level. They become file-scope statics so a
+        #: function body can see them, which is what a Python global is.
+        self.globals: set[str] = set()
+        #: True while the module body itself is being written.
+        self.at_module_level = False
         #: The label a failing C-API call jumps to. Empty outside a `try`,
         #: where a failure ends the process instead.
         self.handlers: list[str] = []
@@ -209,6 +214,11 @@ class CApiEmitter:
         assert self.current is not None
         if name in self.current.parameters:
             return f"p_{name}"
+        if self.at_module_level:
+            # The module body's names are the program's globals, so they live
+            # at file scope where a function can reach them.
+            self.globals.add(name)
+            return f"g_{name}"
         c_name = f"v_{name}"
         if c_name not in self.current.locals:
             self.current.locals.append(c_name)
@@ -275,12 +285,26 @@ class CApiEmitter:
             return self.checked(target, indent)
         raise self.fail(node, f"a {type(node.value).__name__} constant is not translated here yet")
 
+    def reference(self, name: str) -> str | None:
+        """The C name a Python name reads from, or None if nothing binds it.
+
+        Local first, then parameter, then module global - the order Python
+        looks in, minus the closures this does not have.
+        """
+
+        assert self.current is not None
+        if name in self.current.parameters:
+            return f"p_{name}"
+        if f"v_{name}" in self.current.locals:
+            return f"v_{name}"
+        if name in self.globals:
+            return f"g_{name}"
+        return None
+
     def name(self, node: ast.Name, indent: int) -> str:
         assert self.current is not None
-        c_name = (
-            f"p_{node.id}" if node.id in self.current.parameters else f"v_{node.id}"
-        )
-        if c_name not in self.current.locals and node.id not in self.current.parameters:
+        c_name = self.reference(node.id)
+        if c_name is None:
             raise self.fail(node, f"{node.id!r} is used before it is assigned")
         target = self.temporary()
         # Handed back as an owned reference, like every other expression, so a
@@ -637,12 +661,7 @@ class CApiEmitter:
             return self.checked(target, indent)
         if node.func.id not in self.known_functions:
             assert self.current is not None
-            local = (
-                f"p_{node.func.id}"
-                if node.func.id in self.current.parameters
-                else f"v_{node.func.id}"
-            )
-            if local in self.current.locals or node.func.id in self.current.parameters:
+            if self.reference(node.func.id) is not None:
                 # A name the program bound - an imported one, or a value
                 # holding something callable. It wins over the builtin of the
                 # same spelling, exactly as it does in Python.
@@ -1249,19 +1268,59 @@ class CApiEmitter:
                     len(arguments.defaults),
                 )
 
+        # What the module body binds, gathered before any function is written:
+        # a function may read a global defined further down the file, exactly
+        # as it may in Python, so the set has to be complete first.
+        for node in tree.body:
+            self.note_module_bindings(node)
+
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self.write_function(node)
 
         entry = _Function("main", ())
         self.current = entry
+        self.at_module_level = True
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 continue
             self.statement(node, 2)
+        self.at_module_level = False
         self.functions.append(entry)
         self.current = None
         return self.render()
+
+    def note_module_bindings(self, node: ast.stmt) -> None:
+        """Record every name this module-level statement binds."""
+
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for element in (
+                    target.elts
+                    if isinstance(target, (ast.Tuple, ast.List))
+                    else [target]
+                ):
+                    if isinstance(element, ast.Name):
+                        self.globals.add(element.id)
+        elif isinstance(node, (ast.AugAssign, ast.For)) and isinstance(
+            node.target, ast.Name
+        ):
+            self.globals.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    self.globals.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                if isinstance(item.optional_vars, ast.Name):
+                    self.globals.add(item.optional_vars.id)
+        # A name bound inside a module-level if/for/while/try is still global.
+        for field in ("body", "orelse", "finalbody"):
+            for inner in getattr(node, field, []) or []:
+                self.note_module_bindings(inner)
+        for handler in getattr(node, "handlers", []) or []:
+            for inner in handler.body:
+                self.note_module_bindings(inner)
 
     def write_function(self, node: ast.FunctionDef) -> None:
         parameters = tuple(argument.arg for argument in node.args.args)
@@ -1315,6 +1374,8 @@ class CApiEmitter:
             out.append("")
         entry = self.functions[-1]
         out.append("static PyObject *_py2bin_builtins = 0;")
+        for name in sorted(self.globals):
+            out.append(f"static PyObject *g_{name} = 0;")
         out.append("")
         out.append("int main(void) {")
         out.append("    Py_Initialize();")
