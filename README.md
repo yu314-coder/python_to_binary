@@ -286,10 +286,25 @@ identical stdout and exit status.
   closure is a real Python callable: the body is compiled to its own C
   function and `PyCFunction_New` wraps it, with what it captured travelling as
   the object CPython hands that function as `self`.
+- **Classes**, including inheritance, `__init__`, `__repr__` and other dunder
+  methods, class-level attributes, methods with defaults, and `isinstance`. A
+  class is what `type(name, bases, namespace)` answers, so the method
+  resolution order and attribute lookup are the interpreter's own. Each method
+  is a closure wrapped in `functools.partialmethod`, which is what makes it
+  bind — a raw `PyCFunction` is not a descriptor, so the instance would never
+  arrive.
 - `try`/`except` (with `as name` and a tuple of classes), `raise`, and bare
   `raise` to re-raise what a clause is handling. A function body that raises
   with nothing to catch answers `NULL` with the exception still set, exactly
   as a C-API function does, so a `try` around the *call* catches it.
+- `finally`, which runs on every way out of the region it protects: falling
+  off the end, an exception nothing caught, `return`, `break` and `continue`,
+  and through nested clauses in the right order.
+- Assignment to an attribute or a subscript, and augmented assignment to
+  either. `xs[f()] += 1` calls `f` once, as Python does.
+- `*args` and `**kwargs` spread into a call, and `[*xs, 3]` /
+  `{**base, 'k': 1}` in a literal. A module-level `def` is also a value, so it
+  can be passed as a sort key or have arguments spread into it.
 
 Two things it deliberately refuses rather than answering differently from
 Python. A closure captures the *value* a name holds when the closure is made,
@@ -297,8 +312,9 @@ where Python captures the variable; where the enclosing scope moves that name
 afterwards the two disagree, so that case is a build-time refusal naming the
 variable. (At module level there is nothing to refuse: the name lives in the
 module's own storage, so `[f() for f in fs]` after a loop of lambdas gives
-Python's `[2, 2, 2]`.) `finally`, `while`/`else`, starred arguments,
-`global`/`nonlocal` and decorators are not translated yet.
+Python's `[2, 2, 2]`.) `while`/`else`, `*args`/`**kwargs` in a `def`'s own
+parameter list, `global`/`nonlocal`, decorators and `bytes` literals are not
+translated yet.
 
 **What py2bin does not do for you on the hand-written routes.** These apply to
 routes 2 and 3 above, where you write the C-API calls yourself; `compile-capi`
