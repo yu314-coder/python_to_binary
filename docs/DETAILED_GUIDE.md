@@ -320,6 +320,21 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**A compiled artifact finds itself.** `__file__` was the path the module was
+compiled from, so `os.path.dirname(__file__)` named a directory on the machine
+that built it - a bundle that was moved looked for its own files somewhere that
+did not exist. An embedded interpreter resolves `sys.executable` to the *host
+program*, not to libpython, so a compiled binary can be asked where it is; both
+`__file__` and any relative `--site` directory are taken from there at startup.
+A `--site` given as a relative path therefore travels with the bundle.
+
+`sys.argv` is seeded from the same place. An embedded interpreter that was
+never given an argument vector leaves it as `['']`, and a library that reads
+`argv[0]` - to name a window, to find its resources - gets an empty string
+where every other program has a path. `main` in this tier takes no arguments,
+so the real vector is not available; `[sys.executable]` is the honest
+approximation and is what a program with no arguments would see anyway.
+
 **A compiled binary carries the program, not its dependencies.** The
 interpreter it links is whichever one the build machine had, and that
 interpreter's search path knows nothing about where the application's packages

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import re
 import subprocess
 import sys
@@ -1644,6 +1645,7 @@ class CApiEmitTests(unittest.TestCase):
                 entry, (str(elsewhere),)
             )
             self.assertIn("sys.path.insert", generated)
+            self.assertIn("_py2bin_dir", generated)
             if not _HOST_IS_DARWIN_ARM64:
                 return
             source = root / "program.c"
@@ -1661,6 +1663,60 @@ class CApiEmitTests(unittest.TestCase):
                 [str(binary)], capture_output=True, cwd="/", env=environment
             )
             self.assertEqual(ran.stdout, b"found it\n")
+
+    def test_a_binary_finds_itself_wherever_it_is_moved(self):
+        """`__file__` and a relative `--site` follow the binary, not the build.
+
+        Baking the build path meant `os.path.dirname(__file__)` named a
+        directory on the machine that compiled it, so a bundle that was moved
+        looked for its own files somewhere that did not exist. An embedded
+        interpreter resolves `sys.executable` to the host program, which is
+        what lets a compiled artifact find itself.
+        """
+
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("the C-API path is darwin-arm64 only")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            built = root / "built"
+            built.mkdir()
+            (built / "pkgs").mkdir()
+            (built / "pkgs" / "carried.py").write_text(
+                "NAME = 'carried along'\n", encoding="utf-8"
+            )
+            entry = built / "program.py"
+            entry.write_text(
+                "import os, sys, carried\n"
+                "print(carried.NAME)\n"
+                "print(os.path.dirname(os.path.abspath(__file__))\n"
+                "      == os.path.dirname(os.path.abspath(sys.executable)))\n"
+                "print(sys.argv[0] == sys.executable)\n",
+                encoding="utf-8",
+            )
+            generated, _linked = python_program_to_capi_c(entry, ("pkgs",))
+            source = built / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = built / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+
+            # Move the whole thing somewhere the build never heard of, and
+            # take nothing else with it.
+            moved = root / "moved" / "deeper"
+            moved.mkdir(parents=True)
+            shutil.copy(binary, moved / "program.bin")
+            shutil.copytree(built / "pkgs", moved / "pkgs")
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "PYTHONPATH"
+            }
+            ran = subprocess.run(
+                [str(moved / "program.bin")],
+                capture_output=True,
+                cwd="/",
+                env=environment,
+            )
+            self.assertEqual(ran.stdout, b"carried along\nTrue\nTrue\n")
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's

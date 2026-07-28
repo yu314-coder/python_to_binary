@@ -293,7 +293,8 @@ identical stdout and exit status.
   its own `.py` files present.
 - Every module has `__name__` and `__file__`, without which
   `if __name__ == "__main__":` never fires and a program cannot find what sits
-  beside it.
+  beside it. `__file__`, `sys.argv[0]` and any relative `--site` directory are
+  resolved from the running binary, so a bundle can be moved.
 - Compiled functions carry a signature, so `inspect.signature` describes them
   and frameworks that introspect (pywebview binding a JS API, for one) accept
   them. Defaults read as `None` — the format has no spelling for an arbitrary

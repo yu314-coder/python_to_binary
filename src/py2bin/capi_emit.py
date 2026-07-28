@@ -3551,7 +3551,26 @@ class CApiEmitter:
         for dunder, text in (("__name__", name), ("__file__", origin)):
             self.certain_globals.add(dunder)
             slot = self.note_global(dunder)
-            self.emit(f"{slot} = PyUnicode_FromString({_c_string(text)});", indent)
+            if dunder == "__file__":
+                # Beside the binary, wherever that is now. Baking the build
+                # path meant `os.path.dirname(__file__)` named a directory on
+                # the machine that compiled it, so a moved bundle looked for
+                # its own files somewhere that did not exist.
+                where = self.builtin("_py2bin_dir", indent)
+                separator = self.temporary()
+                self.emit(
+                    f"{separator} = PyUnicode_FromString("
+                    f"{_c_string('/' + Path(text).name)});",
+                    indent,
+                )
+                self.checked(separator, indent)
+                self.emit(f"{slot} = PyNumber_Add({where}, {separator});", indent)
+                self.emit(f"Py_DecRef({where});", indent)
+                self.emit(f"Py_DecRef({separator});", indent)
+            else:
+                self.emit(
+                    f"{slot} = PyUnicode_FromString({_c_string(text)});", indent
+                )
             self.checked(slot, indent)
             self.publish(dunder, slot, indent)
         for node in tree.body:
@@ -3730,10 +3749,31 @@ class CApiEmitter:
         # with a UnicodeEncodeError that has nothing to do with the program.
         setup = "import sys; sys.stdout.reconfigure(encoding='utf-8')"
         out.append(f"    PyRun_SimpleString({_c_string(setup)});")
+        # Where this binary is, right now, rather than where it was built. An
+        # embedded interpreter resolves sys.executable to the host program, so
+        # a compiled artifact can find itself and everything shipped beside it
+        # - which is what lets the bundle be moved at all.
+        anchor = (
+            "import sys, os, builtins\n"
+            "builtins._py2bin_dir = os.path.dirname(os.path.abspath("
+            "sys.executable)) if sys.executable else ''\n"
+            # An embedded interpreter that was never given an argument vector
+            # leaves sys.argv as [''], and a library that reads argv[0] - to
+            # name a window, to find its own resources - gets an empty string
+            # where every other program has a path.
+            "if not sys.argv or not sys.argv[0]:\n"
+            "    sys.argv = [sys.executable or '']\n"
+        )
+        out.append(f"    PyRun_SimpleString({_c_string(anchor)});")
         for directory in self.extra_paths:
             # In front, so a directory named at build time wins over whatever
-            # the linked interpreter happens to have.
-            added = f"import sys; sys.path.insert(0, {directory!r})"
+            # the linked interpreter happens to have. A relative one is taken
+            # against the binary, so a bundle carries its own packages.
+            added = (
+                "import sys, os, builtins\n"
+                f"sys.path.insert(0, os.path.normpath(os.path.join("
+                f"builtins._py2bin_dir, {directory!r})))\n"
+            )
             out.append(f"    PyRun_SimpleString({_c_string(added)});")
         for index, (c_name, label, signature) in enumerate(self.method_table):
             out.append(f"    _py2bin_methods[{index}].ml_name = {_c_string(label)};")
