@@ -371,6 +371,26 @@ expression that consumes it decrements, so `return a + b` pays four calls into
 libpython that a borrowing rule would not. That rule is what makes ownership
 checkable by reading, so changing it is a design decision rather than a tweak.
 
+**The builtins are fetched once.** Counting the call sites the emitter
+produces for a real application settled where the cost is: reference counting
+is 48% of them, and after that come 12,747 string constructions from 3,743
+distinct strings and 3,882 builtins lookups from *fifty-one* distinct names.
+Every `None`, `True`, `type` and `str` was a hash and a probe of the builtins
+dictionary, to find something that cannot move. They are fetched once into
+file-scope slots at start-up, and a use is an increment on a slot already in
+hand - which keeps the one rule about owning what an expression yields, while
+paying much less for it. Worth 133 KB off a 9.5 MB binary and a cheaper lookup
+everywhere.
+
+The two larger levers are still open and both are design decisions rather than
+tuning. Reference counting is uniform - reading a name increments and the
+expression consuming it decrements - which is what makes ownership checkable by
+reading the emitted C, and also what makes `return a + b` cost four calls into
+libpython. And a repeated string literal is rebuilt at every use because a
+cached one would have to be handed back *borrowed*, which the same rule
+forbids. Relaxing it buys both, and costs the property that the output can be
+checked by reading it.
+
 **Most of a Python installation is never reached.** Of nearly twelve thousand
 standard-library files, one real application touched under two hundred; of
 seventy-seven compiled extension modules, thirty-seven. `--prune-unused` walks

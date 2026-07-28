@@ -1997,6 +1997,31 @@ class CApiEmitTests(unittest.TestCase):
             self.assertEqual(ran.returncode, 0, ran.stderr.decode()[-400:])
             self.assertEqual(ran.stdout, b"b'hello'\nTrue\n")
 
+    def test_the_builtins_are_fetched_once(self):
+        """About fifty distinct names, fetched thousands of times.
+
+        Every `None`, `True`, `type` and `str` the emitter reaches for was a
+        lookup by name in the builtins dictionary - a hash and a probe, to find
+        something that cannot move. They are fetched once into file-scope slots
+        at start-up, and a use is an increment on a slot already in hand.
+        """
+
+        generated = python_to_capi_c(
+            "xs = [1, 2]\n"
+            "print([str(x) for x in xs], tuple(xs), x is None if xs else True)\n",
+            "program.py",
+        )
+        self.assertIn("_py2bin_b0", generated)
+        # The slot is filled once, at start-up, not at each use.
+        self.assertEqual(generated.count('_py2bin_b0 = PyObject_GetAttrString'), 1)
+        self._run(
+            "xs = [1, 2, 3]\n"
+            "print([str(x) for x in xs])\n"
+            "print(tuple(xs), sorted(xs, reverse=True), None is None, bool(xs))\n"
+            "print(len(xs), max(xs), abs(-2), type(xs).__name__)\n",
+            b"['1', '2', '3']\n(1, 2, 3) [3, 2, 1] True True\n3 3 2 list\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

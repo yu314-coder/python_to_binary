@@ -408,6 +408,11 @@ class CApiEmitter:
         #: innermost last. It is what a zero-argument `super()` needs and has
         #: no other way to reach.
         self.methods_of: list[tuple[str, str]] = []
+        #: Every builtin the emitter itself asks for. There are about fifty
+        #: distinct ones and thousands of uses, and each use was a dictionary
+        #: lookup on a name that cannot change; they are fetched once at
+        #: start-up into file-scope slots instead.
+        self.cached_builtins: dict[str, str] = {}
         #: True once a name read needs the unbound-name helper, which is then
         #: written into the C once rather than at each of a thousand sites.
         self.needs_unbound = False
@@ -1197,7 +1202,17 @@ class CApiEmitter:
         program wrote goes through :meth:`program_name`.
         """
 
-        return self.checked(self.builtin_raw(name, indent), indent)
+        slot = self.cached_builtins.get(name)
+        if slot is None:
+            slot = f"_py2bin_b{len(self.cached_builtins)}"
+            self.cached_builtins[name] = slot
+        target = self.temporary()
+        # Handed back owned, like every other expression, so the one rule for
+        # releasing a value still holds - but an increment on a slot already
+        # in hand, rather than a lookup by name in the builtins dictionary.
+        self.emit(f"Py_IncRef({slot});", indent)
+        self.emit(f"{target} = {slot};", indent)
+        return target
 
     def program_name(self, name: str, indent: int) -> str:
         """A name the program used that is not local, global or one of its own.
@@ -3800,6 +3815,8 @@ class CApiEmitter:
             out.append(f"static PyObject *g_{name} = 0;")
         for _name, key in self.linked:
             out.append(f"static PyObject *m_{key} = 0;")
+        for name, slot in self.cached_builtins.items():
+            out.append(f"static PyObject *{slot} = 0;  /* {name} */")
         if self.needs_unbound:
             out.append(_UNBOUND_HELPER)
         out.append("")
@@ -3839,6 +3856,14 @@ class CApiEmitter:
             "    sys.argv = [sys.executable or '']\n"
         )
         out.append(f"    PyRun_SimpleString({_c_string(anchor)});")
+        for name, slot in self.cached_builtins.items():
+            out.append(
+                f"    {slot} = PyObject_GetAttrString(_py2bin_builtins, "
+                f"{_c_string(name)});"
+            )
+            out.append(
+                f"    if (!{slot}) {{ PyErr_Print(); Py_Finalize(); exit(1); }}"
+            )
         for directory in self.extra_paths:
             # In front, so a directory named at build time wins over whatever
             # the linked interpreter happens to have. A relative one is taken
