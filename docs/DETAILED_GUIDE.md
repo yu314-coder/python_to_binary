@@ -320,6 +320,17 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**`with` closes however the body ends.** `__exit__` was written after the body,
+so it ran only when the body fell off the end - a `break`, a `return` or an
+exception left without it, and the thing the `with` exists to close was not
+closed. Silently, which is the worst way for a resource leak to happen. It is a
+`finally` in every respect, so it is written as one, through the same machinery:
+each way out records why it is leaving and the clause runs once. The three
+arguments `__exit__` takes are the exception's class, the exception and its
+traceback when there is one, and `None` three times when there is not - and a
+truthy answer suppresses, which is how `contextlib.suppress` and every
+swallowing `__exit__` works.
+
 **Runaway recursion.** A compiled call is a real C call on the real stack, so a
 recursion with no base case ran until the operating system took the process
 away - where CPython raises `RecursionError`. A segfault is not something a

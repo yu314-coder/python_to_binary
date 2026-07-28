@@ -1154,6 +1154,138 @@ class CApiEmitTests(unittest.TestCase):
             b"15511210043330985984000000\n",
         )
 
+    def test_loop_and_try_else_clauses(self):
+        """`else` runs when the loop was not left by `break`.
+
+        Not "when it ended early": the test failing, or the sequence running
+        out, is the ordinary way out and the else runs then. Nested loops each
+        need their own flag or an inner `break` would silence an outer else.
+        """
+
+        self._run(
+            "for n in [1, 2]:\n"
+            "    pass\n"
+            "else:\n"
+            "    print('for-else')\n"
+            "for n in [1, 2]:\n"
+            "    break\n"
+            "else:\n"
+            "    print('not reached')\n"
+            "i = 0\n"
+            "while i < 2:\n"
+            "    i += 1\n"
+            "else:\n"
+            "    print('while-else', i)\n"
+            "out = []\n"
+            "for a in [1, 2]:\n"
+            "    for b in [1, 2]:\n"
+            "        break\n"
+            "    else:\n"
+            "        out.append('inner')\n"
+            "else:\n"
+            "    out.append('outer')\n"
+            "print(out)\n"
+            "try:\n"
+            "    v = 1\n"
+            "except ValueError:\n"
+            "    pass\n"
+            "else:\n"
+            "    print('try-else', v)\n",
+            b"for-else\nwhile-else 2\n['outer']\ntry-else 1\n",
+        )
+
+    def test_with_closes_however_the_body_ends(self):
+        """__exit__ used to be written after the body.
+
+        So it ran only when the body fell off the end - a `break`, a `return`
+        or an exception left without it, and the thing the `with` exists to
+        close was not closed. Silently.
+        """
+
+        self._run(
+            "class C:\n"
+            "    def __init__(self, tag):\n"
+            "        self.tag = tag\n"
+            "    def __enter__(self):\n"
+            "        return self.tag\n"
+            "    def __exit__(self, kind, value, trace):\n"
+            "        print('exit', self.tag, kind.__name__ if kind else None)\n"
+            "        return False\n"
+            "for i in range(3):\n"
+            "    with C('loop') as t:\n"
+            "        if i == 1:\n"
+            "            break\n"
+            "def leaves():\n"
+            "    with C('ret') as t:\n"
+            "        return 'returned'\n"
+            "print(leaves())\n"
+            "try:\n"
+            "    with C('raise') as t:\n"
+            "        raise ValueError('boom')\n"
+            "except ValueError as e:\n"
+            "    print('caught', e)\n",
+            b"exit loop None\nexit loop None\nexit ret None\nreturned\n"
+            b"exit raise ValueError\ncaught boom\n",
+        )
+
+    def test_an_exit_that_returns_true_suppresses(self):
+        """The three arguments are the exception, so __exit__ can swallow it."""
+
+        self._run(
+            "class S:\n"
+            "    def __enter__(self):\n"
+            "        return self\n"
+            "    def __exit__(self, kind, value, trace):\n"
+            "        print('suppressing', kind.__name__)\n"
+            "        return True\n"
+            "with S():\n"
+            "    raise KeyError('hidden')\n"
+            "print('carried on')\n",
+            b"suppressing KeyError\ncarried on\n",
+        )
+
+    def test_annotations_assert_del_and_chained_assignment(self):
+        self._run(
+            "x: int = 5\n"
+            "y: str\n"
+            "a = b = [0]\n"
+            "a.append(1)\n"
+            "print(x, a, b, a is b)\n"
+            "class P:\n"
+            "    n: int = 3\n"
+            "    def __init__(self):\n"
+            "        self.v: int = 7\n"
+            "print(P.n, P().v)\n"
+            "q = 1\n"
+            "del q\n"
+            "try:\n"
+            "    print(q)\n"
+            "except NameError as e:\n"
+            "    print('caught:', e)\n"
+            "try:\n"
+            "    assert False, 'boom ' + str(3)\n"
+            "except AssertionError as e:\n"
+            "    print('assert:', e)\n",
+            b"5 [0, 1] [0, 1] True\n3 7\ncaught: name 'q' is not defined\n"
+            b"assert: boom 3\n",
+        )
+
+    def test_print_keywords_go_to_the_interpreters_print(self):
+        """`end=`, `sep=`, `file=`, `flush=` and a spread argument.
+
+        The fast path writes straight to sys.stdout and knows none of them.
+        """
+
+        self._run(
+            "print('a', 'b', sep='-')\n"
+            "print('no newline', end='')\n"
+            "print('|', flush=True)\n"
+            "parts = ['x', 'y']\n"
+            "print(*parts, sep='+')\n"
+            "print()\n",
+            b"a-b\nno newline|\nx+y\n\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

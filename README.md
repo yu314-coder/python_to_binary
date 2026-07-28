@@ -310,7 +310,9 @@ identical stdout and exit status.
   as a C-API function does, so a `try` around the *call* catches it.
 - `finally`, which runs on every way out of the region it protects: falling
   off the end, an exception nothing caught, `return`, `break` and `continue`,
-  and through nested clauses in the right order.
+  and through nested clauses in the right order. `with` is one of these: its
+  `__exit__` runs however the body ends, and receives the real exception so it
+  can suppress.
 - Assignment to an attribute or a subscript, and augmented assignment to
   either. `xs[f()] += 1` calls `f` once, as Python does.
 - `*args` and `**kwargs` spread into a call, and `[*xs, 3]` /
@@ -320,6 +322,9 @@ identical stdout and exit status.
   parameters with their own defaults, and positional-only parameters after
   `/`. Every compiled function takes keywords, so any parameter can be passed
   by name — `show(1, c=9)` reaches `c`.
+- `for`/`while`/`try` with an `else` clause; `assert`; annotated assignment
+  (`x: int = 5`); chained assignment (`a = b = v`); `del` of a name, an
+  attribute or an item; and `print` with `sep=`, `end=`, `file=` or `flush=`.
 - `global`, and dotted imports (`import a.b`, `import a.b as c`).
 - `bytes` literals, and dict comprehensions.
 - Comprehensions have a scope of their own, so `[x * 2 for x in xs]` leaves an
@@ -334,8 +339,8 @@ where Python captures the variable; where the enclosing scope moves that name
 afterwards the two disagree, so that case is a build-time refusal naming the
 variable. (At module level there is nothing to refuse: the name lives in the
 module's own storage, so `[f() for f in fs]` after a loop of lambdas gives
-Python's `[2, 2, 2]`.) `while`/`else`, `try`/`else`, `nonlocal`, decorators,
-`async`, and generators are not translated yet.
+Python's `[2, 2, 2]`.) `nonlocal`, decorators, `async` and generators are not
+translated yet.
 
 **What py2bin does not do for you on the hand-written routes.** These apply to
 routes 2 and 3 above, where you write the C-API calls yourself; `compile-capi`

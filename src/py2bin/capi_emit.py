@@ -316,6 +316,9 @@ class CApiEmitter:
         self.finallys: list[_Protected] = []
         #: How many loops enclose what is being written.
         self.loop_depth = 0
+        #: The flag each enclosing loop uses to record that a `break` left it,
+        #: innermost last, or None where the loop has no `else` to guard.
+        self.loop_flags: list[str | None] = []
         #: How deeply statements are nested in the body being written. Zero
         #: between the statements of a body, which is where a temporary slot
         #: stops being live.
@@ -1495,7 +1498,10 @@ class CApiEmitter:
         """
 
         bound: set[str] = set()
-        if isinstance(node, ast.Assign):
+        if isinstance(node, ast.AnnAssign):
+            if node.value is not None and isinstance(node.target, ast.Name):
+                bound.add(node.target.id)
+        elif isinstance(node, ast.Assign):
             for target in node.targets:
                 for element in (
                     target.elts
@@ -1545,6 +1551,7 @@ class CApiEmitter:
             if self.finallys and self.finallys[-1].loop_depth == self.loop_depth:
                 self.leave_through_finally(_BREAKING, indent)
             else:
+                self.mark_broken(indent)
                 self.emit("break;", indent)
         elif isinstance(node, ast.Continue):
             if self.finallys and self.finallys[-1].loop_depth == self.loop_depth:
@@ -1562,6 +1569,20 @@ class CApiEmitter:
             for name in node.names:
                 self.current.module_names.add(name)
                 self.globals.add(name)
+        elif isinstance(node, ast.AnnAssign):
+            # `x: int = 5` is an assignment with a note attached, and the note
+            # is not something the program can observe here. `x: int` on its
+            # own binds nothing at all - it only tells a reader, and a type
+            # checker, what to expect.
+            if node.value is not None:
+                self.assignment(
+                    ast.copy_location(
+                        ast.Assign(targets=[node.target], value=node.value), node
+                    ),
+                    indent,
+                )
+        elif isinstance(node, ast.Assert):
+            self.check(node, indent)
         elif isinstance(node, ast.Pass):
             pass
         elif isinstance(node, ast.ClassDef):
@@ -1652,27 +1673,101 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({module});", indent)
 
     def assignment(self, node: ast.Assign, indent: int) -> None:
-        if len(node.targets) != 1:
-            raise self.fail(node, "only one assignment target is translated here")
-        if isinstance(node.targets[0], ast.Subscript):
-            self.store_item(node.targets[0], node.value, indent)
-            return
-        if isinstance(node.targets[0], (ast.Tuple, ast.List)):
-            self.unpack(node.targets[0], node.value, indent)
-            return
-        if isinstance(node.targets[0], ast.Attribute):
-            self.store_attribute(node.targets[0], node.value, indent)
-            return
-        if not isinstance(node.targets[0], ast.Name):
-            raise self.fail(
-                node, "only a name, an attribute or a subscript is assigned to here"
-            )
+        """`a = v`, and `a = b = v`.
+
+        The value is computed first and each target bound from it, which is
+        the order Python uses: the right-hand side, then the targets left to
+        right. One value however many names it is given to.
+        """
+
         value = self.expression(node.value, indent)
-        target = self.declare(node.targets[0].id)
-        # The name may already hold something; that reference is released
-        # before it is overwritten, which is what keeps a loop from growing.
-        self.emit(f"if ({target}) Py_DecRef({target});", indent)
-        self.emit(f"{target} = {value};", indent)
+        for position, target in enumerate(node.targets):
+            if position + 1 < len(node.targets):
+                # Every target but the last gets its own reference; the last
+                # one takes the value this already holds.
+                self.emit(f"Py_IncRef({value});", indent)
+            self.bind_target(target, value, indent)
+
+    def bind_target(self, target: ast.expr, value: str, indent: int) -> None:
+        """Give an already-computed value to one assignment target.
+
+        The reference is consumed here, whichever shape the target has.
+        """
+
+        if isinstance(target, ast.Name):
+            slot = self.declare(target.id)
+            # The name may already hold something; that reference is released
+            # before it is overwritten, which is what keeps a loop from
+            # growing.
+            self.emit(f"if ({slot}) Py_DecRef({slot});", indent)
+            self.emit(f"{slot} = {value};", indent)
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            self.unpack_value(target, value, indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            return
+        if isinstance(target, ast.Attribute):
+            owner = self.expression(target.value, indent)
+            outcome = self.temporary_flag()
+            self.emit(
+                f"{outcome} = PyObject_SetAttrString({owner}, "
+                f"{_c_string(target.attr)}, {value});",
+                indent,
+            )
+            self.emit(f"Py_DecRef({owner});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
+            return
+        if isinstance(target, ast.Subscript):
+            if isinstance(target.slice, ast.Slice):
+                raise self.fail(
+                    target, "assigning to a slice is not translated here yet"
+                )
+            container = self.expression(target.value, indent)
+            key = self.expression(target.slice, indent)
+            outcome = self.temporary_flag()
+            self.emit(
+                f"{outcome} = PyObject_SetItem({container}, {key}, {value});", indent
+            )
+            for held in (container, key, value):
+                self.emit(f"Py_DecRef({held});", indent)
+            self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
+            return
+        raise self.fail(
+            target, "only a name, an attribute or a subscript is assigned to here"
+        )
+
+    def check(self, node: ast.Assert, indent: int) -> None:
+        """`assert c` and `assert c, message`.
+
+        Always emitted. CPython skips assertions under `-O`, which is a switch
+        given to the interpreter at run time; a compiled program has no such
+        moment, so the honest thing is to keep them.
+        """
+
+        decision = self.temporary_flag()
+        test = self.expression(node.test, indent)
+        self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
+        self.emit(f"Py_DecRef({test});", indent)
+        self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
+        self.emit(f"if (!{decision}) {{", indent)
+        kind = self.builtin_raw("AssertionError", indent + 1)
+        self.checked(kind, indent + 1)
+        raised = self.temporary()
+        if node.msg is None:
+            self.emit(f"{raised} = PyObject_CallNoArgs({kind});", indent + 1)
+        else:
+            message = self.expression(node.msg, indent + 1)
+            self.emit(
+                f"{raised} = PyObject_CallOneArg({kind}, {message});", indent + 1
+            )
+            self.emit(f"Py_DecRef({message});", indent + 1)
+        self.checked(raised, indent + 1)
+        self.emit(f"PyErr_SetObject({kind}, {raised});", indent + 1)
+        self.emit(f"Py_DecRef({kind});", indent + 1)
+        self.emit(f"Py_DecRef({raised});", indent + 1)
+        self.emit(self.failure(), indent + 1)
+        self.emit("}", indent)
 
     def remove(self, node: ast.Delete, indent: int) -> None:
         """`del xs[k]` - the only del shape with an object-protocol answer.
@@ -1682,11 +1777,59 @@ class CApiEmitter:
         """
 
         for target in node.targets:
+            if isinstance(target, ast.Name):
+                # Emptying the slot *is* how being unbound is recorded, now
+                # that a read tests for it: the next one raises NameError or
+                # UnboundLocalError, which is what Python does.
+                slot = self.reference(target.id)
+                if slot is None or slot.startswith(("p_", "c_")):
+                    raise self.fail(
+                        target,
+                        f"`del {target.id}` names something this scope does "
+                        "not bind",
+                    )
+                self.emit(f"if (!{slot}) {{", indent)
+                self.needs_unbound = True
+                kind = 0 if slot.startswith("g_") else 1
+                message = (
+                    f"name {target.id!r} is not defined"
+                    if kind == 0
+                    else f"cannot access local variable {target.id!r} where it "
+                    "is not associated with a value"
+                )
+                self.emit(
+                    f"_py2bin_unbound({kind}, "
+                    f"PyUnicode_FromString({_c_string(message)}), "
+                    f"PyUnicode_FromString({_c_string(target.id)}));",
+                    indent + 1,
+                )
+                self.emit(self.failure(), indent + 1)
+                self.emit("}", indent)
+                self.emit(f"Py_DecRef({slot});", indent)
+                self.emit(f"{slot} = 0;", indent)
+                assert self.current is not None
+                self.current.certain.discard(target.id)
+                self.certain_globals.discard(target.id)
+                continue
+            if isinstance(target, ast.Attribute):
+                # Deleting an attribute is setting it to nothing: that is what
+                # PyObject_DelAttrString is a spelling of, and the vetted set
+                # already has the setter.
+                owner = self.expression(target.value, indent)
+                outcome = self.temporary_flag()
+                self.emit(
+                    f"{outcome} = PyObject_SetAttrString({owner}, "
+                    f"{_c_string(target.attr)}, 0);",
+                    indent,
+                )
+                self.emit(f"Py_DecRef({owner});", indent)
+                self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
+                continue
             if not isinstance(target, ast.Subscript):
                 raise self.fail(
                     target,
-                    "only `del container[key]` is translated here; deleting a "
-                    "name has nothing to record being unbound",
+                    "only a name, an attribute or `container[key]` is deleted "
+                    "here",
                 )
             container = self.expression(target.value, indent)
             key = (
@@ -1740,13 +1883,18 @@ class CApiEmitter:
             self.emit(self.failure(), indent)
 
     def with_block(self, node: ast.With, indent: int) -> None:
-        """`with a as b:` - __enter__, the body, then __exit__.
+        """`with a as b:` - __enter__, the body, then __exit__ however it ends.
 
-        __exit__ is called on the way out of the body. It is *not* called when
-        the body raises, because that needs the exception threaded into the
-        three arguments it takes, and pretending otherwise would silently skip
-        a close. A body that raises inside a `with` is refused rather than
-        mishandled.
+        __exit__ used to be written after the body, which meant it ran only
+        when the body fell off the end. A `break`, a `return` or an exception
+        left without it - so the thing the `with` exists to close was not
+        closed, silently. It is a `finally` in every respect, so it is written
+        as one.
+
+        The three arguments are the exception when there is one, and `None`
+        three times when there is not. A truthy answer from __exit__ suppresses
+        the exception, which is how `contextlib.suppress` and every `__exit__`
+        that swallows works.
         """
 
         if len(node.items) > 1:
@@ -1780,21 +1928,56 @@ class CApiEmitter:
         introduced = (
             {item.optional_vars.id} if item.optional_vars is not None else set()
         )
-        with self.settled_within(introduced):
-            for statement in node.body:
-                self.statement(statement, indent)
+
+        def emit_body() -> None:
+            with self.settled_within(introduced):
+                for statement in node.body:
+                    self.statement(statement, indent)
+
+        def emit_clause(held: str, protection) -> None:
+            self.close_manager(manager, held, protection, indent)
+            self.emit(f"Py_DecRef({entered});", indent)
+            self.emit(f"Py_DecRef({manager});", indent)
+
+        self.protect(emit_body, emit_clause, indent)
+
+    def close_manager(self, manager: str, held: str, protection, indent: int) -> None:
+        """Call __exit__ with what happened, and let it suppress."""
+
         exit_call = self.temporary()
         self.emit(
             f'{exit_call} = PyObject_GetAttrString({manager}, "__exit__");', indent
         )
         self.checked(exit_call, indent)
-        none = self.builtin("None", indent)
         arguments = self.temporary()
         self.emit(f"{arguments} = PyTuple_New(3LL);", indent)
         self.checked(arguments, indent)
+        # With an exception in hand the three are its class, itself and its
+        # traceback, which is what an __exit__ is written to read.
+        self.emit(f"if ({held}) {{", indent)
+        kind = self.builtin("type", indent + 1)
+        classified = self.temporary()
+        self.emit(f"{classified} = PyObject_CallOneArg({kind}, {held});", indent + 1)
+        self.emit(f"Py_DecRef({kind});", indent + 1)
+        self.checked(classified, indent + 1)
+        trace = self.temporary()
+        self.emit(
+            f'{trace} = PyObject_GetAttrString({held}, "__traceback__");', indent + 1
+        )
+        self.checked(trace, indent + 1)
+        self.emit(f"Py_IncRef({held});", indent + 1)
+        self.emit(f"PyTuple_SetItem({arguments}, 0LL, {classified});", indent + 1)
+        self.emit(f"PyTuple_SetItem({arguments}, 1LL, {held});", indent + 1)
+        self.emit(f"PyTuple_SetItem({arguments}, 2LL, {trace});", indent + 1)
+        self.emit("} else {", indent)
+        nothing = self.builtin("None", indent + 1)
         for position in range(3):
-            self.emit(f"Py_IncRef({none});", indent)
-            self.emit(f"PyTuple_SetItem({arguments}, {position}LL, {none});", indent)
+            self.emit(f"Py_IncRef({nothing});", indent + 1)
+            self.emit(
+                f"PyTuple_SetItem({arguments}, {position}LL, {nothing});", indent + 1
+            )
+        self.emit(f"Py_DecRef({nothing});", indent + 1)
+        self.emit("}", indent)
         outcome = self.temporary()
         self.emit(
             f"{outcome} = PyObject_Call({exit_call}, {arguments}, (PyObject *)0);",
@@ -1802,11 +1985,20 @@ class CApiEmitter:
         )
         self.emit(f"Py_DecRef({exit_call});", indent)
         self.emit(f"Py_DecRef({arguments});", indent)
-        self.emit(f"Py_DecRef({none});", indent)
         self.checked(outcome, indent)
+        # A truthy answer means "I have dealt with it", so the region stops
+        # leaving because of an exception and falls out normally instead.
+        swallowed = self.temporary_flag()
+        self.emit(f"{swallowed} = PyObject_IsTrue({outcome});", indent)
         self.emit(f"Py_DecRef({outcome});", indent)
-        self.emit(f"Py_DecRef({entered});", indent)
-        self.emit(f"Py_DecRef({manager});", indent)
+        self.emit(f"if ({swallowed} < 0) {{ {self.failure()} }}", indent)
+        self.emit(
+            f"if ({swallowed} && {protection.why} == {_PROPAGATING}) {{", indent
+        )
+        self.emit(f"Py_DecRef({held});", indent + 1)
+        self.emit(f"{held} = 0;", indent + 1)
+        self.emit(f"{protection.why} = 0;", indent + 1)
+        self.emit("}", indent)
 
     def guarded(self, node: ast.Try, indent: int) -> None:
         """`try: ... except E: ...` - the body, then a handler it jumps to.
@@ -1820,8 +2012,7 @@ class CApiEmitter:
         if node.finalbody:
             self.protected(node, indent)
             return
-        if node.orelse:
-            raise self.fail(node, "a try-else is not translated here yet")
+
         assert self.current is not None
         self.current.labels += 1
         number = self.current.labels
@@ -1842,6 +2033,11 @@ class CApiEmitter:
                 self.statement(statement, indent)
         finally:
             self.handlers.pop()
+        # The `else` clause runs when the body raised nothing, and is *not*
+        # protected by these handlers - an exception in it belongs outside, as
+        # it does in Python. The handler label is already popped by here.
+        for statement in node.orelse:
+            self.statement(statement, indent)
         self.emit(f"goto {done};", indent)
         self.emit(f"{handler}:", 0)
         for clause, wanted in zip(node.handlers, caught):
@@ -1895,6 +2091,36 @@ class CApiEmitter:
         traceback intact.
         """
 
+        def emit_body() -> None:
+            if node.handlers or node.orelse:
+                inner = ast.copy_location(
+                    ast.Try(
+                        body=node.body,
+                        handlers=node.handlers,
+                        orelse=node.orelse,
+                        finalbody=[],
+                    ),
+                    node,
+                )
+                self.guarded(inner, indent)
+            else:
+                for statement in node.body:
+                    self.statement(statement, indent)
+
+        def emit_clause(_held: str, _protection) -> None:
+            for statement in node.finalbody:
+                self.statement(statement, indent)
+
+        self.protect(emit_body, emit_clause, indent)
+
+    def protect(self, emit_body, emit_clause, indent: int) -> None:
+        """The machinery a `finally` and a `with` both need.
+
+        ``emit_body`` writes the region being protected; ``emit_clause`` writes
+        what must happen however it is left, and is handed the slot holding the
+        exception - empty unless the region is leaving because of one.
+        """
+
         assert self.current is not None
         self.current.labels += 1
         number = self.current.labels
@@ -1912,20 +2138,7 @@ class CApiEmitter:
         self.handlers.append(landing)
         self.finallys.append(protection)
         try:
-            if node.handlers or node.orelse:
-                inner = ast.copy_location(
-                    ast.Try(
-                        body=node.body,
-                        handlers=node.handlers,
-                        orelse=node.orelse,
-                        finalbody=[],
-                    ),
-                    node,
-                )
-                self.guarded(inner, indent)
-            else:
-                for statement in node.body:
-                    self.statement(statement, indent)
+            emit_body()
         finally:
             self.finallys.pop()
             self.handlers.pop()
@@ -1937,8 +2150,7 @@ class CApiEmitter:
         # Falls straight into the clause, which is the point: the exception
         # path and the ordinary path run the same code.
         self.emit(f"{clause}:", 0)
-        for statement in node.finalbody:
-            self.statement(statement, indent)
+        emit_clause(held, protection)
         if _PROPAGATING in protection.reasons:
             self.emit(f"if ({protection.why} == {_PROPAGATING}) {{", indent)
             # It steals the reference, so nothing is released after it.
@@ -1959,7 +2171,10 @@ class CApiEmitter:
                 self.leave(protection.answer, indent + 1)
             self.emit("}", indent)
         if _BREAKING in protection.reasons:
-            self.emit(f"if ({protection.why} == {_BREAKING}) break;", indent)
+            self.emit(f"if ({protection.why} == {_BREAKING}) {{", indent)
+            self.mark_broken(indent + 1)
+            self.emit("break;", indent + 1)
+            self.emit("}", indent)
         if _CONTINUING in protection.reasons:
             self.emit(f"if ({protection.why} == {_CONTINUING}) continue;", indent)
 
@@ -2004,23 +2219,6 @@ class CApiEmitter:
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
-
-    def store_attribute(
-        self, target: ast.Attribute, value_node: ast.expr, indent: int
-    ) -> None:
-        """`a.b = c`. The object first, then the value, as Python orders it."""
-
-        owner = self.expression(target.value, indent)
-        value = self.expression(value_node, indent)
-        outcome = self.temporary_flag()
-        self.emit(
-            f"{outcome} = PyObject_SetAttrString({owner}, "
-            f"{_c_string(target.attr)}, {value});",
-            indent,
-        )
-        self.emit(f"Py_DecRef({owner});", indent)
-        self.emit(f"Py_DecRef({value});", indent)
-        self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
 
     def augmented_place(self, node: ast.AugAssign, indent: int) -> None:
         """`xs[k] += v` and `a.b += v` - read, combine, write back.
@@ -2071,21 +2269,6 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({owner});", indent)
         self.emit(f"Py_DecRef({combined});", indent)
         self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
-
-    def unpack(self, target, value_node: ast.expr, indent: int) -> None:
-        """`a, b = pair` - the value once, then each name from its position.
-
-        Indexed rather than iterated, which is not what Python does for an
-        arbitrary iterable but is right for the sequences this is written for
-        and does not need the iterator threaded through the assignment.
-        """
-
-        for element in target.elts:
-            if not isinstance(element, ast.Name):
-                raise self.fail(target, "unpacking binds plain names here")
-        value = self.expression(value_node, indent)
-        self.unpack_value(target, value, indent)
-        self.emit(f"Py_DecRef({value});", indent)
 
     def unpack_value(self, target, value: str, indent: int) -> None:
         """Take ``value`` apart into the names of ``target``."""
@@ -2144,24 +2327,6 @@ class CApiEmitter:
             self.emit(f"{name} = {item};", indent)
         self.emit(f"Py_DecRef({items});", indent)
 
-    def store_item(
-        self, target: ast.Subscript, value_node: ast.expr, indent: int
-    ) -> None:
-        """`xs[k] = v` - the object protocol, so a list and a dict both work."""
-
-        if isinstance(target.slice, ast.Slice):
-            raise self.fail(target, "assigning to a slice is not translated here yet")
-        container = self.expression(target.value, indent)
-        key = self.expression(target.slice, indent)
-        value = self.expression(value_node, indent)
-        outcome = self.temporary_flag()
-        self.emit(
-            f"{outcome} = PyObject_SetItem({container}, {key}, {value});", indent
-        )
-        for held in (container, key, value):
-            self.emit(f"Py_DecRef({held});", indent)
-        self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
-
     def expression_statement(self, node: ast.Expr, indent: int) -> None:
         if (
             isinstance(node.value, ast.Call)
@@ -2176,8 +2341,18 @@ class CApiEmitter:
     def write_out(self, node: ast.Call, indent: int) -> None:
         """print(...) - straight to sys.stdout through the file API."""
 
-        if node.keywords:
-            raise self.fail(node, "print() keyword arguments are not translated here")
+        if node.keywords or any(
+            isinstance(item, ast.Starred) for item in node.args
+        ):
+            # `end=`, `sep=`, `file=`, `flush=`, `*parts` - the fast path here
+            # writes straight to sys.stdout and knows none of them, so this
+            # hands the whole call to the interpreter's own print, which knows
+            # all of them and is the definition of what they mean.
+            printer = self.builtin("print", indent)
+            answer = self.invoke(printer, node.args, indent, node.keywords)
+            self.emit(f"Py_DecRef({printer});", indent)
+            self.emit(f"Py_DecRef({answer});", indent)
+            return
         # Every argument first, then the writing. print is a call, and a call
         # evaluates all of its arguments before any of it runs: interleaving
         # them let `print("x:", loud())` write "x: " before loud() spoke, and
@@ -2209,8 +2384,14 @@ class CApiEmitter:
         self.emit("}", indent)
 
     def loop(self, node: ast.While, indent: int) -> None:
-        if node.orelse:
-            raise self.fail(node, "a while-else is not translated here yet")
+        """`while c: ... else: ...` - the else runs unless a `break` left.
+
+        Not "unless the loop ended early": the test failing is the ordinary
+        way out and the else runs then. Only a `break` skips it, so only a
+        `break` sets the flag - the exhaustion test does not.
+        """
+
+        broke = self.begin_loop(node, indent)
         decision = self.temporary_flag()
         self.emit("while (1) {", indent)
         test = self.expression(node.test, indent + 1)
@@ -2224,9 +2405,35 @@ class CApiEmitter:
         finally:
             self.loop_depth -= 1
         self.emit("}", indent)
+        self.finish_loop(node, broke, indent)
+
+    def begin_loop(self, node, indent: int) -> str | None:
+        """Set up the flag an `else` clause needs, if there is one."""
+
+        if not node.orelse:
+            self.loop_flags.append(None)
+            return None
+        broke = self.temporary_flag()
+        self.emit(f"{broke} = 0;", indent)
+        self.loop_flags.append(broke)
+        return broke
+
+    def finish_loop(self, node, broke: str | None, indent: int) -> None:
+        """Run the `else` clause, unless a `break` left the loop."""
+
+        self.loop_flags.pop()
+        if broke is None:
+            return
+        self.emit(f"if (!{broke}) {{", indent)
+        for statement in node.orelse:
+            self.statement(statement, indent + 1)
+        self.emit("}", indent)
 
     def for_loop(self, node: ast.For, indent: int) -> None:
         """`for x in seq:` - the iterator protocol, exactly as Python runs it.
+
+        An `else` clause runs when the sequence ran out, which is the ordinary
+        way for a loop to end; only a `break` skips it.
 
         `range(...)`, a list, a string, a file, a generator: whatever the
         object offers, because the interpreter is the one being asked. That is
@@ -2234,8 +2441,6 @@ class CApiEmitter:
         every iterable it supports.
         """
 
-        if node.orelse:
-            raise self.fail(node, "a for-else is not translated here yet")
         if not isinstance(node.target, (ast.Name, ast.Tuple, ast.List)):
             raise self.fail(node, "a for loop binds a name or a tuple of names")
         sequence = self.expression(node.iter, indent)
@@ -2265,6 +2470,7 @@ class CApiEmitter:
         else:
             self.emit(f"if ({target}) Py_DecRef({target});", indent + 1)
             self.emit(f"{target} = {item};", indent + 1)
+        broke = self.begin_loop(node, indent)
         self.loop_depth += 1
         try:
             targets = (
@@ -2283,6 +2489,7 @@ class CApiEmitter:
             self.loop_depth -= 1
         self.emit("}", indent)
         self.emit(f"Py_DecRef({iterator});", indent)
+        self.finish_loop(node, broke, indent)
 
     def temporary_flag(self) -> str:
         assert self.current is not None
@@ -2310,6 +2517,12 @@ class CApiEmitter:
             return
         self.release_locals(indent)
         self.leave(value, indent)
+
+    def mark_broken(self, indent: int) -> None:
+        """Say that this loop is being left by `break`, for its `else`."""
+
+        if self.loop_flags and self.loop_flags[-1] is not None:
+            self.emit(f"{self.loop_flags[-1]} = 1;", indent)
 
     def leave_through_finally(
         self, why: int, indent: int, value: str | None = None
@@ -2627,6 +2840,16 @@ class CApiEmitter:
             ) == 1 and isinstance(statement.targets[0], ast.Name):
                 value = self.expression(statement.value, indent)
                 key = statement.targets[0].id
+            elif (
+                isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+            ):
+                # `n: int = 3` in a class body is a class attribute; `n: int`
+                # alone declares nothing that exists at run time.
+                if statement.value is None:
+                    continue
+                value = self.expression(statement.value, indent)
+                key = statement.target.id
             else:
                 raise self.fail(
                     statement,
@@ -3139,7 +3362,14 @@ class CApiEmitter:
             # static that nothing ever wrote.
             self.globals.add(node.name)
             return
-        if isinstance(node, ast.Assign):
+        if isinstance(node, ast.AnnAssign):
+            # `xs: list[float] = [...]` binds `xs` exactly as a plain
+            # assignment does. Missing it meant a function written before the
+            # module body could not see the name at all, and looked for it in
+            # builtins instead.
+            if node.value is not None and isinstance(node.target, ast.Name):
+                self.globals.add(node.target.id)
+        elif isinstance(node, ast.Assign):
             for target in node.targets:
                 for element in (
                     target.elts
