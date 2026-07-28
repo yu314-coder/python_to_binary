@@ -5,9 +5,9 @@ backend-path = ["src"]
 
 [project]
 name = "python-to-binary"
-version = "0.2.2"
+version = "0.3.0"
 description = "Pure-Python Python-to-C, native binary compiler, and CPython application bundler"
-readme = "README.md"
+readme = "README-pypi.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "python-to-binary contributors" }]

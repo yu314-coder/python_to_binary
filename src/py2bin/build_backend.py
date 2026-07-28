@@ -11,14 +11,18 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-_VERSION = "0.2.2"
+_VERSION = "0.3.0"
 _DISTRIBUTION = f"python_to_binary-{_VERSION}"
 _ZIP_EPOCH = 315532800  # 1980-01-01 UTC, the oldest timestamp ZIP accepts.
 
 
 def _metadata() -> str:
     root = Path(__file__).resolve().parents[2]
-    readme = (root / "README.md").read_text(encoding="utf-8")
+    # The package page, not the repository page. They say the same things -
+    # the platform grid, how the pieces fit, the measurements - but the
+    # repository README also covers building from a checkout, which is not
+    # what someone reading PyPI installed it to do.
+    readme = (root / "README-pypi.md").read_text(encoding="utf-8")
     return (
         "Metadata-Version: 2.1\n"
         "Name: python-to-binary\n"
@@ -44,7 +48,15 @@ def build_wheel(wheel_directory: str, config_settings=None, metadata_directory=N
     rows: list[tuple[str, str, str]] = []
     files: dict[str, bytes] = {}
     source_root = root / "src"
-    for source in sorted((source_root / "py2bin").rglob("*.py")):
+    # Everything in the package, not only its modules. `libm.c` is part of
+    # the compiler - it is the C the math builtins are compiled from - and a
+    # wheel that packed `*.py` alone installed a py2bin that could not compile
+    # anything, failing on a missing file at the first `compile-capi`.
+    for source in sorted((source_root / "py2bin").rglob("*")):
+        if not source.is_file() or "__pycache__" in source.parts:
+            continue
+        if source.suffix in {".pyc", ".pyo"}:
+            continue
         files[source.relative_to(source_root).as_posix()] = source.read_bytes()
     files[f"{dist_info}/METADATA"] = _metadata().encode()
     files[f"{dist_info}/WHEEL"] = b"Wheel-Version: 1.0\nGenerator: py2bin\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
@@ -77,6 +89,9 @@ def build_sdist(sdist_directory: str, config_settings=None) -> str:
         root / "ARCHITECTURE.md",
         root / "LICENSE",
         root / "README.md",
+        # The package page's own text. It has to travel in the sdist, because
+        # building a wheel from an unpacked sdist reads it for the metadata.
+        root / "README-pypi.md",
         root / "pyproject.toml",
         root / "docs",
         root / "examples",
