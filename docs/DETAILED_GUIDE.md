@@ -371,6 +371,31 @@ expression that consumes it decrements, so `return a + b` pays four calls into
 libpython that a borrowing rule would not. That rule is what makes ownership
 checkable by reading, so changing it is a design decision rather than a tweak.
 
+**Most of a Python installation is never reached.** Of nearly twelve thousand
+standard-library files, one real application touched under two hundred; of
+seventy-seven compiled extension modules, thirty-seven. `--prune-unused` walks
+the imports from the entry and drops what cannot be reached, which is the
+difference between a bundle larger than what other compilers produce and one
+smaller.
+
+The walk is static, so it cannot see an import built from a name at run time.
+Two rules keep that from becoming a bundle that starts and then fails:
+
+- What the import machinery reaches by name is kept unconditionally -
+  `encodings` above all, since a codec is looked up by its name and a bundle
+  without it cannot open a text file.
+- A package is kept whole, and *everything its modules import* is kept with it.
+  That second half was learned the hard way: the codec registry imports
+  `encodings.idna` by name, idna imports `stringprep`, and reading only
+  `encodings/__init__.py` mentions neither. The pruned bundle started, ran, and
+  failed inside `socket.getfqdn` with "unknown encoding: idna". Closing the
+  package's own imports costs 2 MB back and is not optional.
+
+A private extension is not automatically kept, either. Most of `lib-dynload` is
+private, so keeping all of it kept curses, tkinter and the database bindings;
+what keeps one is being *named* - `socket.py` says `import _socket`, and the
+walk read that.
+
 **What a self-contained bundle should not carry.** The first working one was
 293 MB against Nuitka's 73 MB for the same application, which is not a
 defensible ratio. Four things accounted for nearly all of it, and none of them

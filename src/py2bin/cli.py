@@ -200,6 +200,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     capi_parser.add_argument(
+        "--prune-unused",
+        action="store_true",
+        help=(
+            "drop bundled modules the program cannot import. The walk is "
+            "static, so a module imported from a name built at run time would "
+            "go with them"
+        ),
+    )
+    capi_parser.add_argument(
         "--bundle-site",
         action="append",
         default=[],
@@ -981,6 +990,14 @@ def main(argv: list[str] | None = None) -> int:
                 from .freezer import embed_cpython_in_app
 
                 carried = embed_cpython_in_app(output)
+                if args.prune_unused:
+                    from .freezer import prune_unreachable
+
+                    freed = prune_unreachable(output, entry)
+                    print(
+                        f"dropped {freed // 1048576} MB the program cannot import",
+                        file=sys.stderr,
+                    )
                 from .freezer import compile_bundle_sources
 
                 compile_bundle_sources(output)

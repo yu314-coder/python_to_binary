@@ -179,7 +179,9 @@ PYTHONPATH=src python3 -m py2bin compile-capi app.py \
 #    have this exact CPython installed.
 PYTHONPATH=src python3 -m py2bin compile-capi app.py \
   --target darwin-arm64 --app --name "My App" --icon icon.icns \
-  --embed-python --site Resources/site-packages -o MyApp.app
+  --embed-python --site Resources/site-packages \\
+  --bundle-site ~/venvs/myapp/lib/python3.12/site-packages --prune-unused \\
+  -o MyApp.app
 
 # 2. Python that imports vetted C-API names from py2bin.cabi.
 PYTHONPATH=src python3 -m py2bin compile program.py \

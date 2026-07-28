@@ -133,6 +133,192 @@ def bundle_site_packages(bundle: Path, sources: tuple[Path, ...]) -> None:
                 shutil.copy2(item, target)
 
 
+#: Packages the import machinery reaches by *name* rather than by an import
+#: statement, so no amount of reading the source finds them. `encodings` is the
+#: clearest case: a codec is looked up by its name at run time, and a bundle
+#: without it cannot even open a text file.
+_REACHED_BY_NAME = (
+    "encodings",
+    "codecs",
+    "importlib",
+    "site",
+    "sitecustomize",
+    "abc",
+    "io",
+    "os",
+    "posixpath",
+    "genericpath",
+    "stat",
+    "_collections_abc",
+    "warnings",
+    "types",
+    "enum",
+    "re",
+    "sre_compile",
+    "sre_parse",
+    "sre_constants",
+    "functools",
+    "operator",
+    "collections",
+    "keyword",
+    "heapq",
+    "itertools",
+    "reprlib",
+    "copyreg",
+    "traceback",
+    "linecache",
+    "tokenize",
+    "token",
+    "zipimport",
+    "runpy",
+    "threading",
+    "weakref",
+    "contextlib",
+)
+
+
+#: Extensions the interpreter itself reaches during start-up or through
+#: machinery no import statement mentions. Keeping these is cheap; finding out
+#: the hard way that one was needed is not.
+_INTERPRETER_NEEDS = frozenset(
+    {
+        "codecs", "io", "abc", "collections", "functools", "locale",
+        "opcode", "operator", "signal", "sre", "stat", "struct", "thread",
+        "weakref", "posixsubprocess", "socket", "select", "math", "errno",
+        "time", "datetime", "random", "hashlib", "ssl", "zlib", "bz2",
+        "lzma", "asyncio", "queue", "heapq", "bisect", "json", "pickle",
+        "csv", "decimal", "uuid", "contextvars", "typing", "zoneinfo",
+        "statistics", "multiprocessing", "scproxy", "unicodedata",
+        "elementtree", "pyexpat", "binascii", "fcntl", "termios", "grp",
+        "pwd", "sha2", "sha3", "blake2", "md5", "sha1", "hmac", "posixshmem",
+    }
+)
+
+
+def _module_imports(source: str) -> set[str]:
+    """Every module name this source imports, dotted names included."""
+
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            found.add(node.module)
+            found.update(f"{node.module}.{a.name}" for a in node.names)
+    return found
+
+
+def prune_unreachable(bundle: Path, entry: Path) -> int:
+    """Drop bundled modules the program cannot import.
+
+    Only a fraction of a Python installation is ever reached: of nearly twelve
+    thousand standard-library files, one application touched under two hundred.
+    Shipping the rest is the difference between a bundle larger than what other
+    compilers produce and one smaller.
+
+    The walk is *static*, so it cannot see an import built from a string. What
+    the import machinery reaches by name is kept unconditionally - see
+    `_REACHED_BY_NAME` - and a whole package is kept as soon as anything in it
+    is reached, because a package's modules routinely import their siblings in
+    ways that only run-time knows about.
+    """
+
+    import shutil
+
+    roots = [
+        bundle / "Contents" / "Resources" / "site-packages",
+        *(bundle / "Contents" / "lib").glob("python*"),
+    ]
+
+    def locate(name: str) -> Path | None:
+        for root in roots:
+            for candidate in (
+                root / (name.replace(".", "/") + ".py"),
+                root / name.replace(".", "/") / "__init__.py",
+            ):
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    seen: set[str] = set()
+    queue = set(_REACHED_BY_NAME)
+    for source in (entry, *(p for p in entry.parent.glob("*.py"))):
+        queue |= _module_imports(source.read_text(encoding="utf-8", errors="replace"))
+    while queue:
+        name = queue.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        # A dotted name needs each package above it.
+        parts = name.split(".")
+        queue |= {".".join(parts[:i]) for i in range(1, len(parts))} - seen
+        found = locate(name)
+        if found is None:
+            continue
+        queue |= _module_imports(
+            found.read_text(encoding="utf-8", errors="replace")
+        ) - seen
+
+    # A package is kept whole, so everything *its* modules need must be kept
+    # too - and that is not visible from the package's __init__. `encodings` is
+    # the case that proves it: the codec registry imports `encodings.idna` by
+    # name, idna imports `stringprep`, and a bundle without stringprep fails
+    # with "unknown encoding: idna" from inside socket.getfqdn.
+    settled = False
+    while not settled:
+        settled = True
+        for package in {name.split(".")[0] for name in seen}:
+            found = locate(package)
+            if found is None or found.name != "__init__.py":
+                continue
+            for module in found.parent.rglob("*.py"):
+                for wanted in _module_imports(
+                    module.read_text(encoding="utf-8", errors="replace")
+                ):
+                    if wanted not in seen:
+                        seen.add(wanted)
+                        parts = wanted.split(".")
+                        seen |= {".".join(parts[:i]) for i in range(1, len(parts))}
+                        settled = False
+
+    keep_packages = {name.split(".")[0] for name in seen}
+    freed = 0
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for item in sorted(root.iterdir()):
+            if item.name in {"lib-dynload", "__pycache__"} or item.name.startswith("_"):
+                continue
+            stem = item.name[:-3] if item.name.endswith(".py") else item.name
+            if stem in keep_packages or not (item.is_dir() or item.name.endswith(".py")):
+                continue
+            freed += sum(f.stat().st_size for f in item.rglob("*") if f.is_file()) \
+                if item.is_dir() else item.stat().st_size
+            shutil.rmtree(item, ignore_errors=True) if item.is_dir() else item.unlink()
+        dynload = root / "lib-dynload"
+        if dynload.is_dir():
+            for module in dynload.glob("*.so"):
+                name = module.name.split(".")[0]
+                # A private extension is not automatically kept: most of
+                # lib-dynload is private, and keeping all of it kept curses,
+                # tkinter, the database bindings and everything else the
+                # program never mentions. What keeps one is being named -
+                # `socket.py` says `import _socket`, and the walk read that.
+                if name in seen or name.lstrip("_") in seen:
+                    continue
+                if name.lstrip("_") in _INTERPRETER_NEEDS:
+                    continue
+                freed += module.stat().st_size
+                module.unlink()
+    return freed
+
+
 def compile_bundle_sources(bundle: Path) -> int:
     """Replace the bundled `.py` files with bytecode, in place.
 

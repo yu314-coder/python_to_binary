@@ -1927,6 +1927,76 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2, 9)\n",
         )
 
+    def test_pruning_keeps_what_a_package_reaches_by_name(self):
+        """A package kept whole needs what *its* modules import, too.
+
+        Only a fraction of a Python installation is ever reached - of nearly
+        twelve thousand standard-library files one application touched under
+        two hundred - so dropping the rest is the difference between a bundle
+        larger than other compilers produce and one smaller. The hazard is
+        that a static walk cannot see an import built from a name.
+
+        This is the case that proved it: the codec registry imports
+        `encodings.idna` by name, idna imports `stringprep`, and reading only
+        `encodings/__init__.py` never mentions either. The pruned bundle
+        started, ran, and then failed inside `socket.getfqdn` with "unknown
+        encoding: idna".
+        """
+
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("the C-API path is darwin-arm64 only")
+        from py2bin.c_native import compile_c_native
+        from py2bin.cli import _embedded_python_path
+        from py2bin.freezer import (
+            compile_bundle_sources,
+            embed_cpython_in_app,
+            prune_unreachable,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            # Nothing here mentions idna or stringprep by name.
+            entry.write_text(
+                "import socket\n"
+                "print('hello'.encode('idna'))\n"
+                "print(type(socket.getfqdn()) is str)\n",
+                encoding="utf-8",
+            )
+            source = root / "program.c"
+            source.write_text(
+                python_to_capi_c(entry.read_text(), str(entry)),
+                encoding="utf-8",
+                newline="\n",
+            )
+            bundle = root / "Program.app"
+            compile_c_native(
+                source,
+                bundle,
+                target="darwin-arm64",
+                clean=True,
+                app=True,
+                app_name="Program",
+                python_dylib=_embedded_python_path(),
+            )
+            embed_cpython_in_app(bundle)
+            freed = prune_unreachable(bundle, entry)
+            self.assertGreater(freed, 1_000_000, "pruning did nothing")
+            compile_bundle_sources(bundle)
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "PYTHONPATH"
+            }
+            ran = subprocess.run(
+                [str(bundle / "Contents" / "MacOS" / "Program")],
+                capture_output=True,
+                cwd="/",
+                env=environment,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stderr.decode()[-400:])
+            self.assertEqual(ran.stdout, b"b'hello'\nTrue\n")
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen
