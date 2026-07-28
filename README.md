@@ -622,6 +622,58 @@ If a program genuinely needs the real NumPy or PyTorch, use `freeze`/`bundle`,
 which carries the real packages and the embedded CPython runtime that executes
 them. That is compatibility packaging, not native translation.
 
+## Measured against Nuitka
+
+Same machine (arm64 macOS), same CPython 3.14, same source. Nuitka 2.x with
+`--standalone`, driving Apple's clang; this driving its own C compiler.
+
+Startup, `print("x")`, median of 13 runs:
+
+| | startup | on disk |
+|---|---|---|
+| this, `compile-capi` | **10.2 ms** | **52 KB** |
+| CPython | 13.8 ms | - |
+| Nuitka `--standalone` | 17.1 ms | 15 MB |
+
+A `compile-capi` binary links the interpreter it was built against and starts
+by calling `Py_Initialize`. It skips the interpreter's own startup path -
+scanning `sys.path`, finding and unmarshalling `__main__` - which is what buys
+the 3.6 ms over CPython. Nuitka's standalone bundle pays to bootstrap its own
+tree first.
+
+Run time, median of 5 runs, seconds:
+
+| | arithmetic | calls | strings |
+|---|---|---|---|
+| this, `compile-capi` | 0.140 | 0.067 | 0.026 |
+| CPython | 0.085 | 0.024 | 0.011 |
+| Nuitka | 0.098 | 0.021 | 0.010 |
+
+**This tier is slower than the interpreter it compiles for, and the reason is
+worth stating rather than hiding.** Since 3.11 CPython does not run the
+bytecode you wrote; it rewrites hot instructions into specialised forms. A
+`+` between two ints becomes an add on two machine words with a type guard,
+never reaching `PyNumber_Add`. Compiling each operation to its generic C API
+entry point produces exactly the code the interpreter has learned to *avoid*.
+Nuitka loses the same way on arithmetic and wins on calls, where it can bypass
+the frame setup a Python call needs.
+
+So the honest summary of what compiling buys here is: a single file that starts
+faster and carries no source, not a faster loop. Making the loop faster means
+type inference and unboxing - emitting `long long` arithmetic with a guard,
+the way the native `compile` tier already does - not more C API calls.
+
+A whole application, manim_app (10,100 lines, pywebview + PIL + pyobjc):
+
+| | py2bin | Nuitka |
+|---|---|---|
+| main binary | **9.0 MB** | 29.6 MB |
+| whole `.app` | 80 MB | 74 MB |
+
+The binary is a third the size because Nuitka compiles every module it reaches,
+including the third-party tree, while this compiles the program and ships its
+dependencies as bytecode. That trade runs the other way for the bundle total.
+
 ## Claims audit
 
 The following wording is intentionally strict. “No installed Python on the
