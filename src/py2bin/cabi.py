@@ -54,6 +54,7 @@ __all__ = [
     "PyNumber_Or", "PyNumber_And", "PyNumber_Xor",
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
+    "PyObject_SetAttrString",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -802,6 +803,9 @@ _PyObject_DelItem = _bind("PyObject_DelItem", ctypes.c_int, _HANDLE, _HANDLE)
 _PyErr_GetRaisedException = _bind("PyErr_GetRaisedException", _HANDLE)
 _PyCFunction_New = _bind("PyCFunction_New", _HANDLE, _HANDLE, _HANDLE)
 _PyTuple_GetItem = _bind("PyTuple_GetItem", _HANDLE, _HANDLE, _SSIZE)
+_PyObject_SetAttrString = _bind(
+    "PyObject_SetAttrString", ctypes.c_int, _HANDLE, ctypes.c_char_p, _HANDLE
+)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -998,6 +1002,12 @@ def PyCFunction_New(method_table: int, closure: int) -> int:
     """
 
     return _handle(_PyCFunction_New(method_table, closure))
+
+
+def PyObject_SetAttrString(object_handle: int, name: bytes, value: int) -> int:
+    """Set an attribute by name. Zero on success, -1 with an exception set."""
+
+    return int(_PyObject_SetAttrString(object_handle, name, value))
 
 
 def PyTuple_GetItem(tuple_handle: int, index: int) -> int:

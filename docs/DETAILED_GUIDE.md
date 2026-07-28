@@ -1250,7 +1250,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 59 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 60 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

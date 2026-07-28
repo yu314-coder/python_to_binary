@@ -61,6 +61,7 @@ extern void Py_DecRef(PyObject *object);
 extern int PyRun_SimpleString(const char *command);
 extern PyObject *PyImport_ImportModule(const char *name);
 extern PyObject *PyObject_GetAttrString(PyObject *object, const char *name);
+extern int PyObject_SetAttrString(PyObject *object, const char *name, PyObject *value);
 extern PyObject *PyObject_CallNoArgs(PyObject *callable);
 extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *argument);
 extern long long PyObject_Size(PyObject *object);
@@ -1148,8 +1149,13 @@ class CApiEmitter:
         if isinstance(node.targets[0], (ast.Tuple, ast.List)):
             self.unpack(node.targets[0], node.value, indent)
             return
+        if isinstance(node.targets[0], ast.Attribute):
+            self.store_attribute(node.targets[0], node.value, indent)
+            return
         if not isinstance(node.targets[0], ast.Name):
-            raise self.fail(node, "only a name or a subscript is assigned to here")
+            raise self.fail(
+                node, "only a name, an attribute or a subscript is assigned to here"
+            )
         value = self.expression(node.value, indent)
         target = self.declare(node.targets[0].id)
         # The name may already hold something; that reference is released
@@ -1376,8 +1382,11 @@ class CApiEmitter:
     def augmented(self, node: ast.AugAssign, indent: int) -> None:
         """`x += 1` - the operation, then the assignment, as Python does it."""
 
+        if isinstance(node.target, (ast.Subscript, ast.Attribute)):
+            self.augmented_place(node, indent)
+            return
         if not isinstance(node.target, ast.Name):
-            raise self.fail(node, "only augmented assignment to a name is translated")
+            raise self.fail(node, "only augmented assignment to a place is translated")
         rewritten = ast.copy_location(
             ast.BinOp(
                 left=ast.copy_location(
@@ -1392,6 +1401,73 @@ class CApiEmitter:
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
+
+    def store_attribute(
+        self, target: ast.Attribute, value_node: ast.expr, indent: int
+    ) -> None:
+        """`a.b = c`. The object first, then the value, as Python orders it."""
+
+        owner = self.expression(target.value, indent)
+        value = self.expression(value_node, indent)
+        outcome = self.temporary_flag()
+        self.emit(
+            f"{outcome} = PyObject_SetAttrString({owner}, "
+            f"{_c_string(target.attr)}, {value});",
+            indent,
+        )
+        self.emit(f"Py_DecRef({owner});", indent)
+        self.emit(f"Py_DecRef({value});", indent)
+        self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
+
+    def augmented_place(self, node: ast.AugAssign, indent: int) -> None:
+        """`xs[k] += v` and `a.b += v` - read, combine, write back.
+
+        The container and the key are computed once and used for both halves.
+        Rewriting into `xs[f()] = xs[f()] + v` would call `f` twice, which
+        Python does not.
+        """
+
+        function = _BINARY.get(type(node.op))
+        if function is None:
+            raise self.fail(
+                node, f"{type(node.op).__name__} is not translated here yet"
+            )
+        owner = self.expression(node.target.value, indent)
+        if isinstance(node.target, ast.Subscript):
+            key = (
+                self.slice_object(node.target.slice, indent)
+                if isinstance(node.target.slice, ast.Slice)
+                else self.expression(node.target.slice, indent)
+            )
+            current = self.temporary()
+            self.emit(f"{current} = PyObject_GetItem({owner}, {key});", indent)
+            self.checked(current, indent)
+        else:
+            name = _c_string(node.target.attr)
+            current = self.temporary()
+            self.emit(f"{current} = PyObject_GetAttrString({owner}, {name});", indent)
+            self.checked(current, indent)
+        addend = self.expression(node.value, indent)
+        combined = self.temporary()
+        self.emit(f"{combined} = {function}({current}, {addend});", indent)
+        self.emit(f"Py_DecRef({current});", indent)
+        self.emit(f"Py_DecRef({addend});", indent)
+        self.checked(combined, indent)
+        outcome = self.temporary_flag()
+        if isinstance(node.target, ast.Subscript):
+            self.emit(
+                f"{outcome} = PyObject_SetItem({owner}, {key}, {combined});", indent
+            )
+            self.emit(f"Py_DecRef({key});", indent)
+        else:
+            self.emit(
+                f"{outcome} = PyObject_SetAttrString({owner}, "
+                f"{_c_string(node.target.attr)}, {combined});",
+                indent,
+            )
+        self.emit(f"Py_DecRef({owner});", indent)
+        self.emit(f"Py_DecRef({combined});", indent)
+        self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
 
     def unpack(self, target, value_node: ast.expr, indent: int) -> None:
         """`a, b = pair` - the value once, then each name from its position.
