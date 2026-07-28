@@ -317,7 +317,7 @@ def _emit_native_module(
         code = encode_linux_arm64(module, 0x401000)
         image = write_elf_arm64(code)
     elif target == "darwin-arm64":
-        code, externs = encode_darwin_extern_arm64(module, 0x100004000)
+        code, externs, statics = encode_darwin_extern_arm64(module, 0x100004000)
         if externs:
             # Each extern names the library that provides it. libSystem is
             # always loaded; any other library (for example the CPython
@@ -348,12 +348,20 @@ def _emit_native_module(
             image = write_macho_arm64_dynamic(
                 code,
                 externs,
+                statics,
+                module.static_bytes,
                 info_plist,
                 code_resources,
                 libraries=libraries,
                 symbol_libraries=symbol_libraries,
             )
         else:
+            # No externs, so nothing can call back in and the mapped static
+            # block through X28 is sound. That image has no __DATA to put
+            # statics in, so it is encoded the original way.
+            code, _externs, _statics = encode_darwin_extern_arm64(
+                module, 0x100004000, image_statics=False
+            )
             image = write_macho_arm64(code, info_plist, code_resources)
     else:
         code_address = 0x401000 if target == "linux-x86_64" else 0x100001000

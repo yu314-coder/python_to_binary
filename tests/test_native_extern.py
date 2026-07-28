@@ -299,7 +299,7 @@ class ExternResultWidthTests(unittest.TestCase):
         from py2bin.native.ir import ExternCall, Module, Store
 
         module = Module([Store(0, ExternCall("PyRun_SimpleString", (), "i32"))], 4)
-        code, _externs = encode_darwin_extern(module, 0x100004000)
+        code, _externs, _statics = encode_darwin_extern(module, 0x100004000)
         # sxtw x0, w0
         self.assertIn((0x93407C00).to_bytes(4, "little"), code)
 
@@ -308,7 +308,7 @@ class ExternResultWidthTests(unittest.TestCase):
         from py2bin.native.ir import ExternCall, Module, Store
 
         module = Module([Store(0, ExternCall("strlen", (), "i64"))], 4)
-        code, _externs = encode_darwin_extern(module, 0x100004000)
+        code, _externs, _statics = encode_darwin_extern(module, 0x100004000)
         self.assertNotIn((0x93407C00).to_bytes(4, "little"), code)
 
     def test_failing_capi_call_is_detected_like_cpython(self):

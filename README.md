@@ -297,8 +297,8 @@ where Python captures the variable; where the enclosing scope moves that name
 afterwards the two disagree, so that case is a build-time refusal naming the
 variable. (At module level there is nothing to refuse: the name lives in the
 module's own storage, so `[f() for f in fs]` after a loop of lambdas gives
-Python's `[2, 2, 2]`.) Classes, `finally`, `while`/`else` and starred
-arguments are not translated yet.
+Python's `[2, 2, 2]`.) `finally`, `while`/`else`, starred arguments,
+`global`/`nonlocal` and decorators are not translated yet.
 
 **What py2bin does not do for you on the hand-written routes.** These apply to
 routes 2 and 3 above, where you write the C-API calls yourself; `compile-capi`

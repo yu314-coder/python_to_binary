@@ -163,6 +163,8 @@ def _uleb(value: int) -> bytes:
 def write_macho_arm64_dynamic(
     code: bytes,
     externs: list[tuple[int, str]],
+    statics: list[tuple[int, int]] = (),
+    static_bytes: int = 0,
     info_plist: bytes | None = None,
     code_resources: bytes | None = None,
     libraries: tuple[str, ...] = ("/usr/lib/libSystem.B.dylib",),
@@ -214,7 +216,14 @@ def write_macho_arm64_dynamic(
     data_fileoff = text_filesize
     data_vmaddr = base + data_fileoff
     got_size = len(symbols) * 8
-    data_filesize = _align(got_size, page) if got_size else page
+    # Static storage follows the GOT in the same writable segment. Putting it
+    # in the image rather than in a runtime mapping is what lets a static be
+    # addressed PC-relatively, which is what a function called back from a
+    # foreign library needs: it has no register it can trust to hold a base.
+    # The bytes are zeros, which is the initial value C gives a static.
+    static_base = data_vmaddr + _align(got_size, 16)
+    data_used = _align(got_size, 16) + static_bytes if static_bytes else got_size
+    data_filesize = _align(data_used, page) if data_used else page
 
     # Patch each GOT call site now that the GOT address is fixed.
     for byte_offset, symbol in externs:
@@ -231,6 +240,20 @@ def write_macho_arm64_dynamic(
             raise ValueError("arm64 __got slot is not 8-byte aligned")
         ldr = 0xF9400210 | ((offset // 8) << 10)
         struct.pack_into("<II", code, byte_offset, adrp, ldr)
+
+    # Patch each static address now that __DATA is fixed: adrp x0, <page>
+    # then add x0, x0, #<offset in page>.
+    for byte_offset, static_offset in statics:
+        instruction_addr = code_vmaddr + byte_offset
+        target = static_base + static_offset
+        page_delta = (target & ~0xFFF) - (instruction_addr & ~0xFFF)
+        pages = page_delta >> 12
+        if not -(1 << 20) <= pages < (1 << 20):
+            raise ValueError("arm64 static reference is outside ADRP range")
+        encoded = pages & 0x1FFFFF
+        adrp = 0x90000000 | ((encoded & 3) << 29) | (((encoded >> 2) & 0x7FFFF) << 5)
+        add = 0x91000000 | ((target & 0xFFF) << 10)
+        struct.pack_into("<II", code, byte_offset, adrp, add)
 
     linkedit_fileoff = data_fileoff + data_filesize
 
@@ -424,7 +447,7 @@ def write_macho_arm64_dynamic(
     image += bytes(code_fileoff - len(image))
     image += code
     image += bytes(data_fileoff - len(image))
-    image += bytes(got_size)
+    image += bytes(data_used)
     image += bytes(linkedit_fileoff - len(image))
     image += bind
     image += symbol_table

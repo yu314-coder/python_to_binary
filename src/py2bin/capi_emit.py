@@ -1070,6 +1070,8 @@ class CApiEmitter:
             self.emit("continue;", indent)
         elif isinstance(node, ast.Pass):
             pass
+        elif isinstance(node, ast.ClassDef):
+            self.class_definition(node, indent)
         elif isinstance(node, ast.FunctionDef):
             value = self.make_closure(node, node.name, indent)
             target = self.declare(node.name)
@@ -1854,6 +1856,108 @@ class CApiEmitter:
         self.write_closure(node, c_name, captures)
         return target
 
+    def class_definition(self, node: ast.ClassDef, indent: int) -> None:
+        """`class C(Base):` - the namespace built, then handed to `type`.
+
+        A class is what `type(name, bases, namespace)` answers, and that is
+        the interpreter's own class machinery rather than a re-implementation
+        of it: inheritance, `__init__`, `__repr__`, attribute lookup and the
+        method resolution order all behave because CPython is the one doing
+        them.
+
+        A method is a closure like any other, wrapped in
+        `functools.partialmethod` on the way into the namespace. A raw
+        `PyCFunction` is not a descriptor and so would never bind - the
+        instance would simply not arrive. `partialmethod` binds it and passes
+        the instance first, which lands in the argument tuple at position
+        zero, exactly where the compiled body already reads its first
+        parameter from.
+        """
+
+        if node.keywords or node.decorator_list:
+            raise self.fail(
+                node,
+                "a class with a metaclass or a decorator is not translated "
+                "here yet",
+            )
+        namespace = self.temporary()
+        self.emit(f"{namespace} = PyDict_New();", indent)
+        self.checked(namespace, indent)
+        binder = None
+        for statement in node.body:
+            if isinstance(statement, ast.Pass):
+                continue
+            if isinstance(statement, ast.Expr) and isinstance(
+                statement.value, ast.Constant
+            ):
+                continue  # a docstring
+            if isinstance(statement, ast.FunctionDef):
+                if binder is None:
+                    functools = self.temporary()
+                    self.emit(
+                        f'{functools} = PyImport_ImportModule("functools");', indent
+                    )
+                    self.checked(functools, indent)
+                    binder = self.temporary()
+                    self.emit(
+                        f"{binder} = PyObject_GetAttrString("
+                        f'{functools}, "partialmethod");',
+                        indent,
+                    )
+                    self.emit(f"Py_DecRef({functools});", indent)
+                    self.checked(binder, indent)
+                body = self.make_closure(statement, statement.name, indent)
+                value = self.temporary()
+                self.emit(
+                    f"{value} = PyObject_CallOneArg({binder}, {body});", indent
+                )
+                self.emit(f"Py_DecRef({body});", indent)
+                self.checked(value, indent)
+                key = statement.name
+            elif isinstance(statement, ast.Assign) and len(
+                statement.targets
+            ) == 1 and isinstance(statement.targets[0], ast.Name):
+                value = self.expression(statement.value, indent)
+                key = statement.targets[0].id
+            else:
+                raise self.fail(
+                    statement,
+                    "only methods and plain attribute assignments are "
+                    "translated in a class body yet",
+                )
+            named = self.temporary()
+            self.emit(f"{named} = PyUnicode_FromString({_c_string(key)});", indent)
+            self.checked(named, indent)
+            self.emit(f"PyDict_SetItem({namespace}, {named}, {value});", indent)
+            self.emit(f"Py_DecRef({named});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+        if binder is not None:
+            self.emit(f"Py_DecRef({binder});", indent)
+        bases = self.tuple_literal(
+            ast.copy_location(ast.Tuple(elts=node.bases, ctx=ast.Load()), node),
+            indent,
+        )
+        title = self.temporary()
+        self.emit(f"{title} = PyUnicode_FromString({_c_string(node.name)});", indent)
+        self.checked(title, indent)
+        arguments = self.temporary()
+        self.emit(f"{arguments} = PyTuple_New(3);", indent)
+        self.checked(arguments, indent)
+        # PyTuple_SetItem steals all three, which is what to do with the
+        # references this is finished with anyway.
+        self.emit(f"PyTuple_SetItem({arguments}, 0, {title});", indent)
+        self.emit(f"PyTuple_SetItem({arguments}, 1, {bases});", indent)
+        self.emit(f"PyTuple_SetItem({arguments}, 2, {namespace});", indent)
+        maker = self.builtin("type", indent)
+        made = self.temporary()
+        self.emit(f"{made} = PyObject_Call({maker}, {arguments}, 0);", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.emit(f"Py_DecRef({arguments});", indent)
+        self.checked(made, indent)
+        target = self.declare(node.name)
+        self.emit(f"if ({target}) Py_DecRef({target});", indent)
+        self.emit(f"{target} = {made};", indent)
+
     def write_closure(
         self, node: ast.AST, c_name: str, captures: tuple[str, ...]
     ) -> None:
@@ -1899,21 +2003,27 @@ class CApiEmitter:
             self.emit(f"c_{name} = PyTuple_GetItem(_self, {offset});", 1)
             self.emit(f"if (!c_{name}) {{ {self.failure()} }}", 1)
             self.emit(f"Py_IncRef(c_{name});", 1)
-        if isinstance(node.body, list):
-            for statement in node.body:
-                self.statement(statement, 1)
-            tail = self.builtin("None", 1)
-        else:
-            tail = self.expression(node.body, 1)
-        self.release_locals(1)
-        self.emit(f"return {tail};", 1)
-        self.write_unwind(function)
-        self.functions.append(function)
-        self.current, self.handlers, self.scope = (
-            outer,
-            outer_handlers,
-            outer_scope,
-        )
+        try:
+            if isinstance(node.body, list):
+                for statement in node.body:
+                    self.statement(statement, 1)
+                tail = self.builtin("None", 1)
+            else:
+                tail = self.expression(node.body, 1)
+            self.release_locals(1)
+            self.emit(f"return {tail};", 1)
+            self.write_unwind(function)
+            self.functions.append(function)
+        finally:
+            # Restored even when the body is refused. Leaving the enclosing
+            # scope's handler stack replaced turned the refusal into an
+            # IndexError from an unrelated `try`, which said nothing about
+            # what the program actually did.
+            self.current, self.handlers, self.scope = (
+                outer,
+                outer_handlers,
+                outer_scope,
+            )
 
     # --- assembly --------------------------------------------------------
 
@@ -1963,6 +2073,9 @@ class CApiEmitter:
     def note_module_bindings(self, node: ast.stmt) -> None:
         """Record every name this module-level statement binds."""
 
+        if isinstance(node, ast.ClassDef):
+            self.globals.add(node.name)
+            return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # The name it binds is a module name; what its body binds is not.
             # Descending would make a function's own locals look like globals,
@@ -2060,16 +2173,10 @@ class CApiEmitter:
             if function.name == "main":
                 continue
             out.append(f"static PyObject *f_{function.name}({signature(function)});")
-        out.append("")
-        for function in self.functions:
-            if function.name == "main":
-                continue
-            out.append(f"static PyObject *f_{function.name}({signature(function)}) {{")
-            out.extend(self.declarations(function, 1))
-            out.extend(function.body)
-            out.append("}")
-            out.append("")
-        entry = self.functions[-1]
+        # The file-scope storage comes before the bodies that read it. A
+        # function placed above the declaration was reading a different slot
+        # from the one main fills in, so a method that reached for a builtin
+        # dereferenced whatever that slot happened to hold.
         out.append("static PyObject *_py2bin_builtins = 0;")
         if self.method_table:
             # Declared empty and filled at startup: the C front end does not
@@ -2081,6 +2188,15 @@ class CApiEmitter:
         for name in sorted(self.globals):
             out.append(f"static PyObject *g_{name} = 0;")
         out.append("")
+        for function in self.functions:
+            if function.name == "main":
+                continue
+            out.append(f"static PyObject *f_{function.name}({signature(function)}) {{")
+            out.extend(self.declarations(function, 1))
+            out.extend(function.body)
+            out.append("}")
+            out.append("")
+        entry = self.functions[-1]
         out.append("int main(void) {")
         out.append("    Py_Initialize();")
         out.append('    _py2bin_builtins = PyImport_ImportModule("builtins");')

@@ -249,6 +249,37 @@ Python rather than a re-implementation of the mini-language; `!r`, `!s` and
 evaluates all of its arguments before any of it runs. Interleaving the two let
 `print("value:", loud())` write `value: ` before `loud()` spoke.
 
+**A class is `type(name, bases, namespace)`**, so inheritance, the method
+resolution order, `isinstance`, `__init__` and every other dunder are the
+interpreter's own machinery rather than a re-implementation. Each method is a
+closure wrapped in `functools.partialmethod` on the way into the namespace: a
+raw `PyCFunction` is not a descriptor and would never bind, so the instance
+would simply not arrive. `partialmethod` passes it first, which lands at
+position zero of the argument tuple - exactly where the compiled body already
+reads its first parameter from, so a method needs no calling convention of its
+own.
+
+**The trap that classes uncovered, and why static storage moved into the
+image.** Statics used to live in a mapping whose base sat in X28 for the whole
+run, on the reasoning that X28 is callee-saved and this backend writes it
+nowhere else. That reasoning holds only while every call goes *outward*. A
+compiled closure can be called *inward*: `PyCFunction_New` hands one to
+CPython, which calls it back from inside its own frames. Callee-saved means a
+frame that uses the register saves the old value and puts *its own* there until
+it returns - so while CPython's frame is live, X28 is CPython's. A callback
+entered from there read a module global through whatever CPython had left, and
+`sorted(rows, key=lambda v: SCALE - v)` segfaulted.
+
+The fix is not a better register. For an image that binds external symbols,
+static storage now lives in the writable `__DATA` segment alongside the GOT,
+and each reference is an `adrp`/`add` pair the Mach-O writer patches once the
+segment address is fixed - PC-relative, register-free, and therefore immune to
+whose frame called in. Images that bind nothing keep the mapping and the
+register, because nothing can call into them. This was found by a class whose
+method printed; it would have been found eventually by a closure, and it is
+worth recording that the first symptom was a static reading back the integer 1,
+which was a `PyMethodDef` field from an entirely unrelated part of the program.
+
 Reference counting follows one rule, chosen so that it can be checked by
 reading: **every expression yields a reference the caller owns**, and every
 statement releases what it finishes with. Reading a name increments before

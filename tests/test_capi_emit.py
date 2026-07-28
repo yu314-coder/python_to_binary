@@ -405,7 +405,6 @@ class CApiEmitTests(unittest.TestCase):
         )
 
     def test_what_is_not_translated_says_so(self):
-        self._reject("class A:\n    pass\n", "has no C-API translation here yet")
         # A format specifier is no longer a refusal - it goes to `format()`,
         # whose mini-language is the interpreter's own. See
         # test_f_string_format_specifiers_go_to_format for what it now does.
@@ -605,6 +604,70 @@ class CApiEmitTests(unittest.TestCase):
             "    return v\n"
             "print('value:', loud(1))\n",
             b"side effect\nvalue: 1\n",
+        )
+
+    def test_a_class_is_built_by_the_interpreters_own_type(self):
+        """`type(name, bases, namespace)` - so it is CPython's class machinery.
+
+        A method is a closure wrapped in `functools.partialmethod`. A raw
+        `PyCFunction` is not a descriptor and would never bind, so the instance
+        would simply not arrive; `partialmethod` passes it first, which lands
+        at position zero of the argument tuple - where the compiled body
+        already reads its first parameter from.
+        """
+
+        self._run(
+            "class Point:\n"
+            "    kind = 'point'\n"
+            "    def __init__(self, x, y):\n"
+            "        self.x = x\n"
+            "        self.y = y\n"
+            "    def norm2(self):\n"
+            "        return self.x * self.x + self.y * self.y\n"
+            "    def shifted(self, dx, dy=1):\n"
+            "        return Point(self.x + dx, self.y + dy)\n"
+            "    def __repr__(self):\n"
+            "        return 'Point(' + str(self.x) + ', ' + str(self.y) + ')'\n"
+            "p = Point(3, 4)\n"
+            "print(p, p.norm2(), p.kind)\n"
+            "print(p.shifted(1), p.shifted(1, 10))\n",
+            b"Point(3, 4) 25 point\nPoint(4, 5) Point(4, 14)\n",
+        )
+
+    def test_a_class_inherits(self):
+        self._run(
+            "class A:\n"
+            "    def value(self):\n"
+            "        return 1\n"
+            "class B(A):\n"
+            "    def value(self):\n"
+            "        return A.value(self) + 10\n"
+            "print([o.value() for o in [A(), B()]], isinstance(B(), A))\n",
+            b"[1, 11] True\n",
+        )
+
+    def test_a_closure_called_back_from_cpython_reaches_its_globals(self):
+        """The regression that made compiled closures unsound.
+
+        Static storage used to live in a mapping whose base sat in X28 for the
+        whole run. That holds while every call goes outward. A compiled
+        closure can be called *inward* - CPython holds it and calls it from
+        inside its own frames - and X28 is callee-saved, so a live CPython
+        frame that uses it has its own value there. The callback then read a
+        module global through whatever CPython left, and `sorted(key=...)`
+        segfaulted. Statics now live in the image's writable __DATA and are
+        addressed PC-relatively, which no caller can disturb.
+        """
+
+        self._run(
+            "SCALE = 10\n"
+            "def run():\n"
+            "    rows = [3, 1, 2]\n"
+            "    print(sorted(rows, key=lambda v: SCALE - v))\n"
+            "    print(list(map(lambda v: v * SCALE, rows)))\n"
+            "    print(max(rows, key=lambda v: SCALE - v))\n"
+            "run()\n",
+            b"[3, 2, 1]\n[30, 10, 20]\n1\n",
         )
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):

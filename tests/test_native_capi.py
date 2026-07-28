@@ -491,7 +491,8 @@ class Arm64ExternAbiTests(unittest.TestCase):
             IntConstant(index + 1) for index in range(count)
         ))
         module = Module([Store(0, call), ExitValue(IntConstant(0))], 1)
-        return encode_darwin_extern(module, 0x100004000)
+        code, externs, _statics = encode_darwin_extern(module, 0x100004000)
+        return code, externs
 
     def test_arguments_land_in_x0_through_x7(self):
         code, externs = self._encode(8)
@@ -542,7 +543,7 @@ class Arm64ExternAbiTests(unittest.TestCase):
             ),
             "i64",
         )
-        code, externs = arm64.encode_darwin_extern(
+        code, externs, _statics = arm64.encode_darwin_extern(
             Module([Store(0, call)], 4), 0x100004000
         )
         words = list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))

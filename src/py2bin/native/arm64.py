@@ -144,6 +144,15 @@ def _frame_add(amount: int) -> list[int]:
 #: there inside every function body and after every external (libSystem) call.
 #: That is what lets a C file-scope variable be one object shared by the entry
 #: point and every function, none of which share a stack frame.
+#:
+#: This holds only while every call goes *outward*. A function this backend
+#: compiles can now also be called *inward* - ``PyCFunction_New`` hands one to
+#: CPython, which calls it back from inside its own frames. X28 is callee-saved,
+#: which means a frame that uses it saves the old value and puts its own there
+#: until it returns: while CPython's frame is live, X28 is CPython's. A callback
+#: entered from there reads whatever CPython left, and a static read through it
+#: is a wild load. So an image whose functions can be called back addresses its
+#: statics without a register - see ``image_statics``.
 _STATIC_BASE = 28
 
 
@@ -294,6 +303,14 @@ class _Refs:
     externs: list[tuple[int, str]] = field(default_factory=list)
     calls: list[tuple[int, str]] = field(default_factory=list)
     addresses: list[tuple[int, str]] = field(default_factory=list)
+    #: ``(word_index, byte offset into static storage)`` for each ``adrp``/
+    #: ``add`` pair that computes the address of a static object. Filled in
+    #: only when ``image_statics`` is set, and patched by the Mach-O writer
+    #: once the ``__DATA`` address is known.
+    statics: list[tuple[int, int]] = field(default_factory=list)
+    #: True when static storage lives in the image's writable ``__DATA``
+    #: rather than in a mapping reached through X28. See ``_static_address``.
+    image_statics: bool = False
 
 
 def _external_call(
@@ -487,7 +504,14 @@ def _expression(
                 "encoders that establish the static base are encode_darwin/"
                 "encode_darwin_extern and encode_linux"
             )
-        words.extend(_static_address(expression.offset))
+        if refs.image_statics:
+            # adrp x0, <page of the static>; add x0, x0, #<offset in page>.
+            # PC-relative and register-free, so it reads the same object no
+            # matter whose frame called this function. Patched by the writer.
+            refs.statics.append((len(words), expression.offset))
+            words.extend((0, 0))
+        else:
+            words.extend(_static_address(expression.offset))
         return
     if isinstance(expression, FunctionAddress):
         if refs is None:
@@ -720,11 +744,12 @@ def _patch_branches(
 
 
 def _darwin_encode(
-    module: Module, code_address: int
-) -> tuple[bytes, list[tuple[int, str]]]:
+    module: Module, code_address: int, image_statics: bool = False
+) -> tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]:
     return _encode(
         module,
         code_address,
+        image_statics=image_statics,
         # Measured rather than assumed: macOS hands the count and the vector
         # to the entry point in X0 and X1, for a static LC_UNIXTHREAD image as
         # well as for a dynamic one dyld calls like a C main. Linux is the
@@ -743,7 +768,7 @@ def _darwin_encode(
 
 
 def encode_linux(module: Module, code_address: int) -> bytes:
-    code, externs = _encode(
+    code, externs, _statics = _encode(
         module,
         code_address,
         write_number=64,
@@ -763,7 +788,7 @@ def encode_linux(module: Module, code_address: int) -> bytes:
 
 
 def encode_darwin(module: Module, code_address: int) -> bytes:
-    code, externs = _darwin_encode(module, code_address)
+    code, externs, _statics = _darwin_encode(module, code_address)
     if externs:
         raise ValueError(
             "external symbol calls require encode_darwin_extern and the dynamic "
@@ -773,15 +798,21 @@ def encode_darwin(module: Module, code_address: int) -> bytes:
 
 
 def encode_darwin_extern(
-    module: Module, code_address: int
-) -> tuple[bytes, list[tuple[int, str]]]:
+    module: Module, code_address: int, image_statics: bool = True
+) -> tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]:
     """Encode a darwin module that may call external (dyld-bound) symbols.
 
-    Returns the ``.text`` bytes and the ordered extern GOT call sites so the
-    dynamic Mach-O writer can lay out the ``__got`` slots and bind opcodes.
+    Returns the ``.text`` bytes, the ordered extern GOT call sites so the
+    dynamic Mach-O writer can lay out the ``__got`` slots and bind opcodes, and
+    the static-address sites for it to point at ``__DATA``.
 
+    Static storage goes in the image here rather than in a mapping reached
+    through X28. An image that binds CPython can hand it a function to call -
+    that is what a compiled closure is - and a callback entered from inside
+    CPython's own frames finds CPython's value in that callee-saved register,
+    not this program's.
     """
-    return _darwin_encode(module, code_address)
+    return _darwin_encode(module, code_address, image_statics=image_statics)
 
 
 def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
@@ -1312,12 +1343,15 @@ def _encode(
     open_takes_dirfd: bool = False,
     errors_use_carry: bool = False,
     entry_gets_registers: bool = False,
-) -> tuple[bytes, list[tuple[int, str]]]:
+    image_statics: bool = False,
+) -> tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]:
     """Encode a module to ARM64 machine code.
 
-    Returns the ``.text`` bytes plus the extern GOT call sites as
+    Returns the ``.text`` bytes, the extern GOT call sites as
     ``(byte_offset_in_text, symbol)`` pairs (empty unless the module contains
-    ``ExternCall`` operations, which only the darwin dynamic path allows).
+    ``ExternCall`` operations, which only the darwin dynamic path allows), and
+    the static-address sites as ``(byte_offset_in_text, static offset)`` pairs
+    (empty unless ``image_statics`` puts static storage in the image).
     """
     system = _Syscalls(
         write_number,
@@ -1335,6 +1369,7 @@ def _encode(
     words: list[int] = list(_frame_sub(entry_frame))
     words.append(0x910003FD)  # mov x29, sp
     operations = list(module.operations)
+    refs = _Refs(image_statics=image_statics)
     if operations and isinstance(operations[0], EntryArguments):
         # Before the static mapping, whose mmap answers in X0 and would
         # overwrite the count this is here to keep.
@@ -1342,16 +1377,17 @@ def _encode(
             words,
             operations[:1],
             0,
-            refs := _Refs(),
+            refs,
             system,
             in_function=False,
             entry_frame=entry_frame,
             entry_gets_registers=entry_gets_registers,
         )
         operations = operations[1:]
-    else:
-        refs = _Refs()
-    _emit_static_block(words, module.static_bytes, system)
+    if not image_statics:
+        # Statics in the image need no mapping and no base register: their
+        # address is part of the image's own layout.
+        _emit_static_block(words, module.static_bytes, system)
     _emit_operations(
         words,
         operations,
@@ -1385,6 +1421,7 @@ def _encode(
             0, (offsets[name] - instruction_index) * 4
         )
     externs = [(index * 4, symbol) for index, symbol in refs.externs]
+    statics = [(index * 4, offset) for index, offset in refs.statics]
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
     for instruction_index, data, register in refs.strings:
         instruction_address = code_address + instruction_index * 4
@@ -1396,4 +1433,4 @@ def _encode(
             _adr(register, data_address - instruction_address),
         )
         image.extend(data)
-    return bytes(image), externs
+    return bytes(image), externs, statics
