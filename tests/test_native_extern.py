@@ -1187,3 +1187,109 @@ class WindowsSectionLayoutTests(unittest.TestCase):
         output = directory / "small.exe"
         compile_native(entry, output, "windows-x86_64", clean=True)
         self.assertEqual(output.read_bytes()[:2], b"MZ")
+
+
+class WindowsImageReferenceTests(unittest.TestCase):
+    """Every reference in a Windows image resolves somewhere real.
+
+    This is what can be checked without a Windows to run on, and it is the
+    half most likely to be wrong: a displacement is computed from an address
+    that is only settled once the sections are placed, so an off-by-one in
+    that arithmetic produces an image that looks perfectly well-formed to a
+    header reader and jumps into nothing.
+    """
+
+    def _image(self) -> tuple[bytes, list[tuple[str, int, int, int, int]], int]:
+        # Externs, a file-scope variable and a string literal used as a
+        # pointer - the three kinds of reference the writer has to place.
+        entry, directory = _write(
+            "from py2bin.cabi import Py_Initialize, PyRun_SimpleString, Py_Finalize\n"
+            "counter = 0\n"
+            "def bump(step):\n"
+            "    global counter\n"
+            "    counter = counter + step\n"
+            "    return counter\n"
+            "Py_Initialize()\n"
+            "PyRun_SimpleString(\"pass\")\n"
+            "bump(3)\n"
+            "Py_Finalize()\n"
+            "raise SystemExit(counter)\n"
+        )
+        output = directory / "image.exe"
+        compile_native(entry, output, "windows-x86_64", clean=True)
+        image = output.read_bytes()
+        pe = struct.unpack_from("<I", image, 0x3C)[0]
+        count = struct.unpack_from("<H", image, pe + 6)[0]
+        optional = struct.unpack_from("<H", image, pe + 20)[0]
+        base = struct.unpack_from("<Q", image, pe + 24 + 24)[0]
+        sections = []
+        for index in range(count):
+            off = pe + 24 + optional + index * 40
+            name = image[off:off + 8].rstrip(b"\0").decode()
+            vsize, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", image, off + 8)
+            sections.append((name, vaddr, vsize, rawptr, rawsize))
+        return image, sections, base
+
+    def test_every_indirect_call_lands_on_an_import_slot(self):
+        image, sections, base = self._image()
+        pe = struct.unpack_from("<I", image, 0x3C)[0]
+
+        def to_offset(rva: int) -> int | None:
+            for _name, vaddr, vsize, rawptr, rawsize in sections:
+                if vaddr <= rva < vaddr + max(vsize, rawsize):
+                    return rawptr + (rva - vaddr)
+            return None
+
+        slots = set()
+        directory = to_offset(struct.unpack_from("<I", image, pe + 24 + 112 + 8)[0])
+        while True:
+            lookup, _a, _b, name_rva, iat = struct.unpack_from(
+                "<IIIII", image, directory
+            )
+            if not (lookup or name_rva or iat):
+                break
+            cursor, index = to_offset(lookup), 0
+            while struct.unpack_from("<Q", image, cursor)[0]:
+                slots.add(base + iat + index * 8)
+                cursor += 8
+                index += 1
+            directory += 20
+        _name, text_rva, _vsize, text_raw, text_size = sections[0]
+        code = image[text_raw:text_raw + text_size]
+        seen = missed = 0
+        position = 0
+        while position < len(code) - 6:
+            if code[position] == 0xFF and code[position + 1] == 0x15:
+                displacement = struct.unpack_from("<i", code, position + 2)[0]
+                target = base + text_rva + position + 6 + displacement
+                if target in slots:
+                    seen += 1
+                else:
+                    missed += 1
+                position += 6
+                continue
+            position += 1
+        self.assertGreater(seen, 0, "no indirect calls found at all")
+        self.assertEqual(missed, 0, f"{missed} call sites resolve to no import slot")
+
+    def test_every_static_and_string_reference_lands_in_the_image(self):
+        image, sections, _base = self._image()
+        _name, text_rva, text_vsize, text_raw, text_size = sections[0]
+        spans = [(vaddr, vaddr + max(vsize, rawsize))
+                 for _n, vaddr, vsize, _rp, rawsize in sections]
+        code = image[text_raw:text_raw + text_size]
+        seen = outside = 0
+        position = 0
+        while position < len(code) - 7:
+            if code[position:position + 3] == b"\x48\x8d\x05":  # lea rax,[rip+d]
+                displacement = struct.unpack_from("<i", code, position + 3)[0]
+                rva = text_rva + position + 7 + displacement
+                if any(low <= rva < high for low, high in spans):
+                    seen += 1
+                else:
+                    outside += 1
+                position += 7
+                continue
+            position += 1
+        self.assertGreater(seen, 0, "no rip-relative references found at all")
+        self.assertEqual(outside, 0, f"{outside} references land outside every section")

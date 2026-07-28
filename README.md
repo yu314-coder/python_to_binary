@@ -153,7 +153,8 @@ WEBP/TIFF, and the app starts with no traceback.
 
 ### What this tier cannot do yet
 
-`compile-capi` targets **`darwin-arm64` and `darwin-x86_64`**. Both bind
+`compile-capi` targets **`darwin-arm64`, `darwin-x86_64` and
+`windows-x86_64`**. Both bind
 through dyld: each architecture's encoder emits the GOT and static reference
 sites, and one Mach-O writer lays out `__got`, the bind opcodes and `__DATA`
 and patches them. The two differ in four things and no more - the header's CPU,
@@ -168,19 +169,36 @@ matters - a compiled closure called back from inside CPython cannot read its
 statics out of a callee-saved register, because while CPython's frame is live
 that register is CPython's. Statics live in the image on both.
 
-**Windows x86-64 builds too, and is not yet run-tested.** The import directory
-now names several DLLs rather than one - the kernel for process services,
-`msvcrt` for the C library half of the vetted ABI, and `pythonXY.dll` for the
-interpreter - and statics live in the image for the same reason they do on
-darwin. A `print("x")` program comes out as a 3.5 KB PE32+ importing 21 symbols
-across 3 DLLs.
+**Windows x86-64 builds and runs.** The import directory names several DLLs
+rather than one - the kernel for process services, `msvcrt` for the C library
+half of the vetted ABI, and `pythonXY.dll` for the interpreter - and statics
+live in the image for the same reason they do on darwin.
 
-What has *not* happened is running one. There is no Windows here and no Wine,
-so it is verified by reading the image back: header, section table, import
-descriptors, thunks and the IAT data directory. That is enough to catch a
-malformed table and not enough to promise it runs, so it is stated as built
-rather than as working. Running one also needs `pythonXY.dll` beside the exe or
-on the path, which is a matter of what you ship rather than of the compiler.
+Verified under Wine 11 against the official embeddable CPython, whose
+`python314.dll` is exactly what the image imports:
+
+```
+$ wine winreal.exe
+Point(3, 4) 998000
+['fig', 'pear', 'apple']
+caught division by zero
+```
+
+Byte-identical to the interpreter, `sorted(key=lambda ...)` included - which is
+the case that matters, because a compiled closure called back from CPython
+cannot read a static out of `r15`. While the interpreter's frame is live, `r15`
+is the interpreter's.
+
+The Microsoft x64 call is not the System V one with the registers renamed.
+System V allocates from two independent counters, so the first pointer goes in
+`rdi` however many doubles precede it; Microsoft allocates by *position*, so a
+double followed by a pointer puts the pointer in `rdx`. A float argument is
+copied into the integer register as well, because a variadic callee reads it
+there, and the caller reserves 32 bytes of shadow space whether or not the
+callee spills into it.
+
+An exe needs `pythonXY.dll` beside it or on the path. That is what you ship,
+not something the compiler can settle.
 
 Linux is still refused: it needs an ELF `.got.plt` and its relocations, which
 nothing here writes.
