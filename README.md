@@ -325,6 +325,9 @@ identical stdout and exit status.
 - `for`/`while`/`try` with an `else` clause; `assert`; annotated assignment
   (`x: int = 5`); chained assignment (`a = b = v`); `del` of a name, an
   attribute or an item; and `print` with `sep=`, `end=`, `file=` or `flush=`.
+- **Decorators**, on functions, methods and classes, stacked and with
+  arguments — including `@staticmethod`, `@classmethod` and `@property`, which
+  are handed the plain callable so their own binding is not obstructed.
 - `global`, and dotted imports (`import a.b`, `import a.b as c`).
 - `bytes` literals, and dict comprehensions. Integers of any width, and text
   or bytes carrying a zero byte — neither of which has a C type to arrive in.
@@ -340,8 +343,8 @@ where Python captures the variable; where the enclosing scope moves that name
 afterwards the two disagree, so that case is a build-time refusal naming the
 variable. (At module level there is nothing to refuse: the name lives in the
 module's own storage, so `[f() for f in fs]` after a loop of lambdas gives
-Python's `[2, 2, 2]`.) `nonlocal`, decorators, `async` and generators are not
-translated yet.
+Python's `[2, 2, 2]`.) `nonlocal`, `async` and generators are not translated
+yet, and `functools.wraps` cannot rename a compiled function — see below.
 
 **What py2bin does not do for you on the hand-written routes.** These apply to
 routes 2 and 3 above, where you write the C-API calls yourself; `compile-capi`

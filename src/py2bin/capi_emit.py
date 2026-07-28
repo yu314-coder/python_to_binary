@@ -1633,6 +1633,7 @@ class CApiEmitter:
             self.class_definition(node, indent)
         elif isinstance(node, ast.FunctionDef):
             value = self.make_closure(node, node.name, indent)
+            value = self.apply_decorators(node.decorator_list, value, indent)
             target = self.declare(node.name)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"{target} = {value};", indent)
@@ -2742,6 +2743,25 @@ class CApiEmitter:
                 "quietly disagreeing",
             )
 
+    def apply_decorators(self, decorators, value: str, indent: int) -> str:
+        """`@a` then `@b` on a `def` is `a(b(f))`.
+
+        The list is in source order and they are applied from the bottom up,
+        which is the order Python applies them in.
+        """
+
+        for decorator in reversed(decorators):
+            applied = self.expression(decorator, indent)
+            wrapped = self.temporary()
+            self.emit(
+                f"{wrapped} = PyObject_CallOneArg({applied}, {value});", indent
+            )
+            self.emit(f"Py_DecRef({applied});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            self.checked(wrapped, indent)
+            value = wrapped
+        return value
+
     def qualified(self, name: str) -> str:
         """The name Python would show for something defined right here.
 
@@ -2769,10 +2789,6 @@ class CApiEmitter:
 
         assert self.current is not None
         arguments = node.args
-        if getattr(node, "decorator_list", []):
-            raise self.fail(
-                node, "a decorated nested function is not translated here yet"
-            )
         bound, read = self.scope_names(node)
         captures = tuple(
             sorted(
@@ -2829,11 +2845,9 @@ class CApiEmitter:
         parameter from.
         """
 
-        if node.keywords or node.decorator_list:
+        if node.keywords:
             raise self.fail(
-                node,
-                "a class with a metaclass or a decorator is not translated "
-                "here yet",
+                node, "a class with a metaclass is not translated here yet"
             )
         self.scope_path.append((node.name, False))
         namespace = self.temporary()
@@ -2872,12 +2886,24 @@ class CApiEmitter:
                     body = self.make_closure(statement, statement.name, indent)
                 finally:
                     self.methods_of.pop()
-                value = self.temporary()
-                self.emit(
-                    f"{value} = PyObject_CallOneArg({binder}, {body});", indent
-                )
-                self.emit(f"Py_DecRef({body});", indent)
-                self.checked(value, indent)
+                if statement.decorator_list:
+                    # The decorator is handed the plain callable, not the
+                    # partialmethod. `staticmethod`, `classmethod` and
+                    # `property` are descriptors that do their own binding,
+                    # and an ordinary wrapping decorator returns a Python
+                    # function - which binds by itself and passes the instance
+                    # as the first argument, which is where a compiled method
+                    # reads it from anyway.
+                    value = self.apply_decorators(
+                        statement.decorator_list, body, indent
+                    )
+                else:
+                    value = self.temporary()
+                    self.emit(
+                        f"{value} = PyObject_CallOneArg({binder}, {body});", indent
+                    )
+                    self.emit(f"Py_DecRef({body});", indent)
+                    self.checked(value, indent)
                 key = statement.name
             elif isinstance(statement, ast.Assign) and len(
                 statement.targets
@@ -2930,6 +2956,7 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({arguments});", indent)
         self.checked(made, indent)
         self.scope_path.pop()
+        made = self.apply_decorators(node.decorator_list, made, indent)
         target = self.declare(node.name)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {made};", indent)
@@ -3348,11 +3375,9 @@ class CApiEmitter:
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 arguments = node.args
-                if node.decorator_list:
-                    raise self.fail(
-                        node, "a decorated function is not translated here yet"
-                    )
-                if arguments.vararg or arguments.kwarg or arguments.kwonlyargs:
+                if node.decorator_list or (
+                    arguments.vararg or arguments.kwarg or arguments.kwonlyargs
+                ):
                     # A C function takes a fixed number of arguments in
                     # registers and cannot express these, so the whole function
                     # is compiled as a closure instead and every call to it

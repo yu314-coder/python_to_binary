@@ -320,6 +320,26 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**Decorators** are `a(b(f))` applied from the bottom up, which needs nothing
+new: the function is already a value, so the decorator is a call. A decorated
+module-level `def` is compiled as a closure rather than as a C function taking
+registers, for the same reason a `*args` one is - the result has to be a value.
+
+A decorated *method* is handed the plain callable and not the `partialmethod`
+wrapper. That is what makes `@staticmethod`, `@classmethod` and `@property`
+work: all three are descriptors that do their own binding, and a second layer
+would obstruct it. An ordinary wrapping decorator works for a reason worth
+stating - it returns a Python function, which binds by itself and passes the
+instance as its first argument, which is exactly where a compiled method reads
+it from.
+
+The idiom this does *not* support is `functools.wraps`, which copies
+`__name__` onto the wrapper by assigning it. A compiled function is a builtin
+function object and that attribute is read-only, so the program stops with an
+AttributeError naming it. The failure is loud and accurate, which is the most
+that can be said for it; a test asserts the divergence rather than pretending
+it is shared, because CPython runs the same program without complaint.
+
 **Values C has no shape for.** Two of Python's ordinary literals have no C
 type to arrive in, and both were build-time refusals until the vetted set grew
 a way to carry them:

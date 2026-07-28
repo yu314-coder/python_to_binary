@@ -420,7 +420,6 @@ class CApiEmitTests(unittest.TestCase):
         # `*args` and `**kwargs` in a parameter list are no longer refused;
         # see test_a_function_takes_star_args_and_keywords for what they do.
         self._reject("nonlocal x\n", "`nonlocal` is not translated")
-        self._reject("@dec\ndef f():\n    pass\n", "decorated function")
         self._reject("async def f():\n    pass\n", "no C-API translation")
 
         # An unknown name is no longer refused at build time: it is looked up
@@ -1323,6 +1322,112 @@ class CApiEmitTests(unittest.TestCase):
             "print(len(b), b.split(b'\\0'))\n",
             b"3 ['a', 'b']\n5 [b'x', b'y', b'z']\n",
         )
+
+    def test_decorators(self):
+        """`@a` then `@b` on a `def` is `a(b(f))`, applied from the bottom up."""
+
+        self._run(
+            "def tag(label):\n"
+            "    def outer(f):\n"
+            "        def wrapper(*a):\n"
+            "            return label + ':' + str(f(*a))\n"
+            "        return wrapper\n"
+            "    return outer\n"
+            "@tag('A')\n"
+            "@tag('B')\n"
+            "def value():\n"
+            "    return 1\n"
+            "print(value())\n"
+            "def register(k):\n"
+            "    def outer(cls):\n"
+            "        cls.tag = k\n"
+            "        return cls\n"
+            "    return outer\n"
+            "@register('marked')\n"
+            "class D:\n"
+            "    pass\n"
+            "print(D.tag)\n"
+            "import functools\n"
+            "@functools.lru_cache(maxsize=None)\n"
+            "def slow(n):\n"
+            "    return n * 2\n"
+            "print(slow(4), slow(4))\n",
+            b"A:B:1\nmarked\n8 8\n",
+        )
+
+    def test_the_descriptor_decorators(self):
+        """A decorated method is handed the plain callable, not the wrapper.
+
+        `staticmethod`, `classmethod` and `property` are descriptors that do
+        their own binding, so `partialmethod` must not get in the way - and an
+        ordinary wrapping decorator returns a Python function, which binds by
+        itself and passes the instance as the first argument, which is where a
+        compiled method reads it from anyway.
+        """
+
+        self._run(
+            "class C:\n"
+            "    @staticmethod\n"
+            "    def stat(x):\n"
+            "        return 'stat ' + str(x)\n"
+            "    @classmethod\n"
+            "    def named(cls, x):\n"
+            "        return cls.__name__ + ' ' + str(x)\n"
+            "    @property\n"
+            "    def prop(self):\n"
+            "        return 'prop'\n"
+            "    def plain(self):\n"
+            "        return 'plain'\n"
+            "c = C()\n"
+            "print(C.stat(1), c.stat(2))\n"
+            "print(C.named(3), c.named(4))\n"
+            "print(c.prop, c.plain())\n",
+            b"stat 1 stat 2\nC 3 C 4\nprop plain\n",
+        )
+
+    def test_functools_wraps_cannot_rename_a_compiled_function(self):
+        """A compiled function is a builtin function object.
+
+        `functools.wraps` copies `__name__` onto the wrapper by assigning it,
+        and that attribute is read-only on this kind of object. The failure is
+        an AttributeError naming the attribute, which is the truth rather than
+        a silent difference - but it does mean the idiom does not work here.
+        """
+
+        source = (
+            "import functools\n"
+            "def shout(f):\n"
+            "    @functools.wraps(f)\n"
+            "    def wrapper(n):\n"
+            "        return f(n)\n"
+            "    return wrapper\n"
+            "@shout\n"
+            "def greet(n):\n"
+            "    return n\n"
+            "print(greet(1))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            generated = root / "program.c"
+            generated.write_text(
+                python_to_capi_c(source, str(entry)), encoding="utf-8", newline="\n"
+            )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            binary = root / "program.bin"
+            compile_c_native(generated, binary, target="darwin-arm64", clean=True)
+            native = subprocess.run([str(binary)], capture_output=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True
+            )
+            # This one is asserted as a *difference*, not a shared failure:
+            # under CPython the program runs, and here it does not.
+            self.assertEqual(reference.returncode, 0)
+            self.assertEqual(native.returncode, 1)
+            self.assertIn(b"AttributeError", native.stderr)
+            self.assertIn(b"__name__", native.stderr)
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
