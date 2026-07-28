@@ -55,7 +55,8 @@ __all__ = [
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
-    "PyBytes_FromStringAndSize",
+    "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
+    "PyNumber_Invert",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -811,6 +812,9 @@ _PyErr_SetRaisedException = _bind("PyErr_SetRaisedException", None, _HANDLE)
 _PyBytes_FromStringAndSize = _bind(
     "PyBytes_FromStringAndSize", _HANDLE, ctypes.c_char_p, _SSIZE
 )
+_PyNumber_Negative = _bind("PyNumber_Negative", _HANDLE, _HANDLE)
+_PyNumber_Positive = _bind("PyNumber_Positive", _HANDLE, _HANDLE)
+_PyNumber_Invert = _bind("PyNumber_Invert", _HANDLE, _HANDLE)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1007,6 +1011,25 @@ def PyCFunction_New(method_table: int, closure: int) -> int:
     """
 
     return _handle(_PyCFunction_New(method_table, closure))
+
+
+def PyNumber_Negative(value: int) -> int:
+    """`-x`. Not `0 - x`: those differ for a float, because `0 - 0.0` is
+    positive zero where `-0.0` is negative zero."""
+
+    return _handle(_PyNumber_Negative(value))
+
+
+def PyNumber_Positive(value: int) -> int:
+    """`+x`."""
+
+    return _handle(_PyNumber_Positive(value))
+
+
+def PyNumber_Invert(value: int) -> int:
+    """`~x`."""
+
+    return _handle(_PyNumber_Invert(value))
 
 
 def PyBytes_FromStringAndSize(text: bytes, length: int) -> int:

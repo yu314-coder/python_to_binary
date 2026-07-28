@@ -297,6 +297,29 @@ is not so - a function body assigning to the name declared a local of the same
 spelling, and the module never saw the change. It now names the module's own
 storage for both reading and writing.
 
+**What a differential sweep of this tier found.** The 889 demo programs run
+against CPython gave 721 agree / 24 differ / 144 refused, and the differences
+were bugs rather than noise. Four were the same shape - accepted, silent, and
+wrong:
+
+- *A comprehension leaked its variable.* `zs = [x * 2 for x in xs]` bound the
+  target as an ordinary name, so an enclosing `x` was overwritten and
+  `print(x)` afterwards answered with the comprehension's last item. A
+  comprehension has a scope of its own and now gets a slot of its own.
+- *`-0.0` came back as `0.0`.* Negation was `0 - x` for want of an entry
+  point, on the reasoning that they are the same operation. They are not, for
+  a float. `PyNumber_Negative` does it, and `+x` and `~x` came along since
+  they had been plain refusals.
+- *Unpacking never counted.* `a, b = (1, 2, 3)` bound two names and said
+  nothing where Python raises `ValueError`. Going through a tuple first is
+  what makes the length knowable, and it also makes unpacking work on any
+  iterable rather than only on something indexable.
+- *Output before a failure was lost.* An uncaught exception called `exit(1)`
+  without `Py_Finalize`, and the interpreter buffers stdout, so a program that
+  printed and then raised showed nothing at all. The test helper for failing
+  programs had only ever looked at stderr, which is why it survived; it now
+  compares stdout too.
+
 **What compiling a 7,000-line program broke, and it was never the language.**
 Once app.py's last construct went through, three limits showed up in a row,
 each of them a number chosen when modules were small:
@@ -384,9 +407,14 @@ is what tells those apart.
 A name that is not a local and not a function defined in the module is looked
 up in `builtins`, which is imported once at startup. So `range`, `sum`,
 `sorted`, `list` and the rest are the interpreter's own - nothing here
-reimplements them. One consequence is worth recording: a name that does not
-exist anywhere fails with `AttributeError` rather than the `NameError` CPython
-gives. Same exit status, different type.
+reimplements them. Past builtins there is nowhere else to look, so a lookup
+that fails is a name the program does not have, and it raises the `NameError`
+Python raises, in Python's wording. It used to leave the `AttributeError` the
+lookup produced, which names the *builtins module* rather than the program -
+and left set, the next thing done turned into `SystemError: ... returned a
+result with an exception set`, which names neither. Only names the program
+wrote pay for that check; the ones this emitter asks for itself - the `None` at
+every function tail, `tuple`, `type` - cannot fail and go straight through.
 
 `and` and `or` answer with an operand rather than a bool - `1 and 2` is 2 -
 and the second operand only runs when the first does not settle the answer.
@@ -1356,7 +1384,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 62 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 65 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

@@ -160,7 +160,13 @@ class CApiEmitTests(unittest.TestCase):
         )
 
     def _run_failing(self, source: str, needle: bytes) -> None:
-        """A program that raises: the message and the status must both match."""
+        """A program that raises: message, status and prior output all match.
+
+        The output matters as much as the message. The interpreter buffers
+        stdout and `exit()` does not run its shutdown, so a program that
+        printed and then raised showed nothing at all - and this helper, by
+        looking only at stderr, had nothing to say about it.
+        """
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -182,6 +188,7 @@ class CApiEmitTests(unittest.TestCase):
             self.assertEqual(native.returncode, reference.returncode)
             self.assertIn(needle, native.stderr)
             self.assertIn(needle, reference.stderr)
+            self.assertEqual(native.stdout, reference.stdout)
 
     def test_a_failing_call_stops_with_the_interpreters_own_message(self):
         # A C-API function answers NULL and leaves an exception set. Letting
@@ -857,6 +864,95 @@ class CApiEmitTests(unittest.TestCase):
         self._run(
             "".join(f"print({n} + {n} * 2 - 1, [{n}, {n} + 1])\n" for n in range(3)),
             b"-1 [0, 1]\n2 [1, 2]\n5 [2, 3]\n",
+        )
+
+    def test_a_comprehension_has_a_scope_of_its_own(self):
+        """`[x * 2 for x in xs]` must not touch the enclosing `x`.
+
+        The target was bound as an ordinary name, so a comprehension whose
+        variable happened to share a spelling with something outside it
+        overwrote that - `print(x)` afterwards answered with the
+        comprehension's last item. Accepted, silent, and wrong.
+        """
+
+        self._run(
+            "x = 7\n"
+            "xs = [0, 1, 2, 3]\n"
+            "print(x, [x * 2 for x in xs])\n"
+            "print(sum(x for x in xs), x)\n"
+            "print({x: x for x in xs}, x)\n"
+            "print({x for x in xs}, x)\n"
+            "n = 'keep'\n"
+            "print([[n for n in range(2)] for n in range(2)], n)\n",
+            b"7 [0, 2, 4, 6]\n6 7\n{0: 0, 1: 1, 2: 2, 3: 3} 7\n{0, 1, 2, 3} 7\n"
+            b"[[0, 1], [0, 1]] keep\n",
+        )
+
+    def test_negation_keeps_the_sign_of_zero(self):
+        """`-x` is not `0 - x`.
+
+        It was, for want of an entry point, on the reasoning that they are the
+        same operation. `0 - 0.0` is positive zero where `-0.0` is negative
+        zero, so a list of floats came back with one sign quietly changed.
+        """
+
+        self._run(
+            "print([1.0, 0.0, -0.0, -1.5])\n"
+            "print(-0.0, 0.0 == -0.0, +5, ~5, -(-3))\n",
+            b"[1.0, 0.0, -0.0, -1.5]\n-0.0 True 5 -6 3\n",
+        )
+
+    def test_unpacking_checks_how_many_there_were(self):
+        """`a, b = (1, 2, 3)` bound two names and said nothing.
+
+        Going through a tuple first is what makes the length knowable, and it
+        also makes unpacking work on any iterable rather than only on
+        something indexable.
+        """
+
+        self._run(
+            "try:\n"
+            "    a, b = (1, 2, 3)\n"
+            "except ValueError as e:\n"
+            "    print('too many:', e)\n"
+            "try:\n"
+            "    a, b, c = (1, 2)\n"
+            "except ValueError as e:\n"
+            "    print('too few:', e)\n"
+            "a, b = 'xy'\n"
+            "print(a, b)\n",
+            b"too many: too many values to unpack (expected 2, got 3)\n"
+            b"too few: not enough values to unpack (expected 3, got 2)\n"
+            b"x y\n",
+        )
+
+    def test_output_survives_an_uncaught_exception(self):
+        """The interpreter buffers stdout and `exit()` does not run shutdown.
+
+        A program that printed and then raised showed nothing at all, which
+        hides the very output that says how far it got.
+        """
+
+        self._run_failing(
+            "print('before the failure')\nraise ValueError('boom')\n",
+            b"ValueError: boom",
+        )
+
+    def test_a_name_that_does_not_exist_raises_NameError(self):
+        """Past builtins there is nowhere else to look.
+
+        The failed lookup left an AttributeError naming the *builtins module*,
+        which is neither the program's name nor its problem; left set, the
+        next thing done turned into `SystemError: ... returned a result with
+        an exception set`, which names neither.
+        """
+
+        self._run(
+            "try:\n"
+            "    missing_function(1)\n"
+            "except NameError as e:\n"
+            "    print('caught:', e)\n",
+            b"caught: name 'missing_function' is not defined\n",
         )
 
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):

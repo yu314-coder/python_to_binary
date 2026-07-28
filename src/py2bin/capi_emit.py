@@ -99,6 +99,9 @@ extern void PyErr_Clear(void);
 extern PyObject *PyErr_GetRaisedException(void);
 extern void PyErr_SetRaisedException(PyObject *exception);
 extern PyObject *PyBytes_FromStringAndSize(const char *text, long long length);
+extern PyObject *PyNumber_Negative(PyObject *value);
+extern PyObject *PyNumber_Positive(PyObject *value);
+extern PyObject *PyNumber_Invert(PyObject *value);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -281,6 +284,10 @@ class CApiEmitter:
         #: between the statements of a body, which is where a temporary slot
         #: stops being live.
         self.depth = 0
+        #: Name to C slot, innermost last, for scopes that are not a function:
+        #: a comprehension has its own, so its target must not be the
+        #: enclosing name of the same spelling.
+        self.shadowed: list[dict[str, str]] = []
         #: ``(python name, method-table index)`` for each module-level `def`,
         #: which also gets a Python callable so the name can be *used* and
         #: not only called - as a sort key, or with `*args` spread into it.
@@ -312,7 +319,11 @@ class CApiEmitter:
         if self.handlers:
             return f"goto {self.handlers[-1]};"
         if self.current.name == "main":
-            return "PyErr_Print(); exit(1);"
+            # Py_Finalize before leaving, or everything already printed is
+            # lost: sys.stdout is buffered inside the interpreter and exit()
+            # does not run its shutdown. A program that printed and then
+            # raised showed nothing at all.
+            return "PyErr_Print(); Py_Finalize(); exit(1);"
         self.current.unwinds = True
         return "goto _unwind;"
 
@@ -356,6 +367,9 @@ class CApiEmitter:
         """
 
         assert self.current is not None
+        for scope in reversed(self.shadowed):
+            if name in scope:
+                return scope[name]
         if name in self.current.module_names:
             # Declared `global` here, so the assignment lands in the module's
             # storage and every other scope sees it.
@@ -392,7 +406,9 @@ class CApiEmitter:
             return self.dict_literal(node, indent)
         if isinstance(node, ast.Set):
             return self.set_literal(node, indent)
-        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+        if isinstance(
+            node, (ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp)
+        ):
             return self.comprehension(node, indent)
         if isinstance(node, ast.Tuple):
             return self.tuple_literal(node, indent)
@@ -463,6 +479,9 @@ class CApiEmitter:
         """
 
         assert self.current is not None
+        for scope in reversed(self.shadowed):
+            if name in scope:
+                return scope[name]
         if name in self.current.module_names:
             # `global x` says this name is the module's, whatever a local of
             # the same spelling would otherwise have been.
@@ -483,8 +502,9 @@ class CApiEmitter:
         if c_name is None:
             # Local, then global, then builtins - the order Python looks in.
             # `bytes` and `len` are names as much as they are callables, and a
-            # program may pass one around rather than call it.
-            return self.builtin(node.id, indent)
+            # program may pass one around rather than call it. Past builtins
+            # there is nowhere else to look, so a failure here is a NameError.
+            return self.program_name(node.id, indent)
         target = self.temporary()
         # Handed back as an owned reference, like every other expression, so a
         # caller never has to ask where a value came from before releasing it.
@@ -702,17 +722,24 @@ class CApiEmitter:
         return target
 
     def unary(self, node: ast.UnaryOp, indent: int) -> str:
-        """`-x` and `not x`. There is no PyNumber_Negative in the vetted set,
-        so a negation is `0 - x`, which is the same operation."""
+        """`-x`, `+x`, `~x` and `not x`.
 
-        if isinstance(node.op, ast.USub):
-            zero = self.temporary()
-            self.emit(f"{zero} = PyLong_FromLongLong(0LL);", indent)
-            self.checked(zero, indent)
+        A negation was `0 - x` for want of an entry point, on the reasoning
+        that it is the same operation. It is not: `0 - 0.0` is positive zero
+        where `-0.0` is negative zero, so a list of floats came back with the
+        sign of one of them quietly changed.
+        """
+
+        signs = {
+            ast.USub: "PyNumber_Negative",
+            ast.UAdd: "PyNumber_Positive",
+            ast.Invert: "PyNumber_Invert",
+        }
+        operation = signs.get(type(node.op))
+        if operation is not None:
             value = self.expression(node.operand, indent)
             target = self.temporary()
-            self.emit(f"{target} = PyNumber_Subtract({zero}, {value});", indent)
-            self.emit(f"Py_DecRef({zero});", indent)
+            self.emit(f"{target} = {operation}({value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
             return self.checked(target, indent)
         if isinstance(node.op, ast.Not):
@@ -817,6 +844,13 @@ class CApiEmitter:
         """
 
         target = self.temporary()
+        if isinstance(node, ast.DictComp):
+            # Built as a dict from the start; there is no list shape a
+            # key-and-value comprehension could go through.
+            self.emit(f"{target} = PyDict_New();", indent)
+            self.checked(target, indent)
+            self.comprehension_clause(node, 0, target, indent)
+            return target
         self.emit(f"{target} = PyList_New(0LL);", indent)
         self.checked(target, indent)
         self.comprehension_clause(node, 0, target, indent)
@@ -835,6 +869,14 @@ class CApiEmitter:
         """One `for` clause of a comprehension, then whatever follows it."""
 
         if position == len(node.generators):
+            if isinstance(node, ast.DictComp):
+                key = self.expression(node.key, indent)
+                value = self.expression(node.value, indent)
+                self.emit(f"PyDict_SetItem({target}, {key}, {value});", indent)
+                # Neither reference is stolen, so both go back.
+                self.emit(f"Py_DecRef({key});", indent)
+                self.emit(f"Py_DecRef({value});", indent)
+                return
             value = self.expression(node.elt, indent)
             self.emit(f"PyList_Append({target}, {value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
@@ -850,7 +892,17 @@ class CApiEmitter:
         self.checked(iterator, indent)
         self.emit(f"Py_DecRef({sequence});", indent)
         item = self.temporary()
-        bound = self.declare(clause.target.id)
+        # A comprehension has a scope of its own, so its target is a slot of
+        # its own: `zs = [x * 2 for x in xs]` must leave the enclosing `x`
+        # exactly as it was. Binding the ordinary name instead left `print(x)`
+        # after it answering with the comprehension's last item.
+        bound = self.temporary()
+        # Cleared first. The loop releases what the slot held before it takes
+        # the next item, and a slot reused from an earlier statement still
+        # holds that statement's pointer - which was released there, so
+        # releasing it again drops a reference this code no longer owns.
+        self.emit(f"{bound} = 0;", indent)
+        self.shadowed.append({clause.target.id: bound})
         self.emit("while (1) {", indent)
         self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
         self.emit(
@@ -873,6 +925,8 @@ class CApiEmitter:
             inner -= 1
             self.emit("}", inner)
         self.emit("}", indent)
+        self.shadowed.pop()
+        self.emit(f"if ({bound}) {{ Py_DecRef({bound}); {bound} = 0; }}", indent)
         self.emit(f"Py_DecRef({iterator});", indent)
 
     def dict_literal(self, node: ast.Dict, indent: int) -> str:
@@ -923,6 +977,42 @@ class CApiEmitter:
         `range`, `sum`, `sorted`, `abs`, `dict` - anything the interpreter
         already has. Nothing here reimplements them; the module is imported
         once at startup and this reads an attribute off it.
+
+        This is for names *this emitter* asks for, which exist. A name the
+        program wrote goes through :meth:`program_name`.
+        """
+
+        return self.checked(self.builtin_raw(name, indent), indent)
+
+    def program_name(self, name: str, indent: int) -> str:
+        """A name the program used that is not local, global or one of its own.
+
+        Then it is either a builtin or nothing at all. When it is nothing, the
+        lookup leaves an AttributeError naming the builtins module rather than
+        the program - and left set, it turned the next thing done into
+        `SystemError: ... returned a result with an exception set`, which names
+        neither. This raises the NameError Python raises, in Python's wording.
+
+        Only this path pays for that. Putting it in :meth:`builtin` instead
+        added the whole construction to every `None` at every function tail,
+        for a lookup that cannot fail.
+        """
+
+        target = self.builtin_raw(name, indent)
+        self.emit(f"if (!{target}) {{", indent)
+        self.emit("PyErr_Clear();", indent + 1)
+        self.raise_named(
+            "NameError", f"name {name!r} is not defined", indent + 1
+        )
+        self.emit("}", indent)
+        return target
+
+    def builtin_raw(self, name: str, indent: int) -> str:
+        """The lookup itself, with nothing said about why it might fail.
+
+        The exception classes a raise needs come through here: turning *their*
+        failure into a NameError would need a class to build it from, which is
+        the lookup that just failed.
         """
 
         target = self.temporary()
@@ -931,7 +1021,7 @@ class CApiEmitter:
             f"{_c_string(name)});",
             indent,
         )
-        return self.checked(target, indent)
+        return target
 
     def attribute(self, node: ast.Attribute, indent: int) -> str:
         value = self.expression(node.value, indent)
@@ -1045,7 +1135,7 @@ class CApiEmitter:
                 )
             else:
                 # Not one of ours, so ask the interpreter for it.
-                callable_value = self.builtin(node.func.id, indent)
+                callable_value = self.program_name(node.func.id, indent)
             target = self.invoke(callable_value, node.args, indent, node.keywords)
             self.emit(f"Py_DecRef({callable_value});", indent)
             return target
@@ -1824,17 +1914,56 @@ class CApiEmitter:
         for element in target.elts:
             if not isinstance(element, ast.Name):
                 raise self.fail(target, "unpacking binds plain names here")
+        # Through a tuple first, for two reasons: unpacking works on any
+        # iterable and indexing does not, and the length has to be known to
+        # say whether it matches. Indexing the value directly took `a, b` from
+        # a three-item tuple without a word, where Python raises ValueError.
+        maker = self.builtin("tuple", indent)
+        items = self.temporary()
+        self.emit(f"{items} = PyObject_CallOneArg({maker}, {value});", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.checked(items, indent)
+        wanted = len(target.elts)
+        measured = self.temporary()
+        self.emit(f"{measured} = PyLong_FromLongLong(PyObject_Size({items}));", indent)
+        self.checked(measured, indent)
+        for comparison, message in (
+            # Py_GT is 4 and Py_LT is 0 in the rich-comparison numbering, which
+            # runs Py_LT, Py_LE, Py_EQ, Py_NE, Py_GT, Py_GE.
+            (4, f"too many values to unpack (expected {wanted}, got "),
+            (0, f"not enough values to unpack (expected {wanted}, got "),
+        ):
+            expected = self.temporary()
+            self.emit(f"{expected} = PyLong_FromLongLong({wanted}LL);", indent)
+            self.checked(expected, indent)
+            verdict = self.temporary_flag()
+            outcome = self.temporary()
+            self.emit(
+                f"{outcome} = PyObject_RichCompare({measured}, {expected}, "
+                f"{comparison});",
+                indent,
+            )
+            self.emit(f"Py_DecRef({expected});", indent)
+            self.checked(outcome, indent)
+            self.emit(f"{verdict} = PyObject_IsTrue({outcome});", indent)
+            self.emit(f"Py_DecRef({outcome});", indent)
+            self.emit(f"if ({verdict} < 0) {{ {self.failure()} }}", indent)
+            self.emit(f"if ({verdict}) {{", indent)
+            self.raise_value_error(message, measured, indent + 1)
+            self.emit("}", indent)
+        self.emit(f"Py_DecRef({measured});", indent)
         for position, element in enumerate(target.elts):
             index = self.temporary()
             self.emit(f"{index} = PyLong_FromLongLong({position}LL);", indent)
             self.checked(index, indent)
             item = self.temporary()
-            self.emit(f"{item} = PyObject_GetItem({value}, {index});", indent)
+            self.emit(f"{item} = PyObject_GetItem({items}, {index});", indent)
             self.emit(f"Py_DecRef({index});", indent)
             self.checked(item, indent)
             name = self.declare(element.id)
             self.emit(f"if ({name}) Py_DecRef({name});", indent)
             self.emit(f"{name} = {item};", indent)
+        self.emit(f"Py_DecRef({items});", indent)
 
     def store_item(
         self, target: ast.Subscript, value_node: ast.expr, indent: int
@@ -2489,10 +2618,56 @@ class CApiEmitter:
         )
         self.emit("}", indent)
 
+    def raise_value_error(self, message: str, count: str, indent: int) -> None:
+        """A ValueError whose message ends with a number only known at runtime."""
+
+        text = self.temporary()
+        self.emit(f"{text} = PyUnicode_FromString({_c_string(message)});", indent)
+        self.checked(text, indent)
+        spelled = self.temporary()
+        self.emit(f"{spelled} = PyObject_Str({count});", indent)
+        self.checked(spelled, indent)
+        joined = self.temporary()
+        self.emit(f"{joined} = PyNumber_Add({text}, {spelled});", indent)
+        self.emit(f"Py_DecRef({text});", indent)
+        self.emit(f"Py_DecRef({spelled});", indent)
+        self.checked(joined, indent)
+        closing = self.temporary()
+        self.emit(f'{closing} = PyUnicode_FromString(")");', indent)
+        self.checked(closing, indent)
+        whole = self.temporary()
+        self.emit(f"{whole} = PyNumber_Add({joined}, {closing});", indent)
+        self.emit(f"Py_DecRef({joined});", indent)
+        self.emit(f"Py_DecRef({closing});", indent)
+        self.checked(whole, indent)
+        # Fetched raw for the same reason raise_named does: an exception class
+        # whose lookup failed cannot be reported as a missing *program* name.
+        kind = self.builtin_raw("ValueError", indent)
+        self.checked(kind, indent)
+        raised = self.temporary()
+        self.emit(f"{raised} = PyObject_CallOneArg({kind}, {whole});", indent)
+        self.emit(f"Py_DecRef({whole});", indent)
+        self.checked(raised, indent)
+        self.emit(f"PyErr_SetObject({kind}, {raised});", indent)
+        self.emit(f"Py_DecRef({kind});", indent)
+        self.emit(f"Py_DecRef({raised});", indent)
+        self.emit(self.failure(), indent)
+
     def raise_type_error(self, message: str, indent: int) -> None:
         """Set a TypeError with this message, then take the failure path."""
 
-        kind = self.builtin("TypeError", indent)
+        self.raise_named("TypeError", message, indent)
+
+    def raise_named(self, kind_name: str, message: str, indent: int) -> None:
+        """Set ``kind_name(message)``, then take the failure path.
+
+        The class comes through ``builtin_raw``: fetching it with the ordinary
+        lookup would turn *its* failure into a NameError, which needs a class
+        to build - the lookup that just failed.
+        """
+
+        kind = self.builtin_raw(kind_name, indent)
+        self.checked(kind, indent)
         text = self.temporary()
         self.emit(f"{text} = PyUnicode_FromString({_c_string(message)});", indent)
         self.checked(text, indent)
