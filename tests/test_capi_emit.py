@@ -1802,6 +1802,26 @@ class CApiEmitTests(unittest.TestCase):
                 lines[1].endswith("Program.app/Contents"), lines[1]
             )
 
+    def test_a_generator_expression_is_an_iterator(self):
+        """Gathered eagerly, but handed back as an iterator.
+
+        A list answers `for` and `sum()` identically and `next()` not at all,
+        so `next((p for p in candidates if ...), None)` stopped with "'list'
+        object is not an iterator" - which names nothing the program wrote.
+        This is what a real application hit; the unit tests had only ever fed
+        a generator expression straight to something that iterates it.
+        """
+
+        self._run(
+            "candidates = ['a', 'bb', 'ccc']\n"
+            "print(next((p for p in candidates if len(p) == 2), None))\n"
+            "print(next((p for p in candidates if p == 'zzz'), 'fallback'))\n"
+            "g = (v * 2 for v in [1, 2, 3])\n"
+            "print(next(g), next(g), list(g))\n"
+            "print(sum(v for v in [1, 2, 3]), max(v for v in [4, 9, 2]))\n",
+            b"bb\nfallback\n2 4 [6]\n6 9\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

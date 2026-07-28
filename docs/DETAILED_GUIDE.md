@@ -320,6 +320,14 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**A generator expression is gathered eagerly but handed back as an iterator.**
+The gathering is a deliberate trade, stated where it is made. Handing back the
+*list* was not a trade, it was a mistake: a list answers `for` and `sum()`
+identically and `next()` not at all, so `next((p for p in candidates if ...),
+None)` stopped with "'list' object is not an iterator" - a message naming
+nothing the program wrote. Found by a real application, not by the tests, which
+had only ever fed a generator expression straight to something that iterates it.
+
 **Carrying the interpreter, so the bundle starts on another Mac.** A compiled
 artifact names its interpreter in an `LC_LOAD_DYLIB`, and dyld resolves that
 before a line of the program runs. The build machine's absolute path is

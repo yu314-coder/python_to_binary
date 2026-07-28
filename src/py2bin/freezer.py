@@ -141,11 +141,63 @@ def embed_cpython_in_app(bundle: Path) -> int:
             "__pycache__", "*.pyc",
         ),
     )
+    # The shared libraries python.org's own extension modules link against -
+    # OpenSSL for `ssl` and `hashlib`, and the compression libraries - are
+    # named by *absolute* path inside those .so files. Carrying the
+    # interpreter is not enough: the first `import ssl` on a machine without
+    # that framework fails, and every one of those imports is in the standard
+    # library rather than anything the application chose.
+    carried_libraries = bundle / "Contents" / "lib"
+    source_libraries = version_directory / "lib"
+    prefix = f"{version_directory.parent.parent}/Versions/{version_directory.name}/lib/"
+    if source_libraries.is_dir():
+        for library in source_libraries.glob("*.dylib"):
+            shutil.copy2(library, carried_libraries / library.name)
+    for module in bundle.rglob("*.so"):
+        _point_at_carried_libraries(module, prefix, carried_libraries)
     return sum(
         item.stat().st_size
-        for item in (*carried_version.rglob("*"), *destination.rglob("*"))
+        for item in (
+            *carried_version.rglob("*"),
+            *destination.rglob("*"),
+            *carried_libraries.glob("*.dylib"),
+        )
         if item.is_file()
     )
+
+
+def _point_at_carried_libraries(
+    module: Path, prefix: str, libraries: Path
+) -> None:
+    """Rewrite absolute library references in one extension module.
+
+    The path is patched *in place*, which is what makes this possible at all:
+    the replacement is shorter than what it replaces, so the load command keeps
+    its size and every offset in the file stays where it was. A longer one
+    would mean rebuilding the header.
+
+    The signature this invalidates is not enforced for these: a patched module
+    loads. That is not true of the interpreter's own library, whose signature
+    seals a neighbouring file - which is why *that* one is copied whole rather
+    than edited.
+    """
+
+    data = bytearray(module.read_bytes())
+    if prefix.encode() not in data:
+        return
+    depth = len(module.parent.relative_to(libraries.parent).parts)
+    reach = "/".join([".."] * depth) or "."
+    changed = False
+    for library in libraries.glob("*.dylib"):
+        old = f"{prefix}{library.name}".encode()
+        new = f"@loader_path/{reach}/lib/{library.name}".encode()
+        if len(new) > len(old):
+            continue
+        while (at := data.find(old)) >= 0:
+            data[at : at + len(old)] = new + b"\0" * (len(old) - len(new))
+            changed = True
+    if changed:
+        module.write_bytes(bytes(data))
 
 
 def _required_suffix(path: Path, suffix: str) -> Path:

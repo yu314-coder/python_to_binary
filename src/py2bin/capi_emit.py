@@ -1050,6 +1050,16 @@ class CApiEmitter:
         self.emit(f"{target} = PyList_New(0LL);", indent)
         self.checked(target, indent)
         self.comprehension_clause(node, 0, target, indent)
+        if isinstance(node, ast.GeneratorExp):
+            # Gathered eagerly, as the docstring says - but handed back as an
+            # *iterator*, because that is what a generator expression is. A
+            # list answers `for` and `sum()` the same way and `next()` not at
+            # all: `next(p for p in candidates)` stopped with "'list' object is
+            # not an iterator", which names nothing the program wrote.
+            walking = self.temporary()
+            self.emit(f"{walking} = PyObject_GetIter({target});", indent)
+            self.emit(f"Py_DecRef({target});", indent)
+            return self.checked(walking, indent)
         if isinstance(node, ast.SetComp):
             maker = self.builtin("set", indent)
             gathered = self.temporary()
