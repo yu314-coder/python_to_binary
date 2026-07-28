@@ -131,10 +131,12 @@ from .native.ir import (
 )
 
 
-#: Targets whose encoder can hand back the address of a string literal. Both
-#: darwin architectures place the bytes after the code and reach them with a
-#: PC-relative reference; the other back ends have nowhere to put them yet.
-_STRING_VALUE_TARGETS = frozenset({"darwin-arm64", "darwin-x86_64"})
+#: Targets whose encoder can hand back the address of a string literal. Each
+#: places the bytes after the code and reaches them with a PC-relative
+#: reference; the back ends not named here have nowhere to put them yet.
+_STRING_VALUE_TARGETS = frozenset(
+    {"darwin-arm64", "darwin-x86_64", "windows-x86_64"}
+)
 
 
 class CCompileError(ValueError):
@@ -3171,7 +3173,7 @@ class Lowerer:
             if self.target not in _STRING_VALUE_TARGETS:
                 self.error(
                     "using a string literal as a pointer value needs the "
-                    "constant bytes a darwin image writer places after the "
+                    "constant bytes an image writer places after the "
                     f"code; it is not implemented for {self.target!r} "
                     "(printf of a literal is)",
                     node.token,

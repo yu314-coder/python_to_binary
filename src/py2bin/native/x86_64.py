@@ -93,6 +93,9 @@ class _X86Refs:
     #: True when static storage lives in the image rather than in a mapping
     #: whose base sits in a register - see `encode_darwin_extern`.
     image_statics: bool = False
+    #: Emits the call instruction for an extern symbol, when the platform
+    #: binds by import table rather than through a GOT the writer patches.
+    extern_call: object = None
     #: `(offset_of_disp32, bytes)` for a C string used as a value. The bytes
     #: are laid down after the code and the displacement patched to reach them,
     #: which is what the operation-level string mechanism already does.
@@ -303,8 +306,16 @@ def _expression(
         return
     if isinstance(expression, ExternCall):
         if refs is None:
-            raise TypeError("x86-64 external calls require the darwin dynamic encoder")
-        _external_call_x86(code, expression, slot_base, refs)
+            raise TypeError(
+                "x86-64 external calls require the darwin or windows encoder"
+            )
+        if refs.extern_call is not None:
+            # Microsoft x64: four registers by position, 32 bytes of shadow.
+            _external_call_windows(
+                code, expression, slot_base, refs, refs.extern_call
+            )
+        else:
+            _external_call_x86(code, expression, slot_base, refs)
         return
     if isinstance(expression, GlobalAddress):
         if refs is not None and refs.image_statics:
@@ -580,6 +591,73 @@ def _external_call_x86(
     code.extend(b"\xb0" + bytes((floats,)))              # mov al, <vector count>
     code.extend(b"\xff\x15\x00\x00\x00\x00")        # call *disp32(rip)
     refs.externs.append((len(code) - 4, expression.symbol))
+
+
+class _WindowsStatics(list):
+    """Records a `lea` site and resolves it against the image's static block."""
+
+    def __init__(self, patches, base: int) -> None:
+        super().__init__()
+        self._patches, self._base = patches, base
+
+    def append(self, site) -> None:
+        position, offset = site
+        self._patches.append((position, self._base + offset))
+
+
+#: Microsoft x64 argument registers, by POSITION rather than by kind. This is
+#: where it parts company with System V: the second argument is rdx or xmm1
+#: according to its own type, never "the first integer" - so a double followed
+#: by a pointer puts the pointer in rdx, not in rcx.
+_MS_INTEGER_RELOAD = (
+    b"\x48\x8b\x0c\x24",  # rcx
+    b"\x48\x8b\x14\x24",  # rdx
+    b"\x4c\x8b\x04\x24",  # r8
+    b"\x4c\x8b\x0c\x24",  # r9
+)
+#: movq <integer register>, xmm<n>. A variadic callee reads a double out of
+#: the integer register, so every float argument goes in both.
+_MS_FLOAT_TO_INTEGER = (
+    b"\x66\x48\x0f\x7e\xc1",  # rcx
+    b"\x66\x48\x0f\x7e\xc2",  # rdx
+    b"\x66\x49\x0f\x7e\xc0",  # r8
+    b"\x66\x49\x0f\x7e\xc1",  # r9
+)
+
+
+def _external_call_windows(
+    code: bytearray, expression, slot_base: int, refs: "_X86Refs", call
+) -> None:
+    """Emit a Microsoft x64 call to a symbol bound through the import table."""
+
+    arguments = expression.arguments
+    if len(arguments) > 4:
+        raise ValueError(
+            "Windows x64 external calls support at most 4 arguments here; "
+            "there is no stack-argument path"
+        )
+    for argument in arguments:
+        if is_float_expression(argument):
+            _float_expression(code, argument, slot_base, refs)
+            code.extend(b"\x48\x83\xec\x10")        # sub rsp, 16
+            code.extend(b"\xf2\x0f\x11\x04\x24")   # movsd [rsp], xmm0
+        else:
+            _expression(code, argument, slot_base, refs)
+            code.extend(b"\x48\x83\xec\x10")
+            code.extend(b"\x48\x89\x04\x24")        # mov [rsp], rax
+    for position in reversed(range(len(arguments))):
+        if is_float_expression(arguments[position]):
+            code.extend(b"\xf2\x0f\x10" + bytes((0x04 | (position << 3), 0x24)))
+            code.extend(_MS_FLOAT_TO_INTEGER[position])
+        else:
+            code.extend(_MS_INTEGER_RELOAD[position])
+        code.extend(b"\x48\x83\xc4\x10")            # add rsp, 16
+    # The 32 bytes of shadow space a callee may spill rcx-r9 into. Reserved by
+    # the caller, released by the caller, and not optional even when the callee
+    # takes no arguments at all.
+    code.extend(b"\x48\x83\xec\x20")
+    call(expression.symbol)
+    code.extend(b"\x48\x83\xc4\x20")
 
 
 def _indirect_call_x86(
@@ -932,8 +1010,22 @@ def _encode_x86(
     return bytes(code), refs
 
 
-def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
-    """Encode calls through a Windows x64 import-address table."""
+def encode_windows(
+    module: Module,
+    code_address: int,
+    imports: dict[str, int],
+    statics_address: int | None = None,
+) -> bytes:
+    """Encode calls through a Windows x64 import-address table.
+
+    `statics_address` puts file-scope storage in the image, at that address,
+    instead of in the VirtualAlloc block whose base lives in r15. An image that
+    binds CPython needs it for the reason the darwin encoders give: r15 is
+    callee-saved, so while CPython's frame is live r15 is CPython's, and a
+    compiled function called back from the interpreter would read a static out
+    of whatever the interpreter left there.
+    """
+
     variable_base = 0x38
     code = bytearray(_sub_stack(_frame_bytes(module.stack_slots, variable_base)))
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp
@@ -947,9 +1039,19 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         code.extend(b"\xff\x15\x00\x00\x00\x00")
         address_patches.append((instruction + 2, imports[symbol]))
 
-    refs = _X86Refs(registers=4, shadow=32)
+    refs = _X86Refs(
+        registers=4, shadow=32, image_statics=statics_address is not None
+    )
+    # An extern call and a static both become a rip-relative reference the tail
+    # of this function patches from an absolute address, so both are handed to
+    # `address_patches` rather than to the darwin site lists.
+    # An extern call goes straight through the import table, and a static
+    # resolves against the image's own block; both are absolute addresses the
+    # tail of this function turns into rip-relative displacements.
+    refs.extern_call = indirect_call
+    refs.statics = _WindowsStatics(address_patches, statics_address or 0)
 
-    if module.static_bytes:
+    if module.static_bytes and statics_address is None:
         # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
         # The result is a zero-filled writable block; its base stays in
         # r15, which is callee-saved and untouched elsewhere here.
@@ -1156,7 +1258,9 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
     for position, target_address in address_patches:
         next_address = code_address + position + 4
         struct.pack_into("<i", code, position, target_address - next_address)
-    for position, data in string_patches:
+    # The operation-level strings and the ones used as a value share the
+    # mechanism: the bytes go after the code and the displacement reaches them.
+    for position, data in (*string_patches, *refs.strings):
         data_address = code_address + len(code)
         next_address = code_address + position + 4
         struct.pack_into("<i", code, position, data_address - next_address)

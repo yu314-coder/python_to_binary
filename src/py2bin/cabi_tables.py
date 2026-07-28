@@ -152,3 +152,32 @@ def symbol_library(symbol: str) -> str | None:
     return LIBSYSTEM
 
 
+
+
+#: Where a vetted symbol lives on Windows. The kernel provides the process
+#: services; `msvcrt.dll` provides the C library functions, and is the one
+#: C runtime present on every Windows without shipping a redistributable; the
+#: interpreter provides the rest.
+WINDOWS_KERNEL = "KERNEL32.dll"
+WINDOWS_C_RUNTIME = "msvcrt.dll"
+
+
+def windows_symbol_library(symbol: str, python_dll: str) -> str:
+    """Which DLL a vetted symbol is imported from.
+
+    `python_dll` is the interpreter's own, `python313.dll` and so on - the name
+    is version-specific because CPython's ABI is, and importing the wrong one
+    would resolve names that mean something different.
+
+    The Objective-C runtime has no Windows equivalent, so a program that
+    reached it is refused rather than given an import that cannot resolve.
+    """
+
+    if symbol in _OBJC_SYMBOLS:
+        raise ValueError(
+            f"{symbol!r} is part of the Objective-C runtime, which exists on "
+            "darwin only; there is no Windows import for it"
+        )
+    if symbol in _LIBC_SYMBOLS:
+        return WINDOWS_C_RUNTIME
+    return python_dll

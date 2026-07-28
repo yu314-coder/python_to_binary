@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 import platform
 import plistlib
 import shutil
@@ -18,7 +19,7 @@ from .formats.macho import (
     write_macho_x86_64,
     write_macho_x86_64_dynamic,
 )
-from .formats.pe import write_pe_arm64, write_pe_x86_64
+from .formats.pe import write_pe_arm64, write_pe_x86_64, write_pe_x86_64_dynamic
 from .frontend import NativeCompileError, lower
 from .ir import CStringConstant, ExternCall, HeapInit, Module
 from .optimizer import optimize
@@ -237,6 +238,39 @@ def _contains_extern(value: object) -> bool:
     return False
 
 
+def _extern_symbols(module: Module) -> list[str]:
+    """Every external symbol the module calls, in first-reference order.
+
+    The darwin path takes these from the encoder, which records a site per
+    call. Windows needs them *before* encoding, because a call is emitted
+    against an import-table slot whose address must already be known - so the
+    IR is walked for them here instead.
+    """
+
+    found: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, ExternCall):
+            if value.symbol not in found:
+                found.append(value.symbol)
+            for argument in value.arguments:
+                visit(argument)
+            return
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+            return
+        for name in getattr(type(value), "__slots__", ()) or ():
+            visit(getattr(value, name))
+
+    for operation in module.operations:
+        visit(operation)
+    for function in module.functions:
+        for operation in function.operations:
+            visit(operation)
+    return found
+
+
 def _module_uses_extern(module: Module) -> bool:
     if any(_contains_extern(operation) for operation in module.operations):
         return True
@@ -254,7 +288,9 @@ def _module_uses_extern(module: Module) -> bool:
 #: Targets whose dynamic-link adapter is implemented rather than designed.
 #: Both are darwin: the Mach-O writer lays out `__got` and the bind opcodes,
 #: and each architecture's encoder emits the reference sites it patches.
-_EXTERN_CAPABLE_TARGETS = frozenset({"darwin-arm64", "darwin-x86_64"})
+_EXTERN_CAPABLE_TARGETS = frozenset(
+    {"darwin-arm64", "darwin-x86_64", "windows-x86_64"}
+)
 
 CALL_CAPABLE_TARGETS = frozenset(
     {
@@ -341,7 +377,20 @@ def _emit_native_module(
         if app
         else (None, None)
     )
-    if target == "windows-x86_64":
+    if target == "windows-x86_64" and _module_uses_extern(module):
+        from ..cabi_tables import windows_symbol_library
+
+        # The interpreter's DLL is version-specific because its ABI is, and
+        # the build machine's interpreter is the one the C was written against.
+        python_dll = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+        symbol_libraries = {
+            symbol: windows_symbol_library(symbol, python_dll)
+            for symbol in _extern_symbols(module)
+        }
+        image = write_pe_x86_64_dynamic(
+            module, symbol_libraries, module.static_bytes
+        )
+    elif target == "windows-x86_64":
         image = write_pe_x86_64(module)
     elif target == "windows-arm64":
         image = write_pe_arm64(module)

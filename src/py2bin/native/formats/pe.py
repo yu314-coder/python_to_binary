@@ -53,6 +53,74 @@ def _imports_for(
     return bytes(data), addresses, iat_offset, lookup_size
 
 
+def _imports_from_libraries(
+    section_rva: int,
+    image_base: int,
+    libraries: "list[tuple[str, tuple[str, ...]]]",
+) -> tuple[bytes, dict[str, int], int, int]:
+    """An import directory naming several DLLs rather than one.
+
+    A program driving CPython imports from at least two: the kernel for the
+    process services, and `pythonXY.dll` for the interpreter itself. The single
+    descriptor the rest of this writer emits cannot say that - a descriptor
+    names one DLL - so the table is built here as one descriptor per library,
+    terminated by a zero descriptor, with every library's thunks in one
+    contiguous IAT so the data directory can describe it with one range.
+
+    Windows resolves a thunk by name at load time and writes the address into
+    the IAT slot. That is all the binding there is: no relocations, no bind
+    opcodes, and nothing for the program to do at startup.
+    """
+
+    descriptor_size = 20
+    directory_size = descriptor_size * (len(libraries) + 1)
+    offset = _align(directory_size, 8)
+    # Lookup and address thunks, per library, each NULL-terminated.
+    layout = []
+    for name, symbols in libraries:
+        lookup_offset = offset
+        offset += (len(symbols) + 1) * 8
+        layout.append([name, symbols, lookup_offset, 0])
+    iat_start = offset
+    for entry in layout:
+        entry[3] = offset
+        offset += (len(entry[1]) + 1) * 8
+    iat_size = offset - iat_start
+    data = bytearray(offset)
+    name_offsets: dict[str, int] = {}
+    library_name_offsets: dict[str, int] = {}
+    for name, symbols, _lookup, _iat in layout:
+        library_name_offsets[name] = len(data)
+        data.extend(name.encode("ascii") + b"\0")
+        if len(data) & 1:
+            data.append(0)
+        for symbol in symbols:
+            name_offsets[(name, symbol)] = len(data)
+            # IMAGE_IMPORT_BY_NAME: a 2-byte hint the loader may ignore, then
+            # the name.
+            data.extend(b"\0\0" + symbol.encode("ascii") + b"\0")
+            if len(data) & 1:
+                data.append(0)
+    addresses: dict[str, int] = {}
+    for index, (name, symbols, lookup_offset, iat_offset) in enumerate(layout):
+        for position, symbol in enumerate(symbols):
+            name_rva = section_rva + name_offsets[(name, symbol)]
+            struct.pack_into("<Q", data, lookup_offset + position * 8, name_rva)
+            struct.pack_into("<Q", data, iat_offset + position * 8, name_rva)
+            addresses[symbol] = image_base + section_rva + iat_offset + position * 8
+        struct.pack_into(
+            "<IIIII",
+            data,
+            index * descriptor_size,
+            section_rva + lookup_offset,
+            0,
+            0,
+            section_rva + library_name_offsets[name],
+            section_rva + iat_offset,
+        )
+    return bytes(data), addresses, iat_start, iat_size
+
+
 def _imports(section_rva: int, image_base: int) -> tuple[bytes, dict[str, int], int, int]:
     return _imports_for(
         section_rva,
@@ -115,7 +183,13 @@ def _pe_image(
     image_base = 0x140000000
     section_alignment = 0x1000
     file_alignment = 0x200
-    text_rva, rdata_rva = 0x1000, 0x2000
+    text_rva = 0x1000
+    # After the code, not at a fixed address. Every image this writer produced
+    # before was smaller than one page, so 0x2000 was after the code by
+    # accident; a program driving CPython is fifty times that, and the two
+    # sections overlapped in virtual address space. Windows maps sections by
+    # these fields, so the loader would have mapped data over code.
+    rdata_rva = _align(text_rva + len(code), section_alignment)
     text_raw_size = _align(len(code), file_alignment)
     rdata_raw_size = _align(len(rdata), file_alignment)
     headers_size = file_alignment
@@ -219,6 +293,86 @@ def _write_pe(module: Module, machine: int, arm64: bool) -> bytes:
         iat_size=iat_size,
         stack_bytes=stack_bytes,
     )
+
+
+def write_pe_x86_64_dynamic(
+    module: Module,
+    symbol_libraries: "dict[str, str]",
+    static_bytes: int = 0,
+) -> bytes:
+    """A PE that imports from several DLLs, one of them the interpreter's.
+
+    The rest of this writer emits one import descriptor, which names one DLL -
+    enough for a program that only asks the kernel for services. A program
+    driving CPython needs at least two, and the interpreter's exports are what
+    the second names.
+
+    Static storage goes in the image, in the writable data section, rather than
+    in the VirtualAlloc block the non-CPython path parks in r15. That register
+    is callee-saved, so while a CPython frame is live it holds CPython's value,
+    and a compiled function called back from the interpreter would read a
+    static through it and get whatever was there.
+    """
+
+    image_base = 0x140000000
+    text_rva = 0x1000
+    ordered: "dict[str, list[str]]" = {}
+    for symbol, library in symbol_libraries.items():
+        ordered.setdefault(library, []).append(symbol)
+    libraries = [
+        (_PE_KERNEL_LIBRARY, _PE_KERNEL_IMPORTS),
+        *((name, tuple(sorted(symbols))) for name, symbols in sorted(ordered.items())),
+    ]
+    # Where the data section lands depends on how long the code is, and how
+    # long the code is does not depend on where the data lands: every reference
+    # is a fixed-size displacement. So encode once to measure, place the
+    # section after it, and encode again against the real addresses.
+    def build(rdata_rva: int) -> tuple[bytes, bytes, int, int, int]:
+        blob, imports, iat_offset, iat_size = _imports_from_libraries(
+            rdata_rva, image_base, libraries
+        )
+        # The statics follow the import table in the same section, which is why
+        # it is written writable here and read-only everywhere else.
+        statics_rva = rdata_rva + _align(len(blob), 16)
+        blob = blob.ljust(_align(len(blob), 16), b"\0") + bytes(static_bytes)
+        encoded = encode_windows(
+            module,
+            image_base + text_rva,
+            imports,
+            statics_address=image_base + statics_rva if static_bytes else None,
+        )
+        return encoded, blob, iat_offset, iat_size, statics_rva
+
+    code, _blob, _io, _is, _sr = build(_align(text_rva + 0x1000, 0x1000))
+    settled = _align(text_rva + len(code), 0x1000)
+    code, rdata, iat_offset, iat_size, _statics_rva = build(settled)
+    if _align(text_rva + len(code), 0x1000) != settled:
+        raise AssertionError("PE code length changed when the data section moved")
+    slots = module.stack_slots + sum(
+        function.stack_slots for function in module.functions
+    )
+    return _pe_image(
+        code,
+        rdata,
+        machine=0x8664,
+        iat_offset=iat_offset,
+        iat_size=iat_size,
+        writable_rdata=True,
+        stack_bytes=slots * 8 + 0x200 * (1 + len(module.functions)),
+    )
+
+
+#: What every image asks the kernel for, whatever else it imports.
+_PE_KERNEL_LIBRARY = "KERNEL32.dll"
+_PE_KERNEL_IMPORTS = (
+    "GetStdHandle",
+    "WriteFile",
+    "ExitProcess",
+    "VirtualAlloc",
+    "CreateFileA",
+    "ReadFile",
+    "CloseHandle",
+)
 
 
 _LAUNCHER_IMPORTS = (

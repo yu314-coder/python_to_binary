@@ -168,10 +168,22 @@ matters - a compiled closure called back from inside CPython cannot read its
 statics out of a callee-saved register, because while CPython's frame is live
 that register is CPython's. Statics live in the image on both.
 
-Windows and Linux are still refused. Windows needs a multi-DLL PE import table
-(the current one describes one, KERNEL32) and the same move of static storage
-out of `r15` and into the image. Linux needs an ELF `.got.plt` and its
-relocations. Neither is written.
+**Windows x86-64 builds too, and is not yet run-tested.** The import directory
+now names several DLLs rather than one - the kernel for process services,
+`msvcrt` for the C library half of the vetted ABI, and `pythonXY.dll` for the
+interpreter - and statics live in the image for the same reason they do on
+darwin. A `print("x")` program comes out as a 3.5 KB PE32+ importing 21 symbols
+across 3 DLLs.
+
+What has *not* happened is running one. There is no Windows here and no Wine,
+so it is verified by reading the image back: header, section table, import
+descriptors, thunks and the IAT data directory. That is enough to catch a
+malformed table and not enough to promise it runs, so it is stated as built
+rather than as working. Running one also needs `pythonXY.dll` beside the exe or
+on the path, which is a matter of what you ship rather than of the compiler.
+
+Linux is still refused: it needs an ELF `.got.plt` and its relocations, which
+nothing here writes.
 
 The bundle is also a **directory**, not one file. `--embed-python` needs
 somewhere to put the interpreter, the extensions and the packages, and a `.app`

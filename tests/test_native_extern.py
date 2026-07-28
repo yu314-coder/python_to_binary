@@ -13,6 +13,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import struct
 import unittest
 from pathlib import Path
 
@@ -240,14 +241,37 @@ class ExternRejectionTests(unittest.TestCase):
             int.from_bytes(image[4:8], "little"), 0x01000007
         )
 
-    def test_extern_on_non_darwin_target_is_rejected(self):
-        for target in ("linux-arm64", "linux-x86_64", "windows-x86_64"):
+    def test_extern_on_a_target_without_an_adapter_is_rejected(self):
+        # Linux is what is left: it needs a `.got.plt` and its relocations,
+        # which nothing here writes. windows-arm64 has no encoder for the
+        # import-table call either.
+        for target in ("linux-arm64", "linux-x86_64", "windows-arm64"):
             message = self._compile_error(
                 "from py2bin.cabi import abs\n"
                 "raise SystemExit(abs(-1))\n",
                 target=target,
             )
-            self.assertIn("darwin-arm64, darwin-x86_64", message)
+            self.assertIn("darwin-arm64, darwin-x86_64, windows-x86_64", message)
+
+    def test_extern_on_windows_x86_64_imports_from_a_dll(self):
+        """The interpreter is a second DLL in the import directory.
+
+        The rest of the PE writer emits one import descriptor, and a descriptor
+        names one DLL - enough for a program that only asks the kernel for
+        services, not for one that calls CPython.
+        """
+
+        entry, directory = _write(
+            "from py2bin.cabi import abs\n"
+            "raise SystemExit(abs(-1))\n"
+        )
+        output = directory / "out.exe"
+        compile_native(entry, output, "windows-x86_64", clean=True)
+        image = output.read_bytes()
+        self.assertEqual(image[:2], b"MZ")
+        # msvcrt provides the C library half of the vetted ABI; `abs` is there.
+        self.assertIn(b"msvcrt.dll", image)
+        self.assertIn(b"KERNEL32.dll", image)
 
     def test_module_uses_extern_detects_nested_calls(self):
         entry, _directory = _write(
@@ -1116,3 +1140,50 @@ class ObjectiveCEncodingAgreementTests(unittest.TestCase):
         for bad in ("", "d@:", "v@:d", "v@:B", "v@", "v:@", "v@::"):
             with self.assertRaises(ValueError, msg=bad):
                 parse_method_encoding(bad)
+
+
+class WindowsSectionLayoutTests(unittest.TestCase):
+    """Where the data section lands, once the code is larger than a page.
+
+    Every PE this writer produced before a program could drive CPython was
+    smaller than one page, so a data section fixed at rva 0x2000 happened to
+    sit after the code. A C-API image is fifty times that, and the two
+    overlapped in virtual address space - which the loader resolves by mapping
+    data over code, not by complaining.
+    """
+
+    def _sections(self, image: bytes) -> list[tuple[str, int, int]]:
+        pe = struct.unpack_from("<I", image, 0x3C)[0]
+        count = struct.unpack_from("<H", image, pe + 6)[0]
+        optional = struct.unpack_from("<H", image, pe + 20)[0]
+        found = []
+        for index in range(count):
+            off = pe + 24 + optional + index * 40
+            name = image[off:off + 8].rstrip(b"\0").decode()
+            virtual_size, virtual_address = struct.unpack_from("<II", image, off + 8)
+            found.append((name, virtual_address, virtual_size))
+        return found
+
+    def test_the_sections_of_a_large_image_do_not_overlap(self):
+        # A body long enough that .text runs past the page the data section
+        # used to be nailed to.
+        body = "".join(f"print({index})\n" for index in range(400))
+        entry, directory = _write(body)
+        output = directory / "big.exe"
+        compile_native(entry, output, "windows-x86_64", clean=True)
+        sections = self._sections(output.read_bytes())
+        self.assertGreater(len(sections), 1)
+        for (_first, address, size), (_second, next_address, _next) in zip(
+            sections, sections[1:]
+        ):
+            self.assertLessEqual(
+                address + size,
+                next_address,
+                f"sections overlap: 0x{address + size:x} > 0x{next_address:x}",
+            )
+
+    def test_a_small_image_still_lays_out(self):
+        entry, directory = _write("raise SystemExit(3)\n")
+        output = directory / "small.exe"
+        compile_native(entry, output, "windows-x86_64", clean=True)
+        self.assertEqual(output.read_bytes()[:2], b"MZ")
