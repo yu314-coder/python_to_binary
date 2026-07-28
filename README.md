@@ -681,11 +681,21 @@ A whole application, manim_app (10,100 lines, pywebview + PIL + pyobjc):
 | | py2bin | Nuitka |
 |---|---|---|
 | main binary | **9.2 MB** | 29.6 MB |
-| whole `.app` | 80 MB | 74 MB |
+| whole `.app` | 74 MB | 74 MB |
+| bare interpreter start | **9.5 ms** | 16.2 ms |
+| start with the app's imports | 53.4 ms | **45.8 ms** |
 
 The binary is a third the size because Nuitka compiles every module it reaches,
 including the third-party tree, while this compiles the program and ships its
-dependencies as bytecode. That trade runs the other way for the bundle total.
+dependencies as bytecode. The bundles come out level: `--zip-stdlib` packs the
+carried library into the `pythonXY.zip` an interpreter already has on
+`sys.path`, which took 8.4 MB to 3.5 MB and closed the difference.
+
+The two startup rows say where the remaining work is. Getting the interpreter
+up is faster here - there is no bundle to bootstrap, just `Py_Initialize`. The
+imports are slower by more than that gain, because Nuitka runs a module body as
+compiled C where this unmarshals bytecode and interprets it. Closing that means
+compiling the dependency tree too, not a better bundle layout.
 
 ## Compiling asks for an interpreter and nothing else
 

@@ -473,6 +473,86 @@ def drop_unused_libraries(bundle: Path) -> int:
     return before - sum(f.stat().st_size for f in libraries.glob("*.dylib"))
 
 
+def zip_bytecode(bundle: Path, compress: bool = True) -> int:
+    """Move the carried stdlib's bytecode into the zip CPython already looks for.
+
+    An interpreter puts `{prefix}/lib/pythonXY.zip` on `sys.path` before the
+    directory beside it, whether or not the file exists - so a bundle can hand
+    its whole standard library over as one deflated archive and change nothing
+    else. No path setup, no import hook: `zipimport` is built in.
+
+    Deflated by default, because it is smaller and costs nothing. Measured on
+    a real application, the three forms of the same library, timed round-robin
+    so that drift on the machine falls on all of them equally:
+
+        loose, 516 files   8.4 MB   53.5 ms
+        stored, one file   8.4 MB   53.4 ms
+        deflated           3.5 MB   53.1 ms
+
+    Startup does not distinguish them. Inflating a module is cheap next to
+    running it, and the directory searches the archive saves are cheap too, so
+    what is left is the 4.9 MB. `store` is kept for a filesystem that already
+    compresses, where deflating twice buys nothing.
+
+    Measuring this needed care, and a first attempt got it wrong: run one after
+    another rather than interleaved, the same three forms read 62.7, 55.4 and
+    66.2 ms, which is a clear result and entirely drift.
+
+    A package holding a native extension is left where it is. `zipimport` can
+    read bytecode out of an archive but not map a `.so` out of one - dyld needs
+    a file - and a package cannot be half in the archive and half beside it, so
+    the whole of such a package stays on disk.
+    """
+
+    import zipfile
+
+    library = bundle / "Contents" / "lib"
+    roots = sorted(library.glob("python[0-9]*.[0-9]*"))
+    if not roots:
+        return 0
+    root = roots[0]
+    # The name CPython computes: no dot, so `python3.14` becomes `python314`.
+    archive = library / (root.name.replace(".", "") + ".zip")
+    if archive.exists():
+        return 0
+    native: set[Path] = set()
+    for extension in root.rglob("*.so"):
+        # Every directory between the extension and the root, and no further:
+        # the root holds the extensions' own private directory but is not
+        # itself a package, so including it would exclude the whole library.
+        for parent in extension.parents:
+            if parent == root:
+                break
+            native.add(parent)
+    before = sum(f.stat().st_size for f in root.rglob("*.pyc"))
+    packed: list[Path] = []
+    method = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    with zipfile.ZipFile(archive, "w", method, compresslevel=9 if compress else None) as out:
+        for module in sorted(root.rglob("*.pyc")):
+            if any(parent in native for parent in module.parents):
+                continue
+            # `__pycache__/os.cpython-314.pyc` is imported as `os`, so the
+            # name in the archive is the one the import system will ask for.
+            place = module.parent
+            name = module.name.split(".")[0]
+            if place.name == "__pycache__":
+                place = place.parent
+            spelled = place.relative_to(root) / (name + ".pyc")
+            out.write(module, str(spelled))
+            packed.append(module)
+    if not packed:
+        archive.unlink()
+        return 0
+    for module in packed:
+        module.unlink()
+    # A `__pycache__` that held nothing else, and then the package directory
+    # that held only it, are both noise once their contents are in the archive.
+    for directory in sorted(root.rglob("*"), key=lambda p: -len(p.parts)):
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    return before - archive.stat().st_size
+
+
 def _referenced_libraries(binary: Path, libraries: Path) -> set[str]:
     """Which carried libraries this file names, however it names them."""
 

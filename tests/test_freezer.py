@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-from py2bin.freezer import _frozen_macos_app, _shell_launcher, extract_wheel
+from py2bin.freezer import zip_bytecode, _frozen_macos_app, _shell_launcher, extract_wheel
 from py2bin.native.launcher import macos_shell_launcher
 from py2bin.onefile import _powershell_script, create_onefile
 
@@ -268,3 +268,84 @@ class FreezerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ZipBytecodeTests(unittest.TestCase):
+    """The carried library, packed into the archive the interpreter expects."""
+
+    def _bundle(self, root: Path) -> Path:
+        """A bundle shaped like the real thing, with one native package."""
+
+        bundle = root / "App.app"
+        library = bundle / "Contents" / "lib" / "python3.14"
+        (library / "json").mkdir(parents=True)
+        (library / "lib-dynload").mkdir(parents=True)
+        (library / "native" / "__pycache__").mkdir(parents=True)
+        (library / "os.pyc").write_bytes(b"os bytecode" * 40)
+        (library / "json" / "__init__.pyc").write_bytes(b"json bytecode" * 40)
+        (library / "lib-dynload" / "select.so").write_bytes(b"\xcf\xfa\xed\xfe" * 10)
+        # A package holding an extension: dyld needs a file, so it stays put.
+        (library / "native" / "ext.so").write_bytes(b"\xcf\xfa\xed\xfe" * 10)
+        (library / "native" / "__pycache__" / "helper.cpython-314.pyc").write_bytes(
+            b"helper" * 40
+        )
+        return bundle
+
+    def test_the_library_moves_into_the_archive_the_interpreter_looks_for(self):
+        # `{prefix}/lib/pythonXY.zip` is on sys.path whether or not it exists,
+        # so no path setup is needed - the name has to be exactly that.
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self._bundle(Path(directory))
+            zip_bytecode(bundle)
+            archive = bundle / "Contents" / "lib" / "python314.zip"
+            self.assertTrue(archive.is_file())
+            with zipfile.ZipFile(archive) as packed:
+                names = set(packed.namelist())
+        self.assertIn("os.pyc", names)
+        self.assertIn("json/__init__.pyc", names)
+
+    def test_a_package_holding_an_extension_is_left_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self._bundle(Path(directory))
+            zip_bytecode(bundle)
+            library = bundle / "Contents" / "lib" / "python3.14"
+            with zipfile.ZipFile(library.parent / "python314.zip") as packed:
+                names = set(packed.namelist())
+            self.assertNotIn("native/helper.pyc", names)
+            self.assertTrue(
+                (library / "native" / "__pycache__" /
+                 "helper.cpython-314.pyc").is_file()
+            )
+            self.assertTrue((library / "native" / "ext.so").is_file())
+
+    def test_the_name_in_the_archive_is_the_one_import_asks_for(self):
+        # `__pycache__/helper.cpython-314.pyc` is imported as `helper`, so a
+        # cache directory in the archive would put every module out of reach.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "App.app"
+            library = bundle / "Contents" / "lib" / "python3.14" / "pkg"
+            (library / "__pycache__").mkdir(parents=True)
+            (library / "__pycache__" / "part.cpython-314.pyc").write_bytes(b"x" * 90)
+            zip_bytecode(bundle)
+            with zipfile.ZipFile(
+                bundle / "Contents" / "lib" / "python314.zip"
+            ) as packed:
+                self.assertEqual(packed.namelist(), ["pkg/part.pyc"])
+
+    def test_storing_is_offered_for_a_filesystem_that_compresses_already(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self._bundle(Path(directory))
+            zip_bytecode(bundle, compress=False)
+            with zipfile.ZipFile(
+                bundle / "Contents" / "lib" / "python314.zip"
+            ) as packed:
+                methods = {item.compress_type for item in packed.infolist()}
+        self.assertEqual(methods, {zipfile.ZIP_STORED})
+
+    def test_a_bundle_with_no_carried_library_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "App.app"
+            (bundle / "Contents" / "MacOS").mkdir(parents=True)
+            self.assertEqual(zip_bytecode(bundle), 0)
+            self.assertEqual(list(bundle.rglob("*.zip")), [])
