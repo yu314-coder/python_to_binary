@@ -432,22 +432,7 @@ def embed_cpython_in_app(bundle: Path) -> int:
     wanted: set[str] = set()
     for module in bundle.rglob("*.so"):
         wanted |= _point_at_carried_libraries(module, prefix, carried_libraries)
-    # A carried library may need another one - libssl needs libcrypto - so the
-    # closure is followed before deciding what to drop.
-    pending = list(wanted)
-    while pending:
-        library = carried_libraries / pending.pop()
-        if not library.is_file():
-            continue
-        found = _point_at_carried_libraries(library, prefix, carried_libraries)
-        pending.extend(found - wanted)
-        wanted |= found
-    for library in carried_libraries.glob("*.dylib"):
-        # The framework ships curses, ncurses, panel, a second copy of
-        # libpython and more. Nothing in a compiled application loads them,
-        # and together they were 18 of the 23 MB this was carrying.
-        if library.name not in wanted:
-            library.unlink()
+    _drop_unreferenced_libraries(carried_libraries, prefix, wanted)
     # Thinned last, so the rewriting above worked on the file as shipped.
     for binary in (
         *bundle.rglob("*.so"),
@@ -465,6 +450,59 @@ def embed_cpython_in_app(bundle: Path) -> int:
         )
         if item.is_file()
     )
+
+
+def drop_unused_libraries(bundle: Path) -> int:
+    """Discard carried libraries nothing left in the bundle refers to.
+
+    Worth running *after* the modules have been pruned: the closure is computed
+    from the extensions present, and pruning removes extensions. `_curses.so`
+    kept ncurses and panel in a bundle for an application with no terminal
+    interface, because the library question was settled before the module
+    question was.
+    """
+
+    libraries = bundle / "Contents" / "lib"
+    if not libraries.is_dir():
+        return 0
+    before = sum(f.stat().st_size for f in libraries.glob("*.dylib"))
+    wanted: set[str] = set()
+    for module in bundle.rglob("*.so"):
+        wanted |= _referenced_libraries(module, libraries)
+    _drop_unreferenced_libraries(libraries, None, wanted)
+    return before - sum(f.stat().st_size for f in libraries.glob("*.dylib"))
+
+
+def _referenced_libraries(binary: Path, libraries: Path) -> set[str]:
+    """Which carried libraries this file names, however it names them."""
+
+    data = binary.read_bytes()
+    return {
+        library.name
+        for library in libraries.glob("*.dylib")
+        if library.name.encode() in data
+    }
+
+
+def _drop_unreferenced_libraries(
+    libraries: Path, prefix: str | None, wanted: set[str]
+) -> None:
+    """Follow the closure, then delete what is left over."""
+
+    pending = list(wanted)
+    while pending:
+        library = libraries / pending.pop()
+        if not library.is_file():
+            continue
+        found = _referenced_libraries(library, libraries) - {library.name}
+        pending.extend(found - wanted)
+        wanted |= found
+    for library in libraries.glob("*.dylib"):
+        if library.name not in wanted:
+            library.unlink()
+
+
+
 
 
 #: The architecture a darwin-arm64 bundle runs. CPU_TYPE_ARM64 is

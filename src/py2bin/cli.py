@@ -994,6 +994,12 @@ def main(argv: list[str] | None = None) -> int:
                     from .freezer import prune_unreachable
 
                     freed = prune_unreachable(output, entry)
+                    from .freezer import drop_unused_libraries
+
+                    # After the modules, not before: the library closure is
+                    # computed from the extensions present, and pruning
+                    # removes extensions.
+                    freed += drop_unused_libraries(output)
                     print(
                         f"dropped {freed // 1048576} MB the program cannot import",
                         file=sys.stderr,
