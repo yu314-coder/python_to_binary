@@ -104,6 +104,8 @@ extern PyObject *PyBytes_FromStringAndSize(const char *text, long long length);
 extern PyObject *PyNumber_Negative(PyObject *value);
 extern PyObject *PyNumber_Positive(PyObject *value);
 extern PyObject *PyNumber_Invert(PyObject *value);
+extern int Py_EnterRecursiveCall(const char *where);
+extern void Py_LeaveRecursiveCall(void);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
@@ -322,6 +324,11 @@ class CApiEmitter:
         #: a comprehension has its own, so its target must not be the
         #: enclosing name of the same spelling.
         self.shadowed: list[dict[str, str]] = []
+        #: True while writing a body that counts its depth. The wrapper for a
+        #: module-level `def` does not: it delegates straight to the real
+        #: function, which counts for itself, and counting twice would halve
+        #: the depth a program may reach.
+        self.guards_recursion = False
         #: The scopes enclosing what is being written, as `(name, is a
         #: function)`. It is what builds the qualified name Python puts in a
         #: TypeError - `outer.<locals>.one`, `C.method` - which is the only
@@ -1949,7 +1956,7 @@ class CApiEmitter:
                 self.emit(f"goto {outer.label};", indent + 1)
             else:
                 self.release_locals(indent + 1)
-                self.emit(f"return {protection.answer};", indent + 1)
+                self.leave(protection.answer, indent + 1)
             self.emit("}", indent)
         if _BREAKING in protection.reasons:
             self.emit(f"if ({protection.why} == {_BREAKING}) break;", indent)
@@ -2302,7 +2309,7 @@ class CApiEmitter:
             self.leave_through_finally(_RETURNING, indent, value)
             return
         self.release_locals(indent)
-        self.emit(f"return {value};", indent)
+        self.leave(value, indent)
 
     def leave_through_finally(
         self, why: int, indent: int, value: str | None = None
@@ -2315,6 +2322,18 @@ class CApiEmitter:
         self.emit(f"{protection.why} = {why};", indent)
         protection.reasons.add(why)
         self.emit(f"goto {protection.label};", indent)
+
+    def leave(self, value: str, indent: int) -> None:
+        """Return from a compiled function, counting back out of the recursion.
+
+        Every path out goes through here. A level entered and not left is
+        never recovered, so the interpreter would come to believe the stack is
+        deeper than it is and refuse calls that are perfectly fine.
+        """
+
+        if self.guards_recursion:
+            self.emit("Py_LeaveRecursiveCall();", indent)
+        self.emit(f"return {value};", indent)
 
     def release_locals(self, indent: int, guarded: bool = False) -> None:
         """Give back what the body still holds, on the way out.
@@ -2689,7 +2708,7 @@ class CApiEmitter:
         self.emit(f"{answer} = f_{node.name}({passed});", 1)
         for name in parameters:
             self.emit(f"if (w_{name}) Py_DecRef(w_{name});", 1)
-        self.emit(f"return {answer};", 1)
+        self.leave(answer, 1)
         self.write_unwind(function)
         self.functions.append(function)
         self.current = outer
@@ -3011,7 +3030,11 @@ class CApiEmitter:
         self.current, self.handlers = function, []
         self.scope = node.body if isinstance(node.body, list) else []
         outer_depth, self.depth = self.depth, 0
+        outer_guard, self.guards_recursion = self.guards_recursion, True
         self.scope_path.append((simple, True))
+        # Before anything is acquired, so the failure path is a plain return
+        # rather than the unwind label - nothing has been entered to leave.
+        self.emit('if (Py_EnterRecursiveCall("")) { return 0; }', 1)
         # The parameters arrive in a tuple rather than as C arguments, so they
         # are locals here and are declared alongside the rest.
         for name in held:
@@ -3035,7 +3058,7 @@ class CApiEmitter:
             else:
                 tail = self.expression(node.body, 1)
             self.release_locals(1)
-            self.emit(f"return {tail};", 1)
+            self.leave(tail, 1)
             self.write_unwind(function)
             self.functions.append(function)
         finally:
@@ -3049,6 +3072,7 @@ class CApiEmitter:
                 outer_scope,
             )
             self.depth = outer_depth
+            self.guards_recursion = outer_guard
             self.scope_path.pop()
 
     # --- assembly --------------------------------------------------------
@@ -3154,6 +3178,8 @@ class CApiEmitter:
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))
+        self.guards_recursion = True
+        self.emit('if (Py_EnterRecursiveCall("")) { return 0; }', 1)
         # A parameter the call left out arrives as NULL and takes its default
         # here, before the increments below, so there is one rule for what the
         # body owns.
@@ -3174,8 +3200,9 @@ class CApiEmitter:
         # Falling off the end is `return None` in Python.
         tail = self.builtin("None", 1)
         self.release_locals(1)
-        self.emit(f"return {tail};", 1)
+        self.leave(tail, 1)
         self.write_unwind(function)
+        self.guards_recursion = False
         self.functions.append(function)
         self.scope_path.pop()
         self.current = None
@@ -3192,7 +3219,7 @@ class CApiEmitter:
             return
         self.current.body.append("_unwind:")
         self.release_locals(1, guarded=True)
-        self.emit("return 0;", 1)
+        self.leave("0", 1)
 
     def render(self) -> str:
         def signature(function: _Function) -> str:

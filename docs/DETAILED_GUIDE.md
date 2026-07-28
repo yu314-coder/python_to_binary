@@ -320,6 +320,21 @@ wrong:
   programs had only ever looked at stderr, which is why it survived; it now
   compares stdout too.
 
+**Runaway recursion.** A compiled call is a real C call on the real stack, so a
+recursion with no base case ran until the operating system took the process
+away - where CPython raises `RecursionError`. A segfault is not something a
+program can catch, report, or clean up after, so each compiled body now counts
+itself in and out through the interpreter's own depth counter, which is exactly
+what CPython does for every call it makes.
+
+Every way out of a body counts back out: a return, a raise, a `finally`
+carrying a return through. A level entered and not left is never recovered -
+the interpreter would come to believe the stack is deeper than it is and start
+refusing calls that are perfectly fine - so all the returns in the emitter go
+through one place rather than being written where they occur. The wrapper that
+makes a module-level `def` into a value is the one body that does not count,
+because it delegates straight to the real function, which counts for itself.
+
 **Zero-argument `super()`.** `super()` is `super(__class__, self)`, and CPython
 supplies both through a cell it creates for any method that so much as mentions
 the name. A compiled method has no cell, so the emitter writes the two values
@@ -1428,7 +1443,7 @@ permanently out of reach of this tier.
 
 ### Accepted
 
-- A fixed table of 65 exported CPython entry points (interpreter lifecycle,
+- A fixed table of 67 exported CPython entry points (interpreter lifecycle,
   `PyLong`/`PyUnicode`/`PyList` constructors, `PyNumber_*` arithmetic,
   `PyObject_*` calls and attribute access, `PyImport_ImportModule`, the
   `PySys_*`/`PyFile_*` output functions, `Py_IncRef`/`Py_DecRef`, and the

@@ -1109,6 +1109,51 @@ class CApiEmitTests(unittest.TestCase):
             b"A.__init__() takes 2 positional arguments but 3 were given\n",
         )
 
+    def test_runaway_recursion_is_an_exception_not_a_dead_process(self):
+        """Compiled calls use the real stack, which the OS takes away silently.
+
+        A recursion with no base case segfaulted where CPython raises
+        RecursionError - and a segfault is not something a program can catch,
+        report, or clean up after. Each compiled body counts itself in and out
+        through the interpreter's own depth counter, which is what CPython
+        does for every call it makes.
+        """
+
+        self._run(
+            "def deep(n):\n"
+            "    return deep(n + 1)\n"
+            "try:\n"
+            "    deep(0)\n"
+            "except RecursionError:\n"
+            "    print('caught RecursionError')\n",
+            b"caught RecursionError\n",
+        )
+
+    def test_the_depth_counter_is_given_back(self):
+        """A level entered and not left is never recovered.
+
+        The interpreter would come to believe the stack is deeper than it is
+        and refuse calls that are perfectly fine, so every way out of a body -
+        a return, a raise, a `finally` - counts back out. Recursion that
+        returns normally, over and over, is what shows the counting balances.
+        """
+
+        self._run(
+            "def fact(n):\n"
+            "    if n < 2:\n"
+            "        return 1\n"
+            "    return n * fact(n - 1)\n"
+            "def guarded(n):\n"
+            "    try:\n"
+            "        return fact(n)\n"
+            "    finally:\n"
+            "        pass\n"
+            "for _ in range(400):\n"
+            "    guarded(20)\n"
+            "print(fact(25))\n",
+            b"15511210043330985984000000\n",
+        )
+
     def test_the_generated_c_declares_what_it_needs_and_no_headers(self):
         # Python.h carries function-pointer typedefs and macros this project's
         # C front end does not parse, so the generated C declares the dozen

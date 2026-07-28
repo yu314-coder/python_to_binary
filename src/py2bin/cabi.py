@@ -56,7 +56,7 @@ __all__ = [
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
-    "PyNumber_Invert",
+    "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyList_New", "PyList_Append", "PySys_GetObject", "PySys_WriteStdout",
     "PyFile_WriteObject", "PyFile_WriteString", "Py_IncRef", "Py_DecRef",
     "PyErr_Occurred", "PyErr_Print", "PyErr_Clear",
@@ -815,6 +815,10 @@ _PyBytes_FromStringAndSize = _bind(
 _PyNumber_Negative = _bind("PyNumber_Negative", _HANDLE, _HANDLE)
 _PyNumber_Positive = _bind("PyNumber_Positive", _HANDLE, _HANDLE)
 _PyNumber_Invert = _bind("PyNumber_Invert", _HANDLE, _HANDLE)
+_Py_EnterRecursiveCall = _bind(
+    "Py_EnterRecursiveCall", ctypes.c_int, ctypes.c_char_p
+)
+_Py_LeaveRecursiveCall = _bind("Py_LeaveRecursiveCall", None)
 _PyList_New = _bind("PyList_New", _HANDLE, _SSIZE)
 _PyList_Append = _bind("PyList_Append", ctypes.c_int, _HANDLE, _HANDLE)
 _PySys_GetObject = _bind("PySys_GetObject", _HANDLE, ctypes.c_char_p)
@@ -1024,6 +1028,22 @@ def PyNumber_Positive(value: int) -> int:
     """`+x`."""
 
     return _handle(_PyNumber_Positive(value))
+
+
+def Py_EnterRecursiveCall(where: bytes) -> int:
+    """Count one level deeper, or answer non-zero with RecursionError set.
+
+    This is what keeps a runaway recursion a Python exception rather than a
+    stack the operating system takes away.
+    """
+
+    return int(_Py_EnterRecursiveCall(where))
+
+
+def Py_LeaveRecursiveCall() -> None:
+    """Count back out again. Every entered level must leave exactly once."""
+
+    _Py_LeaveRecursiveCall()
 
 
 def PyNumber_Invert(value: int) -> int:
