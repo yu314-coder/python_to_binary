@@ -59,6 +59,8 @@ import ast
 STATE = "_py2bin_state"
 #: Where a `for` loop keeps the iterator it is walking, one per loop.
 ITERATOR = "_py2bin_iter"
+#: What `send` last put in, which a resumed `x = yield` reads.
+SENT = "_py2bin_sent"
 
 
 class GeneratorRewriteError(Exception):
@@ -80,10 +82,52 @@ def is_generator(node: ast.FunctionDef) -> bool:
     return any(_yields(statement) for statement in node.body)
 
 
+class _DelegationRewriter(ast.NodeTransformer):
+    """`yield from xs` is a loop, so it is written as one before the cut.
+
+    Delegation forwards iteration, which is what almost every use of it wants.
+    It does not forward `send` into the sub-generator, and it does not answer
+    with the sub-generator's return value, so `x = yield from g` is refused
+    rather than quietly answering None.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def visit_Expr(self, node: ast.Expr) -> ast.stmt:
+        if not isinstance(node.value, ast.YieldFrom):
+            self.generic_visit(node)
+            return node
+        self.count += 1
+        item = f"_py2bin_from{self.count}"
+        loop = ast.For(
+            target=ast.Name(id=item, ctx=ast.Store()),
+            iter=node.value.value,
+            body=[
+                ast.Expr(
+                    value=ast.Yield(value=ast.Name(id=item, ctx=ast.Load()))
+                )
+            ],
+            orelse=[],
+            type_comment=None,
+        )
+        return ast.copy_location(loop, node)
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> ast.AST:
+        raise GeneratorRewriteError(
+            node, "a `yield from` whose value is used"
+        )
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+
 def _yields(node: ast.AST) -> bool:
-    if isinstance(node, ast.YieldFrom):
-        raise GeneratorRewriteError(node, "`yield from`")
-    if isinstance(node, ast.Yield):
+    if isinstance(node, (ast.Yield, ast.YieldFrom)):
         return True
     for child in ast.iter_child_nodes(node):
         if isinstance(
@@ -213,10 +257,11 @@ class _Machine:
     def build(self) -> None:
         # Every `return` first, wherever it sits, so that the cut below never
         # meets one and no copied statement carries one through.
+        delegation = _DelegationRewriter()
         rewriter = _ReturnRewriter(self)
         body: list[ast.stmt] = []
         for statement in self.function.body:
-            replaced = rewriter.visit(statement)
+            replaced = rewriter.visit(delegation.visit(statement))
             body.extend(replaced if isinstance(replaced, list) else [replaced])
         first = self._new_block()
         end = self._emit(body, first)
@@ -247,6 +292,36 @@ class _Machine:
                     ),
                     ast.Return(value=value),
                 ]
+            )
+            return resume
+        if isinstance(statement, ast.Assign) and isinstance(
+            statement.value, ast.Yield
+        ):
+            if len(statement.targets) != 1 or not isinstance(
+                statement.targets[0], ast.Name
+            ):
+                raise GeneratorRewriteError(
+                    statement, "a `yield` assigned to anything but one name"
+                )
+            target = statement.targets[0].id
+            self.names.add(target)
+            resume = self._new_block()
+            value = statement.value.value or ast.Constant(value=None)
+            self.blocks[block].extend(
+                [
+                    ast.Assign(
+                        targets=[self._self(STATE, store=True)],
+                        value=ast.Constant(value=resume),
+                    ),
+                    ast.Return(value=value),
+                ]
+            )
+            # What `send` put there, which `__next__` leaves as None.
+            self.blocks[resume].append(
+                ast.Assign(
+                    targets=[self._self(target, store=True)],
+                    value=self._self(SENT),
+                )
             )
             return resume
         if isinstance(statement, ast.If):
@@ -481,6 +556,16 @@ def rewrite(node: ast.FunctionDef, index: int) -> tuple[ast.ClassDef, ast.Functi
             ],
             value=ast.Call(func=ast.Name(id="object", ctx=ast.Load()), args=[], keywords=[]),
         ),
+        ast.Assign(
+            targets=[
+                ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=SENT,
+                    ctx=ast.Store(),
+                )
+            ],
+            value=ast.Constant(value=None),
+        ),
     ]
     for name in sorted(machine.names):
         setup.append(
@@ -523,10 +608,73 @@ def rewrite(node: ast.FunctionDef, index: int) -> tuple[ast.ClassDef, ast.Functi
                 type_params=[],
                 returns=None,
             ),
+            # The dispatch itself, shared: `next(g)` is `g.send(None)` in the
+            # protocol, and it is the same here - the only difference is what
+            # a resumed `x = yield` finds waiting for it.
+            ast.FunctionDef(
+                name="_py2bin_run",
+                args=_arguments(["self"]),
+                body=[ast.While(test=ast.Constant(value=True), body=dispatch, orelse=[])],
+                decorator_list=[],
+                type_params=[],
+                returns=None,
+            ),
             ast.FunctionDef(
                 name="__next__",
                 args=_arguments(["self"]),
-                body=[ast.While(test=ast.Constant(value=True), body=dispatch, orelse=[])],
+                body=[
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr=SENT,
+                                ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Constant(value=None),
+                    ),
+                    ast.Return(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr="_py2bin_run",
+                                ctx=ast.Load(),
+                            ),
+                            args=[],
+                            keywords=[],
+                        )
+                    ),
+                ],
+                decorator_list=[],
+                type_params=[],
+                returns=None,
+            ),
+            ast.FunctionDef(
+                name="send",
+                args=_arguments(["self", "value"]),
+                body=[
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr=SENT,
+                                ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Name(id="value", ctx=ast.Load()),
+                    ),
+                    ast.Return(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr="_py2bin_run",
+                                ctx=ast.Load(),
+                            ),
+                            args=[],
+                            keywords=[],
+                        )
+                    ),
+                ],
                 decorator_list=[],
                 type_params=[],
                 returns=None,

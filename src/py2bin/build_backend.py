@@ -11,7 +11,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-_VERSION = "0.5.0"
+_VERSION = "0.6.0"
 _DISTRIBUTION = f"python_to_binary-{_VERSION}"
 _ZIP_EPOCH = 315532800  # 1980-01-01 UTC, the oldest timestamp ZIP accepts.
 

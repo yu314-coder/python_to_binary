@@ -2538,12 +2538,26 @@ class NewlyTranslatedSyntaxTests(unittest.TestCase):
             b"circle r=3\nbox plus ['w']\norigin y axis 7\npoint 2,3 unknown\n",
         )
 
-    def test_a_starred_sequence_pattern_is_refused_by_name(self):
+    def test_a_star_in_a_sequence_pattern_takes_the_middle(self):
+        self._run(
+            "def g(v):\n"
+            "    match v:\n"
+            "        case [first, *middle, last]:\n"
+            "            return f'{first}..{middle}..{last}'\n"
+            "        case [a, *rest]:\n"
+            "            return f'head {a} rest {rest}'\n"
+            "        case _:\n"
+            "            return 'no'\n"
+            "print(g([1, 2, 3, 4]), g([9]), g([]), g('x'))\n",
+            b"1..[2, 3]..4 head 9 rest [] no no\n",
+        )
+
+    def test_two_stars_in_one_pattern_are_refused(self):
         with self.assertRaises(CApiEmitError) as caught:
             python_to_capi_c(
-                "match p:\n    case [a, *rest]:\n        pass\n", "program.py"
+                "match p:\n    case [*a, *b]:\n        pass\n", "program.py"
             )
-        self.assertIn("starred sequence pattern", str(caught.exception))
+        self.assertIn("two starred names", str(caught.exception))
 
 
 class GeneratorTests(unittest.TestCase):
@@ -2658,14 +2672,68 @@ class GeneratorTests(unittest.TestCase):
 
     def test_the_shapes_it_cannot_express_are_refused_by_name(self):
         for source, needle in (
-            ("def f():\n    x = yield 1\n", "assign"),
+            # A handler has to survive the suspension, which cutting the body
+            # into blocks does not arrange for.
             ("def f():\n    try:\n        yield 1\n    except ValueError:\n        pass\n", "try"),
             ("def f(c):\n    with c:\n        yield 1\n", "with"),
             ("def f():\n    yield 1\n    return 2\n", "`return` with a value"),
             ("def f(*xs):\n    yield 1\n", "*args"),
-            ("def f():\n    yield from [1]\n", "yield from"),
         ):
             with self.subTest(source=source):
                 with self.assertRaises(CApiEmitError) as caught:
                     python_to_capi_c(source, "program.py")
                 self.assertIn(needle, str(caught.exception))
+
+
+class GeneratorDelegationTests(unittest.TestCase):
+    """`yield from`, and a `yield` that receives what `send` puts in."""
+
+    _run = CApiEmitTests._run
+
+    def test_yield_from_delegates_iteration(self):
+        # Written as the loop it is, before the body is cut into blocks.
+        self._run(
+            "def inner():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+            "def outer():\n"
+            "    yield 0\n"
+            "    yield from inner()\n"
+            "    yield from [7, 8]\n"
+            "    yield 9\n"
+            "print(list(outer()))\n",
+            b"[0, 1, 2, 7, 8, 9]\n",
+        )
+
+    def test_send_reaches_a_yield_used_as_a_value(self):
+        self._run(
+            "def echo():\n"
+            "    while True:\n"
+            "        got = yield\n"
+            "        if got is None:\n"
+            "            return\n"
+            "        yield got * 2\n"
+            "g = echo()\n"
+            "next(g)\n"
+            "print(g.send(5))\n",
+            b"10\n",
+        )
+
+    def test_next_is_send_of_none(self):
+        self._run(
+            "def taking():\n"
+            "    got = yield 'first'\n"
+            "    yield got\n"
+            "g = taking()\n"
+            "print(next(g), next(g))\n",
+            b"first None\n",
+        )
+
+    def test_a_delegation_whose_value_is_used_is_refused(self):
+        # `yield from` answers with the sub-generator's return value, and this
+        # written as a loop cannot, so it is refused rather than answering None.
+        with self.assertRaises(CApiEmitError) as caught:
+            python_to_capi_c(
+                "def f():\n    x = yield from g()\n", "program.py"
+            )
+        self.assertIn("`yield from` whose value is used", str(caught.exception))

@@ -2692,8 +2692,13 @@ class CApiEmitter:
         fitting wrongly.
         """
 
-        if any(isinstance(part, ast.MatchStar) for part in pattern.patterns):
-            raise self.fail(pattern, "a starred sequence pattern is not translated here yet")
+        stars = [
+            index
+            for index, part in enumerate(pattern.patterns)
+            if isinstance(part, ast.MatchStar)
+        ]
+        if len(stars) > 1:
+            raise self.fail(pattern, "two starred names in one pattern")
         kinds = self.temporary()
         # A slot at a time, not PyTuple_Pack: that one is variadic, and Apple's
         # arm64 ABI puts variadic arguments on the stack where this backend
@@ -2707,16 +2712,69 @@ class CApiEmitter:
         self.emit(f"PyTuple_SetItem({kinds}, 0LL, {as_list});", indent)
         self.emit(f"PyTuple_SetItem({kinds}, 1LL, {as_tuple});", indent)
         self.instance_test(subject, kinds, fits, indent)
+        length = self.temporary_flag()
         self.emit(f"if ({fits}) {{", indent)
+        self.emit(f"{length} = (int)PyObject_Size({subject});", indent + 1)
+        # Without a star the length has to match; with one it has to be at
+        # least what the fixed names take, and the star gets the difference.
+        fixed = len(pattern.patterns) - len(stars)
         self.emit(
-            f"{fits} = (PyObject_Size({subject}) == {len(pattern.patterns)});",
-            indent + 1,
+            f"{fits} = ({length} {'>=' if stars else '=='} {fixed});", indent + 1
         )
         self.emit("}", indent)
+        star = stars[0] if stars else len(pattern.patterns)
         for position, part in enumerate(pattern.patterns):
             self.emit(f"if ({fits}) {{", indent)
+            if position == star:
+                # The middle, from where the leading names stopped to where
+                # the trailing ones begin - counted from the end, so its size
+                # does not have to be known here.
+                after = len(pattern.patterns) - star - 1
+                start = self.temporary()
+                stop = self.temporary()
+                self.emit(f"{start} = PyLong_FromLongLong({star}LL);", indent + 1)
+                self.checked(start, indent + 1)
+                self.emit(
+                    f"{stop} = PyLong_FromLongLong((long long)({length} - {after}));",
+                    indent + 1,
+                )
+                self.checked(stop, indent + 1)
+                none = self.builtin("None", indent + 1)
+                cut = self.temporary()
+                self.emit(f"{cut} = PySlice_New({start}, {stop}, {none});", indent + 1)
+                for value in (start, stop, none):
+                    self.emit(f"Py_DecRef({value});", indent + 1)
+                self.checked(cut, indent + 1)
+                rest = self.temporary()
+                self.emit(f"{rest} = PyObject_GetItem({subject}, {cut});", indent + 1)
+                self.emit(f"Py_DecRef({cut});", indent + 1)
+                self.checked(rest, indent + 1)
+                if part.name is not None:
+                    listed = self.builtin("list", indent + 1)
+                    made = self.temporary()
+                    self.emit(
+                        f"{made} = PyObject_CallOneArg({listed}, {rest});", indent + 1
+                    )
+                    self.emit(f"Py_DecRef({listed});", indent + 1)
+                    self.emit(f"Py_DecRef({rest});", indent + 1)
+                    self.checked(made, indent + 1)
+                    self.bind_target(
+                        ast.Name(id=part.name, ctx=ast.Store()), made, indent + 1
+                    )
+                else:
+                    self.emit(f"Py_DecRef({rest});", indent + 1)
+                self.emit("}", indent)
+                continue
+            # Positions after the star are counted from the end.
+            where = (
+                str(position)
+                if position < star
+                else f"{length} - {len(pattern.patterns) - position}"
+            )
             index = self.temporary()
-            self.emit(f"{index} = PyLong_FromLongLong({position}LL);", indent + 1)
+            self.emit(
+                f"{index} = PyLong_FromLongLong((long long)({where}));", indent + 1
+            )
             self.checked(index, indent + 1)
             picked = self.temporary()
             self.emit(f"{picked} = PyObject_GetItem({subject}, {index});", indent + 1)

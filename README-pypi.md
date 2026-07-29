@@ -157,8 +157,8 @@ CPython, and requiring identical stdout and exit status.
 | starred unpacking (`a, *b, c = …`) | ✅ |
 | `match`: values, `\|`, captures, sequences, guards | ✅ |
 | `match`: mapping and class patterns, `__match_args__` | ✅ |
-| generators (`yield`) | ✅ |
-| `yield` as a value (`x = yield`), `yield from` | ❌ |
+| generators (`yield`), `send`, `yield from` | ✅ |
+| `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
 | `yield` inside `try` or `with` | ❌ |
 | `async` / `await` | ❌ |
 
@@ -171,11 +171,16 @@ because they have to outlive a `return`. The class is then compiled by the
 machinery that already compiles classes, so there is no new C and nothing
 interpreted at run time.
 
-That covers `yield` as a statement in straight-line code, `if`/`else`, `while`,
-`for`, `break`, `continue` and a bare `return`. What it does not cover is
-refused by name: a `yield` whose value is used needs `send`, and a `yield`
-inside `try` or `with` needs the handler to survive the suspension. `async`
-needs all of that plus a scheduler.
+That covers `yield` as a statement or as a value, `send`, `yield from`,
+straight-line code, `if`/`else`, `while`, `for`, `break`, `continue` and a bare
+`return`. `next(g)` is `g.send(None)` here as it is in the protocol, and
+`yield from` is written as the loop it is before the body is cut - which
+forwards iteration but not a `send` into the sub-generator, so a `yield from`
+whose value is used is refused rather than quietly answering None.
+
+What is left is refused by name. A `yield` inside `try` or `with` needs the
+handler to survive the suspension, which cutting the body into blocks does not
+arrange for; `async` needs that and a scheduler besides.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
 889-program corpus, 878 programs produce byte-identical output to CPython; the
