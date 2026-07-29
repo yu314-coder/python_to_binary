@@ -155,16 +155,27 @@ CPython, and requiring identical stdout and exit status.
 | walrus (`:=`) | ✅ |
 | `raise … from …` | ✅ |
 | starred unpacking (`a, *b, c = …`) | ✅ |
-| `match`: values, `\|` alternatives, captures, sequences, guards | ✅ |
-| `match`: mapping and class patterns | ❌ |
-| generators (`yield`) | ❌ |
+| `match`: values, `\|`, captures, sequences, guards | ✅ |
+| `match`: mapping and class patterns, `__match_args__` | ✅ |
+| generators (`yield`) | ✅ |
+| `yield` as a value (`x = yield`), `yield from` | ❌ |
+| `yield` inside `try` or `with` | ❌ |
 | `async` / `await` | ❌ |
 
-What is left needs machinery this tier does not have rather than more
-translation. A generator has to suspend and resume, which means a frame to
-suspend into; `async` needs the same thing and a scheduler besides. A mapping
-or class pattern needs the match protocol (`__match_args__`) walked, which is
-tractable and simply not written.
+A generator cannot be compiled the way the rest is - a C function has one
+entry and its locals die with its frame, so it cannot stop in the middle of
+itself. It is turned inside out instead: the body is cut into blocks at each
+`yield`, the blocks are numbered, and the function becomes a class whose
+`__next__` dispatches on which block to run next, with the locals as attributes
+because they have to outlive a `return`. The class is then compiled by the
+machinery that already compiles classes, so there is no new C and nothing
+interpreted at run time.
+
+That covers `yield` as a statement in straight-line code, `if`/`else`, `while`,
+`for`, `break`, `continue` and a bare `return`. What it does not cover is
+refused by name: a `yield` whose value is used needs `send`, and a `yield`
+inside `try` or `with` needs the handler to survive the suspension. `async`
+needs all of that plus a scheduler.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
 889-program corpus, 878 programs produce byte-identical output to CPython; the

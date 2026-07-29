@@ -2510,10 +2510,162 @@ class NewlyTranslatedSyntaxTests(unittest.TestCase):
         )
         self.assertNotIn("= PyTuple_Pack(", written)
 
-    def test_an_untranslated_pattern_is_refused_by_name(self):
-        self._reject = CApiEmitTests._reject
+    def test_mapping_and_class_patterns_translate(self):
+        self._run(
+            "class Point:\n"
+            "    __match_args__ = ('x', 'y')\n"
+            "    def __init__(self, x, y):\n"
+            "        self.x = x\n"
+            "        self.y = y\n"
+            "def describe(v):\n"
+            "    match v:\n"
+            "        case {'kind': 'circle', 'r': r}:\n"
+            "            return f'circle r={r}'\n"
+            "        case {'kind': k, **rest}:\n"
+            "            return f'{k} plus {sorted(rest)}'\n"
+            "        case Point(0, 0):\n"
+            "            return 'origin'\n"
+            "        case Point(x=0, y=y):\n"
+            "            return f'y axis {y}'\n"
+            "        case Point(a, b):\n"
+            "            return f'point {a},{b}'\n"
+            "        case _:\n"
+            "            return 'unknown'\n"
+            "print(describe({'kind': 'circle', 'r': 3}))\n"
+            "print(describe({'kind': 'box', 'w': 1}))\n"
+            "print(describe(Point(0, 0)), describe(Point(0, 7)))\n"
+            "print(describe(Point(2, 3)), describe(42))\n",
+            b"circle r=3\nbox plus ['w']\norigin y axis 7\npoint 2,3 unknown\n",
+        )
+
+    def test_a_starred_sequence_pattern_is_refused_by_name(self):
         with self.assertRaises(CApiEmitError) as caught:
             python_to_capi_c(
-                "match p:\n    case {'k': v}:\n        pass\n", "program.py"
+                "match p:\n    case [a, *rest]:\n        pass\n", "program.py"
             )
-        self.assertIn("mapping pattern is not translated", str(caught.exception))
+        self.assertIn("starred sequence pattern", str(caught.exception))
+
+
+class GeneratorTests(unittest.TestCase):
+    """`yield`, by turning the function inside out.
+
+    A compiled C function cannot stop in the middle of itself: it has one entry
+    and its locals die with its frame. So the body is cut into blocks at each
+    `yield`, the blocks are numbered, and the function becomes a class whose
+    `__next__` dispatches on which block to run next - with the locals as
+    attributes, because they have to outlive a `return`. The class is compiled
+    by the machinery that already compiles classes; no new C, no new entry
+    point, and nothing interpreted at run time.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_a_while_loop_generator(self):
+        self._run(
+            "def counter(limit):\n"
+            "    n = 0\n"
+            "    while n < limit:\n"
+            "        yield n\n"
+            "        n = n + 1\n"
+            "print(list(counter(5)), sum(counter(10)))\n",
+            b"[0, 1, 2, 3, 4] 45\n",
+        )
+
+    def test_a_for_loop_generator_and_straight_line_yields(self):
+        self._run(
+            "def squares(xs):\n"
+            "    for x in xs:\n"
+            "        yield x * x\n"
+            "def three():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+            "    yield 3\n"
+            "print(list(squares([1, 2, 3])), list(three()))\n",
+            b"[1, 4, 9] [1, 2, 3]\n",
+        )
+
+    def test_break_and_continue_go_to_the_right_loop(self):
+        # Once the loop is cut into blocks it is no longer a loop; what runs is
+        # the dispatch loop, and a `break` left as written would leave that -
+        # ending the generator instead of the loop.
+        self._run(
+            "def upto(n):\n"
+            "    i = 0\n"
+            "    while True:\n"
+            "        if i >= n:\n"
+            "            break\n"
+            "        yield i\n"
+            "        i = i + 1\n"
+            "def evens(xs):\n"
+            "    for x in xs:\n"
+            "        if x % 2:\n"
+            "            continue\n"
+            "        yield x\n"
+            "print(list(upto(4)), list(evens([1, 2, 3, 4, 5, 6])))\n",
+            b"[0, 1, 2, 3] [2, 4, 6]\n",
+        )
+
+    def test_an_early_return_ends_the_iteration(self):
+        # A bare `return` left as written becomes `return None` out of
+        # `__next__`, which the protocol reads as *yielding* None, forever.
+        self._run(
+            "def early(xs):\n"
+            "    for x in xs:\n"
+            "        if x == 3:\n"
+            "            return\n"
+            "        yield x\n"
+            "print(list(early([1, 2, 3, 4])))\n",
+            b"[1, 2]\n",
+        )
+
+    def test_nested_loops_and_branches(self):
+        self._run(
+            "def pairs(n):\n"
+            "    for i in range(n):\n"
+            "        for j in range(i):\n"
+            "            yield (i, j)\n"
+            "def branchy(n):\n"
+            "    if n > 0:\n"
+            "        yield 'pos'\n"
+            "    else:\n"
+            "        yield 'neg'\n"
+            "    yield 'done'\n"
+            "print(list(pairs(4)))\n"
+            "print(list(branchy(1)), list(branchy(-1)))\n",
+            b"[(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]\n"
+            b"['pos', 'done'] ['neg', 'done']\n",
+        )
+
+    def test_a_generator_that_never_yields_is_empty(self):
+        self._run(
+            "def empty():\n"
+            "    if False:\n"
+            "        yield 1\n"
+            "print(list(empty()))\n",
+            b"[]\n",
+        )
+
+    def test_it_is_a_real_iterator(self):
+        self._run(
+            "def three():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+            "    yield 3\n"
+            "g = three()\n"
+            "print(next(g), next(g), [x for x in three()], iter(g) is g)\n",
+            b"1 2 [1, 2, 3] True\n",
+        )
+
+    def test_the_shapes_it_cannot_express_are_refused_by_name(self):
+        for source, needle in (
+            ("def f():\n    x = yield 1\n", "assign"),
+            ("def f():\n    try:\n        yield 1\n    except ValueError:\n        pass\n", "try"),
+            ("def f(c):\n    with c:\n        yield 1\n", "with"),
+            ("def f():\n    yield 1\n    return 2\n", "`return` with a value"),
+            ("def f(*xs):\n    yield 1\n", "*args"),
+            ("def f():\n    yield from [1]\n", "yield from"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(CApiEmitError) as caught:
+                    python_to_capi_c(source, "program.py")
+                self.assertIn(needle, str(caught.exception))

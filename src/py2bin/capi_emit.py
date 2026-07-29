@@ -30,6 +30,7 @@ import builtins
 import contextlib
 from pathlib import Path
 
+from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
     ARITHMETIC as _MACHINE_OPS,
     COMPARISONS as _MACHINE_TESTS,
@@ -2672,6 +2673,10 @@ class CApiEmitter:
             return fits
         if isinstance(pattern, ast.MatchSequence):
             return self.sequence_pattern(pattern, subject, fits, indent)
+        if isinstance(pattern, ast.MatchMapping):
+            return self.mapping_pattern(pattern, subject, fits, indent)
+        if isinstance(pattern, ast.MatchClass):
+            return self.class_pattern(pattern, subject, fits, indent)
         raise self.fail(
             pattern,
             f"a {type(pattern).__name__[5:].lower()} pattern is not translated "
@@ -2701,18 +2706,7 @@ class CApiEmitter:
         as_tuple = self.builtin("tuple", indent)
         self.emit(f"PyTuple_SetItem({kinds}, 0LL, {as_list});", indent)
         self.emit(f"PyTuple_SetItem({kinds}, 1LL, {as_tuple});", indent)
-        checker = self.builtin("isinstance", indent)
-        array = self.argument_array(2)
-        self.emit(f"{array}[0] = {subject};", indent)
-        self.emit(f"{array}[1] = {kinds};", indent)
-        answer = self.temporary()
-        self.emit(f"{answer} = PyObject_Vectorcall({checker}, {array}, 2, 0);", indent)
-        self.emit(f"Py_DecRef({checker});", indent)
-        self.emit(f"Py_DecRef({kinds});", indent)
-        self.checked(answer, indent)
-        self.emit(f"{fits} = PyObject_IsTrue({answer});", indent)
-        self.emit(f"Py_DecRef({answer});", indent)
-        self.emit(f"if ({fits} < 0) {{ {self.failure()} }}", indent)
+        self.instance_test(subject, kinds, fits, indent)
         self.emit(f"if ({fits}) {{", indent)
         self.emit(
             f"{fits} = (PyObject_Size({subject}) == {len(pattern.patterns)});",
@@ -2731,6 +2725,154 @@ class CApiEmitter:
             inner = self.pattern_test(part, picked, indent + 1)
             self.emit(f"Py_DecRef({picked});", indent + 1)
             self.emit(f"{fits} = {inner};", indent + 1)
+            self.emit("}", indent)
+        return fits
+
+    def instance_test(self, subject: str, kinds: str, fits: str, indent: int) -> None:
+        """Set `fits` from `isinstance(subject, kinds)`, consuming `kinds`."""
+
+        checker = self.builtin("isinstance", indent)
+        array = self.argument_array(2)
+        self.emit(f"{array}[0] = {subject};", indent)
+        self.emit(f"{array}[1] = {kinds};", indent)
+        answer = self.temporary()
+        self.emit(f"{answer} = PyObject_Vectorcall({checker}, {array}, 2, 0);", indent)
+        self.emit(f"Py_DecRef({checker});", indent)
+        self.emit(f"Py_DecRef({kinds});", indent)
+        self.checked(answer, indent)
+        self.emit(f"{fits} = PyObject_IsTrue({answer});", indent)
+        self.emit(f"Py_DecRef({answer});", indent)
+        self.emit(f"if ({fits} < 0) {{ {self.failure()} }}", indent)
+
+    def mapping_pattern(self, pattern, subject: str, fits: str, indent: int) -> str:
+        """`case {"k": v}` - the named keys present, their values matching.
+
+        A mapping pattern does not care what else is in the mapping, which is
+        the difference from a sequence pattern: `{"a": 1}` fits a dict of ten
+        keys as long as `a` is one of them. `**rest` collects what the pattern
+        did not name.
+
+        `dict` rather than `collections.abc.Mapping`, so a custom mapping does
+        not fit here where Python would let it. That is narrower than the
+        language and not wider, which is the direction a compiler may err in.
+        """
+
+        self.instance_test(subject, self.builtin("dict", indent), fits, indent)
+        seen: list[str] = []
+        for key_node, value_pattern in zip(pattern.keys, pattern.patterns):
+            self.emit(f"if ({fits}) {{", indent)
+            key = self.expression(key_node, indent + 1)
+            seen.append(key)
+            present = self.temporary_flag()
+            self.emit(
+                f"{present} = PySequence_Contains({subject}, {key});", indent + 1
+            )
+            self.emit(f"if ({present} < 0) {{ {self.failure()} }}", indent + 1)
+            self.emit(f"{fits} = {present};", indent + 1)
+            self.emit(f"if ({fits}) {{", indent + 1)
+            picked = self.temporary()
+            self.emit(f"{picked} = PyObject_GetItem({subject}, {key});", indent + 2)
+            self.checked(picked, indent + 2)
+            inner = self.pattern_test(value_pattern, picked, indent + 2)
+            self.emit(f"Py_DecRef({picked});", indent + 2)
+            self.emit(f"{fits} = {inner};", indent + 2)
+            self.emit("}", indent + 1)
+            self.emit("}", indent)
+        if pattern.rest is not None:
+            # What the pattern did not name, as a new dict. Built by copying
+            # and deleting rather than by comprehension, because the keys to
+            # remove are known here and the copy is one call.
+            self.emit(f"if ({fits}) {{", indent)
+            copier = self.builtin("dict", indent + 1)
+            rest = self.temporary()
+            self.emit(
+                f"{rest} = PyObject_CallOneArg({copier}, {subject});", indent + 1
+            )
+            self.emit(f"Py_DecRef({copier});", indent + 1)
+            self.checked(rest, indent + 1)
+            for key in seen:
+                self.emit(f"PyObject_DelItem({rest}, {key});", indent + 1)
+            self.bind_target(
+                ast.Name(id=pattern.rest, ctx=ast.Store()), rest, indent + 1
+            )
+            self.emit("}", indent)
+        for key in seen:
+            self.emit(f"Py_DecRef({key});", indent)
+        return fits
+
+    def class_pattern(self, pattern, subject: str, fits: str, indent: int) -> str:
+        """`case Point(x=1)` - the right class, then its attributes.
+
+        A positional sub-pattern is matched against the attribute
+        `__match_args__` names at that position, which is the protocol Python
+        uses and the reason a class can be matched positionally at all.
+        """
+
+        self.instance_test(subject, self.expression(pattern.cls, indent), fits, indent)
+        if pattern.patterns:
+            # `__match_args__` is a tuple of attribute names; position i of the
+            # pattern matches the attribute it names at position i.
+            self.emit(f"if ({fits}) {{", indent)
+            names = self.temporary()
+            self.emit(
+                f'{names} = PyObject_GetAttrString({subject}, "__match_args__");',
+                indent + 1,
+            )
+            self.emit(f"if (!{names}) {{ PyErr_Clear(); {fits} = 0; }}", indent + 1)
+            self.emit(f"if ({fits}) {{", indent + 1)
+            self.emit(
+                f"{fits} = (PyObject_Size({names}) >= {len(pattern.patterns)});",
+                indent + 2,
+            )
+            self.emit("}", indent + 1)
+            for position, sub in enumerate(pattern.patterns):
+                self.emit(f"if ({fits}) {{", indent + 1)
+                index = self.temporary()
+                self.emit(
+                    f"{index} = PyLong_FromLongLong({position}LL);", indent + 2
+                )
+                self.checked(index, indent + 2)
+                attribute = self.temporary()
+                self.emit(
+                    f"{attribute} = PyObject_GetItem({names}, {index});", indent + 2
+                )
+                self.emit(f"Py_DecRef({index});", indent + 2)
+                self.checked(attribute, indent + 2)
+                got = self.temporary()
+                getter = self.builtin("getattr", indent + 2)
+                array = self.argument_array(2)
+                self.emit(f"{array}[0] = {subject};", indent + 2)
+                self.emit(f"{array}[1] = {attribute};", indent + 2)
+                self.emit(
+                    f"{got} = PyObject_Vectorcall({getter}, {array}, 2, 0);",
+                    indent + 2,
+                )
+                self.emit(f"Py_DecRef({getter});", indent + 2)
+                self.emit(f"Py_DecRef({attribute});", indent + 2)
+                self.emit(
+                    f"if (!{got}) {{ PyErr_Clear(); {fits} = 0; }}", indent + 2
+                )
+                self.emit(f"if ({fits}) {{", indent + 2)
+                inner = self.pattern_test(sub, got, indent + 3)
+                self.emit(f"{fits} = {inner};", indent + 3)
+                self.emit(f"Py_DecRef({got});", indent + 3)
+                self.emit("}", indent + 2)
+                self.emit("}", indent + 1)
+            self.emit(f"Py_DecRef({names});", indent + 1)
+            self.emit("}", indent)
+        for keyword, sub in zip(pattern.kwd_attrs, pattern.kwd_patterns):
+            self.emit(f"if ({fits}) {{", indent)
+            got = self.temporary()
+            self.emit(
+                f'{got} = PyObject_GetAttrString({subject}, {_c_string(keyword)});',
+                indent + 1,
+            )
+            self.emit(f"if (!{got}) {{ PyErr_Clear(); {fits} = 0; }}", indent + 1)
+            self.emit(f"if ({fits}) {{", indent + 1)
+            inner = self.pattern_test(sub, got, indent + 2)
+            self.emit(f"{fits} = {inner};", indent + 2)
+            self.emit(f"Py_DecRef({got});", indent + 2)
+            self.emit("}", indent + 1)
             self.emit("}", indent)
         return fits
 
@@ -4539,6 +4681,14 @@ class CApiEmitter:
 
         # Per-module state. A name is a global *of its own module*, and a
         # function of one module is not callable by bare name from another.
+        # Before anything else looks at the tree: a generator becomes a class
+        # and a function that makes one, so nothing below ever sees a `yield`.
+        try:
+            tree = expand_generators(tree)
+        except GeneratorRewriteError as error:
+            raise self.fail(
+                error.node, f"{error.message} is not translated here yet"
+            ) from None
         self.globals = set()
         self.known_functions = {}
         self.certain_globals = set()
