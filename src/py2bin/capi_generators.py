@@ -82,40 +82,224 @@ def is_generator(node: ast.FunctionDef) -> bool:
     return any(_yields(statement) for statement in node.body)
 
 
-class _DelegationRewriter(ast.NodeTransformer):
-    """`yield from xs` is a loop, so it is written as one before the cut.
+#: PEP 380's expansion of `yield from`, less the `throw` and `close`
+#: passthrough - which would need `throw` and `close` on the generator this
+#: compiles to, and it has neither. What is here is the half that matters for
+#: ordinary use and for `await`: values sent in reach the sub-iterator, and the
+#: sub-iterator's return value is the value of the expression.
+_DELEGATION = """
+_py2bin_i{n} = iter(_py2bin_src{n})
+_py2bin_r{n} = None
+_py2bin_go{n} = 1
+try:
+    _py2bin_y{n} = next(_py2bin_i{n})
+except StopIteration as _py2bin_e{n}:
+    _py2bin_r{n} = _py2bin_e{n}.value
+    _py2bin_go{n} = 0
+while _py2bin_go{n}:
+    _py2bin_s{n} = yield _py2bin_y{n}
+    try:
+        if _py2bin_s{n} is None:
+            _py2bin_y{n} = next(_py2bin_i{n})
+        else:
+            _py2bin_y{n} = _py2bin_i{n}.send(_py2bin_s{n})
+    except StopIteration as _py2bin_e{n}:
+        _py2bin_r{n} = _py2bin_e{n}.value
+        _py2bin_go{n} = 0
+"""
 
-    Delegation forwards iteration, which is what almost every use of it wants.
-    It does not forward `send` into the sub-generator, and it does not answer
-    with the sub-generator's return value, so `x = yield from g` is refused
-    rather than quietly answering None.
+
+class _Hoister(ast.NodeTransformer):
+    """Lift `await` and `yield from` out of the expressions they sit in.
+
+    `total = total + await f(x)` has to become two statements, because the
+    expansion of an `await` is a loop and a loop is not an expression. The
+    lifted value goes into a temporary that the statement then reads.
+
+    Where lifting would change *when* something runs, it is refused instead:
+    the second operand of `and`/`or` and the arms of `a if c else b` are
+    conditional, and a comprehension's body runs once per item. Hoisting any
+    of those would run the await unconditionally, or once instead of many
+    times, and quietly give a different program.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.lifted: list[ast.stmt] = []
+
+    def _lift(self, node: ast.expr) -> ast.expr:
+        self.count += 1
+        name = f"_py2bin_await{self.count}"
+        self.lifted.append(
+            ast.copy_location(
+                ast.Assign(
+                    targets=[ast.Name(id=name, ctx=ast.Store())], value=node
+                ),
+                node,
+            )
+        )
+        return ast.copy_location(ast.Name(id=name, ctx=ast.Load()), node)
+
+    def visit_Await(self, node: ast.Await) -> ast.expr:
+        node.value = self.visit(node.value)
+        return self._lift(node)
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> ast.expr:
+        node.value = self.visit(node.value)
+        return self._lift(node)
+
+    def _refuse_inside(self, node: ast.AST, where: str) -> None:
+        for inner in ast.walk(node):
+            if isinstance(inner, (ast.Await, ast.YieldFrom)):
+                raise GeneratorRewriteError(
+                    inner, f"an `await` inside {where}"
+                )
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        for value in node.values[1:]:
+            self._refuse_inside(value, "`and` or `or`, which may not run it")
+        node.values[0] = self.visit(node.values[0])
+        return node
+
+    def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
+        for arm in (node.body, node.orelse):
+            self._refuse_inside(arm, "an `a if c else b` arm")
+        node.test = self.visit(node.test)
+        return node
+
+    def visit_ListComp(self, node):
+        self._refuse_inside(node, "a comprehension")
+        return node
+
+    visit_SetComp = visit_ListComp
+    visit_DictComp = visit_ListComp
+    visit_GeneratorExp = visit_ListComp
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+
+#: The bodies a compound statement holds, which are hoisted in their own right.
+_NESTED = ("body", "orelse", "finalbody")
+
+
+def _hoist(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Lift awaits out of each statement, and out of the bodies it holds.
+
+    A `while` test is left alone and refused if it awaits: the test runs again
+    on every turn of the loop, and a value hoisted in front of the loop would
+    be computed once. That is a different program, so it is not written.
+    """
+
+    out: list[ast.stmt] = []
+    for statement in body:
+        if isinstance(statement, ast.While):
+            hoister = _Hoister()
+            hoister._refuse_inside(statement.test, "a `while` condition")
+        for field in _NESTED:
+            held = getattr(statement, field, None)
+            if isinstance(held, list) and held and isinstance(held[0], ast.stmt):
+                setattr(statement, field, _hoist(held))
+        if isinstance(statement, ast.Try):
+            for handler in statement.handlers:
+                handler.body = _hoist(handler.body)
+        hoister = _Hoister()
+        if isinstance(
+            statement,
+            (ast.Expr, ast.Assign, ast.AugAssign, ast.Return, ast.If, ast.For),
+        ):
+            # The statement's own expression - an `if` test, a `for` iterable,
+            # the value of an assignment. The bodies were done above.
+            rebuilt = _hoist_head(statement, hoister)
+        else:
+            rebuilt = statement
+        out.extend(hoister.lifted)
+        out.append(rebuilt)
+    return out
+
+
+def _hoist_head(statement: ast.stmt, hoister: "_Hoister") -> ast.stmt:
+    """Hoist out of a statement's own expression, leaving its bodies alone."""
+
+    if isinstance(statement, ast.If):
+        statement.test = hoister.visit(statement.test)
+    elif isinstance(statement, ast.For):
+        statement.iter = hoister.visit(statement.iter)
+    elif isinstance(statement, ast.Return):
+        if statement.value is not None:
+            statement.value = hoister.visit(statement.value)
+    elif isinstance(statement, ast.AugAssign):
+        statement.value = hoister.visit(statement.value)
+    else:
+        statement.value = hoister.visit(statement.value)
+    return statement
+
+
+class _DelegationRewriter(ast.NodeTransformer):
+    """Write `yield from` out as the loop the language defines it to be.
+
+    PEP 380 gives `yield from` a formal expansion in terms of `yield`, `next`
+    and `send`, and that expansion is ordinary Python - so it is written out
+    here and the state machine never has to know delegation exists. What is
+    left out is the `throw` and `close` passthrough, which would need a
+    `throw` and a `close` on the thing this compiles to.
+
+    `await x` is the same expansion over `x.__await__()`, which is what the
+    language says an `await` of an object with `__await__` means.
     """
 
     def __init__(self) -> None:
         self.count = 0
 
-    def visit_Expr(self, node: ast.Expr) -> ast.stmt:
-        if not isinstance(node.value, ast.YieldFrom):
-            self.generic_visit(node)
-            return node
+    def _expand(self, source: ast.expr, target: ast.expr | None) -> list[ast.stmt]:
         self.count += 1
-        item = f"_py2bin_from{self.count}"
-        loop = ast.For(
-            target=ast.Name(id=item, ctx=ast.Store()),
-            iter=node.value.value,
-            body=[
-                ast.Expr(
-                    value=ast.Yield(value=ast.Name(id=item, ctx=ast.Load()))
+        name = self.count
+        body = ast.parse(_DELEGATION.format(n=name)).body
+        # The first statement is `_i = iter(_src)`; give it the real source.
+        body[0].value.args[0] = source
+        if target is not None:
+            body.append(
+                ast.Assign(
+                    targets=[target],
+                    value=ast.Name(id=f"_py2bin_r{name}", ctx=ast.Load()),
                 )
-            ],
-            orelse=[],
-            type_comment=None,
-        )
-        return ast.copy_location(loop, node)
+            )
+        return body
+
+    def visit_Expr(self, node: ast.Expr) -> ast.stmt | list[ast.stmt]:
+        inner = node.value
+        if isinstance(inner, ast.YieldFrom):
+            return self._expand(inner.value, None)
+        if isinstance(inner, ast.Await):
+            return self._expand(_awaited(inner.value), None)
+        self.generic_visit(node)
+        return node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.stmt | list[ast.stmt]:
+        if isinstance(node.value, (ast.YieldFrom, ast.Await)) and len(
+            node.targets
+        ) == 1:
+            source = (
+                node.value.value
+                if isinstance(node.value, ast.YieldFrom)
+                else _awaited(node.value.value)
+            )
+            return self._expand(source, node.targets[0])
+        self.generic_visit(node)
+        return node
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> ast.AST:
         raise GeneratorRewriteError(
-            node, "a `yield from` whose value is used"
+            node, "a `yield from` in an expression this does not expand"
+        )
+
+    def visit_Await(self, node: ast.Await) -> ast.AST:
+        raise GeneratorRewriteError(
+            node, "an `await` in an expression this does not expand"
         )
 
     def visit_FunctionDef(self, node):
@@ -124,6 +308,16 @@ class _DelegationRewriter(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
     visit_Lambda = visit_FunctionDef
     visit_ClassDef = visit_FunctionDef
+
+
+def _awaited(value: ast.expr) -> ast.expr:
+    """`x` becomes `x.__await__()`, which is what awaiting it means."""
+
+    return ast.Call(
+        func=ast.Attribute(value=value, attr="__await__", ctx=ast.Load()),
+        args=[],
+        keywords=[],
+    )
 
 
 def _yields(node: ast.AST) -> bool:
@@ -154,11 +348,10 @@ class _ReturnRewriter(ast.NodeTransformer):
         self.machine = machine
 
     def visit_Return(self, node: ast.Return) -> list[ast.stmt]:
-        if node.value is not None:
-            raise GeneratorRewriteError(
-                node, "a `return` with a value inside a generator"
-            )
-        return [ast.copy_location(part, node) for part in self.machine._stop()]
+        return [
+            ast.copy_location(part, node)
+            for part in self.machine._stop(node.value)
+        ]
 
     def visit_FunctionDef(self, node):  # a nested function's return is its own
         return node
@@ -239,7 +432,13 @@ class _Machine:
             ast.Continue(),
         ]
 
-    def _stop(self) -> list[ast.stmt]:
+    def _stop(self, value: ast.expr | None = None) -> list[ast.stmt]:
+        """End the iteration, carrying a return value if there was one.
+
+        `return v` in a generator is `raise StopIteration(v)`; the value is
+        what `yield from` answers with, which is the only way to see it.
+        """
+
         return [
             ast.Assign(
                 targets=[self._self(STATE, store=True)],
@@ -248,7 +447,7 @@ class _Machine:
             ast.Raise(
                 exc=ast.Call(
                     func=ast.Name(id="StopIteration", ctx=ast.Load()),
-                    args=[],
+                    args=[] if value is None else [value],
                     keywords=[],
                 ),
                 cause=None,
@@ -265,12 +464,18 @@ class _Machine:
     def build(self) -> None:
         # Every `return` first, wherever it sits, so that the cut below never
         # meets one and no copied statement carries one through.
-        delegation = _DelegationRewriter()
-        rewriter = _ReturnRewriter(self)
-        body: list[ast.stmt] = []
-        for statement in self.function.body:
-            replaced = rewriter.visit(delegation.visit(statement))
-            body.extend(replaced if isinstance(replaced, list) else [replaced])
+        # One pass at a time, each over a flat list: a rewriter that answers
+        # with several statements cannot be fed to the next one directly.
+        def pass_over(body: list[ast.stmt], rewriter) -> list[ast.stmt]:
+            out: list[ast.stmt] = []
+            for statement in body:
+                replaced = rewriter.visit(statement)
+                out.extend(replaced if isinstance(replaced, list) else [replaced])
+            return out
+
+        body = _hoist(self.function.body)
+        body = pass_over(body, _DelegationRewriter())
+        body = pass_over(body, _ReturnRewriter(self))
         first = self._new_block()
         end = self._emit(body, first)
         self.blocks[end].extend(self._stop())
@@ -283,6 +488,12 @@ class _Machine:
         return block
 
     def _statement(self, statement: ast.stmt, block: int) -> int:
+        if isinstance(statement, (ast.AsyncFor, ast.AsyncWith)):
+            raise GeneratorRewriteError(
+                statement,
+                f"an `{type(statement).__name__[5:].lower()}` needs the "
+                "asynchronous iteration protocol",
+            )
         if not _yields(statement):
             # Nothing suspends inside it, so it stays exactly as written -
             # only its names are rewritten to attributes, which happens later.
@@ -476,11 +687,7 @@ class _Machine:
                 )
             return after
         if isinstance(statement, ast.Return):
-            if statement.value is not None:
-                raise GeneratorRewriteError(
-                    statement, "a `return` with a value inside a generator"
-                )
-            self.blocks[block].extend(self._stop())
+            self.blocks[block].extend(self._stop(statement.value))
             return self._new_block()
         raise GeneratorRewriteError(
             statement,
@@ -535,7 +742,9 @@ class _ToAttributes(ast.NodeTransformer):
     visit_ClassDef = visit_FunctionDef
 
 
-def rewrite(node: ast.FunctionDef, index: int) -> tuple[ast.ClassDef, ast.FunctionDef]:
+def rewrite(
+    node: ast.FunctionDef, index: int, awaitable: bool = False
+) -> tuple[ast.ClassDef, ast.FunctionDef]:
     """The class that runs the generator, and the function that makes one."""
 
     if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
@@ -673,6 +882,26 @@ def rewrite(node: ast.FunctionDef, index: int) -> tuple[ast.ClassDef, ast.Functi
                 type_params=[],
                 returns=None,
             ),
+            # What `await` asks for. The language defines awaiting an object
+            # with `__await__` as delegating to the iterator it answers with,
+            # and this state machine is one - so a coroutine is a generator
+            # wearing a second name, which is what it is in CPython too.
+            *(
+                [
+                    ast.FunctionDef(
+                        name="__await__",
+                        args=_arguments(["self"]),
+                        body=[
+                            ast.Return(value=ast.Name(id="self", ctx=ast.Load()))
+                        ],
+                        decorator_list=[],
+                        type_params=[],
+                        returns=None,
+                    )
+                ]
+                if awaitable
+                else []
+            ),
             # The dispatch itself, shared: `next(g)` is `g.send(None)` in the
             # protocol, and it is the same here - the only difference is what
             # a resumed `x = yield` finds waiting for it.
@@ -793,6 +1022,24 @@ def expand(tree: ast.Module) -> ast.Module:
         nonlocal counter
         rebuilt: list[ast.stmt] = []
         for statement in body:
+            if isinstance(statement, ast.AsyncFunctionDef):
+                counter += 1
+                # Every `async def` becomes the machine, whether or not it
+                # awaits: what makes it a coroutine is being awaitable, not
+                # being suspended.
+                plain = ast.FunctionDef(
+                    name=statement.name,
+                    args=statement.args,
+                    body=statement.body,
+                    decorator_list=statement.decorator_list,
+                    type_params=[],
+                    returns=None,
+                )
+                ast.copy_location(plain, statement)
+                made, maker = rewrite(plain, counter, awaitable=True)
+                rebuilt.append(made)
+                rebuilt.append(maker)
+                continue
             if isinstance(statement, ast.FunctionDef) and is_generator(statement):
                 counter += 1
                 made, maker = rewrite(statement, counter)

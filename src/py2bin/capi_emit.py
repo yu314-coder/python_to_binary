@@ -101,6 +101,12 @@ class _Machine:
         self.value = value
 
 
+#: The internal name of the module body's function. Deliberately not spellable
+#: as a Python identifier a program would choose, because the renderer tells
+#: the entry body from the program's own functions by this name.
+_ENTRY_BODY = "_py2bin_entry_body"
+
+
 class CApiEmitError(SyntaxError):
     """Something in the program has no C-API translation here yet."""
 
@@ -535,7 +541,7 @@ class CApiEmitter:
         assert self.current is not None
         if self.handlers:
             return f"goto {self.handlers[-1]};"
-        if self.current.name == "main":
+        if self.current.name == _ENTRY_BODY:
             # Py_Finalize before leaving, or everything already printed is
             # lost: sys.stdout is buffered inside the interpreter and exit()
             # does not run its shutdown. A program that printed and then
@@ -4791,7 +4797,11 @@ class CApiEmitter:
                 self.write_function(node)
                 self.write_wrapper(node)
 
-        body = _Function("main" if entry else f"_module_{key}", ())
+        # Not "main": that is a name a Python program may give a function of
+        # its own, and the renderer skips the entry body by name. A program
+        # with `def main()` had its function silently dropped and every call
+        # to it left dangling at the C stage.
+        body = _Function(_ENTRY_BODY if entry else f"_module_{key}", ())
         self.current = body
         self.scope = tree.body
         self.at_module_level = True
@@ -4964,7 +4974,7 @@ class CApiEmitter:
 
         out = [_PROTOTYPES]
         for function in self.functions:
-            if function.name == "main":
+            if function.name == _ENTRY_BODY:
                 continue
             out.append(f"static PyObject *f_{function.name}({signature(function)});")
         # The file-scope storage comes before the bodies that read it. A
@@ -4989,7 +4999,7 @@ class CApiEmitter:
             out.append(_UNBOUND_HELPER)
         out.append("")
         for function in self.functions:
-            if function.name == "main":
+            if function.name == _ENTRY_BODY:
                 continue
             out.append(f"static PyObject *f_{function.name}({signature(function)}) {{")
             out.extend(self.declarations(function, 1))

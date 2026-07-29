@@ -459,7 +459,13 @@ class CApiEmitTests(unittest.TestCase):
         # `*args` and `**kwargs` in a parameter list are no longer refused;
         # see test_a_function_takes_star_args_and_keywords for what they do.
         self._reject("nonlocal x\n", "`nonlocal` is not translated")
-        self._reject("async def f():\n    pass\n", "no C-API translation")
+        # `async def` is no longer refused; see AsyncTests for what it does.
+        # `async for` still is, because there is no asynchronous iteration
+        # protocol here to walk.
+        self._reject(
+            "async def f(xs):\n    async for x in xs:\n        pass\n",
+            "asynchronous iteration",
+        )
 
         # An unknown name is no longer refused at build time: it is looked up
         # in builtins while the program runs, which is how range() and sum()
@@ -2673,7 +2679,6 @@ class GeneratorTests(unittest.TestCase):
     def test_the_shapes_it_cannot_express_are_refused_by_name(self):
         for source, needle in (
             ("def f(c):\n    with c:\n        yield 1\n", "with"),
-            ("def f():\n    yield 1\n    return 2\n", "`return` with a value"),
             ("def f(*xs):\n    yield 1\n", "*args"),
         ):
             with self.subTest(source=source):
@@ -2726,14 +2731,15 @@ class GeneratorDelegationTests(unittest.TestCase):
             b"first None\n",
         )
 
-    def test_a_delegation_whose_value_is_used_is_refused(self):
-        # `yield from` answers with the sub-generator's return value, and this
-        # written as a loop cannot, so it is refused rather than answering None.
+    def test_a_delegation_in_an_expression_it_cannot_lift_is_refused(self):
+        # Lifting it out of an `and` would run it whether or not the first
+        # operand was true.
         with self.assertRaises(CApiEmitError) as caught:
             python_to_capi_c(
-                "def f():\n    x = yield from g()\n", "program.py"
+                "def f(c):\n    x = c and (yield from g())\n    yield x\n",
+                "program.py",
             )
-        self.assertIn("`yield from` whose value is used", str(caught.exception))
+        self.assertIn("`and`", str(caught.exception))
 
 
 class GeneratorHandlerTests(unittest.TestCase):
@@ -2845,3 +2851,133 @@ class GeneratorHandlerTests(unittest.TestCase):
                 with self.assertRaises(CApiEmitError) as caught:
                     python_to_capi_c(source, "program.py")
                 self.assertIn(needle, str(caught.exception))
+
+
+class AsyncTests(unittest.TestCase):
+    """`async def` and `await`, which are the generator machine renamed.
+
+    Awaiting an object with `__await__` means delegating to the iterator it
+    answers with - so a coroutine is a state machine that also says
+    `__await__`, which is what it is in CPython too. `await x` is then PEP
+    380's expansion of `yield from x.__await__()`, and the event loop drives
+    it through `send` exactly as it drives a real coroutine.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_awaiting_a_compiled_coroutine(self):
+        self._run(
+            "import asyncio\n"
+            "async def inner(n):\n"
+            "    return n * 2\n"
+            "async def middle(n):\n"
+            "    doubled = await inner(n)\n"
+            "    return doubled + 1\n"
+            "async def main():\n"
+            "    return await middle(3) + await inner(10)\n"
+            "print(asyncio.run(main()))\n",
+            b"27\n",
+        )
+
+    def test_a_real_suspension_through_the_event_loop(self):
+        # asyncio.sleep actually yields to the loop, so this only passes if
+        # the state machine suspends and resumes the way a coroutine does.
+        self._run(
+            "import asyncio\n"
+            "async def slow(name, delay):\n"
+            "    await asyncio.sleep(delay)\n"
+            "    return name\n"
+            "async def sequential():\n"
+            "    first = await slow('a', 0.01)\n"
+            "    second = await slow('b', 0.01)\n"
+            "    return [first, second]\n"
+            "print(asyncio.run(sequential()))\n",
+            b"['a', 'b']\n",
+        )
+
+    def test_gather_runs_compiled_coroutines_together(self):
+        self._run(
+            "import asyncio\n"
+            "async def slow(name, delay):\n"
+            "    await asyncio.sleep(delay)\n"
+            "    return name\n"
+            "async def together():\n"
+            "    return await asyncio.gather(slow('x', 0.02), slow('y', 0.01))\n"
+            "print(asyncio.run(together()))\n",
+            b"['x', 'y']\n",
+        )
+
+    def test_a_handler_inside_a_coroutine(self):
+        self._run(
+            "import asyncio\n"
+            "async def guarded():\n"
+            "    try:\n"
+            "        await asyncio.sleep(0.01)\n"
+            "        raise ValueError('inside')\n"
+            "    except ValueError as error:\n"
+            "        return f'caught {error}'\n"
+            "print(asyncio.run(guarded()))\n",
+            b"caught inside\n",
+        )
+
+    def test_awaits_that_cannot_be_lifted_are_refused(self):
+        # Lifting an await out of a conditional would run it unconditionally,
+        # and out of a comprehension would run it once instead of many times.
+        for source, needle in (
+            ("import asyncio\nasync def f(c):\n    return c and await g()\n", "`and`"),
+            ("import asyncio\nasync def f(c):\n    return await g() if c else 1\n", "arm"),
+            ("import asyncio\nasync def f(xs):\n    return [await g(x) for x in xs]\n", "comprehension"),
+            ("import asyncio\nasync def f(xs):\n    async for x in xs:\n        pass\n", "asynchronous iteration"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(CApiEmitError) as caught:
+                    python_to_capi_c(source, "program.py")
+                self.assertIn(needle, str(caught.exception))
+
+
+class DelegationReturnTests(unittest.TestCase):
+    """`yield from` written out as PEP 380 defines it."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_sub_generators_return_value_is_the_expressions_value(self):
+        self._run(
+            "def sub():\n"
+            "    got = yield 'sub asks'\n"
+            "    yield f'sub got {got}'\n"
+            "    return 'sub returned'\n"
+            "def outer():\n"
+            "    answer = yield from sub()\n"
+            "    yield f'outer saw {answer}'\n"
+            "g = outer()\n"
+            "print(next(g))\n"
+            "print(g.send('a value'))\n"
+            "print(next(g))\n",
+            b"sub asks\nsub got a value\nouter saw sub returned\n",
+        )
+
+    def test_a_generator_may_return_a_value(self):
+        self._run(
+            "def counted():\n"
+            "    yield 1\n"
+            "    return 99\n"
+            "def uses():\n"
+            "    value = yield from counted()\n"
+            "    yield value\n"
+            "print(list(uses()))\n",
+            b"[1, 99]\n",
+        )
+
+
+class EntryNameTests(unittest.TestCase):
+    """A program may call one of its own functions `main`.
+
+    The module body compiles to the C entry point, and the renderer told it
+    from the program's own functions by the name "main" - so `def main()` was
+    dropped and every call to it dangled at the C stage.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_a_function_called_main_is_compiled(self):
+        self._run("def main():\n    return 7\nprint(main())\n", b"7\n")

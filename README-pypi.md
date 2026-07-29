@@ -157,11 +157,12 @@ CPython, and requiring identical stdout and exit status.
 | starred unpacking (`a, *b, c = …`) | ✅ |
 | `match`: values, `\|`, captures, sequences, guards | ✅ |
 | `match`: mapping and class patterns, `__match_args__` | ✅ |
-| generators (`yield`), `send`, `yield from` | ✅ |
+| generators: `yield`, `send`, `yield from`, `return value` | ✅ |
+| `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
 | `yield` inside `try` / `except` | ✅ |
-| `yield` inside `try` / `finally` or `with` | ❌ |
-| `async` / `await` | ❌ |
+| `yield`/`await` inside `try` / `finally` or `with` | ❌ |
+| `async for` / `async with` | ❌ |
 
 A generator cannot be compiled the way the rest is - a C function has one
 entry and its locals die with its frame, so it cannot stop in the middle of
@@ -185,6 +186,14 @@ something the cut cannot give. It does not: an exception can only be raised
 while a *block* is running, so each block of the guarded region carries the
 handler and it is re-established on every entry rather than having to persist
 across one.
+
+`await` is the same machine with a second name on it. Awaiting an object with
+`__await__` means delegating to the iterator it answers with, and a state
+machine is one - so an `async def` compiles to the same class, plus `__await__`
+returning itself, and `await x` is PEP 380's expansion of
+`yield from x.__await__()`. A real event loop then drives it through `send`
+exactly as it drives a coroutine: `asyncio.run`, `asyncio.sleep` and
+`asyncio.gather` all work on compiled coroutines.
 
 A `finally` is different and is refused. It has to run when the generator is
 *closed* - abandoned, garbage collected - and nothing here is told about a
