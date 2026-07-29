@@ -1085,6 +1085,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"({carried} bytes)",
                     file=sys.stderr,
                 )
+            if args.app and target.startswith("darwin"):
+                from .macos_seal import seal
+
+                # Last, once the interpreter, the packages and the program's
+                # own files are all in place. A seal written any earlier
+                # describes a bundle that does not exist yet.
+                sealed = seal(output)
+                print(f"sealed the bundle over {sealed} files", file=sys.stderr)
             print(
                 f"compiled {entry} through the CPython C API to "
                 f"{artifact.artifact} ({artifact.bytes} bytes, C at {source})"
