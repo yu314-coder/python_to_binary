@@ -689,6 +689,11 @@ class CApiEmitter:
 
         if self.current is None or name not in self.current.unboxed:
             return False
+        # A name whose storage is the module's is not this body's to hold in
+        # registers, whatever the analysis said: every other reference to it
+        # goes to `g_`, and two storages for one name is one too many.
+        if self.at_module_level or name in self.current.module_names:
+            return False
         # A comprehension puts its own scope in front; a name of that scope is
         # a different name that happens to be spelled the same.
         return not any(name in scope for scope in self.shadowed)
@@ -1140,8 +1145,12 @@ class CApiEmitter:
             return f"p_{name}"
         if f"v_{name}" in self.current.locals:
             return f"v_{name}"
-        if name in self.current.unboxed:
+        if self.is_unboxed(name):
             # Declared as three variables; the object half is still `v_`.
+            # Asked through `is_unboxed` rather than of the set directly, so
+            # that a name the set holds but this scope stores in the module's
+            # slot answers with the module's slot, like every other reference
+            # to it.
             return f"v_{name}"
         if name in self.current.captures:
             return f"c_{name}"
@@ -3709,11 +3718,12 @@ class CApiEmitter:
         self.checked(iterator, indent)
         self.emit(f"Py_DecRef({sequence});", indent)
         item = self.temporary()
-        target = (
-            self.declare(node.target.id)
-            if isinstance(node.target, ast.Name)
-            else None
-        )
+        # Through `bind_target`, not `declare`: a name held in the unboxed
+        # representation is three C variables, and `declare` answers with the
+        # storage a *plain* local or global would use. Binding one and reading
+        # the other is how `for arg in cmd:` came to write `g_arg` and read
+        # `v_arg` - a NULL that reached PySequence_Contains and segfaulted.
+        target = None
         self.emit("while (1) {", indent)
         self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
         # NULL means the sequence ended, or that producing the next item
@@ -3722,14 +3732,13 @@ class CApiEmitter:
             f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
             indent + 1,
         )
-        if target is None:
+        if isinstance(node.target, ast.Name):
+            self.bind_target(node.target, item, indent + 1)
+        else:
             # `for a, b in pairs` - the item is taken apart the way an
             # assignment to the same target would take it apart.
             self.unpack_value(node.target, item, indent + 1)
             self.emit(f"Py_DecRef({item});", indent + 1)
-        else:
-            self.emit(f"if ({target}) Py_DecRef({target});", indent + 1)
-            self.emit(f"{target} = {item};", indent + 1)
         broke = self.begin_loop(node, indent)
         self.loop_depth += 1
         try:

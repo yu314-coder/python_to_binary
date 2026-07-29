@@ -3010,3 +3010,53 @@ class CrashLogTests(unittest.TestCase):
     def test_without_the_flag_nothing_is_written(self):
         written = python_to_capi_c("raise ValueError('x')\n", "program.py")
         self.assertNotIn("_py2bin_crash_report", written)
+
+
+class StorageAgreementTests(unittest.TestCase):
+    """A name has one storage, and every reference must use it.
+
+    A name the register analysis picked out is three C variables; a name whose
+    storage is the module's is one. Deciding that separately at the binding and
+    at the read let a `for` loop write `g_arg` while the body read `v_arg` -
+    a NULL that reached PySequence_Contains and segfaulted a real application,
+    with no exception and so no traceback to go on.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_a_for_target_is_read_from_where_the_loop_wrote_it(self):
+        self._run(
+            "cmd = ['a b', 'c']\n"
+            "for arg in cmd:\n"
+            "    if ' ' in arg:\n"
+            "        print('space in', arg)\n"
+            "    else:\n"
+            "        print('no space in', arg)\n",
+            b"space in a b\nno space in c\n",
+        )
+
+    def test_a_module_level_loop_target_uses_the_module_slot(self):
+        written = python_to_capi_c(
+            "total = 0\n"
+            "for n in [1, 2]:\n"
+            "    total = total + n\n"
+            "print(total)\n",
+            "program.py",
+        )
+        # One storage for `n`: the module's. Not a register pair as well.
+        self.assertIn("g_n = ", written)
+        self.assertNotIn("long long n_n", written)
+
+    def test_the_registers_are_still_used_inside_a_function(self):
+        # The fix must not switch the optimisation off where it is correct.
+        written = python_to_capi_c(
+            "def total():\n"
+            "    n = 0\n"
+            "    for i in range(5):\n"
+            "        n = n + i\n"
+            "    return n\n"
+            "print(total())\n",
+            "program.py",
+        )
+        self.assertIn("long long n_n", written)
+        self.assertIn("long long n_i", written)
