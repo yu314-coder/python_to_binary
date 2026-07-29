@@ -2672,9 +2672,6 @@ class GeneratorTests(unittest.TestCase):
 
     def test_the_shapes_it_cannot_express_are_refused_by_name(self):
         for source, needle in (
-            # A handler has to survive the suspension, which cutting the body
-            # into blocks does not arrange for.
-            ("def f():\n    try:\n        yield 1\n    except ValueError:\n        pass\n", "try"),
             ("def f(c):\n    with c:\n        yield 1\n", "with"),
             ("def f():\n    yield 1\n    return 2\n", "`return` with a value"),
             ("def f(*xs):\n    yield 1\n", "*args"),
@@ -2737,3 +2734,114 @@ class GeneratorDelegationTests(unittest.TestCase):
                 "def f():\n    x = yield from g()\n", "program.py"
             )
         self.assertIn("`yield from` whose value is used", str(caught.exception))
+
+
+class GeneratorHandlerTests(unittest.TestCase):
+    """`try`/`except` around a `yield`, which the handler has to survive.
+
+    The difficulty is that the generator stops inside the `try` and the handler
+    has to still be there when it starts again. It is, because an exception can
+    only be raised while a *block* is running: each block of the guarded region
+    carries the handler, so it is re-established on every entry rather than
+    having to persist across one.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_a_handler_survives_the_suspension(self):
+        self._run(
+            "def guarded(xs):\n"
+            "    for x in xs:\n"
+            "        try:\n"
+            "            if x == 0:\n"
+            "                raise ValueError('zero')\n"
+            "            yield 10 // x\n"
+            "        except ValueError as error:\n"
+            "            yield f'caught {error}'\n"
+            "print(list(guarded([1, 0, 2])))\n",
+            b"[10, 'caught zero', 5]\n",
+        )
+
+    def test_an_exception_raised_after_a_yield_is_caught(self):
+        self._run(
+            "def after():\n"
+            "    try:\n"
+            "        yield 'before'\n"
+            "        raise KeyError('k')\n"
+            "    except KeyError:\n"
+            "        yield 'handled'\n"
+            "    yield 'done'\n"
+            "print(list(after()))\n",
+            b"['before', 'handled', 'done']\n",
+        )
+
+    def test_nested_handlers_catch_innermost_first(self):
+        self._run(
+            "def nested():\n"
+            "    try:\n"
+            "        try:\n"
+            "            yield 1\n"
+            "            raise ValueError('inner')\n"
+            "        except ValueError:\n"
+            "            yield 2\n"
+            "            raise TypeError('outer')\n"
+            "    except TypeError:\n"
+            "        yield 3\n"
+            "print(list(nested()))\n",
+            b"[1, 2, 3]\n",
+        )
+
+    def test_several_clauses_a_tuple_and_a_bare_except(self):
+        self._run(
+            "def many(kind):\n"
+            "    try:\n"
+            "        if kind == 'v':\n"
+            "            raise ValueError('v')\n"
+            "        if kind == 'k':\n"
+            "            raise KeyError('k')\n"
+            "        yield 'none raised'\n"
+            "    except ValueError:\n"
+            "        yield 'value'\n"
+            "    except (KeyError, IndexError):\n"
+            "        yield 'key or index'\n"
+            "    yield 'end'\n"
+            "def bare():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "        raise RuntimeError('boom')\n"
+            "    except:\n"
+            "        yield 2\n"
+            "print(list(many('v')), list(many('k')), list(many('n')))\n"
+            "print(list(bare()))\n",
+            b"['value', 'end'] ['key or index', 'end'] ['none raised', 'end']\n"
+            b"[1, 2]\n",
+        )
+
+    def test_what_no_clause_matches_still_propagates(self):
+        self._run(
+            "def escapes():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "        raise TypeError('not caught here')\n"
+            "    except ValueError:\n"
+            "        yield 'wrong'\n"
+            "try:\n"
+            "    print(list(escapes()))\n"
+            "except TypeError as error:\n"
+            "    print('propagated:', error)\n",
+            b"propagated: not caught here\n",
+        )
+
+    def test_finally_and_with_are_refused_with_the_reason(self):
+        # A `finally` has to run when the generator is *closed*, not only when
+        # it is consumed - and nothing here is told about a close. Cleanup that
+        # silently does not happen is worse than a refusal.
+        for source, needle in (
+            ("def f():\n    try:\n        yield 1\n    finally:\n        pass\n",
+             "closed"),
+            ("def f(c):\n    with c:\n        yield 1\n", "with"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(CApiEmitError) as caught:
+                    python_to_capi_c(source, "program.py")
+                self.assertIn(needle, str(caught.exception))

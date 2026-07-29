@@ -208,6 +208,13 @@ class _Machine:
         self.function = function
         #: block number -> the statements that block runs.
         self.blocks: list[list[ast.stmt]] = []
+        #: For each block, the `except` clauses that are live while it runs,
+        #: innermost last. An exception can only be raised while a block is
+        #: executing, so a handler that is re-established on every entry to
+        #: every block of the region is a handler that survives the
+        #: suspension - which is the whole difficulty with `try` and `yield`.
+        self.guards: list[list[tuple[list[ast.ExceptHandler], list[int]]]] = []
+        self.region: list[tuple[list[ast.ExceptHandler], list[int]]] = []
         #: Every name the body binds, which becomes an attribute.
         self.names: set[str] = set()
         self.loops = 0
@@ -250,6 +257,7 @@ class _Machine:
 
     def _new_block(self) -> int:
         self.blocks.append([])
+        self.guards.append(list(self.region))
         return len(self.blocks) - 1
 
     # --- the cut itself ---------------------------------------------------
@@ -439,6 +447,34 @@ class _Machine:
                 self._emit(self._exits(statement.body, test, after), body)
             ].extend(self._goto(test))
             return after
+        if isinstance(statement, ast.Try):
+            if statement.finalbody:
+                raise GeneratorRewriteError(
+                    statement,
+                    "a `try ... finally` containing `yield`, which would have "
+                    "to run its cleanup when the generator is closed",
+                )
+            if statement.orelse:
+                raise GeneratorRewriteError(
+                    statement, "a `try ... else` containing `yield`"
+                )
+            after = self._new_block()
+            # One entry block per clause, outside the region: a handler does
+            # not guard itself.
+            entries = [self._new_block() for _ in statement.handlers]
+            body = self._new_block()
+            self.blocks[block].extend(self._goto(body))
+            self.region.append((statement.handlers, entries))
+            self.guards[body] = list(self.region)
+            self.blocks[self._emit(statement.body, body)].extend(self._goto(after))
+            self.region.pop()
+            for handler, entry in zip(statement.handlers, entries):
+                if handler.name:
+                    self.names.add(handler.name)
+                self.blocks[self._emit(handler.body, entry)].extend(
+                    self._goto(after)
+                )
+            return after
         if isinstance(statement, ast.Return):
             if statement.value is not None:
                 raise GeneratorRewriteError(
@@ -516,6 +552,35 @@ def rewrite(node: ast.FunctionDef, index: int) -> tuple[ast.ClassDef, ast.Functi
         body = [rename.visit(statement) for statement in machine.blocks[number]] or [
             ast.Pass()
         ]
+        # Innermost first, so the nearest handler is the one that catches.
+        for handlers, entries in reversed(machine.guards[number]):
+            caught = []
+            for handler, entry in zip(handlers, entries):
+                jump: list[ast.stmt] = []
+                if handler.name:
+                    # The caught object outlives this call, so it is kept
+                    # where every other local of the generator is kept.
+                    jump.append(
+                        ast.Assign(
+                            targets=[
+                                ast.Attribute(
+                                    value=ast.Name(id="self", ctx=ast.Load()),
+                                    attr=handler.name,
+                                    ctx=ast.Store(),
+                                )
+                            ],
+                            value=ast.Name(id="_py2bin_caught", ctx=ast.Load()),
+                        )
+                    )
+                jump.extend(machine._goto(entry))
+                caught.append(
+                    ast.ExceptHandler(
+                        type=handler.type,
+                        name="_py2bin_caught" if handler.name else None,
+                        body=jump,
+                    )
+                )
+            body = [ast.Try(body=body, handlers=caught, orelse=[], finalbody=[])]
         dispatch = [
             ast.If(
                 test=ast.Compare(

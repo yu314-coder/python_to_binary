@@ -159,7 +159,8 @@ CPython, and requiring identical stdout and exit status.
 | `match`: mapping and class patterns, `__match_args__` | ✅ |
 | generators (`yield`), `send`, `yield from` | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
-| `yield` inside `try` or `with` | ❌ |
+| `yield` inside `try` / `except` | ✅ |
+| `yield` inside `try` / `finally` or `with` | ❌ |
 | `async` / `await` | ❌ |
 
 A generator cannot be compiled the way the rest is - a C function has one
@@ -178,9 +179,18 @@ straight-line code, `if`/`else`, `while`, `for`, `break`, `continue` and a bare
 forwards iteration but not a `send` into the sub-generator, so a `yield from`
 whose value is used is refused rather than quietly answering None.
 
-What is left is refused by name. A `yield` inside `try` or `with` needs the
-handler to survive the suspension, which cutting the body into blocks does not
-arrange for; `async` needs that and a scheduler besides.
+A `try`/`except` around a `yield` works, and the way it works is worth saying,
+because "the handler has to survive the suspension" sounds like it needs
+something the cut cannot give. It does not: an exception can only be raised
+while a *block* is running, so each block of the guarded region carries the
+handler and it is re-established on every entry rather than having to persist
+across one.
+
+A `finally` is different and is refused. It has to run when the generator is
+*closed* - abandoned, garbage collected - and nothing here is told about a
+close. Cleanup that silently does not happen is worse than a refusal, and
+`with` is a `finally`, so it is refused too. `async` needs all of this plus a
+scheduler and the coroutine protocol.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
 889-program corpus, 878 programs produce byte-identical output to CPython; the
