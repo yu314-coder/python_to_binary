@@ -4,6 +4,13 @@ import struct
 import hashlib
 
 
+#: The oldest macOS these images claim to run on, and the SDK they claim to
+#: have been built against. Both are ordinary version numbers, packed as
+#: major<<16 | minor<<8 | patch.
+_MINIMUM_MACOS = 11 << 16          # 11.0.0, the first macOS on arm64
+_DECLARED_SDK = 14 << 16           # 14.0.0
+
+
 def _name(value: str) -> bytes:
     return value.encode("ascii").ljust(16, b"\0")
 
@@ -468,7 +475,16 @@ def _write_macho_dynamic(
         0,
     )
     dylinker = struct.pack("<III", 0xE, 32, 12) + b"/usr/lib/dyld\0".ljust(20, b"\0")
-    build_version = struct.pack("<IIIIII", 0x32, 24, 1, 13 << 16, 0, 0)
+    # LC_BUILD_VERSION: platform macOS, a minimum this can actually run on,
+    # and an SDK that is a real version. The SDK was zero, which macOS reads as
+    # "built before 10.9" - the crash reports say so in as many words, "OS X
+    # SDK version before 10.9 does not support Library Validation". A machine
+    # with System Integrity Protection off tolerates that; one with it on need
+    # not, and refuses before the process starts, which leaves no crash report
+    # and no Gatekeeper entry to look at.
+    build_version = struct.pack(
+        "<IIIIII", 0x32, 24, 1, _MINIMUM_MACOS, _DECLARED_SDK, 0
+    )
     uuid_command = struct.pack("<II", 0x1B, 24) + hashlib.sha256(code).digest()[:16]
     main_command = struct.pack("<IIQQ", 0x80000028, 24, code_fileoff, 0)
 
@@ -561,7 +577,16 @@ def write_macho_arm64(
         0, 0, 0x80000400, 0, 0, 0,
     )
     dylinker = struct.pack("<III", 0xE, 32, 12) + b"/usr/lib/dyld\0".ljust(20, b"\0")
-    build_version = struct.pack("<IIIIII", 0x32, 24, 1, 13 << 16, 0, 0)
+    # LC_BUILD_VERSION: platform macOS, a minimum this can actually run on,
+    # and an SDK that is a real version. The SDK was zero, which macOS reads as
+    # "built before 10.9" - the crash reports say so in as many words, "OS X
+    # SDK version before 10.9 does not support Library Validation". A machine
+    # with System Integrity Protection off tolerates that; one with it on need
+    # not, and refuses before the process starts, which leaves no crash report
+    # and no Gatekeeper entry to look at.
+    build_version = struct.pack(
+        "<IIIIII", 0x32, 24, 1, _MINIMUM_MACOS, _DECLARED_SDK, 0
+    )
     uuid_command = struct.pack("<II", 0x1B, 24) + hashlib.sha256(code).digest()[:16]
     main_command = struct.pack("<IIQQ", 0x80000028, 24, page, 0)
     # Tell dyld explicitly that this image has no rebases, binds, or exports.
