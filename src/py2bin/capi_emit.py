@@ -101,6 +101,45 @@ class _Machine:
         self.value = value
 
 
+#: Written into a program built with --crash-log. An uncaught exception in a
+#: windowed application has nowhere to print: there is no console attached, so
+#: the traceback that would say what went wrong is discarded and the app simply
+#: disappears. This puts it in a file as well, beside the executable when that
+#: is writable and in the user's home when it is not - which is the case for an
+#: app in /Applications.
+_CRASH_REPORT = r"""
+static void _py2bin_crash_report(void) {
+    PyObject *held = PyErr_GetRaisedException();
+    if (held) {
+        /* Handed to Python through builtins: the traceback module formats an
+           exception far better than anything reasonable to write in C, and it
+           is already in the interpreter this program links. */
+        PyObject *builtins = PyImport_ImportModule("builtins");
+        if (builtins) {
+            PyObject_SetAttrString(builtins, "_py2bin_crash", held);
+            Py_DecRef(builtins);
+            PyRun_SimpleString(
+                "import builtins, os, sys, traceback\n"
+                "_e = builtins._py2bin_crash\n"
+                "_where = os.path.dirname(os.path.abspath(sys.executable))\n"
+                "for _dir in (_where, os.path.expanduser('~')):\n"
+                "    try:\n"
+                "        _p = os.path.join(_dir, 'crash.txt')\n"
+                "        with open(_p, 'w', encoding='utf-8') as _f:\n"
+                "            _f.write('argv: %r\\n\\n' % (sys.argv,))\n"
+                "            traceback.print_exception(_e, file=_f)\n"
+                "        sys.stderr.write('py2bin: wrote ' + _p + '\\n')\n"
+                "        break\n"
+                "    except Exception:\n"
+                "        continue\n"
+            );
+        }
+        PyErr_SetRaisedException(held);
+    }
+    PyErr_Print();
+}
+"""
+
 #: The internal name of the module body's function. Deliberately not spellable
 #: as a Python identifier a program would choose, because the renderer tells
 #: the entry body from the program's own functions by this name.
@@ -451,6 +490,8 @@ class CApiEmitter:
         #: Builtin names this module binds for itself. A counted loop is only
         #: written where `range` is certainly the interpreter's own.
         self.shadowed_builtins: set[str] = set()
+        #: True when the program should write a crash.txt as well as printing.
+        self.crash_log = False
         #: Non-zero while emitting the slow arm of a fast path, where the
         #: fast path must not be offered a second time.
         self.boxing = 0
@@ -527,6 +568,11 @@ class CApiEmitter:
         assert self.current is not None
         self.current.body.append("    " * indent + line)
 
+    def _report(self) -> str:
+        """How this program reports a fatal error."""
+
+        return "_py2bin_crash_report()" if self.crash_log else "PyErr_Print()"
+
     def failure(self) -> str:
         """What to do where a C-API call has just failed.
 
@@ -546,7 +592,8 @@ class CApiEmitter:
             # lost: sys.stdout is buffered inside the interpreter and exit()
             # does not run its shutdown. A program that printed and then
             # raised showed nothing at all.
-            return "PyErr_Print(); Py_Finalize(); exit(1);"
+            report = "_py2bin_crash_report()" if self.crash_log else "PyErr_Print()"
+            return f"{report}; Py_Finalize(); exit(1);"
         self.current.unwinds = True
         return "goto _unwind;"
 
@@ -4995,6 +5042,8 @@ class CApiEmitter:
             out.append(f"static PyObject *m_{key} = 0;")
         for name, slot in self.cached_builtins.items():
             out.append(f"static PyObject *{slot} = 0;  /* {name} */")
+        if self.crash_log:
+            out.append(_CRASH_REPORT)
         if self.needs_unbound:
             out.append(_UNBOUND_HELPER)
         out.append("")
@@ -5040,7 +5089,7 @@ class CApiEmitter:
                 f"{_c_string(name)});"
             )
             out.append(
-                f"    if (!{slot}) {{ PyErr_Print(); Py_Finalize(); exit(1); }}"
+                f"    if (!{slot}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
             )
         for directory in self.extra_paths:
             # In front, so a directory named at build time wins over whatever
@@ -5083,7 +5132,7 @@ class CApiEmitter:
                 f"    m_{key} = PyImport_AddModule({_c_string(name)});"
             )
             out.append(
-                f"    if (!m_{key}) {{ PyErr_Print(); Py_Finalize(); exit(1); }}"
+                f"    if (!m_{key}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
             )
             # PyImport_AddModule borrows; sys.modules owns it, and this holds
             # its own reference for as long as the program runs.
@@ -5163,7 +5212,7 @@ def imported_names(path: Path) -> set[str]:
 
 
 def python_program_to_capi_c(
-    entry: Path, extra_paths: tuple[str, ...] = ()
+    entry: Path, extra_paths: tuple[str, ...] = (), crash_log: bool = False
 ) -> tuple[str, list[str]]:
     """Translate a program - the entry and the modules beside it - into one C.
 
@@ -5174,6 +5223,7 @@ def python_program_to_capi_c(
     modules = local_modules(entry)
     emitter = CApiEmitter(entry)
     emitter.extra_paths = list(extra_paths)
+    emitter.crash_log = crash_log
     trees = [
         (name, ast.parse(path.read_text(encoding="utf-8")), str(path))
         for name, path in modules

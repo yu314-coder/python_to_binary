@@ -2981,3 +2981,32 @@ class EntryNameTests(unittest.TestCase):
 
     def test_a_function_called_main_is_compiled(self):
         self._run("def main():\n    return 7\nprint(main())\n", b"7\n")
+
+
+class CrashLogTests(unittest.TestCase):
+    """A windowed application has no console, so a traceback needs a file."""
+
+    def test_a_crash_log_program_writes_the_traceback_beside_itself(self):
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("the C-API path is darwin-arm64 only on this host")
+        from py2bin.capi_emit import python_program_to_capi_c
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text("raise ValueError('deliberate')\n", encoding="utf-8")
+            written = root / "program.c"
+            generated, _linked = python_program_to_capi_c(entry, crash_log=True)
+            written.write_text(generated, encoding="utf-8")
+            binary = root / "program.bin"
+            compile_c_native(written, binary, target="darwin-arm64", clean=True)
+            subprocess.run([str(binary)], capture_output=True, cwd=directory)
+            report = root / "crash.txt"
+            self.assertTrue(report.is_file(), "no crash.txt was written")
+            text = report.read_text(encoding="utf-8")
+        self.assertIn("ValueError: deliberate", text)
+        self.assertIn("argv:", text)
+
+    def test_without_the_flag_nothing_is_written(self):
+        written = python_to_capi_c("raise ValueError('x')\n", "program.py")
+        self.assertNotIn("_py2bin_crash_report", written)

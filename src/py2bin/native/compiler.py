@@ -117,10 +117,28 @@ def _app_metadata(
             "rules2": {
                 ".*\\.dSYM($|/)": {"weight": 11},
                 "^(.*/)?\\.DS_Store$": {"omit": True, "weight": 2000},
-                "^(Frameworks|SharedFrameworks|PlugIns|Plug-ins|XPCServices|Helpers|MacOS)/": {
+                "^(SharedFrameworks|PlugIns|Plug-ins|XPCServices|Helpers)/": {
                     "nested": True,
                     "weight": 10,
                 },
+                # Not Frameworks: the interpreter carried there is thinned to
+                # this bundle's architecture, which breaks the seal Apple put
+                # over its own Resources. Left marked as nested code, that
+                # broken seal is what a second Mac refuses on - the framework
+                # verifies as "directory or signature have been modified".
+                "^Frameworks/": {"omit": True, "weight": 2000},
+                # What this writer puts in a bundle, and what a caller adds
+                # beside the executable. The seal is computed while the image
+                # is being written - before the interpreter, the packages and
+                # the program's own assets are copied in - so it cannot carry
+                # their hashes, and a rule that claimed to seal them would call
+                # every one of them an unsigned addition. That is what stopped
+                # a bundle opening on a second Mac: it ran where it was built,
+                # because a binary's own signature is what execution checks,
+                # and Gatekeeper checks the whole bundle.
+                "^MacOS/": {"omit": True, "weight": 2000},
+                "^lib/": {"omit": True, "weight": 2000},
+                "^Resources/site-packages/": {"omit": True, "weight": 2000},
                 "^.*": True,
                 "^Info\\.plist$": {"omit": True, "weight": 20},
                 "^PkgInfo$": {"omit": True, "weight": 20},
@@ -178,8 +196,11 @@ def compile_native_source(
     if target not in TARGETS:
         raise ValueError(f"unknown target {target!r}; supported: {', '.join(TARGETS)}")
     if app:
-        if target != "darwin-arm64":
-            raise ValueError("--app currently requires target darwin-arm64")
+        if not target.startswith("darwin-"):
+            raise ValueError(
+                f"--app writes a macOS bundle, so it needs a darwin target, "
+                f"not {target!r}"
+            )
         if output.suffix != ".app":
             output = output.with_suffix(".app")
     if output.exists() and not clean:
@@ -214,8 +235,11 @@ def compile_native_module(
     if target not in TARGETS:
         raise ValueError(f"unknown target {target!r}; supported: {', '.join(TARGETS)}")
     if app:
-        if target != "darwin-arm64":
-            raise ValueError("--app currently requires target darwin-arm64")
+        if not target.startswith("darwin-"):
+            raise ValueError(
+                f"--app writes a macOS bundle, so it needs a darwin target, "
+                f"not {target!r}"
+            )
         if output.suffix != ".app":
             output = output.with_suffix(".app")
     if output.exists() and not clean:

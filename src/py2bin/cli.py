@@ -200,6 +200,17 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     capi_parser.add_argument(
+        "--crash-log",
+        action="store_true",
+        help=(
+            "write the traceback to crash.txt as well as printing it. A "
+            "windowed application has no console to print to, so without this "
+            "an uncaught exception makes it vanish with nothing to read; the "
+            "file goes beside the executable, or in the user's home when that "
+            "is not writable"
+        ),
+    )
+    capi_parser.add_argument(
         "--exclude",
         action="append",
         metavar="MODULE",
@@ -978,7 +989,8 @@ def main(argv: list[str] | None = None) -> int:
             target = _target_from_args(args)
             generated, linked = python_program_to_capi_c(
                 entry,
-                _site_paths(args.site),
+                crash_log=args.crash_log,
+                extra_paths=_site_paths(args.site),
             )
             if linked:
                 print(
@@ -1023,7 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.embed_python:
                 from .freezer import embed_cpython_in_app
 
-                carried = embed_cpython_in_app(output)
+                carried = embed_cpython_in_app(output, target)
                 freed = 0
                 if args.prune_unused:
                     from .freezer import (

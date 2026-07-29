@@ -370,7 +370,7 @@ def compile_bundle_sources(bundle: Path) -> int:
     return saved
 
 
-def embed_cpython_in_app(bundle: Path) -> int:
+def embed_cpython_in_app(bundle: Path, target: str = "darwin-arm64") -> int:
     """Put this CPython inside a compiled ``.app`` so the bundle can travel.
 
     A compiled artifact names its interpreter in an ``LC_LOAD_DYLIB``, and dyld
@@ -451,7 +451,7 @@ def embed_cpython_in_app(bundle: Path) -> int:
         carried_version / dylib.name,
     ):
         if binary.is_file():
-            _thin_to_arm64(binary)
+            _thin_to_arm64(binary, _BUNDLE_ARCHITECTURES[target])
     return sum(
         item.stat().st_size
         for item in (
@@ -683,13 +683,18 @@ def _drop_unreferenced_libraries(
 
 
 
-#: The architecture a darwin-arm64 bundle runs. CPU_TYPE_ARM64 is
-#: CPU_TYPE_ARM (12) with the 64-bit ABI bit set.
+#: CPU_TYPE_ARM (12) with the 64-bit ABI bit set, and CPU_TYPE_X86 (7) with it.
 _CPU_TYPE_ARM64 = 0x0100000C
+_CPU_TYPE_X86_64 = 0x01000007
+#: What each darwin target keeps when a carried file is universal.
+_BUNDLE_ARCHITECTURES = {
+    "darwin-arm64": _CPU_TYPE_ARM64,
+    "darwin-x86_64": _CPU_TYPE_X86_64,
+}
 
 
-def _thin_to_arm64(binary: Path) -> bool:
-    """Keep only the arm64 slice of a universal file. True if it changed.
+def _thin_to_arm64(binary: Path, wanted: int = _CPU_TYPE_ARM64) -> bool:
+    """Keep only this architecture's slice of a universal file.
 
     Every slice of a universal binary carries its own signature, so lifting one
     out yields a thin file that is still signed - which is why this is safe on
@@ -713,7 +718,7 @@ def _thin_to_arm64(binary: Path) -> bool:
             cpu, _sub, offset, size = struct.unpack_from(">IIQQ", data, at)
         else:
             cpu, _sub, offset, size = struct.unpack_from(">IIII", data, at)
-        if cpu == _CPU_TYPE_ARM64:
+        if cpu == wanted:
             binary.write_bytes(data[offset : offset + size])
             return True
     return False
