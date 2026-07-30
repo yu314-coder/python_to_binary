@@ -128,6 +128,21 @@ standard library and would pass an imports-only-stdlib check, but it pulls in
 `subprocess` - and there are Pythons where a subprocess is not something a
 program may have.
 
+## Bundling for Windows
+
+The runtime sits beside the executable rather than in a bundle. Two traps,
+both silent:
+
+The embeddable CPython ships a `pythonXY._pth` naming exactly two places, and
+`sys.path` is those and nothing else - packages in `Lib\site-packages` are
+invisible until that file names them, and the program reports
+`ModuleNotFoundError` for something plainly on disk. And a wheel must match the
+interpreter's ABI, not only its version: `cp314` and `cp314t` are named almost
+identically, the second is for the free-threaded build, and only one loads.
+
+`--crash-log` matters here, because a GUI-subsystem executable writes nothing
+to a console; with it the program leaves `crash.txt` beside itself.
+
 ## macOS bundles, signing and disk images
 
 `--app` writes a `.app`; `--embed-python` makes it carry its own interpreter,

@@ -179,6 +179,44 @@ Naming both halves drops the plugin, the extension, and the library behind it:
 That took 7 MB off the bundle below. What the program can then no longer do is
 the caller's to judge - dropping `_avif` means an AVIF file stops opening.
 
+### Bundling for Windows
+
+A Windows target has no `.app` to wrap, so the runtime sits beside the
+executable rather than inside a bundle. Three things about that layout are
+easy to get wrong, and two of them fail silently:
+
+```sh
+py2bin compile-capi app.py --target windows-x86_64 --crash-log \
+  -o dist/win/MyApp.exe
+```
+
+**The interpreter's own path file decides what is importable.** The embeddable
+CPython ships a `pythonXY._pth` naming exactly two places - the zip and the
+directory beside it - and `sys.path` is then those two and nothing else.
+Packages copied into `Lib\site-packages` are invisible until that file says
+so, and what the program reports is `ModuleNotFoundError` for something plainly
+present on disk. Add the line:
+
+```
+python314.zip
+.
+Lib\site-packages
+```
+
+**A wheel has to match the interpreter's ABI, not just its version.** CPython
+3.14 publishes `cp314` and `cp314t` wheels, the second built for the
+free-threaded interpreter. They are named almost identically and only one of
+them loads.
+
+**`--crash-log` is worth setting here.** A GUI-subsystem executable writes
+nothing to a console, so without it a failure on someone else's machine leaves
+no evidence at all. With it, the program leaves `crash.txt` beside itself. When
+diagnosing, prefer the console build: it prints the same thing where you can
+see it immediately.
+
+An icon is embedded with `py2bin.windows_icon.install_windows_identity`, which
+also sets the name and version shown in the file's properties.
+
 ### Signing, and the disk image
 
 A macOS target is signed and sealed as the last step of the build, once the
