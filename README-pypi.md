@@ -128,6 +128,28 @@ standard library and would pass an imports-only-stdlib check, but it pulls in
 `subprocess` - and there are Pythons where a subprocess is not something a
 program may have.
 
+## macOS bundles, signing and disk images
+
+`--app` writes a `.app`; `--embed-python` makes it carry its own interpreter,
+so it runs on a Mac with no Python installed. The bundle is signed and sealed
+as the last step of the build, once everything is in place, and
+`codesign --verify --deep --strict` exits 0 on the result.
+
+The signature is ad-hoc - no Apple Developer ID, no notarisation, since either
+needs a paid account and Apple's own tooling. That only matters to Gatekeeper,
+which inspects apps carrying a quarantine flag: copied from a USB stick there
+is none, downloaded through a browser there is, and then the app needs one
+trip through **System Settings → Privacy & Security → Open Anyway**.
+
+`--dmg` writes a mountable disk image beside the bundle. No `hdiutil` is
+involved, because nothing in this library may reach for a subprocess; the
+filesystem is written byte by byte as ISO 9660 with Joliet, which macOS mounts
+with files executable - what an `.app` needs in order to launch.
+
+```sh
+py2bin compile-capi app.py --app --dmg -o dist/MyApp.app
+```
+
 ## What `compile-capi` supports
 
 Every row is checked by compiling it, running it, running the same source under

@@ -163,6 +163,8 @@ What each part does:
 | `--prune-unused` | drop modules the program cannot import, plus `.dSYM` debug companions |
 | `--zip-stdlib` | pack the carried library into the `pythonXY.zip` the interpreter already reads |
 | `--exclude MODULE` | drop something the static walk had to keep - see below |
+| `--crash-log` | write `<name>-crash.txt` beside the app if it dies, so a failure on someone else's Mac leaves evidence |
+| `--dmg` | also write a mountable `.dmg` beside the `.app` - see below |
 
 `--exclude` is for what the walk cannot work out. Pillow is the case that
 matters: `Image.init()` imports whatever plugin sits beside it, so a static
@@ -176,6 +178,46 @@ Naming both halves drops the plugin, the extension, and the library behind it:
 
 That took 7 MB off the bundle below. What the program can then no longer do is
 the caller's to judge - dropping `_avif` means an AVIF file stops opening.
+
+### Signing, and the disk image
+
+A macOS target is signed and sealed as the last step of the build, once the
+interpreter, the packages and the program's own files are all in place. Both
+halves matter and both are checked by `codesign --verify --deep --strict`,
+which exits 0 on what this produces:
+
+| what | how |
+|---|---|
+| the executable | an ad-hoc SHA-256 signature, which is what the kernel checks in order to run it at all on Apple Silicon |
+| the bundle | `CodeResources` hashing every file that ships, with no rules excusing anything from the seal |
+
+The signature is ad-hoc: there is no Apple Developer ID and no notarisation,
+because getting either means a paid account and Apple's own tooling. The
+practical difference is Gatekeeper, and Gatekeeper only inspects apps carrying
+a quarantine flag - which a file copied from a USB stick does not have, and a
+file downloaded through a browser does. Downloaded, the app needs one trip
+through **System Settings → Privacy & Security → Open Anyway**. Right-click →
+Open no longer works; Apple removed it in macOS 15.
+
+`--dmg` writes a mountable disk image beside the bundle:
+
+```sh
+py2bin compile-capi app.py --app --dmg -o dist/MyApp.app
+```
+
+There is no `hdiutil` behind that, because there cannot be - nothing under
+`src/` may reach for a subprocess. The filesystem is written byte by byte, as
+ISO 9660 with Joliet rather than the HFS+ `hdiutil` would emit. Two reasons
+that fits: it is simple enough to write correctly, with no catalog B-tree, no
+allocation bitmap and no extents; and macOS mounts files from it executable,
+which is what an `.app` needs in order to launch. Being read-only costs
+nothing for something whose purpose is to be dragged to `/Applications`.
+
+Plain ISO 9660 allows eight characters, a dot and three more, which no real
+bundle survives, so every name is carried twice - mangled into that shape for
+the primary descriptor, and in full UCS-2 for Joliet, which is the tree macOS
+reads. A symlink is refused rather than quietly flattened. The image is not
+compressed, so it is about the size of the bundle.
 
 ### Measured on a real application
 
