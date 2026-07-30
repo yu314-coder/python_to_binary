@@ -189,6 +189,11 @@ def _parser() -> argparse.ArgumentParser:
     capi_parser.add_argument(
         "--app", action="store_true", help="wrap the binary in a macOS .app"
     )
+    capi_parser.add_argument(
+        "--dmg",
+        action="store_true",
+        help="also write a mountable .dmg beside the .app (macOS targets)",
+    )
     capi_parser.add_argument("--name", help="application display name")
     capi_parser.add_argument(
         "--embed-python",
@@ -1093,6 +1098,27 @@ def main(argv: list[str] | None = None) -> int:
                 # describes a bundle that does not exist yet.
                 sealed = seal(output)
                 print(f"sealed the bundle over {sealed} files", file=sys.stderr)
+                if args.dmg:
+                    import shutil as _shutil
+                    import tempfile as _tempfile
+
+                    from .dmg import write_image
+
+                    # The image holds the bundle, not the bundle's insides, so
+                    # it mounts showing one thing to drag out.
+                    image = output.with_suffix(".dmg")
+                    with _tempfile.TemporaryDirectory(
+                        prefix="py2bin-dmg-", dir=output.parent
+                    ) as staging:
+                        room = Path(staging) / output.name
+                        _shutil.copytree(output, room, symlinks=True)
+                        size = write_image(
+                            Path(staging), image, args.name or output.stem
+                        )
+                    print(
+                        f"wrote {image.name} ({size // 1024 // 1024} MB)",
+                        file=sys.stderr,
+                    )
             print(
                 f"compiled {entry} through the CPython C API to "
                 f"{artifact.artifact} ({artifact.bytes} bytes, C at {source})"
