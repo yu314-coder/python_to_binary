@@ -242,7 +242,8 @@ def code_resources(bundle: Path) -> bytes:
     )
 
 
-def resign(binary: Path, info_plist: bytes, resources: bytes) -> None:
+def resign(binary: Path, info_plist: bytes | None = None,
+           resources: bytes | None = None) -> None:
     """Sign an already-written Mach-O again, over a seal it did not have.
 
     The image keeps its layout; only the signature at the end is replaced, and
@@ -332,12 +333,49 @@ def _drop_stale_seals(directory: Path) -> int:
     return removed
 
 
+def resign_libraries(bundle: Path) -> int:
+    """Sign every library in the bundle again, over its contents as shipped.
+
+    Relinking an extension so it finds the copy of OpenSSL carried here edits
+    its load commands, and that leaves the signature its author wrote no longer
+    describing it. Nothing complains while building, and nothing complains on a
+    machine with System Integrity Protection turned off. On a stock Mac dyld
+    maps a page, the hash does not match, and the kernel kills the process:
+
+        EXC_BAD_ACCESS (SIGKILL (Code Signature Invalid))
+        Namespace CODESIGNING, Code 2, Invalid Page
+
+    Every Mach-O here is signed again rather than only the ones known to have
+    been edited, because a signature that is already good stays good, and a
+    list of which files were touched is the kind of thing that goes stale.
+    """
+    count = 0
+    executable = _bundle_executable(bundle)
+    main = (bundle / "Contents" / "MacOS" / executable) if executable else None
+    for path in sorted((bundle / "Contents").rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if main is not None and path == main:
+            continue  # signed later, over the resource seal
+        if path.suffix not in (".so", ".dylib") and not is_macho(path):
+            continue
+        try:
+            resign(path)
+            count += 1
+        except (SealError, OSError, struct.error):
+            # Not something this can sign - a fat file, or one with no
+            # signature to replace. Left exactly as it was.
+            continue
+    return count
+
+
 def seal(bundle: Path) -> int:
     """Seal a finished bundle and sign its executable over that seal.
 
     Returns the number of entries sealed.
     """
     _drop_stale_seals(bundle / "Contents" / "Frameworks")
+    signed = resign_libraries(bundle)
     resources = code_resources(bundle)
     signature_directory = bundle / "Contents" / "_CodeSignature"
     signature_directory.mkdir(parents=True, exist_ok=True)
