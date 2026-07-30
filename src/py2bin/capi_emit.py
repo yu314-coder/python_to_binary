@@ -169,6 +169,7 @@ extern PyObject *PyNumber_Multiply(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_TrueDivide(PyObject *left, PyObject *right);
 extern PyObject *PyObject_RichCompare(PyObject *left, PyObject *right, int op);
 extern int PyObject_IsTrue(PyObject *value);
+extern int PyObject_IsInstance(PyObject *value, PyObject *kind);
 extern PyObject *PyObject_Str(PyObject *value);
 extern PyObject *PySys_GetObject(const char *name);
 extern int PyFile_WriteObject(PyObject *value, PyObject *stream, int flags);
@@ -2629,17 +2630,32 @@ class CApiEmitter:
         if node.cause is not None:
             value = self.with_cause(node, value, owned, indent)
             owned = True
-        # PyErr_SetObject wants the class as well as the value, and a NULL
-        # there sets nothing at all - the raise then vanished without a trace.
-        # `type(value)` is the class whether the source named a class or built
-        # an instance, so it answers both shapes.
+        # `raise X` names either a class or an instance, and the two do not
+        # want the same arguments. For an instance the class is type(it); for a
+        # class there is no instance yet, and asking type() for *its* class
+        # answers `type`, the metaclass. That is what produced
+        #
+        #     SystemError: exception <class 'type'> is not a BaseException
+        #
+        # for the plain `raise ValueError` any Python program writes. A class
+        # is handed over on its own instead, which is the shape PyErr_SetObject
+        # expects and normalises when it is caught.
         kind = self.builtin("type", indent)
+        is_class = self.temporary_flag()
+        self.emit(f"{is_class} = PyObject_IsInstance({value}, {kind});", indent)
         classified = self.temporary()
-        self.emit(f"{classified} = PyObject_CallOneArg({kind}, {value});", indent)
+        self.emit(f"if ({is_class} == 1) {{", indent)
+        self.emit(f"PyErr_SetObject({value}, NULL);", indent + 1)
+        self.emit("} else {", indent)
+        self.emit(
+            f"{classified} = PyObject_CallOneArg({kind}, {value});", indent + 1
+        )
+        self.emit(f"if ({classified} != NULL) {{", indent + 1)
+        self.emit(f"PyErr_SetObject({classified}, {value});", indent + 2)
+        self.emit(f"Py_DecRef({classified});", indent + 2)
+        self.emit("}", indent + 1)
+        self.emit("}", indent)
         self.emit(f"Py_DecRef({kind});", indent)
-        self.checked(classified, indent)
-        self.emit(f"PyErr_SetObject({classified}, {value});", indent)
-        self.emit(f"Py_DecRef({classified});", indent)
         if owned:
             self.emit(f"Py_DecRef({value});", indent)
         if self.handlers:

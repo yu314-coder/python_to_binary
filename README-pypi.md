@@ -293,6 +293,34 @@ overhead; something in the class path is doing work per call that it should do
 once. It is the clearest thing to fix next and it is measured here rather than
 left out.
 
+
+### Raising a class
+
+`raise ValueError` names a class and `raise ValueError("x")` an instance, and
+the two want different things from the C API - asking `type()` for the class
+of a class answers `type`, the metaclass. The plainest raise a program can
+write therefore ended in `SystemError: exception <class 'type'> is not a
+BaseException subclass`, in compiled code of every kind. Fixed.
+
+### How `finally` and `with` are handled
+
+A generator becomes a class with `__next__`, not a generator: never closed,
+never finalised by the collector, so the only ways out of a protected region
+are the ones the rewriter can see. The cleanup is not a real `finally:` - a
+`yield` returns from `__next__`, so one would fire on every suspension.
+It is attached to the raising path as a handler that runs it and re-raises,
+while the ordinary path jumps to a block holding the same cleanup. `with`
+expands into the try it stands for and takes that path, with `__exit__` looked
+up once on the type and suppression honoured.
+
+`async for` and `async with` take the same route, each written out as what it
+stands for. A `return` here is signalled by raising `StopIteration`, so the
+cleanup's handler had to learn to tell the frame leaving from a real failure -
+otherwise `__aexit__` is handed a `StopIteration` where CPython passes `None`.
+
+Still refused, with the line and the reason: a `finally` that itself yields,
+and a `break` or `continue` leaving the region.
+
 ## Measured against Nuitka
 
 manim_app: 10,100 lines, pywebview + Pillow + pyobjc, built both ways on the

@@ -656,6 +656,9 @@ _PyObject_RichCompare = _bind(
     "PyObject_RichCompare", _HANDLE, _HANDLE, _HANDLE, ctypes.c_int
 )
 _PyObject_IsTrue = _bind("PyObject_IsTrue", ctypes.c_int, _HANDLE)
+_PyObject_IsInstance = _bind(
+    "PyObject_IsInstance", ctypes.c_int, _HANDLE, _HANDLE
+)
 _PyObject_Str = _bind("PyObject_Str", _HANDLE, _HANDLE)
 _PyObject_Repr = _bind("PyObject_Repr", _HANDLE, _HANDLE)
 _PyObject_Size = _bind("PyObject_Size", _SSIZE, _HANDLE)
@@ -789,6 +792,10 @@ def PyObject_RichCompare(left: int, right: int, operation: int) -> int:
 
 def PyObject_IsTrue(handle: int) -> int:
     return int(_PyObject_IsTrue(handle))
+
+
+def PyObject_IsInstance(handle: int, kind: int) -> int:
+    return int(_PyObject_IsInstance(handle, kind))
 
 
 def PyObject_Str(handle: int) -> int:

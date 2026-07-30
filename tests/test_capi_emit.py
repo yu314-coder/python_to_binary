@@ -459,13 +459,8 @@ class CApiEmitTests(unittest.TestCase):
         # `*args` and `**kwargs` in a parameter list are no longer refused;
         # see test_a_function_takes_star_args_and_keywords for what they do.
         self._reject("nonlocal x\n", "`nonlocal` is not translated")
-        # `async def` is no longer refused; see AsyncTests for what it does.
-        # `async for` still is, because there is no asynchronous iteration
-        # protocol here to walk.
-        self._reject(
-            "async def f(xs):\n    async for x in xs:\n        pass\n",
-            "asynchronous iteration",
-        )
+        # `async def`, `async for` and `async with` are no longer refused;
+        # see AsyncTests for what they do.
 
         # An unknown name is no longer refused at build time: it is looked up
         # in builtins while the program runs, which is how range() and sum()
@@ -2678,7 +2673,6 @@ class GeneratorTests(unittest.TestCase):
 
     def test_the_shapes_it_cannot_express_are_refused_by_name(self):
         for source, needle in (
-            ("def f(c):\n    with c:\n        yield 1\n", "with"),
             ("def f(*xs):\n    yield 1\n", "*args"),
         ):
             with self.subTest(source=source):
@@ -2838,14 +2832,41 @@ class GeneratorHandlerTests(unittest.TestCase):
             b"propagated: not caught here\n",
         )
 
-    def test_finally_and_with_are_refused_with_the_reason(self):
-        # A `finally` has to run when the generator is *closed*, not only when
-        # it is consumed - and nothing here is told about a close. Cleanup that
-        # silently does not happen is worse than a refusal.
+    def test_a_with_around_a_yield_compiles(self):
+        # Expanded into the try it already stands for, then cut into blocks by
+        # the same path a written-out try takes.
+        python_to_capi_c(
+            "def f(c):\n    with c:\n        yield 1\n", "program.py"
+        )
+
+    def test_a_return_inside_a_finally_region_still_runs_the_cleanup(self):
+        # An earlier pass turns the return into a jump that leaves by the
+        # ordinary exit, which is the one that passes the cleanup.
+        python_to_capi_c(
+            "def f():\n    try:\n        yield 1\n        return\n"
+            "    finally:\n        pass\n",
+            "program.py",
+        )
+
+    def test_a_finally_around_a_yield_compiles(self):
+        # The object this produces is a class with __next__, not a generator,
+        # so it is never closed and never finalised by the collector. The only
+        # ways out of the region are the ones the rewriter can see: running off
+        # the end, and an exception on its way past.
+        python_to_capi_c(
+            "def f():\n    try:\n        yield 1\n    finally:\n        pass\n",
+            "program.py",
+        )
+
+    def test_what_a_finally_still_refuses_says_why(self):
         for source, needle in (
-            ("def f():\n    try:\n        yield 1\n    finally:\n        pass\n",
-             "closed"),
-            ("def f(c):\n    with c:\n        yield 1\n", "with"),
+            # Suspending while unwinding needs the cleanup cut into blocks too.
+            ("def f():\n    try:\n        yield 1\n    finally:\n        yield 2\n",
+             "itself contains"),
+            # These leave without passing the block holding the cleanup.
+            # A break goes round the block holding the cleanup.
+            ("def f():\n    for i in (1,):\n        try:\n            yield i\n"
+             "            break\n        finally:\n            pass\n", "break"),
         ):
             with self.subTest(source=source):
                 with self.assertRaises(CApiEmitError) as caught:
@@ -2927,7 +2948,6 @@ class AsyncTests(unittest.TestCase):
             ("import asyncio\nasync def f(c):\n    return c and await g()\n", "`and`"),
             ("import asyncio\nasync def f(c):\n    return await g() if c else 1\n", "arm"),
             ("import asyncio\nasync def f(xs):\n    return [await g(x) for x in xs]\n", "comprehension"),
-            ("import asyncio\nasync def f(xs):\n    async for x in xs:\n        pass\n", "asynchronous iteration"),
         ):
             with self.subTest(source=source):
                 with self.assertRaises(CApiEmitError) as caught:
@@ -3060,3 +3080,65 @@ class StorageAgreementTests(unittest.TestCase):
         )
         self.assertIn("long long n_n", written)
         self.assertIn("long long n_i", written)
+
+
+class AsynchronousIterationTests(unittest.TestCase):
+    """`async for` and `async with`, written out as what they stand for.
+
+    Both expand into shapes the machine already cuts into blocks - a call, an
+    `await` inside a `try`, a flag - rather than needing the machine to learn
+    about the asynchronous protocols directly.
+    """
+
+    def test_async_for_compiles(self):
+        python_to_capi_c(
+            "import asyncio\n"
+            "async def f(xs):\n"
+            "    total = 0\n"
+            "    async for x in xs:\n"
+            "        total += x\n"
+            "    return total\n",
+            "program.py",
+        )
+
+    def test_async_with_compiles(self):
+        python_to_capi_c(
+            "import asyncio\n"
+            "async def f(c):\n"
+            "    async with c as held:\n"
+            "        return held\n",
+            "program.py",
+        )
+
+    def test_an_async_for_else_says_why_it_is_refused(self):
+        with self.assertRaises(CApiEmitError) as caught:
+            python_to_capi_c(
+                "import asyncio\n"
+                "async def f(xs):\n"
+                "    async for x in xs:\n"
+                "        pass\n"
+                "    else:\n"
+                "        pass\n",
+                "program.py",
+            )
+        self.assertIn("else", str(caught.exception))
+
+
+class RaisingAClassTests(unittest.TestCase):
+    """`raise SomeError` names a class, and that is not `type(SomeError)`.
+
+    Asking type() for the class of a class answers `type`, the metaclass, and
+    handing that to PyErr_SetObject produced a SystemError for the plainest
+    raise a Python program can write.
+    """
+
+    def test_raising_a_class_compiles(self):
+        python_to_capi_c("def f():\n    raise ValueError\n", "program.py")
+
+    def test_raising_an_instance_still_compiles(self):
+        python_to_capi_c("def f():\n    raise ValueError('x')\n", "program.py")
+
+    def test_raising_a_class_from_a_generator_compiles(self):
+        python_to_capi_c(
+            "def g():\n    yield 1\n    raise ValueError\n", "program.py"
+        )

@@ -71,7 +71,8 @@ Python frame to suggest from, the repr of a compiled function really is a
 builtin function's, and `"v" is "v"` depends on an interning the compiler does
 not reproduce.
 
-The two remaining cells are the same shape of job as the three that are done.
+The three remaining cells are two jobs, both the same shape as the three
+that are done.
 Windows arm64 needs an encoder for the import-table call; Linux needs an ELF
 `.got.plt` and its relocations.
 
@@ -349,8 +350,65 @@ CPython, and requiring identical stdout and exit status.
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
 | `yield` inside `try` / `except` | ✅ |
-| `yield`/`await` inside `try` / `finally` or `with` | ❌ |
-| `async for` / `async with` | ❌ |
+| `yield`/`await` inside `try` / `finally` | ✅ |
+| `yield`/`await` inside `with`, including suppression | ✅ |
+| `async for` / `async with` | ✅ |
+| a `finally` that itself yields; `break`/`continue` out of one | ❌ |
+
+### Raising a class
+
+`raise ValueError` names a class; `raise ValueError("x")` names an instance.
+The two need different things from the C API, and asking `type()` for the
+class of a *class* answers `type`, the metaclass - so the plainest raise a
+Python program can write ended in
+
+    SystemError: exception <class 'type'> is not a BaseException subclass
+
+in every compiled program, of every kind, until it was found by an
+`async for` whose protocol raises `StopAsyncIteration` without parentheses.
+A class is now handed over on its own, which is the shape `PyErr_SetObject`
+expects and normalises when the exception is caught.
+
+### How `finally` and `with` are handled
+
+The object a generator becomes is a class with `__iter__`, `__next__` and
+`send` - not a generator. It is never closed and never finalised by the
+collector, so the ways out of a protected region are only the ones the
+rewriter can see: running off the end, and an exception on its way past. Both
+are expressible, which is why these compile.
+
+The cleanup is *not* emitted as a real `finally:` around each block. A `yield`
+returns from `__next__`, so a real one would fire on the way out of every
+suspension. Instead it is attached to the raising path as a synthesized
+handler that runs the cleanup and re-raises, and the ordinary path reaches the
+same cleanup by jumping to a block of its own.
+
+`with` is expanded into the try it already stands for, and then takes that
+same path. The manager and its `__exit__` are looked up once, on the type,
+before the body runs, so rebinding the name inside cannot change which object
+is left; a flag records whether a handler already dealt with an exception,
+since `__exit__` is called once either way and with different arguments.
+Returning true from `__exit__` suppresses, as it should.
+
+`async for` and `async with` take the same route: each is written out as
+what it stands for - a `while` over the iterator, a `try` around the body -
+and the machine cuts up the result. Two details are worth recording, because
+both produced answers that looked nothing like their cause. `raise X` where X
+is a class had never worked at all, in any compiled program, and an
+`async for` raising `StopAsyncIteration` was the first thing to notice. And a
+`return` here is signalled by raising `StopIteration`, so the cleanup's
+handler saw the frame leaving as a failure and passed `__aexit__` a
+`StopIteration` where CPython passes `None`; the two are now told apart.
+
+Two shapes are still refused, each with the line and the reason:
+
+- a `finally` that itself contains a `yield`, which would need the cleanup cut
+  into blocks as well
+- a `break` or `continue` leaving the region, which jumps straight to the
+  loop's own blocks and would go round the one holding the cleanup
+
+A `return` is fine: an earlier pass has already turned it into a jump that
+leaves by the ordinary exit, which is the one that passes the cleanup.
 
 A generator cannot be compiled the way the rest is - a C function has one
 entry and its locals die with its frame, so it cannot stop in the middle of
@@ -396,7 +454,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### The interpreter surface it may use
 
-- A fixed table of 71 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+- A fixed table of 72 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
   `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
@@ -410,7 +468,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
   `PyNumber_Rshift`, `PyNumber_Subtract`, `PyNumber_TrueDivide`,
   `PyNumber_Xor`, `PyObject_Call`, `PyObject_CallNoArgs`,
   `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_GetAttrString`,
-  `PyObject_GetItem`, `PyObject_GetIter`, `PyObject_IsTrue`,
+  `PyObject_GetItem`, `PyObject_GetIter`, `PyObject_IsInstance`, `PyObject_IsTrue`,
   `PyObject_Repr`, `PyObject_RichCompare`, `PyObject_SetAttrString`,
   `PyObject_SetItem`, `PyObject_Size`, `PyObject_Str`,
   `PyObject_Vectorcall`, `PyRun_SimpleString`, `PySequence_Contains`,
