@@ -181,38 +181,42 @@ the caller's to judge - dropping `_avif` means an AVIF file stops opening.
 
 ### Bundling for Windows
 
-A Windows target has no `.app` to wrap, so the runtime sits beside the
-executable rather than inside a bundle. Three things about that layout are
-easy to get wrong, and two of them fail silently:
+A Windows target has no `.app` to wrap: the executable, the interpreter and
+the packages share one directory. One command assembles it:
 
 ```sh
 py2bin compile-capi app.py --target windows-x86_64 --crash-log \
+  --runtime /path/to/embeddable-cpython \
+  --bundle-site /path/to/site-packages \
   -o dist/win/MyApp.exe
 ```
 
-**The interpreter's own path file decides what is importable.** The embeddable
-CPython ships a `pythonXY._pth` naming exactly two places - the zip and the
-directory beside it - and `sys.path` is then those two and nothing else.
-Packages copied into `Lib\site-packages` are invisible until that file says
-so, and what the program reports is `ModuleNotFoundError` for something plainly
-present on disk. Add the line:
+| flag | effect |
+|---|---|
+| `--runtime DIR` | copy an embeddable CPython in beside the executable |
+| `--bundle-site DIR` | copy packages into `Lib\site-packages` **and name it on the interpreter's path** |
+| `--crash-log` | write `crash.txt` beside the program if it dies |
 
-```
-python314.zip
-.
-Lib\site-packages
-```
+Those last two words matter. The embeddable CPython ships a `pythonXY._pth`
+naming exactly two places - the zip it came with, and the directory beside it
+- and once that file exists `sys.path` is those two entries and nothing else.
+Packages copied into `Lib\site-packages` are invisible until the path file
+names them, and what the program reports is `ModuleNotFoundError` for a
+directory plainly sitting on disk. A windowed executable has no console to say
+it in, so it looks like nothing happened at all. Placing packages and naming
+them is therefore one step here, not two a caller has to remember to do in
+order.
+
+Two things worth knowing when assembling one by hand:
 
 **A wheel has to match the interpreter's ABI, not just its version.** CPython
 3.14 publishes `cp314` and `cp314t` wheels, the second built for the
-free-threaded interpreter. They are named almost identically and only one of
+free-threaded interpreter. The names differ by one character and only one of
 them loads.
 
-**`--crash-log` is worth setting here.** A GUI-subsystem executable writes
-nothing to a console, so without it a failure on someone else's machine leaves
-no evidence at all. With it, the program leaves `crash.txt` beside itself. When
-diagnosing, prefer the console build: it prints the same thing where you can
-see it immediately.
+**Prefer the console build while diagnosing.** A GUI-subsystem executable
+writes nothing where you can see it; the console one prints the same thing
+immediately.
 
 An icon is embedded with `py2bin.windows_icon.install_windows_identity`, which
 also sets the name and version shown in the file's properties.

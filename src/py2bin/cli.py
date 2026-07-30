@@ -190,6 +190,11 @@ def _parser() -> argparse.ArgumentParser:
         "--app", action="store_true", help="wrap the binary in a macOS .app"
     )
     capi_parser.add_argument(
+        "--runtime",
+        metavar="DIR",
+        help="copy an embeddable interpreter in beside a Windows executable",
+    )
+    capi_parser.add_argument(
         "--dmg",
         action="store_true",
         help="also write a mountable .dmg beside the .app (macOS targets)",
@@ -1033,7 +1038,36 @@ def main(argv: list[str] | None = None) -> int:
                     _embedded_python_path() if args.embed_python else None
                 ),
             )
-            if args.bundle_site:
+            if target.startswith("windows-") and (args.bundle_site or args.runtime):
+                from .windows_bundle import carry_packages, carry_runtime
+
+                # There is no bundle here: the executable, the interpreter and
+                # the packages share one directory, and what is importable is
+                # decided by the interpreter's own path file. Placing packages
+                # and naming them on that path is one step, so a caller cannot
+                # end up with a directory full of modules the program cannot
+                # see - which fails as ModuleNotFoundError for something
+                # plainly on disk, and says nothing at all from a windowed
+                # executable.
+                room = output.parent
+                if args.runtime:
+                    carried = carry_runtime(room, Path(args.runtime))
+                    print(
+                        f"carried the interpreter beside {output.name} "
+                        f"({carried} bytes)",
+                        file=sys.stderr,
+                    )
+                if args.bundle_site:
+                    packed = carry_packages(
+                        room, tuple(Path(entry) for entry in args.bundle_site)
+                    )
+                    print(
+                        f"carried packages into Lib\\site-packages "
+                        f"({packed} bytes), and named it on the interpreter's "
+                        f"path",
+                        file=sys.stderr,
+                    )
+            elif args.bundle_site:
                 from .freezer import bundle_site_packages
 
                 bundle_site_packages(output, tuple(args.bundle_site))

@@ -130,18 +130,26 @@ program may have.
 
 ## Bundling for Windows
 
-The runtime sits beside the executable rather than in a bundle. Two traps,
-both silent:
+The executable, the interpreter and the packages share one directory, and one
+command assembles it:
 
-The embeddable CPython ships a `pythonXY._pth` naming exactly two places, and
-`sys.path` is those and nothing else - packages in `Lib\site-packages` are
-invisible until that file names them, and the program reports
-`ModuleNotFoundError` for something plainly on disk. And a wheel must match the
-interpreter's ABI, not only its version: `cp314` and `cp314t` are named almost
-identically, the second is for the free-threaded build, and only one loads.
+```sh
+py2bin compile-capi app.py --target windows-x86_64 --crash-log \
+  --runtime /path/to/embeddable-cpython \
+  --bundle-site /path/to/site-packages \
+  -o dist/win/MyApp.exe
+```
 
-`--crash-log` matters here, because a GUI-subsystem executable writes nothing
-to a console; with it the program leaves `crash.txt` beside itself.
+`--bundle-site` copies packages into `Lib\site-packages` and names it on the
+interpreter's path, which has to happen together: the embeddable CPython ships
+a `pythonXY._pth` naming exactly two places, and once it exists `sys.path` is
+those two and nothing else. Packages are invisible until the path file names
+them, and the program reports `ModuleNotFoundError` for a directory plainly on
+disk - silently, if it is windowed.
+
+A wheel must also match the interpreter's ABI, not only its version: `cp314`
+and `cp314t` differ by a character, the second is for the free-threaded build,
+and only one loads.
 
 ## macOS bundles, signing and disk images
 
