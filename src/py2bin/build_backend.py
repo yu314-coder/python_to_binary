@@ -11,7 +11,23 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-_VERSION = "0.8.0"
+def _read_version() -> str:
+    """The one place the version is written, read rather than repeated.
+
+    It lived here as a literal as well as in __init__.py and pyproject.toml,
+    and bumping one of the three produced an artifact quietly labelled with
+    the old number - a build that says 0.8.0 after the version was set to
+    0.8.1, which is the kind of thing that gets uploaded before anyone reads
+    the filename.
+    """
+    text = (Path(__file__).parent / "__init__.py").read_text()
+    for line in text.splitlines():
+        if line.startswith("__version__"):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise RuntimeError("py2bin/__init__.py names no __version__")
+
+
+_VERSION = _read_version()
 _DISTRIBUTION = f"python_to_binary-{_VERSION}"
 _ZIP_EPOCH = 315532800  # 1980-01-01 UTC, the oldest timestamp ZIP accepts.
 

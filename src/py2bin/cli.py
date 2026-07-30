@@ -1038,7 +1038,12 @@ def main(argv: list[str] | None = None) -> int:
                     _embedded_python_path() if args.embed_python else None
                 ),
             )
-            if target.startswith("windows-") and (args.bundle_site or args.runtime):
+            # _target_from_args returns None when the caller did not name a
+            # target and the host's own is meant. Asking that None whether it
+            # starts with "windows-" is how every --app build without an
+            # explicit --target came to abort before it was ever sealed.
+            chosen = target or host_target()
+            if chosen.startswith("windows-") and (args.bundle_site or args.runtime):
                 from .windows_bundle import carry_packages, carry_runtime
 
                 # There is no bundle here: the executable, the interpreter and
@@ -1124,7 +1129,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"({carried} bytes)",
                     file=sys.stderr,
                 )
-            if args.app and target.startswith("darwin"):
+            if args.app and chosen.startswith("darwin"):
                 from .macos_seal import seal
 
                 # Last, once the interpreter, the packages and the program's
