@@ -475,6 +475,23 @@ def embed_cpython_in_app(
 
     version = sysconfig.get_config_var("py_version_short")
     standard_library = Path(sysconfig.get_path("stdlib"))
+    if canonical:
+        # The library was carried from somewhere other than this interpreter,
+        # so its standard library has to come from there too. Taking this
+        # one's produced a macOS bundle holding iOS extension modules -
+        # lib-dynload/_socket.cpython-314-iphoneos.fwork - which is a bundle
+        # that cannot start, assembled without a complaint.
+        beside = dylib.parent.parent / "lib" / f"python{_sys.version_info.major}.{_sys.version_info.minor}"
+        if beside.is_dir():
+            standard_library = beside
+        else:
+            found = sorted(dylib.parent.parent.glob("lib/python3.*"))
+            if not found:
+                raise FileNotFoundError(
+                    f"no standard library beside {dylib}; a carried "
+                    f"interpreter brings its own"
+                )
+            standard_library = found[0]
     destination = bundle / "Contents" / "lib" / f"python{version}"
     if destination.exists():
         shutil.rmtree(destination)
