@@ -23,6 +23,10 @@ SOURCE = HERE / "src"
 #: not offered as something to build when this runs inside its own clone.
 _OURS = {"build.py", "get-py2bin.py", "setup.py", "conftest.py", "noxfile.py"}
 
+#: Directories a program opens rather than imports - templates, web assets,
+#: icons. They are carried beside it, because that is where it looks.
+_DATA_DIRECTORIES = ("web", "assets", "static", "templates", "resources", "data")
+
 #: Directories inside the clone that hold py2bin, not anyone's program. Run
 #: from the clone root, these are all there is, and offering them would be
 #: offering to compile the compiler.
@@ -47,7 +51,8 @@ SHAPES = {
         ("bin", "a plain executable, needing Python on the machine"),
     ),
     "windows": (
-        ("exe", ".exe with its interpreter beside it"),
+        ("exe", ".exe with its interpreter beside it, in a folder"),
+        ("onefile", "a single .exe, unpacking itself when it runs"),
         ("bin", "a plain .exe, needing Python on the machine"),
     ),
     "linux": (
@@ -243,7 +248,20 @@ def main() -> int:
             f"  project for - the build will go on without them"
         )
 
-    suffix = {"app": ".app", "dmg": ".app", "exe": ".exe", "bin": ""}[shape]
+    # Anything the program opens rather than imports. Found rather than asked
+    # for: a directory of web assets beside a program is what it is, and a
+    # bundle without it is a bundle that starts and then cannot draw anything.
+    carried = [
+        here / name
+        for name in _DATA_DIRECTORIES
+        if (here / name).is_dir()
+    ]
+    if carried:
+        say(f"  carrying {', '.join(path.name + '/' for path in carried)}")
+
+    suffix = {
+        "app": ".app", "dmg": ".app", "exe": ".exe", "onefile": ".exe", "bin": ""
+    }[shape]
     output = here / "dist" / f"{program.stem}{suffix}"
     arguments = [
         "compile-capi",
@@ -275,6 +293,8 @@ def main() -> int:
         ]
     if shape == "dmg":
         arguments.append("--dmg")
+    for path in carried:
+        arguments += ["--include", str(path)]
     arguments += ["-o", str(output)]
 
     say(f"\nBuilding {output.name} for {target}.")
@@ -285,6 +305,22 @@ def main() -> int:
     from py2bin.cli import main as build
 
     code = build(arguments)
+    if code == 0 and shape == "onefile":
+        # One file rather than a folder: the same payload, wrapped in an
+        # executable that unpacks itself where it runs.
+        say("\n  packing it into a single file ...")
+        from py2bin.onefile import create_onefile
+
+        single = here / "dist" / f"{program.stem}-onefile.exe"
+        create_onefile(
+            payload_root=output.parent,
+            output=single,
+            target=target,
+            launcher=output,
+            windows_windowed=True,
+        )
+        say(f"  done: {single}")
+        return 0
     if code == 0:
         say(f"\n  done: {output}")
     return code

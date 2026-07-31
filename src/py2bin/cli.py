@@ -196,6 +196,14 @@ def _parser() -> argparse.ArgumentParser:
         "(for Windows, omit it and pass --auto-fetch to download one)",
     )
     capi_parser.add_argument(
+        "--include",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="carry this file or directory beside the program - templates, "
+        "web assets, anything it opens rather than imports; repeatable",
+    )
+    capi_parser.add_argument(
         "--auto-fetch",
         action="store_true",
         help="download whatever is missing over verified HTTPS instead of "
@@ -1338,6 +1346,35 @@ def main(argv: list[str] | None = None) -> int:
                     f"({carried} bytes)",
                     file=sys.stderr,
                 )
+            if args.include:
+                import shutil as _shutil
+
+                # Before the seal, and beside the program rather than in the
+                # library: a directory of templates or web assets is opened,
+                # not imported, and the program looks for it next to itself.
+                beside = (
+                    output / "Contents" / "MacOS"
+                    if args.app and chosen.startswith("darwin")
+                    else output.parent
+                )
+                beside.mkdir(parents=True, exist_ok=True)
+                for entry in args.include:
+                    item = Path(entry).expanduser()
+                    if not item.exists():
+                        print(
+                            f"py2bin: nothing to include at {item}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    target = beside / item.name
+                    if target.exists():
+                        _shutil.rmtree(target) if target.is_dir() else target.unlink()
+                    if item.is_dir():
+                        _shutil.copytree(item, target)
+                    else:
+                        _shutil.copy2(item, target)
+                    print(f"carried {item.name} beside the program", file=sys.stderr)
+
             if args.app and chosen.startswith("darwin"):
                 from .macos_seal import seal
 
@@ -1346,6 +1383,14 @@ def main(argv: list[str] | None = None) -> int:
                 # describes a bundle that does not exist yet.
                 sealed = seal(output)
                 print(f"sealed the bundle over {sealed} files", file=sys.stderr)
+            staging = output.parent / ".py2bin-fetched"
+            if staging.is_dir():
+                import shutil as _shutil
+
+                # What was downloaded to build with, not what was built. It is
+                # the interpreter and every wheel over again, and leaving it
+                # beside the result made a 30 MB bundle look like 500 MB.
+                _shutil.rmtree(staging, ignore_errors=True)
                 if args.dmg:
                     import shutil as _shutil
                     import tempfile as _tempfile
