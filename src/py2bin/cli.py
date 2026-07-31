@@ -1068,6 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.auto_fetch or args.fetch_package:
                 from .freezer import default_fetch_cache
                 from .runtime_fetch import (
+                    FetchError,
                     extract_zip,
                     fetch_wheel,
                     fetch_windows_runtime,
@@ -1121,11 +1122,22 @@ def main(argv: list[str] | None = None) -> int:
                             + "; name it with --fetch-package",
                             file=sys.stderr,
                         )
+                missing = []
                 for project in wanted:
                     into = room / "site"
-                    got = fetch_wheel(
-                        project, chosen, version, room / "wheels", cache=cache
-                    )
+                    try:
+                        got = fetch_wheel(
+                            project, chosen, version, room / "wheels", cache=cache
+                        )
+                    except FetchError as reason:
+                        # One package with no wheel for this target is not a
+                        # reason to throw away the build. A project publishes
+                        # wheels for the interpreters that existed when it was
+                        # released, so a new Python leaves some behind for a
+                        # while. The program is compiled either way, and only
+                        # fails if it actually reaches for the missing one.
+                        missing.append((project, str(reason)))
+                        continue
                     # A wheel is a zip, and what goes beside a program is
                     # what is inside it - carrying the archive itself would
                     # put a file on the path that nothing can import.
@@ -1135,6 +1147,16 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if into not in fetched_sites:
                         fetched_sites.append(into)
+                for project, reason in missing:
+                    print(f"py2bin: no wheel for {project}: {reason}", file=sys.stderr)
+                if missing:
+                    print(
+                        "py2bin: the build goes on without "
+                        + ", ".join(name for name, _ in missing)
+                        + "; supply a wheel with --fetch-package once one exists, "
+                        "or --bundle-site a directory holding it",
+                        file=sys.stderr,
+                    )
 
             runtime = args.runtime or fetched_runtime
             sites = [Path(entry) for entry in (args.bundle_site or [])]

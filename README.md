@@ -261,6 +261,13 @@ used, and cached under `~/.cache/py2bin`, so a second build does not go out
 again. A wheel is unpacked rather than carried as an archive - a `.whl` on the
 path is a file nothing can import.
 
+A project that has no wheel for the target does not stop the build. Soon
+after a Python release this is ordinary: a project publishes wheels for the
+interpreters that existed when it was released, so the newest version may
+have nothing yet - an older one is looked for first, and if none of them fit,
+the package is named and the build goes on. The program is compiled either
+way and only fails if it actually reaches for what is missing.
+
 Those last two words matter. The embeddable CPython ships a `pythonXY._pth`
 naming exactly two places - the zip it came with, and the directory beside it
 - and once that file exists `sys.path` is those two entries and nothing else.

@@ -107,3 +107,44 @@ class LentDownloaderTests(unittest.TestCase):
         self.module.DOWNLOADER = lambda url, label: b"payload"
         stream = self.module._open_stream("https://example.invalid/x", "a label")
         self.assertEqual(stream.read(), b"payload")
+
+
+class OlderReleaseTests(unittest.TestCase):
+    """A project publishes wheels for the interpreters that existed then.
+
+    Soon after a Python release the newest version of something often has
+    nothing for it, while an older version does. An older wheel of the right
+    shape is far more use than a build that stops.
+    """
+
+    def test_releases_are_ordered_newest_first(self):
+        from py2bin.runtime_fetch import _earlier_releases
+
+        document = {
+            "releases": {
+                "1.9": [{"filename": "a"}],
+                "2.6.1": [{"filename": "b"}],
+                "2.6.0": [{"filename": "c"}],
+                "2.10.0": [{"filename": "d"}],
+            }
+        }
+        self.assertEqual(
+            [name for name, _ in _earlier_releases(document)],
+            ["2.10.0", "2.6.1", "2.6.0", "1.9"],
+        )
+
+    def test_a_release_with_no_files_is_skipped(self):
+        from py2bin.runtime_fetch import _earlier_releases
+
+        document = {"releases": {"1.0": [], "2.0": [{"filename": "x"}]}}
+        self.assertEqual([name for name, _ in _earlier_releases(document)], ["2.0"])
+
+    def test_a_document_without_releases_answers_nothing(self):
+        from py2bin.runtime_fetch import _earlier_releases
+
+        self.assertEqual(_earlier_releases({}), [])
+
+    def test_a_prerelease_does_not_outrank_the_plain_version(self):
+        from py2bin.runtime_fetch import _version_key
+
+        self.assertLess(_version_key("2.6.0.dev2"), _version_key("2.6.1"))

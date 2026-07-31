@@ -471,6 +471,37 @@ def select_wheel(
     return candidates[0]
 
 
+def _version_key(text: str):
+    """Order releases newest-first, well enough to pick a usable one.
+
+    Not a full PEP 440 implementation - it does not need to be. It has to put
+    2.6.1 after 2.6.0 and both after 1.9, and treat anything it cannot read as
+    older, so a pre-release never wins over a plain one.
+    """
+    parts = []
+    for piece in text.split("."):
+        digits = ""
+        for character in piece:
+            if not character.isdigit():
+                break
+            digits += character
+        parts.append((int(digits) if digits else -1, piece))
+    return parts
+
+
+def _earlier_releases(document: dict):
+    """Every release this project has published, newest first."""
+    releases = document.get("releases")
+    if not isinstance(releases, dict):
+        return []
+    ordered = sorted(releases, key=_version_key, reverse=True)
+    return [
+        (name, releases[name])
+        for name in ordered
+        if isinstance(releases.get(name), list) and releases[name]
+    ]
+
+
 def fetch_wheel(
     project: str,
     target: str,
@@ -495,8 +526,20 @@ def fetch_wheel(
     if not isinstance(files, list):
         raise FetchError(f"PyPI returned unexpected files for {project}")
     chosen = select_wheel(files, target, python_version)
+    release = document.get("info", {}).get("version", "?")
+    if chosen is None and version is None:
+        # The newest release has nothing for this target, which is ordinary
+        # soon after a Python release: a project builds wheels for the
+        # interpreters that existed when it was published. An older release
+        # often has one, and an older release of the right shape is far more
+        # use than a build that stops.
+        older = _earlier_releases(document)
+        for candidate, candidate_files in older:
+            found = select_wheel(candidate_files, target, python_version)
+            if found is not None:
+                chosen, release = found, candidate
+                break
     if chosen is None:
-        release = document.get("info", {}).get("version", "?")
         only_sdist = bool(files) and all(
             item.get("packagetype") == "sdist" for item in files
         )
