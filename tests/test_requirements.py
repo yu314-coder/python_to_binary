@@ -148,3 +148,59 @@ class OlderReleaseTests(unittest.TestCase):
         from py2bin.runtime_fetch import _version_key
 
         self.assertLess(_version_key("2.6.0.dev2"), _version_key("2.6.1"))
+
+
+class WheelRequirementTests(unittest.TestCase):
+    """What a downloaded wheel says it stands on.
+
+    A program imports pywebview and never mentions proxy_tools; pywebview
+    mentions it, in the metadata beside the code. Reading only the program's
+    imports fetches the package without the things under it, and the bundle
+    then fails on an import nobody wrote.
+    """
+
+    def _dist_info(self, body: str) -> Path:
+        room = Path(tempfile.mkdtemp())
+        info = room / "thing-1.0.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(body)
+        return room
+
+    def test_requirements_are_read(self):
+        from py2bin.requirements import required_by
+
+        room = self._dist_info(
+            "Name: thing\nRequires-Dist: proxy-tools\nRequires-Dist: bottle>=0.12\n"
+        )
+        self.assertEqual(required_by(room), ["proxy-tools", "bottle"])
+
+    def test_an_extra_is_not_opted_into(self):
+        from py2bin.requirements import required_by
+
+        room = self._dist_info(
+            "Name: thing\n"
+            "Requires-Dist: needed\n"
+            'Requires-Dist: only-for-tests; extra == "test"\n'
+        )
+        self.assertEqual(required_by(room), ["needed"])
+
+    def test_a_version_specifier_is_not_part_of_the_name(self):
+        from py2bin.requirements import required_by
+
+        room = self._dist_info("Name: thing\nRequires-Dist: cffi>=1.0,!=1.2\n")
+        self.assertEqual(required_by(room), ["cffi"])
+
+    def test_a_marker_that_is_not_an_extra_still_counts(self):
+        # A platform marker may well be true on the target being built for,
+        # and the fetch refuses what does not fit anyway.
+        from py2bin.requirements import required_by
+
+        room = self._dist_info(
+            'Name: thing\nRequires-Dist: pyobjc; sys_platform == "darwin"\n'
+        )
+        self.assertEqual(required_by(room), ["pyobjc"])
+
+    def test_nothing_to_read_is_not_an_error(self):
+        from py2bin.requirements import required_by
+
+        self.assertEqual(required_by(Path(tempfile.mkdtemp())), [])

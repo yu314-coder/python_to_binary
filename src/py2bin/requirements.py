@@ -15,6 +15,7 @@ unknown for a person to name, rather than approximated.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -131,6 +132,37 @@ def _reachable(entry: Path) -> tuple[set[str], set[str]]:
             else:
                 imported.add(name)
     return imported, local
+
+
+def required_by(unpacked: Path) -> list[str]:
+    """The projects a downloaded wheel says it needs, from its own metadata.
+
+    A program that imports pywebview needs proxy_tools too, and never says so -
+    pywebview says it, in the METADATA beside the code. Reading the program's
+    imports alone fetches the package and not the things it stands on, and the
+    bundle then fails on an import nobody wrote.
+
+    Requirements that only apply to an extra are skipped: an extra is opt-in,
+    and nothing here opts in. Requirements guarded by a marker naming another
+    operating system are skipped too.
+    """
+    wanted: list[str] = []
+    for metadata in sorted(unpacked.glob("*.dist-info/METADATA")):
+        try:
+            text = metadata.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if not line.lower().startswith("requires-dist:"):
+                continue
+            body = line.split(":", 1)[1].strip()
+            requirement, _, marker = body.partition(";")
+            if "extra ==" in marker:
+                continue  # opt-in, and nothing opts in
+            name = re.split(r"[\s\[<>=!~();]", requirement.strip(), 1)[0]
+            if name and name not in wanted:
+                wanted.append(name)
+    return wanted
 
 
 def discover(entry: Path) -> Discovered:

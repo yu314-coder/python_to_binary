@@ -1156,14 +1156,42 @@ def main(argv: list[str] | None = None) -> int:
                             + "; name it with --fetch-package",
                             file=sys.stderr,
                         )
+                from .requirements import required_by
+
                 missing = []
-                for project in wanted:
+                seen: set[str] = set()
+                queue = list(wanted)
+                while queue:
+                    project = queue.pop(0)
+                    key = project.lower().replace("_", "-")
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     into = room / "site"
                     try:
                         got = fetch_wheel(
                             project, chosen, version, room / "wheels", cache=cache
                         )
                     except FetchError as reason:
+                        if "only a source distribution" in str(reason):
+                            # Nothing to build is not the same as unbuildable.
+                            try:
+                                from .runtime_fetch import fetch_pure_sdist
+
+                                names = fetch_pure_sdist(
+                                    project, into, cache=cache
+                                )
+                                print(
+                                    f"took {', '.join(names)} from the source "
+                                    f"distribution for {project} - it has "
+                                    f"nothing to compile",
+                                    file=sys.stderr,
+                                )
+                                if into not in fetched_sites:
+                                    fetched_sites.append(into)
+                                continue
+                            except FetchError as second:
+                                reason = second
                         # One package with no wheel for this target is not a
                         # reason to throw away the build. A project publishes
                         # wheels for the interpreters that existed when it was
@@ -1181,6 +1209,12 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if into not in fetched_sites:
                         fetched_sites.append(into)
+                    # What that wheel stands on. A program imports pywebview
+                    # and never mentions proxy_tools; pywebview mentions it,
+                    # in the metadata that just arrived.
+                    for dependency in required_by(into):
+                        if dependency.lower().replace("_", "-") not in seen:
+                            queue.append(dependency)
                 for project, reason in missing:
                     print(f"py2bin: no wheel for {project}: {reason}", file=sys.stderr)
                 if missing:

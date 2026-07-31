@@ -254,6 +254,12 @@ def main() -> int:
         "--clean",
         "--auto-fetch",
     ]
+    if shape in ("app", "dmg", "exe"):
+        # Without these a bundle carries the whole standard library twice over
+        # - once as source and once as bytecode - along with every module the
+        # program cannot reach. It is the difference between 220 MB and about
+        # a third of that.
+        arguments += ["--prune-unused", "--zip-stdlib"]
     if shape in ("app", "dmg"):
         # --site is baked into the program when it is compiled, which happens
         # before anything is downloaded, so where the packages will end up has

@@ -29,6 +29,7 @@ import hashlib
 import json
 import re
 import tarfile
+import shutil
 import stat
 import tempfile
 import urllib.parse
@@ -546,6 +547,68 @@ def fetch_macos_runtime(
     if not found:
         raise FetchError(f"no libpython in the archive {name}")
     return found[0]
+
+
+def fetch_pure_sdist(project: str, output: Path, *, cache: Path) -> list[str]:
+    """Take a pure-Python package out of a source distribution, unbuilt.
+
+    Some small projects publish no wheel at all - proxy_tools, which pywebview
+    stands on, is one. Building one means running setup.py, which this will
+    not do. It does not have to when there is nothing to build: a pure-Python
+    sdist holds the package already, and copying it out is the same bytes a
+    wheel would have carried.
+
+    Refused the moment there is anything to compile, because then the sdist
+    and the wheel are not the same thing and only the build knows the
+    difference. Returns the names copied.
+    """
+    document = _read_json(_PYPI_PROJECT.format(project=project), f"PyPI metadata for {project}")
+    files = document.get("urls") or []
+    sdist = next(
+        (item for item in files if item.get("packagetype") == "sdist"), None
+    )
+    if sdist is None:
+        raise FetchError(f"{project} publishes no source distribution either")
+    archive, _digest = download_verified(
+        sdist["url"],
+        cache,
+        expected_sha256=sdist.get("digests", {}).get("sha256"),
+        label=f"the source distribution for {project}",
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as scratch:
+        room = Path(scratch)
+        if archive.name.endswith(".zip"):
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(room)
+        else:
+            with tarfile.open(archive) as bundle:
+                for member in bundle.getmembers():
+                    place = (room / member.name).resolve()
+                    if not str(place).startswith(str(room.resolve())):
+                        raise FetchError(f"{project} writes outside its directory")
+                bundle.extractall(room)
+        if any(room.rglob("*.c")) or any(room.rglob("*.pyx")):
+            raise FetchError(
+                f"{project} has sources to compile, so its wheel is not simply "
+                f"its sdist; supply one with --fetch-package once published"
+            )
+        copied: list[str] = []
+        for package in sorted(room.rglob("__init__.py")):
+            holder = package.parent
+            if holder.name in ("test", "tests", "docs", "examples"):
+                continue
+            # Only the top of a package, not a subpackage of one already taken.
+            if any(holder.parent.joinpath(name).exists() for name in ("__init__.py",)):
+                continue
+            destination = output / holder.name
+            if destination.exists():
+                continue
+            shutil.copytree(holder, destination)
+            copied.append(holder.name)
+        if not copied:
+            raise FetchError(f"{project} holds no importable package in its sdist")
+    return copied
 
 
 def _version_key(text: str):
