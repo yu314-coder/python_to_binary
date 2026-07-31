@@ -131,6 +131,19 @@ class FetchLock:
         )
 
 
+#: How bytes are fetched. Replaceable, and that is the point: some Pythons are
+#: shipped without a working ssl module, or with the network kept away from
+#: the interpreter while the shell beside it can still reach out - a code
+#: editor on a tablet, typically. Nothing here may start a subprocess, because
+#: the runtimes that need this are the same ones that forbid one. So a caller
+#: outside this package - get-py2bin.py, which may - sets this to something
+#: that shells out to curl or wget, and everything below goes through it.
+#:
+#: A replacement takes (url, label) and answers the bytes. The HTTPS check
+#: below still applies: it happens before this is called.
+DOWNLOADER = None
+
+
 def _open_https(url: str, label: str):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.username or parsed.password:
@@ -143,9 +156,43 @@ def _open_https(url: str, label: str):
     return stream
 
 
-def _read_json(url: str, label: str) -> dict:
+def _open_stream(url: str, label: str):
+    """Something to read the response from, whichever downloader is in use.
+
+    A replacement answers all the bytes at once, so they are wrapped to look
+    like the stream the caller below reads in chunks. The hash is still
+    computed from what actually arrives, so a replacement cannot weaken the
+    check that the download is what the index said it would be.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        raise FetchError(f"{label} URL must be credential-free HTTPS: {url}")
+    if DOWNLOADER is not None:
+        import io
+
+        payload = DOWNLOADER(url, label)
+        if not isinstance(payload, (bytes, bytearray)):
+            raise FetchError(f"the installed downloader returned no bytes for {label}")
+        return io.BytesIO(bytes(payload))
+    return _open_https(url, label)
+
+
+def _read_bytes(url: str, label: str, limit: int) -> bytes:
+    """Read a whole response, through the replacement if one was installed."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        raise FetchError(f"{label} URL must be credential-free HTTPS: {url}")
+    if DOWNLOADER is not None:
+        payload = DOWNLOADER(url, label)
+        if not isinstance(payload, (bytes, bytearray)):
+            raise FetchError(f"the installed downloader returned no bytes for {label}")
+        return bytes(payload)
     with _open_https(url, label) as stream:
-        payload = stream.read(32 * 1024 * 1024)
+        return stream.read(limit)
+
+
+def _read_json(url: str, label: str) -> dict:
+    payload = _read_bytes(url, label, 32 * 1024 * 1024)
     try:
         data = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -176,7 +223,7 @@ def download_verified(
         if cached.is_file() and _hash_file(cached) == expected_sha256:
             return cached, expected_sha256
 
-    stream = _open_https(url, label)
+    stream = _open_stream(url, label)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

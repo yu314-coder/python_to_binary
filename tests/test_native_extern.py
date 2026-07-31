@@ -242,16 +242,17 @@ class ExternRejectionTests(unittest.TestCase):
         )
 
     def test_extern_on_a_target_without_an_adapter_is_rejected(self):
-        # Linux is what is left: it needs a `.got.plt` and its relocations,
-        # which nothing here writes. windows-arm64 has no encoder for the
-        # import-table call either.
-        for target in ("linux-arm64", "linux-x86_64", "windows-arm64"):
+        # linux-x86-64 is what is left. The ELF writer and its relocations
+        # exist now; what that target still needs is its encoder keeping the
+        # call sites it already works out, the way the ARM64 one does.
+        for target in ("linux-x86_64",):
             message = self._compile_error(
                 "from py2bin.cabi import abs\n"
                 "raise SystemExit(abs(-1))\n",
                 target=target,
             )
-            self.assertIn("darwin-arm64, darwin-x86_64, windows-x86_64", message)
+            self.assertIn("darwin-arm64", message)
+            self.assertIn("linux-arm64", message)
 
     def test_extern_on_windows_x86_64_imports_from_a_dll(self):
         """The interpreter is a second DLL in the import directory.

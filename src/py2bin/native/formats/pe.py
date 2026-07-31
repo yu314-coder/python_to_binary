@@ -362,6 +362,83 @@ def write_pe_x86_64_dynamic(
     )
 
 
+def write_pe_arm64_dynamic(
+    module: Module,
+    symbol_libraries: "dict[str, str]",
+    static_bytes: int = 0,
+) -> bytes:
+    """The ARM64 counterpart of the writer above: a PE importing several DLLs.
+
+    Statics go in the image rather than in a block reached through X28. The
+    register form is fine for a program that only calls the kernel, but an
+    image binding CPython can hand it a function to call, and a callback
+    entered from inside CPython's frames finds CPython's value in that
+    callee-saved register. Every static reference is therefore left as two
+    words - adrp then add - and filled in here, once the data section is
+    placed and its address is finally known.
+    """
+
+    image_base = 0x140000000
+    text_rva = 0x1000
+    ordered: "dict[str, list[str]]" = {}
+    for symbol, library in symbol_libraries.items():
+        ordered.setdefault(library, []).append(symbol)
+    libraries = [
+        (_PE_KERNEL_LIBRARY, _PE_KERNEL_IMPORTS),
+        *((name, tuple(sorted(symbols))) for name, symbols in sorted(ordered.items())),
+    ]
+
+    def build(rdata_rva: int):
+        blob, imports, iat_offset, iat_size = _imports_from_libraries(
+            rdata_rva, image_base, libraries
+        )
+        statics_rva = rdata_rva + _align(len(blob), 16)
+        blob = blob.ljust(_align(len(blob), 16), b"\0") + bytes(static_bytes)
+        encoded, sites = encode_windows_arm64(
+            module, image_base + text_rva, imports, image_statics=True
+        )
+        return encoded, blob, iat_offset, iat_size, statics_rva, sites
+
+    # Two passes, for the same reason the x86-64 writer needs them: every
+    # reference is a fixed-size instruction, so the code's length does not
+    # depend on where the data lands, but the data's place depends on the
+    # code's length.
+    code, _blob, _io, _is, _sr, _sites = build(_align(text_rva + 0x1000, 0x1000))
+    settled = _align(text_rva + len(code), 0x1000)
+    code, rdata, iat_offset, iat_size, statics_rva, sites = build(settled)
+    if _align(text_rva + len(code), 0x1000) != settled:
+        raise AssertionError("PE code length changed when the data section moved")
+
+    # adrp reaches a 4 KB page at +/-4 GB, and add supplies the offset within
+    # it. Both are relative to the instruction, so the pair is position
+    # independent and reads the same object from whoever's frame calls in.
+    patched = bytearray(code)
+    static_base = image_base + statics_rva
+    for byte_offset, static_offset in sites:
+        instruction_addr = image_base + text_rva + byte_offset
+        target = static_base + static_offset
+        pages = ((target & ~0xFFF) - (instruction_addr & ~0xFFF)) >> 12
+        if not -(1 << 20) <= pages < (1 << 20):
+            raise ValueError("arm64 static reference is outside ADRP range")
+        encoded = pages & 0x1FFFFF
+        adrp = 0x90000000 | ((encoded & 3) << 29) | (((encoded >> 2) & 0x7FFFF) << 5)
+        add = 0x91000000 | ((target & 0xFFF) << 10)
+        struct.pack_into("<II", patched, byte_offset, adrp, add)
+
+    slots = module.stack_slots + sum(
+        function.stack_slots for function in module.functions
+    )
+    return _pe_image(
+        bytes(patched),
+        rdata,
+        machine=0xAA64,
+        iat_offset=iat_offset,
+        iat_size=iat_size,
+        writable_rdata=True,
+        stack_bytes=slots * 8 + 0x200 * (1 + len(module.functions)),
+    )
+
+
 #: What every image asks the kernel for, whatever else it imports.
 _PE_KERNEL_LIBRARY = "KERNEL32.dll"
 _PE_KERNEL_IMPORTS = (

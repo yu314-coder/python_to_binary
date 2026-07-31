@@ -793,6 +793,38 @@ def _darwin_encode(
     )
 
 
+def encode_linux_extern(
+    module: Module, code_address: int
+) -> "tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]":
+    """A linux module that may call symbols the loader binds.
+
+    The same encoder as below, keeping what it already works out rather than
+    dropping it: the call sites so the ELF writer can lay out a GOT, and the
+    static sites so it can point them at the writable segment instead of a
+    register a callback would find someone else's value in.
+    """
+    return _linux_encode(module, code_address, image_statics=True)
+
+
+def _linux_encode(
+    module: Module, code_address: int, image_statics: bool = False
+) -> "tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]":
+    return _encode(
+        module,
+        code_address,
+        image_statics=image_statics,
+        write_number=64,
+        exit_number=93,
+        mmap_number=222,
+        mmap_flags=0x22,
+        svc=0xD4000001,
+        open_number=56,
+        read_number=63,
+        close_number=57,
+        open_takes_dirfd=True,
+    )
+
+
 def encode_linux(module: Module, code_address: int) -> bytes:
     code, externs, _statics = _encode(
         module,
@@ -841,8 +873,26 @@ def encode_darwin_extern(
     return _darwin_encode(module, code_address, image_statics=image_statics)
 
 
-def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -> bytes:
-    """Encode calls through a Windows ARM64 import-address table."""
+def encode_windows(
+    module: Module,
+    code_address: int,
+    imports: dict[str, int],
+    image_statics: bool = False,
+) -> "bytes | tuple[bytes, list[tuple[int, int]]]":
+    """Encode calls through a Windows ARM64 import-address table.
+
+    With ``image_statics`` the static base is not established at all: every
+    reference to static storage is left as two words for the writer to fill in
+    with ``adrp``/``add`` once the data section is placed, and the sites are
+    returned alongside the code.
+
+    That matters for the tier that drives CPython. The register form below
+    keeps the base in X28 for the whole run, and an image that binds CPython
+    can hand it a function to call - which is what a compiled closure is. A
+    callback entered from inside CPython's own frames finds CPython's value in
+    that callee-saved register, not this program's, and reads a static from
+    wherever that happens to point.
+    """
     slot_base = 16
     words: list[int] = [
         *_frame_sub(_frame_bytes(module.stack_slots, slot_base)),
@@ -859,6 +909,10 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         words.extend((0, 0, 0xD63F0200))  # adrp x16; ldr x16, [x16,#off]; blr x16
         function_references.append((index, symbol))
 
+    if static_pending and image_statics:
+        # Placed in the image by the writer; nothing to reserve, and no
+        # register to keep it in.
+        static_pending = 0
     if static_pending:
         # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
         # returns a zero-filled writable block, which is the initial value C
@@ -876,7 +930,7 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
         words.extend(_mov(0, 3))
         call("ExitProcess")
 
-    refs = _Refs()
+    refs = _Refs(image_statics=image_statics)
 
     def emit(operations, slot_base: int, _epilogue=()) -> None:
         """Encode one body. Labels are body-local; imports are shared."""
@@ -1069,6 +1123,10 @@ def encode_windows(module: Module, code_address: int, imports: dict[str, int]) -
             _adr(1, data_address - instruction_address),
         )
         image.extend(data)
+    if image_statics:
+        # The writer needs the sites as well as the code: it is the only
+        # thing that knows where the data section ends up.
+        return bytes(image), refs.statics
     return bytes(image)
 
 

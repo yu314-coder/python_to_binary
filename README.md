@@ -59,8 +59,8 @@ drives CPython - can target today.
 | | x86-64 | arm64 |
 |---|---|---|
 | **macOS** | ✅ works | ✅ works |
-| **Windows** | ✅ works | ⬜ future work |
-| **Linux** | ⬜ future work | ⬜ future work |
+| **Windows** | ✅ works | ✅ works |
+| **Linux** | ⬜ future work | ✅ works |
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
@@ -71,10 +71,9 @@ Python frame to suggest from, the repr of a compiled function really is a
 builtin function's, and `"v" is "v"` depends on an interning the compiler does
 not reproduce.
 
-The three remaining cells are two jobs, both the same shape as the three
-that are done.
-Windows arm64 needs an encoder for the import-table call; Linux needs an ELF
-`.got.plt` and its relocations.
+The one remaining cell is linux-x86-64: the ELF writer and its relocations
+now exist, and what is left is the x86-64 encoder keeping the call sites it
+already works out, exactly as the ARM64 one now does.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six, and
 **freeze** targets whatever it has a runtime pack for. This grid is about
@@ -197,6 +196,44 @@ py2bin compile-capi app.py --target windows-x86_64 --crash-log \
 | `--runtime DIR` | copy an embeddable CPython in beside the executable |
 | `--bundle-site DIR` | copy packages into `Lib\site-packages` **and name it on the interpreter's path** |
 | `--crash-log` | write `crash.txt` beside the program if it dies |
+| `--auto-fetch` | download the interpreter instead of being told where one is |
+| `--fetch-package NAME` | download that project's wheel for the target and unpack it in; repeatable |
+
+### One file, no paths, no pip
+
+```sh
+python3 get-py2bin.py
+```
+
+That script installs py2bin if it is not already here, lists the Python files
+beside it, asks which one is the program, and builds it. The rest - the other
+`.py` files, the interpreter, the libraries the program imports - is found or
+downloaded.
+
+It is also worth running when py2bin *is* installed, because of what it lends
+the library. Some Pythons are shipped without a working `ssl` module, or keep
+the network away from the interpreter while the shell beside it can still
+reach out - a code editor on a tablet, typically. So the script falls back to
+`curl`, `wget`, `fetch` or PowerShell when Python's own networking fails, and
+hands that fallback to the library for the downloads it makes during the
+build. Nothing under `src/` starts a subprocess, because the runtimes that
+need this are the same ones that will not allow one; the script may, and
+lends the result.
+
+Nothing above needs a path on this machine. With `--auto-fetch` the
+interpreter is downloaded for the target being built, and `--fetch-package`
+takes a name rather than a directory:
+
+```sh
+py2bin compile-capi app.py --target windows-x86_64 --crash-log \
+  --auto-fetch --fetch-package psutil \
+  -o dist/win/MyApp.exe
+```
+
+Every download is checked against a hash the index published before it is
+used, and cached under `~/.cache/py2bin`, so a second build does not go out
+again. A wheel is unpacked rather than carried as an archive - a `.whl` on the
+path is a file nothing can import.
 
 Those last two words matter. The embeddable CPython ships a `pythonXY._pth`
 naming exactly two places - the zip it came with, and the directory beside it

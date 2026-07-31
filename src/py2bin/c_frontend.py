@@ -134,8 +134,18 @@ from .native.ir import (
 #: Targets whose encoder can hand back the address of a string literal. Each
 #: places the bytes after the code and reaches them with a PC-relative
 #: reference; the back ends not named here have nowhere to put them yet.
+#: The targets whose writers place a string literal's bytes where a pointer
+#: to them can be formed. On ARM64 the encoder appends them to the code image
+#: itself and reaches them PC-relatively, so the writer needs to do nothing -
+#: which is why the two ARM64 targets can be here without further work.
 _STRING_VALUE_TARGETS = frozenset(
-    {"darwin-arm64", "darwin-x86_64", "windows-x86_64"}
+    {
+        "darwin-arm64",
+        "darwin-x86_64",
+        "windows-x86_64",
+        "windows-arm64",
+        "linux-arm64",
+    }
 )
 
 

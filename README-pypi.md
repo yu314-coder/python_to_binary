@@ -140,6 +140,10 @@ py2bin compile-capi app.py --target windows-x86_64 --crash-log \
   -o dist/win/MyApp.exe
 ```
 
+Neither needs a path on this machine: `--auto-fetch` downloads the
+interpreter for the target, and `--fetch-package NAME` downloads and unpacks a
+project's wheel. Both are checked against a published hash and cached.
+
 `--bundle-site` copies packages into `Lib\site-packages` and names it on the
 interpreter's path, which has to happen together: the embeddable CPython ships
 a `pythonXY._pth` naming exactly two places, and once it exists `sys.path` is

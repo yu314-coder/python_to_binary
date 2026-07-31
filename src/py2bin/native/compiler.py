@@ -19,7 +19,12 @@ from .formats.macho import (
     write_macho_x86_64,
     write_macho_x86_64_dynamic,
 )
-from .formats.pe import write_pe_arm64, write_pe_x86_64, write_pe_x86_64_dynamic
+from .formats.pe import (
+    write_pe_arm64,
+    write_pe_arm64_dynamic,
+    write_pe_x86_64,
+    write_pe_x86_64_dynamic,
+)
 from .frontend import NativeCompileError, lower
 from .ir import CStringConstant, ExternCall, HeapInit, Module
 from .optimizer import optimize
@@ -313,7 +318,13 @@ def _module_uses_extern(module: Module) -> bool:
 #: Both are darwin: the Mach-O writer lays out `__got` and the bind opcodes,
 #: and each architecture's encoder emits the reference sites it patches.
 _EXTERN_CAPABLE_TARGETS = frozenset(
-    {"darwin-arm64", "darwin-x86_64", "windows-x86_64"}
+    {
+        "darwin-arm64",
+        "darwin-x86_64",
+        "windows-x86_64",
+        "windows-arm64",
+        "linux-arm64",
+    }
 )
 
 CALL_CAPABLE_TARGETS = frozenset(
@@ -401,7 +412,22 @@ def _emit_native_module(
         if app
         else (None, None)
     )
-    if target == "windows-x86_64" and _module_uses_extern(module):
+    if target == "linux-arm64" and _module_uses_extern(module):
+        from .arm64 import encode_linux_extern
+        from .formats.elf import write_elf_dynamic
+
+        # The loader searches every library named here, so the call sites do
+        # not have to say which one a symbol came from - unlike the PE import
+        # table, where a symbol belongs to one named DLL.
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        needed = (f"libpython{version}.so.1.0", "libc.so.6", "libm.so.6")
+        image = write_elf_dynamic(
+            "arm64",
+            lambda address: encode_linux_extern(module, address),
+            module.static_bytes,
+            needed,
+        )
+    elif target in ("windows-x86_64", "windows-arm64") and _module_uses_extern(module):
         from ..cabi_tables import windows_symbol_library
 
         # The interpreter's DLL is version-specific because its ABI is, and
@@ -411,9 +437,12 @@ def _emit_native_module(
             symbol: windows_symbol_library(symbol, python_dll)
             for symbol in _extern_symbols(module)
         }
-        image = write_pe_x86_64_dynamic(
-            module, symbol_libraries, module.static_bytes
+        writer = (
+            write_pe_arm64_dynamic
+            if target == "windows-arm64"
+            else write_pe_x86_64_dynamic
         )
+        image = writer(module, symbol_libraries, module.static_bytes)
     elif target == "windows-x86_64":
         image = write_pe_x86_64(module)
     elif target == "windows-arm64":

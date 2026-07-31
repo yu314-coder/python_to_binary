@@ -192,7 +192,27 @@ def _parser() -> argparse.ArgumentParser:
     capi_parser.add_argument(
         "--runtime",
         metavar="DIR",
-        help="copy an embeddable interpreter in beside a Windows executable",
+        help="copy an embeddable interpreter in beside a Windows executable "
+        "(omit it and pass --auto-fetch to download one)",
+    )
+    capi_parser.add_argument(
+        "--auto-fetch",
+        action="store_true",
+        help="download whatever is missing over verified HTTPS instead of "
+        "asking for a path: the target's interpreter, and any --fetch-package",
+    )
+    capi_parser.add_argument(
+        "--fetch-package",
+        metavar="NAME",
+        action="append",
+        default=[],
+        help="download this PyPI project's wheel for the target and carry it "
+        "in the bundle; repeatable (implies --auto-fetch)",
+    )
+    capi_parser.add_argument(
+        "--fetch-cache",
+        type=Path,
+        help="directory for verified downloads (default: ~/.cache/py2bin/fetch)",
     )
     capi_parser.add_argument(
         "--dmg",
@@ -1043,7 +1063,83 @@ def main(argv: list[str] | None = None) -> int:
             # starts with "windows-" is how every --app build without an
             # explicit --target came to abort before it was ever sealed.
             chosen = target or host_target()
-            if chosen.startswith("windows-") and (args.bundle_site or args.runtime):
+            fetched_runtime = None
+            fetched_sites: list[Path] = []
+            if args.auto_fetch or args.fetch_package:
+                from .freezer import default_fetch_cache
+                from .runtime_fetch import (
+                    extract_zip,
+                    fetch_wheel,
+                    fetch_windows_runtime,
+                )
+
+                cache = args.fetch_cache or default_fetch_cache()
+                # The wheel tags want major.minor; the runtime archive is
+                # published per patch release, so it needs all three.
+                version = f"{sys.version_info.major}.{sys.version_info.minor}"
+                full_version = f"{version}.{sys.version_info.micro}"
+                room = output.parent / ".py2bin-fetched"
+                # Downloaded rather than asked for. Everything here is checked
+                # against a hash the index published before it is used, and
+                # kept in the cache so a second build does not go out again.
+                if chosen.startswith("windows-") and not args.runtime:
+                    pack = room / "runtime"
+                    fetch_windows_runtime(
+                        full_version, chosen, pack, cache=cache, clean=True
+                    )
+                    # The pack is unpacked into a directory of its own
+                    # inside this one, so the interpreter is looked for
+                    # rather than assumed to be at the top.
+                    found = sorted(pack.rglob("python*.dll"))
+                    fetched_runtime = found[0].parent if found else pack
+                    print(
+                        f"fetched an embeddable CPython {full_version} "
+                        f"for {chosen}",
+                        file=sys.stderr,
+                    )
+                wanted = list(args.fetch_package)
+                if args.auto_fetch:
+                    from .requirements import discover
+
+                    needs = discover(entry)
+                    for project in needs.projects:
+                        if project not in wanted:
+                            wanted.append(project)
+                    if needs.projects:
+                        print(
+                            "the program needs " + ", ".join(needs.projects),
+                            file=sys.stderr,
+                        )
+                    if needs.unknown:
+                        # Named rather than guessed at: an import name is not
+                        # a project name, and a guess that lands on an
+                        # unrelated project would put a stranger's code in
+                        # someone's application.
+                        print(
+                            "py2bin: cannot tell which project publishes "
+                            + ", ".join(needs.unknown)
+                            + "; name it with --fetch-package",
+                            file=sys.stderr,
+                        )
+                for project in wanted:
+                    into = room / "site"
+                    got = fetch_wheel(
+                        project, chosen, version, room / "wheels", cache=cache
+                    )
+                    # A wheel is a zip, and what goes beside a program is
+                    # what is inside it - carrying the archive itself would
+                    # put a file on the path that nothing can import.
+                    extract_zip(got.path, into)
+                    print(
+                        f"fetched and unpacked {got.path.name}", file=sys.stderr
+                    )
+                    if into not in fetched_sites:
+                        fetched_sites.append(into)
+
+            runtime = args.runtime or fetched_runtime
+            sites = [Path(entry) for entry in (args.bundle_site or [])]
+            sites.extend(fetched_sites)
+            if chosen.startswith("windows-") and (sites or runtime):
                 from .windows_bundle import carry_packages, carry_runtime
 
                 # There is no bundle here: the executable, the interpreter and
@@ -1055,17 +1151,15 @@ def main(argv: list[str] | None = None) -> int:
                 # plainly on disk, and says nothing at all from a windowed
                 # executable.
                 room = output.parent
-                if args.runtime:
-                    carried = carry_runtime(room, Path(args.runtime))
+                if runtime:
+                    carried = carry_runtime(room, Path(runtime))
                     print(
                         f"carried the interpreter beside {output.name} "
                         f"({carried} bytes)",
                         file=sys.stderr,
                     )
-                if args.bundle_site:
-                    packed = carry_packages(
-                        room, tuple(Path(entry) for entry in args.bundle_site)
-                    )
+                if sites:
+                    packed = carry_packages(room, tuple(sites))
                     print(
                         f"carried packages into Lib\\site-packages "
                         f"({packed} bytes), and named it on the interpreter's "
