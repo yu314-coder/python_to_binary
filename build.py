@@ -23,6 +23,11 @@ SOURCE = HERE / "src"
 #: not offered as something to build when this runs inside its own clone.
 _OURS = {"build.py", "get-py2bin.py", "setup.py", "conftest.py", "noxfile.py"}
 
+#: Directories inside the clone that hold py2bin, not anyone's program. Run
+#: from the clone root, these are all there is, and offering them would be
+#: offering to compile the compiler.
+_NOT_PROGRAMS = {"src", "tests", "docs", "dist", "build", "__pycache__"}
+
 #: What can be built, and what each one produces. Kept in the order someone
 #: is most likely to want, with this machine's own first at run time.
 TARGETS = (
@@ -96,26 +101,89 @@ def programs(here: Path) -> list[Path]:
     return found
 
 
-def main() -> int:
-    if not (SOURCE / "py2bin" / "__init__.py").is_file():
-        raise SystemExit(
-            f"no py2bin beside this script.\n"
-            f"  Expected it at {SOURCE / 'py2bin'}.\n"
-            f"  This is meant to be run from a clone of the repository; if you\n"
-            f"  have no clone, use get-py2bin.py instead."
+def nearby(here: Path) -> list[Path]:
+    """Directories next to this one that hold something to build.
+
+    Run from inside the clone there is nothing to build, and the useful thing
+    is not an error - it is the list of places that do hold a program.
+    """
+    places = []
+    for parent in (here, here.parent):
+        if not parent.is_dir():
+            continue
+        try:
+            entries = sorted(parent.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            if entry.name in _NOT_PROGRAMS or entry.resolve() == HERE:
+                continue
+            if programs(entry) and entry not in places:
+                places.append(entry)
+    return places
+
+
+def where_to_build(here: Path) -> Path | None:
+    """The directory whose program is to be built, asking if need be."""
+    if programs(here):
+        return here
+    say(f"\n  Nothing to build in {here}")
+    if here.resolve() == HERE:
+        say("  (this is py2bin's own directory - your program goes elsewhere)")
+    places = nearby(here)
+    if places:
+        chosen = ask(
+            "Where is your program?",
+            [(path, f"{path.name}/  ({len(programs(path))} file(s))") for path in places]
+            + [(None, "somewhere else - let me type the path")],
+            1,
         )
+        if chosen < len(places):
+            return places[chosen]
+    while True:
+        try:
+            typed = input("\n  Path to the folder holding your program: ").strip()
+        except EOFError:
+            return None
+        if not typed:
+            return None
+        candidate = Path(typed).expanduser()
+        if candidate.is_file() and candidate.suffix == ".py":
+            return candidate.parent
+        if programs(candidate):
+            return candidate
+        say(f"  no Python files to build in {candidate}")
+
+
+def main() -> int:
+    # Everything is said on stdout. Some editors show only that, and an
+    # explanation nobody sees is the same as no explanation: this exact
+    # script reported "nothing to build" to a console that dropped stderr,
+    # and looked from the outside like a crash during imports.
+    if not (SOURCE / "py2bin" / "__init__.py").is_file():
+        say(f"No py2bin beside this script - expected {SOURCE / 'py2bin'}.")
+        say("Run this from a clone of the repository, or use get-py2bin.py.")
+        return 1
     sys.path.insert(0, str(SOURCE))
     import py2bin
 
     say(f"py2bin {py2bin.__version__}, from {SOURCE}")
 
-    here = Path.cwd()
+    start = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path.cwd()
+    if start.is_file() and start.suffix == ".py":
+        here, forced = start.parent, start
+    else:
+        here, forced = where_to_build(start), None
+    if here is None:
+        say("\n  Nowhere to build from. Pass the folder as an argument:")
+        say(f"    python3 {Path(__file__).name} /path/to/your/program")
+        return 1
     candidates = programs(here)
-    if not candidates:
-        raise SystemExit(
-            f"no Python files to build in {here}\n"
-            f"  Put your program here, or run this from the directory it is in."
-        )
+    if forced is not None:
+        candidates = [forced]
+    say(f"  building from {here}")
 
     if len(candidates) == 1:
         program = candidates[0]

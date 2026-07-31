@@ -207,6 +207,13 @@ py2bin compile-capi app.py --target windows-x86_64 --crash-log \
 
 ```sh
 git clone https://github.com/yu314-coder/python_to_binary
+python3 python_to_binary/build.py my-program/
+```
+
+or run it from the directory your program is in, or with no argument at all
+and answer where it is:
+
+```sh
 cd my-program
 python3 ../python_to_binary/build.py
 ```
