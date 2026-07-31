@@ -132,6 +132,10 @@ src/py2bin/
   cabi.py             the vetted CPython entry points, callable from Python
   cabi_tables.py        which library each one lives in - no ctypes, so a
                         build never imports it
+  requirements.py       what a program needs from an index, worked out from
+                        what it imports - and never guessed at
+  runtime_fetch.py      verified downloads, through a downloader a caller
+                        outside this package may replace
 ```
 
 So `compile-capi` on a program is five stages, all of them here:
@@ -478,11 +482,9 @@ returning itself, and `await x` is PEP 380's expansion of
 exactly as it drives a coroutine: `asyncio.run`, `asyncio.sleep` and
 `asyncio.gather` all work on compiled coroutines.
 
-A `finally` is different and is refused. It has to run when the generator is
-*closed* - abandoned, garbage collected - and nothing here is told about a
-close. Cleanup that silently does not happen is worse than a refusal, and
-`with` is a `finally`, so it is refused too. `async` needs all of this plus a
-scheduler and the coroutine protocol.
+A `finally` around a `yield` works, and so does `with`, `async for` and
+`async with` - see *How `finally` and `with` are handled* above for why the
+cleanup is not emitted as a real `finally:` and what is still refused.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
 889-program corpus, 878 programs produce byte-identical output to CPython; the

@@ -244,11 +244,9 @@ returning itself, and `await x` is PEP 380's expansion of
 exactly as it drives a coroutine: `asyncio.run`, `asyncio.sleep` and
 `asyncio.gather` all work on compiled coroutines.
 
-A `finally` is different and is refused. It has to run when the generator is
-*closed* - abandoned, garbage collected - and nothing here is told about a
-close. Cleanup that silently does not happen is worse than a refusal, and
-`with` is a `finally`, so it is refused too. `async` needs all of this plus a
-scheduler and the coroutine protocol.
+A `finally` around a `yield` works, and so do `with`, `async for` and
+`async with` - see *How `finally` and `with` are handled* above for how, and
+for the two shapes that are still refused.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
 889-program corpus, 878 programs produce byte-identical output to CPython; the
