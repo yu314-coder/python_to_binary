@@ -255,7 +255,18 @@ def main() -> int:
         "--auto-fetch",
     ]
     if shape in ("app", "dmg"):
-        arguments += ["--app", "--embed-python", "--name", program.stem]
+        # --site is baked into the program when it is compiled, which happens
+        # before anything is downloaded, so where the packages will end up has
+        # to be said now. It stays relative: it is resolved against the running
+        # executable, which is what lets the bundle carry its own.
+        arguments += [
+            "--app",
+            "--embed-python",
+            "--site",
+            "../Resources/site-packages",
+            "--name",
+            program.stem,
+        ]
     if shape == "dmg":
         arguments.append("--dmg")
     arguments += ["-o", str(output)]

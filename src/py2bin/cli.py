@@ -1222,10 +1222,20 @@ def main(argv: list[str] | None = None) -> int:
                         f"path",
                         file=sys.stderr,
                     )
-            elif args.bundle_site:
+            elif sites:
+                # A macOS bundle keeps them in Contents/Resources/site-packages,
+                # which --site names relative to the executable. Fetched ones
+                # belong here too: they were downloaded and then left behind,
+                # so a bundle carrying its own interpreter reached for pywebview
+                # and found nothing - ModuleNotFoundError from an application
+                # whose packages had been fetched minutes earlier.
                 from .freezer import bundle_site_packages
 
-                bundle_site_packages(output, tuple(args.bundle_site))
+                bundle_site_packages(output, tuple(sites))
+                print(
+                    f"carried {len(sites)} package source(s) into the bundle",
+                    file=sys.stderr,
+                )
             carried = 0
             embedded = args.embed_python
             if embedded:
