@@ -3744,8 +3744,9 @@ class CApiEmitter:
         every iterable it supports.
         """
 
-        if not isinstance(node.target, (ast.Name, ast.Tuple, ast.List)):
-            raise self.fail(node, "a for loop binds a name or a tuple of names")
+        # Any target shape. `for d[k] in ...` is legal Python, and a loop
+        # variable a closure captures becomes a subscript of its cell, which
+        # is how a lambda made in a loop sees the value Python would show it.
         if isinstance(node.target, ast.Name) and self.is_unboxed(node.target.id):
             bounds = narrow_range(node.iter)
             if bounds is not None and "range" not in self.shadowed_builtins:
@@ -3771,13 +3772,15 @@ class CApiEmitter:
             f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
             indent + 1,
         )
-        if isinstance(node.target, ast.Name):
-            self.bind_target(node.target, item, indent + 1)
-        else:
+        if isinstance(node.target, (ast.Tuple, ast.List)):
             # `for a, b in pairs` - the item is taken apart the way an
             # assignment to the same target would take it apart.
             self.unpack_value(node.target, item, indent + 1)
             self.emit(f"Py_DecRef({item});", indent + 1)
+        else:
+            # One target: a name, or a subscript or attribute to store
+            # through. bind_target consumes the item either way.
+            self.bind_target(node.target, item, indent + 1)
         broke = self.begin_loop(node, indent)
         self.loop_depth += 1
         try:

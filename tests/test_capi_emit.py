@@ -531,31 +531,30 @@ class CApiEmitTests(unittest.TestCase):
             b"6\n",
         )
 
-    def test_a_capture_the_scope_moves_afterwards_is_refused(self):
-        """Python closes over the variable, this closes over the value.
+    def test_a_capture_the_scope_moves_afterwards_agrees_with_python(self):
+        """Python closes over the variable, so a closure sees the later value.
 
-        Where the captured name is settled by the time the closure is made the
-        two agree, and where it is not they do not - so the cases where they
-        would disagree are refused rather than quietly answered differently.
+        Capturing by value sees the earlier one, and these two cases used to
+        be refused rather than answered differently. They are not refused now:
+        a name whose value is still moving is put in a cell, which is the
+        variable back again, and both scopes reach the same place through it.
         """
 
-        self._reject(
+        for source in (
             "def f():\n"
             "    n = 1\n"
             "    def g():\n"
             "        return n\n"
             "    n = 2\n"
             "    return g()\n",
-            "binds again afterwards",
-        )
-        self._reject(
             "def f():\n"
             "    out = []\n"
             "    for i in range(3):\n"
             "        out.append(lambda: i)\n"
             "    return out\n",
-            "binds again afterwards",
-        )
+        ):
+            with self.subTest(source=source):
+                self.assertIn("_py2bin_cell_", python_to_capi_c(source, "p.py"))
 
     def test_a_module_level_capture_keeps_pythons_late_binding(self):
         """Read from the module's own storage, so it moves when Python's does.

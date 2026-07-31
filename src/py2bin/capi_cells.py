@@ -159,12 +159,82 @@ class _ToCell(ast.NodeTransformer):
         return node
 
 
+def _nested(function: ast.AST):
+    """Every function defined inside this one, at any depth."""
+    for node in _in_this_scope(function):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            yield node
+
+
+def _read_by(closure: ast.AST) -> set[str]:
+    """Every name this closure reads, including from further inside it."""
+    return {
+        node.id
+        for node in ast.walk(closure)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+
+def _still_moving(function: ast.AST) -> set[str]:
+    """Locals a closure captures whose value has not settled yet.
+
+    Python closes over the variable, so a closure made before the name is
+    assigned again sees the later value, and one made inside a loop sees the
+    loop's last. Capturing by value gives the value at the moment the closure
+    was made, which is a different answer. A cell restores the variable, so
+    the two agree again - and these are exactly the cases that were refused
+    rather than quietly disagreeing.
+    """
+    local = _bound_here(function)
+    moving: set[str] = set()
+
+    bindings = [
+        (node, getattr(node, "lineno", 0))
+        for node in _in_this_scope(function)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    ]
+    loops = [
+        node
+        for node in _in_this_scope(function)
+        if isinstance(node, (ast.For, ast.While))
+    ]
+
+    for closure in _nested(function):
+        line = getattr(closure, "lineno", 0)
+        captured = _read_by(closure) & local
+        if not captured:
+            continue
+        for node, bound_at in bindings:
+            if bound_at > line and node.id in captured:
+                moving.add(node.id)
+        for loop in loops:
+            start = getattr(loop, "lineno", 0)
+            end = getattr(loop, "end_lineno", start) or start
+            if not start <= line <= end:
+                continue
+            inside = list(loop.body)
+            if isinstance(loop, ast.For):
+                inside.append(loop.target)
+            for statement in inside:
+                for node in ast.walk(statement):
+                    if (
+                        isinstance(node, ast.Name)
+                        and isinstance(node.ctx, ast.Store)
+                        and node.id in captured
+                    ):
+                        moving.add(node.id)
+    return moving
+
+
 def _rewrite(function: ast.AST) -> None:
     """Give this function a cell for each name a closure below rebinds."""
     wanted = sorted(
-        name
-        for name in _declared_nonlocal(function)
-        if name in _bound_here(function)
+        {
+            name
+            for name in _declared_nonlocal(function)
+            if name in _bound_here(function)
+        }
+        | _still_moving(function)
     )
     if not wanted:
         return

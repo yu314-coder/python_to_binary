@@ -414,6 +414,7 @@ CPython, and requiring identical stdout and exit status.
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
 | `yield` inside `try` / `except` | ✅ |
 | `nonlocal`, as a cell a closure can rebind | ✅ |
+| a closure over a name still moving, with Python's late binding | ✅ |
 | unpacking into nested tuples, attributes, subscripts | ✅ |
 | `yield`/`await` inside `try` / `finally` | ✅ |
 | `yield`/`await` inside `with`, including suppression | ✅ |
