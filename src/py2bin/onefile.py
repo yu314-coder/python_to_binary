@@ -28,11 +28,27 @@ class OnefileResult:
     payload_sha256: str
 
 
-def _payload_files(root: Path) -> list[Path]:
-    return sorted(
-        (path for path in root.rglob("*") if path.is_file()),
-        key=lambda path: path.relative_to(root).as_posix(),
-    )
+def _payload_files(root: Path, exclude: "frozenset[Path]" = frozenset()) -> list[Path]:
+    """Every file to pack, minus anything this packing is itself writing.
+
+    An output written inside the directory being packed is an archive that
+    contains itself, growing as it is read: one such run reached 217 GB before
+    it was stopped. The output and the scratch directory beside it are left
+    out, so a caller who puts the result in dist/ beside what it packs gets
+    what they meant rather than a disk full.
+    """
+    skipped = {item.resolve() for item in exclude}
+    kept = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        settled = path.resolve()
+        if settled in skipped or any(
+            parent in skipped for parent in settled.parents
+        ):
+            continue
+        kept.append(path)
+    return sorted(kept, key=lambda path: path.relative_to(root).as_posix())
 
 
 def _zip_payload(root: Path, destination: Path) -> None:
@@ -43,7 +59,7 @@ def _zip_payload(root: Path, destination: Path) -> None:
         compresslevel=_ZIP_COMPRESSLEVEL,
         allowZip64=True,
     ) as archive:
-        for path in _payload_files(root):
+        for path in _payload_files(root, frozenset({destination})):
             relative = path.relative_to(root).as_posix()
             info = zipfile.ZipInfo.from_file(path, relative)
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -62,7 +78,7 @@ def _tar_payload(root: Path, destination: Path) -> None:
         compresslevel=9,
         format=tarfile.PAX_FORMAT,
     ) as archive:
-        for path in _payload_files(root):
+        for path in _payload_files(root, frozenset({destination})):
             archive.add(
                 path,
                 arcname=path.relative_to(root).as_posix(),
@@ -257,6 +273,14 @@ def create_onefile(
 
     payload_root = payload_root.resolve()
     output = output.resolve()
+    if output.parent == payload_root or payload_root in output.parents:
+        raise ValueError(
+            f"the single file would be written inside what it packs:\n"
+            f"  packing {payload_root}\n"
+            f"  writing {output}\n"
+            f"An archive that contains itself grows as it is read. Write it "
+            f"somewhere else."
+        )
     relative_launcher = launcher.resolve().relative_to(payload_root).as_posix()
     windows_name = Path(relative_launcher).stem
     windows = target.startswith("windows-")

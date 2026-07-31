@@ -311,7 +311,9 @@ def main() -> int:
         say("\n  packing it into a single file ...")
         from py2bin.onefile import create_onefile
 
-        single = here / "dist" / f"{program.stem}-onefile.exe"
+        # Beside dist/, not inside it: the packer reads dist/, and an
+        # archive written where it is being read contains itself.
+        single = here / f"{program.stem}-onefile.exe"
         create_onefile(
             payload_root=output.parent,
             output=single,
