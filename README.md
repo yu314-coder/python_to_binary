@@ -203,6 +203,21 @@ py2bin compile-capi app.py --target windows-x86_64 --crash-log \
 | `--auto-fetch` | download the interpreter instead of being told where one is |
 | `--fetch-package NAME` | download that project's wheel for the target and unpack it in; repeatable |
 
+### From a clone, with three questions
+
+```sh
+git clone https://github.com/yu314-coder/python_to_binary
+cd my-program
+python3 ../python_to_binary/build.py
+```
+
+Nothing is installed and nothing is checked for: `build.py` runs the
+`src/py2bin` in the clone it sits in. It lists the Python files where you
+ran it, asks which one is the program, which machine it is for, and what
+shape it should take - a `.app`, a `.dmg`, an `.exe`, or a plain executable -
+and builds it. Anything the program imports from beside it is found, and
+anything it needs from an index is downloaded.
+
 ### One file, no paths, no pip
 
 ```sh

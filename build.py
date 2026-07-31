@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Build a program with the py2bin sitting next to this file.
+
+    python3 build.py
+
+Nothing is installed and nothing is downloaded to get started: this runs the
+`src/py2bin` in the clone it lives in. Clone the repository, drop your program
+in beside it or run this from the directory your program is in, and answer
+three questions - which file, which machine, what shape.
+
+Written for editors on tablets and other places where pip is awkward and a
+path is worse. `get-py2bin.py` is the other half of this: it fetches py2bin
+when you have no clone. This one assumes you do.
+"""
+
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SOURCE = HERE / "src"
+
+#: Files that belong to py2bin rather than to anyone's program, so they are
+#: not offered as something to build when this runs inside its own clone.
+_OURS = {"build.py", "get-py2bin.py", "setup.py", "conftest.py", "noxfile.py"}
+
+#: What can be built, and what each one produces. Kept in the order someone
+#: is most likely to want, with this machine's own first at run time.
+TARGETS = (
+    ("darwin-arm64", "macOS, Apple silicon"),
+    ("darwin-x86_64", "macOS, Intel"),
+    ("windows-x86_64", "Windows, 64-bit Intel/AMD"),
+    ("windows-arm64", "Windows on ARM"),
+    ("linux-arm64", "Linux, 64-bit ARM"),
+)
+
+#: The shapes each target can take. A macOS bundle and a disk image only mean
+#: something on macOS; Windows and Linux produce a single executable.
+SHAPES = {
+    "darwin": (
+        ("app", ".app bundle, carrying its own interpreter"),
+        ("dmg", ".app inside a .dmg, ready to hand to someone"),
+        ("bin", "a plain executable, needing Python on the machine"),
+    ),
+    "windows": (
+        ("exe", ".exe with its interpreter beside it"),
+        ("bin", "a plain .exe, needing Python on the machine"),
+    ),
+    "linux": (
+        ("bin", "an executable, linking the machine's libpython"),
+    ),
+}
+
+
+def say(message: str = "") -> None:
+    print(message, flush=True)
+
+
+def ask(question: str, options, default: int) -> int:
+    """Offer a numbered list and answer with the chosen index."""
+    say()
+    say(question)
+    say()
+    for index, (_value, description) in enumerate(options, start=1):
+        mark = "  <-" if index == default else ""
+        say(f"  {index:>2}. {description}{mark}")
+    while True:
+        try:
+            answer = input(f"\nNumber [{default}]: ").strip() or str(default)
+        except EOFError:
+            # Nothing to read from - a pipe, or a runtime with no console.
+            say(f"\n  nothing to read from; taking {default}")
+            answer = str(default)
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return int(answer) - 1
+        say("  that is not one of the numbers above")
+
+
+def host_target() -> str:
+    import platform
+
+    system = {"Darwin": "darwin", "Windows": "windows", "Linux": "linux"}.get(
+        platform.system(), "linux"
+    )
+    machine = platform.machine().lower()
+    architecture = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+    return f"{system}-{architecture}"
+
+
+def programs(here: Path) -> list[Path]:
+    """The Python files that could be someone's program."""
+    found = []
+    for path in sorted(here.glob("*.py")):
+        if path.name in _OURS or path.name.startswith("_"):
+            continue
+        found.append(path)
+    return found
+
+
+def main() -> int:
+    if not (SOURCE / "py2bin" / "__init__.py").is_file():
+        raise SystemExit(
+            f"no py2bin beside this script.\n"
+            f"  Expected it at {SOURCE / 'py2bin'}.\n"
+            f"  This is meant to be run from a clone of the repository; if you\n"
+            f"  have no clone, use get-py2bin.py instead."
+        )
+    sys.path.insert(0, str(SOURCE))
+    import py2bin
+
+    say(f"py2bin {py2bin.__version__}, from {SOURCE}")
+
+    here = Path.cwd()
+    candidates = programs(here)
+    if not candidates:
+        raise SystemExit(
+            f"no Python files to build in {here}\n"
+            f"  Put your program here, or run this from the directory it is in."
+        )
+
+    if len(candidates) == 1:
+        program = candidates[0]
+        say(f"\n  building {program.name}, the only program here")
+    else:
+        obvious = [
+            path
+            for path in candidates
+            if path.name in ("main.py", "app.py", "__main__.py")
+        ]
+        default = candidates.index(obvious[0]) + 1 if obvious else 1
+        chosen = ask(
+            "Which file is the program? Any others it imports are found on "
+            "their own.",
+            [(path, path.name) for path in candidates],
+            default,
+        )
+        program = candidates[chosen]
+
+    ordered = sorted(TARGETS, key=lambda entry: entry[0] != host_target())
+    target = ordered[
+        ask(
+            "Which machine is it for?",
+            [(name, f"{label}  ({name})") for name, label in ordered],
+            1,
+        )
+    ][0]
+
+    system = target.split("-")[0]
+    shapes = SHAPES[system]
+    shape = shapes[ask("What shape should it be?", shapes, 1)][0]
+
+    from py2bin.requirements import discover
+
+    needs = discover(program)
+    if needs.local:
+        say(f"\n  it imports {', '.join(needs.local)} from beside it")
+    if needs.projects:
+        say(f"  it needs {', '.join(needs.projects)}, which will be downloaded")
+    if needs.unknown:
+        say(
+            f"  it imports {', '.join(needs.unknown)}, which this cannot name a\n"
+            f"  project for - the build will go on without them"
+        )
+
+    suffix = {"app": ".app", "dmg": ".app", "exe": ".exe", "bin": ""}[shape]
+    output = here / "dist" / f"{program.stem}{suffix}"
+    arguments = [
+        "compile-capi",
+        str(program),
+        "--target",
+        target,
+        "--crash-log",
+        "--clean",
+        "--auto-fetch",
+    ]
+    if shape in ("app", "dmg"):
+        arguments += ["--app", "--embed-python", "--name", program.stem]
+    if shape == "dmg":
+        arguments.append("--dmg")
+    arguments += ["-o", str(output)]
+
+    say(f"\nBuilding {output.name} for {target}.")
+    if shape in ("app", "dmg", "exe"):
+        say("It carries an interpreter, so this takes a while.")
+    say()
+
+    from py2bin.cli import main as build
+
+    code = build(arguments)
+    if code == 0:
+        say(f"\n  done: {output}")
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
