@@ -321,6 +321,22 @@ def _c_bytes(data: bytes) -> str:
     return "".join(out)
 
 
+def _bound_names(target: ast.expr) -> list[str]:
+    """Every name one assignment target binds, in the order they appear.
+
+    Only names being stored. `for d[k] in ...` mentions both `d` and `k`, and
+    binds neither: they are read to find where the item goes. Counting them
+    would give a comprehension its own `d`, shadowing the one holding the
+    dictionary being written to.
+    """
+    found: list[str] = []
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            if node.id not in found:
+                found.append(node.id)
+    return found
+
+
 def _c_string(text: str) -> str:
     """``text`` as a C string literal, escaped so the C parser reads it back."""
 
@@ -1641,8 +1657,9 @@ class CApiEmitter:
         clause = node.generators[position]
         if clause.is_async:
             raise self.fail(node, "an async comprehension is not translated here")
-        if not isinstance(clause.target, ast.Name):
-            raise self.fail(node, "a comprehension binds one name per clause here")
+        # May be empty: `for d[k] in ...` stores through a subscript and binds
+        # no name of its own, which needs no scope but is perfectly legal.
+        names = _bound_names(clause.target)
         sequence = self.expression(clause.iter, indent)
         iterator = self.temporary()
         self.emit(f"{iterator} = PyObject_GetIter({sequence});", indent)
@@ -1653,21 +1670,27 @@ class CApiEmitter:
         # its own: `zs = [x * 2 for x in xs]` must leave the enclosing `x`
         # exactly as it was. Binding the ordinary name instead left `print(x)`
         # after it answering with the comprehension's last item.
-        bound = self.temporary()
-        # Cleared first. The loop releases what the slot held before it takes
-        # the next item, and a slot reused from an earlier statement still
-        # holds that statement's pointer - which was released there, so
-        # releasing it again drops a reference this code no longer owns.
-        self.emit(f"{bound} = 0;", indent)
-        self.shadowed.append({clause.target.id: bound})
+        # One slot per name the clause binds, so `for k, v in pairs` works and
+        # neither k nor v is the enclosing scope's. Cleared first: the loop
+        # releases what a slot held before taking the next item, and a slot
+        # reused from an earlier statement still holds that statement's
+        # pointer - released there, so releasing it again drops a reference
+        # this code no longer owns.
+        scope = {}
+        for name in names:
+            slot = self.temporary()
+            self.emit(f"{slot} = 0;", indent)
+            scope[name] = slot
+        self.shadowed.append(scope)
         self.emit("while (1) {", indent)
         self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
         self.emit(
             f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
             indent + 1,
         )
-        self.emit(f"if ({bound}) Py_DecRef({bound});", indent + 1)
-        self.emit(f"{bound} = {item};", indent + 1)
+        # bind_target consumes the item, whatever shape the target has, and
+        # unpacks a tuple into the slots just declared.
+        self.bind_target(clause.target, item, indent + 1)
         inner = indent + 1
         for condition in clause.ifs:
             decision = self.temporary_flag()
@@ -1683,7 +1706,8 @@ class CApiEmitter:
             self.emit("}", inner)
         self.emit("}", indent)
         self.shadowed.pop()
-        self.emit(f"if ({bound}) {{ Py_DecRef({bound}); {bound} = 0; }}", indent)
+        for slot in scope.values():
+            self.emit(f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent)
         self.emit(f"Py_DecRef({iterator});", indent)
 
     def dict_literal(self, node: ast.Dict, indent: int) -> str:

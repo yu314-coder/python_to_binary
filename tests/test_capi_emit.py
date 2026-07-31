@@ -3142,3 +3142,46 @@ class RaisingAClassTests(unittest.TestCase):
         python_to_capi_c(
             "def g():\n    yield 1\n    raise ValueError\n", "program.py"
         )
+
+
+class ComprehensionTargetTests(unittest.TestCase):
+    """A comprehension clause binds whatever a `for` statement would.
+
+    `for k, v in d.items()` is ordinary Python and was refused inside a
+    comprehension while working perfectly as a statement - a gap that turned
+    up when a real application was compiled.
+    """
+
+    def test_a_pair_target_compiles(self):
+        python_to_capi_c(
+            "d = {'a': 1}\nprint([f'{k}{v}' for k, v in d.items()])\n",
+            "program.py",
+        )
+
+    def test_a_dict_comprehension_takes_a_pair(self):
+        python_to_capi_c(
+            "d = {'a': 1}\nprint({v: k for k, v in d.items()})\n", "program.py"
+        )
+
+    def test_a_longer_target_compiles(self):
+        python_to_capi_c(
+            "rows = [(1, 2, 3)]\nprint([a + b + c for a, b, c in rows])\n",
+            "program.py",
+        )
+
+    def test_the_names_stay_inside_the_comprehension(self):
+        # A comprehension has a scope of its own, so binding k there must not
+        # disturb the k outside it.
+        c = python_to_capi_c(
+            "d = {'a': 1}\nk = 'outer'\nprint([k for k, v in d.items()], k)\n",
+            "program.py",
+        )
+        self.assertIn("PyObject_GetIter", c)
+
+    def test_a_clause_storing_through_a_subscript_keeps_the_outer_name(self):
+        # `for d[k] in ...` reads d and k to find where the item goes; it
+        # binds neither. Treating them as bound would give the comprehension
+        # its own d, shadowing the dictionary being written to.
+        python_to_capi_c(
+            "d = {}\nk = 'a'\nprint([1 for d[k] in [9]], d)\n", "program.py"
+        )

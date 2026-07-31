@@ -52,6 +52,18 @@ KNOWN_PROJECTS = {
     "psutil": "psutil",
     "numpy": "numpy",
     "requests": "requests",
+    "imageio": "imageio",
+    "pygame": "pygame",
+    "manim": "manim",
+    "scipy": "scipy",
+    "pandas": "pandas",
+    "matplotlib": "matplotlib",
+    "moviepy": "moviepy",
+    "pydub": "pydub",
+    "rich": "rich",
+    "click": "click",
+    "tqdm": "tqdm",
+    "pyright": "pyright",
 }
 
 
