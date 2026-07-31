@@ -261,6 +261,12 @@ used, and cached under `~/.cache/py2bin`, so a second build does not go out
 again. A wheel is unpacked rather than carried as an archive - a `.whl` on the
 path is a file nothing can import.
 
+A macOS bundle carries a macOS interpreter, and until now that meant only a
+Mac could build one. It does not any more: where the machine has no framework
+of its own, a portable CPython is downloaded for the target, checked against
+the checksum published beside it, and laid out inside the bundle. A Mac still
+uses its own, which matches everything else about it.
+
 A project that has no wheel for the target does not stop the build. Soon
 after a Python release this is ordinary: a project publishes wheels for the
 interpreters that existed when it was released, so the newest version may

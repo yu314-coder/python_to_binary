@@ -442,17 +442,29 @@ def embed_cpython_in_app(
     frameworks = bundle / "Contents" / "Frameworks"
     frameworks.mkdir(parents=True, exist_ok=True)
     version_directory = dylib.parent
+    # A framework says its version in the directory above the library. A
+    # portable build does not - it is just a lib/ - so the carried copy is
+    # laid out canonically, matching what the executable was linked against.
+    import sys as _sys
+
+    canonical = version_directory.parent.name != "Versions"
+    carried_name = "Python" if canonical else dylib.name
+    version_name = (
+        f"{_sys.version_info.major}.{_sys.version_info.minor}"
+        if canonical
+        else version_directory.name
+    )
     # The framework *layout*, not the bare library: the signature on that
     # library seals its neighbouring Resources/Info.plist, so a dylib lifted
     # out on its own is reported as modified and dyld refuses it. The bytes are
     # identical either way - what is missing is the file the seal names.
     carried_version = (
-        frameworks / "Python.framework" / "Versions" / version_directory.name
+        frameworks / "Python.framework" / "Versions" / version_name
     )
     if carried_version.exists():
         shutil.rmtree(carried_version)
     carried_version.mkdir(parents=True)
-    shutil.copy2(dylib, carried_version / dylib.name)
+    shutil.copy2(dylib, carried_version / carried_name)
     # Only the file the signature seals. The framework's Resources directory
     # is another 76 MB - a second copy of the standard library and the Tcl/Tk
     # frameworks - and nothing loads it from here.
@@ -493,7 +505,7 @@ def embed_cpython_in_app(
     for binary in (
         *bundle.rglob("*.so"),
         *bundle.rglob("*.dylib"),
-        carried_version / dylib.name,
+        carried_version / carried_name,
     ):
         if binary.is_file():
             _thin_to_arm64(binary, _BUNDLE_ARCHITECTURES[target])

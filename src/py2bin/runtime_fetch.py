@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tarfile
 import stat
 import tempfile
 import urllib.parse
@@ -469,6 +470,82 @@ def select_wheel(
         return None
     candidates.sort(key=lambda item: _abi_rank(item["filename"], python_version))
     return candidates[0]
+
+
+#: Portable CPython builds for macOS, which python.org does not publish - it
+#: ships an installer, and unpacking one needs the installer. These are plain
+#: archives of a prefix, with a checksum file beside them.
+_STANDALONE_LATEST = (
+    "https://api.github.com/repos/astral-sh/python-build-standalone"
+    "/releases/latest"
+)
+_STANDALONE_ARCH = {"darwin-arm64": "aarch64", "darwin-x86_64": "x86_64"}
+
+
+def fetch_macos_runtime(
+    version: str, target: str, output: Path, *, cache: Path
+) -> Path:
+    """Download a macOS CPython and answer the shared library inside it.
+
+    A macOS bundle links against a macOS libpython, and only a Mac has one -
+    which stops a bundle being built anywhere else, including on the tablet
+    someone is writing the program on. It does not have to: portable builds
+    of exactly this are published, so the machine doing the building needs to
+    be no particular machine at all.
+    """
+    architecture = _STANDALONE_ARCH.get(target)
+    if architecture is None:
+        raise FetchError(f"no portable CPython is published for {target}")
+    wanted = f"{version.split('.')[0]}.{version.split('.')[1]}"
+
+    release = _read_json(_STANDALONE_LATEST, "the portable CPython index")
+    assets = {item.get("name"): item for item in release.get("assets") or []}
+    pattern = re.compile(
+        rf"^cpython-({re.escape(wanted)}\.\d+)\+\d+-"
+        rf"{architecture}-apple-darwin-install_only\.tar\.gz$"
+    )
+    matches = sorted(name for name in assets if name and pattern.match(name))
+    if not matches:
+        raise FetchError(
+            f"the portable CPython release {release.get('tag_name', '?')} has "
+            f"no {wanted} build for {target}"
+        )
+    name = matches[-1]
+
+    # The checksums are published beside the archives, so what arrives can be
+    # held to what was published rather than merely to what was served.
+    digest = None
+    if "SHA256SUMS" in assets:
+        listing = _read_bytes(
+            assets["SHA256SUMS"]["browser_download_url"],
+            "the portable CPython checksums",
+            8 * 1024 * 1024,
+        ).decode("utf-8", "replace")
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].lstrip("*") == name:
+                digest = parts[0]
+                break
+    if digest is None:
+        raise FetchError(f"no published checksum for {name}")
+
+    archive, _got = download_verified(
+        assets[name]["browser_download_url"],
+        cache,
+        expected_sha256=digest,
+        label=f"portable CPython {wanted} for {target}",
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as bundle:
+        for member in bundle.getmembers():
+            place = (output / member.name).resolve()
+            if not str(place).startswith(str(output.resolve())):
+                raise FetchError(f"the archive writes outside its directory: {member.name}")
+        bundle.extractall(output)
+    found = sorted(output.rglob("libpython*.dylib"))
+    if not found:
+        raise FetchError(f"no libpython in the archive {name}")
+    return found[0]
 
 
 def _version_key(text: str):

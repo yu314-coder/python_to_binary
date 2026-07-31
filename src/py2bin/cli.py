@@ -674,10 +674,21 @@ def _embedded_python_path() -> str:
     from .cabi_tables import _cpython_library
 
     dylib = Path(_cpython_library())
-    version = dylib.parent.name
+    if dylib.is_file() and dylib.parent.parent.name == "Versions":
+        # A real framework on this machine: use its own layout, which is what
+        # everything else about this interpreter already agrees with.
+        return (
+            f"@executable_path/../Frameworks/Python.framework/Versions/"
+            f"{dylib.parent.name}/{dylib.name}"
+        )
+    # No framework here, or one whose path says nothing useful - a portable
+    # build, or an interpreter reporting where it was built rather than where
+    # it is. The carried one is laid out canonically instead, and the step
+    # that carries it puts it exactly here.
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
     return (
         f"@executable_path/../Frameworks/Python.framework/Versions/"
-        f"{version}/{dylib.name}"
+        f"{version}/Python"
     )
 
 
@@ -1070,6 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
                 from .runtime_fetch import (
                     FetchError,
                     extract_zip,
+                    fetch_macos_runtime,
                     fetch_wheel,
                     fetch_windows_runtime,
                 )
@@ -1098,6 +1110,28 @@ def main(argv: list[str] | None = None) -> int:
                         f"for {chosen}",
                         file=sys.stderr,
                     )
+                if (
+                    chosen.startswith("darwin-")
+                    and args.app
+                    and args.embed_python
+                    and not args.runtime
+                ):
+                    # Only when this machine cannot supply one. A Mac has a
+                    # framework already and its own matches everything else
+                    # about it; anywhere else there is none, which is what
+                    # stopped a macOS bundle being built off a Mac at all.
+                    from .cabi_tables import _cpython_library
+
+                    if not Path(_cpython_library()).is_file():
+                        fetched_runtime = fetch_macos_runtime(
+                            version, chosen, room / "macos-runtime", cache=cache
+                        )
+                        print(
+                            f"fetched a portable CPython for {chosen} - this "
+                            f"machine has none to carry",
+                            file=sys.stderr,
+                        )
+
                 wanted = list(args.fetch_package)
                 if args.auto_fetch:
                     from .requirements import discover
@@ -1206,11 +1240,10 @@ def main(argv: list[str] | None = None) -> int:
                 # @executable_path/../Frameworks/Python.framework before this
                 # ran, so a bundle without one is a bundle dyld refuses to
                 # start - which is worse than saying so now.
-                carried = embed_cpython_in_app(
-                    output,
-                    chosen,
-                    Path(args.runtime) if args.runtime else None,
+                source = (
+                    Path(args.runtime) if args.runtime else fetched_runtime
                 )
+                carried = embed_cpython_in_app(output, chosen, source)
             if embedded:
                 freed = 0
                 if args.prune_unused:
