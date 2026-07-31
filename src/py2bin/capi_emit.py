@@ -30,6 +30,7 @@ import builtins
 import contextlib
 from pathlib import Path
 
+from .capi_cells import CellError, expand as expand_cells
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
     ARITHMETIC as _MACHINE_OPS,
@@ -3582,9 +3583,10 @@ class CApiEmitter:
         if any(isinstance(element, ast.Starred) for element in target.elts):
             self.unpack_with_star(target, value, indent)
             return
-        for element in target.elts:
-            if not isinstance(element, ast.Name):
-                raise self.fail(target, "unpacking binds plain names here")
+        # Any target shape: bind_target below takes a name, a nested tuple, an
+        # attribute or a subscript, so `(a, b), c = pair` and `d[k], e = row`
+        # work, and so does unpacking into a `nonlocal` name once it has
+        # become a cell.
         # Through a tuple first, for two reasons: unpacking works on any
         # iterable and indexing does not, and the length has to be known to
         # say whether it matches. Indexing the value directly took `a, b` from
@@ -3631,10 +3633,7 @@ class CApiEmitter:
             self.emit(f"{item} = PyObject_GetItem({items}, {index});", indent)
             self.emit(f"Py_DecRef({index});", indent)
             self.checked(item, indent)
-            name = self.declare(element.id)
-            self.emit(f"if ({name}) Py_DecRef({name});", indent)
-            self.emit(f"{name} = {item};", indent)
-            self.publish(element.id, name, indent)
+            self.bind_target(element, item, indent)
         self.emit(f"Py_DecRef({items});", indent)
 
     def expression_statement(self, node: ast.Expr, indent: int) -> None:
@@ -4844,6 +4843,12 @@ class CApiEmitter:
         # Before anything else looks at the tree: a generator becomes a class
         # and a function that makes one, so nothing below ever sees a `yield`.
         try:
+            # Before the generators: a `nonlocal` inside one has to become
+            # a cell while it is still an ordinary function body.
+            try:
+                tree = expand_cells(tree)
+            except CellError as error:
+                raise self.fail(error.node, error.message) from None
             tree = expand_generators(tree)
         except GeneratorRewriteError as error:
             raise self.fail(

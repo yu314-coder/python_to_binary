@@ -413,6 +413,8 @@ CPython, and requiring identical stdout and exit status.
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
 | `yield` inside `try` / `except` | ✅ |
+| `nonlocal`, as a cell a closure can rebind | ✅ |
+| unpacking into nested tuples, attributes, subscripts | ✅ |
 | `yield`/`await` inside `try` / `finally` | ✅ |
 | `yield`/`await` inside `with`, including suppression | ✅ |
 | `async for` / `async with` | ✅ |
