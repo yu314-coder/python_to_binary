@@ -4753,6 +4753,14 @@ class CApiEmitter:
         )
         self.current, self.handlers = function, []
         self.scope = node.body if isinstance(node.body, list) else []
+        # A closure is not inside the region that encloses its definition. Its
+        # `return` is its own, and leaving through the enclosing `finally`
+        # would set a flag and jump to a label that belong to another C
+        # function - which is how a closure defined inside a try/finally came
+        # to emit `_c27 = 1; goto _finally1;` where neither exists. The same
+        # for loops: a `break` here is not the outer loop's.
+        outer_finallys, self.finallys = self.finallys, []
+        outer_loop_depth, self.loop_depth = self.loop_depth, 0
         outer_depth, self.depth = self.depth, 0
         outer_guard, self.guards_recursion = self.guards_recursion, True
         self.scope_path.append((simple, True))
@@ -4797,6 +4805,8 @@ class CApiEmitter:
             )
             self.depth = outer_depth
             self.guards_recursion = outer_guard
+            self.finallys = outer_finallys
+            self.loop_depth = outer_loop_depth
             self.scope_path.pop()
 
     # --- assembly --------------------------------------------------------
