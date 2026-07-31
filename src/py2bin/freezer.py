@@ -370,7 +370,30 @@ def compile_bundle_sources(bundle: Path) -> int:
     return saved
 
 
-def embed_cpython_in_app(bundle: Path, target: str = "darwin-arm64") -> int:
+def _named_framework(source: Path) -> Path:
+    """The shared library inside a Python.framework a caller pointed at.
+
+    Given the framework, a version inside it, or the library itself - all
+    three are things someone reasonably types.
+    """
+    source = source.expanduser().resolve()
+    if source.is_file():
+        return source
+    for candidate in (
+        source / "Python",
+        source / "Versions" / "Current" / "Python",
+        *sorted(source.glob("Versions/*/Python")),
+        *sorted(source.glob("Python.framework/Versions/*/Python")),
+        *sorted(source.glob("lib/libpython*.dylib")),
+    ):
+        if candidate.is_file():
+            return candidate
+    return source / "Python"
+
+
+def embed_cpython_in_app(
+    bundle: Path, target: str = "darwin-arm64", source: Path | None = None
+) -> int:
     """Put this CPython inside a compiled ``.app`` so the bundle can travel.
 
     A compiled artifact names its interpreter in an ``LC_LOAD_DYLIB``, and dyld
@@ -391,9 +414,31 @@ def embed_cpython_in_app(bundle: Path, target: str = "darwin-arm64") -> int:
 
     from .cabi_tables import _cpython_library
 
-    dylib = Path(_cpython_library())
+    # A caller may name the framework instead: the running interpreter's is
+    # the right one on a Mac and no use at all on a machine that is not one.
+    dylib = _named_framework(source) if source is not None else Path(_cpython_library())
     if not dylib.is_file():
-        raise FileNotFoundError(f"no CPython shared library at {dylib}")
+        # The path comes from the running interpreter, which reports where it
+        # was *built*. On a phone or a tablet that is a machine in a data
+        # centre, and the framework named is often for another platform
+        # entirely - an iOS one cannot go inside a macOS .app whether it is
+        # there or not. Said plainly, because the path alone reads like a
+        # missing file rather than a machine that never had it.
+        raise FileNotFoundError(
+            f"no CPython shared library at {dylib}\n"
+            f"  That path comes from this interpreter, which reports where it\n"
+            f"  was *built*, not where it is - on a phone or a tablet that is a\n"
+            f"  machine in a data centre, and the framework named there may be\n"
+            f"  for another platform entirely. An iOS framework cannot go\n"
+            f"  inside a macOS bundle in any case.\n"
+            f"\n"
+            f"  A macOS bundle links against a macOS Python.framework, so one\n"
+            f"  has to be here. Either:\n"
+            f"    --runtime /path/to/Python.framework   to carry that one, or\n"
+            f"    --target windows-x86_64               which downloads its own\n"
+            f"                                          interpreter and needs\n"
+            f"                                          nothing from this machine"
+        )
     frameworks = bundle / "Contents" / "Frameworks"
     frameworks.mkdir(parents=True, exist_ok=True)
     version_directory = dylib.parent

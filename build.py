@@ -216,6 +216,20 @@ def main() -> int:
     shapes = SHAPES[system]
     shape = shapes[ask("What shape should it be?", shapes, 1)][0]
 
+    # A macOS bundle links against a macOS Python.framework, and only a Mac
+    # has one. Said before the build rather than after it, because everything
+    # up to that point takes a while and downloads a good deal.
+    if system == "darwin" and shape in ("app", "dmg"):
+        import platform as _platform
+
+        if _platform.system() != "Darwin":
+            say(
+                "\n  Note: a macOS bundle carries a macOS Python.framework, and\n"
+                "  this is not a Mac. The build will ask for one. A Windows\n"
+                "  target downloads its own interpreter and needs nothing from\n"
+                "  this machine, if that suits."
+            )
+
     from py2bin.requirements import discover
 
     needs = discover(program)

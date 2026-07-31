@@ -192,8 +192,8 @@ def _parser() -> argparse.ArgumentParser:
     capi_parser.add_argument(
         "--runtime",
         metavar="DIR",
-        help="copy an embeddable interpreter in beside a Windows executable "
-        "(omit it and pass --auto-fetch to download one)",
+        help="where to find an interpreter to carry: an embeddable CPython for a Windows executable, or a Python.framework for a macOS bundle "
+        "(for Windows, omit it and pass --auto-fetch to download one)",
     )
     capi_parser.add_argument(
         "--auto-fetch",
@@ -1192,10 +1192,26 @@ def main(argv: list[str] | None = None) -> int:
                 from .freezer import bundle_site_packages
 
                 bundle_site_packages(output, tuple(args.bundle_site))
-            if args.embed_python:
+            carried = 0
+            embedded = args.embed_python
+            if embedded:
                 from .freezer import embed_cpython_in_app
 
-                carried = embed_cpython_in_app(output, target)
+                # `chosen`, not `target`: the latter is None when the caller
+                # did not name one and the host's is meant, and the
+                # architecture tables have no entry for None.
+                #
+                # No falling back here, unlike a package with no wheel. The
+                # executable was linked against
+                # @executable_path/../Frameworks/Python.framework before this
+                # ran, so a bundle without one is a bundle dyld refuses to
+                # start - which is worse than saying so now.
+                carried = embed_cpython_in_app(
+                    output,
+                    chosen,
+                    Path(args.runtime) if args.runtime else None,
+                )
+            if embedded:
                 freed = 0
                 if args.prune_unused:
                     from .freezer import (
