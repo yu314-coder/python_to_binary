@@ -241,18 +241,26 @@ class ExternRejectionTests(unittest.TestCase):
             int.from_bytes(image[4:8], "little"), 0x01000007
         )
 
-    def test_extern_on_a_target_without_an_adapter_is_rejected(self):
-        # linux-x86-64 is what is left. The ELF writer and its relocations
-        # exist now; what that target still needs is its encoder keeping the
-        # call sites it already works out, the way the ARM64 one does.
-        for target in ("linux-x86_64",):
-            message = self._compile_error(
-                "from py2bin.cabi import abs\n"
-                "raise SystemExit(abs(-1))\n",
-                target=target,
-            )
-            self.assertIn("darwin-arm64", message)
-            self.assertIn("linux-arm64", message)
+    def test_every_target_can_call_out_now(self):
+        """There is no target left without a way to bind its symbols.
+
+        dyld on macOS, the import table on Windows, the loader's GOT on
+        Linux - all six, which is what this used to enumerate the exceptions
+        to.
+        """
+        from py2bin.native.compiler import _EXTERN_CAPABLE_TARGETS
+
+        self.assertEqual(
+            sorted(_EXTERN_CAPABLE_TARGETS),
+            [
+                "darwin-arm64",
+                "darwin-x86_64",
+                "linux-arm64",
+                "linux-x86_64",
+                "windows-arm64",
+                "windows-x86_64",
+            ],
+        )
 
     def test_extern_on_windows_x86_64_imports_from_a_dll(self):
         """The interpreter is a second DLL in the import directory.

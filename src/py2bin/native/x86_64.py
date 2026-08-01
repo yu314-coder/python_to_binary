@@ -926,6 +926,21 @@ def encode_darwin_extern(
     return code, refs.externs, refs.statics
 
 
+def encode_linux_extern(
+    module: Module, code_address: int
+) -> tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]:
+    """A linux x86-64 module that may call symbols the loader binds.
+
+    The same encoder as everything else here, keeping what it already works
+    out rather than discarding it: the call sites so the ELF writer can lay
+    out a GOT, and the static sites so it can point them at the writable
+    segment rather than a register a callback would find someone else's value
+    in.
+    """
+    code, refs = _encode_x86(module, "linux", code_address, image_statics=True)
+    return code, refs.externs, refs.statics
+
+
 def encode(module: Module, platform: str, code_address: int) -> bytes:
     """Encode native syscalls directly; no text assembly is produced."""
 

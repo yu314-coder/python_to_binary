@@ -2857,33 +2857,26 @@ class GeneratorHandlerTests(unittest.TestCase):
             "program.py",
         )
 
-    def test_what_a_finally_still_refuses_says_why(self):
-        for source, needle in (
-            # Suspending while unwinding needs the cleanup cut into blocks too.
-            ("def f():\n    try:\n        yield 1\n    finally:\n        yield 2\n",
-             "itself contains"),
-            # These leave without passing the block holding the cleanup.
-            # A break goes round the block holding the cleanup.
-            ("def f():\n    for i in (1,):\n        try:\n            yield i\n"
-             "            break\n        finally:\n            pass\n", "break"),
-        ):
-            with self.subTest(source=source):
-                with self.assertRaises(CApiEmitError) as caught:
-                    python_to_capi_c(source, "program.py")
-                self.assertIn(needle, str(caught.exception))
+    def test_a_finally_that_itself_yields_compiles(self):
+        """The cleanup is a block, and a block may suspend.
 
+        Reached the same way from both paths - finishing and raising - so it
+        can hold a `yield` of its own. What was raised waits in a name until
+        the cleanup is done and is put back afterwards.
+        """
+        python_to_capi_c(
+            "def f():\n    try:\n        yield 1\n    finally:\n        yield 2\n",
+            "program.py",
+        )
 
-class AsyncTests(unittest.TestCase):
-    """`async def` and `await`, which are the generator machine renamed.
-
-    Awaiting an object with `__await__` means delegating to the iterator it
-    answers with - so a coroutine is a state machine that also says
-    `__await__`, which is what it is in CPython too. `await x` is then PEP
-    380's expansion of `yield from x.__await__()`, and the event loop drives
-    it through `send` exactly as it drives a real coroutine.
-    """
-
-    _run = CApiEmitTests._run
+    def test_a_break_out_of_a_finally_region_compiles(self):
+        # The cleanup runs before the jump, which is what the jump would have
+        # reached had it left the ordinary way.
+        python_to_capi_c(
+            "def f():\n    for i in (1,):\n        try:\n            yield i\n"
+            "            break\n        finally:\n            pass\n",
+            "program.py",
+        )
 
     def test_awaiting_a_compiled_coroutine(self):
         self._run(

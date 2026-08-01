@@ -404,6 +404,43 @@ class _ExitRewriter(ast.NodeTransformer):
     visit_ClassDef = visit_For
 
 
+class _CleanupBeforeExit(ast.NodeTransformer):
+    """Run a `finally` before a `break` or `continue` that leaves past it.
+
+    Those jump straight to the loop's own blocks, going round the block that
+    holds the cleanup - so it would simply not run. A copy of it is put
+    immediately before the jump instead, which is what the jump would have
+    reached had it gone the ordinary way.
+
+    A loop written inside the protected region is left alone: a `break` there
+    belongs to that loop and never leaves the region at all. So is a nested
+    function, whose loops are its own.
+    """
+
+    def __init__(self, cleanup: "list[ast.stmt]"):
+        self.cleanup = cleanup
+
+    def visit_For(self, node):
+        return node
+
+    visit_While = visit_For
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+
+    def _leave(self, node):
+        return [*(copy.deepcopy(item) for item in self.cleanup), node]
+
+    def visit_Break(self, node):
+        return self._leave(node)
+
+    def visit_Continue(self, node):
+        return self._leave(node)
+
+
 class _Machine:
     """Cuts one function body into numbered blocks."""
 
@@ -674,50 +711,75 @@ class _Machine:
                     statement, "a `try ... else` containing `yield`"
                 )
             cleanup_body = statement.finalbody
-            if cleanup_body and _suspends(cleanup_body):
-                raise GeneratorRewriteError(
-                    statement,
-                    "a `finally` that itself contains `yield`, which would "
-                    "have to suspend while unwinding",
-                )
-            if cleanup_body and any(
-                isinstance(inner, (ast.Break, ast.Continue))
-                for node in statement.body
-                for inner in ast.walk(node)
-            ):
-                # A `break` or `continue` jumps straight to the loop's own
-                # blocks, going around the one that holds the cleanup, so the
-                # cleanup would simply not run. Refused rather than compiled
-                # into something that skips a `finally`. A `return` is fine:
-                # an earlier pass has already turned it into a jump that
-                # leaves through the ordinary exit.
-                raise GeneratorRewriteError(
-                    statement,
-                    "a `break` or `continue` inside a `try ... finally` "
-                    "containing `yield`",
-                )
+            if cleanup_body:
+                # A `break` or `continue` leaving the region jumps to the
+                # loop's own blocks and would go round the cleanup. A copy of
+                # it runs first instead, which is what the jump would have
+                # reached had it left the ordinary way.
+                through = _CleanupBeforeExit(cleanup_body)
+                statement.body = [
+                    inner
+                    for item in statement.body
+                    for inner in (
+                        lambda got: got if isinstance(got, list) else [got]
+                    )(through.visit(item))
+                ]
+                ast.fix_missing_locations(statement)
             after = self._new_block()
             # One entry block per clause, outside the region: a handler does
             # not guard itself.
             entries = [self._new_block() for _ in statement.handlers]
             body = self._new_block()
+            # The cleanup is a block of its own, reached from every way out -
+            # finishing, and raising. A block may suspend, which is what lets
+            # the cleanup itself hold a `yield`; inlining it into the handler
+            # could not. What was raised is held in a name until the cleanup
+            # has run, and put back afterwards.
+            leave = after
+            pending = None
+            if cleanup_body:
+                leave = self._new_block()
+                pending = f"_py2bin_pending{leave}"
+                self.names.add(pending)
             self.blocks[block].extend(self._goto(body))
-            self.region.append((statement.handlers, entries, cleanup_body))
+            if pending is not None:
+                self.blocks[block].append(
+                    ast.Assign(
+                        targets=[ast.Name(id=pending, ctx=ast.Store())],
+                        value=ast.Constant(value=None),
+                    )
+                )
+                self.blocks[block][-1], self.blocks[block][-2] = (
+                    self.blocks[block][-2],
+                    self.blocks[block][-1],
+                )
+            self.region.append((statement.handlers, entries, cleanup_body, leave, pending))
             self.guards[body] = list(self.region)
             end = self._emit(statement.body, body)
             self.region.pop()
-            # Where a clause goes when it finishes without raising. With a
-            # `finally` that is a block holding the cleanup, which then goes
-            # on to `after`; the cleanup on the raising path is inlined into a
-            # handler instead, because a jump would land after the exception
-            # had already been lost.
-            leave = after
             if cleanup_body:
-                leave = self._new_block()
-                self.blocks[leave].extend(
-                    copy.deepcopy(inner) for inner in cleanup_body
+                # Emitted, not appended: the cleanup may hold a `yield`, and
+                # only going through here cuts it into blocks at that point.
+                finished = self._emit(
+                    [copy.deepcopy(inner) for inner in cleanup_body], leave
                 )
-                self.blocks[leave].extend(self._goto(after))
+                self.blocks[finished].append(
+                    ast.If(
+                        test=ast.Compare(
+                            left=ast.Name(id=pending, ctx=ast.Load()),
+                            ops=[ast.IsNot()],
+                            comparators=[ast.Constant(value=None)],
+                        ),
+                        body=[
+                            ast.Raise(
+                                exc=ast.Name(id=pending, ctx=ast.Load()),
+                                cause=None,
+                            )
+                        ],
+                        orelse=[],
+                    )
+                )
+                self.blocks[finished].extend(self._goto(after))
             self.blocks[end].extend(self._goto(leave))
             for handler, entry in zip(statement.handlers, entries):
                 if handler.name:
@@ -1225,50 +1287,75 @@ class _Machine:
                     statement, "a `try ... else` containing `yield`"
                 )
             cleanup_body = statement.finalbody
-            if cleanup_body and _suspends(cleanup_body):
-                raise GeneratorRewriteError(
-                    statement,
-                    "a `finally` that itself contains `yield`, which would "
-                    "have to suspend while unwinding",
-                )
-            if cleanup_body and any(
-                isinstance(inner, (ast.Break, ast.Continue))
-                for node in statement.body
-                for inner in ast.walk(node)
-            ):
-                # A `break` or `continue` jumps straight to the loop's own
-                # blocks, going around the one that holds the cleanup, so the
-                # cleanup would simply not run. Refused rather than compiled
-                # into something that skips a `finally`. A `return` is fine:
-                # an earlier pass has already turned it into a jump that
-                # leaves through the ordinary exit.
-                raise GeneratorRewriteError(
-                    statement,
-                    "a `break` or `continue` inside a `try ... finally` "
-                    "containing `yield`",
-                )
+            if cleanup_body:
+                # A `break` or `continue` leaving the region jumps to the
+                # loop's own blocks and would go round the cleanup. A copy of
+                # it runs first instead, which is what the jump would have
+                # reached had it left the ordinary way.
+                through = _CleanupBeforeExit(cleanup_body)
+                statement.body = [
+                    inner
+                    for item in statement.body
+                    for inner in (
+                        lambda got: got if isinstance(got, list) else [got]
+                    )(through.visit(item))
+                ]
+                ast.fix_missing_locations(statement)
             after = self._new_block()
             # One entry block per clause, outside the region: a handler does
             # not guard itself.
             entries = [self._new_block() for _ in statement.handlers]
             body = self._new_block()
+            # The cleanup is a block of its own, reached from every way out -
+            # finishing, and raising. A block may suspend, which is what lets
+            # the cleanup itself hold a `yield`; inlining it into the handler
+            # could not. What was raised is held in a name until the cleanup
+            # has run, and put back afterwards.
+            leave = after
+            pending = None
+            if cleanup_body:
+                leave = self._new_block()
+                pending = f"_py2bin_pending{leave}"
+                self.names.add(pending)
             self.blocks[block].extend(self._goto(body))
-            self.region.append((statement.handlers, entries, cleanup_body))
+            if pending is not None:
+                self.blocks[block].append(
+                    ast.Assign(
+                        targets=[ast.Name(id=pending, ctx=ast.Store())],
+                        value=ast.Constant(value=None),
+                    )
+                )
+                self.blocks[block][-1], self.blocks[block][-2] = (
+                    self.blocks[block][-2],
+                    self.blocks[block][-1],
+                )
+            self.region.append((statement.handlers, entries, cleanup_body, leave, pending))
             self.guards[body] = list(self.region)
             end = self._emit(statement.body, body)
             self.region.pop()
-            # Where a clause goes when it finishes without raising. With a
-            # `finally` that is a block holding the cleanup, which then goes
-            # on to `after`; the cleanup on the raising path is inlined into a
-            # handler instead, because a jump would land after the exception
-            # had already been lost.
-            leave = after
             if cleanup_body:
-                leave = self._new_block()
-                self.blocks[leave].extend(
-                    copy.deepcopy(inner) for inner in cleanup_body
+                # Emitted, not appended: the cleanup may hold a `yield`, and
+                # only going through here cuts it into blocks at that point.
+                finished = self._emit(
+                    [copy.deepcopy(inner) for inner in cleanup_body], leave
                 )
-                self.blocks[leave].extend(self._goto(after))
+                self.blocks[finished].append(
+                    ast.If(
+                        test=ast.Compare(
+                            left=ast.Name(id=pending, ctx=ast.Load()),
+                            ops=[ast.IsNot()],
+                            comparators=[ast.Constant(value=None)],
+                        ),
+                        body=[
+                            ast.Raise(
+                                exc=ast.Name(id=pending, ctx=ast.Load()),
+                                cause=None,
+                            )
+                        ],
+                        orelse=[],
+                    )
+                )
+                self.blocks[finished].extend(self._goto(after))
             self.blocks[end].extend(self._goto(leave))
             for handler, entry in zip(statement.handlers, entries):
                 if handler.name:
@@ -1607,7 +1694,9 @@ def rewrite(
             ast.Pass()
         ]
         # Innermost first, so the nearest handler is the one that catches.
-        for handlers, entries, cleanup_body in reversed(machine.guards[number]):
+        for handlers, entries, cleanup_body, leave, pending in reversed(
+            machine.guards[number]
+        ):
             caught = []
             for handler, entry in zip(handlers, entries):
                 jump: list[ast.stmt] = []
@@ -1636,18 +1725,25 @@ def rewrite(
                 )
             if cleanup_body:
                 # A real `finally:` here would fire on the way out of every
-                # `yield` as well, because a yield returns from __next__. So
-                # the cleanup is attached to the raising path only, and the
-                # ordinary path reaches it by jumping to its own block.
+                # `yield` too, because a yield returns from __next__. So what
+                # was raised is put where the cleanup block can find it, and
+                # that block is jumped to - a block may suspend, which is what
+                # lets the cleanup hold a `yield` of its own. It puts the
+                # exception back when it is done.
+                store: list[ast.stmt] = [
+                    rename.visit(
+                        ast.Assign(
+                            targets=[ast.Name(id=pending, ctx=ast.Store())],
+                            value=ast.Name(id="_py2bin_caught", ctx=ast.Load()),
+                        )
+                    )
+                ]
+                store.extend(machine._goto(leave))
                 caught.append(
                     ast.ExceptHandler(
                         type=ast.Name(id="BaseException", ctx=ast.Load()),
-                        name=None,
-                        body=[
-                            rename.visit(copy.deepcopy(inner))
-                            for inner in cleanup_body
-                        ]
-                        + [ast.Raise()],
+                        name="_py2bin_caught",
+                        body=store,
                     )
                 )
             body = [ast.Try(body=body, handlers=caught, orelse=[], finalbody=[])]

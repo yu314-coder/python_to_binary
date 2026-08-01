@@ -21,8 +21,8 @@ drives CPython - can target today.
 | | x86-64 | arm64 |
 |---|---|---|
 | **macOS** | ✅ works | ✅ works |
-| **Windows** | ✅ works | ⬜ future work |
-| **Linux** | ⬜ future work | ⬜ future work |
+| **Windows** | ✅ works | ✅ works |
+| **Linux** | ✅ works | ✅ works |
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
@@ -232,8 +232,14 @@ CPython, and requiring identical stdout and exit status.
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
 | `yield` inside `try` / `except` | ✅ |
-| `yield`/`await` inside `try` / `finally` or `with` | ❌ |
-| `async for` / `async with` | ❌ |
+| `yield`/`await` inside `try` / `finally` | ✅ |
+| `yield`/`await` inside `with`, including suppression | ✅ |
+| a `finally` that itself yields; `break` out of one | ✅ |
+| `async for` / `async with` | ✅ |
+| `nonlocal`, as a cell a closure can rebind | ✅ |
+| a closure over a name still moving, with Python's late binding | ✅ |
+| unpacking into nested tuples, attributes, subscripts | ✅ |
+| `raise SomeError` - a class rather than an instance | ✅ |
 
 A generator cannot be compiled the way the rest is - a C function has one
 entry and its locals die with its frame, so it cannot stop in the middle of
@@ -342,8 +348,11 @@ stands for. A `return` here is signalled by raising `StopIteration`, so the
 cleanup's handler had to learn to tell the frame leaving from a real failure -
 otherwise `__aexit__` is handed a `StopIteration` where CPython passes `None`.
 
-Still refused, with the line and the reason: a `finally` that itself yields,
-and a `break` or `continue` leaving the region.
+A `finally` that itself yields works too: the cleanup is a block and a block
+may suspend, reached the same way from both paths, with whatever was raised
+waiting in a name until it is done. A `break` or `continue` leaving the region
+runs a copy of the cleanup first, which is what it would have reached had it
+left the ordinary way.
 
 ## Measured against Nuitka
 

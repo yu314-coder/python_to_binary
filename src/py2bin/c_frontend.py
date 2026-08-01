@@ -145,6 +145,7 @@ _STRING_VALUE_TARGETS = frozenset(
         "windows-x86_64",
         "windows-arm64",
         "linux-arm64",
+        "linux-x86_64",
     }
 )
 

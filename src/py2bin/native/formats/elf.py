@@ -234,10 +234,15 @@ def _patch_indirect(architecture, code, text_addr, externs, got_addr, slot_of) -
         target = got_addr + slot_of[symbol] * 8
         here = text_addr + byte_offset
         if architecture == "x86_64":
-            delta = target - (here + 6)
+            # The recorded offset is the displacement field, not the start of
+            # the instruction - which is what the Mach-O writer assumes for
+            # the same sites from the same encoder. Counting from the start
+            # instead put every call four bytes wide of its slot, and the
+            # program segfaulted on the first one it made.
+            delta = target - (here + 4)
             if not -(1 << 31) <= delta < (1 << 31):
                 raise ValueError("x86-64 GOT reference is out of rip-relative range")
-            _struct.pack_into("<i", code, byte_offset + 2, delta)
+            _struct.pack_into("<i", code, byte_offset, delta)
             continue
         pages = ((target & ~0xFFF) - (here & ~0xFFF)) >> 12
         if not -(1 << 20) <= pages < (1 << 20):

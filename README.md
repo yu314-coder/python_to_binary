@@ -60,7 +60,7 @@ drives CPython - can target today.
 |---|---|---|
 | **macOS** | ✅ works | ✅ works |
 | **Windows** | ✅ works | ✅ works |
-| **Linux** | ⬜ future work | ✅ works |
+| **Linux** | ✅ works | ✅ works |
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
@@ -71,9 +71,11 @@ Python frame to suggest from, the repr of a compiled function really is a
 builtin function's, and `"v" is "v"` depends on an interning the compiler does
 not reproduce.
 
-The one remaining cell is linux-x86-64: the ELF writer and its relocations
-now exist, and what is left is the x86-64 encoder keeping the call sites it
-already works out, exactly as the ARM64 one now does.
+All six. Each was built from one program and the three that can run on this
+machine were run - darwin-arm64 natively, both Linux targets in containers -
+answering exactly what CPython answers. The two Windows targets and the Intel
+Mac are built and checked structurally; there is no Windows, no Intel Mac and
+no emulator here, and that is the honest limit of what was verified.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six, and
 **freeze** targets whatever it has a runtime pack for. This grid is about
@@ -420,7 +422,6 @@ CPython, and requiring identical stdout and exit status.
 | `yield`/`await` inside `try` / `finally` | ✅ |
 | `yield`/`await` inside `with`, including suppression | ✅ |
 | `async for` / `async with` | ✅ |
-| a `finally` that itself yields; `break`/`continue` out of one | ❌ |
 
 ### Raising a class
 
@@ -467,15 +468,15 @@ is a class had never worked at all, in any compiled program, and an
 handler saw the frame leaving as a failure and passed `__aexit__` a
 `StopIteration` where CPython passes `None`; the two are now told apart.
 
-Two shapes are still refused, each with the line and the reason:
-
-- a `finally` that itself contains a `yield`, which would need the cleanup cut
-  into blocks as well
-- a `break` or `continue` leaving the region, which jumps straight to the
-  loop's own blocks and would go round the one holding the cleanup
-
-A `return` is fine: an earlier pass has already turned it into a jump that
-leaves by the ordinary exit, which is the one that passes the cleanup.
+Both of the shapes this used to refuse now work, and for the same reason:
+the cleanup is a block, and a block may suspend. It is reached the same way
+from both paths - finishing and raising - so it can hold a `yield` of its own,
+with whatever was raised waiting in a name until the cleanup is done and put
+back afterwards. A `break` or `continue` leaving the region would jump to the
+loop's own blocks and go round it, so a copy of the cleanup runs immediately
+before the jump - which is what the jump would have reached had it left the
+ordinary way. A `return` needs nothing: an earlier pass already turns it into
+a jump that leaves by the ordinary exit.
 
 A generator cannot be compiled the way the rest is - a C function has one
 entry and its locals die with its frame, so it cannot stop in the middle of

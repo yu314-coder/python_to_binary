@@ -324,6 +324,7 @@ _EXTERN_CAPABLE_TARGETS = frozenset(
         "windows-x86_64",
         "windows-arm64",
         "linux-arm64",
+        "linux-x86_64",
     }
 )
 
@@ -412,9 +413,13 @@ def _emit_native_module(
         if app
         else (None, None)
     )
-    if target == "linux-arm64" and _module_uses_extern(module):
-        from .arm64 import encode_linux_extern
+    if target.startswith("linux-") and _module_uses_extern(module):
         from .formats.elf import write_elf_dynamic
+
+        if target == "linux-arm64":
+            from .arm64 import encode_linux_extern
+        else:
+            from .x86_64 import encode_linux_extern
 
         # The loader searches every library named here, so the call sites do
         # not have to say which one a symbol came from - unlike the PE import
@@ -422,7 +427,7 @@ def _emit_native_module(
         version = f"{sys.version_info.major}.{sys.version_info.minor}"
         needed = (f"libpython{version}.so.1.0", "libc.so.6", "libm.so.6")
         image = write_elf_dynamic(
-            "arm64",
+            target.partition("-")[2],
             lambda address: encode_linux_extern(module, address),
             module.static_bytes,
             needed,

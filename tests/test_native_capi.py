@@ -481,13 +481,19 @@ class ExternCallSafetyTests(unittest.TestCase):
                 _PROTOTYPES + "int main(void) { Py_Initialize(); return 0; }\n",
                 encoding="utf-8",
             )
-            # Both darwin architectures bind through dyld now; the other
-            # back ends have no dynamic-link adapter, so they still refuse.
-            with self.assertRaisesRegex(
-                NativeCompileError, "darwin-arm64, darwin-x86_64"
-            ):
+            # Every target binds its symbols now - dyld on macOS, the import
+            # table on Windows, the loader's GOT on Linux - so none of them
+            # refuses. A target that does not exist still does.
+            from py2bin.native.compiler import _EXTERN_CAPABLE_TARGETS
+
+            self.assertEqual(len(_EXTERN_CAPABLE_TARGETS), 6)
+            for target in sorted(_EXTERN_CAPABLE_TARGETS):
                 compile_c_native(
-                    entry, root / "program", target="linux-x86_64", clean=True
+                    entry, root / f"program-{target}", target=target, clean=True
+                )
+            with self.assertRaises((NativeCompileError, ValueError)):
+                compile_c_native(
+                    entry, root / "nope", target="plan9-mips", clean=True
                 )
 
 
@@ -995,13 +1001,13 @@ class ShippedCapiExampleTests(unittest.TestCase):
         from py2bin.native.compiler import compile_native
 
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(
-                NativeCompileError, "darwin-arm64, darwin-x86_64"
-            ):
+            # The shipped example builds for every target now; only one that
+            # does not exist is refused.
+            with self.assertRaises((NativeCompileError, ValueError)):
                 compile_native(
                     _EXAMPLES / "capi_embedding.py",
                     Path(directory) / "out",
-                    "linux-x86_64",
+                    "plan9-mips",
                     clean=True,
                 )
 
