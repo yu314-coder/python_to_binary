@@ -1292,10 +1292,10 @@ def main(argv: list[str] | None = None) -> int:
                 # @executable_path/../Frameworks/Python.framework before this
                 # ran, so a bundle without one is a bundle dyld refuses to
                 # start - which is worse than saying so now.
-                source = (
+                framework = (
                     Path(args.runtime) if args.runtime else fetched_runtime
                 )
-                carried = embed_cpython_in_app(output, chosen, source)
+                carried = embed_cpython_in_app(output, chosen, framework)
             if embedded:
                 freed = 0
                 if args.prune_unused:
@@ -1358,8 +1358,8 @@ def main(argv: list[str] | None = None) -> int:
                     else output.parent
                 )
                 beside.mkdir(parents=True, exist_ok=True)
-                for entry in args.include:
-                    item = Path(entry).expanduser()
+                for named in args.include:
+                    item = Path(named).expanduser()
                     if not item.exists():
                         print(
                             f"py2bin: nothing to include at {item}",
@@ -1391,27 +1391,27 @@ def main(argv: list[str] | None = None) -> int:
                 # the interpreter and every wheel over again, and leaving it
                 # beside the result made a 30 MB bundle look like 500 MB.
                 _shutil.rmtree(staging, ignore_errors=True)
-                if args.dmg:
-                    import shutil as _shutil
-                    import tempfile as _tempfile
+            if args.dmg:
+                import shutil as _shutil
+                import tempfile as _tempfile
 
-                    from .dmg import write_image
+                from .dmg import write_image
 
-                    # The image holds the bundle, not the bundle's insides, so
-                    # it mounts showing one thing to drag out.
-                    image = output.with_suffix(".dmg")
-                    with _tempfile.TemporaryDirectory(
-                        prefix="py2bin-dmg-", dir=output.parent
-                    ) as staging:
-                        room = Path(staging) / output.name
-                        _shutil.copytree(output, room, symlinks=True)
-                        size = write_image(
-                            Path(staging), image, args.name or output.stem
-                        )
-                    print(
-                        f"wrote {image.name} ({size // 1024 // 1024} MB)",
-                        file=sys.stderr,
+                # The image holds the bundle, not the bundle's insides, so
+                # it mounts showing one thing to drag out.
+                image = output.with_suffix(".dmg")
+                with _tempfile.TemporaryDirectory(
+                    prefix="py2bin-dmg-", dir=output.parent
+                ) as staging:
+                    room = Path(staging) / output.name
+                    _shutil.copytree(output, room, symlinks=True)
+                    size = write_image(
+                        Path(staging), image, args.name or output.stem
                     )
+                print(
+                    f"wrote {image.name} ({size // 1024 // 1024} MB)",
+                    file=sys.stderr,
+                )
             print(
                 f"compiled {entry} through the CPython C API to "
                 f"{artifact.artifact} ({artifact.bytes} bytes, C at {source})"

@@ -42,21 +42,22 @@ TARGETS = (
     ("linux-arm64", "Linux, 64-bit ARM"),
 )
 
-#: The shapes each target can take. A macOS bundle and a disk image only mean
-#: something on macOS; Windows and Linux produce a single executable.
+#: The shapes each target can take, one file first because that is what a
+#: person hands to someone else. A .app is a directory however it is built, so
+#: on macOS the single file is the disk image holding it.
 SHAPES = {
     "darwin": (
-        ("app", ".app bundle, carrying its own interpreter"),
-        ("dmg", ".app inside a .dmg, ready to hand to someone"),
+        ("dmg", "ONE FILE: a .dmg holding the app, ready to hand over"),
+        ("app", "a .app folder, carrying its own interpreter"),
         ("bin", "a plain executable, needing Python on the machine"),
     ),
     "windows": (
-        ("exe", ".exe with its interpreter beside it, in a folder"),
-        ("onefile", "a single .exe, unpacking itself when it runs"),
+        ("onefile", "ONE FILE: an .exe that unpacks itself when it runs"),
+        ("exe", "a folder holding the .exe and its interpreter"),
         ("bin", "a plain .exe, needing Python on the machine"),
     ),
     "linux": (
-        ("bin", "an executable, linking the machine's libpython"),
+        ("bin", "ONE FILE: an executable linking the machine's libpython"),
     ),
 }
 
@@ -297,7 +298,11 @@ def main() -> int:
         arguments += ["--include", str(path)]
     arguments += ["-o", str(output)]
 
-    say(f"\nBuilding {output.name} for {target}.")
+    delivered = {
+        "dmg": f"{program.stem}.dmg",
+        "onefile": f"{program.stem}-onefile.exe",
+    }.get(shape, output.name)
+    say(f"\nBuilding {delivered} for {target}.")
     if shape in ("app", "dmg", "exe"):
         say("It carries an interpreter, so this takes a while.")
     say()
@@ -324,7 +329,12 @@ def main() -> int:
         say(f"  done: {single}")
         return 0
     if code == 0:
-        say(f"\n  done: {output}")
+        # Name what came out, not what it was built from: for a disk image the
+        # .app is a step along the way, and the file to hand over is the .dmg.
+        final = output.with_suffix(".dmg") if shape == "dmg" else output
+        say(f"\n  done: {final}")
+        if shape == "dmg":
+            say("  (the .app beside it is what the image holds)")
     return code
 
 
