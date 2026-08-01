@@ -203,48 +203,31 @@ py2bin compile-capi app.py --target windows-x86_64 --crash-log \
 | `--auto-fetch` | download the interpreter instead of being told where one is |
 | `--fetch-package NAME` | download that project's wheel for the target and unpack it in; repeatable |
 
-### From a clone, with three questions
+### Three questions, and nothing to type
 
 ```sh
-git clone https://github.com/yu314-coder/python_to_binary
-python3 python_to_binary/build.py my-program/
+py2bin make                 # installed with pip
+python3 build.py            # from a clone, nothing installed
+python3 get-py2bin.py       # no clone either - fetches one first
 ```
 
-or run it from the directory your program is in, or with no argument at all
-and answer where it is:
+All three ask the same three things: which file is the program, which machine
+it is for, and what shape it should take. Everything else is found or
+downloaded rather than typed - the other `.py` files beside it, the libraries
+it imports, an interpreter for the target, `web/` and `assets/` if they are
+there, and an `icon.ico` or `icon.icns` if one is.
 
-```sh
-cd my-program
-python3 ../python_to_binary/build.py
-```
+| the shape offered first | what comes out |
+|---|---|
+| macOS | a compressed `.dmg` holding the app |
+| Windows | one `.exe` that unpacks itself |
+| Linux | one executable |
 
-Nothing is installed and nothing is checked for: `build.py` runs the
-`src/py2bin` in the clone it sits in. It lists the Python files where you
-ran it, asks which one is the program, which machine it is for, and what
-shape it should take - a `.app`, a `.dmg`, an `.exe`, or a plain executable -
-and builds it. Anything the program imports from beside it is found, and
-anything it needs from an index is downloaded.
-
-### One file, no paths, no pip
-
-```sh
-python3 get-py2bin.py
-```
-
-That script installs py2bin if it is not already here, lists the Python files
-beside it, asks which one is the program, and builds it. The rest - the other
-`.py` files, the interpreter, the libraries the program imports - is found or
-downloaded.
-
-It is also worth running when py2bin *is* installed, because of what it lends
-the library. Some Pythons are shipped without a working `ssl` module, or keep
-the network away from the interpreter while the shell beside it can still
-reach out - a code editor on a tablet, typically. So the script falls back to
-`curl`, `wget`, `fetch` or PowerShell when Python's own networking fails, and
-hands that fallback to the library for the downloads it makes during the
-build. Nothing under `src/` starts a subprocess, because the runtimes that
-need this are the same ones that will not allow one; the script may, and
-lends the result.
+`get-py2bin.py` is the one for a machine with no pip and no clone. It also
+falls back to `curl`, `wget`, `fetch` or PowerShell when Python's own
+networking fails - some runtimes keep the network from the interpreter while
+the shell beside it can still reach out - and lends that fallback to the
+library for the downloads the build itself makes.
 
 Nothing above needs a path on this machine. With `--auto-fetch` the
 interpreter is downloaded for the target being built, and `--fetch-package`

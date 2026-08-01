@@ -109,6 +109,11 @@ def build_sdist(sdist_directory: str, config_settings=None) -> str:
         # building a wheel from an unpacked sdist reads it for the metadata.
         root / "README-pypi.md",
         root / "pyproject.toml",
+        # The two front ends. build.py runs the clone it sits in and
+        # get-py2bin.py fetches one; both are how someone without a working
+        # pip gets started, so both have to be in what pip hands them.
+        root / "build.py",
+        root / "get-py2bin.py",
         root / "docs",
         root / "examples",
         root / "src",

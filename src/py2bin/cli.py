@@ -171,6 +171,17 @@ def _parser() -> argparse.ArgumentParser:
     c_parser.add_argument("--output", "-o", required=True, type=Path)
     c_parser.add_argument("--container", action="store_true", help="write a checksummed .py2cbin")
     c_parser.add_argument("--clean", action="store_true")
+    # `build` is taken. This is the interactive one: it asks rather than being
+    # told, which is the whole difference.
+    ask_parser = commands.add_parser(
+        "make",
+        help="answer three questions and get a bundle - the interactive way in",
+    )
+    ask_parser.add_argument(
+        "where",
+        nargs="?",
+        help="the program, or the folder holding it (default: this directory)",
+    )
     capi_parser = commands.add_parser(
         "compile-capi",
         help=(
@@ -702,6 +713,13 @@ def _embedded_python_path() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "make":
+        # Before anything else looks at the arguments: this command has
+        # none of the ones the compiling paths expect, because it asks
+        # for them instead of being given them.
+        from .interactive import main as interactive
+
+        return interactive(args.where)
     if args.command == "targets":
         print("\n".join(supported_targets()))
         return 0

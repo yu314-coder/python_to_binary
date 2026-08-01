@@ -128,6 +128,28 @@ standard library and would pass an imports-only-stdlib check, but it pulls in
 `subprocess` - and there are Pythons where a subprocess is not something a
 program may have.
 
+## Three questions, and nothing to type
+
+```sh
+py2bin make
+```
+
+It asks which file is the program, which machine it is for, and what shape it
+should take. Everything else is found or downloaded rather than typed - the
+other `.py` files beside it, the libraries it imports, an interpreter for the
+target, `web/` and `assets/` if they are there, and an icon if one is.
+
+| the shape offered first | what comes out |
+|---|---|
+| macOS | a compressed `.dmg` holding the app |
+| Windows | one `.exe` that unpacks itself |
+| Linux | one executable |
+
+Two other ways in ship in the source distribution: `build.py` runs a clone
+with nothing installed, and `get-py2bin.py` fetches py2bin for a machine with
+neither - falling back to `curl` or `wget` where Python's own networking is
+kept away from the interpreter.
+
 ## Bundling for Windows
 
 The executable, the interpreter and the packages share one directory, and one
