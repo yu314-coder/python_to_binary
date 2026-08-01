@@ -1346,6 +1346,20 @@ def main(argv: list[str] | None = None) -> int:
                     f"({carried} bytes)",
                     file=sys.stderr,
                 )
+            if chosen.startswith("windows-") and args.icon:
+                from .windows_icon import install_windows_identity
+
+                # A Windows executable carries its icon as a resource inside
+                # itself; without one the shell shows a default, which says
+                # nothing about the program and looks like nobody finished it.
+                install_windows_identity(
+                    output,
+                    args.name or output.stem,
+                    version="1.0.0",
+                    icon=Path(args.icon),
+                )
+                print(f"put {Path(args.icon).name} inside {output.name}", file=sys.stderr)
+
             if args.include:
                 import shutil as _shutil
 

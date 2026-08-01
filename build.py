@@ -23,6 +23,10 @@ SOURCE = HERE / "src"
 #: not offered as something to build when this runs inside its own clone.
 _OURS = {"build.py", "get-py2bin.py", "setup.py", "conftest.py", "noxfile.py"}
 
+#: Icon files a program is likely to ship, best first. Windows wants .ico and
+#: macOS wants .icns; either is converted if the other is what is there.
+_ICONS = ("icon.ico", "icon.icns", "icon.png", "app.ico", "app.icns")
+
 #: Directories a program opens rather than imports - templates, web assets,
 #: icons. They are carried beside it, because that is where it looks.
 _DATA_DIRECTORIES = ("web", "assets", "static", "templates", "resources", "data")
@@ -260,6 +264,10 @@ def main() -> int:
     if carried:
         say(f"  carrying {', '.join(path.name + '/' for path in carried)}")
 
+    icon = next((here / name for name in _ICONS if (here / name).is_file()), None)
+    if icon is not None:
+        say(f"  using {icon.name} as the icon")
+
     suffix = {
         "app": ".app", "dmg": ".app", "exe": ".exe", "onefile": ".exe", "bin": ""
     }[shape]
@@ -294,6 +302,8 @@ def main() -> int:
         ]
     if shape == "dmg":
         arguments.append("--dmg")
+    if icon is not None:
+        arguments += ["--icon", str(icon)]
     for path in carried:
         arguments += ["--include", str(path)]
     arguments += ["-o", str(output)]
@@ -324,6 +334,7 @@ def main() -> int:
             output=single,
             target=target,
             launcher=output,
+            icon=icon,
             windows_windowed=True,
         )
         say(f"  done: {single}")
