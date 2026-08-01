@@ -19,7 +19,9 @@ Joliet tree and shows the real names.
 
 from __future__ import annotations
 
+import plistlib
 import struct
+import tempfile
 from pathlib import Path
 
 SECTOR = 2048
@@ -350,3 +352,112 @@ def write_image(source: Path, output: Path, volume_name: str = "py2bin") -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(bytes(image))
     return len(image)
+
+
+# --- compressed images ----------------------------------------------------
+#
+# The image above is the filesystem laid out plainly, which macOS mounts and
+# which is exactly as large as what it holds. Apple's compressed form (UDZO)
+# wraps that same image: cut into chunks, each deflated, with a table saying
+# where each one went and a trailer saying where the table is. Reads are
+# inflated as the volume is used, so what is handed over is smaller while what
+# it holds is unchanged.
+#
+# zlib is the standard library, so this needs nothing new.
+
+import base64 as _base64
+import zlib as _zlib
+
+_UDIF_SECTOR = 512
+#: One megabyte at a time. Larger chunks compress slightly better and cost
+#: more to read a little of; this is what Apple's own tools use.
+_CHUNK_SECTORS = 2048
+
+_ZLIB_CHUNK = 0x80000005
+_LAST_CHUNK = 0xFFFFFFFF
+
+
+def _blkx(image: bytes) -> "tuple[bytes, bytes]":
+    """Deflate the image chunk by chunk, and describe where each one went."""
+    sectors = (len(image) + _UDIF_SECTOR - 1) // _UDIF_SECTOR
+    compressed = bytearray()
+    entries = bytearray()
+    count = 0
+    for start in range(0, sectors, _CHUNK_SECTORS):
+        length = min(_CHUNK_SECTORS, sectors - start)
+        piece = image[start * _UDIF_SECTOR:(start + length) * _UDIF_SECTOR]
+        piece = piece.ljust(length * _UDIF_SECTOR, b"\0")
+        packed = _zlib.compress(piece, 9)
+        entries += struct.pack(
+            ">IIQQQQ", _ZLIB_CHUNK, 0, start, length, len(compressed), len(packed)
+        )
+        compressed += packed
+        count += 1
+    entries += struct.pack(
+        ">IIQQQQ", _LAST_CHUNK, 0, sectors, 0, len(compressed), 0
+    )
+    count += 1
+
+    table = bytearray()
+    table += b"mish" + struct.pack(">I", 1)
+    table += struct.pack(">QQQ", 0, sectors, 0)
+    table += struct.pack(">II", 0x00000208, 0)
+    table += b"\0" * 24
+    table += struct.pack(">II", 0, 0) + b"\0" * 128   # no checksum
+    table += struct.pack(">I", count)
+    table += entries
+    return bytes(compressed), bytes(table)
+
+
+def _koly(data_length: int, plist_offset: int, plist_length: int, sectors: int) -> bytes:
+    """The trailer macOS reads first: where the table is and how big all this is."""
+    trailer = bytearray()
+    trailer += b"koly" + struct.pack(">III", 4, 512, 1)
+    trailer += struct.pack(">QQQQQ", 0, 0, data_length, 0, 0)
+    trailer += struct.pack(">II", 1, 1)
+    trailer += b"\0" * 16                                   # segment id
+    trailer += struct.pack(">II", 0, 0) + b"\0" * 128       # data fork checksum
+    trailer += struct.pack(">QQ", plist_offset, plist_length)
+    trailer += b"\0" * 120                                  # reserved
+    trailer += struct.pack(">II", 0, 0) + b"\0" * 128       # master checksum
+    trailer += struct.pack(">I", 2)                         # image variant
+    trailer += struct.pack(">Q", sectors)
+    trailer += b"\0" * 12
+    return bytes(trailer).ljust(512, b"\0")
+
+
+def compress_image(raw: bytes) -> bytes:
+    """Wrap a plain disk image as a compressed one macOS can mount."""
+    compressed, table = _blkx(raw)
+    document = {
+        "resource-fork": {
+            "blkx": [
+                {
+                    "Attributes": "0x0050",
+                    "Data": table,
+                    "ID": "0",
+                    "Name": "whole disk",
+                }
+            ]
+        }
+    }
+    plist = plistlib.dumps(document, fmt=plistlib.FMT_XML)
+    sectors = (len(raw) + _UDIF_SECTOR - 1) // _UDIF_SECTOR
+    return (
+        compressed
+        + plist
+        + _koly(len(compressed), len(compressed), len(plist), sectors)
+    )
+
+
+def write_compressed_image(
+    source: Path, output: Path, volume_name: str = "py2bin"
+) -> int:
+    """Write a compressed disk image of a directory. Returns its size."""
+    with tempfile.TemporaryDirectory() as scratch:
+        plain = Path(scratch) / "plain.img"
+        write_image(source, plain, volume_name)
+        packed = compress_image(plain.read_bytes())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(packed)
+    return len(packed)

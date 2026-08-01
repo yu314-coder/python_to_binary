@@ -82,3 +82,60 @@ class DiskImageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompressedImageTests(unittest.TestCase):
+    """The same image, deflated - what is handed over rather than what it holds.
+
+    A bundle is mostly native code, which compresses to about two fifths.
+    macOS inflates as the volume is read, so the app is unchanged and only the
+    file someone downloads is smaller.
+    """
+
+    def _tree(self, root: Path) -> None:
+        (root / "App").mkdir()
+        (root / "App" / "text.txt").write_bytes(b"compress me " * 4000)
+        (root / "App" / "other.bin").write_bytes(bytes(range(256)) * 400)
+
+    def test_it_is_smaller_than_the_plain_image(self):
+        from py2bin.dmg import write_compressed_image
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "src"
+            root.mkdir()
+            self._tree(root)
+            plain = write_image(root, Path(directory) / "a.dmg", "A")
+            packed = write_compressed_image(root, Path(directory) / "b.dmg", "B")
+            self.assertLess(packed, plain)
+
+    def test_it_ends_with_the_trailer_macos_reads_first(self):
+        from py2bin.dmg import write_compressed_image
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "src"
+            root.mkdir()
+            self._tree(root)
+            out = Path(directory) / "b.dmg"
+            write_compressed_image(root, out, "B")
+            data = out.read_bytes()
+            # The trailer is the last 512 bytes and names itself.
+            self.assertEqual(data[-512:-508], b"koly")
+
+    def test_the_chunk_table_is_present_and_terminated(self):
+        from py2bin.dmg import compress_image, _LAST_CHUNK, _blkx
+
+        _packed, table = _blkx(b"\0" * (512 * 5000))
+        self.assertEqual(table[:4], b"mish")
+        # mish header: magic+version 8, three 8-byte fields 24, two 4-byte 8,
+        # reserved 24, checksum 136 - the count sits at 200.
+        count = struct.unpack_from(">I", table, 200)[0]
+        self.assertGreater(count, 1)
+        # The final entry says there is no more.
+        last = table[-40:]
+        self.assertEqual(struct.unpack_from(">I", last, 0)[0], _LAST_CHUNK)
+
+    def test_an_empty_image_still_produces_a_valid_trailer(self):
+        from py2bin.dmg import compress_image
+
+        packed = compress_image(b"")
+        self.assertEqual(packed[-512:-508], b"koly")

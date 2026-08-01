@@ -335,8 +335,13 @@ nothing for something whose purpose is to be dragged to `/Applications`.
 Plain ISO 9660 allows eight characters, a dot and three more, which no real
 bundle survives, so every name is carried twice - mangled into that shape for
 the primary descriptor, and in full UCS-2 for Joliet, which is the tree macOS
-reads. A symlink is refused rather than quietly flattened. The image is not
-compressed, so it is about the size of the bundle.
+reads. A symlink is refused rather than quietly flattened.
+
+The image is compressed, in Apple's own UDZO form: the filesystem cut into
+chunks, each deflated, with a table saying where each one went. A bundle is
+mostly native code, which deflates to about two fifths - a 23 MB bundle
+becomes a 9.5 MB image. What it holds is unchanged; macOS inflates as the
+volume is read, so the app that comes out is the same size it always was.
 
 ### Measured on a real application
 

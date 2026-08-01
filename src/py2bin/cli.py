@@ -1409,7 +1409,7 @@ def main(argv: list[str] | None = None) -> int:
                 import shutil as _shutil
                 import tempfile as _tempfile
 
-                from .dmg import write_image
+                from .dmg import write_compressed_image
 
                 # The image holds the bundle, not the bundle's insides, so
                 # it mounts showing one thing to drag out.
@@ -1419,7 +1419,11 @@ def main(argv: list[str] | None = None) -> int:
                 ) as staging:
                     room = Path(staging) / output.name
                     _shutil.copytree(output, room, symlinks=True)
-                    size = write_image(
+                    # Compressed: the image is what gets handed over, and
+                    # a bundle is mostly native code, which deflates well.
+                    # What it holds is unchanged - macOS inflates as the
+                    # volume is read.
+                    size = write_compressed_image(
                         Path(staging), image, args.name or output.stem
                     )
                 print(
