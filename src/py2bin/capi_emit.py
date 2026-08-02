@@ -513,6 +513,11 @@ class _Function:
         #: any of them is stored, so a nested call has finished with the array
         #: before the outer one begins to fill it.
         self.argument_arrays: dict[int, str] = {}
+        #: Names the body's own statements bind, *not* counting the parameter
+        #: list. `shadows` is this plus the parameters; kept apart because the
+        #: two answer different questions - what the scope binds at all, and
+        #: what the body itself rebinds.
+        self.body_binds: set[str] = set()
         #: Every name this body binds anywhere in itself. A module-level
         #: function is called as a direct C call, which is only right when the
         #: name at the call site is that function - a scope with its own
@@ -2774,7 +2779,17 @@ class CApiEmitter:
         return self.checked(target, indent)
 
     def argument_array(self, arity: int) -> str:
-        """The array a call of this many arguments passes."""
+        """The array a call of this many arguments passes.
+
+        Not offered to the callee as writable. `PY_VECTORCALL_ARGUMENTS_OFFSET`
+        says a callee may put a value in `args[-1]`, which is what a bound
+        method wants to do with `self`, and passing it was measured and taken
+        back out: CPython only allocates for that when the call has more
+        arguments than its small stack buffer holds, so almost never, while the
+        flagged count is a full 64-bit immediate that this compiler has to
+        materialise at every call site. It cost about seven nanoseconds a call
+        and saved nothing.
+        """
 
         assert self.current is not None
         existing = self.current.argument_arrays.get(arity)
@@ -5388,7 +5403,8 @@ class CApiEmitter:
             given = set(held) | set(captures)
             function.doubles = double_locals(node.body, given)
             function.unboxed = unboxable_locals(node.body, given) - function.doubles
-            function.shadows = _scope_bindings(node.body) | set(held)
+            function.body_binds = _scope_bindings(node.body)
+            function.shadows = function.body_binds | set(held)
         outer, outer_handlers, outer_scope = (
             self.current,
             self.handlers,
@@ -5700,7 +5716,8 @@ class CApiEmitter:
         function.unboxed = (
             unboxable_locals(node.body, set(parameters)) - function.doubles
         )
-        function.shadows = _scope_bindings(node.body) | set(parameters)
+        function.body_binds = _scope_bindings(node.body)
+        function.shadows = function.body_binds | set(parameters)
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))
