@@ -42,14 +42,16 @@ py2bin's own C compiler - the tier Nuitka occupies, with Nuitka's dependency on
 clang removed. Almost the whole language goes through, and anything the linked
 interpreter can import still works, so a real application with pywebview and
 Pillow compiles. Integer loops beat CPython because their locals are held in
-registers; most other operations are slower, because each one is a real C-API
-call where the interpreter has specialised bytecode. See
+registers, and so is float arithmetic; attribute and method access are slower,
+because each is a real C-API call where the interpreter has a per-site cache
+that reads the object's internals directly. See
 [what it supports](#what-compile-capi-supports) for the per-feature table.
 
 The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the
-fast path is off. On a loop it can claim, the same tier is 1.67× faster than
-CPython.
+fast path is off. On a loop it can claim, the same tier is 1.17× faster than
+CPython, and a float loop - which used to be the worst case at 0.32× - is now
+1.07×.
 
 ## Platforms
 
@@ -522,7 +524,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### The interpreter surface it may use
 
-- A fixed table of 72 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+- A fixed table of 78 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
   `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
@@ -535,13 +537,15 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
   `PyNumber_Positive`, `PyNumber_Power`, `PyNumber_Remainder`,
   `PyNumber_Rshift`, `PyNumber_Subtract`, `PyNumber_TrueDivide`,
   `PyNumber_Xor`, `PyObject_Call`, `PyObject_CallNoArgs`,
-  `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_GetAttrString`,
+  `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_GetAttr`, `PyObject_GetAttrString`,
   `PyObject_GetItem`, `PyObject_GetIter`, `PyObject_IsInstance`, `PyObject_IsTrue`,
-  `PyObject_Repr`, `PyObject_RichCompare`, `PyObject_SetAttrString`,
+  `PyObject_Repr`, `PyObject_RichCompare`, `PyObject_RichCompareBool`,
+  `PyObject_SetAttr`, `PyObject_SetAttrString`,
   `PyObject_SetItem`, `PyObject_Size`, `PyObject_Str`,
-  `PyObject_Vectorcall`, `PyRun_SimpleString`, `PySequence_Contains`,
+  `PyObject_Vectorcall`, `PyObject_VectorcallMethod`,
+  `PyInstanceMethod_New`, `PyRun_SimpleString`, `PySequence_Contains`,
   `PySlice_New`, `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`,
-  `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_DecodeUTF8`,
+  `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_DecodeUTF8`, `PyUnicode_InternFromString`,
   `PyUnicode_FromString`, `Py_DecRef`, `Py_EnterRecursiveCall`,
   `Py_Finalize`, `Py_IncRef`, `Py_Initialize`, `Py_IsInitialized`,
   `Py_LeaveRecursiveCall`
@@ -559,47 +563,67 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| integer arithmetic | **5.1 ms** | 8.5 ms | **1.67× faster** |
-| comparisons | **3.8 ms** | 4.7 ms | **1.24× faster** |
-| `while` loop | 7.5 ms | 6.5 ms | 0.87× |
-| direct function call | 7.9 ms | 6.4 ms | 0.81× |
-| comprehension | 5.2 ms | 4.0 ms | 0.77× |
-| dict store | 10.9 ms | 7.8 ms | 0.72× |
-| subscript | 7.1 ms | 3.9 ms | 0.55× |
-| attribute read | 7.5 ms | 3.8 ms | 0.51× |
-| exception raise/catch | 13.8 ms | 6.7 ms | 0.49× |
-| closure call | 14.0 ms | 6.5 ms | 0.46× |
-| f-string | 13.6 ms | 5.1 ms | 0.38× |
-| float arithmetic | 10.6 ms | 3.4 ms | 0.32× |
-| list append | 19.1 ms | 5.3 ms | 0.28× |
-| string concatenation | 24.3 ms | 3.3 ms | 0.14× |
-| instantiation | 177 ms | 16.3 ms | 0.09× |
-| method call | 142 ms | 6.7 ms | 0.05× |
+| `while` loop | **4.3 ms** | 5.2 ms | **1.22× faster** |
+| comparisons | **4.7 ms** | 5.7 ms | **1.20× faster** |
+| integer arithmetic | **9.1 ms** | 10.6 ms | **1.17× faster** |
+| float arithmetic | **6.2 ms** | 6.7 ms | **1.08× faster** |
+| attribute read | 7.8 ms | 5.7 ms | 0.72× |
+| dict store | 12.7 ms | 8.8 ms | 0.69× |
+| comprehension | 3.6 ms | 2.4 ms | 0.67× |
+| string concatenation | 29.1 ms | 18.0 ms | 0.62× |
+| direct function call | 15.6 ms | 9.4 ms | 0.60× |
+| list append | 10.1 ms | 6.0 ms | 0.60× |
+| f-string | 34.7 ms | 20.2 ms | 0.58× |
+| subscript | 13.9 ms | 8.0 ms | 0.57× |
+| closure call | 17.9 ms | 9.3 ms | 0.52× |
+| instantiation | 35.4 ms | 17.6 ms | 0.50× |
+| exception raise/catch | 44.9 ms | 22.2 ms | 0.49× |
+| method call | 35.7 ms | 11.1 ms | 0.31× |
 
-**Integer loops win** because a local the analysis picks out is held in a
-machine register, with an overflow check that falls back to unbounded
-arithmetic when the value leaves the word. That is what CPython's specialising
-interpreter does, and doing anything less was what made this tier slower than
-not compiling at all.
+**Arithmetic loops win** because a local the analysis picks out is held in a
+machine register - a `long long` for an integer, a `double` for a float - with
+an overflow check that falls back to unbounded arithmetic when an integer
+leaves the word. That is what CPython's specialising interpreter does, and
+doing anything less was what made this tier slower than not compiling at all.
+Literal arithmetic is folded before any of it, so `1.5 * 2.0 - 0.5` is the one
+constant it computes to.
 
-**Everything else loses, by a factor that tracks how many C-API calls the
+**Attribute and method access still lose**, and the reason is worth stating
+plainly rather than leaving as a number. CPython caches a `LOAD_ATTR` against
+the type's version tag and, on a hit, reads the value straight out of the
+instance without a lookup. Doing the same here means reading `ob_type` and its
+version out of the object, and this compiler treats `PyObject` as opaque and
+goes through the documented entry points - which is what lets one binary work
+against a CPython it was not built against. `PyObject_GetAttr` does the full
+generic lookup every time. That is a deliberate trade, not an oversight, and
+until it is revisited a program dominated by attribute traffic will run slower
+here than under the interpreter.
+
+**Everything else loses by a factor that tracks how many C-API calls the
 operation costs.** Each one is a real call with the reference-count discipline
 around it, where the interpreter's specialised bytecode does the same work
-inline. Floats are not held in registers at all yet, which is the same job as
-the integers and not done.
+inline.
 
-**Method calls and instantiation are far worse than the pattern predicts** -
-21× and 11× rather than the 2-4× everything else pays. That is not the C-API
-overhead; something in the class path is doing work per call that it should do
-once. It is the clearest thing to fix next and it is measured here rather than
-left out.
+**Method calls used to be far worse than that pattern predicted** - 21×, where
+everything else paid 2-4×. That was not C-API overhead. Every compiled method
+was wrapped in `functools.partialmethod` to make it bind, and that wrapper's
+`__get__` is written in Python, so each `obj.method` ran interpreted code and
+built a `functools.partial` before the call could start. CPython's own
+`instancemethod` does the same binding in C. Instantiation was the same wrapper
+showing up in `__init__`. Both are now within the general pattern rather than
+outside it.
 
 ## Measured against Nuitka
 
 Same machine (arm64 macOS), same CPython 3.14, same source. Nuitka 2.x with
 `--standalone`, driving Apple's clang; this driving its own C compiler.
 
-Run time, median of 5 runs, seconds:
+Run time, median of 5 runs, seconds. **These predate the register and folding
+work above** and were not re-run for it, because the machine they were taken on
+no longer has Nuitka installed: the `this` column is now pessimistic, by
+roughly the margin the per-feature table shows. They are left as measured
+rather than adjusted by arithmetic, since a number nobody ran is not a
+measurement:
 
 | | this | CPython | Nuitka |
 |---|---|---|---|

@@ -66,13 +66,15 @@ py2bin's own C compiler - the tier Nuitka occupies, with Nuitka's dependency on
 clang removed. Almost the whole language goes through, and anything the linked
 interpreter can import still works, so a real application with pywebview and
 Pillow compiles. Integer loops beat CPython because their locals are held in
-registers; most other operations are slower, because each one is a real C-API
-call where the interpreter has specialised bytecode. The per-feature table is below.
+registers, and so is float arithmetic; attribute and method access are slower,
+because each is a real C-API call where the interpreter has a per-site cache
+that reads the object's internals directly. The per-feature table is below.
 
 The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the
-fast path is off. On a loop it can claim, the same tier is 1.67× faster than
-CPython.
+fast path is off. On a loop it can claim, the same tier is 1.17× faster than
+CPython, and a float loop - which used to be the worst case at 0.32× - is now
+1.07×.
 
 ## Using it
 
@@ -293,22 +295,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| integer arithmetic | **5.1 ms** | 8.5 ms | **1.67× faster** |
-| comparisons | **3.8 ms** | 4.7 ms | **1.24× faster** |
-| `while` loop | 7.5 ms | 6.5 ms | 0.87× |
-| direct function call | 7.9 ms | 6.4 ms | 0.81× |
-| comprehension | 5.2 ms | 4.0 ms | 0.77× |
-| dict store | 10.9 ms | 7.8 ms | 0.72× |
-| subscript | 7.1 ms | 3.9 ms | 0.55× |
-| attribute read | 7.5 ms | 3.8 ms | 0.51× |
-| exception raise/catch | 13.8 ms | 6.7 ms | 0.49× |
-| closure call | 14.0 ms | 6.5 ms | 0.46× |
-| f-string | 13.6 ms | 5.1 ms | 0.38× |
-| float arithmetic | 10.6 ms | 3.4 ms | 0.32× |
-| list append | 19.1 ms | 5.3 ms | 0.28× |
-| string concatenation | 24.3 ms | 3.3 ms | 0.14× |
-| instantiation | 177 ms | 16.3 ms | 0.09× |
-| method call | 142 ms | 6.7 ms | 0.05× |
+| `while` loop | **4.3 ms** | 5.2 ms | **1.22× faster** |
+| comparisons | **4.7 ms** | 5.7 ms | **1.20× faster** |
+| integer arithmetic | **9.1 ms** | 10.6 ms | **1.17× faster** |
+| float arithmetic | **6.2 ms** | 6.7 ms | **1.08× faster** |
+| attribute read | 7.8 ms | 5.7 ms | 0.72× |
+| dict store | 12.7 ms | 8.8 ms | 0.69× |
+| comprehension | 3.6 ms | 2.4 ms | 0.67× |
+| string concatenation | 29.1 ms | 18.0 ms | 0.62× |
+| direct function call | 15.6 ms | 9.4 ms | 0.60× |
+| list append | 10.1 ms | 6.0 ms | 0.60× |
+| f-string | 34.7 ms | 20.2 ms | 0.58× |
+| subscript | 13.9 ms | 8.0 ms | 0.57× |
+| closure call | 17.9 ms | 9.3 ms | 0.52× |
+| instantiation | 35.4 ms | 17.6 ms | 0.50× |
+| exception raise/catch | 44.9 ms | 22.2 ms | 0.49× |
+| method call | 35.7 ms | 11.1 ms | 0.31× |
 
 **Integer loops win** because a local the analysis picks out is held in a
 machine register, with an overflow check that falls back to unbounded
@@ -319,14 +321,14 @@ not compiling at all.
 **Everything else loses, by a factor that tracks how many C-API calls the
 operation costs.** Each one is a real call with the reference-count discipline
 around it, where the interpreter's specialised bytecode does the same work
-inline. Floats are not held in registers at all yet, which is the same job as
-the integers and not done.
+inline.
 
-**Method calls and instantiation are far worse than the pattern predicts** -
-21× and 11× rather than the 2-4× everything else pays. That is not the C-API
-overhead; something in the class path is doing work per call that it should do
-once. It is the clearest thing to fix next and it is measured here rather than
-left out.
+**Method calls used to be far worse than that pattern predicted** - 21×,
+where everything else paid 2-4×. Every compiled method was wrapped in
+`functools.partialmethod` to make it bind, and that wrapper's `__get__` is
+written in Python, so each `obj.method` ran interpreted code before the
+call could start. CPython's own `instancemethod` does the same binding in
+C, and both are now within the general pattern.
 
 
 ### Raising a class
@@ -372,7 +374,10 @@ same machine.
 | start with the app's imports | 52.1 ms | **44.8 ms** |
 | compile time | **16.7 s** | minutes |
 
-Run time, median of 5, seconds:
+Run time, median of 5, seconds. **These predate the register and folding work
+above** and were not re-run for it - the machine no longer has Nuitka
+installed - so the py2bin column is now pessimistic. Left as measured rather
+than adjusted by arithmetic:
 
 | workload | py2bin | CPython | Nuitka |
 |---|---|---|---|

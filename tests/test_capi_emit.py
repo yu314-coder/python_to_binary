@@ -2311,6 +2311,233 @@ class MachineIntegerTests(unittest.TestCase):
         )
 
 
+class MachineDoubleTests(unittest.TestCase):
+    """Floats held in a register rather than on the heap.
+
+    The same exercise as the integers, and until it existed the float half was
+    the worse of the two: an integer loop already beat the interpreter while
+    the same loop written in floats ran at four tenths of its speed.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_a_float_accumulator_is_added_in_a_register(self):
+        source = (
+            "def total():\n"
+            "    t = 0.0\n"
+            "    i = 0\n"
+            "    while i < 4:\n"
+            "        t = t + 1.5\n"
+            "        i = i + 1\n"
+            "    return t\n"
+            "print(total())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("double d_t", written)
+        self.assertIn("int s_t", written)
+        self._run(source, b"6.0\n")
+
+    def test_the_result_is_a_float_and_not_an_integer(self):
+        # The whole point of keeping the two representations apart. A value
+        # that went out as `6` rather than `6.0` would be a wrong program.
+        source = (
+            "def total():\n"
+            "    t = 0.0\n"
+            "    i = 0\n"
+            "    while i < 3:\n"
+            "        t = t + 2.0\n"
+            "        i = i + 1\n"
+            "    return t\n"
+            "print(type(total()).__name__, total())\n"
+        )
+        self._run(source, b"float 6.0\n")
+
+    def test_division_by_zero_still_raises(self):
+        # C answers an infinity where Python raises, so the fast path has to
+        # hand the zero to the slow arm rather than compute it.
+        source = (
+            "def go():\n"
+            "    a = 6.0\n"
+            "    b = 0.0\n"
+            "    b = b + 0.0\n"
+            "    a = a * 1.0\n"
+            "    try:\n"
+            "        return a / b\n"
+            "    except ZeroDivisionError:\n"
+            "        return -1.0\n"
+            "print(go())\n"
+        )
+        self._run(source, b"-1.0\n")
+
+    def test_a_name_that_stops_being_a_float_still_reads_back(self):
+        source = (
+            "def go(flag):\n"
+            "    t = 1.5\n"
+            "    t = t + 1.5\n"
+            "    if flag:\n"
+            "        t = 'text'\n"
+            "    return t\n"
+            "print(go(False), go(True))\n"
+        )
+        self._run(source, b"3.0 text\n")
+
+    def test_an_integer_loop_is_not_turned_into_a_float_one(self):
+        source = (
+            "def total():\n"
+            "    n = 0\n"
+            "    i = 0\n"
+            "    while i < 4:\n"
+            "        n = n + 3\n"
+            "        i = i + 1\n"
+            "    return n\n"
+            "print(type(total()).__name__, total())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertNotIn("double d_n", written)
+        self._run(source, b"int 12\n")
+
+
+class MethodBindingTests(unittest.TestCase):
+    """A compiled method binds the way a plain Python function binds.
+
+    This was `functools.partialmethod`, whose `__get__` is written in Python,
+    so every `obj.method` ran interpreted code and allocated a `partial`. The
+    replacement is CPython's own `instancemethod`, and these pin the parts of
+    the behaviour that a swap of binder could quietly have changed.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_an_instance_method_receives_the_instance(self):
+        source = (
+            "class C:\n"
+            "    def __init__(self, n):\n"
+            "        self.n = n\n"
+            "    def doubled(self):\n"
+            "        return self.n * 2\n"
+            "print(C(21).doubled())\n"
+        )
+        self._run(source, b"42\n")
+
+    def test_reaching_the_method_through_the_class_passes_self_by_hand(self):
+        # `C.f` is the plain function on a class, as it is in Python 3, so it
+        # takes the instance as its first argument.
+        source = (
+            "class C:\n"
+            "    def __init__(self):\n"
+            "        self.n = 7\n"
+            "    def get(self):\n"
+            "        return self.n\n"
+            "print(C.get(C()))\n"
+        )
+        self._run(source, b"7\n")
+
+    def test_a_bound_method_can_be_stored_and_called_later(self):
+        source = (
+            "class C:\n"
+            "    def __init__(self):\n"
+            "        self.n = 3\n"
+            "    def add(self, k):\n"
+            "        return self.n + k\n"
+            "f = C().add\n"
+            "print(f(4))\n"
+        )
+        self._run(source, b"7\n")
+
+    def test_a_subclass_inherits_and_overrides(self):
+        source = (
+            "class A:\n"
+            "    def name(self):\n"
+            "        return 'A'\n"
+            "    def shout(self):\n"
+            "        return self.name() + '!'\n"
+            "class B(A):\n"
+            "    def name(self):\n"
+            "        return 'B'\n"
+            "print(A().shout(), B().shout())\n"
+        )
+        self._run(source, b"A! B!\n")
+
+    def test_a_method_call_with_keywords_still_works(self):
+        # Keywords take the other path - the one that fetches the attribute
+        # and calls it - so both arms of `method_call` are covered.
+        source = (
+            "class C:\n"
+            "    def go(self, a, b=10):\n"
+            "        return a * b\n"
+            "print(C().go(3), C().go(3, b=2))\n"
+        )
+        self._run(source, b"30 6\n")
+
+
+class ConstantFoldingTests(unittest.TestCase):
+    """Literal arithmetic computed once, at compile time - and only when safe."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_literal_expression_is_folded(self):
+        source = "x = 1.5 * 2.0 - 0.5\nprint(x)\n"
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("2.5", written)
+        self._run(source, b"2.5\n")
+
+    def test_a_division_by_zero_is_left_for_run_time(self):
+        # Folding it would either refuse a program Python accepts or run one
+        # Python does not.
+        source = (
+            "try:\n"
+            "    print(1 // 0)\n"
+            "except ZeroDivisionError:\n"
+            "    print('raised')\n"
+        )
+        self._run(source, b"raised\n")
+
+    def test_bools_are_not_folded_into_integers(self):
+        source = "print(True + True, type(True + True).__name__)\n"
+        self._run(source, b"2 int\n")
+
+    def test_an_enormous_power_is_left_for_run_time(self):
+        written = python_to_capi_c("x = 2 ** 100000\n", "program.py")
+        # The folded value would be tens of kilobytes of digits in the binary.
+        self.assertNotIn("PyLong_FromString(\"1" + "0" * 60, written)
+
+
+class ConstantPoolTests(unittest.TestCase):
+    """Literals built once at start-up rather than at every execution."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_string_in_a_loop_is_built_once(self):
+        source = (
+            "def go():\n"
+            "    n = 0\n"
+            "    i = 0\n"
+            "    while i < 3:\n"
+            "        s = 'a constant'\n"
+            "        n = n + len(s)\n"
+            "        i = i + 1\n"
+            "    return n\n"
+            "print(go())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertEqual(written.count('PyUnicode_FromString("a constant")'), 1)
+        self._run(source, b"30\n")
+
+    def test_negative_zero_keeps_its_sign(self):
+        # `-0.0 == 0.0` and the two hash alike, so a pool keyed by value gave
+        # them one slot and turned every `-0.0` into `0.0`.
+        source = (
+            "a = -0.0\n"
+            "b = 0.0\n"
+            "print(a, b, str(a) == str(b))\n"
+        )
+        self._run(source, b"-0.0 0.0 False\n")
+
+    def test_an_integer_and_a_float_stay_apart(self):
+        source = "print(repr(1), repr(1.0))\n"
+        self._run(source, b"1 1.0\n")
+
+
 class CApiCommandLineTests(unittest.TestCase):
     """What `compile-capi` refuses, and how it says so."""
 

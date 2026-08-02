@@ -52,6 +52,22 @@ VETTED = [
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
+    # The interned-name forms. `...String` builds a fresh str from the
+    # char* on every call and hashes it; these take a str built once,
+    # which is what makes an attribute in a loop cost a lookup rather
+    # than an allocation.
+    "PyObject_GetAttr", "PyObject_SetAttr", "PyUnicode_InternFromString",
+    # `functools.partialmethod` was what made a compiled method bind, and
+    # its `__get__` is written in Python: every `obj.method` built a
+    # `functools.partial` through the interpreter. `instancemethod` is the
+    # same idea in C - its `__get__` is `PyMethod_New` and nothing else -
+    # and `PyObject_VectorcallMethod` skips even that, calling the function
+    # found on the type without binding an object to hold the pair.
+    "PyInstanceMethod_New", "PyObject_VectorcallMethod",
+    # The verdict without the object. `PyObject_RichCompare` answers `True`
+    # or `False` and every condition then asked `PyObject_IsTrue` what that
+    # meant - two calls where the interpreter makes one.
+    "PyObject_RichCompareBool",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",

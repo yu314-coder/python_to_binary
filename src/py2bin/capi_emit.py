@@ -31,6 +31,7 @@ import contextlib
 from pathlib import Path
 
 from .capi_cells import CellError, expand as expand_cells
+from .capi_fold import fold as fold_constants
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
     ARITHMETIC as _MACHINE_OPS,
@@ -40,6 +41,31 @@ from .capi_ints import (
     narrow_range,
     unboxable_locals,
 )
+from .capi_floats import (
+    ARITHMETIC as _DOUBLE_OPS,
+    COMPARISONS as _DOUBLE_TESTS,
+    is_machine_float,
+    unboxable_locals as double_locals,
+)
+
+
+#: How each double operator is written in C. Division is here like the rest:
+#: what makes it special is the divisor test, not the spelling.
+_DOUBLE_SPELLING = {
+    ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+}
+
+#: How each comparison is written in C, for the machine-double path.
+_COMPARISON_SPELLING = {
+    ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+    ast.Eq: "==", ast.NotEq: "!=",
+}
+
+#: The `Py_LT`-family opcode each comparison passes to the C API. The order is
+#: CPython's and is not alphabetical, so it is written out rather than counted.
+_COMPARISON_CODES = {
+    ast.Lt: 0, ast.LtE: 1, ast.Eq: 2, ast.NotEq: 3, ast.Gt: 4, ast.GtE: 5,
+}
 
 
 def _shadowed_builtins(tree: ast.Module) -> set[str]:
@@ -182,6 +208,14 @@ extern PyObject *PyImport_ImportModule(const char *name);
 extern PyObject *PyImport_AddModule(const char *name);
 extern PyObject *PyObject_GetAttrString(PyObject *object, const char *name);
 extern int PyObject_SetAttrString(PyObject *object, const char *name, PyObject *value);
+extern PyObject *PyObject_GetAttr(PyObject *object, PyObject *name);
+extern int PyObject_SetAttr(PyObject *object, PyObject *name, PyObject *value);
+extern PyObject *PyUnicode_InternFromString(const char *text);
+extern PyObject *PyInstanceMethod_New(PyObject *function);
+extern int PyObject_RichCompareBool(PyObject *a, PyObject *b, int op);
+extern PyObject *PyObject_VectorcallMethod(
+    PyObject *name, PyObject **arguments, long long count,
+    PyObject *keyword_names);
 extern PyObject *PyObject_CallNoArgs(PyObject *callable);
 extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *argument);
 extern long long PyObject_Size(PyObject *object);
@@ -464,9 +498,16 @@ class _Function:
         #: Locals held as a machine integer whenever they contain one. Each
         #: becomes three C variables rather than one - see `narrow_slots`.
         self.unboxed: set[str] = set()
+        #: Locals held as a machine double whenever they contain one. Held in
+        #: the same three-variable shape as `unboxed`, with a `double` in place
+        #: of the `long long`. The two sets never overlap: a name is narrowed
+        #: one way or the other, never both.
+        self.doubles: set[str] = set()
         #: Counter for the `long long` scratch the fast path computes in, wound
         #: back at the end of each statement as the object temporaries are.
         self.machines = 0
+        #: The same, for the `double` scratch.
+        self.reals = 0
 
 
 class CApiEmitter:
@@ -563,6 +604,21 @@ class CApiEmitter:
         #: lookup on a name that cannot change; they are fetched once at
         #: start-up into file-scope slots instead.
         self.cached_builtins: dict[str, str] = {}
+        #: Every attribute name the program mentions, interned once at start-up.
+        #: `PyObject_GetAttrString` looks harmless and is not: it builds a str
+        #: from the char* and hashes it on *every* call, so an attribute read
+        #: in a loop pays an allocation and a hash that the name being constant
+        #: makes entirely pointless. Interning moves both to start-up, and an
+        #: interned str carries its hash, so the lookup that remains is the
+        #: dictionary probe and nothing else.
+        self.interned_names: dict[str, str] = {}
+        #: Every literal the program mentions, built once at start-up. A
+        #: constant was rebuilt at each execution, so a string inside a loop
+        #: was decoded from UTF-8 and allocated on every iteration and an
+        #: integer literal was allocated on every one - for a value that,
+        #: being a literal, cannot have changed. Keyed by type as well as
+        #: value, so `1`, `1.0` and `True` stay three different objects.
+        self.pooled: dict[tuple[str, object], str] = {}
         #: True once a name read needs the unbound-name helper, which is then
         #: written into the C once rather than at each of a thousand sites.
         self.needs_unbound = False
@@ -795,6 +851,182 @@ class CApiEmitter:
         self.emit("}", indent)
         return target
 
+    # --- machine doubles ------------------------------------------------------
+    #
+    # The same three variables as an integer, with a `double` in place of the
+    # `long long`. Everything said about the integer form holds here, and two
+    # things are easier: an overflowing double is an infinity, which is the
+    # answer Python gives, so nothing has to be checked; and there is no
+    # `bool` masquerading as a `float` the way `True` masquerades as `1`.
+    #
+    # Only division has anything to refuse, and it refuses zero: Python raises
+    # where C answers infinity.
+
+    def is_double(self, name: str) -> bool:
+        """True when this name is held as a machine double."""
+
+        if self.current is None or name not in self.current.doubles:
+            return False
+        if self.at_module_level or name in self.current.module_names:
+            return False
+        return not any(name in scope for scope in self.shadowed)
+
+    def double_slots(self, name: str) -> tuple[str, str, str]:
+        """Declare the three variables, and answer with their C names."""
+
+        assert self.current is not None
+        value, obj, flag = f"d_{name}", f"v_{name}", f"s_{name}"
+        for spelling in (f"double {value}", obj, f"int {flag}"):
+            if spelling not in self.current.locals:
+                self.current.locals.append(spelling)
+        return value, obj, flag
+
+    def real_slot(self) -> str:
+        """Scratch for one intermediate machine double."""
+
+        assert self.current is not None
+        self.current.reals += 1
+        name = f"_r{self.current.reals}"
+        if f"double {name}" not in self.current.locals:
+            self.current.locals.append(f"double {name}")
+        return name
+
+    def store_double_object(self, name: str, value: str, indent: int) -> None:
+        """Bind a double-held name to an object, consuming the reference."""
+
+        _held, obj, flag = self.double_slots(name)
+        self.emit(f"if ({obj}) Py_DecRef({obj});", indent)
+        self.emit(f"{obj} = {value};", indent)
+        self.emit(f"{flag} = 0;", indent)
+
+    def store_real(self, name: str, value: str, indent: int) -> None:
+        """Bind a double-held name to a machine double. Nothing is allocated."""
+
+        held, obj, flag = self.double_slots(name)
+        self.emit(f"if ({obj}) {{ Py_DecRef({obj}); {obj} = 0; }}", indent)
+        self.emit(f"{held} = {value};", indent)
+        self.emit(f"{flag} = 1;", indent)
+
+    def double_unbound_test(self, name: str, indent: int) -> None:
+        """Refuse to read a double-held name that nothing has written."""
+
+        _held, obj, flag = self.double_slots(name)
+        self.needs_unbound = True
+        message = (
+            f"cannot access local variable {name!r} where it is not "
+            "associated with a value"
+        )
+        self.emit(
+            f"if (!{obj} && !{flag}) {{ _py2bin_unbound(1, "
+            f"PyUnicode_FromString({_c_string(message)}), "
+            f"PyUnicode_FromString({_c_string(name)})); {self.failure()} }}",
+            indent,
+        )
+
+    def read_double(self, node: ast.Name, indent: int) -> str:
+        """A double-held name as an owned reference, boxing it if it has to."""
+
+        assert self.current is not None
+        held, obj, flag = self.double_slots(node.id)
+        target = self.temporary()
+        if node.id not in self.current.certain:
+            self.double_unbound_test(node.id, indent)
+        self.emit(f"if ({flag}) {{", indent)
+        self.emit(f"{target} = PyFloat_FromDouble({held});", indent + 1)
+        self.emit(f"if (!{target}) {{ {self.failure()} }}", indent + 1)
+        self.emit("} else {", indent)
+        self.emit(f"Py_IncRef({obj});", indent + 1)
+        self.emit(f"{target} = {obj};", indent + 1)
+        self.emit("}", indent)
+        return target
+
+    def double_tree(self, node: ast.expr) -> bool:
+        """True when every leaf of this expression is already a machine double.
+
+        An integer literal is allowed as an operand but never as the whole
+        tree: `2` on its own is an `int` and writing it back as a `double`
+        would turn it into `2.0`, which is a different object.
+        """
+
+        if self.boxing:
+            return False
+        return self._double_leaf(node) and not is_machine_integer(node)
+
+    def _double_leaf(self, node: ast.expr) -> bool:
+        if isinstance(node, ast.Constant):
+            return is_machine_float(node) or is_machine_integer(node)
+        if isinstance(node, ast.Name):
+            return self.is_double(node.id)
+        if isinstance(node, ast.UnaryOp) and isinstance(
+            node.op, (ast.UAdd, ast.USub)
+        ):
+            return self._double_leaf(node.operand)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, _DOUBLE_OPS):
+            if not (self._double_leaf(node.left) and self._double_leaf(node.right)):
+                return False
+            # One side has to be a float, or this is integer arithmetic wearing
+            # a float's clothes - `2 * 3` must answer 6, not 6.0.
+            return not (
+                is_machine_integer(node.left) and is_machine_integer(node.right)
+            )
+        return False
+
+    def double_expression(self, node: ast.expr, indent: int) -> _Machine:
+        """Compute a double tree in registers. Only call it on one."""
+
+        assert self.current is not None
+        if isinstance(node, ast.Constant):
+            # Spelled so C reads it as a double even when it is written as an
+            # integer: `1` and `1.0` are the same value and different types,
+            # and integer division of two ints is not what this is computing.
+            return _Machine(None, f"(double)({node.value!r})")
+        if isinstance(node, ast.Name):
+            held, _, state = self.double_slots(node.id)
+            if node.id not in self.current.certain:
+                self.double_unbound_test(node.id, indent)
+            return _Machine(state, held)
+        if isinstance(node, ast.UnaryOp):
+            inner = self.double_expression(node.operand, indent)
+            if isinstance(node.op, ast.UAdd):
+                return inner
+            slot = self.real_slot()
+            self.emit(f"{slot} = -({inner.value});", indent)
+            return _Machine(inner.flag, slot)
+        assert isinstance(node, ast.BinOp)
+        left = self.double_expression(node.left, indent)
+        right = self.double_expression(node.right, indent)
+        known = [side.flag for side in (left, right) if side.flag is not None]
+        flag = self.temporary_flag()
+        self.emit(f"{flag} = {' && '.join(known) if known else '1'};", indent)
+        slot = self.real_slot()
+        if isinstance(node.op, ast.Div):
+            # Python raises ZeroDivisionError where C answers an infinity, so
+            # the zero goes to the slow arm rather than being computed wrongly.
+            self.emit(f"if ({flag} && ({right.value}) == 0.0) {flag} = 0;", indent)
+        self.emit(f"if ({flag}) {{", indent)
+        self.emit(
+            f"{slot} = ({left.value}) {_DOUBLE_SPELLING[type(node.op)]} "
+            f"({right.value});",
+            indent + 1,
+        )
+        self.emit("}", indent)
+        return _Machine(flag, slot)
+
+    def double_comparison(self, node: ast.expr) -> bool:
+        """True for a comparison of two machine doubles."""
+
+        if self.boxing or not isinstance(node, ast.Compare):
+            return False
+        if len(node.ops) != 1:
+            return False
+        if not isinstance(node.ops[0], _DOUBLE_TESTS):
+            return False
+        left, right = node.left, node.comparators[0]
+        if not (self._double_leaf(left) and self._double_leaf(right)):
+            return False
+        # At least one side has to be a double, or this is an integer compare.
+        return self.double_tree(left) or self.double_tree(right)
+
     @contextlib.contextmanager
     def boxed_only(self):
         """Emit the plain C-API translation, however narrow the tree looks.
@@ -999,6 +1231,49 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({spelled});", indent + 1)
             self.emit("}", indent)
             return answer
+        if self.double_comparison(node):
+            answer = self.temporary_flag()
+            left = self.double_expression(node.left, indent)
+            right = self.double_expression(node.comparators[0], indent)
+            known = [
+                side.flag for side in (left, right) if side.flag is not None
+            ]
+            settled = self.temporary_flag()
+            self.emit(
+                f"{settled} = {' && '.join(known) if known else '1'};", indent
+            )
+            self.emit(f"if ({settled}) {{", indent)
+            self.emit(
+                f"{answer} = ({left.value}) "
+                f"{_COMPARISON_SPELLING[type(node.ops[0])]} ({right.value});",
+                indent + 1,
+            )
+            self.emit("} else {", indent)
+            with self.boxed_only():
+                spelled = self.expression(node, indent + 1)
+            self.emit(f"{answer} = PyObject_IsTrue({spelled});", indent + 1)
+            self.emit(f"Py_DecRef({spelled});", indent + 1)
+            self.emit("}", indent)
+            return answer
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and type(node.ops[0]) in _COMPARISON_CODES
+        ):
+            # The verdict straight out, with no `True` to make and no second
+            # call to ask what it meant. Every `if` and every loop test that
+            # compares two things comes through here.
+            decision = self.temporary_flag()
+            left = self.expression(node.left, indent)
+            right = self.expression(node.comparators[0], indent)
+            self.emit(
+                f"{decision} = PyObject_RichCompareBool({left}, {right}, "
+                f"{_COMPARISON_CODES[type(node.ops[0])]});",
+                indent,
+            )
+            self.emit(f"Py_DecRef({left});", indent)
+            self.emit(f"Py_DecRef({right});", indent)
+            return decision
         decision = self.temporary_flag()
         test = self.expression(node, indent)
         self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
@@ -1013,6 +1288,8 @@ class CApiEmitter:
         a heap allocation and two reference counts, every iteration.
         """
 
+        if self.is_double(name) and self.double_tree(value):
+            return self.narrow_double_assign(name, value, indent)
         if not self.is_unboxed(name) or not self.narrow_tree(value):
             return False
         machine = self.machine_expression(value, indent)
@@ -1027,6 +1304,43 @@ class CApiEmitter:
         self.store_object(name, spelled, indent + 1)
         self.emit("}", indent)
         return True
+
+    def narrow_double_assign(self, name: str, value: ast.expr, indent: int) -> bool:
+        """`x = <double tree>` straight into the register holding `x`."""
+
+        real = self.double_expression(value, indent)
+        if real.flag is None:
+            self.store_real(name, real.value, indent)
+            return True
+        self.emit(f"if ({real.flag}) {{", indent)
+        self.store_real(name, real.value, indent + 1)
+        self.emit("} else {", indent)
+        with self.boxed_only():
+            spelled = self.expression(value, indent + 1)
+        self.store_double_object(name, spelled, indent + 1)
+        self.emit("}", indent)
+        return True
+
+    def box_double(self, real: _Machine, slow, indent: int) -> str:
+        """A computed double as an object, with the slow arm for when it isn't.
+
+        The counterpart of `box_machine`. A tree whose flag never came off can
+        be boxed with no arm at all - only division can clear it.
+        """
+
+        target = self.temporary()
+        if real.flag is None:
+            self.emit(f"{target} = PyFloat_FromDouble({real.value});", indent)
+            return self.checked(target, indent)
+        self.emit(f"if ({real.flag}) {{", indent)
+        self.emit(f"{target} = PyFloat_FromDouble({real.value});", indent + 1)
+        self.emit(f"if (!{target}) {{ {self.failure()} }}", indent + 1)
+        self.emit("} else {", indent)
+        with self.boxed_only():
+            spelled = slow(indent + 1)
+        self.emit(f"{target} = {spelled};", indent + 1)
+        self.emit("}", indent)
+        return target
 
     # --- expressions -----------------------------------------------------
 
@@ -1111,13 +1425,10 @@ class CApiEmitter:
             self.current.temporaries -= 1
             self.current.locals.remove(target)
             return self.builtin(repr(node.value), indent)
-        if isinstance(node.value, float):
-            self.emit(f"{target} = PyFloat_FromDouble({node.value!r});", indent)
-            return self.checked(target, indent)
-        if isinstance(node.value, int):
+        if isinstance(node.value, (int, float, str, bytes)):
             self.current.temporaries -= 1
             self.current.locals.remove(target)
-            return self.integer(node.value, indent)
+            return self.pool(node.value, indent)
         if isinstance(node.value, str):
             encoded = node.value.encode("utf-8")
             if b"\0" in encoded:
@@ -1163,6 +1474,8 @@ class CApiEmitter:
             return f"p_{name}"
         if f"v_{name}" in self.current.locals:
             return f"v_{name}"
+        if self.is_double(name):
+            return f"v_{name}"
         if self.is_unboxed(name):
             # Declared as three variables; the object half is still `v_`.
             # Asked through `is_unboxed` rather than of the set directly, so
@@ -1180,6 +1493,8 @@ class CApiEmitter:
         assert self.current is not None
         if self.is_unboxed(node.id):
             return self.read_unboxed(node, indent)
+        if self.is_double(node.id):
+            return self.read_double(node, indent)
         c_name = self.reference(node.id)
         if c_name is None:
             # Local, then global, then builtins - the order Python looks in.
@@ -1252,6 +1567,12 @@ class CApiEmitter:
         function = _BINARY.get(type(node.op))
         if function is None:
             raise self.fail(node, f"{type(node.op).__name__} is not translated here yet")
+        if isinstance(node.op, _DOUBLE_OPS) and self.double_tree(node):
+            if any(isinstance(part, ast.Name) for part in ast.walk(node)):
+                real = self.double_expression(node, indent)
+                return self.box_double(
+                    real, lambda inner: self.boxed_binary(node, function, inner), indent
+                )
         if isinstance(node.op, _MACHINE_OPS) and self.narrow_tree(node):
             # Worth the two arms only when a local is involved; a tree of
             # literals is folded into one constant elsewhere.
@@ -1825,13 +2146,67 @@ class CApiEmitter:
         )
         return target
 
-    def attribute(self, node: ast.Attribute, indent: int) -> str:
-        value = self.expression(node.value, indent)
+    def interned(self, text: str) -> str:
+        """The file-scope slot holding ``text`` as an interned str.
+
+        One slot per distinct name, however many times it is mentioned: the
+        cost is a pointer per attribute name in the program, paid once.
+        """
+
+        slot = self.interned_names.get(text)
+        if slot is None:
+            slot = f"_py2bin_s{len(self.interned_names)}"
+            self.interned_names[text] = slot
+        return slot
+
+    def pool(self, value, indent: int) -> str:
+        """A literal as an owned reference, taken from the start-up pool.
+
+        The value is immutable, so one object serves every mention of it. That
+        also matches CPython more closely than rebuilding did: equal literals
+        in one code object are the same object there too.
+        """
+
+        # Keyed by `repr`, not by the value. `-0.0 == 0.0` is true and the two
+        # hash alike, so keying by value gave both the same slot and turned
+        # every `-0.0` in the program into `0.0` - which is a different float,
+        # and the one that decides the sign of the result it is multiplied
+        # into. `repr` tells them apart, as it tells `1` from `1.0`.
+        key = (type(value).__name__, repr(value))
+        entry = self.pooled.get(key)
+        if entry is None:
+            slot = f"_py2bin_k{len(self.pooled)}"
+            self.pooled[key] = (value, slot)
+        else:
+            slot = entry[1]
+        target = self.temporary()
+        self.emit(f"Py_IncRef({slot});", indent)
+        self.emit(f"{target} = {slot};", indent)
+        return target
+
+    def get_attr(self, owner: str, name: str, indent: int) -> str:
+        """`owner.name`, through the interned form. Does not release `owner`."""
+
         target = self.temporary()
         self.emit(
-            f"{target} = PyObject_GetAttrString({value}, {_c_string(node.attr)});",
+            f"{target} = PyObject_GetAttr({owner}, {self.interned(name)});", indent
+        )
+        return target
+
+    def set_attr(self, owner: str, name: str, value: str, indent: int) -> str:
+        """`owner.name = value`, answering the C variable holding the status."""
+
+        outcome = self.temporary_flag()
+        self.emit(
+            f"{outcome} = PyObject_SetAttr({owner}, {self.interned(name)}, "
+            f"{value});",
             indent,
         )
+        return outcome
+
+    def attribute(self, node: ast.Attribute, indent: int) -> str:
+        value = self.expression(node.value, indent)
+        target = self.get_attr(value, node.attr, indent)
         self.emit(f"Py_DecRef({value});", indent)
         return self.checked(target, indent)
 
@@ -2050,7 +2425,7 @@ class CApiEmitter:
 
         method = self.temporary()
         self.emit(
-            f"{method} = PyObject_GetAttrString({owner}, {_c_string(name)});", indent
+            f"{method} = PyObject_GetAttr({owner}, {self.interned(name)});", indent
         )
         self.checked(method, indent)
         outcome = self.temporary()
@@ -2109,9 +2484,43 @@ class CApiEmitter:
         """
 
         assert isinstance(node.func, ast.Attribute)
+        plain = not node.keywords and not any(
+            isinstance(item, ast.Starred) for item in node.args
+        )
+        if plain:
+            return self.method_vectorcall(node, indent)
         callable_value = self.attribute(node.func, indent)
         target = self.invoke(callable_value, node.args, indent, node.keywords)
         self.emit(f"Py_DecRef({callable_value});", indent)
+        return self.checked(target, indent)
+
+    def method_vectorcall(self, node: ast.Call, indent: int) -> str:
+        """`x.f(a)` without ever building the bound method it looks up.
+
+        Fetching `x.f` and then calling it allocates a bound method whose only
+        job is to remember `x` until the call one line later reads it back out.
+        `PyObject_VectorcallMethod` is handed the name and an argument array
+        whose first element is `x`, and finds the function on the type without
+        pairing it with anything - which is what CPython does for a method call
+        it has not been asked to store.
+        """
+
+        assert isinstance(node.func, ast.Attribute)
+        owner = self.expression(node.func.value, indent)
+        values = [self.expression(item, indent) for item in node.args]
+        array = self.argument_array(len(values) + 1)
+        self.emit(f"{array}[0] = {owner};", indent)
+        for position, value in enumerate(values, start=1):
+            self.emit(f"{array}[{position}] = {value};", indent)
+        target = self.temporary()
+        self.emit(
+            f"{target} = PyObject_VectorcallMethod("
+            f"{self.interned(node.func.attr)}, {array}, {len(values) + 1}LL, 0);",
+            indent,
+        )
+        self.emit(f"Py_DecRef({owner});", indent)
+        for value in values:
+            self.emit(f"Py_DecRef({value});", indent)
         return self.checked(target, indent)
 
     def invoke(
@@ -2464,6 +2873,9 @@ class CApiEmitter:
             if self.is_unboxed(target.id):
                 self.store_object(target.id, value, indent)
                 return
+            if self.is_double(target.id):
+                self.store_double_object(target.id, value, indent)
+                return
             slot = self.declare(target.id)
             # The name may already hold something; that reference is released
             # before it is overwritten, which is what keeps a loop from
@@ -2480,8 +2892,8 @@ class CApiEmitter:
             owner = self.expression(target.value, indent)
             outcome = self.temporary_flag()
             self.emit(
-                f"{outcome} = PyObject_SetAttrString({owner}, "
-                f"{_c_string(target.attr)}, {value});",
+                f"{outcome} = PyObject_SetAttr({owner}, "
+                f"{self.interned(target.attr)}, {value});",
                 indent,
             )
             self.emit(f"Py_DecRef({owner});", indent)
@@ -3211,7 +3623,8 @@ class CApiEmitter:
         entered = self.temporary()
         enter = self.temporary()
         self.emit(
-            f'{enter} = PyObject_GetAttrString({manager}, "__enter__");', indent
+            f'{enter} = PyObject_GetAttr({manager}, {self.interned("__enter__")});',
+            indent,
         )
         self.checked(enter, indent)
         self.emit(f"{entered} = PyObject_CallNoArgs({enter});", indent)
@@ -3522,6 +3935,9 @@ class CApiEmitter:
         if self.is_unboxed(node.target.id):
             self.store_object(node.target.id, value, indent)
             return
+        if self.is_double(node.target.id):
+            self.store_double_object(node.target.id, value, indent)
+            return
         target = self.declare(node.target.id)
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {value};", indent)
@@ -3551,9 +3967,12 @@ class CApiEmitter:
             self.emit(f"{current} = PyObject_GetItem({owner}, {key});", indent)
             self.checked(current, indent)
         else:
-            name = _c_string(node.target.attr)
             current = self.temporary()
-            self.emit(f"{current} = PyObject_GetAttrString({owner}, {name});", indent)
+            self.emit(
+                f"{current} = PyObject_GetAttr({owner}, "
+                f"{self.interned(node.target.attr)});",
+                indent,
+            )
             self.checked(current, indent)
         addend = self.expression(node.value, indent)
         combined = self.temporary()
@@ -3569,8 +3988,8 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({key});", indent)
         else:
             self.emit(
-                f"{outcome} = PyObject_SetAttrString({owner}, "
-                f"{_c_string(node.target.attr)}, {combined});",
+                f"{outcome} = PyObject_SetAttr({owner}, "
+                f"{self.interned(node.target.attr)}, {combined});",
                 indent,
             )
         self.emit(f"Py_DecRef({owner});", indent)
@@ -4231,13 +4650,20 @@ class CApiEmitter:
         method resolution order all behave because CPython is the one doing
         them.
 
-        A method is a closure like any other, wrapped in
-        `functools.partialmethod` on the way into the namespace. A raw
-        `PyCFunction` is not a descriptor and so would never bind - the
-        instance would simply not arrive. `partialmethod` binds it and passes
-        the instance first, which lands in the argument tuple at position
-        zero, exactly where the compiled body already reads its first
-        parameter from.
+        A method is a closure like any other, wrapped in `instancemethod` on
+        the way into the namespace. A raw `PyCFunction` is not a descriptor
+        and so would never bind - the instance would simply not arrive. The
+        wrapper binds it and passes the instance first, which lands in the
+        argument tuple at position zero, exactly where the compiled body
+        already reads its first parameter from.
+
+        This was `functools.partialmethod`, which binds correctly and is
+        written in Python: every `obj.method` ran interpreted code and built a
+        `functools.partial`, and a method call measured sixteen times slower
+        than CPython running the same class. `instancemethod` is CPython's own
+        C type for this - its `__get__` is `PyMethod_New` and nothing else -
+        and it is what a plain Python function does, so the semantics are the
+        ones being copied rather than an approximation of them.
         """
 
         if node.keywords:
@@ -4257,20 +4683,7 @@ class CApiEmitter:
             ):
                 continue  # a docstring
             if isinstance(statement, ast.FunctionDef):
-                if binder is None:
-                    functools = self.temporary()
-                    self.emit(
-                        f'{functools} = PyImport_ImportModule("functools");', indent
-                    )
-                    self.checked(functools, indent)
-                    binder = self.temporary()
-                    self.emit(
-                        f"{binder} = PyObject_GetAttrString("
-                        f'{functools}, "partialmethod");',
-                        indent,
-                    )
-                    self.emit(f"Py_DecRef({functools});", indent)
-                    self.checked(binder, indent)
+                binder = True
                 first = (
                     statement.args.posonlyargs or statement.args.args
                 )
@@ -4283,7 +4696,7 @@ class CApiEmitter:
                     self.methods_of.pop()
                 if statement.decorator_list:
                     # The decorator is handed the plain callable, not the
-                    # partialmethod. `staticmethod`, `classmethod` and
+                    # bound wrapper. `staticmethod`, `classmethod` and
                     # `property` are descriptors that do their own binding,
                     # and an ordinary wrapping decorator returns a Python
                     # function - which binds by itself and passes the instance
@@ -4294,9 +4707,7 @@ class CApiEmitter:
                     )
                 else:
                     value = self.temporary()
-                    self.emit(
-                        f"{value} = PyObject_CallOneArg({binder}, {body});", indent
-                    )
+                    self.emit(f"{value} = PyInstanceMethod_New({body});", indent)
                     self.emit(f"Py_DecRef({body});", indent)
                     self.checked(value, indent)
                 key = statement.name
@@ -4327,8 +4738,7 @@ class CApiEmitter:
             self.emit(f"PyDict_SetItem({namespace}, {named}, {value});", indent)
             self.emit(f"Py_DecRef({named});", indent)
             self.emit(f"Py_DecRef({value});", indent)
-        if binder is not None:
-            self.emit(f"Py_DecRef({binder});", indent)
+        del binder  # `instancemethod` needs nothing fetched and so nothing freed
         bases = self.tuple_literal(
             ast.copy_location(ast.Tuple(elts=node.bases, ctx=ast.Load()), node),
             indent,
@@ -4745,7 +5155,9 @@ class CApiEmitter:
             c_name, held, len(arguments.defaults), captures, closure=True
         )
         if isinstance(node.body, list):
-            function.unboxed = unboxable_locals(node.body, set(held) | set(captures))
+            given = set(held) | set(captures)
+            function.doubles = double_locals(node.body, given)
+            function.unboxed = unboxable_locals(node.body, given) - function.doubles
         outer, outer_handlers, outer_scope = (
             self.current,
             self.handlers,
@@ -4862,6 +5274,10 @@ class CApiEmitter:
                 tree = expand_cells(tree)
             except CellError as error:
                 raise self.fail(error.node, error.message) from None
+            # Before the generator rewrite, so the value a fold produces is
+            # what gets moved into the state machine, and before the narrowing
+            # analyses, which read literals to decide what a name holds.
+            tree = fold_constants(tree)
             tree = expand_generators(tree)
         except GeneratorRewriteError as error:
             raise self.fail(
@@ -5022,7 +5438,18 @@ class CApiEmitter:
         # The C name carries the module's prefix, because two modules linked
         # into one image may each define a function of the same name.
         function = _Function(self.prefix + node.name, parameters, len(defaults))
-        function.unboxed = unboxable_locals(node.body, set(parameters))
+        # Both analyses can claim a name, because eligibility is the same
+        # question for each: `t = t + 1.5` uses `+`, and `+` is an integer
+        # operator too. The float side wins, because it is the side holding
+        # evidence - it has checked that every value the name is ever bound to
+        # is a float, where the integer side has only checked that nothing
+        # stops it trying. Letting the integer side win gave such a name the
+        # three-variable form and then never once took the fast path, since no
+        # binding was an integer: all of the cost and none of the saving.
+        function.doubles = double_locals(node.body, set(parameters))
+        function.unboxed = (
+            unboxable_locals(node.body, set(parameters)) - function.doubles
+        )
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))
@@ -5109,6 +5536,10 @@ class CApiEmitter:
             out.append(f"static PyObject *m_{key} = 0;")
         for name, slot in self.cached_builtins.items():
             out.append(f"static PyObject *{slot} = 0;  /* {name} */")
+        for text, slot in self.interned_names.items():
+            out.append(f"static PyObject *{slot} = 0;  /* {text!r} */")
+        for value, slot in self.pooled.values():
+            out.append(f"static PyObject *{slot} = 0;  /* {value!r:.40} */")
         if self.crash_log:
             out.append(_CRASH_REPORT)
         if self.needs_unbound:
@@ -5150,6 +5581,20 @@ class CApiEmitter:
             "    sys.argv = [sys.executable or '']\n"
         )
         out.append(f"    PyRun_SimpleString({_c_string(anchor)});")
+        # Before the builtins, and before any body runs: an interned name
+        # is what those lookups are about to be spelled with.
+        for text, slot in self.interned_names.items():
+            out.append(
+                f"    {slot} = PyUnicode_InternFromString({_c_string(text)});"
+            )
+        for value, slot in self.pooled.values():
+            out.append(f"    {slot} = {self._build_constant(value)};")
+            out.append(
+                f"    if (!{slot}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
+            )
+            out.append(
+                f"    if (!{slot}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
+            )
         for name, slot in self.cached_builtins.items():
             out.append(
                 f"    {slot} = PyObject_GetAttrString(_py2bin_builtins, "
@@ -5223,14 +5668,35 @@ class CApiEmitter:
         out.append("}")
         return "\n".join(out) + "\n"
 
+    def _build_constant(self, value) -> str:
+        """The C expression that makes this literal, run once at start-up."""
+
+        if isinstance(value, bool):  # never pooled, but never guessed at either
+            raise AssertionError("bool is fetched from builtins, not pooled")
+        if isinstance(value, int):
+            if -(1 << 63) < value < (1 << 63):
+                return f"PyLong_FromLongLong({value}LL)"
+            # Wider than the machine word, so it is read from its decimal text.
+            return f"PyLong_FromString({_c_string(str(value))}, 0, 10)"
+        if isinstance(value, float):
+            return f"PyFloat_FromDouble({value!r})"
+        if isinstance(value, bytes):
+            return (
+                f"PyBytes_FromStringAndSize({_c_bytes(value)}, {len(value)}LL)"
+            )
+        encoded = value.encode("utf-8")
+        if b"\0" in encoded:
+            # A zero byte is a character in Python and an end in C, so this
+            # text goes through the decoder that is told how long it is.
+            return f"PyUnicode_DecodeUTF8({_c_bytes(encoded)}, {len(encoded)}LL, 0)"
+        return f"PyUnicode_FromString({_c_string(value)})"
+
     @staticmethod
     def declarations(function: _Function, depth: int) -> list[str]:
         lines = []
         pad = "    " * depth
         for name in function.locals:
-            if name.startswith("long long "):
-                lines.append(f"{pad}{name} = 0;")
-            elif name.startswith("int "):
+            if name.startswith(("long long ", "int ", "double ")):
                 lines.append(f"{pad}{name} = 0;")
             elif "[" in name:
                 lines.append(f"{pad}PyObject *{name};")

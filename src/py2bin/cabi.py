@@ -662,6 +662,20 @@ _PyObject_IsInstance = _bind(
 _PyObject_Str = _bind("PyObject_Str", _HANDLE, _HANDLE)
 _PyObject_Repr = _bind("PyObject_Repr", _HANDLE, _HANDLE)
 _PyObject_Size = _bind("PyObject_Size", _SSIZE, _HANDLE)
+_PyObject_GetAttr = _bind("PyObject_GetAttr", _HANDLE, _HANDLE, _HANDLE)
+_PyInstanceMethod_New = _bind("PyInstanceMethod_New", _HANDLE, _HANDLE)
+_PyObject_RichCompareBool = _bind(
+    "PyObject_RichCompareBool", ctypes.c_int, _HANDLE, _HANDLE, ctypes.c_int
+)
+_PyObject_VectorcallMethod = _bind(
+    "PyObject_VectorcallMethod", _HANDLE, _HANDLE, _HANDLE, _SSIZE, _HANDLE
+)
+_PyObject_SetAttr = _bind(
+    "PyObject_SetAttr", ctypes.c_int, _HANDLE, _HANDLE, _HANDLE
+)
+_PyUnicode_InternFromString = _bind(
+    "PyUnicode_InternFromString", _HANDLE, ctypes.c_char_p
+)
 _PyObject_GetAttrString = _bind(
     "PyObject_GetAttrString", _HANDLE, _HANDLE, ctypes.c_char_p
 )
@@ -812,6 +826,34 @@ def PyObject_Size(handle: int) -> int:
 
 def PyObject_GetAttrString(handle: int, name: bytes | str) -> int:
     return _handle(_PyObject_GetAttrString(handle, _cstring(name)))
+
+
+def PyObject_GetAttr(handle: int, name: int) -> int:
+    return _handle(_PyObject_GetAttr(handle, name))
+
+
+def PyInstanceMethod_New(function: int) -> int:
+    return _handle(_PyInstanceMethod_New(function))
+
+
+def PyObject_RichCompareBool(left: int, right: int, operation: int) -> int:
+    return int(_PyObject_RichCompareBool(left, right, operation))
+
+
+def PyObject_VectorcallMethod(
+    name: int, arguments: int, count: int, keyword_names: int = 0
+) -> int:
+    return _handle(
+        _PyObject_VectorcallMethod(name, arguments, count, keyword_names)
+    )
+
+
+def PyObject_SetAttr(handle: int, name: int, value: int) -> int:
+    return int(_PyObject_SetAttr(handle, name, value))
+
+
+def PyUnicode_InternFromString(text: bytes | str) -> int:
+    return _handle(_PyUnicode_InternFromString(_cstring(text)))
 
 
 def PyObject_CallNoArgs(callable_handle: int) -> int:
