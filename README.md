@@ -563,22 +563,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.7 ms** | 9.7 ms | **2.05× faster** |
-| `while` loop | **4.6 ms** | 5.4 ms | **1.17× faster** |
-| comparisons | **5.0 ms** | 5.8 ms | **1.16× faster** |
-| integer arithmetic | **9.5 ms** | 10.9 ms | **1.14× faster** |
-| float arithmetic | **6.6 ms** | 6.9 ms | **1.05× faster** |
-| attribute read | 7.1 ms | 5.8 ms | 0.81× |
-| string concatenation | 23.9 ms | 18.7 ms | 0.78× |
-| exception raise/catch | 29.8 ms | 23.0 ms | 0.77× |
-| dict store | 13.4 ms | 9.4 ms | 0.70× |
-| comprehension | 3.7 ms | 2.5 ms | 0.68× |
-| subscript | 12.6 ms | 8.3 ms | 0.66× |
-| closure call | 14.9 ms | 9.5 ms | 0.64× |
-| f-string | 32.9 ms | 20.9 ms | 0.64× |
-| list append | 10.6 ms | 6.4 ms | 0.60× |
-| instantiation | 36.3 ms | 18.5 ms | 0.51× |
-| method call | 34.9 ms | 11.6 ms | 0.33× |
+| direct function call | **4.5 ms** | 9.4 ms | **2.07× faster** |
+| comparisons | **4.7 ms** | 5.6 ms | **1.19× faster** |
+| `while` loop | **4.4 ms** | 5.2 ms | **1.18× faster** |
+| integer arithmetic | **9.1 ms** | 10.6 ms | **1.17× faster** |
+| float arithmetic | **6.1 ms** | 6.7 ms | **1.09× faster** |
+| attribute read | 6.9 ms | 5.7 ms | 0.82× |
+| exception raise/catch | 28.0 ms | 22.1 ms | 0.79× |
+| string concatenation | 23.1 ms | 18.1 ms | 0.78× |
+| dict store | 12.7 ms | 8.8 ms | 0.69× |
+| subscript | 11.9 ms | 8.1 ms | 0.68× |
+| comprehension | 3.6 ms | 2.4 ms | 0.65× |
+| closure call | 14.2 ms | 9.2 ms | 0.65× |
+| f-string | 32.2 ms | 20.3 ms | 0.63× |
+| list append | 10.2 ms | 6.1 ms | 0.60× |
+| instantiation | 34.7 ms | 17.7 ms | 0.51× |
+| method call | 27.8 ms | 11.0 ms | 0.39× |
 
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
@@ -587,6 +587,13 @@ leaves the word. That is what CPython's specialising interpreter does, and
 doing anything less was what made this tier slower than not compiling at all.
 Literal arithmetic is folded before any of it, so `1.5 * 2.0 - 0.5` is the one
 constant it computes to.
+
+**A method body is treated like any other function body**, which it was not.
+A method is written while the module's own statements are being emitted, and
+the flag saying "this is module level" was still set inside it - so the
+register analysis and the borrowing below were switched off for every method
+in every class. Turning them on there is worth more than either was worth
+anywhere else.
 
 **An operand that is a local is read without taking a reference.** A local, a
 parameter and a capture are C variables this function alone writes, and each

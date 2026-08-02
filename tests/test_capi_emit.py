@@ -2577,6 +2577,69 @@ class ArgumentBindingTests(unittest.TestCase):
         self._run(source, b"(1, 5, (), [])\n(1, 2, (3,), ['x'])\n")
 
 
+class MethodBodyTests(unittest.TestCase):
+    """A method body gets the same treatment as any other function body.
+
+    It did not. A method is written while the module's own statements are
+    being emitted, and the flag saying "this is module level" was still set
+    inside it - so the register analysis and the borrowing of locals were both
+    switched off for every method in every class, which is the one place they
+    matter most.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_an_integer_accumulator_in_a_method_is_held_in_a_register(self):
+        source = (
+            "class Acc:\n"
+            "    def run(self, n):\n"
+            "        t = 0\n"
+            "        i = 0\n"
+            "        while i < n:\n"
+            "            t = t + i * 2\n"
+            "            i = i + 1\n"
+            "        return t\n"
+            "print(Acc().run(10))\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("long long n_t", written)
+        self._run(source, b"90\n")
+
+    def test_a_float_accumulator_in_a_method_is_held_in_a_register(self):
+        source = (
+            "class Acc:\n"
+            "    def run(self, n):\n"
+            "        f = 0.0\n"
+            "        i = 0\n"
+            "        while i < n:\n"
+            "            f = f + 1.5\n"
+            "            i = i + 1\n"
+            "        return f\n"
+            "r = Acc().run(4)\n"
+            "print(r, type(r).__name__)\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("double d_f", written)
+        self._run(source, b"6.0 float\n")
+
+    def test_a_module_global_read_in_a_method_still_reaches_the_module(self):
+        # The flag also decides where a name lives. Clearing it inside a method
+        # must not turn a module-level name into a local of the method.
+        source = (
+            "LIMIT = 3\n"
+            "class C:\n"
+            "    def go(self):\n"
+            "        return LIMIT * 2\n"
+            "    def set(self):\n"
+            "        global LIMIT\n"
+            "        LIMIT = 9\n"
+            "        return LIMIT\n"
+            "c = C()\n"
+            "print(c.go(), c.set(), c.go(), LIMIT)\n"
+        )
+        self._run(source, b"6 9 18 9\n")
+
+
 class BorrowedOperandTests(unittest.TestCase):
     """Operands read without taking a reference, where that is sound.
 

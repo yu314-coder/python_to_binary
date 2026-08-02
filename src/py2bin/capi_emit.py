@@ -5406,6 +5406,12 @@ class CApiEmitter:
         outer_loop_depth, self.loop_depth = self.loop_depth, 0
         outer_depth, self.depth = self.depth, 0
         outer_guard, self.guards_recursion = self.guards_recursion, True
+        # A closure body is not the module body, however it got here. A method
+        # is written while the module's own statements are being emitted, so
+        # this flag was still set inside it - which switched off both the
+        # register analysis and the borrowing of locals for every method in
+        # every class, the one place they matter most.
+        outer_module_level, self.at_module_level = self.at_module_level, False
         self.scope_path.append((simple, True))
         # Before anything is acquired, so the failure path is a plain return
         # rather than the unwind label - nothing has been entered to leave.
@@ -5450,6 +5456,7 @@ class CApiEmitter:
             self.guards_recursion = outer_guard
             self.finallys = outer_finallys
             self.loop_depth = outer_loop_depth
+            self.at_module_level = outer_module_level
             self.scope_path.pop()
 
     # --- assembly --------------------------------------------------------
