@@ -32,6 +32,7 @@ from pathlib import Path
 
 from .capi_cells import CellError, expand as expand_cells
 from .capi_fold import fold as fold_constants
+from .capi_inline import expand_module as inline_calls
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
     ARITHMETIC as _MACHINE_OPS,
@@ -66,6 +67,34 @@ _COMPARISON_SPELLING = {
 _COMPARISON_CODES = {
     ast.Lt: 0, ast.LtE: 1, ast.Eq: 2, ast.NotEq: 3, ast.Gt: 4, ast.GtE: 5,
 }
+
+
+def _scope_bindings(body: list) -> set[str]:
+    """Every name these statements bind, not looking into nested scopes.
+
+    Python has no block scope, so a name bound anywhere in a function body is
+    local to all of it - including before the line that binds it. A nested
+    function is a scope of its own and what it binds stays there.
+    """
+
+    bound: set[str] = set()
+    pending = list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        pending.extend(ast.iter_child_nodes(node))
+    return bound
 
 
 def _shadowed_builtins(tree: ast.Module) -> set[str]:
@@ -482,6 +511,12 @@ class _Function:
         #: any of them is stored, so a nested call has finished with the array
         #: before the outer one begins to fill it.
         self.argument_arrays: dict[int, str] = {}
+        #: Every name this body binds anywhere in itself. A module-level
+        #: function is called as a direct C call, which is only right when the
+        #: name at the call site is that function - a scope with its own
+        #: binding of the same spelling means it is not, and calling the C
+        #: function anyway answered with the wrong one, silently.
+        self.shadows: set[str] = set()
         #: Names this body declared `global`. They read and write the module's
         #: own storage rather than a local of the same spelling.
         self.module_names: set[str] = set()
@@ -2348,6 +2383,9 @@ class CApiEmitter:
             and self.reference(node.func.id) is None
             and node.func.id not in self.globals
             and not any(node.func.id in scope for scope in self.shadowed)
+            and not (
+                self.current is not None and node.func.id in self.current.shadows
+            )
         )
         if shortcut and node.func.id == "len":
             if len(node.args) != 1:
@@ -2372,7 +2410,10 @@ class CApiEmitter:
             any(isinstance(item, ast.Starred) for item in node.args)
             or bool(node.keywords)
         )
-        if node.func.id not in self.known_functions or indirect:
+        shadowed_here = (
+            self.current is not None and node.func.id in self.current.shadows
+        )
+        if node.func.id not in self.known_functions or indirect or shadowed_here:
             assert self.current is not None
             if self.reference(node.func.id) is not None:
                 # A name the program bound - an imported one, or a value
@@ -4889,6 +4930,7 @@ class CApiEmitter:
         and each named parameter is *removed* from the copy as it is taken, so
         what is left is exactly what `**` should see. Without one there is
         nothing to remove them from, and the dict the caller owns is only read.
+
         """
 
         arguments = node.args
@@ -5235,6 +5277,7 @@ class CApiEmitter:
             given = set(held) | set(captures)
             function.doubles = double_locals(node.body, given)
             function.unboxed = unboxable_locals(node.body, given) - function.doubles
+            function.shadows = _scope_bindings(node.body) | set(held)
         outer, outer_handlers, outer_scope = (
             self.current,
             self.handlers,
@@ -5355,6 +5398,12 @@ class CApiEmitter:
             # what gets moved into the state machine, and before the narrowing
             # analyses, which read literals to decide what a name holds.
             tree = fold_constants(tree)
+            # Before the narrowing analyses read it, which is the whole point:
+            # they decide what can live in a register by looking at what each
+            # name is assigned, and a value arriving from a call tells them
+            # nothing. Folding runs first so an inlined body carries constants
+            # already computed.
+            tree = inline_calls(tree)
             tree = expand_generators(tree)
         except GeneratorRewriteError as error:
             raise self.fail(
@@ -5527,6 +5576,7 @@ class CApiEmitter:
         function.unboxed = (
             unboxable_locals(node.body, set(parameters)) - function.doubles
         )
+        function.shadows = _scope_bindings(node.body) | set(parameters)
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))

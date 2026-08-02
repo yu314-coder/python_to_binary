@@ -563,22 +563,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| comparisons | **4.8 ms** | 5.8 ms | **1.21× faster** |
-| `while` loop | **4.5 ms** | 5.3 ms | **1.19× faster** |
-| integer arithmetic | **9.3 ms** | 10.9 ms | **1.17× faster** |
-| float arithmetic | **6.2 ms** | 6.8 ms | **1.09× faster** |
-| string concatenation | 23.1 ms | 18.2 ms | 0.79× |
-| exception raise/catch | 28.7 ms | 22.4 ms | 0.78× |
-| attribute read | 7.7 ms | 5.7 ms | 0.74× |
-| dict store | 13.0 ms | 9.0 ms | 0.69× |
-| comprehension | 3.5 ms | 2.4 ms | 0.68× |
-| f-string | 32.7 ms | 20.4 ms | 0.62× |
-| direct function call | 15.4 ms | 9.5 ms | 0.62× |
-| list append | 10.2 ms | 6.2 ms | 0.61× |
-| subscript | 14.3 ms | 8.2 ms | 0.58× |
-| closure call | 17.1 ms | 9.4 ms | 0.55× |
-| instantiation | 35.3 ms | 18.0 ms | 0.51× |
-| method call | 34.4 ms | 11.3 ms | 0.33× |
+| direct function call | **4.8 ms** | 9.9 ms | **2.05× faster** |
+| `while` loop | **4.8 ms** | 5.5 ms | **1.15× faster** |
+| comparisons | **5.2 ms** | 5.9 ms | **1.14× faster** |
+| integer arithmetic | **10.0 ms** | 11.1 ms | **1.12× faster** |
+| float arithmetic | **6.7 ms** | 6.9 ms | **1.03× faster** |
+| exception raise/catch | 29.8 ms | 23.0 ms | 0.77× |
+| string concatenation | 24.2 ms | 18.5 ms | 0.77× |
+| attribute read | 7.9 ms | 5.9 ms | 0.75× |
+| dict store | 13.5 ms | 9.4 ms | 0.69× |
+| comprehension | 3.7 ms | 2.5 ms | 0.68× |
+| f-string | 33.2 ms | 21.0 ms | 0.63× |
+| list append | 10.7 ms | 6.4 ms | 0.60× |
+| subscript | 14.9 ms | 8.4 ms | 0.57× |
+| closure call | 17.9 ms | 9.7 ms | 0.54× |
+| instantiation | 36.5 ms | 18.6 ms | 0.51× |
+| method call | 35.9 ms | 11.6 ms | 0.32× |
 
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
@@ -597,17 +597,26 @@ through the documented entry points - which is what lets one binary work
 against a CPython it was not built against. `PyObject_GetAttr` does the full
 generic lookup every time. That is a deliberate trade, not an oversight.
 
-**Method calls are the worst row, and the next thing to fix is known.** A
-compiled method is wrapped in `instancemethod`, which binds correctly but does
-not carry `Py_TPFLAGS_METHOD_DESCRIPTOR`. CPython checks that flag in two
-places - when it fetches a method to call it, and when it calls `__init__` -
-and skips allocating a bound method object for anything that has it. Without
-it, every method call and every instantiation allocates one. `PyDescr_NewMethod`
-produces a descriptor that has the flag; adopting it means passing the instance
-as the C `self` argument, which is where a compiled method currently finds the
-values it captured from an enclosing scope. That is a calling-convention change
-rather than a substitution, which is why it is written down here rather than
-done in passing.
+**Calls that can be written out disappear entirely.** A module-level function
+whose body is one expression naming nothing but its own parameters is
+substituted at the call site. The gain is not the call saved: `t = add(t, i)`
+tells the register analysis nothing, because the value arrives from a call,
+while `t = t + i` tells it everything - so the loop around it narrows and the
+whole thing becomes machine arithmetic. That is what takes this row past the
+interpreter rather than merely level with it.
+
+**Method calls are the worst row, and it was tried.** A compiled method is
+wrapped in `instancemethod`, which binds correctly but does not carry
+`Py_TPFLAGS_METHOD_DESCRIPTOR`; CPython checks that flag when it fetches a
+method to call and when it calls `__init__`, and skips allocating a bound
+method for anything that has it. `PyDescr_NewMethod` produces a descriptor
+that does. It was implemented, and it works, and it was **reverted**: a method
+reached that way is a `builtin_function_or_method` rather than a bound method,
+so `inspect.ismethod` answers False and `self` appears in the signature. That
+is precisely the breakage that once stopped pywebview from binding a single
+method of a compiled application. Compiled methods introspect like Python
+methods, and they will keep doing so; the speed is not worth what it costs to
+every framework that looks at them.
 
 **Everything else loses by a factor that tracks how many C-API calls the
 operation costs.** Each one is a real call with the reference-count discipline

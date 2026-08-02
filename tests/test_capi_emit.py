@@ -2577,6 +2577,130 @@ class ArgumentBindingTests(unittest.TestCase):
         self._run(source, b"(1, 5, (), [])\n(1, 2, (3,), ['x'])\n")
 
 
+class InliningTests(unittest.TestCase):
+    """Small module-level functions written out where they are called.
+
+    The point is not the call saved. The register analysis reads what a name
+    is assigned to decide whether it can live in one, and a value arriving
+    from a call tells it nothing - so inlining is what lets the loop around it
+    be narrowed. These pin that, and the refusals that keep it honest.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_the_call_disappears_and_the_loop_narrows(self):
+        source = (
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "def run():\n"
+            "    t = 0\n"
+            "    i = 0\n"
+            "    while i < 5:\n"
+            "        t = add(t, i)\n"
+            "        i = i + 1\n"
+            "    return t\n"
+            "print(run())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        # The accumulator is in a register, which it could not be while the
+        # value came back from a call.
+        self.assertIn("long long n_t", written)
+        self._run(source, b"10\n")
+
+    def test_the_function_still_exists_as_a_value(self):
+        source = (
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "g = add\n"
+            "print(add(1, 2), g(3, 4), list(map(add, [1], [2])))\n"
+        )
+        self._run(source, b"3 7 [3]\n")
+
+    def test_a_shadowed_name_is_not_inlined(self):
+        # A nested scope with its own `add` means the call there is not this
+        # function, so the whole candidate is refused.
+        source = (
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "def go():\n"
+            "    add = lambda x, y: 99\n"
+            "    return add(1, 2)\n"
+            "print(go(), add(1, 2))\n"
+        )
+        self._run(source, b"99 3\n")
+
+    def test_a_body_naming_a_global_is_refused(self):
+        # Substituted into a scope with its own `K`, the body would read the
+        # local. Refusing every non-parameter name is what prevents it.
+        source = (
+            "K = 100\n"
+            "def bump(a):\n"
+            "    return a + K\n"
+            "def go():\n"
+            "    K = 1\n"
+            "    return bump(5) + K\n"
+            "print(go())\n"
+        )
+        self._run(source, b"106\n")
+
+    def test_an_argument_that_can_have_an_effect_is_not_duplicated(self):
+        # `twice` uses its parameter twice; the argument prints when it runs,
+        # so a duplicated substitution would print twice.
+        source = (
+            "def twice(x):\n"
+            "    return x + x\n"
+            "def noisy():\n"
+            "    print('ran')\n"
+            "    return 3\n"
+            "print(twice(noisy()))\n"
+        )
+        self._run(source, b"ran\n6\n")
+
+    def test_arguments_keep_their_order(self):
+        source = (
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "def one():\n"
+            "    print('one')\n"
+            "    return 1\n"
+            "def two():\n"
+            "    print('two')\n"
+            "    return 2\n"
+            "print(add(one(), two()))\n"
+        )
+        self._run(source, b"one\ntwo\n3\n")
+
+    def test_a_dropped_argument_still_runs(self):
+        # `first` never mentions `b`, so substituting would skip the argument
+        # entirely - which must not happen when it can do something.
+        source = (
+            "def first(a, b):\n"
+            "    return a\n"
+            "def noisy():\n"
+            "    print('ran')\n"
+            "    return 9\n"
+            "print(first(1, noisy()))\n"
+        )
+        self._run(source, b"ran\n1\n")
+
+    def test_recursion_is_left_alone(self):
+        source = (
+            "def down(n):\n"
+            "    return 0 if n <= 0 else down(n - 1)\n"
+            "print(down(3))\n"
+        )
+        self._run(source, b"0\n")
+
+    def test_keywords_and_spreading_take_the_call(self):
+        source = (
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "pair = (3, 4)\n"
+            "print(add(1, b=2), add(*pair))\n"
+        )
+        self._run(source, b"3 7\n")
+
+
 class TextFoldingTests(unittest.TestCase):
     """Literal text joined once, and only where Python would agree."""
 
