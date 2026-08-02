@@ -44,7 +44,7 @@ against each other, and which one you want depends on which you care about.
 | **speed** on a 30M-iteration loop | **0.062 s** | 1.27 s | 0.66 s |
 | **artifact** | **48 KB** | 66 KB | tens of MB |
 | **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
-| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus | **everything** |
+| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
 | **third-party packages** | none | any the interpreter can import | **carried inside** |
 | what actually runs your logic | machine code | machine code | CPython, interpreting |
 
@@ -73,8 +73,9 @@ that reads the object's internals directly. The per-feature table is below.
 The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the
 fast path is off. On a loop it can claim, the same tier is 1.17× faster than
-CPython, and a float loop - which used to be the worst case at 0.32× - is now
-1.09×.
+CPython; a float loop, once the worst row at 0.32×, is 1.06×; and a call to a
+small helper is 2.10×, because the call stops existing and the loop around it
+becomes machine arithmetic.
 
 ## Using it
 
@@ -312,11 +313,34 @@ better; `1.00×` means the same speed as CPython.
 | instantiation | 35.3 ms | 18.1 ms | 0.51× |
 | method call | 28.1 ms | 11.2 ms | 0.40× |
 
-**Integer loops win** because a local the analysis picks out is held in a
-machine register, with an overflow check that falls back to unbounded
-arithmetic when the value leaves the word. That is what CPython's specialising
-interpreter does, and doing anything less was what made this tier slower than
-not compiling at all.
+### Where those numbers came from
+
+Nine of the sixteen rows sit at 0.80× or better and six beat the interpreter
+outright. Most did not a short while ago.
+
+| row | was | now | what it was |
+|---|---|---|---|
+| direct function call | 0.81× | **2.10×** | the call hid the arithmetic from the register analysis |
+| exception raise/catch | 0.49× | **1.06×** | every raise classified its argument through a Python-level `type()` |
+| float arithmetic | 0.32× | **1.06×** | floats were never held in registers at all |
+| attribute read | 0.51× | 0.82× | the name was built and hashed at every access |
+| string concatenation | 0.14× | 0.80× | literal text was joined at run time, every time |
+| list append | 0.28× | 0.72× | a lookup, a bound method and a discarded `None` per call |
+| instantiation | 0.09× | 0.51× | `__init__` was reached through a Python-level wrapper |
+| method call | 0.05× | 0.40× | so was every other method |
+
+The largest wins were not optimisations but mistakes being removed - a wrapper
+written in Python on the method path, a float analysis that did not exist, a
+string rebuilt on every iteration of a loop. And they all have one shape:
+something stops happening. Adding a cheap test in order to skip expensive work
+*inside* the interpreter was tried five times and measured flat or slower every
+time, because the extra call through the import table cost more than it saved.
+
+**Arithmetic loops win** because a local the analysis picks out is held in a
+machine register - a `long long` for an integer, a `double` for a float - with
+an overflow check that falls back to unbounded arithmetic when an integer
+leaves the word. That is what CPython's specialising interpreter does, and
+doing anything less was what made this tier slower than not compiling at all.
 
 **Everything else loses, by a factor that tracks how many C-API calls the
 operation costs.** Each one is a real call with the reference-count discipline
@@ -397,3 +421,9 @@ neither.
 
 MIT. Full documentation, source and issues:
 **https://github.com/yu314-coder/python_to_binary**
+
+[^corpus]: That sweep was last run before the optimisation work described
+    further down, and its harness was scratch rather than committed, so the
+    figure is reported as measured rather than as currently verified. What is
+    checked on every change is the 1529-test suite and a differential set that
+    demands byte-identical output to CPython.

@@ -20,7 +20,7 @@ against each other, and which one you want depends on which you care about.
 | **speed** on a 30M-iteration loop | **0.062 s** | 1.27 s | 0.66 s |
 | **artifact** | **48 KB** | 66 KB | tens of MB |
 | **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
-| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus | **everything** |
+| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
 | **third-party packages** | none | any the interpreter can import | **carried inside** |
 | what actually runs your logic | machine code | machine code | CPython, interpreting |
 
@@ -50,8 +50,9 @@ that reads the object's internals directly. See
 The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the
 fast path is off. On a loop it can claim, the same tier is 1.17× faster than
-CPython, and a float loop - which used to be the worst case at 0.32× - is now
-1.09×.
+CPython; a float loop, once the worst row at 0.32×, is 1.06×; and a call to a
+small helper is 2.10×, because the call stops existing and the loop around it
+becomes machine arithmetic.
 
 ## Platforms
 
@@ -581,6 +582,34 @@ better; `1.00×` means the same speed as CPython.
 | instantiation | 35.3 ms | 18.1 ms | 0.51× |
 | method call | 28.1 ms | 11.2 ms | 0.40× |
 
+### Where those numbers came from
+
+Nine of the sixteen rows above sit at 0.80× or better and six beat the
+interpreter outright. Most of them did not a short while ago, and the reason
+each moved is worth having in one place, because none of it was a matter of
+turning something up.
+
+| row | was | now | what it was |
+|---|---|---|---|
+| direct function call | 0.81× | **2.10×** | the call hid the arithmetic from the register analysis |
+| exception raise/catch | 0.49× | **1.06×** | every raise classified its argument through a Python-level `type()` |
+| float arithmetic | 0.32× | **1.06×** | floats were never held in registers at all |
+| comprehension | 0.77× | **0.81×** | `[x for x in it]` walked a loop `list(it)` already walks |
+| attribute read | 0.51× | 0.82× | the name was built and hashed at every access |
+| string concatenation | 0.14× | 0.80× | literal text was joined at run time, every time |
+| list append | 0.28× | 0.72× | a lookup, a bound method and a discarded `None` per call |
+| instantiation | 0.09× | 0.51× | `__init__` was reached through a Python-level wrapper |
+| method call | 0.05× | 0.40× | so was every other method |
+
+Two things run through the whole list. The first is that the largest wins were
+not optimisations but *mistakes being removed* - a wrapper written in Python on
+the method path, a float analysis that did not exist, a string rebuilt on every
+iteration of a loop. The second is that the wins all have one shape: something
+stops happening. Adding a cheap test to skip expensive work inside the
+interpreter was tried five separate times and measured flat or slower every
+time, because the extra call through the import table cost more than it saved.
+Those attempts are recorded next to the code that does not do them.
+
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
 an overflow check that falls back to unbounded arithmetic when an integer
@@ -611,7 +640,7 @@ ran `type(value)` - through a Python-level call - to decide whether it was
 handed a class or an instance. For an untouched builtin exception name the
 answer is known at compile time: a call on the class answers an instance, the
 bare name is the class. The lookup itself stays live, so a replaced
-`builtins.ValueError` is still honoured. Exceptions now run at 1.03×.
+`builtins.ValueError` is still honoured. Exceptions now run at 1.06×.
 
 **`len()` inside a hot expression is a machine integer.** `n = n + len(s)`
 was three heap allocations to add a number the C already had: `PyObject_Size`
@@ -686,10 +715,15 @@ method of a compiled application. Compiled methods introspect like Python
 methods, and they will keep doing so; the speed is not worth what it costs to
 every framework that looks at them.
 
-**Everything else loses by a factor that tracks how many C-API calls the
-operation costs.** Each one is a real call with the reference-count discipline
-around it, where the interpreter's specialised bytecode does the same work
-inline.
+**What is left below the line loses by a factor that tracks how many C-API
+calls the operation costs.** Each is a real call through the import table, with
+the reference-count discipline around it, where the interpreter's specialised
+bytecode does the same work inline in its own loop. That is also the shape of
+every optimisation here that *failed*: five separate attempts to add a cheap
+test in order to skip work inside libpython measured flat or slower, because
+the extra out-of-line call cost more than the work it skipped. The wins all
+have the same shape instead - a call, a lookup or an allocation stops happening
+at all.
 
 **Method calls used to be far worse than that pattern predicted** - 21×, where
 everything else paid 2-4×. That was not C-API overhead. Every compiled method
@@ -733,8 +767,9 @@ by calling `Py_Initialize`, skipping the interpreter's own startup path -
 scanning `sys.path`, finding and unmarshalling `__main__`. Nuitka's standalone
 bundle pays to bootstrap its own tree first.
 
-**Loops are faster than the interpreter; calls are not.** The reason is worth
-stating rather than hiding, because it explains both halves.
+**Loops are faster than the interpreter, and so now are calls.** The reason is
+worth stating rather than hiding, because it explains both halves - and because
+the second half only became true recently.
 
 Since 3.11 CPython does not run the bytecode you wrote: it rewrites hot
 instructions into specialised forms, so a `+` between two ints becomes an add
@@ -853,3 +888,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 under `src/` imports `subprocess`, `multiprocessing`, `pty`, `distutils` or
 `setuptools`, or names an external toolchain as a value - which is what keeps
 the zero-toolchain claim honest rather than aspirational.
+
+[^corpus]: That sweep was last run before the optimisation work described under
+    [how fast each one is](#how-fast-each-one-is), and the harness that ran it
+    was scratch rather than committed, so the figure is reported as measured
+    rather than as currently verified. What is checked on every change is the
+    1529-test suite and a differential set that compiles each program and
+    demands byte-identical output to CPython.
