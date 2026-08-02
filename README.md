@@ -563,22 +563,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.3 ms** | 9.2 ms | **2.16× faster** |
-| comparisons | **4.6 ms** | 5.6 ms | **1.21× faster** |
-| integer arithmetic | **8.8 ms** | 10.4 ms | **1.18× faster** |
-| `while` loop | **4.4 ms** | 5.2 ms | **1.18× faster** |
-| float arithmetic | **6.0 ms** | 6.6 ms | **1.09× faster** |
-| attribute read | 6.8 ms | 5.6 ms | 0.82× |
-| exception raise/catch | 27.4 ms | 21.8 ms | 0.80× |
-| string concatenation | 22.8 ms | 17.7 ms | 0.78× |
-| comprehension | 3.9 ms | 3.0 ms | 0.77× |
-| dict store | 12.4 ms | 8.5 ms | 0.69× |
-| subscript | 11.7 ms | 7.9 ms | 0.68× |
-| closure call | 13.9 ms | 9.0 ms | 0.65× |
-| f-string | 31.4 ms | 19.9 ms | 0.63× |
-| list append | 10.0 ms | 6.0 ms | 0.60× |
-| instantiation | 34.3 ms | 17.5 ms | 0.51× |
-| method call | 27.3 ms | 11.0 ms | 0.40× |
+| direct function call | **4.5 ms** | 9.1 ms | **2.05× faster** |
+| integer arithmetic | **8.9 ms** | 10.4 ms | **1.18× faster** |
+| comparisons | **4.8 ms** | 5.6 ms | **1.17× faster** |
+| `while` loop | **4.4 ms** | 5.0 ms | **1.14× faster** |
+| float arithmetic | **6.3 ms** | 6.7 ms | **1.07× faster** |
+| attribute read | 6.7 ms | 5.5 ms | 0.82× |
+| string concatenation | 22.2 ms | 17.6 ms | 0.80× |
+| exception raise/catch | 27.9 ms | 21.9 ms | 0.78× |
+| comprehension | 4.0 ms | 3.0 ms | 0.75× |
+| dict store | 12.1 ms | 8.8 ms | 0.72× |
+| subscript | 11.5 ms | 7.9 ms | 0.69× |
+| closure call | 13.3 ms | 9.0 ms | 0.68× |
+| f-string | 30.7 ms | 19.9 ms | 0.65× |
+| list append | 9.8 ms | 6.0 ms | 0.61× |
+| instantiation | 33.9 ms | 17.4 ms | 0.51× |
+| method call | 27.1 ms | 10.8 ms | 0.40× |
 
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
@@ -594,6 +594,15 @@ the flag saying "this is module level" was still set inside it - so the
 register analysis and the borrowing below were switched off for every method
 in every class. Turning them on there is worth more than either was worth
 anywhere else.
+
+**`len()` inside a hot expression is a machine integer.** `n = n + len(s)`
+was three heap allocations to add a number the C already had: `PyObject_Size`
+answers a `long long`, which was boxed, added to a boxed `n`, and stored as an
+object - unmaking `n`'s register form for the rest of the loop. The
+measurement is hoisted into a slot of the emitter's own, once, before the fast
+path's two arms - which is what keeps a program's `__len__` from running twice
+when the fast arm declines. `while i < len(xs)` gets the same treatment, and
+still measures every iteration, so a list that grows mid-loop is seen growing.
 
 **A comprehension over a `range` counts in a register.** Its target becomes a
 name of the emitter's own, registered with the integer analysis, so `x * 2` in

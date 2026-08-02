@@ -2700,6 +2700,116 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class HoistedLengthTests(unittest.TestCase):
+    """`len(name)` loaded into a machine slot, so the expression stays narrow."""
+
+    _run = CApiEmitTests._run
+
+    def test_an_accumulator_fed_by_len_stays_in_a_register(self):
+        source = (
+            "def run():\n"
+            "    i = 0\n"
+            "    n = 0\n"
+            "    while i < 4:\n"
+            "        s = 'ab' + str(i)\n"
+            "        n = n + len(s)\n"
+            "        i = i + 1\n"
+            "    return n\n"
+            "print(run())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertNotIn("PyLong_FromLongLong(PyObject_Size", written)
+        self._run(source, b"12\n")
+
+    def test_a_loop_bounded_by_len_measures_every_iteration(self):
+        # `while i < len(xs)` re-measures, so a list that grows mid-loop is
+        # seen growing - hoisting must not turn the bound into a constant.
+        source = (
+            "def run():\n"
+            "    xs = [1]\n"
+            "    i = 0\n"
+            "    while i < len(xs):\n"
+            "        if i < 3:\n"
+            "            xs.append(i)\n"
+            "        i = i + 1\n"
+            "    return len(xs)\n"
+            "print(run())\n"
+        )
+        self._run(source, b"4\n")
+
+    def test_a_side_effecting_len_runs_exactly_once(self):
+        # The slow arm of the fast path re-evaluates its tree; the measurement
+        # is hoisted out of it precisely so `__len__` cannot run twice.
+        source = (
+            "class Weird:\n"
+            "    def __len__(self):\n"
+            "        print('measured')\n"
+            "        return 3\n"
+            "def run():\n"
+            "    w = Weird()\n"
+            "    n = 0\n"
+            "    n = n + len(w)\n"
+            "    return n\n"
+            "print(run())\n"
+        )
+        self._run(source, b"measured\n3\n")
+
+    def test_len_of_the_unmeasurable_raises_and_is_catchable(self):
+        # `PyObject_Size` answers -1 with the exception set; the shortcut
+        # boxed that unchecked, so `len(5)` answered -1 and left the
+        # exception for whatever ran next.
+        source = (
+            "def run():\n"
+            "    n = 0\n"
+            "    try:\n"
+            "        n = n + len(5)\n"
+            "    except TypeError:\n"
+            "        return 'TypeError'\n"
+            "    return n\n"
+            "print(run())\n"
+            "try:\n"
+            "    print(len(5))\n"
+            "except TypeError:\n"
+            "    print('TypeError again')\n"
+        )
+        self._run(source, b"TypeError\nTypeError again\n")
+
+    def test_a_shadowed_len_is_the_program_s_own(self):
+        source = (
+            "def run():\n"
+            "    len = lambda x: 99\n"
+            "    n = 0\n"
+            "    n = n + len('ab')\n"
+            "    return n\n"
+            "print(run())\n"
+        )
+        self._run(source, b"99\n")
+
+
+class BorrowedCaptureTests(unittest.TestCase):
+    """A capture is borrowed from the tuple the callable holds."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_closure_that_drops_its_own_name_mid_call(self):
+        # The caller holds the callable for the length of the call, so the
+        # tuple - and the borrowed capture - outlive the body even when the
+        # body removes the only name the program had for it.
+        source = (
+            "def make():\n"
+            "    k = [41]\n"
+            "    def inner():\n"
+            "        global f\n"
+            "        f = None\n"
+            "        k[0] = k[0] + 1\n"
+            "        return k[0]\n"
+            "    return inner\n"
+            "f = make()\n"
+            "print(f(), f)\n"
+        )
+        self._run(source, b"42 None\n")
+
+
 class CountedComprehensionTests(unittest.TestCase):
     """Comprehensions over a `range`, counted in a register.
 

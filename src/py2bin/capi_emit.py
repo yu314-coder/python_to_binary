@@ -1286,6 +1286,18 @@ class CApiEmitter:
         `if` and every `while` comes through here.
         """
 
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], _MACHINE_TESTS)
+            and not self.narrow_comparison(node)
+        ):
+            # `while i < len(xs)` is the loop condition most Python has; the
+            # measurement is hoisted so the compare runs on two machine
+            # integers, exactly as the assignment above it does.
+            hoisted = self.hoisted_lengths(node, indent)
+            if hoisted is not None and self.narrow_comparison(hoisted):
+                node = hoisted
         if self.narrow_comparison(node):
             flag, answer = self.machine_comparison(node, indent)
             self.emit(f"if (!{flag}) {{", indent)
@@ -1354,8 +1366,13 @@ class CApiEmitter:
 
         if self.is_double(name) and self.double_tree(value):
             return self.narrow_double_assign(name, value, indent)
-        if not self.is_unboxed(name) or not self.narrow_tree(value):
+        if not self.is_unboxed(name):
             return False
+        if not self.narrow_tree(value):
+            hoisted = self.hoisted_lengths(value, indent)
+            if hoisted is None or not self.narrow_tree(hoisted):
+                return False
+            value = hoisted
         machine = self.machine_expression(value, indent)
         if machine.flag is None:
             self.store_machine(name, machine.value, indent)
@@ -2731,22 +2748,21 @@ class CApiEmitter:
         # module that defines its own `len` was still getting `PyObject_Size`,
         # so it printed the length where CPython printed what the program's
         # own function returned - a wrong answer, silently.
-        shortcut = (
-            node.func.id not in self.known_functions
-            and self.reference(node.func.id) is None
-            and node.func.id not in self.globals
-            and not any(node.func.id in scope for scope in self.shadowed)
-            and not (
-                self.current is not None and node.func.id in self.current.shadows
-            )
-        )
+        shortcut = self.builtin_untouched(node.func.id)
         if shortcut and node.func.id == "len":
             if len(node.args) != 1:
                 raise self.fail(node, "len() takes one argument")
-            value = self.expression(node.args[0], indent)
+            value, owned = self.operand(node.args[0], indent)
+            measured = self.machine_slot()
+            # `PyObject_Size` answers -1 with the exception set when the
+            # object has no length. Boxing that unchecked answered `-1` where
+            # `len(5)` raises - and left the exception set for whatever ran
+            # next to trip over.
+            self.emit(f"{measured} = PyObject_Size({value});", indent)
+            self.release(value, owned, indent)
+            self.emit(f"if ({measured} < 0) {{ {self.failure()} }}", indent)
             target = self.temporary()
-            self.emit(f"{target} = PyLong_FromLongLong(PyObject_Size({value}));", indent)
-            self.emit(f"Py_DecRef({value});", indent)
+            self.emit(f"{target} = PyLong_FromLongLong({measured});", indent)
             return self.checked(target, indent)
         if shortcut and node.func.id == "str":
             if len(node.args) != 1:
@@ -2936,6 +2952,102 @@ class CApiEmitter:
         target = self.invoke(callable_value, node.args, indent, node.keywords)
         self.emit(f"Py_DecRef({callable_value});", indent)
         return self.checked(target, indent)
+
+    def builtin_untouched(self, name: str) -> bool:
+        """True when this name can only mean the builtin, here and now.
+
+        A program that binds the name anywhere this could see - a module
+        global, a local, an enclosing scope, a comprehension target - gets its
+        own binding, exactly as it would from the interpreter.
+        """
+
+        return (
+            name not in self.known_functions
+            and self.reference(name) is None
+            and name not in self.globals
+            and not any(name in scope for scope in self.shadowed)
+            and not (self.current is not None and name in self.current.shadows)
+        )
+
+    def hoisted_lengths(self, value: ast.expr, indent: int) -> ast.expr | None:
+        """`len(name)` subexpressions loaded into machine slots, or None.
+
+        `n = n + len(s)` was three heap allocations to add a machine integer
+        the C already had: `PyObject_Size` answers a `long long`, which was
+        boxed, added to a boxed `n`, and the result stored as an object -
+        which then unmade `n`'s register form for the rest of the loop. Each
+        `len(name)` becomes a synthetic name of the emitter's own, loaded once
+        here, so the surrounding expression stays narrow and the slow arm -
+        which re-evaluates the tree - reads the slot rather than measuring
+        again. That re-evaluation is why this exists at all: substituting the
+        size straight into both arms of the fast path would run a program's
+        `__len__` twice whenever the fast arm declined.
+
+        Only an expression that is effect-free apart from the measurements is
+        rewritten, because the loads run first: in `f() + len(s)` the measure
+        would happen before `f`, and `f` may rebind `s`.
+        """
+
+        if self.boxing or self.current is None:
+            return None
+        measured: list[tuple[str, ast.Name]] = []
+
+        def walk(node: ast.expr) -> bool:
+            if isinstance(node, ast.Constant):
+                return True
+            if isinstance(node, ast.Name):
+                return isinstance(node.ctx, ast.Load)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, _MACHINE_OPS):
+                return walk(node.left) and walk(node.right)
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == 1
+                and isinstance(node.ops[0], _MACHINE_TESTS)
+            ):
+                return walk(node.left) and walk(node.comparators[0])
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "len"
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and isinstance(node.args[0].ctx, ast.Load)
+                and self.builtin_untouched("len")
+            ):
+                return True
+            return False
+
+        class _Load(ast.NodeTransformer):
+            def visit_Call(inner, node: ast.Call) -> ast.AST:
+                self.comp_serial += 1
+                unique = f"_py2bin_n{self.comp_serial}"
+                measured.append((unique, node.args[0]))
+                return ast.copy_location(
+                    ast.Name(id=unique, ctx=ast.Load()), node
+                )
+
+        if not walk(value):
+            return None
+        import copy as _copy
+
+        rewritten = ast.fix_missing_locations(
+            _Load().visit(_copy.deepcopy(value))
+        )
+        if not measured:
+            return None
+        for unique, argument in measured:
+            self.current.unboxed.add(unique)
+            self.synthetic.add(unique)
+            self.current.certain.add(unique)
+            held, obj, state = self.narrow_slots(unique)
+            slot, owned = self.operand(argument, indent)
+            self.emit(f"if ({obj}) {{ Py_DecRef({obj}); {obj} = 0; }}", indent)
+            self.emit(f"{held} = PyObject_Size({slot});", indent)
+            self.emit(f"if ({held} < 0) {{ {self.failure()} }}", indent)
+            self.emit(f"{state} = 1;", indent)
+            self.release(slot, owned, indent)
+        return rewritten
 
     def method_vectorcall(self, node: ast.Call, indent: int) -> str:
         """`x.f(a)` without ever building the bound method it looks up.
@@ -4879,11 +4991,9 @@ class CApiEmitter:
                 self.emit(f"if (p_{name}) Py_DecRef(p_{name});", indent)
             else:
                 self.emit(f"Py_DecRef(p_{name});", indent)
-        for name in self.current.captures:
-            if guarded:
-                self.emit(f"if (c_{name}) Py_DecRef(c_{name});", indent)
-            else:
-                self.emit(f"Py_DecRef(c_{name});", indent)
+        # Captures are borrowed from the tuple the callable holds - see the
+        # binding in `write_closure` - so there is nothing of theirs to give
+        # back here.
         for name in self.current.locals:
             # Only the names the program bound. A temporary was released where
             # it was consumed, so releasing it again here would be a second
@@ -5684,7 +5794,10 @@ class CApiEmitter:
             # for the length of the call like every other name here.
             self.emit(f"c_{name} = PyTuple_GetItem(_self, {offset});", 1)
             self.emit(f"if (!c_{name}) {{ {self.failure()} }}", 1)
-            self.emit(f"Py_IncRef(c_{name});", 1)
+            # Borrowed for the whole call, not taken: the tuple is immutable,
+            # `_self` is the caller's reference to it and the caller keeps the
+            # callable alive for as long as the call runs, and nothing below
+            # ever rebinds a `c_` slot - the one write is this one.
         try:
             if isinstance(node.body, list):
                 for statement in node.body:
