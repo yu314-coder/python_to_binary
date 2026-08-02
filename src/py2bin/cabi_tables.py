@@ -68,6 +68,10 @@ VETTED = [
     # or `False` and every condition then asked `PyObject_IsTrue` what that
     # meant - two calls where the interpreter makes one.
     "PyObject_RichCompareBool",
+    # One pass over the pieces instead of a chain of concatenations. An
+    # f-string built with `+` copies the whole accumulated string at every
+    # piece, which is quadratic in its length.
+    "PyUnicode_Join",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",

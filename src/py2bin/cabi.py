@@ -676,6 +676,7 @@ _PyObject_SetAttr = _bind(
 _PyUnicode_InternFromString = _bind(
     "PyUnicode_InternFromString", _HANDLE, ctypes.c_char_p
 )
+_PyUnicode_Join = _bind("PyUnicode_Join", _HANDLE, _HANDLE, _HANDLE)
 _PyObject_GetAttrString = _bind(
     "PyObject_GetAttrString", _HANDLE, _HANDLE, ctypes.c_char_p
 )
@@ -854,6 +855,10 @@ def PyObject_SetAttr(handle: int, name: int, value: int) -> int:
 
 def PyUnicode_InternFromString(text: bytes | str) -> int:
     return _handle(_PyUnicode_InternFromString(_cstring(text)))
+
+
+def PyUnicode_Join(separator: int, pieces: int) -> int:
+    return _handle(_PyUnicode_Join(separator, pieces))
 
 
 def PyObject_CallNoArgs(callable_handle: int) -> int:

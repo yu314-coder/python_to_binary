@@ -2502,6 +2502,150 @@ class ConstantFoldingTests(unittest.TestCase):
         self.assertNotIn("PyLong_FromString(\"1" + "0" * 60, written)
 
 
+class JoinedStringTests(unittest.TestCase):
+    """f-strings built in one pass rather than by repeated concatenation."""
+
+    _run = CApiEmitTests._run
+
+    def test_the_pieces_are_joined_not_added(self):
+        source = "n = 42\nw = 'x'\nprint(f'a{n}b{w}c')\n"
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("PyUnicode_Join", written)
+        self._run(source, b"a42bxc\n")
+
+    def test_conversions_and_specifiers_still_mean_what_they_mean(self):
+        source = (
+            "v = 1.5\n"
+            "w = 'x'\n"
+            "places = 2\n"
+            "print(f'{v:.3f} {v!r} {w!s} {w!a}')\n"
+            "print(f'{v:.{places}f}')\n"
+        )
+        self._run(source, b"1.500 1.5 x 'x'\n1.50\n")
+
+    def test_an_empty_f_string_is_empty(self):
+        self._run("print(repr(f''), repr(f'{1}'))\n", b"'' '1'\n")
+
+
+class ArgumentBindingTests(unittest.TestCase):
+    """The fast prologue must not change what any call shape does."""
+
+    _run = CApiEmitTests._run
+
+    def test_the_exact_arity_call_binds_positionally(self):
+        source = (
+            "def f(a, b, c):\n"
+            "    return a * 100 + b * 10 + c\n"
+            "print(f(1, 2, 3))\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("!_kwnames && _nargs ==", written)
+        self._run(source, b"123\n")
+
+    def test_keywords_still_reach_the_right_parameters(self):
+        source = (
+            "def f(a, b, c):\n"
+            "    return a * 100 + b * 10 + c\n"
+            "print(f(1, c=3, b=2), f(1, 2, c=3))\n"
+        )
+        self._run(source, b"123 123\n")
+
+    def test_too_few_and_too_many_are_still_refused(self):
+        # Reached through a value: a call that names the function directly has
+        # its arity checked when the program is compiled, so the run-time
+        # refusal - which is what the fast prologue could have skipped - only
+        # happens on the path that goes through the wrapper.
+        source = (
+            "def f(a, b):\n"
+            "    return a + b\n"
+            "g = f\n"
+            "for count in (1, 3):\n"
+            "    try:\n"
+            "        g(*range(count))\n"
+            "    except TypeError:\n"
+            "        print('TypeError')\n"
+        )
+        self._run(source, b"TypeError\nTypeError\n")
+
+    def test_defaults_and_star_args_take_the_general_path(self):
+        source = (
+            "def f(a, b=5, *rest, **named):\n"
+            "    return (a, b, rest, sorted(named))\n"
+            "print(f(1))\n"
+            "print(f(1, 2, 3, x=4))\n"
+        )
+        self._run(source, b"(1, 5, (), [])\n(1, 2, (3,), ['x'])\n")
+
+
+class TextFoldingTests(unittest.TestCase):
+    """Literal text joined once, and only where Python would agree."""
+
+    _run = CApiEmitTests._run
+
+    def test_adjacent_literals_are_folded(self):
+        written = python_to_capi_c("print('a' + 'b')\n", "program.py")
+        self.assertIn('"ab"', written)
+        self._run("print('a' + 'b')\n", b"ab\n")
+
+    def test_repetition_is_folded_either_way_round(self):
+        self._run("print('-' * 4, 3 * 'ab')\n", b"---- ababab\n")
+
+    def test_mismatched_types_are_left_for_run_time(self):
+        # `b'a' + 'b'` is a TypeError; folding it would refuse at compile time
+        # a program that Python refuses at run time, which is a different
+        # program.
+        source = (
+            "try:\n"
+            "    print(b'a' + 'b')\n"
+            "except TypeError:\n"
+            "    print('TypeError')\n"
+        )
+        self._run(source, b"TypeError\n")
+
+    def test_an_enormous_repetition_is_left_for_run_time(self):
+        written = python_to_capi_c("x = 'y' * 100000\n", "program.py")
+        self.assertNotIn("y" * 5000, written)
+
+
+class BuiltinLookupTests(unittest.TestCase):
+    """A builtin the program names is looked up live, not cached."""
+
+    _run = CApiEmitTests._run
+
+    def test_rebinding_a_builtin_is_seen(self):
+        # The name is interned for speed; the lookup itself stays live, so a
+        # program that replaces a builtin gets the replacement.
+        source = (
+            "import builtins\n"
+            "def shout(*a):\n"
+            "    return 'replaced'\n"
+            "print(sorted([2, 1]))\n"
+            "builtins.sorted = shout\n"
+            "print(sorted([2, 1]))\n"
+        )
+        self._run(source, b"[1, 2]\nreplaced\n")
+
+    def test_a_program_may_define_its_own_len_and_str(self):
+        # `len` and `str` go straight to their C entry points, which was done
+        # whether or not the program had bound the name - so a module with its
+        # own `len` printed the length instead of calling its own function.
+        source = (
+            "def len(x):\n"
+            "    return 'shadowed'\n"
+            "print(len([1, 2, 3]))\n"
+            "def go():\n"
+            "    str = lambda v: 'mine'\n"
+            "    return str(5)\n"
+            "print(go())\n"
+        )
+        self._run(source, b"shadowed\nmine\n")
+
+    def test_the_shortcut_still_applies_when_nothing_shadows_it(self):
+        written = python_to_capi_c("print(len('abc'), str(2))\n", "program.py")
+        self.assertIn("PyObject_Size", written)
+        self._run("print(len('abc'), str(2))\n", b"3 2\n")
+
+
 class ConstantPoolTests(unittest.TestCase):
     """Literals built once at start-up rather than at every execution."""
 

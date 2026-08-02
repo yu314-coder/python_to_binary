@@ -51,7 +51,7 @@ The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the
 fast path is off. On a loop it can claim, the same tier is 1.17× faster than
 CPython, and a float loop - which used to be the worst case at 0.32× - is now
-1.07×.
+1.09×.
 
 ## Platforms
 
@@ -524,7 +524,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### The interpreter surface it may use
 
-- A fixed table of 78 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+- A fixed table of 79 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
   `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
@@ -545,7 +545,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
   `PyObject_Vectorcall`, `PyObject_VectorcallMethod`,
   `PyInstanceMethod_New`, `PyRun_SimpleString`, `PySequence_Contains`,
   `PySlice_New`, `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`,
-  `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_DecodeUTF8`, `PyUnicode_InternFromString`,
+  `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_DecodeUTF8`, `PyUnicode_InternFromString`, `PyUnicode_Join`,
   `PyUnicode_FromString`, `Py_DecRef`, `Py_EnterRecursiveCall`,
   `Py_Finalize`, `Py_IncRef`, `Py_Initialize`, `Py_IsInitialized`,
   `Py_LeaveRecursiveCall`
@@ -563,22 +563,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| `while` loop | **4.3 ms** | 5.2 ms | **1.22× faster** |
-| comparisons | **4.7 ms** | 5.7 ms | **1.20× faster** |
-| integer arithmetic | **9.1 ms** | 10.6 ms | **1.17× faster** |
-| float arithmetic | **6.2 ms** | 6.7 ms | **1.08× faster** |
-| attribute read | 7.8 ms | 5.7 ms | 0.72× |
-| dict store | 12.7 ms | 8.8 ms | 0.69× |
-| comprehension | 3.6 ms | 2.4 ms | 0.67× |
-| string concatenation | 29.1 ms | 18.0 ms | 0.62× |
-| direct function call | 15.6 ms | 9.4 ms | 0.60× |
-| list append | 10.1 ms | 6.0 ms | 0.60× |
-| f-string | 34.7 ms | 20.2 ms | 0.58× |
-| subscript | 13.9 ms | 8.0 ms | 0.57× |
-| closure call | 17.9 ms | 9.3 ms | 0.52× |
-| instantiation | 35.4 ms | 17.6 ms | 0.50× |
-| exception raise/catch | 44.9 ms | 22.2 ms | 0.49× |
-| method call | 35.7 ms | 11.1 ms | 0.31× |
+| comparisons | **4.8 ms** | 5.8 ms | **1.21× faster** |
+| `while` loop | **4.5 ms** | 5.3 ms | **1.19× faster** |
+| integer arithmetic | **9.3 ms** | 10.9 ms | **1.17× faster** |
+| float arithmetic | **6.2 ms** | 6.8 ms | **1.09× faster** |
+| string concatenation | 23.1 ms | 18.2 ms | 0.79× |
+| exception raise/catch | 28.7 ms | 22.4 ms | 0.78× |
+| attribute read | 7.7 ms | 5.7 ms | 0.74× |
+| dict store | 13.0 ms | 9.0 ms | 0.69× |
+| comprehension | 3.5 ms | 2.4 ms | 0.68× |
+| f-string | 32.7 ms | 20.4 ms | 0.62× |
+| direct function call | 15.4 ms | 9.5 ms | 0.62× |
+| list append | 10.2 ms | 6.2 ms | 0.61× |
+| subscript | 14.3 ms | 8.2 ms | 0.58× |
+| closure call | 17.1 ms | 9.4 ms | 0.55× |
+| instantiation | 35.3 ms | 18.0 ms | 0.51× |
+| method call | 34.4 ms | 11.3 ms | 0.33× |
 
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
@@ -588,16 +588,26 @@ doing anything less was what made this tier slower than not compiling at all.
 Literal arithmetic is folded before any of it, so `1.5 * 2.0 - 0.5` is the one
 constant it computes to.
 
-**Attribute and method access still lose**, and the reason is worth stating
-plainly rather than leaving as a number. CPython caches a `LOAD_ATTR` against
-the type's version tag and, on a hit, reads the value straight out of the
-instance without a lookup. Doing the same here means reading `ob_type` and its
-version out of the object, and this compiler treats `PyObject` as opaque and
-goes through the documented entry points - which is what lets one binary work
+**Attribute access still loses**, and the reason is worth stating plainly
+rather than leaving as a number. CPython caches a `LOAD_ATTR` against the
+type's version tag and, on a hit, reads the value straight out of the instance
+without a lookup. Doing the same here means reading `ob_type` and its version
+out of the object, and this compiler treats `PyObject` as opaque and goes
+through the documented entry points - which is what lets one binary work
 against a CPython it was not built against. `PyObject_GetAttr` does the full
-generic lookup every time. That is a deliberate trade, not an oversight, and
-until it is revisited a program dominated by attribute traffic will run slower
-here than under the interpreter.
+generic lookup every time. That is a deliberate trade, not an oversight.
+
+**Method calls are the worst row, and the next thing to fix is known.** A
+compiled method is wrapped in `instancemethod`, which binds correctly but does
+not carry `Py_TPFLAGS_METHOD_DESCRIPTOR`. CPython checks that flag in two
+places - when it fetches a method to call it, and when it calls `__init__` -
+and skips allocating a bound method object for anything that has it. Without
+it, every method call and every instantiation allocates one. `PyDescr_NewMethod`
+produces a descriptor that has the flag; adopting it means passing the instance
+as the C `self` argument, which is where a compiled method currently finds the
+values it captured from an enclosing scope. That is a calling-convention change
+rather than a substitution, which is why it is written down here rather than
+done in passing.
 
 **Everything else loses by a factor that tracks how many C-API calls the
 operation costs.** Each one is a real call with the reference-count discipline

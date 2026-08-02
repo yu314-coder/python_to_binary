@@ -74,7 +74,7 @@ The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the
 fast path is off. On a loop it can claim, the same tier is 1.17× faster than
 CPython, and a float loop - which used to be the worst case at 0.32× - is now
-1.07×.
+1.09×.
 
 ## Using it
 
@@ -295,22 +295,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| `while` loop | **4.3 ms** | 5.2 ms | **1.22× faster** |
-| comparisons | **4.7 ms** | 5.7 ms | **1.20× faster** |
-| integer arithmetic | **9.1 ms** | 10.6 ms | **1.17× faster** |
-| float arithmetic | **6.2 ms** | 6.7 ms | **1.08× faster** |
-| attribute read | 7.8 ms | 5.7 ms | 0.72× |
-| dict store | 12.7 ms | 8.8 ms | 0.69× |
-| comprehension | 3.6 ms | 2.4 ms | 0.67× |
-| string concatenation | 29.1 ms | 18.0 ms | 0.62× |
-| direct function call | 15.6 ms | 9.4 ms | 0.60× |
-| list append | 10.1 ms | 6.0 ms | 0.60× |
-| f-string | 34.7 ms | 20.2 ms | 0.58× |
-| subscript | 13.9 ms | 8.0 ms | 0.57× |
-| closure call | 17.9 ms | 9.3 ms | 0.52× |
-| instantiation | 35.4 ms | 17.6 ms | 0.50× |
-| exception raise/catch | 44.9 ms | 22.2 ms | 0.49× |
-| method call | 35.7 ms | 11.1 ms | 0.31× |
+| comparisons | **4.8 ms** | 5.8 ms | **1.21× faster** |
+| `while` loop | **4.5 ms** | 5.3 ms | **1.19× faster** |
+| integer arithmetic | **9.3 ms** | 10.9 ms | **1.17× faster** |
+| float arithmetic | **6.2 ms** | 6.8 ms | **1.09× faster** |
+| string concatenation | 23.1 ms | 18.2 ms | 0.79× |
+| exception raise/catch | 28.7 ms | 22.4 ms | 0.78× |
+| attribute read | 7.7 ms | 5.7 ms | 0.74× |
+| dict store | 13.0 ms | 9.0 ms | 0.69× |
+| comprehension | 3.5 ms | 2.4 ms | 0.68× |
+| f-string | 32.7 ms | 20.4 ms | 0.62× |
+| direct function call | 15.4 ms | 9.5 ms | 0.62× |
+| list append | 10.2 ms | 6.2 ms | 0.61× |
+| subscript | 14.3 ms | 8.2 ms | 0.58× |
+| closure call | 17.1 ms | 9.4 ms | 0.55× |
+| instantiation | 35.3 ms | 18.0 ms | 0.51× |
+| method call | 34.4 ms | 11.3 ms | 0.33× |
 
 **Integer loops win** because a local the analysis picks out is held in a
 machine register, with an overflow check that falls back to unbounded

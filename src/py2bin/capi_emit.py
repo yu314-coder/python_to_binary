@@ -213,6 +213,8 @@ extern int PyObject_SetAttr(PyObject *object, PyObject *name, PyObject *value);
 extern PyObject *PyUnicode_InternFromString(const char *text);
 extern PyObject *PyInstanceMethod_New(PyObject *function);
 extern int PyObject_RichCompareBool(PyObject *a, PyObject *b, int op);
+extern PyObject *PyUnicode_Join(PyObject *separator, PyObject *pieces);
+extern PyObject *PyObject_Repr(PyObject *value);
 extern PyObject *PyObject_VectorcallMethod(
     PyObject *name, PyObject **arguments, long long count,
     PyObject *keyword_names);
@@ -1703,17 +1705,22 @@ class CApiEmitter:
         return target
 
     def joined(self, node: ast.JoinedStr, indent: int) -> str:
-        """An f-string: each piece rendered, then joined by concatenation.
+        """An f-string: every piece rendered, then joined in one pass.
 
         A format specifier goes to `format()`, whose mini-language is the
         interpreter's own, so `{x:.2f}` means here exactly what it means in
         Python rather than a re-implementation of it. `!r` and `!a` are
         `repr()` and `ascii()` for the same reason.
+
+        The pieces used to be added together one at a time, starting from an
+        empty string. That copies everything accumulated so far at every step,
+        so an f-string cost time quadratic in its own length and allocated a
+        string per piece that was thrown away by the next one. `PyUnicode_Join`
+        measures the total first and fills one result, which is what the
+        interpreter does for the same syntax.
         """
 
-        target = self.temporary()
-        self.emit(f'{target} = PyUnicode_FromString("");', indent)
-        self.checked(target, indent)
+        pieces = []
         for piece in node.values:
             if isinstance(piece, ast.Constant):
                 rendered = self.constant(piece, indent)
@@ -1725,13 +1732,24 @@ class CApiEmitter:
                     piece.conversion, "" if piece.format_spec is not None else "str"
                 )
                 if shaped:
-                    caller = self.builtin(shaped, indent)
                     converted = self.temporary()
-                    self.emit(
-                        f"{converted} = PyObject_CallOneArg({caller}, {value});",
-                        indent,
-                    )
-                    self.emit(f"Py_DecRef({caller});", indent)
+                    # `str` and `repr` have their own entry points. Calling the
+                    # *type* instead went through `type.__call__`, which
+                    # allocates and dispatches to reach the same `tp_str` these
+                    # two go straight to - and `{x}` is the commonest piece an
+                    # f-string has.
+                    direct = {"str": "PyObject_Str", "repr": "PyObject_Repr"}
+                    if shaped in direct:
+                        self.emit(
+                            f"{converted} = {direct[shaped]}({value});", indent
+                        )
+                    else:
+                        caller = self.builtin(shaped, indent)
+                        self.emit(
+                            f"{converted} = PyObject_CallOneArg({caller}, {value});",
+                            indent,
+                        )
+                        self.emit(f"Py_DecRef({caller});", indent)
                     self.emit(f"Py_DecRef({value});", indent)
                     self.checked(converted, indent)
                     value = converted
@@ -1762,13 +1780,25 @@ class CApiEmitter:
                     self.checked(rendered, indent)
             else:
                 raise self.fail(node, "unsupported f-string piece")
-            joined = self.temporary()
-            self.emit(f"{joined} = PyNumber_Add({target}, {rendered});", indent)
-            self.emit(f"Py_DecRef({target});", indent)
-            self.emit(f"Py_DecRef({rendered});", indent)
-            self.checked(joined, indent)
-            target = joined
-        return target
+            pieces.append(rendered)
+
+        if not pieces:
+            target = self.temporary()
+            self.emit(f'{target} = PyUnicode_FromString("");', indent)
+            return self.checked(target, indent)
+        gathered = self.temporary()
+        self.emit(f"{gathered} = PyTuple_New({len(pieces)});", indent)
+        self.checked(gathered, indent)
+        for position, rendered in enumerate(pieces):
+            # PyTuple_SetItem steals, which is what to do with a reference
+            # this is finished with anyway.
+            self.emit(f"PyTuple_SetItem({gathered}, {position}, {rendered});", indent)
+        blank = self.pool("", indent)
+        target = self.temporary()
+        self.emit(f"{target} = PyUnicode_Join({blank}, {gathered});", indent)
+        self.emit(f"Py_DecRef({blank});", indent)
+        self.emit(f"Py_DecRef({gathered});", indent)
+        return self.checked(target, indent)
 
     def boolean(self, node: ast.BoolOp, indent: int) -> str:
         """`a and b` - the operand that decides, which is a value and not a
@@ -2136,12 +2166,19 @@ class CApiEmitter:
         The exception classes a raise needs come through here: turning *their*
         failure into a NameError would need a class to build it from, which is
         the lookup that just failed.
+
+        The lookup stays live rather than being cached into a slot the way the
+        emitter's own builtins are. A program may rebind one - `builtins.print
+        = ...` is legal and people do it in tests - and a cached slot would go
+        on answering with what was there at start-up. The *name* is interned,
+        so what is paid each time is a dictionary probe and not the building
+        and hashing of the name to probe with.
         """
 
         target = self.temporary()
         self.emit(
-            f"{target} = PyObject_GetAttrString(_py2bin_builtins, "
-            f"{_c_string(name)});",
+            f"{target} = PyObject_GetAttr(_py2bin_builtins, "
+            f"{self.interned(name)});",
             indent,
         )
         return target
@@ -2300,7 +2337,19 @@ class CApiEmitter:
             target = self.invoke(callable_value, node.args, indent, node.keywords)
             self.emit(f"Py_DecRef({callable_value});", indent)
             return target
-        if node.func.id == "len":
+        # `len(x)` and `str(x)` have entry points of their own, and going
+        # straight to them skips building the callable and dispatching through
+        # it. Only when the program has not bound the name itself, though: a
+        # module that defines its own `len` was still getting `PyObject_Size`,
+        # so it printed the length where CPython printed what the program's
+        # own function returned - a wrong answer, silently.
+        shortcut = (
+            node.func.id not in self.known_functions
+            and self.reference(node.func.id) is None
+            and node.func.id not in self.globals
+            and not any(node.func.id in scope for scope in self.shadowed)
+        )
+        if shortcut and node.func.id == "len":
             if len(node.args) != 1:
                 raise self.fail(node, "len() takes one argument")
             value = self.expression(node.args[0], indent)
@@ -2308,7 +2357,7 @@ class CApiEmitter:
             self.emit(f"{target} = PyLong_FromLongLong(PyObject_Size({value}));", indent)
             self.emit(f"Py_DecRef({value});", indent)
             return self.checked(target, indent)
-        if node.func.id == "str":
+        if shortcut and node.func.id == "str":
             if len(node.args) != 1:
                 raise self.fail(node, "str() takes one argument")
             value = self.expression(node.args[0], indent)
@@ -4855,6 +4904,32 @@ class CApiEmitter:
         keyword_only = tuple(argument.arg for argument in arguments.kwonlyargs)
         defaults = list(arguments.defaults)
         required = len(positional) - len(defaults)
+
+        # The overwhelming majority of calls pass exactly the parameters the
+        # function declares, positionally, with no keywords at all. Recognising
+        # that in one test skips the whole apparatus below - which builds a
+        # dict of the names, looks for each parameter in it, decides whether a
+        # default is needed and counts the extras - and leaves a call binding
+        # its arguments in two instructions each. Every other call falls into
+        # the general path, which is unchanged, so nothing is given up.
+        simple = (
+            not arguments.vararg
+            and not arguments.kwarg
+            and not arguments.kwonlyargs
+            and not defaults
+            and keyword_source is None
+            and positional
+        )
+        closing = 0
+        if simple:
+            self.emit(f"if (!_kwnames && _nargs == {len(positional)}) {{", indent)
+            for offset, name in enumerate(positional):
+                slot = f"{prefix}{name}"
+                self.emit(f"{slot} = _args[{offset}];", indent + 1)
+                self.emit(f"Py_IncRef({slot});", indent + 1)
+            self.emit("} else {", indent)
+            closing = 1
+
         wants_names = bool(
             keyword_source or arguments.kwonlyargs or positional[named_from:]
         )
@@ -4971,6 +5046,8 @@ class CApiEmitter:
             self.emit(
                 f"PyTuple_SetItem({slot}, (long long){counter}, {held});", indent + 1
             )
+            self.emit("}", indent)
+        if closing:
             self.emit("}", indent)
 
     def refuse_extra_arguments(
@@ -5589,9 +5666,6 @@ class CApiEmitter:
             )
         for value, slot in self.pooled.values():
             out.append(f"    {slot} = {self._build_constant(value)};")
-            out.append(
-                f"    if (!{slot}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
-            )
             out.append(
                 f"    if (!{slot}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
             )
