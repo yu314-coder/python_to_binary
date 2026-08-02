@@ -244,6 +244,8 @@ extern PyObject *PyInstanceMethod_New(PyObject *function);
 extern int PyObject_RichCompareBool(PyObject *a, PyObject *b, int op);
 extern PyObject *PyUnicode_Join(PyObject *separator, PyObject *pieces);
 extern PyObject *PyObject_Repr(PyObject *value);
+extern int PySequence_Check(PyObject *object);
+extern PyObject *PySequence_GetItem(PyObject *object, long long index);
 extern PyObject *PyObject_VectorcallMethod(
     PyObject *name, PyObject **arguments, long long count,
     PyObject *keyword_names);
@@ -554,6 +556,11 @@ class CApiEmitter:
         self.path = path
         self.functions: list[_Function] = []
         self.known_functions: dict[str, int] = {}
+        #: Names any walrus in the module assigns. A slot one of these
+        #: names cannot be borrowed from: a walrus is the one thing that
+        #: writes a slot in the middle of an expression, so a borrowed
+        #: earlier read of it could be stale by the time it is used.
+        self.walrus_names: set[str] = set()
         self.current: _Function | None = None
         #: Names bound at module level. They become file-scope statics so a
         #: function body can see them, which is what a Python global is.
@@ -1301,15 +1308,15 @@ class CApiEmitter:
             # call to ask what it meant. Every `if` and every loop test that
             # compares two things comes through here.
             decision = self.temporary_flag()
-            left = self.expression(node.left, indent)
-            right = self.expression(node.comparators[0], indent)
+            left, left_owned = self.operand(node.left, indent)
+            right, right_owned = self.operand(node.comparators[0], indent)
             self.emit(
                 f"{decision} = PyObject_RichCompareBool({left}, {right}, "
                 f"{_COMPARISON_CODES[type(node.ops[0])]});",
                 indent,
             )
-            self.emit(f"Py_DecRef({left});", indent)
-            self.emit(f"Py_DecRef({right});", indent)
+            self.release(left, left_owned, indent)
+            self.release(right, right_owned, indent)
             return decision
         decision = self.temporary_flag()
         test = self.expression(node, indent)
@@ -1526,6 +1533,60 @@ class CApiEmitter:
             return f"g_{self.prefix}{name}"
         return None
 
+    def borrowable(self, node: ast.expr) -> str | None:
+        """The C slot this name can be read from without taking a reference.
+
+        An operand that is a plain local, parameter or capture does not need
+        one. The slot holds a reference for the whole of the function body, and
+        nothing else can write to it: it is a C variable, and the only code
+        that assigns it is this function's own, between statements rather than
+        during an expression. So the value cannot go away while the operation
+        using it runs, and the increment-then-decrement around every read is
+        two memory writes to arrive back where it started.
+
+        A *global* is a different matter and is refused. Anything called while
+        the expression is being evaluated can rebind a module-level name, and
+        the reference the slot held may have been the last one - so a borrowed
+        global can be read after it is freed.
+
+        A walrus in the same function is also refused, because that is the one
+        way a slot *can* be written in the middle of an expression.
+        """
+
+        if self.boxing or self.current is None or self.at_module_level:
+            return None
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            return None
+        name = node.id
+        if self.is_unboxed(name) or self.is_double(name):
+            return None  # read through the narrow form, which may allocate
+        if name in self.current.module_names or name in self.walrus_names:
+            return None
+        if any(name in scope for scope in self.shadowed):
+            return None
+        slot = self.reference(name)
+        if slot is None or slot[:2] not in ("v_", "p_", "c_"):
+            return None
+        if slot.startswith("v_") and name not in self.current.certain:
+            # May never have been written; the test that says so belongs with
+            # the read, and the borrowing path does not emit one.
+            return None
+        return slot
+
+    def operand(self, node: ast.expr, indent: int) -> tuple[str, bool]:
+        """A value for one operation, and whether the caller has to release it."""
+
+        slot = self.borrowable(node)
+        if slot is not None:
+            return slot, False
+        return self.expression(node, indent), True
+
+    def release(self, value: str, owned: bool, indent: int) -> None:
+        """Release what `operand` handed back, if it handed back a reference."""
+
+        if owned:
+            self.emit(f"Py_DecRef({value});", indent)
+
     def name(self, node: ast.Name, indent: int) -> str:
         assert self.current is not None
         if self.is_unboxed(node.id):
@@ -1621,12 +1682,12 @@ class CApiEmitter:
         return self.boxed_binary(node, function, indent)
 
     def boxed_binary(self, node: ast.BinOp, function: str, indent: int) -> str:
-        left = self.expression(node.left, indent)
-        right = self.expression(node.right, indent)
+        left, left_owned = self.operand(node.left, indent)
+        right, right_owned = self.operand(node.right, indent)
         target = self.temporary()
         self.emit(f"{target} = {function}({left}, {right});", indent)
-        self.emit(f"Py_DecRef({left});", indent)
-        self.emit(f"Py_DecRef({right});", indent)
+        self.release(left, left_owned, indent)
+        self.release(right, right_owned, indent)
         return self.checked(target, indent)
 
     def comparison(self, node: ast.Compare, indent: int) -> str:
@@ -1818,8 +1879,20 @@ class CApiEmitter:
             pieces.append(rendered)
 
         if not pieces:
+            return self.pool("", indent)
+        if len(pieces) == 1:
+            # Every piece is already a str - a literal, or the result of
+            # `str`/`repr`/`ascii`/`format`, all of which answer one - so
+            # joining a single piece would answer that piece.
+            return pieces[0]
+        if len(pieces) == 2:
+            # One allocation for the result, where the tuple would be a second.
             target = self.temporary()
-            self.emit(f'{target} = PyUnicode_FromString("");', indent)
+            self.emit(
+                f"{target} = PyNumber_Add({pieces[0]}, {pieces[1]});", indent
+            )
+            self.emit(f"Py_DecRef({pieces[0]});", indent)
+            self.emit(f"Py_DecRef({pieces[1]});", indent)
             return self.checked(target, indent)
         gathered = self.temporary()
         self.emit(f"{gathered} = PyTuple_New({len(pieces)});", indent)
@@ -1919,7 +1992,11 @@ class CApiEmitter:
         """`xs[k]` - the object protocol, so a list, a dict and a string all
         work without any of them being known about here."""
 
-        container = self.expression(node.value, indent)
+        container, owned = self.operand(node.value, indent)
+        if not isinstance(node.slice, ast.Slice) and self.narrow_tree(node.slice):
+            target = self.indexed(container, node.slice, indent)
+            self.release(container, owned, indent)
+            return self.checked(target, indent)
         key = (
             self.slice_object(node.slice, indent)
             if isinstance(node.slice, ast.Slice)
@@ -1927,9 +2004,42 @@ class CApiEmitter:
         )
         target = self.temporary()
         self.emit(f"{target} = PyObject_GetItem({container}, {key});", indent)
-        self.emit(f"Py_DecRef({container});", indent)
+        self.release(container, owned, indent)
         self.emit(f"Py_DecRef({key});", indent)
         return self.checked(target, indent)
+
+    def indexed(self, container: str, index: ast.expr, indent: int) -> str:
+        """`xs[i]` where `i` is already a machine integer.
+
+        Two things are avoided. The index does not become a `PyLong` only to be
+        turned back into a machine integer inside the lookup; and a sequence is
+        asked through the sequence protocol, which goes straight to the item,
+        rather than through the mapping protocol, which first has to decide
+        the subscript is not a slice.
+
+        `PySequence_Check` is what keeps this honest. A dict answers no - `d[0]`
+        is a mapping lookup and stays one - and so does anything else without
+        the protocol, which then takes the ordinary path with a real index
+        object. Nothing is tried and retried: a failure from `PySequence_GetItem`
+        is the failure the program should see, not a signal to try again, which
+        would run a `__getitem__` twice.
+        """
+
+        machine = self.machine_expression(index, indent)
+        target = self.temporary()
+        self.emit(f"if ({machine.flag or '1'} && PySequence_Check({container})) {{", indent)
+        self.emit(
+            f"{target} = PySequence_GetItem({container}, {machine.value});",
+            indent + 1,
+        )
+        self.emit("} else {", indent)
+        with self.boxed_only():
+            key = self.expression(index, indent + 1)
+        self.emit(f"{target} = PyObject_GetItem({container}, {key});", indent + 1)
+        self.emit(f"Py_DecRef({key});", indent + 1)
+        self.emit("}", indent)
+        return target
+
 
     def slice_object(self, node: ast.Slice, indent: int) -> str:
         """`a:b:c` as the slice object the subscript protocol expects."""
@@ -2277,9 +2387,9 @@ class CApiEmitter:
         return outcome
 
     def attribute(self, node: ast.Attribute, indent: int) -> str:
-        value = self.expression(node.value, indent)
+        value, owned = self.operand(node.value, indent)
         target = self.get_attr(value, node.attr, indent)
-        self.emit(f"Py_DecRef({value});", indent)
+        self.release(value, owned, indent)
         return self.checked(target, indent)
 
     def identity(self, node: ast.Compare, indent: int) -> str:
@@ -2596,21 +2706,21 @@ class CApiEmitter:
         """
 
         assert isinstance(node.func, ast.Attribute)
-        owner = self.expression(node.func.value, indent)
-        values = [self.expression(item, indent) for item in node.args]
-        array = self.argument_array(len(values) + 1)
+        owner, owner_owned = self.operand(node.func.value, indent)
+        held = [self.operand(item, indent) for item in node.args]
+        array = self.argument_array(len(held) + 1)
         self.emit(f"{array}[0] = {owner};", indent)
-        for position, value in enumerate(values, start=1):
+        for position, (value, _) in enumerate(held, start=1):
             self.emit(f"{array}[{position}] = {value};", indent)
         target = self.temporary()
         self.emit(
             f"{target} = PyObject_VectorcallMethod("
-            f"{self.interned(node.func.attr)}, {array}, {len(values) + 1}LL, 0);",
+            f"{self.interned(node.func.attr)}, {array}, {len(held) + 1}LL, 0);",
             indent,
         )
-        self.emit(f"Py_DecRef({owner});", indent)
-        for value in values:
-            self.emit(f"Py_DecRef({value});", indent)
+        self.release(owner, owner_owned, indent)
+        for value, owned in held:
+            self.release(value, owned, indent)
         return self.checked(target, indent)
 
     def invoke(
@@ -2643,7 +2753,8 @@ class CApiEmitter:
             )
             self.emit(f"Py_DecRef({argument});", indent)
             return self.checked(target, indent)
-        values = [self.expression(item, indent) for item in args]
+        held = [self.operand(item, indent) for item in args]
+        values = [value for value, _ in held]
         # A plain array rather than a tuple. Building a tuple meant an
         # allocation, a fill and a free for every call a program makes, which
         # measured four times slower than the same call under the interpreter -
@@ -2658,8 +2769,8 @@ class CApiEmitter:
             f"{len(values)}LL, 0);",
             indent,
         )
-        for value in values:
-            self.emit(f"Py_DecRef({value});", indent)
+        for value, owned in held:
+            self.release(value, owned, indent)
         return self.checked(target, indent)
 
     def argument_array(self, arity: int) -> str:
@@ -5411,6 +5522,12 @@ class CApiEmitter:
             ) from None
         self.globals = set()
         self.known_functions = {}
+        self.walrus_names = {
+            node.target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.NamedExpr)
+            and isinstance(node.target, ast.Name)
+        }
         self.certain_globals = set()
         self.shadowed_builtins = _shadowed_builtins(tree)
         # What `__package__` would hold. A package's `__init__` is in itself;

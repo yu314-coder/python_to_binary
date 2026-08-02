@@ -524,7 +524,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### The interpreter surface it may use
 
-- A fixed table of 79 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+- A fixed table of 81 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
   `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
@@ -543,7 +543,7 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
   `PyObject_SetAttr`, `PyObject_SetAttrString`,
   `PyObject_SetItem`, `PyObject_Size`, `PyObject_Str`,
   `PyObject_Vectorcall`, `PyObject_VectorcallMethod`,
-  `PyInstanceMethod_New`, `PyRun_SimpleString`, `PySequence_Contains`,
+  `PyInstanceMethod_New`, `PyRun_SimpleString`, `PySequence_Check`, `PySequence_Contains`, `PySequence_GetItem`,
   `PySlice_New`, `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`,
   `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_DecodeUTF8`, `PyUnicode_InternFromString`, `PyUnicode_Join`,
   `PyUnicode_FromString`, `Py_DecRef`, `Py_EnterRecursiveCall`,
@@ -563,22 +563,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.8 ms** | 9.9 ms | **2.05× faster** |
-| `while` loop | **4.8 ms** | 5.5 ms | **1.15× faster** |
-| comparisons | **5.2 ms** | 5.9 ms | **1.14× faster** |
-| integer arithmetic | **10.0 ms** | 11.1 ms | **1.12× faster** |
-| float arithmetic | **6.7 ms** | 6.9 ms | **1.03× faster** |
+| direct function call | **4.7 ms** | 9.7 ms | **2.05× faster** |
+| `while` loop | **4.6 ms** | 5.4 ms | **1.17× faster** |
+| comparisons | **5.0 ms** | 5.8 ms | **1.16× faster** |
+| integer arithmetic | **9.5 ms** | 10.9 ms | **1.14× faster** |
+| float arithmetic | **6.6 ms** | 6.9 ms | **1.05× faster** |
+| attribute read | 7.1 ms | 5.8 ms | 0.81× |
+| string concatenation | 23.9 ms | 18.7 ms | 0.78× |
 | exception raise/catch | 29.8 ms | 23.0 ms | 0.77× |
-| string concatenation | 24.2 ms | 18.5 ms | 0.77× |
-| attribute read | 7.9 ms | 5.9 ms | 0.75× |
-| dict store | 13.5 ms | 9.4 ms | 0.69× |
+| dict store | 13.4 ms | 9.4 ms | 0.70× |
 | comprehension | 3.7 ms | 2.5 ms | 0.68× |
-| f-string | 33.2 ms | 21.0 ms | 0.63× |
-| list append | 10.7 ms | 6.4 ms | 0.60× |
-| subscript | 14.9 ms | 8.4 ms | 0.57× |
-| closure call | 17.9 ms | 9.7 ms | 0.54× |
-| instantiation | 36.5 ms | 18.6 ms | 0.51× |
-| method call | 35.9 ms | 11.6 ms | 0.32× |
+| subscript | 12.6 ms | 8.3 ms | 0.66× |
+| closure call | 14.9 ms | 9.5 ms | 0.64× |
+| f-string | 32.9 ms | 20.9 ms | 0.64× |
+| list append | 10.6 ms | 6.4 ms | 0.60× |
+| instantiation | 36.3 ms | 18.5 ms | 0.51× |
+| method call | 34.9 ms | 11.6 ms | 0.33× |
 
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
@@ -587,6 +587,15 @@ leaves the word. That is what CPython's specialising interpreter does, and
 doing anything less was what made this tier slower than not compiling at all.
 Literal arithmetic is folded before any of it, so `1.5 * 2.0 - 0.5` is the one
 constant it computes to.
+
+**An operand that is a local is read without taking a reference.** A local, a
+parameter and a capture are C variables this function alone writes, and each
+holds its reference for the whole body, so the increment and decrement around
+every read were two memory writes to arrive back where they started. A
+*global* is not borrowed: anything called while the expression runs can rebind
+a module-level name, and the reference the slot held may have been the last
+one. Nor is a name any `:=` assigns, that being the one thing which writes a
+slot in the middle of an expression.
 
 **Attribute access still loses**, and the reason is worth stating plainly
 rather than leaving as a number. CPython caches a `LOAD_ATTR` against the

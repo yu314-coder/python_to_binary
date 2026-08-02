@@ -72,6 +72,12 @@ VETTED = [
     # f-string built with `+` copies the whole accumulated string at every
     # piece, which is quadratic in its length.
     "PyUnicode_Join",
+    # A sequence index without an integer object to hold it. `xs[i]` had to
+    # build a PyLong for the index and then go through the mapping protocol,
+    # which handles slices; these two go to the sequence protocol with a
+    # machine integer. `PySequence_Check` is what keeps a dict out of it -
+    # `d[0]` is a mapping lookup and must stay one.
+    "PySequence_Check", "PySequence_GetItem",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",

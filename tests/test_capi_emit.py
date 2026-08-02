@@ -2577,6 +2577,147 @@ class ArgumentBindingTests(unittest.TestCase):
         self._run(source, b"(1, 5, (), [])\n(1, 2, (3,), ['x'])\n")
 
 
+class BorrowedOperandTests(unittest.TestCase):
+    """Operands read without taking a reference, where that is sound.
+
+    A local, parameter or capture is a C variable this function alone writes,
+    and it holds its reference for the whole body - so the increment and
+    decrement around every read are two writes to arrive back where they
+    started. These cover the cases where that reasoning does *not* hold.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_a_local_is_borrowed(self):
+        source = (
+            "def go():\n"
+            "    a = [1]\n"
+            "    b = [2]\n"
+            "    return a + b\n"
+            "print(go())\n"
+        )
+        self._run(source, b"[1, 2]\n")
+
+    def test_a_global_rebound_during_the_expression_is_not_borrowed(self):
+        # The call in the middle drops the module's last reference to `data`.
+        # A borrowed read would be looking at freed memory; an owned one keeps
+        # it alive for the operation, which is why globals are refused.
+        source = (
+            "data = [1, 2, 3]\n"
+            "def clear():\n"
+            "    global data\n"
+            "    data = None\n"
+            "    return [9]\n"
+            "def go():\n"
+            "    return data + clear()\n"
+            "print(go(), data)\n"
+        )
+        self._run(source, b"[1, 2, 3, 9] None\n")
+
+    def test_a_walrus_rebinding_mid_expression_is_not_borrowed(self):
+        # A walrus is the one thing that writes a slot in the middle of an
+        # expression, so a name any walrus assigns is never borrowed.
+        source = (
+            "def go():\n"
+            "    x = [1]\n"
+            "    return x + (x := [2]) + x\n"
+            "print(go())\n"
+        )
+        self._run(source, b"[1, 2, 2]\n")
+
+    def test_an_attribute_owner_that_is_a_call_is_still_released(self):
+        source = (
+            "class C:\n"
+            "    def __init__(self):\n"
+            "        self.v = 5\n"
+            "def make():\n"
+            "    return C()\n"
+            "print(make().v)\n"
+        )
+        self._run(source, b"5\n")
+
+
+class IndexedSubscriptTests(unittest.TestCase):
+    """`xs[i]` with a machine integer index, without an index object."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_sequence_is_indexed_without_boxing(self):
+        source = (
+            "def go():\n"
+            "    xs = [10, 20, 30]\n"
+            "    i = 0\n"
+            "    t = 0\n"
+            "    while i < 3:\n"
+            "        t = t + xs[i]\n"
+            "        i = i + 1\n"
+            "    return t\n"
+            "print(go())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("PySequence_GetItem", written)
+        self._run(source, b"60\n")
+
+    def test_a_dict_keeps_the_mapping_lookup(self):
+        # `d[0]` is a mapping lookup and must stay one: the sequence protocol
+        # would not find the key at all.
+        source = (
+            "def go():\n"
+            "    d = {0: 'a', 1: 'b'}\n"
+            "    i = 0\n"
+            "    out = []\n"
+            "    while i < 2:\n"
+            "        out.append(d[i])\n"
+            "        i = i + 1\n"
+            "    return out\n"
+            "print(go())\n"
+        )
+        self._run(source, b"['a', 'b']\n")
+
+    def test_strings_tuples_and_negative_indices_agree(self):
+        source = (
+            "def go():\n"
+            "    s = 'hello'\n"
+            "    t = (7, 8, 9)\n"
+            "    xs = [1, 2, 3]\n"
+            "    one = 1\n"
+            "    return (s[one], t[one], xs[-one])\n"
+            "print(go())\n"
+        )
+        self._run(source, b"('e', 8, 3)\n")
+
+    def test_a_getitem_with_an_effect_runs_once(self):
+        # Trying the sequence protocol and retrying on failure would run the
+        # program's `__getitem__` twice. It is guarded, not retried.
+        source = (
+            "class Odd:\n"
+            "    def __getitem__(self, k):\n"
+            "        print('getitem')\n"
+            "        raise TypeError('nope')\n"
+            "def go():\n"
+            "    i = 0\n"
+            "    try:\n"
+            "        return Odd()[i]\n"
+            "    except TypeError:\n"
+            "        return 'caught'\n"
+            "print(go())\n"
+        )
+        self._run(source, b"getitem\ncaught\n")
+
+    def test_an_index_out_of_range_still_raises(self):
+        source = (
+            "def go():\n"
+            "    xs = [1]\n"
+            "    i = 5\n"
+            "    try:\n"
+            "        return xs[i]\n"
+            "    except IndexError:\n"
+            "        return 'IndexError'\n"
+            "print(go())\n"
+        )
+        self._run(source, b"IndexError\n")
+
+
 class InliningTests(unittest.TestCase):
     """Small module-level functions written out where they are called.
 
