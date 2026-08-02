@@ -604,6 +604,21 @@ a module-level name, and the reference the slot held may have been the last
 one. Nor is a name any `:=` assigns, that being the one thing which writes a
 slot in the middle of an expression.
 
+**The one mechanism that could close this was looked for and found, and it is
+still not enough.** An inline cache needs two halves: something to invalidate
+it when a class changes, and a cheap way to check that the object in hand is
+the type the cache was filled for. `PyType_AddWatcher` and `PyType_Watch`
+(3.12) supply the first, through the documented API, with no object layout
+involved. The second does not exist: there is no public way to read an
+object's type without taking a reference to it. `PyObject_Type` is an
+out-of-line call plus a reference count, and that is already more than a
+guarded fast path saves - measured twice, once on `list.append`, where adding
+the guard made it seventeen per cent *slower*, because a builtin method
+already reaches CPython's fast path. Nuitka does specialise these, and can,
+because it includes `Python.h` and reads `ob_type` directly. That is the trade
+this compiler makes the other way, and it is why one binary here runs against
+a CPython it was not built against.
+
 **Attribute access still loses**, and the reason is worth stating plainly
 rather than leaving as a number. CPython caches a `LOAD_ATTR` against the
 type's version tag and, on a hit, reads the value straight out of the instance
