@@ -78,6 +78,10 @@ VETTED = [
     # machine integer. `PySequence_Check` is what keeps a dict out of it -
     # `d[0]` is a mapping lookup and must stay one.
     "PySequence_Check", "PySequence_GetItem",
+    # Fill a list made at its final length. Steals the reference, like its
+    # tuple sibling, and never grows the storage - which is what a counted
+    # comprehension wants, knowing its item count before the first item.
+    "PyList_SetItem",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",

@@ -524,13 +524,13 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### The interpreter surface it may use
 
-- A fixed table of 81 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+- A fixed table of 82 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
   `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
   `PyFile_WriteString`, `PyFloat_AsDouble`, `PyFloat_FromDouble`,
   `PyImport_AddModule`, `PyImport_ImportModule`, `PyIter_Next`,
-  `PyList_Append`, `PyList_New`, `PyLong_AsLongLong`, `PyLong_FromLongLong`,
+  `PyList_Append`, `PyList_New`, `PyList_SetItem`, `PyLong_AsLongLong`, `PyLong_FromLongLong`,
   `PyLong_FromString`, `PyNumber_Add`, `PyNumber_And`,
   `PyNumber_FloorDivide`, `PyNumber_Invert`, `PyNumber_Lshift`,
   `PyNumber_Multiply`, `PyNumber_Negative`, `PyNumber_Or`,
@@ -563,22 +563,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.5 ms** | 9.4 ms | **2.07× faster** |
-| comparisons | **4.7 ms** | 5.6 ms | **1.19× faster** |
+| direct function call | **4.3 ms** | 9.2 ms | **2.16× faster** |
+| comparisons | **4.6 ms** | 5.6 ms | **1.21× faster** |
+| integer arithmetic | **8.8 ms** | 10.4 ms | **1.18× faster** |
 | `while` loop | **4.4 ms** | 5.2 ms | **1.18× faster** |
-| integer arithmetic | **9.1 ms** | 10.6 ms | **1.17× faster** |
-| float arithmetic | **6.1 ms** | 6.7 ms | **1.09× faster** |
-| attribute read | 6.9 ms | 5.7 ms | 0.82× |
-| exception raise/catch | 28.0 ms | 22.1 ms | 0.79× |
-| string concatenation | 23.1 ms | 18.1 ms | 0.78× |
-| dict store | 12.7 ms | 8.8 ms | 0.69× |
-| subscript | 11.9 ms | 8.1 ms | 0.68× |
-| comprehension | 3.6 ms | 2.4 ms | 0.65× |
-| closure call | 14.2 ms | 9.2 ms | 0.65× |
-| f-string | 32.2 ms | 20.3 ms | 0.63× |
-| list append | 10.2 ms | 6.1 ms | 0.60× |
-| instantiation | 34.7 ms | 17.7 ms | 0.51× |
-| method call | 27.8 ms | 11.0 ms | 0.39× |
+| float arithmetic | **6.0 ms** | 6.6 ms | **1.09× faster** |
+| attribute read | 6.8 ms | 5.6 ms | 0.82× |
+| exception raise/catch | 27.4 ms | 21.8 ms | 0.80× |
+| string concatenation | 22.8 ms | 17.7 ms | 0.78× |
+| comprehension | 3.9 ms | 3.0 ms | 0.77× |
+| dict store | 12.4 ms | 8.5 ms | 0.69× |
+| subscript | 11.7 ms | 7.9 ms | 0.68× |
+| closure call | 13.9 ms | 9.0 ms | 0.65× |
+| f-string | 31.4 ms | 19.9 ms | 0.63× |
+| list append | 10.0 ms | 6.0 ms | 0.60× |
+| instantiation | 34.3 ms | 17.5 ms | 0.51× |
+| method call | 27.3 ms | 11.0 ms | 0.40× |
 
 **Arithmetic loops win** because a local the analysis picks out is held in a
 machine register - a `long long` for an integer, a `double` for a float - with
@@ -594,6 +594,16 @@ the flag saying "this is module level" was still set inside it - so the
 register analysis and the borrowing below were switched off for every method
 in every class. Turning them on there is worth more than either was worth
 anywhere else.
+
+**A comprehension over a `range` counts in a register.** Its target becomes a
+name of the emitter's own, registered with the integer analysis, so `x * 2` in
+the element is machine arithmetic boxed once, by the store; and with no filter
+the list is made at its final length and filled with `PyList_SetItem`, which
+steals the reference and never grows the storage. `[x for x in it]` - the
+identity - is `list(it)` to the letter and is emitted as exactly that call.
+The comprehension row below is the general shape, not the identity: measuring
+the shape the optimisation is best at and calling it "comprehension" would be
+the benchmark measuring itself.
 
 **An operand that is a local is read without taking a reference.** A local, a
 parameter and a capture are C variables this function alone writes, and each

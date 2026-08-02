@@ -301,6 +301,7 @@ extern void Py_LeaveRecursiveCall(void);
 extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
+extern int PyList_SetItem(PyObject *list, long long index, PyObject *value);
 extern int PyList_Append(PyObject *list, PyObject *value);
 extern PyObject *PyObject_GetIter(PyObject *object);
 extern PyObject *PyIter_Next(PyObject *iterator);
@@ -566,6 +567,17 @@ class CApiEmitter:
         #: writes a slot in the middle of an expression, so a borrowed
         #: earlier read of it could be stale by the time it is used.
         self.walrus_names: set[str] = set()
+        #: Serial for the unique spelling a counted comprehension gives
+        #: its target. Never wound back: two comprehensions in one
+        #: function must not share slots.
+        self.comp_serial = 0
+        #: The unique spellings counted comprehensions made up. These are the
+        #: emitter's own names: nothing else binds them, they have no module
+        #: storage even at module level, and no scope can shadow them - so
+        #: `is_unboxed` says yes to them wherever they appear, where a name
+        #: the program wrote is refused at module level because its storage
+        #: there is the module's `g_` slot.
+        self.synthetic: set[str] = set()
         self.current: _Function | None = None
         #: Names bound at module level. They become file-scope statics so a
         #: function body can see them, which is what a Python global is.
@@ -812,6 +824,9 @@ class CApiEmitter:
 
         if self.current is None or name not in self.current.unboxed:
             return False
+        if name in self.synthetic:
+            # The emitter's own spelling: no module storage, no shadowing.
+            return True
         # A name whose storage is the module's is not this body's to hold in
         # registers, whatever the analysis said: every other reference to it
         # goes to `g_`, and two storages for one name is one too many.
@@ -1567,8 +1582,12 @@ class CApiEmitter:
             return None  # read through the narrow form, which may allocate
         if name in self.current.module_names or name in self.walrus_names:
             return None
-        if any(name in scope for scope in self.shadowed):
-            return None
+        for scope in reversed(self.shadowed):
+            # A comprehension target lives in a slot of its own, written by
+            # the loop between iterations and read only after it is bound -
+            # the same discipline as a local, so it is borrowed like one.
+            if name in scope:
+                return scope[name]
         slot = self.reference(name)
         if slot is None or slot[:2] not in ("v_", "p_", "c_"):
             return None
@@ -2108,6 +2127,41 @@ class CApiEmitter:
         immediately, which is the case the trade is made for.
         """
 
+        first = node.generators[0]
+        identity = (
+            len(node.generators) == 1
+            and not first.is_async
+            and not first.ifs
+            and isinstance(first.target, ast.Name)
+            and not isinstance(node, ast.DictComp)
+            and isinstance(node.elt, ast.Name)
+            and node.elt.id == first.target.id
+        )
+        if identity:
+            # `[x for x in it]` is `list(it)` to the letter - same iteration,
+            # same errors, same result - and `list(it)` runs the whole loop
+            # inside the interpreter with a length hint, where the written-out
+            # loop pays a `PyIter_Next` and an append per item. The name
+            # `list` is not consulted: the comprehension's meaning does not
+            # involve it, so the genuine type fetched at start-up is exactly
+            # right even for a program that rebinds the builtin.
+            source = self.expression(first.iter, indent)
+            target = self.temporary()
+            if isinstance(node, ast.GeneratorExp):
+                # An iterator is what a generator expression is; handing one
+                # straight over is nearer the real thing than gathering.
+                self.emit(f"{target} = PyObject_GetIter({source});", indent)
+            else:
+                maker = self.builtin(
+                    "set" if isinstance(node, ast.SetComp) else "list", indent
+                )
+                self.emit(
+                    f"{target} = PyObject_CallOneArg({maker}, {source});", indent
+                )
+                self.emit(f"Py_DecRef({maker});", indent)
+            self.emit(f"Py_DecRef({source});", indent)
+            return self.checked(target, indent)
+
         target = self.temporary()
         if isinstance(node, ast.DictComp):
             # Built as a dict from the start; there is no list shape a
@@ -2118,7 +2172,8 @@ class CApiEmitter:
             return target
         self.emit(f"{target} = PyList_New(0LL);", indent)
         self.checked(target, indent)
-        self.comprehension_clause(node, 0, target, indent)
+        if not self.counted_comprehension(node, target, indent):
+            self.comprehension_clause(node, 0, target, indent)
         if isinstance(node, ast.GeneratorExp):
             # Gathered eagerly, as the docstring says - but handed back as an
             # *iterator*, because that is what a generator expression is. A
@@ -2139,6 +2194,189 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({target});", indent)
             return self.checked(gathered, indent)
         return target
+
+    def counted_comprehension(self, node, target: str, indent: int) -> bool:
+        """`[e for x in range(...)]` counted in a register, like a `for` is.
+
+        The written-out comprehension loop paid `PyIter_Next` and an integer
+        object per item even over a `range`, and - worse - its target was an
+        object, so arithmetic on it in the element was boxed too. Here the
+        target becomes a function-level name of its own, spelled uniquely and
+        registered with the integer analysis, so `x * 2` in the element runs
+        in machine registers and is boxed once, by the append.
+
+        Answers False when the shape is not claimed, and emits nothing then.
+        Anything that introduces a scope inside the element - a lambda, a
+        nested comprehension, a walrus - declines: the rewrite renames the
+        target inside the element, and a nested scope of the same spelling is
+        a different name.
+        """
+
+        if isinstance(node, ast.DictComp) or len(node.generators) != 1:
+            return False
+        clause = node.generators[0]
+        if clause.is_async or not isinstance(clause.target, ast.Name):
+            return False
+        bounds = narrow_range(clause.iter)
+        if bounds is None:
+            return False
+        pieces = [node.elt, *clause.ifs]
+        for piece in pieces:
+            for inner in ast.walk(piece):
+                if isinstance(
+                    inner,
+                    (
+                        ast.Lambda, ast.NamedExpr, ast.ListComp, ast.SetComp,
+                        ast.DictComp, ast.GeneratorExp, ast.Await,
+                        ast.Yield, ast.YieldFrom,
+                    ),
+                ):
+                    return False
+        assert self.current is not None
+        name = clause.target.id
+        self.comp_serial += 1
+        unique = f"_py2bin_c{self.comp_serial}_{name}"
+
+        class _Rename(ast.NodeTransformer):
+            def visit_Name(self, found: ast.Name) -> ast.AST:
+                if found.id == name:
+                    found = ast.copy_location(
+                        ast.Name(id=unique, ctx=found.ctx), found
+                    )
+                return found
+
+        import copy as _copy
+
+        renamed = [
+            ast.fix_missing_locations(_Rename().visit(_copy.deepcopy(piece)))
+            for piece in pieces
+        ]
+        element, conditions = renamed[0], renamed[1:]
+        self.current.unboxed.add(unique)
+        self.synthetic.add(unique)
+        # The loop binds it before anything reads it, so no unbound test.
+        self.current.certain.add(unique)
+        held, obj, state = self.narrow_slots(unique)
+
+        spelled = [self.expression(argument, indent) for argument in bounds]
+        start, stop, step = (
+            self.machine_slot(), self.machine_slot(), self.machine_slot()
+        )
+        counting = self.temporary_flag()
+        self.emit(f"{counting} = 1;", indent)
+        order = (
+            [(start, spelled[0]), (stop, spelled[1])]
+            if len(spelled) > 1
+            else [(stop, spelled[0])]
+        )
+        if len(spelled) > 2:
+            order.append((step, spelled[2]))
+        if len(spelled) < 2:
+            self.emit(f"{start} = 0;", indent)
+        if len(spelled) < 3:
+            self.emit(f"{step} = 1;", indent)
+        for slot, value in order:
+            self.emit(f"{slot} = PyLong_AsLongLong({value});", indent)
+            self.emit(
+                f"if ({slot} == -1 && PyErr_Occurred()) "
+                f"{{ PyErr_Clear(); {counting} = 0; }}",
+                indent,
+            )
+        self.emit(f"if ({step} == 0) {counting} = 0;", indent)
+        for slot in (start, stop, step):
+            self.emit(
+                f"if ({slot} > {_MACHINE_LIMIT} || {slot} < -{_MACHINE_LIMIT}) "
+                f"{counting} = 0;",
+                indent,
+            )
+        iterator = self.temporary()
+        self.emit(f"{iterator} = 0;", indent)
+        self.emit(f"if (!{counting}) {{", indent)
+        built = self.call_range(spelled, indent + 1)
+        self.emit(f"{iterator} = PyObject_GetIter({built});", indent + 1)
+        self.emit(f"Py_DecRef({built});", indent + 1)
+        self.emit(f"if (!{iterator}) {{ {self.failure()} }}", indent + 1)
+        self.emit("}", indent)
+        for value in spelled:
+            self.emit(f"Py_DecRef({value});", indent)
+        filling = None
+        if not conditions:
+            # With no filter, the counting arm knows how many items are coming
+            # and fills a list made at that length: `PyList_SetItem` steals
+            # the reference and never grows the storage, where an append pays
+            # for both. The count is what `len(range(...))` answers, and zero
+            # for a range that runs the wrong way.
+            length = self.machine_slot()
+            filling = self.machine_slot()
+            self.emit(f"{filling} = -1;", indent)
+            self.emit(f"if ({counting}) {{", indent)
+            self.emit(f"if ({step} > 0) {{", indent + 1)
+            self.emit(
+                f"{length} = {stop} > {start} "
+                f"? ({stop} - {start} + {step} - 1) / {step} : 0;",
+                indent + 2,
+            )
+            self.emit("} else {", indent + 1)
+            self.emit(
+                f"{length} = {start} > {stop} "
+                f"? ({start} - {stop} - {step} - 1) / (-{step}) : 0;",
+                indent + 2,
+            )
+            self.emit("}", indent + 1)
+            self.emit(f"Py_DecRef({target});", indent + 1)
+            self.emit(f"{target} = PyList_New({length});", indent + 1)
+            self.emit(f"if (!{target}) {{ {self.failure()} }}", indent + 1)
+            self.emit(f"{filling} = 0;", indent + 1)
+            self.emit("}", indent)
+        counter = self.machine_slot()
+        self.emit(f"{counter} = {start};", indent)
+        item = self.temporary()
+        self.emit("while (1) {", indent)
+        self.emit(f"if ({counting}) {{", indent + 1)
+        self.emit(f"if ({step} > 0) {{", indent + 2)
+        self.emit(f"if ({counter} >= {stop}) break;", indent + 3)
+        self.emit("} else {", indent + 2)
+        self.emit(f"if ({counter} <= {stop}) break;", indent + 3)
+        self.emit("}", indent + 2)
+        self.emit(f"if ({obj}) {{ Py_DecRef({obj}); {obj} = 0; }}", indent + 2)
+        self.emit(f"{held} = {counter};", indent + 2)
+        self.emit(f"{state} = 1;", indent + 2)
+        self.emit(f"{counter} = {counter} + {step};", indent + 2)
+        self.emit("} else {", indent + 1)
+        self.emit(f"{item} = PyIter_Next({iterator});", indent + 2)
+        self.emit(
+            f"if (!{item}) {{ if (PyErr_Occurred()) {{ {self.failure()} }} break; }}",
+            indent + 2,
+        )
+        self.store_object(unique, item, indent + 2)
+        self.emit("}", indent + 1)
+        inner = indent + 1
+        closing = 0
+        for condition in conditions:
+            decision = self.truth(condition, inner)
+            self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", inner)
+            self.emit(f"if ({decision}) {{", inner)
+            inner += 1
+            closing += 1
+        value = self.expression(element, inner)
+        if filling is not None:
+            # Stolen by `PyList_SetItem`, so nothing to give back on that arm.
+            self.emit(f"if ({filling} >= 0) {{", inner)
+            self.emit(f"PyList_SetItem({target}, {filling}, {value});", inner + 1)
+            self.emit(f"{filling} = {filling} + 1;", inner + 1)
+            self.emit("} else {", inner)
+            self.emit(f"PyList_Append({target}, {value});", inner + 1)
+            self.emit(f"Py_DecRef({value});", inner + 1)
+            self.emit("}", inner)
+        else:
+            self.emit(f"PyList_Append({target}, {value});", inner)
+            self.emit(f"Py_DecRef({value});", inner)
+        for _ in range(closing):
+            inner -= 1
+            self.emit("}", inner)
+        self.emit("}", indent)
+        self.emit(f"if ({iterator}) Py_DecRef({iterator});", indent)
+        return True
 
     def comprehension_clause(self, node, position: int, target: str, indent: int) -> None:
         """One `for` clause of a comprehension, then whatever follows it."""

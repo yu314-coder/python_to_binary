@@ -2700,6 +2700,68 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class CountedComprehensionTests(unittest.TestCase):
+    """Comprehensions over a `range`, counted in a register.
+
+    The written-out loop paid `PyIter_Next` and an integer object per item;
+    now the target is a synthetic unboxed name, the element's arithmetic runs
+    in machine registers, and - with no filter - the list is made at its final
+    length and filled with `PyList_SetItem`, which steals the reference.
+    """
+
+    _run = CApiEmitTests._run
+
+    def test_the_element_runs_in_registers_and_the_list_is_preallocated(self):
+        source = "print([x * 2 for x in range(5)])\n"
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("PyList_SetItem", written)
+        self.assertIn("n__py2bin_c", written)  # the synthetic machine slot
+        self._run(source, b"[0, 2, 4, 6, 8]\n")
+
+    def test_an_identity_comprehension_is_the_constructor(self):
+        source = "print([x for x in range(4)], sorted({y for y in [2, 1, 2]}))\n"
+        self._run(source, b"[0, 1, 2, 3] [1, 2]\n")
+
+    def test_negative_steps_and_empty_ranges(self):
+        source = (
+            "print([x for x in range(10, 2, -3)])\n"
+            "print([x + 1 for x in range(3, 3)], [x for x in range(0)])\n"
+        )
+        self._run(source, b"[10, 7, 4]\n[] []\n")
+
+    def test_a_filter_keeps_the_growing_list(self):
+        # With an `if`, the final length is unknown, so the list grows - and
+        # the answer is the same either way.
+        source = "print([w for w in range(6) if w % 2 == 0])\n"
+        self._run(source, b"[0, 2, 4]\n")
+
+    def test_bounds_wider_than_a_word_decline_to_the_iterator(self):
+        source = (
+            "big = 2 ** 70\n"
+            "print(len([x for x in range(big, big + 3)]))\n"
+        )
+        self._run(source, b"3\n")
+
+    def test_an_element_that_raises_leaves_the_exception(self):
+        # The preallocated list has empty slots past the failure point, and
+        # tearing it down must not touch them.
+        source = (
+            "def boom(v):\n"
+            "    if v == 2:\n"
+            "        raise ValueError('mid')\n"
+            "    return v\n"
+            "try:\n"
+            "    [boom(x) for x in range(5)]\n"
+            "except ValueError as e:\n"
+            "    print('caught', e)\n"
+        )
+        self._run(source, b"caught mid\n")
+
+    def test_the_enclosing_name_is_untouched(self):
+        source = "x = 'outer'\nprint([x * x for x in range(3)], x)\n"
+        self._run(source, b"[0, 1, 4] outer\n")
+
+
 class IndexedSubscriptTests(unittest.TestCase):
     """`xs[i]` with a machine integer index, without an index object."""
 

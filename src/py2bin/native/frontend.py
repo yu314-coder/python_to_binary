@@ -311,6 +311,7 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "PyUnicode_Join": ("PyUnicode_Join", ("ptr", "ptr")),
     "PySequence_Check": ("PySequence_Check", ("ptr",)),
     "PySequence_GetItem": ("PySequence_GetItem", ("ptr", "int")),
+    "PyList_SetItem": ("PyList_SetItem", ("ptr", "int", "ptr")),
     "PyObject_CallNoArgs": ("PyObject_CallNoArgs", ("ptr",)),
     "PyObject_CallOneArg": ("PyObject_CallOneArg", ("ptr", "ptr")),
     # Calls of any arity: the arguments go in a tuple, which PyObject_Call
@@ -425,6 +426,7 @@ _CABI_RESULTS: dict[str, str] = {
     "PyUnicode_Join": "ptr",
     "PySequence_Check": "int",
     "PySequence_GetItem": "ptr",
+    "PyList_SetItem": "int",
     "PyObject_CallNoArgs": "ptr",
     "PyObject_CallOneArg": "ptr",
     "PyObject_Call": "ptr",

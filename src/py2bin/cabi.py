@@ -679,6 +679,7 @@ _PyUnicode_InternFromString = _bind(
 _PyUnicode_Join = _bind("PyUnicode_Join", _HANDLE, _HANDLE, _HANDLE)
 _PySequence_Check = _bind("PySequence_Check", ctypes.c_int, _HANDLE)
 _PySequence_GetItem = _bind("PySequence_GetItem", _HANDLE, _HANDLE, _SSIZE)
+_PyList_SetItem = _bind("PyList_SetItem", ctypes.c_int, _HANDLE, _SSIZE, _HANDLE)
 _PyObject_GetAttrString = _bind(
     "PyObject_GetAttrString", _HANDLE, _HANDLE, ctypes.c_char_p
 )
@@ -869,6 +870,10 @@ def PySequence_Check(handle: int) -> int:
 
 def PySequence_GetItem(handle: int, index: int) -> int:
     return _handle(_PySequence_GetItem(handle, index))
+
+
+def PyList_SetItem(handle: int, index: int, value: int) -> int:
+    return int(_PyList_SetItem(handle, index, value))
 
 
 def PyObject_CallNoArgs(callable_handle: int) -> int:
