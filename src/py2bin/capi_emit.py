@@ -33,6 +33,7 @@ from pathlib import Path
 from .capi_cells import CellError, expand as expand_cells
 from .capi_fold import fold as fold_constants
 from .capi_inline import expand_module as inline_calls
+from .capi_exact import exact_dicts, exact_lists
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
     ARITHMETIC as _MACHINE_OPS,
@@ -548,6 +549,11 @@ class _Function:
         #: of the `long long`. The two sets never overlap: a name is narrowed
         #: one way or the other, never both.
         self.doubles: set[str] = set()
+        #: Locals that always hold an exact `list`, and exact `dict`. Decided
+        #: from their bindings alone - see `capi_exact` - so no run-time
+        #: guard is ever emitted for them.
+        self.exact_lists: set[str] = set()
+        self.exact_dicts: set[str] = set()
         #: Counter for the `long long` scratch the fast path computes in, wound
         #: back at the end of each statement as the object temporaries are.
         self.machines = 0
@@ -934,6 +940,28 @@ class CApiEmitter:
         if self.at_module_level or name in self.current.module_names:
             return False
         return not any(name in scope for scope in self.shadowed)
+
+    def _exactly(self, node: ast.expr, wanted: set[str]) -> bool:
+        """True when this is a Name the analysis put in `wanted`, here."""
+
+        if self.boxing or self.current is None or self.at_module_level:
+            # Not at module level: a nested function may rebind a module name
+            # through `global`, which the module body's own analysis never
+            # sees.
+            return False
+        if not isinstance(node, ast.Name) or node.id not in wanted:
+            return False
+        if node.id in self.current.module_names:
+            return False
+        return not any(node.id in scope for scope in self.shadowed)
+
+    def is_exact_list(self, node: ast.expr) -> bool:
+        assert self.current is not None
+        return self._exactly(node, self.current.exact_lists)
+
+    def is_exact_dict(self, node: ast.expr) -> bool:
+        assert self.current is not None
+        return self._exactly(node, self.current.exact_dicts)
 
     def double_slots(self, name: str) -> tuple[str, str, str]:
         """Declare the three variables, and answer with their C names."""
@@ -2947,6 +2975,23 @@ class CApiEmitter:
             isinstance(item, ast.Starred) for item in node.args
         )
         if plain:
+            if (
+                node.func.attr == "append"
+                and len(node.args) == 1
+                and self.is_exact_list(node.func.value)
+            ):
+                # The name always holds an exact `list` - decided from its
+                # bindings, so unlike the run-time guard this replaces, the
+                # knowledge costs nothing per call. The lookup, the bound
+                # method and both dispatch layers all go.
+                owner, owned = self.operand(node.func.value, indent)
+                value, value_owned = self.operand(node.args[0], indent)
+                outcome = self.temporary_flag()
+                self.emit(f"{outcome} = PyList_Append({owner}, {value});", indent)
+                self.release(owner, owned, indent)
+                self.release(value, value_owned, indent)
+                self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
+                return self.builtin("None", indent)
             return self.method_vectorcall(node, indent)
         callable_value = self.attribute(node.func, indent)
         target = self.invoke(callable_value, node.args, indent, node.keywords)
@@ -3471,14 +3516,23 @@ class CApiEmitter:
                 raise self.fail(
                     target, "assigning to a slice is not translated here yet"
                 )
-            container = self.expression(target.value, indent)
+            container, owned = self.operand(target.value, indent)
             key = self.expression(target.slice, indent)
             outcome = self.temporary_flag()
-            self.emit(
-                f"{outcome} = PyObject_SetItem({container}, {key}, {value});", indent
+            # `d[k] = v` on a name that always holds an exact dict skips the
+            # mapping-protocol dispatch; an unhashable key raises through
+            # either spelling.
+            store = (
+                "PyDict_SetItem"
+                if self.is_exact_dict(target.value)
+                else "PyObject_SetItem"
             )
-            for held in (container, key, value):
-                self.emit(f"Py_DecRef({held});", indent)
+            self.emit(
+                f"{outcome} = {store}({container}, {key}, {value});", indent
+            )
+            self.release(container, owned, indent)
+            self.emit(f"Py_DecRef({key});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
             self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
             return
         raise self.fail(
@@ -3629,6 +3683,45 @@ class CApiEmitter:
             # that clause, so this sets it again without giving it away.
             value, owned = self.handling[-1], False
         else:
+            if node.cause is None:
+                    # `raise ValueError('x')` and the bare `raise ValueError` are how
+                # nearly every raise is written, and for an untouched builtin
+                # exception name the class-or-instance question below is settled
+                # at compile time: a call on the class answers an instance of it,
+                # and the bare name is the class. The name is still looked up
+                # live - `builtins.ValueError` may have been replaced - which is
+                # `program_name`'s job; only the run-time classification goes.
+                spelled = (
+                    node.exc.func.id
+                    if isinstance(node.exc, ast.Call)
+                    and isinstance(node.exc.func, ast.Name)
+                    and not node.exc.keywords
+                    and not any(
+                        isinstance(item, ast.Starred) for item in node.exc.args
+                    )
+                    else node.exc.id if isinstance(node.exc, ast.Name) else None
+                )
+                named = getattr(builtins, spelled, None) if spelled else None
+                if (
+                    spelled is not None
+                    and self.builtin_untouched(spelled)
+                    and isinstance(named, type)
+                    and issubclass(named, BaseException)
+                ):
+                    if isinstance(node.exc, ast.Call):
+                        kind = self.program_name(spelled, indent)
+                        raised = self.invoke(kind, node.exc.args, indent, [])
+                        self.emit(f"PyErr_SetObject({kind}, {raised});", indent)
+                        self.emit(f"Py_DecRef({raised});", indent)
+                    else:
+                        kind = self.program_name(spelled, indent)
+                        self.emit(f"PyErr_SetObject({kind}, NULL);", indent)
+                    self.emit(f"Py_DecRef({kind});", indent)
+                    if self.handlers:
+                        self.emit(f"goto {self.handlers[-1]};", indent)
+                    else:
+                        self.emit(self.failure(), indent)
+                    return
             value, owned = self.expression(node.exc, indent), True
         if node.cause is not None:
             value = self.with_cause(node, value, owned, indent)
@@ -5751,6 +5844,8 @@ class CApiEmitter:
             given = set(held) | set(captures)
             function.doubles = double_locals(node.body, given)
             function.unboxed = unboxable_locals(node.body, given) - function.doubles
+            function.exact_lists = exact_lists(node.body, given)
+            function.exact_dicts = exact_dicts(node.body, given)
             function.body_binds = _scope_bindings(node.body)
             function.shadows = function.body_binds | set(held)
         outer, outer_handlers, outer_scope = (
@@ -6067,6 +6162,8 @@ class CApiEmitter:
         function.unboxed = (
             unboxable_locals(node.body, set(parameters)) - function.doubles
         )
+        function.exact_lists = exact_lists(node.body, set(parameters))
+        function.exact_dicts = exact_dicts(node.body, set(parameters))
         function.body_binds = _scope_bindings(node.body)
         function.shadows = function.body_binds | set(parameters)
         self.current = function

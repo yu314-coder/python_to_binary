@@ -2700,6 +2700,145 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class ExactContainerTests(unittest.TestCase):
+    """Names whose bindings prove an exact list or dict, with no run-time guard."""
+
+    _run = CApiEmitTests._run
+
+    def test_append_on_a_display_bound_list_goes_direct(self):
+        source = (
+            "def run():\n"
+            "    xs = []\n"
+            "    i = 0\n"
+            "    while i < 4:\n"
+            "        xs.append(i * 2)\n"
+            "        i = i + 1\n"
+            "    return xs\n"
+            "print(run())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertNotIn("PyObject_VectorcallMethod", written.split("f_run")[1].split("static")[0])
+        self._run(source, b"[0, 2, 4, 6]\n")
+
+    def test_a_subclass_keeps_its_override(self):
+        # `w = Loud()` is a call, not a display, so the name is excluded and
+        # the overridden method is the one that runs.
+        source = (
+            "class Loud(list):\n"
+            "    def append(self, v):\n"
+            "        print('override')\n"
+            "        list.append(self, v * 10)\n"
+            "def run():\n"
+            "    w = Loud()\n"
+            "    w.append(3)\n"
+            "    return w\n"
+            "print(run())\n"
+        )
+        self._run(source, b"override\n[30]\n")
+
+    def test_a_rebound_name_is_excluded(self):
+        source = (
+            "def run():\n"
+            "    xs = []\n"
+            "    xs = make()\n"
+            "    try:\n"
+            "        xs.append(1)\n"
+            "    except AttributeError:\n"
+            "        return 'AttributeError'\n"
+            "def make():\n"
+            "    return object()\n"
+            "print(run())\n"
+        )
+        self._run(source, b"AttributeError\n")
+
+    def test_dict_store_goes_direct_and_unhashable_still_raises(self):
+        source = (
+            "def run():\n"
+            "    d = {}\n"
+            "    i = 0\n"
+            "    while i < 4:\n"
+            "        d[i % 2] = i\n"
+            "        i = i + 1\n"
+            "    try:\n"
+            "        d[[1]] = 2\n"
+            "    except TypeError:\n"
+            "        return sorted(d.items())\n"
+            "print(run())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("PyDict_SetItem(", written)
+        self._run(source, b"[(0, 2), (1, 3)]\n")
+
+    def test_augmented_assignment_keeps_a_list_exact(self):
+        source = (
+            "def run():\n"
+            "    xs = [1]\n"
+            "    xs += [2, 3]\n"
+            "    xs.append(4)\n"
+            "    return xs\n"
+            "print(run())\n"
+        )
+        self._run(source, b"[1, 2, 3, 4]\n")
+
+
+class SpecialisedRaiseTests(unittest.TestCase):
+    """`raise BuiltinError(...)` without the run-time class-or-instance test."""
+
+    _run = CApiEmitTests._run
+
+    def test_the_usual_shapes_still_catch(self):
+        source = (
+            "try:\n"
+            "    raise ValueError('x')\n"
+            "except ValueError as e:\n"
+            "    print('a', e)\n"
+            "try:\n"
+            "    raise ValueError\n"
+            "except ValueError as e:\n"
+            "    print('b', repr(e))\n"
+            "try:\n"
+            "    raise KeyError('k')\n"
+            "except KeyError as e:\n"
+            "    print('c', repr(e))\n"
+        )
+        self._run(source, b"a x\nb ValueError()\nc KeyError('k')\n")
+
+    def test_the_constructor_runs_exactly_once(self):
+        source = (
+            "n = [0]\n"
+            "class Counting(ValueError):\n"
+            "    def __init__(s, *a):\n"
+            "        n[0] += 1\n"
+            "        super().__init__(*a)\n"
+            "try:\n"
+            "    raise Counting('x')\n"
+            "except ValueError:\n"
+            "    pass\n"
+            "print('ctor ran', n[0], 'time')\n"
+        )
+        self._run(source, b"ctor ran 1 time\n")
+
+    def test_a_program_class_takes_the_general_path(self):
+        source = (
+            "class Mine(Exception):\n"
+            "    pass\n"
+            "try:\n"
+            "    raise Mine('own')\n"
+            "except Mine as e:\n"
+            "    print(e)\n"
+        )
+        self._run(source, b"own\n")
+
+    def test_raise_from_keeps_its_cause(self):
+        source = (
+            "try:\n"
+            "    raise RuntimeError('why') from KeyError('cause')\n"
+            "except RuntimeError as e:\n"
+            "    print(e, repr(e.__cause__))\n"
+        )
+        self._run(source, b"why KeyError('cause')\n")
+
+
 class HoistedLengthTests(unittest.TestCase):
     """`len(name)` loaded into a machine slot, so the expression stays narrow."""
 

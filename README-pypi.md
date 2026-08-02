@@ -295,22 +295,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.5 ms** | 9.1 ms | **2.05× faster** |
-| integer arithmetic | **8.9 ms** | 10.4 ms | **1.18× faster** |
-| comparisons | **4.8 ms** | 5.6 ms | **1.17× faster** |
-| `while` loop | **4.4 ms** | 5.0 ms | **1.14× faster** |
-| float arithmetic | **6.3 ms** | 6.7 ms | **1.07× faster** |
-| attribute read | 6.7 ms | 5.5 ms | 0.82× |
-| string concatenation | 22.2 ms | 17.6 ms | 0.80× |
-| exception raise/catch | 27.9 ms | 21.9 ms | 0.78× |
-| comprehension | 4.0 ms | 3.0 ms | 0.75× |
-| dict store | 12.1 ms | 8.8 ms | 0.72× |
-| subscript | 11.5 ms | 7.9 ms | 0.69× |
-| closure call | 13.3 ms | 9.0 ms | 0.68× |
-| f-string | 30.7 ms | 19.9 ms | 0.65× |
-| list append | 9.8 ms | 6.0 ms | 0.61× |
-| instantiation | 33.9 ms | 17.4 ms | 0.51× |
-| method call | 27.1 ms | 10.8 ms | 0.40× |
+| direct function call | **4.8 ms** | 10.1 ms | **2.10× faster** |
+| `while` loop | **4.8 ms** | 5.7 ms | **1.19× faster** |
+| integer arithmetic | **10.0 ms** | 11.8 ms | **1.18× faster** |
+| comparisons | **5.2 ms** | 6.1 ms | **1.16× faster** |
+| exception raise/catch | **23.7 ms** | 25.0 ms | **1.05× faster** |
+| float arithmetic | **6.8 ms** | 7.1 ms | **1.05× faster** |
+| string concatenation | 24.3 ms | 19.8 ms | 0.82× |
+| comprehension | 4.1 ms | 3.3 ms | 0.80× |
+| attribute read | 7.4 ms | 5.9 ms | 0.80× |
+| dict store | 13.2 ms | 9.7 ms | 0.74× |
+| subscript | 12.9 ms | 8.7 ms | 0.67× |
+| closure call | 15.1 ms | 10.0 ms | 0.66× |
+| list append | 10.3 ms | 6.6 ms | 0.64× |
+| f-string | 35.1 ms | 22.1 ms | 0.63× |
+| instantiation | 38.8 ms | 19.5 ms | 0.50× |
+| method call | 30.8 ms | 12.4 ms | 0.40× |
 
 **Integer loops win** because a local the analysis picks out is held in a
 machine register, with an overflow check that falls back to unbounded
