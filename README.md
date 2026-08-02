@@ -336,15 +336,17 @@ volume is read, so the app that comes out is the same size it always was.
 ### Measured on a real application
 
 manim_app: 10,100 lines, pywebview + Pillow + pyobjc, built both ways on the
-same machine and interleaved so that drift falls on both equally.
+same machine, same CPython 3.14, against Nuitka 4.1.3. Both bundles carry an
+interpreter and 73 native extension modules, which is what makes the sizes
+comparable at all.
 
 | | py2bin | Nuitka |
 |---|---|---|
-| whole `.app` | **61.2 MB** | 72.6 MB |
-| main binary | **9.2 MB** | 29.6 MB |
-| bare interpreter start | **9.5 ms** | 16.2 ms |
-| start with the app's imports | 52.1 ms | **44.8 ms** |
-| compile time | **16.7 s** | minutes |
+| whole `.app` | **66.0 MB** | 73.5 MB |
+| main binary | **8.9 MB** | 28.9 MB |
+| native extensions carried | 8.7 MB | 8.7 MB |
+| start with the app's imports | 84.4 ms | **78.6 ms** |
+| compile time | **20.1 s** | 88.3 s |
 
 Verified from a copy moved elsewhere on disk: every module the program imports
 resolves, a pty opens and echoes, Pillow still round-trips PNG/JPEG/GIF/BMP/
@@ -739,28 +741,38 @@ outside it.
 Same machine (arm64 macOS), same CPython 3.14, same source. Nuitka 2.x with
 `--standalone`, driving Apple's clang; this driving its own C compiler.
 
-Run time, median of 5 runs, seconds. **These predate the register and folding
-work above** and were not re-run for it, because the machine they were taken on
-no longer has Nuitka installed: the `this` column is now pessimistic, by
-roughly the margin the per-feature table shows. They are left as measured
-rather than adjusted by arithmetic, since a number nobody ran is not a
-measurement:
+Run time, median of 5 runs, seconds, re-measured against **Nuitka 4.1.3** -
+several major versions newer than the 2.x these were first taken against, and
+faster for it:
 
 | | this | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | **0.054** | 0.089 | 0.098 |
-| `while` loop | **0.048** | 0.071 | 0.046 |
-| nested loops | **0.023** | 0.037 | 0.043 |
-| function calls | 0.069 | 0.024 | **0.021** |
-| string building | 0.026 | 0.011 | **0.010** |
+| integer arithmetic | 0.095 | 0.112 | **0.094** |
+| `while` loop | **0.046** | 0.054 | 0.053 |
+| nested loops | 0.018 | **0.017** | 0.018 |
+| function calls | **0.015** | 0.033 | 0.027 |
+| string building | 0.016 | **0.012** | 0.014 |
+
+Nuitka moved too. These were first taken against Nuitka 2.x, and against 4.1.3
+it is faster than it was: integer arithmetic is now a tie rather than a win,
+and it has closed most of the loop gap. Where the two still differ is calls -
+a small helper compiled here is written out at the call site, which takes the
+arithmetic around it into registers as well, and no amount of a *better* call
+reaches a call that is not made. String building is the row to look at if you
+want the honest weakness: both compilers lose to the interpreter on it, and
+this one loses by more.
+
+Both compile the same source on the same machine against the same CPython
+3.14. Nuitka drives Apple's clang; this drives its own C compiler, which is
+the whole point of the row below it.
 
 Startup, `print("x")`, median of 13 runs:
 
 | | startup | on disk |
 |---|---|---|
-| this, `compile-capi` | **10.2 ms** | **52 KB** |
-| CPython | 13.8 ms | - |
-| Nuitka `--standalone` | 17.1 ms | 15 MB |
+| this, `compile-capi` | **12.6 ms** | **49 KB** |
+| CPython | 14.7 ms | - |
+| Nuitka `--standalone` | 18.1 ms | 17 MB |
 
 A `compile-capi` binary links the interpreter it was built against and starts
 by calling `Py_Initialize`, skipping the interpreter's own startup path -

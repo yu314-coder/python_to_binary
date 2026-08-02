@@ -392,24 +392,27 @@ same machine.
 
 | | py2bin | Nuitka |
 |---|---|---|
-| whole `.app` | **61.2 MB** | 72.6 MB |
-| main binary | **9.2 MB** | 29.6 MB |
-| bare interpreter start | **9.5 ms** | 16.2 ms |
-| start with the app's imports | 52.1 ms | **44.8 ms** |
-| compile time | **16.7 s** | minutes |
+| whole `.app` | **66.0 MB** | 73.5 MB |
+| main binary | **8.9 MB** | 28.9 MB |
+| native extensions carried | 8.7 MB | 8.7 MB |
+| start with the app's imports | 84.4 ms | **78.6 ms** |
+| compile time | **20.1 s** | 88.3 s |
 
-Run time, median of 5, seconds. **These predate the register and folding work
-above** and were not re-run for it - the machine no longer has Nuitka
-installed - so the py2bin column is now pessimistic. Left as measured rather
-than adjusted by arithmetic:
+Run time, median of 5, seconds, re-measured against **Nuitka 4.1.3**:
 
 | workload | py2bin | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | **0.050** | 0.084 | 0.095 |
-| `while` loop | **0.045** | 0.070 | 0.045 |
-| nested loops | **0.022** | 0.035 | 0.042 |
-| function calls | 0.065 | 0.023 | **0.020** |
-| string building | 0.025 | 0.011 | **0.009** |
+| integer arithmetic | 0.095 | 0.112 | **0.094** |
+| `while` loop | **0.046** | 0.054 | 0.053 |
+| nested loops | 0.018 | **0.017** | 0.018 |
+| function calls | **0.015** | 0.033 | 0.027 |
+| string building | 0.016 | **0.012** | 0.014 |
+
+These were first taken against Nuitka 2.x; against 4.1.3 it is faster than
+it was, and integer arithmetic is now a tie rather than a win. Where the two
+still differ is calls - a small helper is written out at the call site here,
+and no better call reaches a call that is not made. String building is the
+honest weakness: both lose to the interpreter, and this one by more.
 
 Loops beat both because a local the analysis picks out is held in a register
 rather than on the heap, with the overflow check that falls back to unbounded
