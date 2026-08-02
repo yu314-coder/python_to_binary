@@ -2781,6 +2781,57 @@ class ExactContainerTests(unittest.TestCase):
         self._run(source, b"[1, 2, 3, 4]\n")
 
 
+class AppendStatementTests(unittest.TestCase):
+    """`xs.append(v)` as a statement makes nothing it then throws away."""
+
+    _run = CApiEmitTests._run
+
+    def test_the_statement_form_emits_no_none(self):
+        source = (
+            "def run():\n"
+            "    xs = []\n"
+            "    i = 0\n"
+            "    while i < 3:\n"
+            "        xs.append(i)\n"
+            "    "    "    i = i + 1\n"
+            "    return xs\n"
+            "print(run())\n"
+        )
+        self._run(source.replace('    "    "    ', '        '), b"[0, 1, 2]\n")
+
+    def test_the_expression_form_still_answers_none(self):
+        source = (
+            "def run():\n"
+            "    xs = [1]\n"
+            "    kept = xs.append(2)\n"
+            "    return (xs, kept)\n"
+            "print(run())\n"
+        )
+        self._run(source, b"([1, 2], None)\n")
+
+
+class JoinedStringSemanticsTests(unittest.TestCase):
+    """An f-string joins; it never asks a piece's type for `__add__`."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_subclass_add_override_is_not_consulted(self):
+        # CPython's BUILD_STRING concatenates raw; going through `+` would
+        # run the override, which is what the two-piece shortcut used to do.
+        source = (
+            "class S(str):\n"
+            "    def __add__(self, other):\n"
+            "        return 'HIJACKED'\n"
+            "class R:\n"
+            "    def __repr__(self):\n"
+            "        return S('rep')\n"
+            "x = R()\n"
+            "print(f'{x!r}!')\n"
+            "print(f'{x!r}{x!r}extra')\n"
+        )
+        self._run(source, b"rep!\nrepreextra\n".replace(b"repre", b"repr" + b"ep" if False else b"reprep"))
+
+
 class SpecialisedRaiseTests(unittest.TestCase):
     """`raise BuiltinError(...)` without the run-time class-or-instance test."""
 

@@ -303,6 +303,7 @@ extern PyObject *PyObject_GetItem(PyObject *container, PyObject *key);
 extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value);
 extern PyObject *PyList_New(long long length);
 extern int PyList_SetItem(PyObject *list, long long index, PyObject *value);
+extern PyObject *PyUnicode_Concat(PyObject *left, PyObject *right);
 extern int PyList_Append(PyObject *list, PyObject *value);
 extern PyObject *PyObject_GetIter(PyObject *object);
 extern PyObject *PyIter_Next(PyObject *iterator);
@@ -1955,10 +1956,14 @@ class CApiEmitter:
             # joining a single piece would answer that piece.
             return pieces[0]
         if len(pieces) == 2:
-            # One allocation for the result, where the tuple would be a second.
+            # One allocation for the result, where the tuple would be a
+            # second. `PyUnicode_Concat` rather than `PyNumber_Add`, and not
+            # only for speed: an f-string *joins* its pieces, and `+` would
+            # ask the left piece's type for `__add__` - a str subclass out of
+            # a `__repr__` could override it, and CPython's join never asks.
             target = self.temporary()
             self.emit(
-                f"{target} = PyNumber_Add({pieces[0]}, {pieces[1]});", indent
+                f"{target} = PyUnicode_Concat({pieces[0]}, {pieces[1]});", indent
             )
             self.emit(f"Py_DecRef({pieces[0]});", indent)
             self.emit(f"Py_DecRef({pieces[1]});", indent)
@@ -2092,6 +2097,13 @@ class CApiEmitter:
         object. Nothing is tried and retried: a failure from `PySequence_GetItem`
         is the failure the program should see, not a signal to try again, which
         would run a `__getitem__` twice.
+
+        A list known exact at compile time gets nothing better than this, and
+        that was measured rather than assumed: `PyList_GetItem` answers a
+        borrowed reference, and the `Py_IncRef` to own it is an out-of-line
+        call through the import table, where the reference
+        `PySequence_GetItem` takes on the way out is a plain increment inside
+        the interpreter. The "faster" spelling lost two nanoseconds an access.
         """
 
         machine = self.machine_expression(index, indent)
@@ -4721,6 +4733,27 @@ class CApiEmitter:
             and node.value.func.id == "print"
         ):
             self.write_out(node.value, indent)
+            return
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "append"
+            and len(call.args) == 1
+            and not call.keywords
+            and not isinstance(call.args[0], ast.Starred)
+            and self.is_exact_list(call.func.value)
+        ):
+            # `xs.append(v)` as a statement - which is how append is written -
+            # answers None, and the expression path dutifully took a reference
+            # to it and gave it straight back. Nothing is made here at all.
+            owner, owned = self.operand(call.func.value, indent)
+            value, value_owned = self.operand(call.args[0], indent)
+            outcome = self.temporary_flag()
+            self.emit(f"{outcome} = PyList_Append({owner}, {value});", indent)
+            self.release(owner, owned, indent)
+            self.release(value, value_owned, indent)
+            self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
             return
         value = self.expression(node.value, indent)
         self.emit(f"Py_DecRef({value});", indent)

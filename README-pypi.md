@@ -295,22 +295,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.8 ms** | 10.1 ms | **2.10× faster** |
-| `while` loop | **4.8 ms** | 5.7 ms | **1.19× faster** |
-| integer arithmetic | **10.0 ms** | 11.8 ms | **1.18× faster** |
-| comparisons | **5.2 ms** | 6.1 ms | **1.16× faster** |
-| exception raise/catch | **23.7 ms** | 25.0 ms | **1.05× faster** |
-| float arithmetic | **6.8 ms** | 7.1 ms | **1.05× faster** |
-| string concatenation | 24.3 ms | 19.8 ms | 0.82× |
-| comprehension | 4.1 ms | 3.3 ms | 0.80× |
-| attribute read | 7.4 ms | 5.9 ms | 0.80× |
-| dict store | 13.2 ms | 9.7 ms | 0.74× |
-| subscript | 12.9 ms | 8.7 ms | 0.67× |
-| closure call | 15.1 ms | 10.0 ms | 0.66× |
-| list append | 10.3 ms | 6.6 ms | 0.64× |
-| f-string | 35.1 ms | 22.1 ms | 0.63× |
-| instantiation | 38.8 ms | 19.5 ms | 0.50× |
-| method call | 30.8 ms | 12.4 ms | 0.40× |
+| direct function call | **4.5 ms** | 9.6 ms | **2.10× faster** |
+| comparisons | **4.9 ms** | 5.8 ms | **1.19× faster** |
+| `while` loop | **4.5 ms** | 5.4 ms | **1.19× faster** |
+| integer arithmetic | **9.3 ms** | 10.9 ms | **1.17× faster** |
+| float arithmetic | **6.3 ms** | 6.7 ms | **1.06× faster** |
+| exception raise/catch | **21.1 ms** | 22.4 ms | **1.06× faster** |
+| attribute read | 7.0 ms | 5.7 ms | 0.82× |
+| comprehension | 3.9 ms | 3.2 ms | 0.81× |
+| string concatenation | 22.6 ms | 18.1 ms | 0.80× |
+| dict store | 12.0 ms | 9.0 ms | 0.75× |
+| list append | 8.8 ms | 6.3 ms | 0.72× |
+| closure call | 13.9 ms | 9.3 ms | 0.67× |
+| subscript | 12.2 ms | 8.1 ms | 0.67× |
+| f-string | 32.2 ms | 20.3 ms | 0.63× |
+| instantiation | 35.3 ms | 18.1 ms | 0.51× |
+| method call | 28.1 ms | 11.2 ms | 0.40× |
 
 **Integer loops win** because a local the analysis picks out is held in a
 machine register, with an overflow check that falls back to unbounded

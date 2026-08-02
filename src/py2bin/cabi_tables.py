@@ -82,6 +82,10 @@ VETTED = [
     # tuple sibling, and never grows the storage - which is what a counted
     # comprehension wants, knowing its item count before the first item.
     "PyList_SetItem",
+    # Two strings, concatenated the way an f-string joins - without asking
+    # either operand's type for `__add__`, which is also what makes it
+    # right for the join: `BUILD_STRING` never dispatches an override.
+    "PyUnicode_Concat",
     "PyBytes_FromStringAndSize", "PyNumber_Negative", "PyNumber_Positive",
     "PyNumber_Invert", "Py_EnterRecursiveCall", "Py_LeaveRecursiveCall",
     "PyLong_FromString", "PyUnicode_DecodeUTF8", "PyImport_AddModule",

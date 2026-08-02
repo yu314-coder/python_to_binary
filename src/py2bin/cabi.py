@@ -680,6 +680,7 @@ _PyUnicode_Join = _bind("PyUnicode_Join", _HANDLE, _HANDLE, _HANDLE)
 _PySequence_Check = _bind("PySequence_Check", ctypes.c_int, _HANDLE)
 _PySequence_GetItem = _bind("PySequence_GetItem", _HANDLE, _HANDLE, _SSIZE)
 _PyList_SetItem = _bind("PyList_SetItem", ctypes.c_int, _HANDLE, _SSIZE, _HANDLE)
+_PyUnicode_Concat = _bind("PyUnicode_Concat", _HANDLE, _HANDLE, _HANDLE)
 _PyObject_GetAttrString = _bind(
     "PyObject_GetAttrString", _HANDLE, _HANDLE, ctypes.c_char_p
 )
@@ -874,6 +875,10 @@ def PySequence_GetItem(handle: int, index: int) -> int:
 
 def PyList_SetItem(handle: int, index: int, value: int) -> int:
     return int(_PyList_SetItem(handle, index, value))
+
+
+def PyUnicode_Concat(left: int, right: int) -> int:
+    return _handle(_PyUnicode_Concat(left, right))
 
 
 def PyObject_CallNoArgs(callable_handle: int) -> int:
