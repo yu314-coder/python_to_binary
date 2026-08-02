@@ -82,6 +82,7 @@ pip install python-to-binary
 
 | command | what it does |
 |---|---|
+| `py2bin make` | three questions, then a bundle - see below |
 | `py2bin compile-capi` | Python → C driving the CPython C API → machine code |
 | `py2bin compile` | Python → machine code, no CPython anywhere |
 | `py2bin compile-c` | py2bin's own C compiler, on your C |
@@ -96,9 +97,13 @@ py2bin compile-capi app.py --target darwin-arm64 \
   --app --name "My App" --icon icon.icns \
   --embed-python --site ../Resources/site-packages \
   --bundle-site /path/to/venv/lib/python3.14/site-packages \
-  --prune-unused --zip-stdlib \
+  --prune-unused --zip-stdlib --include web \
   -o dist/MyApp.app --clean
 ```
+
+`--include PATH` carries a file or directory beside the program - a `web/`
+folder, templates, anything it opens at runtime rather than imports. `make`
+finds those on its own; this is how to name one it did not.
 
 ## How it works
 
