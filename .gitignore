@@ -9,3 +9,4 @@ dist/
 
 # local build/test scratch on disk D
 .py2bin-work/
+dist_release/

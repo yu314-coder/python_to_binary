@@ -104,6 +104,7 @@ The two are the same program; `py2bin` is a console script and
 
 | command | what it does |
 |---|---|
+| `make` | three questions, then a bundle - the way in with nothing to type |
 | `compile-capi` | Python → C driving the CPython C API → machine code |
 | `compile` | Python → machine code, no CPython anywhere |
 | `compile-c` | py2bin's own C compiler, on your C |
@@ -170,7 +171,8 @@ What each part does:
 | `--zip-stdlib` | pack the carried library into the `pythonXY.zip` the interpreter already reads |
 | `--exclude MODULE` | drop something the static walk had to keep - see below |
 | `--crash-log` | write `<name>-crash.txt` beside the app if it dies, so a failure on someone else's Mac leaves evidence |
-| `--dmg` | also write a mountable `.dmg` beside the `.app` - see below |
+| `--dmg` | also write a compressed `.dmg` beside the `.app` - see below |
+| `--include PATH` | carry a file or directory beside the program - web assets, templates, anything it opens rather than imports |
 
 `--exclude` is for what the walk cannot work out. Pillow is the case that
 matters: `Image.init()` imports whatever plugin sits beside it, so a static
