@@ -1490,6 +1490,17 @@ def main(argv: list[str] | None = None) -> int:
                 # describes a bundle that does not exist yet.
                 sealed = seal(output)
                 print(f"sealed the bundle over {sealed} files", file=sys.stderr)
+            if args.icon and chosen.startswith("linux-"):
+                # Accepted and quietly ignored until now. An ELF has nowhere
+                # to carry an icon: Linux takes one from a `.desktop` entry
+                # naming an image installed under the icon theme, which is a
+                # thing the *packager* writes, not the compiler.
+                print(
+                    "py2bin: --icon does nothing for a Linux target - an ELF "
+                    "carries no icon. Ship a .desktop file naming an image "
+                    "under ~/.local/share/icons instead.",
+                    file=sys.stderr,
+                )
             if args.onefile and not args.app:
                 from .onefile import pack_beside_executable
 
