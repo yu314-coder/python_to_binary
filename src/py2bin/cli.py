@@ -238,6 +238,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also write a mountable .dmg beside the .app (macOS targets)",
     )
+    capi_parser.add_argument(
+        "--onefile",
+        action="store_true",
+        help=(
+            "pack the bundle into its own executable, so the .app holds one "
+            "real file and unpacks itself when it runs (macOS targets)"
+        ),
+    )
     capi_parser.add_argument("--name", help="application display name")
     capi_parser.add_argument(
         "--embed-python",
@@ -1073,6 +1081,13 @@ def main(argv: list[str] | None = None) -> int:
             output = args.output
             if args.app and output.suffix != ".app":
                 output = output.with_suffix(".app")
+            if args.onefile and not args.app:
+                print(
+                    "py2bin: error: --onefile needs --app: what it packs is "
+                    "the bundle",
+                    file=sys.stderr,
+                )
+                return 2
             if args.embed_python and not args.app:
                 # `main` does not hold the parser, and reaching for one that
                 # is not there turned a refusal a user should be able to act
@@ -1415,6 +1430,18 @@ def main(argv: list[str] | None = None) -> int:
                 # describes a bundle that does not exist yet.
                 sealed = seal(output)
                 print(f"sealed the bundle over {sealed} files", file=sys.stderr)
+            if args.onefile and args.app and chosen.startswith("darwin"):
+                from .onefile import pack_app_bundle
+
+                # After the seal, because what is packed has to be the bundle
+                # as it would have shipped - the payload the launcher writes
+                # out is that bundle, byte for byte, and it is verified there.
+                held, total = pack_app_bundle(output, chosen, args.name)
+                print(
+                    f"packed the bundle into one file "
+                    f"({held} files -> {total // 1024 // 1024} MB)",
+                    file=sys.stderr,
+                )
             staging = output.parent / ".py2bin-fetched"
             if staging.is_dir():
                 import shutil as _shutil

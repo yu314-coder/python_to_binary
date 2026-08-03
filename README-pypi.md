@@ -387,29 +387,23 @@ left the ordinary way.
 
 ### One file, both ways
 
-Nuitka's `--mode=onefile` makes a file that *is* the program: it unpacks itself
-to a temporary directory on every start. py2bin's macOS single-file shape is a
-`.dmg` - one file to hand over, out of which a `.app` is dragged once and then
-runs normally. (On Windows and Linux py2bin does produce a self-unpacking
-executable; on macOS the platform already has a container for this.)
+On macOS an application *is* a directory - Finder runs `Contents/MacOS/<name>`
+and Gatekeeper reads `Contents/Info.plist` beside it. Nuitka says so in its own
+help: `--mode=app` is "onefile except on macOS where it creates an app bundle".
+What stays open is how much is *inside* the bundle, and `--onefile` folds the
+payload into the bundle's own executable.
 
-| | py2bin | Nuitka |
-|---|---|---|
-| shape | `.dmg` holding a `.app` | one executable that unpacks itself |
-| a plain program, to ship | 9.5 MB | **4.5 MB** |
-| its first start | **12.8 ms** | 771 ms cached, 261 ms uncached |
-| its later starts | **12.8 ms** | 38.3 ms cached, 261 ms uncached |
-| the real application | **21.8 MB** | refused |
-| compile time for it | **23.3 s** | - |
+| | files | to hand over | first start | later starts |
+|---|---|---|---|---|
+| py2bin `--app` | 495 | 66.0 MB | 84 ms | **84 ms** |
+| py2bin `--app --onefile` | **3** | 23.0 MB | 4.3 s | 134 ms |
+| py2bin `--app --dmg` | 1 image | **21.8 MB** | 84 ms | **84 ms** |
+| Nuitka `--mode=app` | 255 | 73.5 MB | **79 ms** | **79 ms** |
 
-Nuitka's is the smaller file for a program with no third-party extensions.
-What it charges for is the unpacking, on every run unless told to cache. A
-`.dmg` unpacks nothing, so the `.app` out of it starts the same every time.
-
-For the application it was not an option: Nuitka refuses `--mode=onefile` when
-pyobjc is in the graph - `package 'Foundation' requires '--mode=app'` - which
-is any pywebview program on macOS. That row is a shape it declines to build,
-not a benchmark it lost.
+The packed bundle unpacks once into a content-addressed cache and runs from
+there. A self-extracting single *executable* is what py2bin builds on Windows
+and Linux, and Nuitka where it can - on macOS it declines that shape once
+pyobjc is in the graph, which is any pywebview program.
 
 ## Measured against Nuitka
 

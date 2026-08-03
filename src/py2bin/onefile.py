@@ -404,3 +404,88 @@ def create_onefile(
             _write_executable(output, image)
 
     return OnefileResult(output, archive_size, digest)
+
+
+def pack_app_bundle(
+    bundle: Path, target: str, name: str | None = None
+) -> tuple[int, int]:
+    """Fold a finished `.app` into an `.app` holding one real file.
+
+    A macOS application is a directory, and it has to stay one - the launcher
+    Finder runs is `Contents/MacOS/<name>`, and Gatekeeper reads
+    `Contents/Info.plist` beside it. So this does not produce a single file
+    on disk; it produces a bundle whose payload has become one. Five hundred
+    files turn into two, and what the user drags is the same shape they
+    already know.
+
+    The packed bundle is the sealed one, byte for byte: the payload is written
+    after the seal, so what unpacks at run time is the application that would
+    have shipped, signature included.
+
+    What guards the payload is the launcher's own signature, not the digest in
+    its script. That digest names the cache directory and nothing more - it is
+    taken at build time, so a payload edited afterwards would simply unpack
+    under the name of the payload that should have been there. On arm64 the
+    archive is carried inside `__TEXT`, which the ad-hoc signature covers, so
+    the kernel refuses to start a binary whose payload has been altered: a
+    flipped byte in the archive ends in SIGKILL before any of this script
+    runs. That is measured, not assumed.
+
+    Answers how many files were folded in, and the size of the bundle that
+    results.
+    """
+
+    bundle = bundle.resolve()
+    contents = bundle / "Contents"
+    plist = contents / "Info.plist"
+    if not plist.is_file():
+        raise ValueError(f"{bundle} has no Contents/Info.plist to pack")
+    executables = [
+        item for item in (contents / "MacOS").iterdir() if item.is_file()
+    ]
+    inner = next(
+        (item for item in executables if item.name == (name or bundle.stem)),
+        None,
+    ) or (executables[0] if executables else None)
+    if inner is None:
+        raise ValueError(f"{bundle} has no executable in Contents/MacOS")
+
+    held = sum(1 for item in bundle.rglob("*") if item.is_file())
+    with tempfile.TemporaryDirectory(
+        prefix="py2bin-app-onefile-", dir=bundle.parent
+    ) as scratch:
+        room = Path(scratch)
+        # Packed from a copy: `create_onefile` refuses to write inside what it
+        # reads, and the file it writes is going where the original stands.
+        packed_from = room / bundle.name
+        shutil.copytree(bundle, packed_from, symlinks=True)
+        launcher = packed_from / inner.relative_to(bundle)
+        single = room / "packed"
+        create_onefile(
+            payload_root=packed_from,
+            output=single,
+            target=target,
+            launcher=launcher,
+            info_plist=plist.read_bytes(),
+        )
+        # The old tree goes only once the new executable exists, so a failure
+        # anywhere above leaves the bundle that was already built.
+        shutil.rmtree(bundle)
+        (bundle / "Contents" / "MacOS").mkdir(parents=True)
+        shutil.copy2(single, bundle / "Contents" / "MacOS" / inner.name)
+        (bundle / "Contents" / "MacOS" / inner.name).chmod(0o755)
+        shutil.copy2(
+            packed_from / "Contents" / "Info.plist",
+            bundle / "Contents" / "Info.plist",
+        )
+
+    # Sealed again, over the two files that are left. The launcher's signature
+    # names a `CodeResources` that described the bundle before it was packed,
+    # and `codesign` says so - "code has no resources but signature indicates
+    # they must be present" - which is a bundle macOS would come to distrust.
+    # Re-sealing writes the manifest for what is actually there.
+    from .macos_seal import seal
+
+    seal(bundle)
+    total = sum(item.stat().st_size for item in bundle.rglob("*") if item.is_file())
+    return held, total
