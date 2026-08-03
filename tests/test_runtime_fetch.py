@@ -4,8 +4,11 @@ import hashlib
 import json
 import tempfile
 import unittest
+import os
 import zipfile
 from pathlib import Path
+
+from py2bin import runtime_fetch
 
 from py2bin.runtime_fetch import (
     FetchError,
@@ -187,3 +190,58 @@ class DigestVerificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArchivePermissionTests(unittest.TestCase):
+    """A wheel's executable bit has to survive being unpacked.
+
+    Wheels ship programs as well as modules - Qt's `QtWebEngineProcess`, the
+    console scripts under `*.data/scripts`, anything a package runs rather
+    than imports. The mode was read to check the member was a regular file
+    and then dropped, so every one of them came out at 0644 and the package
+    failed at the moment it tried to start one. Qt reported it as
+    "LaunchProcess: failed to execvp", which names nothing a reader would
+    connect to unpacking.
+    """
+
+    def _archive(self, room: Path) -> Path:
+        path = room / "wheel.zip"
+        with zipfile.ZipFile(path, "w") as out:
+            program = zipfile.ZipInfo("pkg/libexec/helper")
+            program.external_attr = 0o100755 << 16
+            out.writestr(program, "#!/bin/sh\nexit 0\n")
+            module = zipfile.ZipInfo("pkg/__init__.py")
+            module.external_attr = 0o100644 << 16
+            out.writestr(module, "x = 1\n")
+            bare = zipfile.ZipInfo("pkg/nomode.txt")
+            out.writestr(bare, "no mode recorded\n")
+        return path
+
+    def test_an_executable_member_stays_executable(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            runtime_fetch.extract_zip(self._archive(room), room / "out")
+            helper = room / "out" / "pkg" / "libexec" / "helper"
+            self.assertTrue(os.access(helper, os.X_OK), "helper lost its mode")
+
+    def test_a_plain_module_is_not_made_executable(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            runtime_fetch.extract_zip(self._archive(room), room / "out")
+            module = room / "out" / "pkg" / "__init__.py"
+            self.assertFalse(os.access(module, os.X_OK))
+
+    def test_the_owner_can_still_write_what_was_unpacked(self):
+        # The tree is pruned and packed after this, which needs to be able to
+        # remove and rewrite what it holds.
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            runtime_fetch.extract_zip(self._archive(room), room / "out")
+            for name in ("pkg/libexec/helper", "pkg/__init__.py"):
+                self.assertTrue(os.access(room / "out" / name, os.W_OK), name)
+
+    def test_a_member_with_no_recorded_mode_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            runtime_fetch.extract_zip(self._archive(room), room / "out")
+            self.assertTrue((room / "out" / "pkg" / "nomode.txt").is_file())

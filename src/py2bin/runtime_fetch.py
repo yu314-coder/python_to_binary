@@ -311,6 +311,19 @@ def extract_zip(archive_path: Path, destination: Path) -> int:
                     if not chunk:
                         break
                     output.write(chunk)
+            # The mode the archive recorded, which was read above only to
+            # decide the member was a regular file and then thrown away. A
+            # wheel that ships a helper program - Qt's `QtWebEngineProcess`,
+            # a console script, anything a package runs rather than imports -
+            # came out without its executable bit, and the package failed at
+            # the point it tried to start it. Only the permission bits are
+            # taken, and only when the archive recorded any.
+            permissions = unix_mode & 0o777
+            if permissions:
+                # Nothing is made more permissive than the archive said, and
+                # writability for the owner is kept so the tree can be pruned
+                # and packed afterwards.
+                target.chmod(permissions | 0o200)
             written += 1
     return written
 

@@ -183,7 +183,13 @@ static void _py2bin_crash_report(void) {
             PyRun_SimpleString(
                 "import builtins, os, sys, traceback\n"
                 "_e = builtins._py2bin_crash\n"
-                "_where = os.path.dirname(os.path.abspath(sys.executable))\n"
+                /* Beside the program, which is what _py2bin_dir holds.
+                   sys.executable is the interpreter's own installation on a
+                   platform that cannot resolve it to the host binary, so the
+                   report landed next to the system Python rather than next to
+                   the thing that crashed. */
+                "_where = getattr(builtins, '_py2bin_dir', '') or "
+                "os.path.dirname(os.path.abspath(sys.executable))\n"
                 "for _dir in (_where, os.path.expanduser('~')):\n"
                 "    try:\n"
                 "        _p = os.path.join(_dir, 'crash.txt')\n"
