@@ -1062,10 +1062,30 @@ def main(argv: list[str] | None = None) -> int:
             from .capi_emit import python_program_to_capi_c
 
             target = _target_from_args(args)
+            sites_wanted = list(args.site)
+            if (
+                not args.app
+                and not sites_wanted
+                and (args.auto_fetch or args.bundle_site or args.fetch_package)
+            ):
+                # Packages are going to be carried, and without `--app` there
+                # is no bundle layout to put them in. Beside the executable is
+                # the only place that travels with it, and the path has to be
+                # named *now*: it is written into the C, and this runs before
+                # the C is written. Left unnamed, the packages were copied
+                # somewhere the program never looked - or, for a target with no
+                # `Contents/` at all, the copy failed outright with "Not a
+                # directory".
+                sites_wanted = ["site-packages"]
+                print(
+                    "py2bin: carrying packages beside the executable as "
+                    "./site-packages; name somewhere else with --site",
+                    file=sys.stderr,
+                )
             generated, linked = python_program_to_capi_c(
                 entry,
                 crash_log=args.crash_log,
-                extra_paths=_site_paths(args.site),
+                extra_paths=_site_paths(sites_wanted),
             )
             if linked:
                 print(
@@ -1178,8 +1198,27 @@ def main(argv: list[str] | None = None) -> int:
                     from .requirements import discover
 
                     needs = discover(entry)
+                    # `--exclude` says the program will not import this, so
+                    # fetching it downloads a dependency tree nothing reaches.
+                    # For one application that was 379 MB of scientific stack
+                    # carried beside a program that had been told to leave the
+                    # package out. The name is matched through the same table
+                    # `discover` used, so `--exclude manim` and the project
+                    # `manim` are understood to be the same thing.
+                    from .requirements import KNOWN_PROJECTS
+
+                    unwanted = {
+                        KNOWN_PROJECTS.get(name, name) for name in args.exclude
+                    } | set(args.exclude)
+                    refused = sorted(set(needs.projects) & unwanted)
+                    if refused:
+                        print(
+                            "not fetching " + ", ".join(refused)
+                            + ": --exclude says the program will not import it",
+                            file=sys.stderr,
+                        )
                     for project in needs.projects:
-                        if project not in wanted:
+                        if project not in wanted and project not in unwanted:
                             wanted.append(project)
                     if needs.projects:
                         print(
@@ -1297,6 +1336,22 @@ def main(argv: list[str] | None = None) -> int:
                         f"path",
                         file=sys.stderr,
                     )
+            elif sites and not args.app:
+                # No bundle to put them in: they go beside the executable,
+                # under the name that was written into the C above - and
+                # through the same filter a bundle uses, so the test suites
+                # and the build metadata are left behind either way.
+                from .freezer import copy_site_packages
+
+                beside = output.parent / (
+                    sites_wanted[0] if sites_wanted else "site-packages"
+                )
+                copy_site_packages(beside, tuple(sites))
+                print(
+                    f"carried {len(sites)} package source(s) beside the "
+                    f"executable as {beside.name}/",
+                    file=sys.stderr,
+                )
             elif sites:
                 # A macOS bundle keeps them in Contents/Resources/site-packages,
                 # which --site names relative to the executable. Fetched ones

@@ -2703,6 +2703,32 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class CarriedPackageLayoutTests(unittest.TestCase):
+    """Where fetched packages go when there is no bundle to put them in."""
+
+    def test_a_bundle_and_a_bare_executable_filter_alike(self):
+        # One filter, two layouts. Carrying the test suites and the build
+        # metadata into a bare directory but not into a `.app` would be an
+        # accident of which branch ran.
+        from py2bin.freezer import copy_site_packages
+
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            source = room / "site"
+            (source / "keep").mkdir(parents=True)
+            (source / "keep" / "__init__.py").write_text("")
+            (source / "pip").mkdir()
+            (source / "pip" / "__init__.py").write_text("")
+            (source / "thing-1.0.dist-info").mkdir()
+            (source / "thing-1.0.dist-info" / "METADATA").write_text("x")
+            destination = room / "beside"
+            copy_site_packages(destination, (source,))
+            landed = sorted(p.name for p in destination.iterdir())
+            self.assertIn("keep", landed)
+            self.assertNotIn("pip", landed)
+            self.assertNotIn("thing-1.0.dist-info", landed)
+
+
 class ConcatenatedFStringTests(unittest.TestCase):
     """Few pieces are concatenated in a chain; many are gathered and joined."""
 

@@ -102,16 +102,27 @@ _UNUSED_AT_RUNTIME = (
 
 
 def bundle_site_packages(bundle: Path, sources: tuple[Path, ...]) -> None:
-    """Copy the application's packages into the bundle, without their baggage.
+    """Copy the application's packages into a macOS bundle, without baggage."""
+
+    copy_site_packages(
+        bundle / "Contents" / "Resources" / "site-packages", sources
+    )
+
+
+def copy_site_packages(destination: Path, sources: tuple[Path, ...]) -> None:
+    """Copy the application's packages to `destination`, without their baggage.
 
     A site-packages directory carries the test suites, the build metadata and
     pip itself. None of it runs; together, for one small application, it was
     29 MB of 66.
+
+    Shared by every layout rather than written twice: a target with no bundle
+    puts its packages beside the executable instead, and carrying the baggage
+    there and not in a `.app` would be an accident of which branch ran.
     """
 
     import shutil
 
-    destination = bundle / "Contents" / "Resources" / "site-packages"
     destination.mkdir(parents=True, exist_ok=True)
     for source in sources:
         for item in source.iterdir():
