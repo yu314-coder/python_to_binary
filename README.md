@@ -612,22 +612,22 @@ better; `1.00×` means the same speed as CPython.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **4.5 ms** | 9.6 ms | **2.10× faster** |
-| comparisons | **4.9 ms** | 5.8 ms | **1.19× faster** |
-| `while` loop | **4.5 ms** | 5.4 ms | **1.19× faster** |
-| integer arithmetic | **9.3 ms** | 10.9 ms | **1.17× faster** |
-| float arithmetic | **6.3 ms** | 6.7 ms | **1.06× faster** |
-| exception raise/catch | **21.1 ms** | 22.4 ms | **1.06× faster** |
-| attribute read | 7.0 ms | 5.7 ms | 0.82× |
-| comprehension | 3.9 ms | 3.2 ms | 0.81× |
-| string concatenation | 22.6 ms | 18.1 ms | 0.80× |
-| dict store | 12.0 ms | 9.0 ms | 0.75× |
-| list append | 8.8 ms | 6.3 ms | 0.72× |
-| closure call | 13.9 ms | 9.3 ms | 0.67× |
-| subscript | 12.2 ms | 8.1 ms | 0.67× |
-| f-string | 32.2 ms | 20.3 ms | 0.63× |
-| instantiation | 35.3 ms | 18.1 ms | 0.51× |
-| method call | 28.1 ms | 11.2 ms | 0.40× |
+| comprehension | **1.1 ms** | 2.9 ms | **2.56× faster** |
+| direct function call | **5.4 ms** | 11.1 ms | **2.05× faster** |
+| `while` loop | **5.4 ms** | 6.3 ms | **1.16× faster** |
+| comparisons | **5.9 ms** | 6.8 ms | **1.14× faster** |
+| integer arithmetic | **11.3 ms** | 12.8 ms | **1.13× faster** |
+| exception raise/catch | **25.0 ms** | 26.1 ms | **1.04× faster** |
+| float arithmetic | **7.7 ms** | 8.0 ms | **1.04× faster** |
+| attribute read | 8.2 ms | 6.7 ms | 0.81× |
+| string concatenation | 26.8 ms | 21.8 ms | 0.81× |
+| dict store | 14.4 ms | 10.8 ms | 0.75× |
+| f-string | 33.4 ms | 24.2 ms | 0.72× |
+| list append | 10.3 ms | 7.3 ms | 0.71× |
+| subscript | 13.8 ms | 9.3 ms | 0.68× |
+| closure call | 16.5 ms | 11.0 ms | 0.67× |
+| instantiation | 42.1 ms | 21.3 ms | 0.51× |
+| method call | 33.5 ms | 13.4 ms | 0.40× |
 
 ### Where those numbers came from
 
@@ -688,6 +688,23 @@ handed a class or an instance. For an untouched builtin exception name the
 answer is known at compile time: a call on the class answers an instance, the
 bare name is the class. The lookup itself stays live, so a replaced
 `builtins.ValueError` is still honoured. Exceptions now run at 1.06×.
+
+**An f-string of a few pieces is concatenated, not gathered and joined.** The
+join allocates a tuple to be handed the pieces in and then walks it twice -
+once to measure, once to fill - where a chain of concatenations allocates only
+the intermediates. For the three-piece f-string most programs write that is
+0.034 against 0.038; past four pieces the join's single allocation wins again
+and it takes over. Both spellings concatenate rather than add, because an
+f-string joins: `+` would ask the left piece's type for `__add__`, and a `str`
+subclass out of a `__repr__` can override that where CPython never asks.
+
+**A subscript on a proven list asks no protocol question.** `PySequence_Check`
+is a call to answer what the bindings already settled. Dropping it is worth
+about five per cent. `PySequence_GetItem` stays, though: reaching for
+`PyList_GetItem` instead was measured *slower*, because the borrowed reference
+it answers needs an increment that is an out-of-line call from here, where the
+one `PySequence_GetItem` takes on its way out is inside the interpreter
+already.
 
 **`len()` inside a hot expression is a machine integer.** `n = n + len(s)`
 was three heap allocations to add a number the C already had: `PyObject_Size`

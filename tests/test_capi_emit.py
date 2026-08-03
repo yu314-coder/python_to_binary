@@ -2508,9 +2508,12 @@ class JoinedStringTests(unittest.TestCase):
     _run = CApiEmitTests._run
 
     def test_the_pieces_are_joined_not_added(self):
+        # Five pieces - literal, value, literal, value, literal - which is
+        # past the point where the chain of concatenations stops being the
+        # cheaper shape, so this one is gathered and joined.
         source = "n = 42\nw = 'x'\nprint(f'a{n}b{w}c')\n"
         written = python_to_capi_c(source, "program.py")
-        self.assertIn("PyUnicode_Join", written)
+        self.assertIn("= PyUnicode_Join(", written)
         self._run(source, b"a42bxc\n")
 
     def test_conversions_and_specifiers_still_mean_what_they_mean(self):
@@ -2698,6 +2701,43 @@ class BorrowedOperandTests(unittest.TestCase):
             "print(make().v)\n"
         )
         self._run(source, b"5\n")
+
+
+class ConcatenatedFStringTests(unittest.TestCase):
+    """Few pieces are concatenated in a chain; many are gathered and joined."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_short_f_string_concatenates(self):
+        # Three pieces: the literal, the value, the literal.
+        source = "n = 42\nprint(f'value {n} here')\n"
+        written = python_to_capi_c(source, "program.py")
+        # The assignment form, not the extern declaration, which is always
+        # emitted for every vetted entry point whether or not it is called.
+        self.assertIn("= PyUnicode_Concat(", written)
+        self.assertNotIn("= PyUnicode_Join(", written)
+        self._run(source, b"value 42 here\n")
+
+    def test_a_long_f_string_joins(self):
+        source = "n = 1\nprint(f'{n}{n}{n}{n}{n}{n}')\n"
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("PyUnicode_Join", written)
+        self._run(source, b"111111\n")
+
+    def test_neither_shape_consults_a_subclass_add(self):
+        # Both paths must join rather than add: `+` would run the override.
+        source = (
+            "class S(str):\n"
+            "    def __add__(self, other):\n"
+            "        return 'HIJACKED'\n"
+            "class R:\n"
+            "    def __repr__(self):\n"
+            "        return S('r')\n"
+            "x = R()\n"
+            "print(f'{x!r}{x!r}c')\n"
+            "print(f'{x!r}{x!r}{x!r}{x!r}{x!r}{x!r}t')\n"
+        )
+        self._run(source, b"rrc\nrrrrrrt\n")
 
 
 class ExactContainerTests(unittest.TestCase):
@@ -3082,6 +3122,43 @@ class IndexedSubscriptTests(unittest.TestCase):
         written = python_to_capi_c(source, "program.py")
         self.assertIn("PySequence_GetItem", written)
         self._run(source, b"60\n")
+
+    def test_a_proven_list_needs_no_protocol_test(self):
+        # The bindings say it is a list, so `PySequence_Check` asks a question
+        # already answered. `PySequence_GetItem` stays: `PyList_GetItem` was
+        # measured slower, its borrowed reference needing an increment that is
+        # an out-of-line call from here.
+        source = (
+            "def run():\n"
+            "    xs = [10, 20, 30]\n"
+            "    i = 0\n"
+            "    t = 0\n"
+            "    while i < 3:\n"
+            "        t = t + xs[i]\n"
+            "        i = i + 1\n"
+            "    return t\n"
+            "print(run())\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("= PySequence_GetItem(", written)
+        # The extern declaration always appears; a *call* must not.
+        self.assertNotIn("&& PySequence_Check(", written)
+        self._run(source, b"60\n")
+
+    def test_an_unproven_container_keeps_the_test(self):
+        # `xs` arrives as a parameter, so nothing here says what it is - and
+        # a dict must keep the mapping lookup. The index is arithmetic so
+        # that it narrows and the fast path is reached at all.
+        source = (
+            "def run(xs):\n"
+            "    i = 0\n"
+            "    i = i + 0\n"
+            "    return xs[i]\n"
+            "print(run([7]), run({0: 'm'}))\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertIn("&& PySequence_Check(", written)
+        self._run(source, b"7 m\n")
 
     def test_a_dict_keeps_the_mapping_lookup(self):
         # `d[0]` is a mapping lookup and must stay one: the sequence protocol
