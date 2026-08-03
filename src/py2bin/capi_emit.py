@@ -6352,14 +6352,32 @@ class CApiEmitter:
         # - which is what lets the bundle be moved at all.
         anchor = (
             "import sys, os, builtins\n"
-            "builtins._py2bin_dir = os.path.dirname(os.path.abspath("
-            "sys.executable)) if sys.executable else ''\n"
-            # An embedded interpreter that was never given an argument vector
-            # leaves sys.argv as [''], and a library that reads argv[0] - to
-            # name a window, to find its own resources - gets an empty string
-            # where every other program has a path.
+            # Where this binary is, asked of the operating system rather
+            # than assumed. An embedded interpreter is given no argument
+            # vector, so it has nothing to locate itself from and answers
+            # `sys.executable` with the installation it was *configured*
+            # with - on Linux `/usr/local/bin/python3.14`, wherever the
+            # program actually sits. A bundle then looked for the packages it
+            # carries next to the system Python and found none of them, and
+            # the program stopped on an import of something it was shipped
+            # with. `/proc/self/exe` is the exact answer where it exists;
+            # macOS resolves `sys.executable` to the host program already.
+            "_p = ''\n"
+            "try:\n"
+            "    _p = os.readlink('/proc/self/exe')\n"
+            "except OSError:\n"
+            "    pass\n"
+            "if not _p:\n"
+            "    _a = sys.argv[0] if sys.argv and sys.argv[0] else ''\n"
+            "    if _a and not os.path.dirname(_a):\n"
+            "        import shutil\n"
+            "        _a = shutil.which(_a) or _a\n"
+            "    _p = os.path.realpath(_a) if _a else (sys.executable or '')\n"
+            "builtins._py2bin_dir = os.path.dirname(_p) if _p else ''\n"
+            # A library that reads argv[0] - to name a window, to find its own
+            # resources - gets a path rather than an empty string.
             "if not sys.argv or not sys.argv[0]:\n"
-            "    sys.argv = [sys.executable or '']\n"
+            "    sys.argv = [_p or (sys.executable or '')]\n"
         )
         out.append(f"    PyRun_SimpleString({_c_string(anchor)});")
         # Before the builtins, and before any body runs: an interned name

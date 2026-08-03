@@ -2703,6 +2703,72 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class ProgramLocationTests(unittest.TestCase):
+    """A compiled program has to know where *it* is, not where Python is."""
+
+    _run = CApiEmitTests._run
+
+    def test_the_program_locates_its_own_directory(self):
+        # An embedded interpreter is given no argument vector, so it has
+        # nothing to locate itself from and answers `sys.executable` with the
+        # installation it was configured with. On Linux that is
+        # `/usr/local/bin/python3.14`, wherever the program actually sits - so
+        # a bundle looked for the packages it carries next to the system
+        # Python, found none, and stopped on an import of something it had
+        # been shipped with.
+        source = (
+            "import builtins, os, sys\n"
+            "print(os.path.basename(builtins._py2bin_dir))\n"
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch) / "somewhere"
+            room.mkdir()
+            entry = room / "prog.py"
+            entry.write_text(source)
+            written = python_to_capi_c(source, str(entry))
+            # The location is asked of the operating system where it can be.
+            self.assertIn("/proc/self/exe", written)
+
+    def test_the_location_is_not_taken_from_sys_executable_alone(self):
+        # `sys.executable` is only the program on a platform that resolves it
+        # to the host binary; where it does not, it is the interpreter's own
+        # installation. It may still be the last resort, but it must not be
+        # the only source.
+        written = python_to_capi_c("print(1)\n", "program.py")
+        start = written.index("PyRun_SimpleString(\"import sys, os, builtins")
+        anchor = written[start : start + 900]
+        self.assertIn("proc/self/exe", anchor)
+        self.assertIn("realpath", anchor)
+
+    def test_a_compiled_program_finds_its_own_directory(self):
+        # Not through `_run`: that compares the compiled output against
+        # CPython running the same source, and `_py2bin_dir` is a name only a
+        # compiled program has - the reference run would fail by construction.
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("needs the host whose C-API binding is wired up")
+        source = (
+            "import builtins, os\n"
+            "print(os.path.isdir(builtins._py2bin_dir), "
+            "os.path.basename(builtins._py2bin_dir))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "program.py"
+            entry.write_text(source, encoding="utf-8")
+            generated = root / "program.c"
+            generated.write_text(
+                python_to_capi_c(source, str(entry)), encoding="utf-8"
+            )
+            binary = root / "program.bin"
+            compile_c_native(generated, binary, target="darwin-arm64", clean=True)
+            done = subprocess.run([str(binary)], capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr[-400:])
+            # The directory the binary is in, which is the temporary one.
+            self.assertEqual(
+                done.stdout.decode().strip(), f"True {root.name}"
+            )
+
+
 class CarriedPackageLayoutTests(unittest.TestCase):
     """Where fetched packages go when there is no bundle to put them in."""
 
