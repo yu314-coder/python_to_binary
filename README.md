@@ -352,6 +352,49 @@ Verified from a copy moved elsewhere on disk: every module the program imports
 resolves, a pty opens and echoes, Pillow still round-trips PNG/JPEG/GIF/BMP/
 WEBP/TIFF, and the app starts with no traceback.
 
+### One file, both ways
+
+"One file" means two different things, and the difference is worth more than
+the sizes. Nuitka's `--mode=onefile` produces a file that *is* the program: it
+unpacks itself into a temporary directory and runs from there, every time it
+starts. py2bin's macOS single-file shape is a `.dmg` - one file to hand over,
+out of which a `.app` is dragged once and then runs as an ordinary application.
+On Windows and Linux py2bin does produce a self-unpacking executable, like
+Nuitka's; on macOS it does not, because the platform already has a container
+for this and users know what to do with it.
+
+| | py2bin | Nuitka |
+|---|---|---|
+| shape | `.dmg` holding a `.app` | one executable that unpacks itself |
+| a plain program, to ship | 9.5 MB | **4.5 MB** |
+| its first start | **12.8 ms** | 771 ms cached, 261 ms uncached |
+| its later starts | **12.8 ms** | 38.3 ms cached, 261 ms uncached |
+| the real application | **21.8 MB** | refused - see below |
+| compile time for it | **23.3 s** | - |
+
+Nuitka's onefile is the smaller file for a program that has no third-party
+extensions, and that is a real win for it. What it charges for is every run
+after the first: unpacking costs about a quarter of a second by default,
+because the default cache mode is a temporary directory that is thrown away
+when the program exits. Told to cache instead - which needs a company and
+product name, since the cache path is built from them - it pays 771 ms once
+and 38 ms afterwards. A `.dmg` unpacks nothing at any point, so the `.app` out
+of it starts at the same 12.8 ms every time.
+
+**And for the application it was not an option at all.** Nuitka refuses
+`--mode=onefile` outright when pyobjc is in the dependency graph:
+
+```
+FATAL: options-nanny: Error, package 'Foundation' requires '--mode=app'
+```
+
+That is any pywebview program on macOS, and most GUI applications. It was
+checked against a plain program to be sure of the cause - `--mode=onefile`
+works there and stops working the moment `import objc` is added. So the row
+above is not a benchmark py2bin won; it is a shape Nuitka declines to build,
+and the 21.8 MB is what py2bin hands over for the same source. It mounts, the
+`.app` inside is 67 MB, and its signature verifies.
+
 ### How the targets are reached
 
 Every target binds its interpreter through the platform's own dynamic linker.

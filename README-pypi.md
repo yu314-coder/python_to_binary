@@ -385,6 +385,32 @@ waiting in a name until it is done. A `break` or `continue` leaving the region
 runs a copy of the cleanup first, which is what it would have reached had it
 left the ordinary way.
 
+### One file, both ways
+
+Nuitka's `--mode=onefile` makes a file that *is* the program: it unpacks itself
+to a temporary directory on every start. py2bin's macOS single-file shape is a
+`.dmg` - one file to hand over, out of which a `.app` is dragged once and then
+runs normally. (On Windows and Linux py2bin does produce a self-unpacking
+executable; on macOS the platform already has a container for this.)
+
+| | py2bin | Nuitka |
+|---|---|---|
+| shape | `.dmg` holding a `.app` | one executable that unpacks itself |
+| a plain program, to ship | 9.5 MB | **4.5 MB** |
+| its first start | **12.8 ms** | 771 ms cached, 261 ms uncached |
+| its later starts | **12.8 ms** | 38.3 ms cached, 261 ms uncached |
+| the real application | **21.8 MB** | refused |
+| compile time for it | **23.3 s** | - |
+
+Nuitka's is the smaller file for a program with no third-party extensions.
+What it charges for is the unpacking, on every run unless told to cache. A
+`.dmg` unpacks nothing, so the `.app` out of it starts the same every time.
+
+For the application it was not an option: Nuitka refuses `--mode=onefile` when
+pyobjc is in the graph - `package 'Foundation' requires '--mode=app'` - which
+is any pywebview program on macOS. That row is a shape it declines to build,
+not a benchmark it lost.
+
 ## Measured against Nuitka
 
 manim_app: 10,100 lines, pywebview + Pillow + pyobjc, built both ways on the
