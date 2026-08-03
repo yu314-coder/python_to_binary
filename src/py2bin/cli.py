@@ -1101,13 +1101,6 @@ def main(argv: list[str] | None = None) -> int:
             output = args.output
             if args.app and output.suffix != ".app":
                 output = output.with_suffix(".app")
-            if args.onefile and not args.app:
-                print(
-                    "py2bin: error: --onefile needs --app: what it packs is "
-                    "the bundle",
-                    file=sys.stderr,
-                )
-                return 2
             if args.embed_python and not args.app:
                 # `main` does not hold the parser, and reaching for one that
                 # is not there turned a refusal a user should be able to act
@@ -1469,6 +1462,18 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         continue
                     target = beside / item.name
+                    if target.resolve() == item.resolve():
+                        # Already where it is being carried to, which happens
+                        # whenever the program is built in its own directory.
+                        # The copy below clears the destination first, and
+                        # with the two the same that cleared the *source* -
+                        # `--include web` beside the output deleted `web`, and
+                        # then failed to copy what it had just removed.
+                        print(
+                            f"{item.name} is already beside the program",
+                            file=sys.stderr,
+                        )
+                        continue
                     if target.exists():
                         _shutil.rmtree(target) if target.is_dir() else target.unlink()
                     if item.is_dir():
@@ -1485,6 +1490,24 @@ def main(argv: list[str] | None = None) -> int:
                 # describes a bundle that does not exist yet.
                 sealed = seal(output)
                 print(f"sealed the bundle over {sealed} files", file=sys.stderr)
+            if args.onefile and not args.app:
+                from .onefile import pack_beside_executable
+
+                # Everything the program was given: the packages that were
+                # fetched or bundled, and whatever `--include` carried. The
+                # generated C and the fetch scratch are build leavings and
+                # stay behind - what unpacks has to be what would have run.
+                carried_names = [
+                    name for name in (sites_wanted or ["site-packages"])
+                ] + [Path(item).name for item in args.include]
+                held, total = pack_beside_executable(
+                    output, chosen, carried_names
+                )
+                print(
+                    f"packed the program and what it carries into one file "
+                    f"({held} files -> {total // 1024 // 1024} MB)",
+                    file=sys.stderr,
+                )
             if args.onefile and args.app and chosen.startswith("darwin"):
                 from .onefile import pack_app_bundle
 

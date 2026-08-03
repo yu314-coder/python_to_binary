@@ -489,3 +489,73 @@ def pack_app_bundle(
     seal(bundle)
     total = sum(item.stat().st_size for item in bundle.rglob("*") if item.is_file())
     return held, total
+
+
+def pack_beside_executable(
+    program: Path, target: str, carried: list[str]
+) -> tuple[int, int]:
+    """Fold a program and what it carries into one self-extracting file.
+
+    A target with no bundle - Linux, or a bare Windows executable - leaves its
+    packages and its data directories sitting beside the program, and all of
+    them have to travel together or none of it runs. This makes them one file:
+    the launcher unpacks the lot into a content-addressed cache the first time
+    it runs and executes the program from in there, so the directories are
+    beside it again exactly as the build left them.
+
+    Only what the program was given is packed. The generated C and the
+    fetch scratch are build leavings, and a payload that carried them would
+    unpack a copy of the compiler's workings next to the application.
+
+    Answers how many files were folded in, and the size of the file that
+    results.
+    """
+
+    program = program.resolve()
+    if not program.is_file():
+        raise ValueError(f"{program} is not a file to pack")
+    beside = program.parent
+    wanted = [program]
+    for name in dict.fromkeys(carried):
+        item = beside / name
+        if item.exists():
+            wanted.append(item)
+
+    with tempfile.TemporaryDirectory(
+        prefix="py2bin-beside-", dir=beside
+    ) as scratch:
+        room = Path(scratch)
+        # Staged rather than packed in place: `create_onefile` reads the whole
+        # directory it is given, and the directory the program sits in also
+        # holds the C it was compiled from.
+        staged = room / "payload"
+        staged.mkdir()
+        held = 0
+        for item in wanted:
+            landing = staged / item.name
+            if item.is_dir():
+                shutil.copytree(item, landing, symlinks=True)
+                held += sum(1 for f in landing.rglob("*") if f.is_file())
+            else:
+                shutil.copy2(item, landing)
+                held += 1
+        single = room / "packed"
+        create_onefile(
+            payload_root=staged,
+            output=single,
+            target=target,
+            launcher=staged / program.name,
+        )
+        # Only the program is replaced. What sat beside it is left exactly
+        # where it was, because there is no way from here to tell a directory
+        # this build copied in from one the *user* keeps there - `--include
+        # web` run in a source tree carries a directory that is already
+        # beside the output, and deleting it after packing destroys the
+        # original. The loose copies are redundant once the single file
+        # exists; which of them to remove is the caller's to decide, and it
+        # knows what it made.
+        image = single.read_bytes()
+        program.write_bytes(image)
+        program.chmod(0o755)
+
+    return held, program.stat().st_size

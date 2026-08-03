@@ -123,3 +123,68 @@ class PackedAppBundleTests(unittest.TestCase):
             plain.mkdir()
             with self.assertRaises(ValueError):
                 onefile.pack_app_bundle(plain, "darwin-arm64", "NotAnApp")
+
+
+class PackedBesideExecutableTests(unittest.TestCase):
+    """`--onefile` where there is no bundle: the program and what it carries."""
+
+    def _tree(self, root: Path) -> Path:
+        program = root / "prog"
+        program.write_bytes(b"#!/bin/sh\necho hi\n")
+        program.chmod(0o755)
+        (root / "site-packages").mkdir()
+        (root / "site-packages" / "mod.py").write_text("x = 1")
+        (root / "web").mkdir()
+        (root / "web" / "index.html").write_text("<p>hi</p>")
+        # A build leaving that must not travel with the program.
+        (root / "prog.capi.c").write_text("/* generated */")
+        return program
+
+    def test_the_payload_holds_the_program_and_what_it_carries(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            program = self._tree(root)
+            held, total = onefile.pack_beside_executable(
+                program, "linux-x86_64", ["site-packages", "web"]
+            )
+            self.assertEqual(held, 3)  # prog, mod.py, index.html
+            self.assertGreater(total, 0)
+            image = program.read_bytes()
+            self.assertIn(b"PY2BIN-ONEFILE-PAYLOAD-V1:", image)
+
+    def test_the_generated_c_is_not_packed(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            program = self._tree(root)
+            onefile.pack_beside_executable(
+                program, "linux-x86_64", ["site-packages", "web"]
+            )
+            self.assertNotIn(b"/* generated */", program.read_bytes())
+
+    def test_what_sat_beside_the_program_is_left_alone(self):
+        # There is no way from here to tell a directory the build copied in
+        # from one the user keeps there, and deleting the second is data loss.
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            program = self._tree(root)
+            onefile.pack_beside_executable(
+                program, "linux-x86_64", ["site-packages", "web"]
+            )
+            self.assertTrue((root / "web" / "index.html").is_file())
+            self.assertTrue((root / "site-packages" / "mod.py").is_file())
+
+    def test_a_name_that_is_not_there_is_skipped(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            program = self._tree(root)
+            held, _ = onefile.pack_beside_executable(
+                program, "linux-x86_64", ["site-packages", "web", "absent"]
+            )
+            self.assertEqual(held, 3)
+
+    def test_a_missing_program_is_refused(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            with self.assertRaises(ValueError):
+                onefile.pack_beside_executable(
+                    Path(scratch) / "nothing", "linux-x86_64", []
+                )
