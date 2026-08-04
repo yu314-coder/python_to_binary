@@ -17,7 +17,7 @@ against each other, and which one you want depends on which you care about.
 
 | | `compile` | `compile-capi` | `freeze` |
 |---|---|---|---|
-| **speed** on a 30M-iteration loop | **0.06 s** | 0.49 s | 0.74 s |
+| **speed** on a 30M-iteration loop | **0.05 s** | 0.44 s | 0.74 s |
 | **artifact** | **32 KB** | 50 KB | 24 MB |
 | **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
 | **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
@@ -26,7 +26,7 @@ against each other, and which one you want depends on which you care about.
 
 **`compile` is the fastest and the smallest.** Python AST → py2bin IR →
 optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
-interpreter in the artifact and none on the machine: 12× faster than CPython on
+interpreter in the artifact and none on the machine: 14× faster than CPython on
 that loop, in 32 KB that runs on a bare system. You pay for it in what it will
 accept - integers, floats, strings, control flow, your own functions - and it
 will not import a package at all.
@@ -701,23 +701,30 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.1 ms** | 7.4 ms | **2.41× faster** |
-| integer arithmetic | **5.5 ms** | 8.7 ms | **1.57× faster** |
-| `while` loop | **4.8 ms** | 6.8 ms | **1.42× faster** |
-| comparisons | **3.9 ms** | 4.7 ms | **1.22× faster** |
-| float arithmetic | **5.6 ms** | 5.9 ms | **1.05× faster** |
-| exception raise/catch | **20.3 ms** | 20.4 ms | **1.01× faster** |
-| list append | 6.0 ms | 5.9 ms | 0.98× |
-| comprehension | 6.5 ms | 6.2 ms | 0.96× |
-| dict store | 8.9 ms | 8.4 ms | 0.94× |
-| f-string | 24.9 ms | 18.4 ms | 0.74× |
-| string concatenation | 6.8 ms | 4.7 ms | 0.70× |
-| subscript | 8.9 ms | 6.3 ms | 0.70× |
-| `and` / `or` | 8.9 ms | 5.9 ms | 0.67× |
-| attribute read | 6.5 ms | 3.8 ms | 0.58× |
-| closure call | 12.7 ms | 6.8 ms | 0.54× |
-| instantiation | 40.2 ms | 16.6 ms | 0.41× |
-| method call | 16.8 ms | 6.9 ms | 0.41× |
+| direct function call | **2.8 ms** | 6.9 ms | **2.50× faster** |
+| integer arithmetic | **5.0 ms** | 8.1 ms | **1.61× faster** |
+| `while` loop | **4.4 ms** | 6.5 ms | **1.46× faster** |
+| comparisons | **3.9 ms** | 4.5 ms | **1.15× faster** |
+| float arithmetic | **5.1 ms** | 5.5 ms | **1.08× faster** |
+| exception raise/catch | **19.0 ms** | 19.2 ms | **1.01× faster** |
+| comprehension | 5.8 ms | 5.6 ms | 0.96× |
+| dict store | 8.1 ms | 7.7 ms | 0.96× |
+| list append | 5.4 ms | 5.1 ms | 0.95× |
+| subscript | 7.9 ms | 5.9 ms | 0.75× |
+| f-string | 23.5 ms | 17.1 ms | 0.73× |
+| string concatenation | 6.5 ms | 4.5 ms | 0.69× |
+| `and` / `or` | 9.0 ms | 5.9 ms | 0.66× |
+| attribute read | 6.9 ms | 4.0 ms | 0.57× |
+| closure call | 12.6 ms | 6.9 ms | 0.55× |
+| instantiation | 37.2 ms | 15.7 ms | 0.42× |
+| method call | 15.8 ms | 6.4 ms | 0.41× |
+
+Ratios are computed from the unrounded timings, so dividing the millisecond
+figures as shown gives a slightly different number in the last decimal.
+
+One recorded run, the one in `benchmarks/last-run.json`. Repeat it and the
+figures move by a few per cent either way - which rows beat the interpreter,
+and by roughly how much, does not.
 
 ### Where those numbers came from
 
@@ -1167,11 +1174,11 @@ python3 benchmarks/vs_nuitka.py
 
 | | this | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | **0.067** | 0.108 | 0.100 |
-| `while` loop | **0.057** | 0.083 | 0.062 |
-| nested loops | **0.023** | 0.028 | 0.031 |
-| function calls | **0.022** | 0.040 | 0.036 |
-| string building | **0.024** | 0.028 | 0.026 |
+| integer arithmetic | **0.061** | 0.099 | 0.094 |
+| `while` loop | **0.055** | 0.084 | 0.062 |
+| nested loops | **0.021** | 0.025 | 0.027 |
+| function calls | **0.020** | 0.038 | 0.036 |
+| string building | **0.022** | 0.024 | 0.026 |
 
 Read these as whole-process numbers and not as pure throughput. Two of the
 five rows finish in under thirty milliseconds, and start-up is a large share
@@ -1248,9 +1255,9 @@ Startup, `print("x")`, median of 13 runs, same M4:
 
 | | startup | on disk |
 |---|---|---|
-| this, `compile-capi` | **10.0 ms** | **49 KB** |
-| CPython | 13.3 ms | - |
-| Nuitka `--standalone` | 15.2 ms | 17.2 MB |
+| this, `compile-capi` | **10.1 ms** | **49 KB** |
+| CPython | 13.8 ms | - |
+| Nuitka `--standalone` | 15.4 ms | 17.2 MB |
 
 A `compile-capi` binary links the interpreter it was built against and starts
 by calling `Py_Initialize`, skipping the interpreter's own startup path -

@@ -34,13 +34,19 @@ app's iPad/iPhone build is a separate native Swift port embedding CPython for
 **An iPad can build all three of them, though.** py2bin has no compiler,
 assembler or linker behind it - it writes the machine code and the Mach-O, PE
 and ELF itself - so a cross-build is arithmetic and file writing, which a
-sandbox allows. Run inside the embedded Python of the iPad app, it produced a
-Windows `.exe`, a macOS `.app` and `.dmg`, and a Linux arm64 ELF; each was
-carried off by USB and opened on the machine it was built for. Nothing on that
-path needs `subprocess`, `ctypes`, `fork` or `exec` - every target still
-compiles with all of them removed from the interpreter, which is a test. What
-an iPad cannot do is *run* the result: an App Store app cannot `exec` an
-arbitrary binary.
+sandbox allows. Run inside the embedded Python of the iPad app:
+
+| built on iPadOS | artifact | carried off by | opened on the target |
+|---|---|---|---|
+| Windows x86-64 | `.exe` | USB | ✅ opens and runs |
+| macOS arm64 | `.app`, and a `.dmg` of it | USB | ✅ opens and runs |
+| Linux arm64 | ELF executable | USB | ✅ opens and runs |
+
+Nothing on that path needs `subprocess`, `ctypes`, `fork` or `exec` - every
+target still compiles with all of them removed from the interpreter, which is
+a test. The iPad is a build machine and nothing else: an App Store app cannot
+`exec` an arbitrary binary, so there is no such thing as a py2bin artifact
+that runs on the tablet that made it.
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
@@ -154,7 +160,7 @@ against each other, and which one you want depends on which you care about.
 
 | | `compile` | `compile-capi` | `freeze` |
 |---|---|---|---|
-| **speed** on a 30M-iteration loop | **0.06 s** | 0.49 s | 0.74 s |
+| **speed** on a 30M-iteration loop | **0.05 s** | 0.44 s | 0.74 s |
 | **artifact** | **32 KB** | 50 KB | 24 MB |
 | **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
 | **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
@@ -163,7 +169,7 @@ against each other, and which one you want depends on which you care about.
 
 **`compile` is the fastest and the smallest.** Python AST → py2bin IR →
 optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
-interpreter in the artifact and none on the machine: 12× faster than CPython on
+interpreter in the artifact and none on the machine: 14× faster than CPython on
 that loop, in 32 KB that runs on a bare system. You pay for it in what it will
 accept - integers, floats, strings, control flow, your own functions - and it
 will not import a package at all.
@@ -415,30 +421,37 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.1 ms** | 7.4 ms | **2.41× faster** |
-| integer arithmetic | **5.5 ms** | 8.7 ms | **1.57× faster** |
-| `while` loop | **4.8 ms** | 6.8 ms | **1.42× faster** |
-| comparisons | **3.9 ms** | 4.7 ms | **1.22× faster** |
-| float arithmetic | **5.6 ms** | 5.9 ms | **1.05× faster** |
-| exception raise/catch | **20.3 ms** | 20.4 ms | **1.01× faster** |
-| list append | 6.0 ms | 5.9 ms | 0.98× |
-| comprehension | 6.5 ms | 6.2 ms | 0.96× |
-| dict store | 8.9 ms | 8.4 ms | 0.94× |
-| f-string | 24.9 ms | 18.4 ms | 0.74× |
-| string concatenation | 6.8 ms | 4.7 ms | 0.70× |
-| subscript | 8.9 ms | 6.3 ms | 0.70× |
-| `and` / `or` | 8.9 ms | 5.9 ms | 0.67× |
-| attribute read | 6.5 ms | 3.8 ms | 0.58× |
-| closure call | 12.7 ms | 6.8 ms | 0.54× |
-| instantiation | 40.2 ms | 16.6 ms | 0.41× |
-| method call | 16.8 ms | 6.9 ms | 0.41× |
+| direct function call | **2.8 ms** | 6.9 ms | **2.50× faster** |
+| integer arithmetic | **5.0 ms** | 8.1 ms | **1.61× faster** |
+| `while` loop | **4.4 ms** | 6.5 ms | **1.46× faster** |
+| comparisons | **3.9 ms** | 4.5 ms | **1.15× faster** |
+| float arithmetic | **5.1 ms** | 5.5 ms | **1.08× faster** |
+| exception raise/catch | **19.0 ms** | 19.2 ms | **1.01× faster** |
+| comprehension | 5.8 ms | 5.6 ms | 0.96× |
+| dict store | 8.1 ms | 7.7 ms | 0.96× |
+| list append | 5.4 ms | 5.1 ms | 0.95× |
+| subscript | 7.9 ms | 5.9 ms | 0.75× |
+| f-string | 23.5 ms | 17.1 ms | 0.73× |
+| string concatenation | 6.5 ms | 4.5 ms | 0.69× |
+| `and` / `or` | 9.0 ms | 5.9 ms | 0.66× |
+| attribute read | 6.9 ms | 4.0 ms | 0.57× |
+| closure call | 12.6 ms | 6.9 ms | 0.55× |
+| instantiation | 37.2 ms | 15.7 ms | 0.42× |
+| method call | 15.8 ms | 6.4 ms | 0.41× |
+
+Ratios are computed from the unrounded timings, so dividing the millisecond
+figures as shown gives a slightly different number in the last decimal.
+
+One recorded run, the one in `benchmarks/last-run.json` in the repository.
+Repeat it and the figures move by a few per cent either way - which rows beat
+the interpreter, and by roughly how much, does not.
 
 ### Where those numbers came from
 
 Nine of the seventeen rows sit at 0.80× or better and six beat the interpreter
 outright. Most did not a short while ago.
 
-| row | was | now | what it was |
+| row | before the fix | after it | what it was |
 |---|---|---|---|
 | direct function call | 0.81× | **2.10×** | the call hid the arithmetic from the register analysis |
 | exception raise/catch | 0.49× | **1.06×** | every raise classified its argument through a Python-level `type()` |
@@ -530,6 +543,11 @@ pyobjc is in the graph, which is any pywebview program.
 manim_app: 10,100 lines, pywebview + Pillow + pyobjc, built both ways on the
 same machine.
 
+> **The two bundle tables were taken at 0.8.5 and have not been re-taken.**
+> They need the application's own virtualenv staged into wheels, which is not
+> a build this repository can run on its own. Every other figure here was
+> re-measured for 0.8.7.
+
 | | py2bin | Nuitka |
 |---|---|---|
 | whole `.app` | **66.0 MB** | 73.5 MB |
@@ -543,11 +561,11 @@ Apple M4 against **Nuitka 4.1.3 `--standalone`**:
 
 | workload | py2bin | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | **0.067** | 0.108 | 0.100 |
-| `while` loop | **0.057** | 0.083 | 0.062 |
-| nested loops | **0.023** | 0.028 | 0.031 |
-| function calls | **0.022** | 0.040 | 0.036 |
-| string building | **0.024** | 0.028 | 0.026 |
+| integer arithmetic | **0.061** | 0.099 | 0.094 |
+| `while` loop | **0.055** | 0.084 | 0.062 |
+| nested loops | **0.021** | 0.025 | 0.027 |
+| function calls | **0.020** | 0.038 | 0.036 |
+| string building | **0.022** | 0.024 | 0.026 |
 
 Two of those rows finish in under thirty milliseconds, so start-up is a large
 share of them - a real difference between the three rather than a distortion.
@@ -556,6 +574,44 @@ compiler's weaknesses do not show up in a five-loop benchmark at all; for
 those read the grid above, where method call and instantiation sit at 0.41×.
 Put a hot loop at module level instead of in a function and the loop advantage
 goes away, because module-scope names are not narrowed into registers.
+
+### What a build costs
+
+Run time is what a user waits for; build memory is what decides whether the
+build runs at all. py2bin never starts a C toolchain. Peak resident set of the
+whole build process tree, sampled every 25 ms. Nuitka keeps a ccache and a
+module cache and py2bin keeps none, so both answers are given - py2bin's
+column is the same in each.
+
+**Cold** - a first build, or CI without a warm cache:
+
+| what is being built | py2bin | | Nuitka | |
+|---|---|---|---|---|
+| a small program (~10 lines) | **38-42 MB** | **0.1-0.2 s** | 564-719 MB | 17-18 s |
+| 200 functions | **186 MB** | **2.0 s** | 678 MB | 18.7 s |
+| 1,000 functions | **601 MB** | **7.5 s** | 833 MB | 23.7 s |
+| 3,000 functions | **1,514 MB** | **22.0 s** | 1,740 MB | 36.3 s |
+
+**Warm** - Nuitka's cache in place, which is what a second build gets:
+
+| what is being built | py2bin | | Nuitka | |
+|---|---|---|---|---|
+| a small program | **40-42 MB** | **0.1-0.2 s** | 294-303 MB | 3.6-4.4 s |
+| 200 functions | **186 MB** | **2.0 s** | 417 MB | 4.7 s |
+| 1,000 functions | **601 MB** | **7.3 s** | 762 MB | 7.9 s |
+| 3,000 functions | 1,568 MB | 21.0 s | **1,517 MB** | **17.1 s** |
+
+A small build costs a seventh of a warm Nuitka's and a fifteenth of a cold
+one, which is the whole reason an iPad can run one. The advantage narrows with
+program size: nothing here streams, so the curve is steeper than clang's.
+
+Startup, `print("x")`, median of 13 runs, same M4:
+
+| | startup | on disk |
+|---|---|---|
+| py2bin `compile-capi` | **10.1 ms** | **49 KB** |
+| CPython | 13.8 ms | - |
+| Nuitka `--standalone` | 15.4 ms | 17.2 MB |
 
 Loops beat both because a local the analysis picks out is held in a register
 rather than on the heap, with the overflow check that falls back to unbounded
