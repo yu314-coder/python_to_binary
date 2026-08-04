@@ -1128,6 +1128,11 @@ CPython. Use `--embed-python` with `--app` on macOS to carry it instead.
 has to be signed *after* everything is in place, which `--app` does. If you
 change a file inside a built bundle, seal it again.
 
+**"this translation unit needs more than 524288 bytes of stack frame".** One
+compiled function may not exceed a 512 KB frame, which is about 1,800
+statements of ordinary shape in a single `def`. It is a limit on one function,
+not on a program - 3,000 separate `def`s are fine. Split the function.
+
 **`--icon` did nothing on Linux.** An ELF has nowhere to carry one; Linux
 reads an application's icon from a `.desktop` entry. py2bin says so now rather
 than accepting the flag in silence.
@@ -1174,6 +1179,43 @@ loop in a function, as any real program does.
 Both compile the same source on the same machine against the same CPython
 3.14. Nuitka drives Apple's clang; this drives its own C compiler, which is
 the whole point of the row below it.
+
+### What a build costs
+
+Run time is what a user waits for; build memory is what decides whether the
+build runs at all. py2bin writes the machine code, the object file and the
+container in Python and never starts a C toolchain. Nuitka writes C and hands
+it to Apple's clang. Peak resident set of the **whole process tree** - parent
+and every descendant, summed, sampled every 25 ms:
+
+```sh
+python3 benchmarks/build_memory.py
+```
+
+| what is being built | py2bin | | Nuitka | |
+|---|---|---|---|---|
+| a small program (5 cases, ~10 lines) | **38-41 MB** | **0.1 s** | 292-336 MB | 3.5 s |
+| 200 functions | **186 MB** | **1.9 s** | 415 MB | 4.6 s |
+| 1,000 functions | **601 MB** | **7.2 s** | 723 MB | 10.0 s |
+| 3,000 functions | 1,567 MB | **20.8 s** | **1,522 MB** | 23.1 s |
+
+**On a small program a build costs about a seventh of what Nuitka's does** -
+40 MB against 300 - and finishes in a tenth of the time. That is the whole
+reason an iPad can run one.
+
+**The advantage narrows as the program grows, and at three thousand functions
+it is gone**: 1,567 MB against 1,522, which is a loss. Nothing here streams -
+the program, its IR, its C and its machine code are all live in memory at
+once - so the curve is steeper than clang's, which compiles a translation
+unit at a time and forgets it. For anything of ordinary size the first row is
+what applies; for a very large generated program, budget accordingly.
+
+**One function may not exceed a 512 KB stack frame**, which works out at
+around 1,800 statements of ordinary shape in a single `def`. This is a limit
+on one function and not on a program: 3,000 separate `def`s compile without
+complaint, and it was a `main()` of 3,000 statements that found it. Generated
+code is where this bites; splitting the function is the fix, and the error
+says so at build time rather than producing something broken.
 
 Startup, `print("x")`, median of 13 runs, same M4:
 

@@ -9,6 +9,7 @@ python3 benchmarks/run.py              # the 17-row grid against CPython
 python3 benchmarks/run.py subscript    # one row
 python3 benchmarks/vs_nuitka.py        # whole-process, against CPython and Nuitka
 python3 benchmarks/vs_nuitka.py --skip-nuitka
+python3 benchmarks/build_memory.py     # what a build costs in RAM and time
 ```
 
 ## The machine the published numbers were taken on
@@ -30,7 +31,7 @@ binary against the wrong one is the easiest way to publish a number that is
 not true, so both harnesses compile a probe, ask *it* which interpreter it
 ended up using, and time that one. Neither harness lets you pick.
 
-## Two suites, because there are two questions
+## Three suites, because there are three questions
 
 `run.py` times **only the hot loop, inside the process**. A row that takes a
 millisecond would otherwise be buried under ten milliseconds of start-up.
@@ -41,6 +42,16 @@ process, which would let one column warm up on the other's cache state.
 running the artifact waits for, and because start-up is a genuine difference
 between the three. Read those rows knowing that: two of the five finish in
 under thirty milliseconds, where start-up is much of the total.
+
+`build_memory.py` measures what the **build** costs, which is what decides
+whether it can run somewhere small. Peak resident set of the whole process
+tree - parent and every descendant, **summed** rather than maxed, because a
+peak of one 400 MB clang is a different thing from four at once. `ru_maxrss`
+is reported beside it as a floor when it rose during the build; read it only
+as "some single child got at least this big", never as a total, and never
+across builds - it is a running maximum for the life of the harness process,
+which reported a previous build's clang as this build's peak until that was
+caught.
 
 ## Writing a case
 
