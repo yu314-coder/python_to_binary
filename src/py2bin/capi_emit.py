@@ -2791,6 +2791,7 @@ class CApiEmitter:
             and not node.args
             and not node.keywords
             and self.methods_of
+            and self.builtin_untouched("super")
         ):
             # `super()` is `super(__class__, self)`, and CPython supplies those
             # two through a cell it creates for any method that mentions the
@@ -2827,28 +2828,37 @@ class CApiEmitter:
         # so it printed the length where CPython printed what the program's
         # own function returned - a wrong answer, silently.
         shortcut = self.builtin_untouched(node.func.id)
-        if shortcut and node.func.id == "len":
+        if shortcut and node.func.id in ("len", "str"):
+            # `len` and `str` go straight to `PyObject_Size` and
+            # `PyObject_Str` whenever the *program* has not bound the name.
+            # Unlike `print`, they are not checked against `builtins` at run
+            # time: the check is a dictionary probe on every call, and these
+            # two appear in the innermost loops a program has - it measured a
+            # fifth of the time on a loop that calls both. Replacing
+            # `builtins.len` is also a different sort of act from replacing
+            # `builtins.print`: harnesses capture output routinely, and
+            # nothing replaces `len` without breaking the interpreter's own
+            # machinery along with it. The trade is stated in the README
+            # beside the row it costs.
+            spelled = node.func.id
             if len(node.args) != 1:
-                raise self.fail(node, "len() takes one argument")
+                raise self.fail(node, f"{spelled}() takes one argument")
             value, owned = self.operand(node.args[0], indent)
-            measured = self.machine_slot()
-            # `PyObject_Size` answers -1 with the exception set when the
-            # object has no length. Boxing that unchecked answered `-1` where
-            # `len(5)` raises - and left the exception set for whatever ran
-            # next to trip over.
-            self.emit(f"{measured} = PyObject_Size({value});", indent)
-            self.release(value, owned, indent)
-            self.emit(f"if ({measured} < 0) {{ {self.failure()} }}", indent)
             target = self.temporary()
-            self.emit(f"{target} = PyLong_FromLongLong({measured});", indent)
-            return self.checked(target, indent)
-        if shortcut and node.func.id == "str":
-            if len(node.args) != 1:
-                raise self.fail(node, "str() takes one argument")
-            value = self.expression(node.args[0], indent)
-            target = self.temporary()
-            self.emit(f"{target} = PyObject_Str({value});", indent)
-            self.emit(f"Py_DecRef({value});", indent)
+            if spelled == "len":
+                measured = self.machine_slot()
+                # `PyObject_Size` answers -1 with the exception set when the
+                # object has no length; boxing that unchecked answered -1
+                # where `len(5)` raises.
+                self.emit(f"{measured} = PyObject_Size({value});", indent)
+                self.release(value, owned, indent)
+                self.emit(f"if ({measured} < 0) {{ {self.failure()} }}", indent)
+                self.emit(
+                    f"{target} = PyLong_FromLongLong({measured});", indent
+                )
+            else:
+                self.emit(f"{target} = PyObject_Str({value});", indent)
+                self.release(value, owned, indent)
             return self.checked(target, indent)
         # A spread, or any keyword, has to go through the callable form: the
         # direct C call passes arguments by position and has nowhere to put a
@@ -4769,7 +4779,13 @@ class CApiEmitter:
             isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name)
             and node.value.func.id == "print"
+            and self.builtin_untouched("print")
         ):
+            # Only when the program has not bound the name itself. Writing
+            # straight to `sys.stdout` is right for the builtin and wrong for
+            # a `def print` of the program's own, which was being skipped in
+            # silence - the output went out, just not through the function the
+            # program wrote.
             self.write_out(node.value, indent)
             return
         call = node.value
@@ -4796,6 +4812,29 @@ class CApiEmitter:
         value = self.expression(node.value, indent)
         self.emit(f"Py_DecRef({value});", indent)
 
+    def still_the_builtin(self, name: str, indent: int) -> str:
+        """A C flag: is `builtins.<name>` still the object it was at start-up?
+
+        The shortcuts below reach past the name to what it usually means -
+        `print` writes to `sys.stdout`, `len` calls `PyObject_Size`. That is
+        only right while the name still means that. A program is free to put
+        something else on `builtins`, and test harnesses and logging shims do,
+        so the shortcut asks first: one dictionary probe and a pointer compare
+        against the object cached at start-up, against a whole call saved when
+        the answer is yes - and the ordinary path taken when it is no.
+        """
+
+        live = self.builtin_raw(name, indent)
+        answer = self.temporary_flag()
+        slot = self.cached_builtins.get(name)
+        if slot is None:
+            slot = f"_py2bin_b{len(self.cached_builtins)}"
+            self.cached_builtins[name] = slot
+        self.emit(f"{answer} = ({live} == {slot});", indent)
+        self.emit(f"if ({live}) Py_DecRef({live});", indent)
+        self.emit(f"else PyErr_Clear();", indent)
+        return answer
+
     def write_out(self, node: ast.Call, indent: int) -> None:
         """print(...) - straight to sys.stdout through the file API."""
 
@@ -4816,16 +4855,40 @@ class CApiEmitter:
         # them let `print("x:", loud())` write "x: " before loud() spoke, and
         # let `print(7, 1 // 0)` write "7 " before raising.
         values = [self.expression(argument, indent) for argument in node.args]
+        # Writing to the stream is only what `print` means while `print` still
+        # means the builtin. A program that puts its own callable on
+        # `builtins` - which harnesses that capture output do - gets that
+        # callable, with the arguments already evaluated above so each is
+        # computed exactly once whichever arm runs.
+        original = self.still_the_builtin("print", indent)
+        self.emit(f"if ({original}) {{", indent)
         stream = self.temporary()
-        self.emit(f'{stream} = PySys_GetObject("stdout");', indent)
+        self.emit(f'{stream} = PySys_GetObject("stdout");', indent + 1)
         for position, value in enumerate(values):
             if position:
-                self.emit(f'PyFile_WriteString(" ", {stream});', indent)
+                self.emit(f'PyFile_WriteString(" ", {stream});', indent + 1)
             # Py_PRINT_RAW is 1: str() of the object rather than its repr,
             # which is what print writes.
-            self.emit(f"PyFile_WriteObject({value}, {stream}, 1);", indent)
-            self.emit(f"Py_DecRef({value});", indent)
-        self.emit(f'PyFile_WriteString("\\n", {stream});', indent)
+            self.emit(f"PyFile_WriteObject({value}, {stream}, 1);", indent + 1)
+            self.emit(f"Py_DecRef({value});", indent + 1)
+        self.emit(f'PyFile_WriteString("\\n", {stream});', indent + 1)
+        self.emit("} else {", indent)
+        replaced = self.program_name("print", indent + 1)
+        array = self.argument_array(max(len(values), 1))
+        for position, value in enumerate(values):
+            self.emit(f"{array}[{position}] = {value};", indent + 1)
+        answer = self.temporary()
+        self.emit(
+            f"{answer} = PyObject_Vectorcall({replaced}, {array}, "
+            f"{len(values)}LL, 0);",
+            indent + 1,
+        )
+        self.emit(f"Py_DecRef({replaced});", indent + 1)
+        for value in values:
+            self.emit(f"Py_DecRef({value});", indent + 1)
+        self.emit(f"if (!{answer}) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"Py_DecRef({answer});", indent + 1)
+        self.emit("}", indent)
 
     def conditional(self, node: ast.If, indent: int) -> None:
         decision = self.truth(node.test, indent)

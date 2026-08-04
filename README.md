@@ -749,6 +749,21 @@ because it includes `Python.h` and reads `ob_type` directly. That is the trade
 this compiler makes the other way, and it is why one binary here runs against
 a CPython it was not built against.
 
+**A builtin the program shadows is the program's.** `def len(x)` of your own,
+a local `str`, a `super` bound to something else - the compiler reaches past
+the name to the C entry point only when nothing in the program has bound it.
+That was not always true, and the failure was silent: a module defining its
+own `len` printed the length instead of calling its function.
+
+`print` is checked at run time as well, against the object `builtins` held at
+start-up, because replacing it is a thing programs actually do - harnesses
+capture output that way. `len` and `str` are not, and that is a trade rather
+than an oversight: the check is a dictionary probe on every call, these two
+appear in the innermost loops a program has, and it measured a fifth of the
+running time of a loop that calls both. Nothing replaces `builtins.len`
+without breaking the interpreter's own machinery along with it, so the
+exchange is a real cost against an imagined case.
+
 **Attribute access still loses**, and the reason is worth stating plainly
 rather than leaving as a number. CPython caches a `LOAD_ATTR` against the
 type's version tag and, on a hit, reads the value straight out of the instance

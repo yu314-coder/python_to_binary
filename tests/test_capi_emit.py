@@ -2703,6 +2703,65 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class ShadowedBuiltinTests(unittest.TestCase):
+    """A builtin the program binds is the program's, not the shortcut's."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_program_defined_print_is_used(self):
+        source = (
+            "def print(*a):\n"
+            "    import sys\n"
+            "    sys.stdout.write('S:' + ' '.join(map(str, a)) + '\\n')\n"
+            "print('hi', 1)\n"
+        )
+        self._run(source, b"S:hi 1\n")
+
+    def test_a_replaced_builtin_print_is_used(self):
+        # Checked at run time against what `builtins` held at start-up, so a
+        # harness that captures output by replacing `print` gets its calls.
+        source = (
+            "import builtins\n"
+            "_real = builtins.print\n"
+            "def loud(*a, **k):\n"
+            "    _real('LOUD:', *a, **k)\n"
+            "builtins.print = loud\n"
+            "print('x')\n"
+        )
+        self._run(source, b"LOUD: x\n")
+
+    def test_a_shadowed_super_is_the_programs_own(self):
+        source = (
+            "class A:\n"
+            "    def f(self): return 'A'\n"
+            "class B(A):\n"
+            "    def f(self):\n"
+            "        super = lambda: A()\n"
+            "        return 'B+' + super().f()\n"
+            "print(B().f())\n"
+        )
+        self._run(source, b"B+A\n")
+
+    def test_len_and_str_bound_by_the_program_are_the_programs(self):
+        source = (
+            "def len(x): return 'mine'\n"
+            "def go():\n"
+            "    str = lambda v: 'also mine'\n"
+            "    return str(1)\n"
+            "print(len([1, 2]), go())\n"
+        )
+        self._run(source, b"mine also mine\n")
+
+    def test_len_and_str_are_not_rechecked_against_builtins(self):
+        # The documented trade: `print` is verified at run time, `len` and
+        # `str` are not, because the check costs a dictionary probe in the
+        # innermost loops a program has. Pinned so the choice cannot drift
+        # without someone deciding to change it.
+        written = python_to_capi_c("print(len('ab'), str(1))\n", "program.py")
+        self.assertIn("PyObject_Size(", written)
+        self.assertIn("= PyObject_Str(", written)
+
+
 class ProgramLocationTests(unittest.TestCase):
     """A compiled program has to know where *it* is, not where Python is."""
 
