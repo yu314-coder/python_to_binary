@@ -2703,6 +2703,46 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class SyntaxErrorReportTests(unittest.TestCase):
+    """A program that will not parse gets an error, not a traceback."""
+
+    def _compile(self, source: str):
+        import io
+        import contextlib
+        from py2bin.cli import main as cli
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            entry = room / "bad.py"
+            entry.write_text(source, encoding="utf-8")
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                code = cli([
+                    "compile-capi", str(entry), "-o", str(room / "out"), "--clean"
+                ])
+            return code, captured.getvalue(), entry
+
+    UNPARSEABLE = 'def f(\n  print("unclosed"\n'
+
+    def test_it_names_the_file_and_the_line(self):
+        code, text, entry = self._compile(self.UNPARSEABLE)
+        self.assertEqual(code, 2)
+        self.assertIn(str(entry), text)
+        self.assertIn(":2", text)
+
+    def test_it_shows_the_offending_line(self):
+        _, text, _ = self._compile(self.UNPARSEABLE)
+        self.assertIn('print("unclosed"', text)
+
+    def test_it_is_not_a_traceback_through_py2bin(self):
+        # The failure used to arrive as a Python traceback through this
+        # compiler's own frames, ending at "<unknown>" - which tells a reader
+        # about py2bin and nothing about the file they wrote.
+        _, text, _ = self._compile("def f(\n")
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("<unknown>", text)
+        self.assertNotIn("capi_emit.py", text)
+
+
 class ShadowedBuiltinTests(unittest.TestCase):
     """A builtin the program binds is the program's, not the shortcut's."""
 

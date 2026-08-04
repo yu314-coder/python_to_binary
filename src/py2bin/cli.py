@@ -719,7 +719,38 @@ def _embedded_python_path() -> str:
     )
 
 
+def _report_syntax_error(error: SyntaxError) -> int:
+    """Say where the program is wrong, in the shape a compiler says it.
+
+    A `SyntaxError` from the program being compiled used to come out as a
+    traceback through this compiler's own frames, ending at `<unknown>`. That
+    tells a reader about py2bin and nothing about the file they wrote.
+    """
+
+    where = error.filename or "<program>"
+    line = f":{error.lineno}" if error.lineno else ""
+    column = f":{error.offset}" if error.offset else ""
+    print(f"py2bin: error: {where}{line}{column}: {error.msg}", file=sys.stderr)
+    if error.text:
+        print(f"    {error.text.rstrip()}", file=sys.stderr)
+        if error.offset and error.offset >= 1:
+            print("    " + " " * (error.offset - 1) + "^", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Run one command, reporting a program's own syntax error as an error."""
+
+    try:
+        return _main(argv)
+    except SyntaxError as error:
+        # Raised while reading the program, from any of the several places
+        # that parse it. Caught here rather than at each of them, because
+        # what a reader needs is the same wherever it came from.
+        return _report_syntax_error(error)
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "make":
         # Before anything else looks at the arguments: this command has

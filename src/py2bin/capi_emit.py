@@ -6601,7 +6601,11 @@ def imported_names(path: Path) -> set[str]:
     """The top-level module names this file imports."""
 
     found: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    # Named, so a syntax error in the program says which file and not
+    # "<unknown>", which is what `ast.parse` calls a source with no filename.
+    for node in ast.walk(
+        ast.parse(path.read_text(encoding="utf-8"), str(path))
+    ):
         if isinstance(node, ast.Import):
             found.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
