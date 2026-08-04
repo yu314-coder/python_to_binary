@@ -607,14 +607,24 @@ a way to carry them:
   separately and therefore reads every byte, which is what lets
   `PyUnicode_DecodeUTF8` and `PyBytes_FromStringAndSize` take one.
 
-**What is still refused, and why.** Of the 889 demo programs, four ask for a
+**What is still refused, and why.** Of the 889 demo programs, four asked for a
 frame larger than the 512 KB budget. One of them, `hugef.py`, genuinely does:
-67,001 named locals is 536 KB before anything else. The other three do not -
-`big.py` uses ten temporary slots - and are refused because the *C front end*
-allocates a stack slot per expression temporary across the whole translation
-unit without reusing any, which is the same defect that was fixed one level up
-in the Python-to-C emitter. Recorded rather than fixed: it needs liveness in
-the C lowerer.
+67,001 named locals is 536 KB before anything else, and no amount of reuse
+changes what a program names. The other three did not - `big.py` uses ten
+temporary slots - and were refused because the *C front end* took a stack slot
+for every expression temporary and never gave one back, so a function's frame
+grew with its length rather than with how much of it was live.
+
+**That one is fixed as of 0.8.7.** Slots taken for a statement's temporaries
+are handed back when the statement finishes, and the frame is built from the
+high-water mark rather than from whatever is outstanding at the end - reading
+the live count instead would hand a function a frame smaller than the offsets
+written into its own code. Reclaiming stops at a floor that locals and the
+float formatter's scratch raise, because those outlive the statement that
+made them; and it is done per *statement* rather than per expression, which is
+what keeps a loop's condition alive across its own body. Forty thousand
+statements in a single `def` now compile and answer correctly where 1,900 was
+refused. `hugef.py` is still refused and always will be.
 
 **`with` closes however the body ends.** `__exit__` was written after the body,
 so it ran only when the body fell off the end - a `break`, a `return` or an

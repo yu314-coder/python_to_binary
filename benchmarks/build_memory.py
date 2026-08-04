@@ -121,10 +121,12 @@ def _build(command: list[str], env: dict[str, str] | None = None):
 
 #: Statements in the driver, held constant while the function count grows.
 #: Growing both was the first attempt and it measured the wrong thing: py2bin
-#: gives one C function a fixed 512 KB frame, so a single `main()` of about
-#: 1,800 statements is refused outright - independent of how large the
-#: *program* is. 3,000 separate `def`s compile without complaint. The axis
-#: that matters for a real program is how many functions it has.
+#: gave one C function a fixed 512 KB frame it could not reuse, so a single
+#: `main()` of about 1,800 statements was refused outright - independent of
+#: how large the *program* was, while 3,000 separate `def`s compiled without
+#: complaint. That limit is gone as of 0.8.7, but the case stays as written:
+#: the axis that matters for a real program is how many functions it has, not
+#: how long one of them is.
 _DRIVER_CALLS = 200
 
 
