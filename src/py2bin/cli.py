@@ -234,6 +234,12 @@ def _parser() -> argparse.ArgumentParser:
         help="directory for verified downloads (default: ~/.cache/py2bin/fetch)",
     )
     capi_parser.add_argument(
+        "--fetch-lock",
+        type=Path,
+        help="record/verify the SHA-256 of every fetched file for reproducible "
+        "builds - without one, a runtime is trusted the first time it is seen",
+    )
+    capi_parser.add_argument(
         "--dmg",
         action="store_true",
         help="also write a mountable .dmg beside the .app (macOS targets)",
@@ -747,6 +753,8 @@ def _report_syntax_error(error: SyntaxError) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run one command, reporting a program's own syntax error as an error."""
 
+    from .runtime_fetch import FetchError
+
     try:
         return _main(argv)
     except SyntaxError as error:
@@ -754,6 +762,13 @@ def main(argv: list[str] | None = None) -> int:
         # that parse it. Caught here rather than at each of them, because
         # what a reader needs is the same wherever it came from.
         return _report_syntax_error(error)
+    except FetchError as error:
+        # A refused download is a decision, not a crash - a digest that did
+        # not match, or an archive that wanted to write outside its
+        # directory. A traceback for it buries the one line that matters and
+        # reads like py2bin broke, which is the opposite of what happened.
+        print(f"py2bin: {error}", file=sys.stderr)
+        return 1
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -1171,6 +1186,7 @@ def _main(argv: list[str] | None = None) -> int:
                 from .freezer import default_fetch_cache
                 from .runtime_fetch import (
                     FetchError,
+                    FetchLock,
                     extract_zip,
                     fetch_macos_runtime,
                     fetch_wheel,
@@ -1178,6 +1194,10 @@ def _main(argv: list[str] | None = None) -> int:
                 )
 
                 cache = args.fetch_cache or default_fetch_cache()
+                # One lock for the whole build, so every file this command
+                # downloads is written into the same record and a later build
+                # verifies all of them rather than some.
+                fetch_lock = FetchLock.load(args.fetch_lock)
                 # The wheel tags want major.minor; the runtime archive is
                 # published per patch release, so it needs all three.
                 version = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -1189,7 +1209,12 @@ def _main(argv: list[str] | None = None) -> int:
                 if chosen.startswith("windows-") and not args.runtime:
                     pack = room / "runtime"
                     fetch_windows_runtime(
-                        full_version, chosen, pack, cache=cache, clean=True
+                        full_version,
+                        chosen,
+                        pack,
+                        cache=cache,
+                        clean=True,
+                        lock=fetch_lock,
                     )
                     # The pack is unpacked into a directory of its own
                     # inside this one, so the interpreter is looked for
@@ -1280,7 +1305,12 @@ def _main(argv: list[str] | None = None) -> int:
                     into = room / "site"
                     try:
                         got = fetch_wheel(
-                            project, chosen, version, room / "wheels", cache=cache
+                            project,
+                            chosen,
+                            version,
+                            room / "wheels",
+                            cache=cache,
+                            lock=fetch_lock,
                         )
                     except FetchError as reason:
                         if "only a source distribution" in str(reason):
@@ -1335,6 +1365,9 @@ def _main(argv: list[str] | None = None) -> int:
                         "or --bundle-site a directory holding it",
                         file=sys.stderr,
                     )
+                # Written once everything has been fetched, so the record is
+                # of the build that actually happened.
+                fetch_lock.save()
 
             runtime = args.runtime or fetched_runtime
             sites = [Path(entry) for entry in (args.bundle_site or [])]

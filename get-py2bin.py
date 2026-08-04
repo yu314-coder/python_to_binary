@@ -22,7 +22,7 @@ import tarfile
 import tempfile
 import urllib.request
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 INDEX = "https://pypi.org/pypi/python-to-binary/json"
 HOME = Path(os.environ.get("PY2BIN_HOME", Path.home() / ".py2bin"))
@@ -144,7 +144,7 @@ def install() -> Path:
         unpacked.mkdir()
         if archive.suffix == ".whl" or archive.suffix == ".zip":
             with zipfile.ZipFile(archive) as bundle:
-                bundle.extractall(unpacked)
+                _safe_extract_zip(bundle, unpacked)
         else:
             with tarfile.open(archive) as bundle:
                 _safe_extract(bundle, unpacked)
@@ -156,13 +156,97 @@ def install() -> Path:
     return root
 
 
+def _safe_relative(name: str) -> PurePosixPath | None:
+    """Where a member may land, or None if nowhere.
+
+    A backslash is refused rather than translated: `..\\x` holds no `..`
+    part to a POSIX path and is a traversal once Windows splits it again.
+    """
+
+    if not name or name.startswith("/") or "\\" in name:
+        return None
+    relative = PurePosixPath(name)
+    if relative.is_absolute() or not relative.parts:
+        return None
+    if any(part in {"..", ".", ""} for part in relative.parts):
+        return None
+    return relative
+
+
+def _safe_extract_zip(bundle: zipfile.ZipFile, destination: Path) -> None:
+    """The same rule for a wheel, which is a ZIP.
+
+    `zipfile` already drops leading slashes and `..` on extraction and never
+    makes a link, so this is the smaller of the two risks - but a rule that
+    holds for one archive format and not the other is how the first hole got
+    in, and there was no ceiling at all on how far a wheel could expand.
+    """
+
+    members = bundle.infolist()
+    if len(members) > 200_000:
+        raise SystemExit("the archive holds an implausible number of members")
+    total = 0
+    for member in members:
+        if member.is_dir():
+            continue
+        if _safe_relative(member.filename) is None:
+            raise SystemExit(
+                f"the archive tries to write outside: {member.filename}"
+            )
+        total += member.file_size
+        if total > 4 * 1024 * 1024 * 1024:
+            raise SystemExit("the archive expands past the size limit")
+    for member in members:
+        bundle.extract(member, destination)
+
+
 def _safe_extract(bundle: tarfile.TarFile, destination: Path) -> None:
-    """Unpack, refusing any member that would land outside the directory."""
-    for member in bundle.getmembers():
-        target = (destination / member.name).resolve()
-        if not str(target).startswith(str(destination.resolve())):
+    """Unpack member by member, refusing anything that leaves the directory.
+
+    The check this replaced resolved where each member would land and
+    compared the strings. Both halves were wrong: `resolve()` runs before
+    extraction, so a symlink the archive is about to create is not yet there
+    to resolve through - `esc -> ..` followed by `esc/x` passed, and then
+    `extractall` followed the link it had just made - and `/tmp/outsider`
+    starts with `/tmp/out`. Containment is decided on the archive's own names
+    now, before anything is written, because that is the only question that
+    can be answered before the tree exists.
+
+    This duplicates `py2bin.archives`, and has to: this script is what runs
+    when there is no py2bin to import yet.
+    """
+
+    import posixpath
+
+    members = bundle.getmembers()
+    if len(members) > 200_000:
+        raise SystemExit("the archive holds an implausible number of members")
+    total = 0
+    for member in members:
+        if _safe_relative(member.name) is None:
             raise SystemExit(f"the archive tries to write outside: {member.name}")
-    bundle.extractall(destination)
+        if member.issym() or member.islnk():
+            link = member.linkname
+            base = "" if member.islnk() else posixpath.dirname(member.name)
+            landing = posixpath.normpath(posixpath.join(base, link))
+            if (
+                not link
+                or "\\" in link
+                or posixpath.isabs(link)
+                or landing == ".."
+                or landing.startswith("../")
+            ):
+                raise SystemExit(
+                    f"the archive links outside itself: {member.name} -> {link}"
+                )
+        elif not (member.isfile() or member.isdir()):
+            raise SystemExit(f"the archive holds a special file: {member.name}")
+        if member.isfile():
+            total += member.size
+            if total > 4 * 1024 * 1024 * 1024:
+                raise SystemExit("the archive expands past the size limit")
+    for member in members:
+        bundle.extract(member, destination)
 
 
 def _copy_tree(source: Path, destination: Path) -> None:

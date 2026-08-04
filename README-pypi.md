@@ -58,6 +58,46 @@ really is a builtin function's.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
+## Security fixes in 0.8.8
+
+py2bin's safety story is that it never *runs* what it downloads - no
+`setup.py`, no pip, no install hooks. Unpacking is therefore the only moment a
+hostile wheel or runtime pack acts at all, and it was not being guarded well
+enough. Reported by a static scan; each was reproduced before it was fixed.
+
+**A symbolic link in an archive could write outside the build.** Three callers
+each checked containment by resolving where a member would land and comparing
+strings. Both halves fail: `resolve()` runs *before* extraction, so a link the
+archive is about to create is not there to be resolved through - `esc -> ..`
+followed by `esc/passwd` passed both members and `extractall` then followed the
+link it had just made - and `/tmp/outsider` starts with `/tmp/out`. Reproduced
+on Python 3.11, writing a file outside the destination. Python 3.14 happens to
+stop it because `extractall` defaults to the `data` filter there; this project
+supports 3.10 upwards, so on most of that range nothing did.
+
+Extraction now happens member by member through one shared implementation
+(`py2bin.archives`), never `extractall`, with every member judged before
+anything is written. Links are *validated*, not banned: a CPython framework is
+a structure of symbolic links, and a runtime pack that lost them would not run.
+
+**A wheel could escape on Windows through a backslash.** `..\..\x` is a
+single atom to a POSIX path - no `..` part, not absolute, so it passed - and
+then becomes a traversal when Windows splits it again. One of the two copies
+of this rule refused the character and the other did not.
+
+**An archive could expand without limit.** Member *count* was capped, which
+says nothing about size.
+
+**A fetched runtime is no longer trusted silently.** `--fetch-lock` now exists
+on `compile-capi` as well as `freeze`, so the tier most people use can pin what
+it downloads. python.org publishes a GPG signature for the Windows embeddable
+CPython and no SHA-256, so there is nothing to verify against on a first fetch:
+that is now said out loud, with the digest and how to pin it, instead of being
+recorded quietly and compared against on later builds.
+
+A refused download now reports as one line rather than a traceback, and a test
+asserts no fetching path can go back to unpacking its own way.
+
 ## New in 0.8.7
 
 **A long function no longer needs a bigger stack frame than a short one.**

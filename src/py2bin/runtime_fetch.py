@@ -38,6 +38,13 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from .archives import (
+    DEFAULT_MAX_EXPANDED,
+    ArchiveError,
+    extract_tar as _extract_tar_safely,
+    extract_zip as _extract_zip_safely,
+    safe_relative,
+)
 from .runtime_packs import RuntimePackInfo, write_runtime_manifest
 
 DEFAULT_MAX_DOWNLOAD = 512 * 1024 * 1024
@@ -273,59 +280,35 @@ def _hash_file(path: Path) -> str:
 
 
 def _safe_member(name: str) -> PurePosixPath | None:
-    if not name or name.startswith("/") or "\\" in name:
-        return None
-    relative = PurePosixPath(name)
-    if relative.is_absolute() or any(part in {"..", ""} for part in relative.parts):
-        return None
-    return relative
+    """Kept as the module's own name for a check that now lives in one place."""
+
+    return safe_relative(name)
 
 
-def extract_zip(archive_path: Path, destination: Path) -> int:
-    """Extract a ZIP, rejecting traversal paths, links, and special files."""
+def extract_zip(
+    archive_path: Path,
+    destination: Path,
+    *,
+    max_expanded: int = DEFAULT_MAX_EXPANDED,
+) -> int:
+    """Extract a ZIP, rejecting traversal paths, links, and special files.
 
-    destination.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with zipfile.ZipFile(archive_path) as archive:
-        members = archive.infolist()
-        if len(members) > DEFAULT_MAX_MEMBERS:
-            raise FetchError(f"archive contains too many members: {archive_path}")
-        for member in members:
-            if member.is_dir():
-                continue
-            relative = _safe_member(member.filename)
-            if relative is None:
-                raise FetchError(
-                    f"archive member escapes its root: {member.filename!r}"
-                )
-            unix_mode = (member.external_attr >> 16) & 0xFFFF
-            if unix_mode and not stat.S_ISREG(unix_mode) and unix_mode & 0xF000:
-                raise FetchError(
-                    f"archive member is not a regular file: {member.filename!r}"
-                )
-            target = destination / Path(*relative.parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as source, target.open("wb") as output:
-                while True:
-                    chunk = source.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-            # The mode the archive recorded, which was read above only to
-            # decide the member was a regular file and then thrown away. A
-            # wheel that ships a helper program - Qt's `QtWebEngineProcess`,
-            # a console script, anything a package runs rather than imports -
-            # came out without its executable bit, and the package failed at
-            # the point it tried to start it. Only the permission bits are
-            # taken, and only when the archive recorded any.
-            permissions = unix_mode & 0o777
-            if permissions:
-                # Nothing is made more permissive than the archive said, and
-                # writability for the owner is kept so the tree can be pruned
-                # and packed afterwards.
-                target.chmod(permissions | 0o200)
-            written += 1
-    return written
+    The work is `archives.extract_zip`; what is kept here is this module's
+    own member ceiling and the error type its callers already catch. It
+    gained a cap on the *expanded* size: counting members bounded how many
+    files an archive could hold and said nothing about how large they were,
+    so a few members claiming to be terabytes were unopposed.
+    """
+
+    try:
+        return _extract_zip_safely(
+            archive_path,
+            destination,
+            max_expanded=max_expanded,
+            max_members=DEFAULT_MAX_MEMBERS,
+        )
+    except ArchiveError as error:
+        raise FetchError(str(error)) from None
 
 
 # --- Windows embeddable CPython ---------------------------------------------
@@ -356,12 +339,35 @@ def fetch_windows_runtime(
     url = _EMBED_URL.format(version=version, arch=_EMBED_ARCH[target])
     name = f"cpython-{version}-{target}"
     lock = lock if lock is not None else FetchLock()
+    pinned = lock.expected(name)
     archive, digest = download_verified(
         url,
         cache,
         label="Windows embeddable runtime",
-        expected_sha256=lock.expected(name),
+        expected_sha256=pinned,
     )
+    if pinned is None:
+        # python.org publishes a GPG signature for these and no SHA-256
+        # sidecar, so unlike the macOS pack - which is checked against the
+        # checksum file its release publishes - there is nothing to verify
+        # against on a first fetch. What was wrong was doing that silently:
+        # the digest was recorded afterwards and every later build compared
+        # against whatever the first one happened to receive. Trust on first
+        # use is a defensible position; not saying so is not.
+        import sys as _sys
+
+        print(
+            f"py2bin: {name} was not verified against a pinned digest - "
+            f"python.org publishes no SHA-256 for it. Got {digest}.",
+            file=_sys.stderr,
+        )
+        if lock.path is None:
+            print(
+                "py2bin: pass --fetch-lock FILE to pin it, and later builds "
+                "will verify against this digest instead of trusting the "
+                "download.",
+                file=_sys.stderr,
+            )
     lock.record(name, url, digest)
 
     if output.exists():
@@ -550,12 +556,13 @@ def fetch_macos_runtime(
         label=f"portable CPython {wanted} for {target}",
     )
     output.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive) as bundle:
-        for member in bundle.getmembers():
-            place = (output / member.name).resolve()
-            if not str(place).startswith(str(output.resolve())):
-                raise FetchError(f"the archive writes outside its directory: {member.name}")
-        bundle.extractall(output)
+    try:
+        # Links are allowed and validated rather than refused: a CPython
+        # framework *is* a structure of symbolic links, and one that lost
+        # them would not run.
+        _extract_tar_safely(archive, output, allow_links=True)
+    except ArchiveError as error:
+        raise FetchError(f"{name}: {error}") from None
     found = sorted(output.rglob("libpython*.dylib"))
     if not found:
         raise FetchError(f"no libpython in the archive {name}")
@@ -591,16 +598,13 @@ def fetch_pure_sdist(project: str, output: Path, *, cache: Path) -> list[str]:
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as scratch:
         room = Path(scratch)
-        if archive.name.endswith(".zip"):
-            with zipfile.ZipFile(archive) as bundle:
-                bundle.extractall(room)
-        else:
-            with tarfile.open(archive) as bundle:
-                for member in bundle.getmembers():
-                    place = (room / member.name).resolve()
-                    if not str(place).startswith(str(room.resolve())):
-                        raise FetchError(f"{project} writes outside its directory")
-                bundle.extractall(room)
+        try:
+            if archive.name.endswith(".zip"):
+                _extract_zip_safely(archive, room)
+            else:
+                _extract_tar_safely(archive, room, allow_links=True)
+        except ArchiveError as error:
+            raise FetchError(f"{project}: {error}") from None
         if any(room.rglob("*.c")) or any(room.rglob("*.pyx")):
             raise FetchError(
                 f"{project} has sources to compile, so its wheel is not simply "

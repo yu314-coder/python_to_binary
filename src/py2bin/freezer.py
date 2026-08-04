@@ -1003,6 +1003,19 @@ def _wheel_matches_target(wheel: WheelInfo, target: str, python: str) -> None:
 
 
 def _safe_wheel_member(name: str) -> Path | None:
+    """Where a wheel member may land inside the bundle, or None if nowhere.
+
+    The backslash check is not redundant with the `..` one, and leaving it out
+    was a hole on Windows only. `..\\..\\outside.txt` is a single atom to
+    `PurePosixPath`, so it holds no `..` part and is not absolute - it passes
+    - and then `Path(*parts)` on a Windows host splits it on the backslash and
+    it is a traversal after all. The sibling check in `runtime_fetch` refused
+    the character; this one did not, which is the kind of difference two
+    copies of a rule acquire.
+    """
+
+    if "\\" in name:
+        return None
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or not path.parts:
         return None
