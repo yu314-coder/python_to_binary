@@ -120,11 +120,11 @@ for three other platforms:
 | Windows x86-64 | `.exe` | USB | ✅ opens and runs |
 | macOS arm64 | `.app`, and a `.dmg` of it | USB | ✅ opens and runs |
 | Linux arm64 | ELF executable | USB | ✅ opens and runs |
-| iOS / iPadOS itself | — | — | ⬜ never attempted, and would not be expected to work |
 
-The last row is a limit, not a failure: an App Store app cannot `exec` an
-arbitrary binary, so a py2bin artifact has nowhere to start from on the device
-that built it. It was never tried, and is marked untested rather than assumed.
+The table is what the device builds *for*, and iPadOS is not among them: an
+App Store app cannot `exec` an arbitrary binary, so there is no such thing as
+a py2bin artifact that runs on the tablet that made it. The iPad is a build
+machine here, nothing else.
 
 **Why the tablet can do this at all** is the thing worth taking from the
 table. py2bin has no compiler, assembler, linker or toolchain behind it - it
