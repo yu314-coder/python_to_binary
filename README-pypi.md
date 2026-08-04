@@ -34,6 +34,50 @@ really is a builtin function's.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
+## New in 0.8.5
+
+A correctness sweep. Each of these produced a *wrong result rather than an
+error*, which is the worst way for a compiler to be wrong; all are now pinned
+by tests.
+
+- A name the program bound was ignored - its own `len`, `str`, `print` or
+  `super` lost to the builtin, and a module-level function called through a
+  rebound name calling the wrong one.
+- A bundle could not find the packages it carried, on Linux: the program asked
+  CPython where it was, and CPython - handed no argument vector - answered with
+  its own installation.
+- `sys.argv` held one entry this compiler had put there, so a command-line tool
+  could not read what it was asked to do. It is taken from the operating system
+  now.
+- `len(5)` answered `-1` instead of raising, leaving the `TypeError` set.
+- A two-piece f-string ran `__add__`; an f-string joins.
+- A wheel's executable bit was dropped, so a package shipping a helper program
+  could not start it.
+
+Two that destroyed things: `--clean` removed whatever was at the output path,
+directory and contents; `--include` removed its own source when the output was
+in the same directory. Both are refused now.
+
+New: `--onefile` for a macOS `.app` and for targets with no bundle;
+`--exclude` reaching the fetch rather than downloading what it excluded; a
+syntax error reported with file, line and column instead of a traceback.
+
+Faster too - seven of sixteen measured operations now beat CPython, where two
+did. See the table below.
+
+## What it guarantees
+
+Names the program binds are the program's. Integers do not stop at 64 bits.
+Floats stay floats and `-0.0` stays distinct. Evaluation order is Python's, and
+a `__len__` or `__getitem__` runs exactly once. Exceptions - class, message,
+`__cause__`, traceback, what `except` matches - are the interpreter's.
+
+Where it knowingly differs: a generator expression is built eagerly;
+`builtins.len` and `builtins.str` replaced at run time are not observed
+(`print` is); attribute access is slower than the interpreter's, because
+matching it means reading `ob_type` out of an object this treats as opaque -
+which is what lets one binary run against a CPython it was not built against.
+
 ## The paths through it
 
 Three ways to turn a program into an artifact. They trade the same three things

@@ -823,6 +823,165 @@ built a `functools.partial` before the call could start. CPython's own
 showing up in `__init__`. Both are now within the general pattern rather than
 outside it.
 
+## What changed in 0.8.5
+
+A long correctness sweep, and the compiled code got faster while it happened.
+
+### Wrong answers, now right
+
+Each of these produced a *wrong result rather than an error*, which is the
+worst way for a compiler to be wrong. All are pinned by tests.
+
+- **A name the program bound was ignored.** A module defining its own `len`
+  got the builtin; so did `str`. A local `super` was rewritten into
+  `super(__class__, self)` and handed two arguments to something that took
+  none. A `def print` of the program's own was skipped, and its output still
+  appeared - just not through the function written to produce it. A
+  module-level function called through a name a nested scope had rebound
+  called the wrong one.
+- **A bundle could not find what it carried.** On Linux the program asked
+  CPython where it was; CPython, given no argument vector, answered with its
+  own installation. So a bundle looked for its packages next to
+  `/usr/local/bin/python3.14` and stopped on an import of something inside
+  its own executable. It asks the operating system now.
+- **`sys.argv` held one entry** this compiler had put there, so a
+  command-line tool could not read what it was asked to do.
+- **`len(5)` answered `-1`** instead of raising, and left the `TypeError` set
+  for whatever ran next to trip over.
+- **A two-piece f-string ran `__add__`.** An f-string joins; `+` asks the left
+  piece's type, and a `str` subclass out of a `__repr__` could answer.
+- **A wheel's executable bit was dropped**, so any package shipping a helper
+  program - Qt's `QtWebEngineProcess`, console scripts - could not start it.
+
+### Things it destroyed
+
+- **`--clean` deleted whatever was at the output path.** `-o build` or
+  `-o dist` pointing at a directory holding anything else removed it, contents
+  and all. A directory is now only removed when it is one py2bin could have
+  built, or empty.
+- **`--include` deleted its own source** when the output was in the same
+  directory, which is what happens building a program in its own tree: it
+  cleared the destination first, and the destination *was* the source.
+
+### Now possible
+
+- **`--onefile`** for a macOS `.app`, folding the bundle into the executable
+  Finder runs - 498 files and 66 MB down to three files and 23 MB - and for a
+  target with no bundle at all, packing the program and everything carried
+  beside it into one self-extracting executable.
+- **`--exclude` reaches the fetch.** It said the program would not import a
+  package and then downloaded it anyway, with its whole dependency tree: 379
+  MB of scientific stack beside a program told to leave it out.
+- **A syntax error is reported**, with file, line, column and the offending
+  line, rather than a traceback through this compiler ending at `<unknown>`.
+
+### Faster
+
+Seven of sixteen measured operations now beat CPython, where two did.
+`direct function call` 0.81x to 2.05x, `exception raise/catch` 0.49x to 1.05x,
+`float arithmetic` 0.32x to 1.09x, `method call` 0.05x to 0.40x,
+`instantiation` 0.09x to 0.51x, `string concatenation` 0.14x to 0.80x. The
+table above says how, and the two rows that remain slow say why they do.
+
+## What it guarantees, and what it does not
+
+A compiler that is *nearly* right about semantics is worse than a slow one,
+because the difference shows up as a wrong answer rather than an error. This
+is what `compile-capi` promises, and where it knowingly stops.
+
+### It behaves as CPython does
+
+**Names the program binds are the program's.** `def len(x)` of your own, a
+local called `str`, a `super` bound to something else, a module-level `add`
+shadowed inside a function - the compiler reaches past a name to a C entry
+point only when nothing in the program has bound it. Getting this wrong is
+silent, which is why each one is pinned by a test.
+
+**Integers do not stop at 64 bits.** A local the analysis holds in a register
+carries an overflow check, and the arm that overflows hands the operation to
+`PyNumber_Add` and its unbounded arithmetic. `2 ** 200` is exact.
+
+**Floats are floats.** A value that entered as `1` comes out as `1`, not
+`1.0`; `-0.0` stays distinct from `0.0`, which the constant pool learned the
+hard way. Division by zero raises where C would answer an infinity.
+
+**Evaluation order is Python's.** Arguments are evaluated left to right before
+the call; `print(7, 1 // 0)` writes nothing before it raises; a function
+written out at its call site is only written out when the substitution
+provably preserves the order and the number of evaluations.
+
+**`__len__`, `__getitem__` and the rest run exactly once.** Every fast path
+that has a slow arm hoists what it measured *out* of the arms, because the
+slow arm re-evaluates its tree, and a `__len__` that printed would have
+printed twice.
+
+**Exceptions are the interpreter's.** The class, the message, the
+`__cause__`, the traceback and what `except` matches all come from CPython;
+nothing here re-implements them.
+
+**`sys.argv` holds what the process was started with**, recovered from the
+operating system - the embedded interpreter is handed no argument vector.
+
+### It knowingly differs
+
+**A generator expression is built eagerly.** `(x for x in source)` gathers
+into a list and hands back an iterator over it. An infinite source will not
+terminate and the memory is spent up front. Every generator in the programs
+this targets is consumed immediately, which is the case the trade is made for.
+
+**`builtins.len` and `builtins.str` replaced at run time are not observed.**
+Those two go straight to `PyObject_Size` and `PyObject_Str` when the program
+has not bound the name. Checking `builtins` on every call was written and
+measured: a dictionary probe in the innermost loops a program has, costing a
+fifth of the running time of a loop that calls both. `print` *is* checked,
+because harnesses replace it to capture output and the check is nothing
+against the write.
+
+**Attribute access is slower than the interpreter's.** CPython caches
+`LOAD_ATTR` against the type's version tag and reads the value straight out of
+the instance. Doing the same means reading `ob_type` out of an object this
+compiler treats as opaque - which is what lets one binary run against a
+CPython it was not built against. The trade is deliberate; the cost is in the
+table above.
+
+**A metaclass is refused**, by name, rather than approximated.
+
+## When it does not work
+
+The failures worth recognising, and what each one actually means.
+
+**`ModuleNotFoundError` for something you bundled.** The program is not
+finding what was carried beside it. Check that the directory `--site` named is
+where the packages actually landed; a bundle moved without it will not find
+them. This was also a bug of ours through 0.8.4 on Linux, where the program
+asked CPython where it was and CPython answered with its own installation -
+fixed in 0.8.5.
+
+**A wheel has no build for your target.** `--auto-fetch` says so by name and
+carries on without it. PyPI has no macOS wheel for a Windows-only package and
+none of pyobjc for Linux. Supply one with `--wheel-dir`, or leave the package
+out with `--exclude`, which now also stops it being fetched.
+
+**The Linux binary starts and no window opens.** pywebview and anything like
+it needs a GUI toolkit, and a distribution's own bindings are built for the
+distribution's Python rather than for the one you are linking. Bundle a Qt
+backend with `--fetch-package PySide6-Essentials --fetch-package
+PySide6-Addons`, and expect the machine to have Qt's ordinary runtime
+libraries - on Debian and Ubuntu `apt install libqt6webenginecore6` pulls the
+whole set.
+
+**`libpython3.x.so` not found.** A `compile-capi` binary links the interpreter
+rather than carrying one, which is what keeps it small. The machine needs that
+CPython. Use `--embed-python` with `--app` on macOS to carry it instead.
+
+**The macOS app will not open on another Mac.** Every Mach-O inside a bundle
+has to be signed *after* everything is in place, which `--app` does. If you
+change a file inside a built bundle, seal it again.
+
+**`--icon` did nothing on Linux.** An ELF has nowhere to carry one; Linux
+reads an application's icon from a `.desktop` entry. py2bin says so now rather
+than accepting the flag in silence.
+
 ## Measured against Nuitka
 
 Same machine (arm64 macOS), same CPython 3.14, same source. Nuitka 2.x with
