@@ -61,9 +61,16 @@ drives CPython - can target today.
 
 | | x86-64 | arm64 |
 |---|---|---|
-| **macOS** | ✅ works | ✅ works |
-| **Windows** | ✅ works | ✅ works |
-| **Linux** | ✅ works | ✅ works |
+| **macOS** | ✅ works | ✅ works · 📦 ships a real app |
+| **Windows** | ✅ works · 📦 ships a real app | ✅ works |
+| **Linux** | ✅ works | ✅ works · 📦 ships a real app |
+
+📦 marks a target that a **complete third-party GUI application** has been
+built for and run on real hardware, rather than only a corpus: ManimStudio -
+10,100 lines, pywebview, Pillow, manim - as a Windows x86-64 `.exe`, a macOS
+arm64 app, and a Linux arm64 executable. All three work. That is a stronger
+claim than the corpus makes, and it is the author's own report from real
+machines rather than something this repository's test rig can reach.
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
@@ -78,7 +85,22 @@ All six. Each was built from one program and the three that can run on this
 machine were run - darwin-arm64 natively, both Linux targets in containers -
 answering exactly what CPython answers. The two Windows targets and the Intel
 Mac are built and checked structurally; there is no Windows, no Intel Mac and
-no emulator here, and that is the honest limit of what was verified.
+no emulator here, and that is the honest limit of what *this machine* verified.
+Windows x86-64 is no longer only a structural check: a real application built
+for it runs on real Windows, reported by the author rather than measured here.
+
+**iOS is not a py2bin target and this grid does not claim it.** ManimStudio
+also ships on iPad and iPhone
+([App Store](https://apps.apple.com/app/id6764472686)), and that build has
+nothing to do with this compiler: it is a from-scratch native Swift port
+embedding a full CPython 3.14 for `arm64-iphoneos` from
+[python-ios-lib](https://github.com/yu314-coder/python-ios-lib), with the
+App Store-compliant packaging worked out in
+[CodeBench](https://github.com/yu314-coder/CodeBench). It is listed here only
+so the four platforms that application runs on are not mistaken for four
+targets py2bin can build - iOS forbids the JIT-adjacent and dynamic-linking
+freedoms every py2bin tier depends on, and reaching it needs an embedded
+interpreter and an Xcode toolchain instead.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six, and
 **freeze** targets whatever it has a runtime pack for. This grid is about
@@ -352,6 +374,15 @@ comparable at all.
 Verified from a copy moved elsewhere on disk: every module the program imports
 resolves, a pty opens and echoes, Pillow still round-trips PNG/JPEG/GIF/BMP/
 WEBP/TIFF, and the app starts with no traceback.
+
+The same application has since been built for **three targets and run on real
+machines** - Windows x86-64 as an `.exe`, macOS arm64, and Linux arm64 - and
+works on all three. The numbers above are the macOS arm64 build, which is the
+one this machine can measure; the other two are the author's report from the
+hardware itself, which is evidence this repository's test rig cannot produce
+for Windows at all. A fourth platform, iPad and iPhone, is
+[on the App Store](https://apps.apple.com/app/id6764472686) and is **not** a
+py2bin build - see the note under *Platforms*.
 
 ### One file, both ways
 

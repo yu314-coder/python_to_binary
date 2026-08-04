@@ -20,9 +20,16 @@ drives CPython - can target today.
 
 | | x86-64 | arm64 |
 |---|---|---|
-| **macOS** | ✅ works | ✅ works |
-| **Windows** | ✅ works | ✅ works |
-| **Linux** | ✅ works | ✅ works |
+| **macOS** | ✅ works | ✅ works · 📦 ships a real app |
+| **Windows** | ✅ works · 📦 ships a real app | ✅ works |
+| **Linux** | ✅ works | ✅ works · 📦 ships a real app |
+
+📦 marks a target a complete third-party GUI application has been built for and
+run on real hardware rather than only a corpus: ManimStudio - 10,100 lines,
+pywebview, Pillow, manim - as a Windows x86-64 `.exe`, a macOS arm64 app and a
+Linux arm64 executable, all three working. iOS is **not** a py2bin target; that
+app's iPad/iPhone build is a separate native Swift port embedding CPython for
+`arm64-iphoneos`, and is not this compiler's work.
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
