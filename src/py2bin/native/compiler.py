@@ -561,6 +561,21 @@ def _emit_native_module(
         image = write_elf_x86_64(code) if platform_name == "linux" else write_macho_x86_64(code)
     if output.exists():
         if output.is_dir():
+            # A directory at the output path is only ever removed when it is
+            # one of ours to remove. `--clean` means "replace what I built
+            # last time", and it was taken to mean "delete whatever is here":
+            # `-o build` or `-o dist` pointing at a directory holding anything
+            # else destroyed it and left an executable in its place. An `.app`
+            # is a directory this does produce, and an empty one is nobody's
+            # loss; anything else is refused with what to do about it.
+            bundle = (output / "Contents" / "Info.plist").is_file()
+            if not bundle and any(output.iterdir()):
+                raise FileExistsError(
+                    f"refusing to remove {output}: it is a directory that "
+                    f"py2bin did not build, and this target writes a file. "
+                    f"Name the file to write, or delete the directory "
+                    f"yourself if that is what you meant."
+                )
             shutil.rmtree(output)
         else:
             output.unlink()

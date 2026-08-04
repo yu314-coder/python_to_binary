@@ -2898,3 +2898,34 @@ class NativeSetRefusalTests(unittest.TestCase):
             "a = {1, 2}\nb = {3}\na += b\nprint(len(a))\n",
             "native set augmented assignment supports |= &= -=",
         )
+
+
+class OutputSafetyTests(unittest.TestCase):
+    """`--clean` replaces what py2bin built; it does not clear a directory.
+
+    `-o build` or `-o dist` pointing at a directory holding anything else
+    removed it and left an executable in its place. The flag was read as
+    "delete whatever is here" when it means "replace what I built last time".
+    """
+
+    def test_a_directory_py2bin_did_not_build_is_refused(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            keep = room / "keep"
+            keep.mkdir()
+            (keep / "notes.txt").write_text("important")
+            entry = room / "p.py"
+            entry.write_text("print(1)\n")
+            with self.assertRaises(FileExistsError):
+                compile_native(entry, keep, target="darwin-arm64", clean=True)
+            self.assertTrue((keep / "notes.txt").is_file())
+
+    def test_an_empty_directory_is_replaced(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            room = Path(scratch)
+            empty = room / "empty"
+            empty.mkdir()
+            entry = room / "p.py"
+            entry.write_text("print(1)\n")
+            compile_native(entry, empty, target="darwin-arm64", clean=True)
+            self.assertTrue(empty.is_file())
