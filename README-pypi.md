@@ -136,8 +136,8 @@ against each other, and which one you want depends on which you care about.
 
 | | `compile` | `compile-capi` | `freeze` |
 |---|---|---|---|
-| **speed** on a 30M-iteration loop | **0.062 s** | 1.27 s | 0.66 s |
-| **artifact** | **48 KB** | 66 KB | tens of MB |
+| **speed** on a 30M-iteration loop | **0.06 s** | 0.49 s | 0.74 s |
+| **artifact** | **32 KB** | 50 KB | 24 MB |
 | **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
 | **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
 | **third-party packages** | none | any the interpreter can import | **carried inside** |
@@ -145,8 +145,8 @@ against each other, and which one you want depends on which you care about.
 
 **`compile` is the fastest and the smallest.** Python AST → py2bin IR →
 optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
-interpreter in the artifact and none on the machine: 11× faster than CPython on
-that loop, in 48 KB that runs on a bare system. You pay for it in what it will
+interpreter in the artifact and none on the machine: 12× faster than CPython on
+that loop, in 32 KB that runs on a bare system. You pay for it in what it will
 accept - integers, floats, strings, control flow, your own functions - and it
 will not import a package at all.
 
@@ -386,31 +386,38 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### How fast each one is
 
-300,000 iterations, median of 5, against the interpreter it links. Higher is
-better; `1.00×` means the same speed as CPython.
+Measured on an **Apple M4** (10 cores - 4 performance, 6 efficiency - 24 GB,
+macOS 27.0, arm64) against **CPython 3.14.3, python.org framework build** -
+the interpreter these binaries actually bind, which is not the same as
+whichever `python3` is first on PATH and does not perform alike.
+
+300,000 iterations per row, nine fresh processes each, median taken, timing
+only the hot loop so neither column pays for start-up. Higher is better.
+The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| comprehension | **1.1 ms** | 2.9 ms | **2.56× faster** |
-| direct function call | **5.4 ms** | 11.1 ms | **2.05× faster** |
-| `while` loop | **5.4 ms** | 6.3 ms | **1.16× faster** |
-| comparisons | **5.9 ms** | 6.8 ms | **1.14× faster** |
-| integer arithmetic | **11.3 ms** | 12.8 ms | **1.13× faster** |
-| exception raise/catch | **25.0 ms** | 26.1 ms | **1.04× faster** |
-| float arithmetic | **7.7 ms** | 8.0 ms | **1.04× faster** |
-| attribute read | 8.2 ms | 6.7 ms | 0.81× |
-| string concatenation | 26.8 ms | 21.8 ms | 0.81× |
-| dict store | 14.4 ms | 10.8 ms | 0.75× |
-| f-string | 33.4 ms | 24.2 ms | 0.72× |
-| list append | 10.3 ms | 7.3 ms | 0.71× |
-| subscript | 13.8 ms | 9.3 ms | 0.68× |
-| closure call | 16.5 ms | 11.0 ms | 0.67× |
-| instantiation | 42.1 ms | 21.3 ms | 0.51× |
-| method call | 33.5 ms | 13.4 ms | 0.40× |
+| direct function call | **3.1 ms** | 7.4 ms | **2.41× faster** |
+| integer arithmetic | **5.5 ms** | 8.7 ms | **1.57× faster** |
+| `while` loop | **4.8 ms** | 6.8 ms | **1.42× faster** |
+| comparisons | **3.9 ms** | 4.7 ms | **1.22× faster** |
+| float arithmetic | **5.6 ms** | 5.9 ms | **1.05× faster** |
+| exception raise/catch | **20.3 ms** | 20.4 ms | **1.01× faster** |
+| list append | 6.0 ms | 5.9 ms | 0.98× |
+| comprehension | 6.5 ms | 6.2 ms | 0.96× |
+| dict store | 8.9 ms | 8.4 ms | 0.94× |
+| f-string | 24.9 ms | 18.4 ms | 0.74× |
+| string concatenation | 6.8 ms | 4.7 ms | 0.70× |
+| subscript | 8.9 ms | 6.3 ms | 0.70× |
+| `and` / `or` | 8.9 ms | 5.9 ms | 0.67× |
+| attribute read | 6.5 ms | 3.8 ms | 0.58× |
+| closure call | 12.7 ms | 6.8 ms | 0.54× |
+| instantiation | 40.2 ms | 16.6 ms | 0.41× |
+| method call | 16.8 ms | 6.9 ms | 0.41× |
 
 ### Where those numbers came from
 
-Nine of the sixteen rows sit at 0.80× or better and six beat the interpreter
+Nine of the seventeen rows sit at 0.80× or better and six beat the interpreter
 outright. Most did not a short while ago.
 
 | row | was | now | what it was |
@@ -513,21 +520,24 @@ same machine.
 | start with the app's imports | 84.4 ms | **78.6 ms** |
 | compile time | **20.1 s** | 88.3 s |
 
-Run time, median of 5, seconds, re-measured against **Nuitka 4.1.3**:
+Whole-process time - start-up included - median of 5, seconds, on the same
+Apple M4 against **Nuitka 4.1.3 `--standalone`**:
 
 | workload | py2bin | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | 0.095 | 0.112 | **0.094** |
-| `while` loop | **0.046** | 0.054 | 0.053 |
-| nested loops | 0.018 | **0.017** | 0.018 |
-| function calls | **0.015** | 0.033 | 0.027 |
-| string building | 0.016 | **0.012** | 0.014 |
+| integer arithmetic | **0.067** | 0.108 | 0.100 |
+| `while` loop | **0.057** | 0.083 | 0.062 |
+| nested loops | **0.023** | 0.028 | 0.031 |
+| function calls | **0.022** | 0.040 | 0.036 |
+| string building | **0.024** | 0.028 | 0.026 |
 
-These were first taken against Nuitka 2.x; against 4.1.3 it is faster than
-it was, and integer arithmetic is now a tie rather than a win. Where the two
-still differ is calls - a small helper is written out at the call site here,
-and no better call reaches a call that is not made. String building is the
-honest weakness: both lose to the interpreter, and this one by more.
+Two of those rows finish in under thirty milliseconds, so start-up is a large
+share of them - a real difference between the three rather than a distortion.
+The margins that are about generated code are the loops and the calls. This
+compiler's weaknesses do not show up in a five-loop benchmark at all; for
+those read the grid above, where method call and instantiation sit at 0.41×.
+Put a hot loop at module level instead of in a function and the loop advantage
+goes away, because module-scope names are not narrowed into registers.
 
 Loops beat both because a local the analysis picks out is held in a register
 rather than on the heap, with the overflow check that falls back to unbounded

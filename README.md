@@ -17,8 +17,8 @@ against each other, and which one you want depends on which you care about.
 
 | | `compile` | `compile-capi` | `freeze` |
 |---|---|---|---|
-| **speed** on a 30M-iteration loop | **0.062 s** | 1.27 s | 0.66 s |
-| **artifact** | **48 KB** | 66 KB | tens of MB |
+| **speed** on a 30M-iteration loop | **0.06 s** | 0.49 s | 0.74 s |
+| **artifact** | **32 KB** | 50 KB | 24 MB |
 | **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
 | **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
 | **third-party packages** | none | any the interpreter can import | **carried inside** |
@@ -26,8 +26,8 @@ against each other, and which one you want depends on which you care about.
 
 **`compile` is the fastest and the smallest.** Python AST → py2bin IR →
 optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
-interpreter in the artifact and none on the machine: 11× faster than CPython on
-that loop, in 48 KB that runs on a bare system. You pay for it in what it will
+interpreter in the artifact and none on the machine: 12× faster than CPython on
+that loop, in 32 KB that runs on a bare system. You pay for it in what it will
 accept - integers, floats, strings, control flow, your own functions - and it
 will not import a package at all.
 
@@ -399,6 +399,13 @@ same machine, same CPython 3.14, against Nuitka 4.1.3. Both bundles carry an
 interpreter and 73 native extension modules, which is what makes the sizes
 comparable at all.
 
+> **These three bundle tables were taken at 0.8.5 and have not been re-taken
+> since.** Unlike every other table here they need the application's own
+> virtualenv staged into wheels, which is a build this repository cannot run
+> on its own. The machine is the same Apple M4 described under *Measured
+> against Nuitka*; treat the sizes as accurate to a release or two ago rather
+> than to today's `main`.
+
 | | py2bin | Nuitka |
 |---|---|---|
 | whole `.app` | **66.0 MB** | 73.5 MB |
@@ -674,36 +681,58 @@ A refusal is a `file:line:col` error, never a silent approximation. On an
 
 ### How fast each one is
 
-300,000 iterations, median of 5, against the interpreter it links. Higher is
-better; `1.00×` means the same speed as CPython.
+**Measured on an Apple M4** (10 cores - 4 performance, 6 efficiency - 24 GB,
+macOS 27.0, arm64) against **CPython 3.14.3 from the python.org framework
+build**, which is the interpreter these binaries actually bind. That last part
+matters: this machine also carries a Homebrew 3.14.3, the two do not perform
+alike, and timing against the wrong one is the easiest way to publish a number
+that is not true. The harness asks a compiled program which interpreter it
+ended up using and times that one.
+
+300,000 iterations per row, each row run in nine fresh processes with the
+median taken, timing only the hot loop inside the process so neither column
+pays for start-up. Higher is better; `1.00×` means the same speed as CPython.
+
+Run it yourself - the harness and every case live in [`benchmarks/`](benchmarks):
+
+```sh
+python3 benchmarks/run.py
+```
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| comprehension | **1.1 ms** | 2.9 ms | **2.56× faster** |
-| direct function call | **5.4 ms** | 11.1 ms | **2.05× faster** |
-| `while` loop | **5.4 ms** | 6.3 ms | **1.16× faster** |
-| comparisons | **5.9 ms** | 6.8 ms | **1.14× faster** |
-| integer arithmetic | **11.3 ms** | 12.8 ms | **1.13× faster** |
-| exception raise/catch | **25.0 ms** | 26.1 ms | **1.04× faster** |
-| float arithmetic | **7.7 ms** | 8.0 ms | **1.04× faster** |
-| attribute read | 8.2 ms | 6.7 ms | 0.81× |
-| string concatenation | 26.8 ms | 21.8 ms | 0.81× |
-| dict store | 14.4 ms | 10.8 ms | 0.75× |
-| f-string | 33.4 ms | 24.2 ms | 0.72× |
-| list append | 10.3 ms | 7.3 ms | 0.71× |
-| subscript | 13.8 ms | 9.3 ms | 0.68× |
-| closure call | 16.5 ms | 11.0 ms | 0.67× |
-| instantiation | 42.1 ms | 21.3 ms | 0.51× |
-| method call | 33.5 ms | 13.4 ms | 0.40× |
+| direct function call | **3.1 ms** | 7.4 ms | **2.41× faster** |
+| integer arithmetic | **5.5 ms** | 8.7 ms | **1.57× faster** |
+| `while` loop | **4.8 ms** | 6.8 ms | **1.42× faster** |
+| comparisons | **3.9 ms** | 4.7 ms | **1.22× faster** |
+| float arithmetic | **5.6 ms** | 5.9 ms | **1.05× faster** |
+| exception raise/catch | **20.3 ms** | 20.4 ms | **1.01× faster** |
+| list append | 6.0 ms | 5.9 ms | 0.98× |
+| comprehension | 6.5 ms | 6.2 ms | 0.96× |
+| dict store | 8.9 ms | 8.4 ms | 0.94× |
+| f-string | 24.9 ms | 18.4 ms | 0.74× |
+| string concatenation | 6.8 ms | 4.7 ms | 0.70× |
+| subscript | 8.9 ms | 6.3 ms | 0.70× |
+| `and` / `or` | 8.9 ms | 5.9 ms | 0.67× |
+| attribute read | 6.5 ms | 3.8 ms | 0.58× |
+| closure call | 12.7 ms | 6.8 ms | 0.54× |
+| instantiation | 40.2 ms | 16.6 ms | 0.41× |
+| method call | 16.8 ms | 6.9 ms | 0.41× |
 
 ### Where those numbers came from
 
-Nine of the sixteen rows above sit at 0.80× or better and six beat the
+Nine of the seventeen rows above sit at 0.80× or better and six beat the
 interpreter outright. Most of them did not a short while ago, and the reason
 each moved is worth having in one place, because none of it was a matter of
 turning something up.
 
-| row | was | now | what it was |
+The pair of numbers below is a **before-and-after of each fix**, both taken
+with the harness of the day on the same machine, so the pair means what it
+says. They are not comparable to the grid above, which is a fresh measurement
+with different case shapes - where the two disagree, the grid above is the
+current answer and this table is the history.
+
+| row | before the fix | after it | what it was |
 |---|---|---|---|
 | direct function call | 0.81× | **2.10×** | the call hid the arithmetic from the register analysis |
 | exception raise/catch | 0.49× | **1.06×** | every raise classified its argument through a Python-level `type()` |
@@ -1105,41 +1134,54 @@ than accepting the flag in silence.
 
 ## Measured against Nuitka
 
-Same machine (arm64 macOS), same CPython 3.14, same source. Nuitka 2.x with
-`--standalone`, driving Apple's clang; this driving its own C compiler.
+**Apple M4** (10 cores - 4 performance, 6 efficiency - 24 GB, macOS 27.0,
+arm64), same CPython 3.14.3 python.org framework build for all three columns,
+same source. **Nuitka 4.1.3** with `--standalone`, driving Apple's clang; this
+driving its own C compiler.
 
-Run time, median of 5 runs, seconds, re-measured against **Nuitka 4.1.3** -
-several major versions newer than the 2.x these were first taken against, and
-faster for it:
+Whole-process time - start-up included, because that is what someone running
+the artifact waits for - median of 5 runs, seconds. The cases and the runner
+are in [`benchmarks/`](benchmarks):
+
+```sh
+python3 benchmarks/vs_nuitka.py
+```
 
 | | this | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | 0.095 | 0.112 | **0.094** |
-| `while` loop | **0.046** | 0.054 | 0.053 |
-| nested loops | 0.018 | **0.017** | 0.018 |
-| function calls | **0.015** | 0.033 | 0.027 |
-| string building | 0.016 | **0.012** | 0.014 |
+| integer arithmetic | **0.067** | 0.108 | 0.100 |
+| `while` loop | **0.057** | 0.083 | 0.062 |
+| nested loops | **0.023** | 0.028 | 0.031 |
+| function calls | **0.022** | 0.040 | 0.036 |
+| string building | **0.024** | 0.028 | 0.026 |
 
-Nuitka moved too. These were first taken against Nuitka 2.x, and against 4.1.3
-it is faster than it was: integer arithmetic is now a tie rather than a win,
-and it has closed most of the loop gap. Where the two still differ is calls -
-a small helper compiled here is written out at the call site, which takes the
-arithmetic around it into registers as well, and no amount of a *better* call
-reaches a call that is not made. String building is the row to look at if you
-want the honest weakness: both compilers lose to the interpreter on it, and
-this one loses by more.
+Read these as whole-process numbers and not as pure throughput. Two of the
+five rows finish in under thirty milliseconds, and start-up is a large share
+of those - which is a real difference between the three rather than a
+distortion, and the table below measures it directly. The wider margins are
+the loops and the calls, where the register work and the inlining show up.
+
+The rows are what `run.py` measures at a finer grain, and the two agree:
+calls, integer arithmetic and loops are where this compiler is ahead. Its
+weaknesses do not appear here at all, because a whole-program benchmark of
+five loops does not touch method dispatch or instantiation - for those, read
+the seventeen-row grid above, where they sit at 0.41×. **Put a hot loop at
+module level rather than in a function and this advantage disappears**: names
+at module scope are not narrowed into registers, which cost 1.41× → 0.73× on
+the `while` loop when measured directly. Every case here therefore puts its
+loop in a function, as any real program does.
 
 Both compile the same source on the same machine against the same CPython
 3.14. Nuitka drives Apple's clang; this drives its own C compiler, which is
 the whole point of the row below it.
 
-Startup, `print("x")`, median of 13 runs:
+Startup, `print("x")`, median of 13 runs, same M4:
 
 | | startup | on disk |
 |---|---|---|
-| this, `compile-capi` | **12.6 ms** | **49 KB** |
-| CPython | 14.7 ms | - |
-| Nuitka `--standalone` | 18.1 ms | 17 MB |
+| this, `compile-capi` | **10.0 ms** | **49 KB** |
+| CPython | 13.3 ms | - |
+| Nuitka `--standalone` | 15.2 ms | 17.2 MB |
 
 A `compile-capi` binary links the interpreter it was built against and starts
 by calling `Py_Initialize`, skipping the interpreter's own startup path -

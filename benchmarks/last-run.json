@@ -1,0 +1,107 @@
+{
+  "interpreter": "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3",
+  "rows": [
+    {
+      "row": "direct function call",
+      "py2bin_ms": 3.08,
+      "cpython_ms": 7.42,
+      "ratio": 2.41
+    },
+    {
+      "row": "integer arithmetic",
+      "py2bin_ms": 5.54,
+      "cpython_ms": 8.68,
+      "ratio": 1.57
+    },
+    {
+      "row": "while loop",
+      "py2bin_ms": 4.79,
+      "cpython_ms": 6.79,
+      "ratio": 1.42
+    },
+    {
+      "row": "comparisons",
+      "py2bin_ms": 3.89,
+      "cpython_ms": 4.74,
+      "ratio": 1.22
+    },
+    {
+      "row": "float arithmetic",
+      "py2bin_ms": 5.62,
+      "cpython_ms": 5.88,
+      "ratio": 1.05
+    },
+    {
+      "row": "exception raise catch",
+      "py2bin_ms": 20.32,
+      "cpython_ms": 20.43,
+      "ratio": 1.01
+    },
+    {
+      "row": "list append",
+      "py2bin_ms": 5.97,
+      "cpython_ms": 5.87,
+      "ratio": 0.98
+    },
+    {
+      "row": "comprehension",
+      "py2bin_ms": 6.52,
+      "cpython_ms": 6.23,
+      "ratio": 0.96
+    },
+    {
+      "row": "dict store",
+      "py2bin_ms": 8.95,
+      "cpython_ms": 8.37,
+      "ratio": 0.94
+    },
+    {
+      "row": "f string",
+      "py2bin_ms": 24.87,
+      "cpython_ms": 18.37,
+      "ratio": 0.74
+    },
+    {
+      "row": "subscript",
+      "py2bin_ms": 8.92,
+      "cpython_ms": 6.25,
+      "ratio": 0.7
+    },
+    {
+      "row": "string concatenation",
+      "py2bin_ms": 6.78,
+      "cpython_ms": 4.75,
+      "ratio": 0.7
+    },
+    {
+      "row": "boolean operators",
+      "py2bin_ms": 8.88,
+      "cpython_ms": 5.92,
+      "ratio": 0.67
+    },
+    {
+      "row": "attribute read",
+      "py2bin_ms": 6.46,
+      "cpython_ms": 3.77,
+      "ratio": 0.58
+    },
+    {
+      "row": "closure call",
+      "py2bin_ms": 12.66,
+      "cpython_ms": 6.82,
+      "ratio": 0.54
+    },
+    {
+      "row": "instantiation",
+      "py2bin_ms": 40.22,
+      "cpython_ms": 16.64,
+      "ratio": 0.41
+    },
+    {
+      "row": "method call",
+      "py2bin_ms": 16.78,
+      "cpython_ms": 6.89,
+      "ratio": 0.41
+    }
+  ]
+}
