@@ -31,6 +31,17 @@ Linux arm64 executable, all three working. iOS is **not** a py2bin target; that
 app's iPad/iPhone build is a separate native Swift port embedding CPython for
 `arm64-iphoneos`, and is not this compiler's work.
 
+**An iPad can build all three of them, though.** py2bin has no compiler,
+assembler or linker behind it - it writes the machine code and the Mach-O, PE
+and ELF itself - so a cross-build is arithmetic and file writing, which a
+sandbox allows. Run inside the embedded Python of the iPad app, it produced a
+Windows `.exe`, a macOS `.app` and `.dmg`, and a Linux arm64 ELF; each was
+carried off by USB and opened on the machine it was built for. Nothing on that
+path needs `subprocess`, `ctypes`, `fork` or `exec` - every target still
+compiles with all of them removed from the interpreter, which is a test. What
+an iPad cannot do is *run* the result: an App Store app cannot `exec` an
+arbitrary binary.
+
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
 CPython's. macOS agrees on 878 and differs on 7; a 100-program slice run

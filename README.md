@@ -102,6 +102,42 @@ targets py2bin can build - iOS forbids the JIT-adjacent and dynamic-linking
 freedoms every py2bin tier depends on, and reaching it needs an embedded
 interpreter and an Xcode toolchain instead.
 
+### Building on an iPad
+
+iOS cannot *run* a py2bin binary. It can *produce* one - and this has been
+done on a real device, with the artifacts carried off and opened on the
+machines they were built for.
+
+py2bin ran inside the embedded CPython of
+[ManimStudio for iPad](https://apps.apple.com/app/id6764472686) - the same
+`arm64-iphoneos` Python 3.14 from
+[python-ios-lib](https://github.com/yu314-coder/python-ios-lib) that
+[CodeBench](https://github.com/yu314-coder/CodeBench) ships - and compiled
+for three other platforms:
+
+| built on iPadOS | artifact | carried off by | opened on the target |
+|---|---|---|---|
+| Windows x86-64 | `.exe` | USB | ✅ opens and runs |
+| macOS arm64 | `.app`, and a `.dmg` of it | USB | ✅ opens and runs |
+| Linux arm64 | ELF executable | USB | ✅ opens and runs |
+| iOS / iPadOS itself | — | — | ⬜ never attempted, and would not be expected to work |
+
+The last row is a limit, not a failure: an App Store app cannot `exec` an
+arbitrary binary, so a py2bin artifact has nowhere to start from on the device
+that built it. It was never tried, and is marked untested rather than assumed.
+
+**Why the tablet can do this at all** is the thing worth taking from the
+table. py2bin has no compiler, assembler, linker or toolchain behind it - it
+writes the machine code, the Mach-O, the PE and the ELF itself, in Python -
+so a cross-build is arithmetic and file writing, which is all any sandbox
+allows. Held to that claim directly: every target was compiled on this machine
+with `subprocess`, `multiprocessing`, `ctypes`, `fcntl`, `pty`, and `os.fork`,
+`os.execv`, `os.execve`, `os.posix_spawn`, `os.system` and `os.popen` removed
+from the interpreter first. All six builds - `compile-capi` and `compile`,
+across macOS, Linux and Windows - produced correct binaries with none of them
+present. Nothing on that path asks the operating system for anything iOS
+withholds.
+
 The **native** tier (`py2bin compile`, no CPython at all) targets all six, and
 **freeze** targets whatever it has a runtime pack for. This grid is about
 `compile-capi` because that is the tier with the interesting constraint: it has
