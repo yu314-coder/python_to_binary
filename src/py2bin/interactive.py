@@ -38,6 +38,7 @@ TARGETS = (
     ("darwin-x86_64", "macOS, Intel"),
     ("windows-x86_64", "Windows, 64-bit Intel/AMD"),
     ("windows-arm64", "Windows on ARM"),
+    ("linux-x86_64", "Linux, 64-bit Intel/AMD"),
     ("linux-arm64", "Linux, 64-bit ARM"),
 )
 
@@ -56,7 +57,12 @@ SHAPES = {
         ("bin", "a plain .exe, needing Python on the machine"),
     ),
     "linux": (
-        ("bin", "ONE FILE: an executable linking the machine's libpython"),
+        (
+            "onefile",
+            "ONE FILE: an executable carrying its packages, unpacked on first "
+            "run",
+        ),
+        ("bin", "an executable beside the packages it needs"),
     ),
 }
 
@@ -258,8 +264,13 @@ def main(where: str | None = None) -> int:
     if icon is not None:
         say(f"  using {icon.name} as the icon")
 
+    windows = target.startswith("windows-")
     suffix = {
-        "app": ".app", "dmg": ".app", "exe": ".exe", "onefile": ".exe", "bin": ""
+        "app": ".app",
+        "dmg": ".app",
+        "exe": ".exe",
+        "onefile": ".exe" if windows else "",
+        "bin": ".exe" if windows else "",
     }[shape]
     output = here / "dist" / f"{program.stem}{suffix}"
     arguments = [
@@ -292,6 +303,11 @@ def main(where: str | None = None) -> int:
         ]
     if shape == "dmg":
         arguments.append("--dmg")
+    if shape == "onefile" and not windows:
+        # A target with no bundle folds the program and everything carried
+        # beside it into the executable itself. Windows keeps its own path
+        # below, which wraps the built folder rather than the program.
+        arguments += ["--onefile", "--prune-unused"]
     if icon is not None:
         arguments += ["--icon", str(icon)]
     for path in carried:
@@ -300,7 +316,9 @@ def main(where: str | None = None) -> int:
 
     delivered = {
         "dmg": f"{program.stem}.dmg",
-        "onefile": f"{program.stem}-onefile.exe",
+        "onefile": (
+            f"{program.stem}-onefile.exe" if windows else output.name
+        ),
     }.get(shape, output.name)
     say(f"\nBuilding {delivered} for {target}.")
     if shape in ("app", "dmg", "exe"):
@@ -310,7 +328,7 @@ def main(where: str | None = None) -> int:
     from py2bin.cli import main as build
 
     code = build(arguments)
-    if code == 0 and shape == "onefile":
+    if code == 0 and shape == "onefile" and windows:
         # One file rather than a folder: the same payload, wrapped in an
         # executable that unpacks itself where it runs.
         say("\n  packing it into a single file ...")

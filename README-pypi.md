@@ -34,6 +34,23 @@ really is a builtin function's.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
+## New in 0.8.6
+
+**0.8.5 could not build anything through `py2bin make` or `build.py`.** An
+`append` option nobody passed is `None` rather than an empty list, and the
+change that stopped `--exclude` fetching what it excluded read it without a
+default - so every `--auto-fetch` build without `--exclude` stopped with a
+`TypeError`. Fixed, and every `append` option is now checked for a default by
+a test.
+
+The three questions offer six machines rather than five (`linux-x86_64` was
+missing), Linux gains a one-file shape, and all sixteen target-and-shape
+combinations are driven through `build.py` end to end in testing.
+
+A helper naming a module constant, or calling another helper, is now written
+out at its call site: `bump(v)` over `weigh(v)` collapses to `v * SCALE + 1`,
+0.67x to 1.26x against the interpreter.
+
 ## New in 0.8.5
 
 A correctness sweep. Each of these produced a *wrong result rather than an

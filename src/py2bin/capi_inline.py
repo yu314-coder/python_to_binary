@@ -103,8 +103,20 @@ def _simple_body(node: ast.FunctionDef) -> ast.expr | None:
     return body[0].value
 
 
-def describe(node: ast.FunctionDef) -> Inlinable | None:
-    """Answer how to inline this function, or None if it cannot be."""
+def describe(
+    node: ast.FunctionDef, bound: dict[str, int] | None = None
+) -> Inlinable | None:
+    """Answer how to inline this function, or None if it cannot be.
+
+    `bound` counts how many times each name is bound anywhere in the module.
+    Without it every non-parameter name is refused, which is the safe answer
+    when nothing is known about them. With it, a name that the whole module
+    binds *at most once* is allowed: there is then only one thing it can mean,
+    so it means the same at the call site as it did in the body. That is what
+    lets `return v * SCALE` past a rule written to keep `return a + K` out -
+    the danger was never the module constant, it was a second `K` somewhere
+    else.
+    """
 
     if not isinstance(node, ast.FunctionDef) or not _plain_signature(node):
         return None
@@ -119,11 +131,18 @@ def describe(node: ast.FunctionDef) -> Inlinable | None:
     ]
     if len(set(parameters)) != len(parameters):
         return None
-    # Nothing but its own parameters, so where it lands cannot change what it
-    # means. This also rules out a `yield` or an `await`, whose surrounding
-    # machinery is not something a substituted expression can carry with it.
-    if _names(expression) - set(parameters):
+    # Every other name has to mean the same thing wherever the body lands.
+    # A name nothing binds is a builtin and means one thing; a name the module
+    # binds once means that one thing; a name bound twice could be either, and
+    # substituting it would silently read whichever the call site had.
+    outside = _names(expression) - set(parameters)
+    if outside and bound is None:
         return None
+    for name in outside:
+        if bound.get(name, 0) > 1:
+            return None
+        if name == node.name:
+            return None  # recursive: writing it out would never terminate
     for inner in ast.walk(expression):
         if isinstance(
             inner, (ast.Yield, ast.YieldFrom, ast.Await, ast.NamedExpr)
@@ -313,11 +332,34 @@ def expand_module(tree: ast.AST) -> ast.AST:
             continue
         if bound.get(node.name, 0) != 1:
             continue  # something else binds this name; the call may not be this
-        described = describe(node)
+        described = describe(node, bound)
         if described is not None:
             candidates[node.name] = described
     if not candidates:
         return tree
+    # A candidate whose body calls another candidate is itself worth writing
+    # out, but only once the call inside it has been. Expanding the bodies
+    # against each other first is what makes `bump` - which calls `weigh` -
+    # inlinable at all. It runs until nothing more changes, and cannot run
+    # away: a body only ever grows by the bodies of *other* candidates, and a
+    # candidate that names itself was refused above.
+    for _ in range(len(candidates)):
+        settled = True
+        for name, described in list(candidates.items()):
+            grown = _Expander(
+                {k: v for k, v in candidates.items() if k != name}
+            ).visit(copy.deepcopy(described.expression))
+            if ast.dump(grown) == ast.dump(described.expression):
+                continue
+            ast.fix_missing_locations(grown)
+            if sum(1 for _ in ast.walk(grown)) > _BIGGEST:
+                continue
+            candidates[name] = Inlinable(
+                described.parameters, grown, described.repeated
+            )
+            settled = False
+        if settled:
+            break
     expanded = _Expander(candidates).visit(tree)
     ast.fix_missing_locations(expanded)
     return expanded

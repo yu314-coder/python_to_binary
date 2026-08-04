@@ -823,6 +823,29 @@ built a `functools.partial` before the call could start. CPython's own
 showing up in `__init__`. Both are now within the general pattern rather than
 outside it.
 
+## What changed in 0.8.6
+
+**0.8.5 could not build anything through `py2bin make` or `build.py`.** The
+change that stopped `--exclude` fetching what it excluded read the option
+without a default, and an `append` option nobody passed is `None` rather than
+an empty list - so every `--auto-fetch` build that did not also pass
+`--exclude` stopped with a `TypeError`. That is every build the three-question
+front end makes. Fixed, pinned, and every `append` option in the command line
+is now checked for a default by a test.
+
+The three questions also offer **six machines** rather than five -
+`linux-x86_64` was missing - and Linux gains the one-file shape, an executable
+carrying its packages and unpacking them on first run. All sixteen
+target-and-shape combinations were driven through `build.py` end to end and
+checked to produce the format and architecture they promise.
+
+A helper is written out at its call site in more cases: one that names a
+module constant, and one that calls another helper. `def bump(v): return
+weigh(v) + 1` over `def weigh(v): return v * SCALE` collapses to `v * SCALE +
+1` at the call site, which took that shape from 0.67x to 1.26x against the
+interpreter. A name is only substituted when the whole module binds it at most
+once, so there is only one thing it can mean.
+
 ## What changed in 0.8.5
 
 A long correctness sweep, and the compiled code got faster while it happened.

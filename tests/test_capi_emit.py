@@ -2931,6 +2931,115 @@ class ProgramLocationTests(unittest.TestCase):
             )
 
 
+class AutoFetchWithoutExcludeTests(unittest.TestCase):
+    """`--auto-fetch` with no `--exclude` must not fall over."""
+
+    def test_the_option_defaults_to_a_list(self):
+        # An `append` option nobody passed is None, not an empty list, and
+        # the code that reads it to decide what not to fetch iterated it. So
+        # every --auto-fetch build that did not also pass --exclude stopped
+        # with a TypeError - which is every build the three-question front end
+        # makes, and it shipped.
+        from py2bin.cli import _parser as build_parser
+
+        parsed = build_parser().parse_args(
+            ["compile-capi", "x.py", "-o", "out"]
+        )
+        self.assertEqual(parsed.exclude, [])
+        self.assertEqual(parsed.include, [])
+
+    def test_every_append_option_has_a_default(self):
+        import argparse
+        from py2bin.cli import _parser as build_parser
+
+        missing = []
+
+        def walk(parser, path):
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for name, sub in action.choices.items():
+                        walk(sub, f"{path} {name}".strip())
+                elif action.__class__.__name__ == "_AppendAction":
+                    if action.default is None:
+                        missing.append(f"{path} {action.option_strings}")
+
+        walk(build_parser(), "")
+        self.assertEqual(missing, [])
+
+
+class WidenedInliningTests(unittest.TestCase):
+    """A helper naming a module constant, or calling another helper."""
+
+    _run = CApiEmitTests._run
+
+    def test_a_body_naming_a_module_constant_is_written_out(self):
+        source = (
+            "SCALE = 3\n"
+            "def weigh(v):\n"
+            "    return v * SCALE\n"
+            "print(weigh(5))\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        # One call remains: the Python-callable wrapper's own, which exists so
+        # the function can still be passed around as a value. The call site
+        # `weigh(5)` is gone.
+        self.assertEqual(written.count("= f_weigh("), 1)
+        self._run(source, b"15\n")
+
+    def test_a_helper_calling_a_helper_collapses(self):
+        source = (
+            "SCALE = 3\n"
+            "def weigh(v):\n"
+            "    return v * SCALE\n"
+            "def bump(v):\n"
+            "    return weigh(v) + 1\n"
+            "print(bump(5))\n"
+        )
+        written = python_to_capi_c(source, "program.py")
+        self.assertEqual(written.count("= f_bump("), 1)
+        # `bump` calls `weigh`, and that call is written out inside `bump`'s
+        # own body before `bump` is written out at its call site.
+        self.assertEqual(written.count("= f_weigh("), 1)
+        self._run(source, b"16\n")
+
+    def test_a_name_bound_twice_is_refused(self):
+        # The danger was never the module constant, it was a second one
+        # elsewhere - substituting would read whichever the call site had.
+        source = (
+            "K = 10\n"
+            "def f(a):\n"
+            "    return a + K\n"
+            "def go():\n"
+            "    K = 1\n"
+            "    return f(5) + K\n"
+            "print(go(), f(5))\n"
+        )
+        self._run(source, b"16 15\n")
+
+    def test_a_shadowed_builtin_in_a_body_is_refused(self):
+        source = (
+            "def sz(x):\n"
+            "    return len(x) * 2\n"
+            "def go():\n"
+            "    def len(y): return 99\n"
+            "    return sz([1, 2, 3])\n"
+            "print(sz([1, 2, 3]), go())\n"
+        )
+        self._run(source, b"6 6\n")
+
+    def test_mutual_recursion_does_not_run_away(self):
+        source = (
+            "def down(n):\n"
+            "    return 0 if n <= 0 else down(n - 1)\n"
+            "def a(x):\n"
+            "    return b(x) + 1\n"
+            "def b(x):\n"
+            "    return a(x) - 1\n"
+            "print(down(3))\n"
+        )
+        self._run(source, b"0\n")
+
+
 class CarriedPackageLayoutTests(unittest.TestCase):
     """Where fetched packages go when there is no bundle to put them in."""
 

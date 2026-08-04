@@ -270,6 +270,12 @@ def _parser() -> argparse.ArgumentParser:
     capi_parser.add_argument(
         "--exclude",
         action="append",
+        # Without a default an unused `append` option is None, not an empty
+        # list, and everything that reads it has to remember that. One place
+        # did not, and every `--auto-fetch` build that did not also pass
+        # `--exclude` stopped with a TypeError - which is every build the
+        # three-question front end makes.
+        default=[],
         metavar="MODULE",
         help=(
             "drop this module from the bundle even though the walk kept its "
