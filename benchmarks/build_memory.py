@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What a build costs in memory, against Nuitka.
 
-    python3 benchmarks/build_memory.py [--skip-nuitka] [case ...]
+    python3 benchmarks/build_memory.py [--skip-nuitka] [--warm] [case ...]
 
 py2bin writes the machine code, the object file and the container itself, in
 Python. Nuitka writes C and hands it to Apple's clang. That difference should
@@ -16,6 +16,16 @@ different thing from a build whose peak is four of them at once. Sampling can
 miss a spike shorter than the interval, so `ru_maxrss` for the largest single
 waited-for child is reported beside it as a floor - if the sampled total ever
 came in under that, the sampler missed something and the run says so.
+
+**Nuitka's caches are disabled** (`--disable-cache=all`), and that is not a
+handicap - it is the only way the column reproduces. Nuitka keeps a ccache and
+a module cache under `~/Library/Caches/Nuitka`, so the first run of this
+harness measured cold builds and every run after it measured warm ones: at
+3,000 functions the same build came out at 1,522 MB once and 1,175 MB the next
+time, which would have been published as a difference in the compilers. py2bin
+has no build cache of any kind, so a cold Nuitka is the like-for-like
+comparison. Nuitka's *re*builds are faster than these numbers; py2bin's are
+not, because it has nothing to reuse.
 
 The scaling case matters more than the small ones. A hundred-line program says
 little; the interesting question is what happens to a build as the program
@@ -138,6 +148,7 @@ def _scaling_case(work: Path, functions: int) -> Path:
 
 def main(argv: list[str]) -> int:
     skip = "--skip-nuitka" in argv
+    warm = "--warm" in argv
     wanted = {a for a in argv if not a.startswith("--")}
 
     with tempfile.TemporaryDirectory() as directory:
@@ -156,7 +167,9 @@ def main(argv: list[str]) -> int:
                 )
 
         print(f"peak resident set of the build's whole process tree, "
-              f"sampled every {int(INTERVAL * 1000)} ms\n")
+              f"sampled every {int(INTERVAL * 1000)} ms")
+        print(f"nuitka: {'cache left in place (warm)' if warm else 'caches disabled (cold)'}"
+              f"; py2bin has no build cache either way\n")
         print(f"  {'case':<26} {'py2bin':>9} {'time':>7}   "
               f"{'Nuitka':>9} {'time':>7}")
         for label, source in sources:
@@ -173,10 +186,13 @@ def main(argv: list[str]) -> int:
                 print(f"  {label:<26} {ours[1]:8.0f}M {ours[0]:6.1f}s"
                       f"   {'-':>9} {'-':>7}")
                 continue
-            theirs = _build(
-                [sys.executable, "-m", "nuitka", "--standalone",
-                 "--no-progress-bar", f"--output-dir={work}", str(source)]
-            )
+            nuitka_command = [
+                sys.executable, "-m", "nuitka", "--standalone",
+                "--no-progress-bar", f"--output-dir={work}", str(source),
+            ]
+            if not warm:
+                nuitka_command.insert(4, "--disable-cache=all")
+            theirs = _build(nuitka_command)
             shown = (f"{theirs[1]:8.0f}M {theirs[0]:6.1f}s"
                      if theirs[3] else f"{'failed':>9} {'-':>7}")
             print(f"  {label:<26} {ours[1]:8.0f}M {ours[0]:6.1f}s   {shown}")

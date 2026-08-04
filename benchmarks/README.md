@@ -44,7 +44,11 @@ between the three. Read those rows knowing that: two of the five finish in
 under thirty milliseconds, where start-up is much of the total.
 
 `build_memory.py` measures what the **build** costs, which is what decides
-whether it can run somewhere small. Peak resident set of the whole process
+whether it can run somewhere small. It disables Nuitka's caches by default
+(`--disable-cache=all`, or `--warm` to leave them): Nuitka keeps a ccache and
+a module cache and py2bin keeps nothing, so a cold Nuitka is the like-for-like
+comparison and the only one that reproduces - the same warm build measured
+1,522 MB one run and 1,175 MB the next. Peak resident set of the whole process
 tree - parent and every descendant, **summed** rather than maxed, because a
 peak of one 400 MB clang is a different thing from four at once. `ru_maxrss`
 is reported beside it as a floor when it rose during the build; read it only

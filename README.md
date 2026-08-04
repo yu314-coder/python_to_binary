@@ -921,6 +921,24 @@ outside it.
 
 ## What changed in 0.8.7
 
+**A long function no longer needs a bigger stack frame than a short one.**
+Every intermediate the C lowering needed took a stack slot and never gave it
+back, so a function's frame grew with its *length* rather than with how much
+of it was live at once. About eighteen hundred statements in a single `def`
+reached the 512 KB budget and the build was refused outright - which generated
+code walks into without doing anything unusual. Slots taken for a statement's
+temporaries are handed back when it finishes, and the frame is now built from
+the high-water mark rather than from what happens to be outstanding at the
+end. Forty thousand statements in one function compile and answer correctly,
+where 1,900 was refused before.
+
+Two things had to be got right and both have tests. A local, or the scratch
+area the float formatter allocates the first time a program prints a double,
+outlives the statement that created it - reclaiming those handed a later
+statement slots something still held, which did not print wrong numbers but
+exhausted the heap. And reclaiming is per statement rather than per
+expression, which is what keeps a loop's condition alive across its own body.
+
 **A decorator written without the `@` was skipped.** `greet = trace(greet)` is
 how decoration is spelled when the `@` is not convenient, and py2bin kept
 calling the *undecorated* body - quietly, with the right number of arguments
@@ -1128,11 +1146,6 @@ CPython. Use `--embed-python` with `--app` on macOS to carry it instead.
 has to be signed *after* everything is in place, which `--app` does. If you
 change a file inside a built bundle, seal it again.
 
-**"this translation unit needs more than 524288 bytes of stack frame".** One
-compiled function may not exceed a 512 KB frame, which is about 1,800
-statements of ordinary shape in a single `def`. It is a limit on one function,
-not on a program - 3,000 separate `def`s are fine. Split the function.
-
 **`--icon` did nothing on Linux.** An ELF has nowhere to carry one; Linux
 reads an application's icon from a `.desktop` entry. py2bin says so now rather
 than accepting the flag in silence.
@@ -1192,30 +1205,44 @@ and every descendant, summed, sampled every 25 ms:
 python3 benchmarks/build_memory.py
 ```
 
+Nuitka keeps a ccache and a module cache; py2bin has no build cache of any
+kind. So there are two honest answers, and py2bin's column is the same in
+both.
+
+**Cold** - a first build, or any CI runner without a warm cache
+(`--disable-cache=all`):
+
 | what is being built | py2bin | | Nuitka | |
 |---|---|---|---|---|
-| a small program (5 cases, ~10 lines) | **38-41 MB** | **0.1 s** | 292-336 MB | 3.5 s |
-| 200 functions | **186 MB** | **1.9 s** | 415 MB | 4.6 s |
-| 1,000 functions | **601 MB** | **7.2 s** | 723 MB | 10.0 s |
-| 3,000 functions | 1,567 MB | **20.8 s** | **1,522 MB** | 23.1 s |
+| a small program (5 cases, ~10 lines) | **38-42 MB** | **0.1-0.2 s** | 564-719 MB | 17-18 s |
+| 200 functions | **186 MB** | **2.0 s** | 678 MB | 18.7 s |
+| 1,000 functions | **601 MB** | **7.5 s** | 833 MB | 23.7 s |
+| 3,000 functions | **1,514 MB** | **22.0 s** | 1,740 MB | 36.3 s |
 
-**On a small program a build costs about a seventh of what Nuitka's does** -
-40 MB against 300 - and finishes in a tenth of the time. That is the whole
-reason an iPad can run one.
+**Warm** - Nuitka's cache in place, which is what a second build gets:
 
-**The advantage narrows as the program grows, and at three thousand functions
-it is gone**: 1,567 MB against 1,522, which is a loss. Nothing here streams -
-the program, its IR, its C and its machine code are all live in memory at
-once - so the curve is steeper than clang's, which compiles a translation
-unit at a time and forgets it. For anything of ordinary size the first row is
-what applies; for a very large generated program, budget accordingly.
+| what is being built | py2bin | | Nuitka | |
+|---|---|---|---|---|
+| a small program | **40-42 MB** | **0.1-0.2 s** | 294-303 MB | 3.6-4.4 s |
+| 200 functions | **186 MB** | **2.0 s** | 417 MB | 4.7 s |
+| 1,000 functions | **601 MB** | **7.3 s** | 762 MB | 7.9 s |
+| 3,000 functions | 1,568 MB | 21.0 s | **1,517 MB** | **17.1 s** |
 
-**One function may not exceed a 512 KB stack frame**, which works out at
-around 1,800 statements of ordinary shape in a single `def`. This is a limit
-on one function and not on a program: 3,000 separate `def`s compile without
-complaint, and it was a `main()` of 3,000 statements that found it. Generated
-code is where this bites; splitting the function is the fix, and the error
-says so at build time rather than producing something broken.
+**On a small program a build costs a seventh of a warm Nuitka's and a
+fifteenth of a cold one** - 40 MB against 300 or 600. That is the whole reason
+an iPad can run one, and it does not depend on which column you pick.
+
+**The advantage narrows as the program grows.** Nothing here streams - the
+program, its IR, its C and its machine code are all live at once - so the
+curve is steeper than clang's, which compiles a translation unit and forgets
+it. Cold, py2bin is still ahead at three thousand functions; warm, it is
+slightly behind on both memory and time. For anything of ordinary size the
+first rows are what apply.
+
+Measuring this is where the caching had to be pinned down: the same warm
+Nuitka build came out at 1,522 MB one run and 1,175 MB the next, which would
+have been published as a difference between the compilers rather than a
+difference between two runs of one of them.
 
 Startup, `print("x")`, median of 13 runs, same M4:
 

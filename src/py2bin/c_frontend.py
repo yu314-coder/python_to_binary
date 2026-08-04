@@ -2784,6 +2784,13 @@ class Lowerer:
         self.target = target
         self.operations: list[Operation] = []
         self.stack_slots = 0
+        #: The largest the frame ever was, which is what it must be built to.
+        #: `stack_slots` falls back at every statement boundary now, so it is
+        #: no longer the answer.
+        self.peak_slots = 0
+        #: One past the highest slot holding something that outlives its
+        #: statement. Reclamation never goes below this.
+        self.reserved_slots = 0
         self.scopes: list[dict[str, Local]] = []
         self.counter = 0
         self.break_targets: list[str] = []
@@ -2824,7 +2831,16 @@ class Lowerer:
     def emit(self, operation: Operation) -> None:
         self.operations.append(operation)
 
-    def allocate(self, size: int) -> int:
+    def take(self, size: int) -> int:
+        """Slots for something whose lifetime ends with the statement.
+
+        The frame is one fixed allocation, so what matters for its size is the
+        high-water mark rather than what is outstanding now - :attr:`peak_slots`
+        carries that, and is what the emitted frame is built from. Reading the
+        live count instead would hand the function a frame smaller than the
+        offsets written into its own code.
+        """
+
         slots = max(1, (size + 7) // 8)
         base = self.stack_slots
         self.stack_slots += slots
@@ -2833,14 +2849,38 @@ class Lowerer:
                 self.filename,
                 1,
                 1,
-                f"this translation unit needs more than {_MAXIMUM_SLOTS * 8} bytes "
-                "of stack frame; py2bin's native frames are a single fixed "
-                "allocation, so reduce the size of the local arrays",
+                f"this function needs more than {_MAXIMUM_SLOTS * 8} bytes of "
+                "stack frame; py2bin's native frames are a single fixed "
+                "allocation, so split it into smaller functions",
             )
+        self.peak_slots = max(self.peak_slots, self.stack_slots)
+        return base
+
+    def allocate(self, size: int) -> int:
+        """Slots for something that outlives the statement that made it.
+
+        A local, or one of the function-wide scratch areas. Reclaiming these
+        at a statement boundary would hand the next statement a slot something
+        still holds - which is why the two allocators are separate rather than
+        one with a flag nobody remembers to pass.
+        """
+
+        base = self.take(size)
+        self.reserved_slots = self.stack_slots
         return base
 
     def new_temp(self) -> int:
-        return self.allocate(8)
+        return self.take(8)
+
+    def release_temporaries(self, mark: int) -> None:
+        """Give back every temporary slot taken since `mark`.
+
+        Never below :attr:`reserved_slots`: a statement that declared a local
+        or first touched the float formatter's scratch raised that floor, and
+        those slots are still live even though the statement has finished.
+        """
+
+        self.stack_slots = max(mark, self.reserved_slots)
 
     def new_label(self, prefix: str) -> str:
         self.counter += 1
@@ -4091,6 +4131,8 @@ class Lowerer:
         saved = (
             self.operations,
             self.stack_slots,
+            self.peak_slots,
+            self.reserved_slots,
             self.scopes,
             self.buffer_slot,
             self.digit_slot,
@@ -4106,6 +4148,8 @@ class Lowerer:
         )
         self.operations = []
         self.stack_slots = 0
+        self.peak_slots = 0
+        self.reserved_slots = 0
         self.scopes = [{}]
         self.buffer_slot = None
         self.digit_slot = None
@@ -4151,13 +4195,15 @@ class Lowerer:
             body = IRFunction(
                 function.name,
                 len(function.parameters),
-                self.stack_slots,
+                self.peak_slots,
                 self.operations,
             )
         finally:
             (
                 self.operations,
                 self.stack_slots,
+                self.peak_slots,
+                self.reserved_slots,
                 self.scopes,
                 self.buffer_slot,
                 self.digit_slot,
@@ -4234,6 +4280,29 @@ class Lowerer:
         self.scopes.pop()
 
     def statement(self, node: Node) -> None:
+        """One statement, then its temporaries handed back.
+
+        Every intermediate a statement needs is dead once it finishes: C gives
+        no way to name a temporary, so nothing outside can still be holding
+        one. Slots were previously taken and never given back, which made the
+        frame grow with the *length* of a function rather than with how much
+        it needs at once - about eighteen hundred statements reached the
+        512 KB limit and the build was refused.
+
+        The mark is taken here, per statement, which is what makes this safe
+        around loops. A `while` evaluates its condition into temporaries taken
+        before the body is lowered, and the body's own statements can only
+        reclaim down to marks above those - so the condition's slots survive
+        the body, which at run time they must, since the loop comes back to
+        them. The whole `while` is itself one statement in its enclosing list,
+        so its condition is reclaimed once the loop is done.
+        """
+
+        mark = self.stack_slots
+        self.statement_body(node)
+        self.release_temporaries(mark)
+
+    def statement_body(self, node: Node) -> None:
         if isinstance(node, Compound):
             self.block(node)
             return
@@ -4980,7 +5049,10 @@ class Lowerer:
             self.digit_slot = self.allocate(_DIGIT_BYTES)
             self.text_slot = self.allocate(_TEXT_BYTES)
             self.float_scratch = {
-                name: self.new_temp() for name in self._FLOAT_SCRATCH
+                # `allocate`, not `new_temp`: this is reached from whichever
+                # statement first formats a float, and is then read by every
+                # later one.
+                name: self.allocate(8) for name in self._FLOAT_SCRATCH
             }
         assert self.text_slot is not None
         return self.digit_slot, self.text_slot, self.float_scratch
@@ -5841,7 +5913,7 @@ class Lowerer:
         self.scopes.pop()
         return Module(
             self.operations,
-            self.stack_slots,
+            self.peak_slots,
             list(self.lowered.values()),
             static_bytes=self.static_bytes,
         )

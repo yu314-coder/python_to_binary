@@ -54,6 +54,24 @@ The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
 ## New in 0.8.7
 
+**A long function no longer needs a bigger stack frame than a short one.**
+Every intermediate the C lowering needed took a stack slot and never gave it
+back, so a function's frame grew with its *length* rather than with how much
+of it was live at once. About eighteen hundred statements in a single `def`
+reached the 512 KB budget and the build was refused outright - which generated
+code walks into without doing anything unusual. Slots taken for a statement's
+temporaries are handed back when it finishes, and the frame is now built from
+the high-water mark rather than from what happens to be outstanding at the
+end. Forty thousand statements in one function compile and answer correctly,
+where 1,900 was refused before.
+
+Two things had to be got right and both have tests. A local, or the scratch
+area the float formatter allocates the first time a program prints a double,
+outlives the statement that created it - reclaiming those handed a later
+statement slots something still held, which did not print wrong numbers but
+exhausted the heap. And reclaiming is per statement rather than per
+expression, which is what keeps a loop's condition alive across its own body.
+
 **A decorator written without the `@` was skipped.** `greet = trace(greet)`
 kept calling the undecorated body: a module-level `def` became a direct C call
 keyed on the name alone, so a later rebinding of that name was never
