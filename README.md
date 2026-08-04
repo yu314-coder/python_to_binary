@@ -823,6 +823,37 @@ built a `functools.partial` before the call could start. CPython's own
 showing up in `__init__`. Both are now within the general pattern rather than
 outside it.
 
+## What changed in 0.8.7
+
+**A decorator written without the `@` was skipped.** `greet = trace(greet)` is
+how decoration is spelled when the `@` is not convenient, and py2bin kept
+calling the *undecorated* body - quietly, with the right number of arguments
+and a plausible answer. A module-level `def` was compiled to a direct C call
+keyed on the name alone, so anything else that bound the name later was never
+consulted. A `def` now earns the direct call only when it is the one thing
+binding that name at module scope.
+
+That was one of four bugs of a single shape, all found by a differential
+corpus aimed at the inliner, all present since the tier was written. The
+question the compiler was asking was *does the module bind this name* where
+the question is *is it bound yet*:
+
+- `print(y)` above `y = 5` skipped the unbound test and handed the program a
+  raw NULL. Under `print` that shows as `<NULL>`; anywhere else it is a crash.
+  Now a `NameError`, as in Python.
+- The same for a class used above its `class` statement.
+- `print(later(3))` above `def later(...)` answered instead of raising: the
+  callable was built *and bound* at start-up. It is still built at start-up,
+  where a failure can be reported cleanly, but bound at the `def`.
+
+The rule that replaced the old one is positional rather than textual, so
+nothing ordinary is refused: a function may still call one written below it -
+neither runs until the module body reaches the end - and recursion keeps the
+direct call, because a function's own name is bound by the time its body runs.
+Nine tests pin the behaviour; five of them fail against 0.8.6. There is no
+measurable speed cost, and all sixteen `build.py` combinations were rebuilt
+and re-checked.
+
 ## What changed in 0.8.6
 
 **0.8.5 could not build anything through `py2bin make` or `build.py`.** The

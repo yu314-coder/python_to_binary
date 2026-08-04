@@ -229,6 +229,96 @@ class CApiEmitTests(unittest.TestCase):
             self.assertIn(needle, reference.stderr)
             self.assertEqual(native.stdout, reference.stdout)
 
+    def test_a_module_function_rebound_later_is_called_through_the_name(self):
+        # `def f` gave the name a direct C call keyed on the spelling alone,
+        # so the rebinding below was never consulted: this answered 2 twice
+        # where Python answers 2 then 101. Same class as the `len`/`str`
+        # shortcuts - a shortcut keyed on a name must first check the program
+        # has not bound that name somewhere else.
+        self._run(
+            "def f(a): return a + 1\n"
+            "print(f(1))\n"
+            "f = lambda a: a + 100\n"
+            "print(f(1))\n",
+            b"2\n101\n",
+        )
+
+    def test_a_function_decorated_by_reassignment_is_not_bypassed(self):
+        # The idiom the case above exists for. `greet = trace(greet)` is how a
+        # decorator is spelled without the `@`, and a direct call would run the
+        # undecorated body forever.
+        self._run(
+            "def greet(name): return 'hi ' + name\n"
+            "def trace(inner):\n"
+            "    def wrapped(name): return '[' + inner(name) + ']'\n"
+            "    return wrapped\n"
+            "greet = trace(greet)\n"
+            "print(greet('you'))\n",
+            b"[hi you]\n",
+        )
+
+    def test_calling_a_function_above_its_def_raises_name_error(self):
+        # The `def` binds the name when it runs, not when the file is read.
+        # The callable used to be made at start-up and bound with it, so this
+        # answered 21 where Python raises.
+        self._run_failing(
+            "print(later(3))\ndef later(x): return x * 7\n",
+            b"NameError",
+        )
+
+    def test_reading_a_global_above_its_assignment_raises_name_error(self):
+        # `certain_globals` asked only whether the module binds the name
+        # anywhere, not whether it had yet - so the NULL test was skipped and
+        # the raw NULL reached `print`, which showed it as `<NULL>`. Anywhere
+        # less forgiving than `print` that NULL is a crash.
+        self._run_failing("print(y)\ny = 5\n", b"NameError")
+
+    def test_a_class_used_above_its_statement_raises_name_error(self):
+        self._run_failing(
+            "class C: pass\nprint(D)\nclass D: pass\n", b"NameError"
+        )
+
+    def test_a_global_bound_only_in_a_branch_that_did_not_run(self):
+        # The pre-existing half of the same test: bound later *and* only
+        # conditionally. This one always raised; it is here so the positional
+        # rule cannot be "fixed" by dropping the test that motivated it.
+        self._run_failing(
+            "if False:\n    z = 1\nprint(z)\n", b"NameError"
+        )
+
+    def test_a_function_still_reaches_a_global_defined_below_it(self):
+        # The rule is positional, not textual: `helper` runs after the whole
+        # module body has, so `LIMIT` is bound by then. Refusing this would
+        # break the ordinary shape of a Python file.
+        self._run(
+            "def helper(v): return v + LIMIT\n"
+            "LIMIT = 10\n"
+            "print(helper(5))\n",
+            b"15\n",
+        )
+
+    def test_a_function_may_call_one_defined_below_it(self):
+        # Same reasoning for calls. `first` is written above `second` and
+        # neither runs until the module body reaches the last line.
+        self._run(
+            "def first(v): return second(v) + 1\n"
+            "def second(v): return v * 2\n"
+            "print(first(4))\n",
+            b"9\n",
+        )
+
+    def test_recursion_stays_on_the_direct_path(self):
+        # A function's own name is bound by the time its body runs, which is
+        # what keeps the positional rule from disabling the direct call for
+        # the case it matters most for.
+        self._run(
+            "def down(n):\n"
+            "    if n <= 0: return 0\n"
+            "    return n + down(n - 1)\n"
+            "print(down(100))\n",
+            b"5050\n",
+        )
+
     def test_a_failing_call_stops_with_the_interpreters_own_message(self):
         # A C-API function answers NULL and leaves an exception set. Letting
         # that NULL travel is how `1 + "x"` came to print `<NULL>` and exit 0

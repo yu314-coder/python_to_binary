@@ -291,6 +291,42 @@ or keyword-only - is compiled as a closure bound to its name instead of as a
 C function taking registers. Nothing is lost but the direct call, which needs
 a count known at build time.
 
+**A direct call is keyed on a name, so it has to earn the name twice.** The
+optimisation is "this call site means this `def`", and there are two ways that
+can be false.
+
+*The module binds the name somewhere else too.* `greet = trace(greet)` is how
+a decorator is spelled without the `@`, and `f = lambda a: a + 100` under an
+earlier `def f` is a plain rebinding; Python calls whichever binding is
+current, and the direct call always meant the `def`. The decorated program ran
+the *undecorated* body and said nothing. A `def` is now only eligible when it
+is the sole thing binding that name at module scope - counted by
+`_module_scope_bindings`, which descends into module-level `if`/`for`/`try`
+(still module scope) and stops at a nested `def`, `class` or `lambda` (a scope
+of its own, which `_Function.shadows` already covers).
+
+*The name is not bound yet where the call sits.* A `def` binds its name when
+it runs, not when the file is read, so `print(later(3))` above
+`def later(...)` is a `NameError` in Python. The callable used to be made
+*and bound* at start-up, so it answered 21. It is still made at start-up -
+where a failure can be reported cleanly - but held in a separate static and
+bound to the module name at the `def` itself, which is also what makes the
+`NameError` come out right. The rule that decides a call site is positional:
+the `def` must not sit after the module-body statement whose code is being
+written, which for a function body is that function's own `def`. That is why
+a function may still call one written below it (neither runs until the module
+body reaches the end) while a module-level statement may not, and why
+recursion stays on the direct path (a function's own name is bound by the time
+its body runs).
+
+The same positional reasoning fixed a sharper bug one level down. Whether a
+global needs its unbound-NULL test was decided by asking if the module binds
+the name *anywhere*, which is not the same as *yet* - so `print(y)` above
+`y = 5` skipped the test and handed the program a raw NULL. `print` shows that
+as `<NULL>`; anything less forgiving is a crash. The answer each name became
+certain at is recorded alongside the name, and the test is emitted whenever
+the read can be reached first.
+
 `global` was previously *accepted and ignored*: the comment reasoned that every
 name lives in one C scope per function so the storage was already shared, which
 is not so - a function body assigning to the name declared a local of the same

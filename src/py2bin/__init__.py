@@ -34,4 +34,4 @@ __all__ = [
     "decode_c_container", "encode_c_container", "fetch_sources_for_entry",
     "freeze", "library_capability", "load_source_lock", "plan_c",
 ]
-__version__ = "0.8.6"
+__version__ = "0.8.7"

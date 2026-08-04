@@ -34,6 +34,22 @@ really is a builtin function's.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
+## New in 0.8.7
+
+**A decorator written without the `@` was skipped.** `greet = trace(greet)`
+kept calling the undecorated body: a module-level `def` became a direct C call
+keyed on the name alone, so a later rebinding of that name was never
+consulted. A `def` now earns the direct call only when it is the one thing
+binding the name at module scope.
+
+Three more of the same shape, all asking *does the module bind this name*
+where the question is *is it bound yet*: `print(y)` above `y = 5` handed the
+program a raw NULL instead of raising `NameError`, the same for a class used
+above its `class`, and a call above its own `def` answered rather than
+raising. The replacement rule is positional, so a function may still call one
+written below it and recursion keeps the direct call. Nine tests pin it, five
+of which fail against 0.8.6; no measurable speed cost.
+
 ## New in 0.8.6
 
 **0.8.5 could not build anything through `py2bin make` or `build.py`.** An

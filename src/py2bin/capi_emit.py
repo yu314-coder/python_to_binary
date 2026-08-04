@@ -103,6 +103,60 @@ def _scope_bindings(body: list) -> set[str]:
     return bound
 
 
+#: Larger than any statement position: a name that never settles.
+_NEVER = 1 << 30
+
+
+def _module_scope_bindings(tree: ast.Module) -> dict[str, int]:
+    """How many times each name is bound *at module scope*.
+
+    Module scope is not the same as the top level of the file: a name bound
+    inside a module-level `if`, `for`, `while`, `with` or `try` is still a
+    module global, so this descends into those. It stops at a `def`, `class`
+    or `lambda`, whose bindings belong to a scope of their own - and which
+    `_Function.shadows` already accounts for separately.
+
+    A module-level function is only worth calling directly when its `def` is
+    the *sole* thing that binds the name. `f = lambda a: a + 100` after
+    `def f(a): return a + 1` rebinds the global, and Python calls whichever
+    one is current; the direct C call answered with the `def` forever. This
+    is the same class of bug as the `len`/`str` shortcuts - a shortcut keyed
+    on a name must first check the program has not bound that name elsewhere.
+    """
+
+    counts: dict[str, int] = {}
+
+    def note(name: str) -> None:
+        counts[name] = counts.get(name, 0) + 1
+
+    def walk(node: ast.AST) -> None:
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            # The name it binds is this scope's; its body is a scope of its
+            # own, so the walk stops here rather than counting its locals.
+            note(node.name)
+            return
+        if isinstance(node, ast.Lambda):
+            return
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            note(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                note((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            note(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                note(name)
+        for child in ast.iter_child_nodes(node):
+            walk(child)
+
+    for statement in tree.body:
+        walk(statement)
+    return counts
+
+
 def _shadowed_builtins(tree: ast.Module) -> set[str]:
     """Every name this module binds anywhere, at any depth.
 
@@ -580,6 +634,12 @@ class CApiEmitter:
         self.path = path
         self.functions: list[_Function] = []
         self.known_functions: dict[str, int] = {}
+        # Where each of those `def`s sits in the module body, and how far
+        # through that body execution has got. A direct call is only correct
+        # once the `def` has run: `print(later(3))` above `def later(...)` is
+        # a NameError in Python, and used to answer 21 here.
+        self.defined_at: dict[str, int] = {}
+        self.reached = -1
         #: Names any walrus in the module assigns. A slot one of these
         #: names cannot be borrowed from: a walrus is the one thing that
         #: writes a slot in the middle of an expression, so a borrowed
@@ -708,6 +768,13 @@ class CApiEmitter:
         #: body runs after the module body in every arrangement this compiles,
         #: so one of these is bound by the time any function can read it.
         self.certain_globals: set[str] = set()
+        #: Where in the module body each of those became certain. A global is
+        #: only certainly bound *after* the statement that binds it has run,
+        #: and `print(y)` above `y = 5` is a NameError in Python - so without
+        #: the position this skipped the NULL test and handed the program a
+        #: raw NULL, which printed as `<NULL>` and would crash anywhere less
+        #: forgiving than `print`.
+        self.certain_at: dict[str, int] = {}
         #: ``(python name, method-table index)`` for each module-level `def`,
         #: which also gets a Python callable so the name can be *used* and
         #: not only called - as a sort key, or with `*args` spread into it.
@@ -1686,7 +1753,10 @@ class CApiEmitter:
             return self.program_name(node.id, indent)
         target = self.temporary()
         settled = node.id in self.current.certain or (
-            c_name.startswith("g_") and node.id in self.certain_globals
+            c_name.startswith("g_")
+            and node.id in self.certain_globals
+            # Unrecorded means never settled, so the test is emitted.
+            and self.certain_at.get(node.id, _NEVER) <= self.reached
         )
         if c_name[:2] in ("v_", "g_") and not settled:
             # A slot the program binds may never have been written to: `d` is
@@ -2873,7 +2943,18 @@ class CApiEmitter:
         shadowed_here = (
             self.current is not None and node.func.id in self.current.shadows
         )
-        if node.func.id not in self.known_functions or indirect or shadowed_here:
+        # Not yet defined where this call can run. `self.reached` is the
+        # module-body statement whose code is being written, which for a
+        # function body is that function's own `def` - so a call inside `f`
+        # to a `g` defined below `f` is refused, since the module could call
+        # `f` in between and Python would raise NameError there.
+        unborn = self.defined_at.get(node.func.id, 0) > self.reached
+        if (
+            node.func.id not in self.known_functions
+            or indirect
+            or shadowed_here
+            or unborn
+        ):
             assert self.current is not None
             if self.reference(node.func.id) is not None:
                 # A name the program bound - an imported one, or a value
@@ -3691,6 +3772,7 @@ class CApiEmitter:
                 assert self.current is not None
                 self.current.certain.discard(target.id)
                 self.certain_globals.discard(target.id)
+                self.certain_at.pop(target.id, None)
                 continue
             if isinstance(target, ast.Attribute):
                 # Deleting an attribute is setting it to nothing: that is what
@@ -6144,6 +6226,8 @@ class CApiEmitter:
             ) from None
         self.globals = set()
         self.known_functions = {}
+        self.defined_at = {}
+        self.reached = -1
         self.walrus_names = {
             node.target.id
             for node in ast.walk(tree)
@@ -6151,6 +6235,7 @@ class CApiEmitter:
             and isinstance(node.target, ast.Name)
         }
         self.certain_globals = set()
+        self.certain_at = {}
         self.shadowed_builtins = _shadowed_builtins(tree)
         # What `__package__` would hold. A package's `__init__` is in itself;
         # any other module is in the package above it. `__main__` is in none,
@@ -6161,9 +6246,16 @@ class CApiEmitter:
             else name.rpartition(".")[0]
         )
 
-        for node in tree.body:
+        module_bindings = _module_scope_bindings(tree)
+        for position, node in enumerate(tree.body):
             if isinstance(node, ast.FunctionDef):
                 arguments = node.args
+                if module_bindings.get(node.name, 0) != 1:
+                    # Something else at module scope binds this name too - a
+                    # second `def`, a `name = ...`, an import, a `for` target.
+                    # Python calls whichever binding is current at the call;
+                    # a direct C call would always mean this one.
+                    continue
                 if node.decorator_list or (
                     arguments.vararg or arguments.kwarg or arguments.kwonlyargs
                 ):
@@ -6177,9 +6269,12 @@ class CApiEmitter:
                     len(arguments.posonlyargs) + len(arguments.args),
                     len(arguments.defaults),
                 )
+                self.defined_at[node.name] = position
 
-        for node in tree.body:
-            self.certain_globals.update(self.settles(node))
+        for position, node in enumerate(tree.body):
+            for settled_name in self.settles(node):
+                self.certain_globals.add(settled_name)
+                self.certain_at.setdefault(settled_name, position)
 
         # What the module body binds, gathered before any function is written:
         # a function may read a global defined further down the file, exactly
@@ -6187,8 +6282,12 @@ class CApiEmitter:
         for node in tree.body:
             self.note_module_bindings(node)
 
-        for node in tree.body:
+        for position, node in enumerate(tree.body):
             if isinstance(node, ast.FunctionDef) and node.name in self.known_functions:
+                # A body runs only after its own `def` has, so every earlier
+                # `def` is certainly bound by then - and its own name is too,
+                # which is what keeps recursion on the direct path.
+                self.reached = position
                 self.write_function(node)
                 self.write_wrapper(node)
 
@@ -6207,6 +6306,7 @@ class CApiEmitter:
         # what sits beside it.
         for dunder, text in (("__name__", name), ("__file__", origin)):
             self.certain_globals.add(dunder)
+            self.certain_at[dunder] = -1
             slot = self.note_global(dunder)
             if dunder == "__file__":
                 # Beside the binary, wherever that is now. Baking the build
@@ -6230,8 +6330,17 @@ class CApiEmitter:
                 )
             self.checked(slot, indent)
             self.publish(dunder, slot, indent)
-        for node in tree.body:
+        for position, node in enumerate(tree.body):
+            self.reached = position
             if isinstance(node, ast.FunctionDef) and node.name in self.known_functions:
+                # The body was written above; what happens *here*, where the
+                # `def` is, is the binding - the name starts unbound and this
+                # statement is what gives it a value, exactly as in Python.
+                slot = self.note_global(node.name)
+                held = f"_py2bin_fn_{self.prefix}{node.name}"
+                self.emit(f"Py_IncRef({held});", indent)
+                self.emit(f"{slot} = {held};", indent)
+                self.publish(node.name, slot, indent)
                 continue
             # A `def` this could not give a fixed C shape is written here, as
             # a closure bound to its name like any other value.
@@ -6401,6 +6510,11 @@ class CApiEmitter:
             )
         for name in sorted(self.declared):
             out.append(f"static PyObject *g_{name} = 0;")
+        for name, _index in self.value_functions:
+            # Holds the callable from start-up until its `def` binds it to the
+            # module name. Only the binding is deferred; the object is not
+            # remade each time the `def` is reached.
+            out.append(f"static PyObject *_py2bin_fn_{name} = 0;")
         for _name, key in self.linked:
             out.append(f"static PyObject *m_{key} = 0;")
         for name, slot in self.cached_builtins.items():
@@ -6565,10 +6679,18 @@ class CApiEmitter:
                 f"    _py2bin_methods[{index}].ml_doc = {_c_string(signature)};"
             )
         for name, index in self.value_functions:
+            # Made here, where a failure can still be reported cleanly, but
+            # *bound* to the module name at the `def` itself. Binding it here
+            # too meant a function existed before its own `def` had run, so
+            # `print(later(3))` above `def later(...)` answered rather than
+            # raising the NameError Python raises.
             out.append(
-                f"    g_{name} = PyCFunction_New(&_py2bin_methods[{index}], 0);"
+                f"    _py2bin_fn_{name} = "
+                f"PyCFunction_New(&_py2bin_methods[{index}], 0);"
             )
-            out.append(f"    if (!g_{name}) {{ PyErr_Print(); exit(1); }}")
+            out.append(
+                f"    if (!_py2bin_fn_{name}) {{ PyErr_Print(); exit(1); }}"
+            )
         for name, key in self.linked:
             # Registered under its own name *before* the body runs, so an
             # import of it - even from inside its own body - finds this object

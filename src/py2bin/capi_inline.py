@@ -327,7 +327,8 @@ def expand_module(tree: ast.AST) -> ast.AST:
         return tree
     bound = _bindings(tree)
     candidates: dict[str, Inlinable] = {}
-    for node in tree.body:
+    defined_at: dict[str, int] = {}
+    for position, node in enumerate(tree.body):
         if not isinstance(node, ast.FunctionDef):
             continue
         if bound.get(node.name, 0) != 1:
@@ -335,6 +336,7 @@ def expand_module(tree: ast.AST) -> ast.AST:
         described = describe(node, bound)
         if described is not None:
             candidates[node.name] = described
+            defined_at[node.name] = position
     if not candidates:
         return tree
     # A candidate whose body calls another candidate is itself worth writing
@@ -360,6 +362,20 @@ def expand_module(tree: ast.AST) -> ast.AST:
             settled = False
         if settled:
             break
-    expanded = _Expander(candidates).visit(tree)
-    ast.fix_missing_locations(expanded)
-    return expanded
+    # Statement by statement, offering only the functions that are certainly
+    # bound by the time it runs. `print(later(3))` above `def later(...)` is a
+    # NameError in Python; writing the body out there would answer instead of
+    # raising. A candidate's own `def` counts as reached, which is what lets a
+    # body call something defined alongside it.
+    tree.body = [
+        _Expander(
+            {
+                name: described
+                for name, described in candidates.items()
+                if defined_at[name] <= position
+            }
+        ).visit(statement)
+        for position, statement in enumerate(tree.body)
+    ]
+    ast.fix_missing_locations(tree)
+    return tree
