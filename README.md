@@ -749,6 +749,16 @@ because it includes `Python.h` and reads `ob_type` directly. That is the trade
 this compiler makes the other way, and it is why one binary here runs against
 a CPython it was not built against.
 
+**A compiled program reads the arguments it was started with.** An embedded
+interpreter is handed no argument vector, so `sys.argv` used to hold one entry
+this compiler put there - a command-line tool could not read what it had been
+asked to do. The arguments are taken from the operating system instead:
+`/proc/self/cmdline` on Linux, `_NSGetArgv` on macOS, `GetCommandLineW` on
+Windows. Not through the C entry point, whose signature py2bin's own C front
+end fixes at `int main(void)`, and which is handed nothing at all on Windows
+even where it is not fixed. It is emitted only for a program that mentions
+`argv`, so one that never asks pays neither the file read nor the import.
+
 **A builtin the program shadows is the program's.** `def len(x)` of your own,
 a local `str`, a `super` bound to something else - the compiler reaches past
 the name to the C entry point only when nothing in the program has bound it.

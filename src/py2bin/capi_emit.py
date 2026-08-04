@@ -585,6 +585,9 @@ class CApiEmitter:
         #: writes a slot in the middle of an expression, so a borrowed
         #: earlier read of it could be stale by the time it is used.
         self.walrus_names: set[str] = set()
+        #: True when the program reads `sys.argv`, which is what decides
+        #: whether the recovery for it is emitted at all.
+        self.reads_argv = False
         #: Serial for the unique spelling a counted comprehension gives
         #: its target. Never wound back: two comprehensions in one
         #: function must not share slots.
@@ -6118,6 +6121,22 @@ class CApiEmitter:
             # nothing. Folding runs first so an inlined body carries constants
             # already computed.
             tree = inline_calls(tree)
+            # Does the program ever read `sys.argv`? Only then is recovering
+            # it worth what recovering it costs. `argv` under any spelling
+            # counts - `sys.argv`, `from sys import argv`, a module the
+            # program links that reads it - because guessing narrowly here
+            # would leave a program with an empty argument list and no sign
+            # of why.
+            self.reads_argv = self.reads_argv or any(
+                (isinstance(node, ast.Attribute) and node.attr == "argv")
+                or (isinstance(node, ast.Name) and node.id == "argv")
+                or (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "sys"
+                    and any(alias.name == "argv" for alias in node.names)
+                )
+                for node in ast.walk(tree)
+            )
             tree = expand_generators(tree)
         except GeneratorRewriteError as error:
             raise self.fail(
@@ -6448,6 +6467,55 @@ class CApiEmitter:
             "if not sys.argv or not sys.argv[0]:\n"
             "    sys.argv = [_p or (sys.executable or '')]\n"
         )
+        if self.reads_argv:
+            # The arguments the process was started with, which the embedded
+            # interpreter never saw: it is handed no argument vector, so
+            # `sys.argv` holds one entry this compiler put there and a
+            # command-line program could not read what it was asked to do.
+            #
+            # Recovered from the operating system rather than through the C
+            # entry point, whose signature this compiler's own C front end
+            # fixes at `int main(void)` - and which would still leave Windows
+            # out, where the entry is passed nothing at all.
+            #
+            # Emitted only for a program that mentions `sys.argv`. On Linux
+            # the answer costs a file read; elsewhere it costs importing
+            # ctypes, and a program that never asks should not pay for it.
+            anchor += (
+                "def _py2bin_argv():\n"
+                "    if sys.platform.startswith('linux'):\n"
+                "        with open('/proc/self/cmdline', 'rb') as _f:\n"
+                "            _raw = _f.read()\n"
+                "        _parts = _raw.split(b'\\0')[:-1]\n"
+                "        return [_x.decode('utf-8', 'surrogateescape') "
+                "for _x in _parts]\n"
+                "    import ctypes\n"
+                "    if sys.platform == 'darwin':\n"
+                "        _lib = ctypes.CDLL(None)\n"
+                "        _get = _lib._NSGetArgv\n"
+                "        _get.restype = ctypes.POINTER("
+                "ctypes.POINTER(ctypes.c_char_p))\n"
+                "        _n = ctypes.c_int.in_dll(_lib, 'NXArgc').value\n"
+                "        _v = _get().contents\n"
+                "        return [_v[_i].decode('utf-8', 'surrogateescape') "
+                "for _i in range(_n)]\n"
+                "    _line = ctypes.windll.kernel32.GetCommandLineW\n"
+                "    _line.restype = ctypes.c_wchar_p\n"
+                "    _count = ctypes.c_int(0)\n"
+                "    _split = ctypes.windll.shell32.CommandLineToArgvW\n"
+                "    _split.restype = ctypes.POINTER(ctypes.c_wchar_p)\n"
+                "    _got = _split(_line(), ctypes.byref(_count))\n"
+                "    return [_got[_i] for _i in range(_count.value)]\n"
+                "try:\n"
+                "    _found = _py2bin_argv()\n"
+                "except Exception:\n"
+                # Any platform that answers differently, or a stripped /proc:
+                # the single entry set above is what was there before, and is
+                # better than a traceback out of the program's first line.
+                "    _found = None\n"
+                "if _found:\n"
+                "    sys.argv = _found\n"
+            )
         out.append(f"    PyRun_SimpleString({_c_string(anchor)});")
         # Before the builtins, and before any body runs: an interned name
         # is what those lookups are about to be spelled with.

@@ -2703,6 +2703,69 @@ class BorrowedOperandTests(unittest.TestCase):
         self._run(source, b"5\n")
 
 
+class CommandLineArgumentTests(unittest.TestCase):
+    """A compiled program can read the arguments it was started with.
+
+    An embedded interpreter is handed no argument vector, so `sys.argv` held
+    a single entry this compiler put there and a command-line program could
+    not read what it had been asked to do. The arguments are recovered from
+    the operating system instead - `/proc/self/cmdline` on Linux, `_NSGetArgv`
+    on macOS, `GetCommandLineW` on Windows - because the C entry point's
+    signature is fixed at `int main(void)` by this compiler's own front end,
+    and Windows would be left out even if it were not.
+    """
+
+    def _built(self, source: str, room: Path) -> Path:
+        entry = room / "program.py"
+        entry.write_text(source, encoding="utf-8")
+        generated = room / "program.c"
+        generated.write_text(
+            python_to_capi_c(source, str(entry)), encoding="utf-8"
+        )
+        binary = room / "program.bin"
+        compile_c_native(generated, binary, target="darwin-arm64", clean=True)
+        return binary
+
+    def test_the_arguments_arrive(self):
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("needs the host whose C-API binding is wired up")
+        source = "import sys\nprint(sys.argv[1:])\n"
+        with tempfile.TemporaryDirectory() as scratch:
+            binary = self._built(source, Path(scratch))
+            done = subprocess.run(
+                [str(binary), "one", "two", "three four"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr[-300:])
+            self.assertEqual(
+                done.stdout.strip(), "['one', 'two', 'three four']"
+            )
+
+    def test_no_arguments_is_an_empty_tail(self):
+        if not _HOST_IS_DARWIN_ARM64:
+            self.skipTest("needs the host whose C-API binding is wired up")
+        source = "import sys\nprint(sys.argv[1:], len(sys.argv))\n"
+        with tempfile.TemporaryDirectory() as scratch:
+            binary = self._built(source, Path(scratch))
+            done = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(done.stdout.strip(), "[] 1")
+
+    def test_a_program_that_never_asks_does_not_pay(self):
+        # Recovering the arguments costs a file read on Linux and an import
+        # of ctypes elsewhere. A program that does not mention `argv` should
+        # carry none of it.
+        quiet = python_to_capi_c("print('hello')\n", "program.py")
+        self.assertNotIn("_py2bin_argv", quiet)
+        asking = python_to_capi_c("import sys\nprint(sys.argv)\n", "program.py")
+        self.assertIn("_py2bin_argv", asking)
+
+    def test_from_sys_import_argv_counts_as_asking(self):
+        written = python_to_capi_c(
+            "from sys import argv\nprint(argv)\n", "program.py"
+        )
+        self.assertIn("_py2bin_argv", written)
+
+
 class SyntaxErrorReportTests(unittest.TestCase):
     """A program that will not parse gets an error, not a traceback."""
 
