@@ -1153,6 +1153,14 @@ CPython. Use `--embed-python` with `--app` on macOS to carry it instead.
 has to be signed *after* everything is in place, which `--app` does. If you
 change a file inside a built bundle, seal it again.
 
+**`python -m build` started asking which machine to compile for.** This
+repository's `build.py` shares a name with the PEP 517 packaging frontend, and
+`-m` puts the working directory first on the path - so from a clone the
+command found this file, took `--outdir` for the name of a program, and wrote
+an app bundle where a wheel was wanted. It now notices (`__spec__` is set for
+`-m` and `None` for a script) and hands over to the real frontend, or says how
+to install one. `python3 build.py` is unchanged.
+
 **`--icon` did nothing on Linux.** An ELF has nowhere to carry one; Linux
 reads an application's icon from a `.desktop` entry. py2bin says so now rather
 than accepting the flag in silence.
