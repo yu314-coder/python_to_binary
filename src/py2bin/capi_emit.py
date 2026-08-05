@@ -3901,14 +3901,17 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({value});", indent)
             return
         if isinstance(target, ast.Attribute):
-            owner = self.expression(target.value, indent)
+            # Borrowed, like the subscript store below it: `PyObject_SetAttr`
+            # borrows what it is given, and `obj.field = v` on a local took a
+            # reference to the object and dropped it again around the call.
+            owner, owner_owned = self.operand(target.value, indent)
             outcome = self.temporary_flag()
             self.emit(
                 f"{outcome} = PyObject_SetAttr({owner}, "
                 f"{self.interned(target.attr)}, {value});",
                 indent,
             )
-            self.emit(f"Py_DecRef({owner});", indent)
+            self.release(owner, owner_owned, indent)
             self.emit(f"Py_DecRef({value});", indent)
             self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
             return
@@ -3918,7 +3921,7 @@ class CApiEmitter:
                     target, "assigning to a slice is not translated here yet"
                 )
             container, owned = self.operand(target.value, indent)
-            key = self.expression(target.slice, indent)
+            key, key_owned = self.operand(target.slice, indent)
             outcome = self.temporary_flag()
             # `d[k] = v` on a name that always holds an exact dict skips the
             # mapping-protocol dispatch; an unhashable key raises through
@@ -3932,7 +3935,7 @@ class CApiEmitter:
                 f"{outcome} = {store}({container}, {key}, {value});", indent
             )
             self.release(container, owned, indent)
-            self.emit(f"Py_DecRef({key});", indent)
+            self.release(key, key_owned, indent)
             self.emit(f"Py_DecRef({value});", indent)
             self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
             return
@@ -4807,6 +4810,17 @@ class CApiEmitter:
                 self.statement(statement, indent)
         finally:
             self.handlers.pop()
+        # The classes are finished with the moment the body has run without
+        # raising. They were left held: a `try` that did not raise released
+        # none of them, so `except (ValueError, TypeError)` - whose class
+        # expression builds a fresh tuple every time it is evaluated - leaked
+        # one tuple per execution. Four hundred thousand turns of a loop
+        # measured 40 MB against the interpreter's 15, and it grew with the
+        # count. The handler path releases them itself, clause by clause, and
+        # is not reached from here.
+        for wanted in caught:
+            if wanted is not None:
+                self.emit(f"Py_DecRef({wanted});", indent)
         # The `else` clause runs when the body raised nothing, and is *not*
         # protected by these handlers - an exception in it belongs outside, as
         # it does in Python. The handler label is already popped by here.
@@ -4816,7 +4830,9 @@ class CApiEmitter:
         self.emit(f"{handler}:", 0)
         for clause, wanted in zip(node.handlers, caught):
             if clause.type is None:
-                # A bare except catches whatever is set.
+                # A bare except catches whatever is set. Python requires it to
+                # be the last clause, so there is never one after it holding a
+                # class that would go unreleased.
                 held = self.bind_exception(clause, indent)
                 self.handling.append(held)
                 with self.settled_within({clause.name} if clause.name else set()):
@@ -4831,6 +4847,13 @@ class CApiEmitter:
             self.emit(f"{decision} = PyErr_ExceptionMatches({wanted});", indent)
             self.emit(f"Py_DecRef({wanted});", indent)
             self.emit(f"if ({decision}) {{", indent)
+            # The clauses after this one are never tested, so nothing else
+            # will release them. Their classes were built before the body ran
+            # like every other clause's.
+            position = node.handlers.index(clause)
+            for later in caught[position + 1 :]:
+                if later is not None:
+                    self.emit(f"Py_DecRef({later});", indent + 1)
             held = self.bind_exception(clause, indent + 1)
             self.handling.append(held)
             with self.settled_within({clause.name} if clause.name else set()):

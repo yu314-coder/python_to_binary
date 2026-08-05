@@ -547,6 +547,75 @@ class CApiEmitTests(unittest.TestCase):
     def test_isinstance_passed_as_a_value_is_still_the_builtin(self):
         self._run("f = isinstance\nprint(f(5, int))\n", b"True\n")
 
+    def test_a_try_that_does_not_raise_releases_what_it_built(self):
+        """The classes a clause catches are built before the body runs.
+
+        They were never released on the path where the body raised nothing,
+        so `except (ValueError, TypeError)` - whose class expression builds a
+        fresh tuple each time it is evaluated - leaked one tuple per
+        execution. Measured by what it costs rather than by reading the C:
+        four hundred thousand turns held 40 MB against the interpreter's 15,
+        and it grew with the count.
+        """
+
+        self._run(
+            "import resource\n"
+            "def go():\n"
+            "    t = 0\n"
+            "    for i in range(800000):\n"
+            "        try:\n"
+            "            t += 1\n"
+            "        except (ValueError, TypeError):\n"
+            "            pass\n"
+            "    return t\n"
+            "go()\n"
+            "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024\n"
+            "print(peak < 35000)\n",
+            b"True\n",
+        )
+
+    def test_a_matched_clause_releases_the_ones_after_it(self):
+        # A clause that matches jumps out, so the classes of every clause
+        # after it are never tested and nothing else would release them.
+        self._run(
+            "import resource\n"
+            "def go():\n"
+            "    t = 0\n"
+            "    for i in range(800000):\n"
+            "        try:\n"
+            "            raise ValueError('x')\n"
+            "        except (ValueError, TypeError):\n"
+            "            t += 1\n"
+            "        except (KeyError, IndexError):\n"
+            "            pass\n"
+            "    return t\n"
+            "print(go())\n"
+            "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024\n"
+            "print(peak < 35000)\n",
+            b"800000\nTrue\n",
+        )
+
+    def test_a_bare_except_still_catches_after_a_tuple_clause(self):
+        # Not a leak test: Python requires a bare `except` to be last, so
+        # there is never a clause after it whose class would go unreleased.
+        # This is here because the first draft asserted otherwise and passed
+        # against the unfixed compiler, which is how the impossibility was
+        # noticed.
+        self._run(
+            "def go():\n"
+            "    t = 0\n"
+            "    for i in range(1000):\n"
+            "        try:\n"
+            "            raise IndexError\n"
+            "        except (ValueError, TypeError):\n"
+            "            pass\n"
+            "        except:\n"
+            "            t += 1\n"
+            "    return t\n"
+            "print(go())\n",
+            b"1000\n",
+        )
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which

@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.5** takes `in` past the interpreter and shortens `isinstance` -
+**0.9.6** fixes a memory leak in every `try` that catches a tuple of exception types -
 see *Release notes* below.
 
 ## Platforms
@@ -342,31 +342,31 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **2.9 ms** | 7.2 ms | **2.49× faster** |
-| integer arithmetic | **5.2 ms** | 8.5 ms | **1.62× faster** |
-| `while` loop | **4.6 ms** | 6.2 ms | **1.35× faster** |
-| comparisons | **3.6 ms** | 4.6 ms | **1.27× faster** |
-| float arithmetic | **5.3 ms** | 5.8 ms | **1.10× faster** |
-| exception raise/catch | **18.8 ms** | 20.0 ms | **1.06× faster** |
-| `in` on a list | **8.9 ms** | 9.0 ms | **1.02× faster** |
-| list append | 5.3 ms | 5.2 ms | 0.99× |
-| comprehension | 5.6 ms | 5.5 ms | 0.98× |
-| dict store | 8.4 ms | 8.0 ms | 0.96× |
-| `and` / `or` | 6.1 ms | 5.8 ms | 0.95× |
-| `isinstance` | 7.4 ms | 6.0 ms | 0.80× |
-| f-string | 22.2 ms | 17.8 ms | 0.80× |
-| string concatenation | 16.0 ms | 12.4 ms | 0.78× |
-| module global read | 5.3 ms | 3.9 ms | 0.73× |
-| subscript | 8.5 ms | 6.0 ms | 0.71× |
-| `try` that does not raise | 5.4 ms | 3.8 ms | 0.70× |
-| closure call | 10.2 ms | 6.7 ms | 0.66× |
+| direct function call | **2.9 ms** | 7.0 ms | **2.40× faster** |
+| integer arithmetic | **5.2 ms** | 8.4 ms | **1.62× faster** |
+| `while` loop | **4.7 ms** | 6.5 ms | **1.39× faster** |
+| comparisons | **3.7 ms** | 4.6 ms | **1.26× faster** |
+| exception raise/catch | **18.8 ms** | 20.1 ms | **1.07× faster** |
+| float arithmetic | **5.3 ms** | 5.7 ms | **1.06× faster** |
+| `in` on a list | **9.0 ms** | 9.0 ms | **1.01× faster** |
+| list append | 5.2 ms | 5.2 ms | 1.00× |
+| comprehension | 5.6 ms | 5.4 ms | 0.97× |
+| dict store | 8.2 ms | 7.9 ms | 0.96× |
+| `and` / `or` | 6.3 ms | 5.7 ms | 0.91× |
+| `isinstance` | 7.5 ms | 6.1 ms | 0.82× |
+| f-string | 22.0 ms | 17.6 ms | 0.80× |
+| string concatenation | 15.9 ms | 12.4 ms | 0.78× |
+| subscript | 8.4 ms | 6.1 ms | 0.73× |
+| module global read | 5.3 ms | 3.7 ms | 0.69× |
+| closure call | 10.1 ms | 6.8 ms | 0.66× |
+| `try` that does not raise | 5.5 ms | 3.6 ms | 0.65× |
 | `for` over a list | 4.3 ms | 2.8 ms | 0.65× |
-| dict lookup by name | 7.5 ms | 4.6 ms | 0.61× |
-| attribute read | 6.2 ms | 3.7 ms | 0.59× |
-| attribute write | 6.5 ms | 3.0 ms | 0.47× |
-| instantiation | 37.6 ms | 16.4 ms | 0.44× |
-| method call | 15.6 ms | 6.5 ms | 0.42× |
-| tuple unpacking | 15.4 ms | 5.5 ms | 0.36× |
+| dict lookup by name | 7.1 ms | 4.6 ms | 0.64× |
+| attribute read | 6.4 ms | 3.7 ms | 0.58× |
+| attribute write | 6.2 ms | 3.2 ms | 0.52× |
+| instantiation | 34.7 ms | 16.3 ms | 0.47× |
+| method call | 15.5 ms | 6.7 ms | 0.43× |
+| tuple unpacking | 15.5 ms | 5.6 ms | 0.36× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -572,6 +572,35 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.6 - a `try` gave back what it borrowed
+
+Chasing the `try` row found a memory leak rather than a slow path.
+
+**Every `try` leaked the classes its clauses catch.** They are built before the
+body runs - building them inside the handler calls into Python while an
+exception is set, which CPython refuses - and nothing released them on the path
+where the body raised nothing. `except (ValueError, TypeError)` builds a fresh
+tuple each time it is evaluated, so a `try` in a loop leaked one tuple per turn:
+four hundred thousand turns held 40 MB against the interpreter's 15, and eight
+hundred thousand held 65. It grew with the count, which is what makes it a leak
+rather than an overhead. A clause that matched also left every clause *after*
+it unreleased, since those are never tested.
+
+Both paths give them back now, and the row got **slower** for it - 0.70× to
+0.65× - because releasing is work that was not being done. That is the right
+way round.
+
+**Attribute writes and subscript keys are borrowed.** `obj.field = v` took a
+reference to the object and dropped it again around a call that borrows it,
+and `d[k] = v` did the same with the key. Attribute write 0.47× → 0.53×.
+
+One piece of the fix was deleted again: Python requires a bare `except` to be
+last, so no clause can follow it and there is nothing after it to release. The
+first draft handled that case and the test written for it passed against the
+unfixed compiler, which is how the impossibility came to light. The test is
+still there, checking that a bare `except` after a tuple clause catches - it
+just no longer claims to be about leaks.
 
 ### 0.9.5 - a test wants a verdict, and a builtin has an entry point
 
