@@ -1115,7 +1115,9 @@ compiler treats as opaque - which is what lets one binary run against a
 CPython it was not built against. The trade is deliberate; the cost is in the
 table above.
 
-**A metaclass is refused**, by name, rather than approximated.
+**What is still refused is refused by name**, with a `file:line:col`, rather than
+approximated: an `async def` that yields, `globals()`, and a one-argument
+`eval` or `exec`. Each says what to do instead where there is something to do.
 
 ## When it does not work
 
@@ -1399,6 +1401,103 @@ runtime and library adapters.
 ## Release notes
 
 Newest first. Older releases are in the repository's history.
+
+### 0.9.0 - what a compiled function could not do, and now can
+
+Found by probing the language a feature at a time - seventy shapes, each
+compiled and its output compared against CPython's - rather than by reading
+code. Sixty-four of the seventy now agree exactly, three are refused by name,
+and three are structural.
+
+**Two silent wrong answers, both in code people write every day.**
+
+A default argument was evaluated on every call. Python evaluates it once, when
+the `def` runs, and hands every later call the same object - which is what
+makes `def f(x=[])` share one list and what the memoisation idiom rests on.
+`accum(1), accum(2)` answered `[1] [2]` where Python answers `[1, 2] [1, 2]`.
+Nested functions had it worse: `def each(x=i)` in a loop read the loop
+variable late, so two closures both answered 1 where Python gives 0 and 1.
+Defaults are now evaluated where the `def` is - in statics for a module-level
+function, and in the tuple a closure already carries its captures in, which is
+what makes the loop case come out right.
+
+A closure captured names by asking *does the module bind this spelling*, and a
+parameter of the enclosing function shadows a module name. So
+
+    def d(f):
+        def w(): return f() + 1
+        return w
+    @d
+    def f(): return 1
+
+made a `w` that called the module's `f` - which `@d` had just rebound to `w` -
+and every call recursed until the stack ran out. The quieter form of the same
+hole let `def d(helper)` beside `def helper()` answer from the module's
+`helper`: no crash, just the wrong number. What decides a capture is now
+whether the name resolves to the module's slot or to something nearer. A
+module global is still not captured, on purpose - Python reads a global when
+the closure runs.
+
+**Classes.** `class C(metaclass=M)` was refused outright and now works, along
+with every keyword in a class header. Three things came with it: the bases are
+built before the body, which is the order Python does it in; `__prepare__` is
+asked of the most derived metaclass of the bases, which is what `enum` needs -
+its namespace is a mapping that notices a member name used twice, and a plain
+dict is why every `Enum` subclass failed; and `__annotations__` is recorded,
+which is what `dataclasses` reads to find the fields, so every dataclass used
+to come out with none.
+
+**Generators and coroutines in classes.** `def items(self): yield` did not
+compile, and neither did any `async def` method - both are everywhere. A
+generator becomes a machine class and a maker, and a class inside a class body
+is not translated, so the machine now goes in front of the class. Two
+collisions came out of that, both quiet: a method's first parameter is spelled
+the same as the machine's receiver, and every name a generator binds is
+rewritten into an attribute of that receiver - so the machine's own
+`self.<state>` became `self.self.<state>`, the state lived on the instance,
+and iterating yielded the first value for ever.
+
+**`locals()` and `vars()`** answered `None`, and callers then tried to iterate
+it. The builtin wants the frame of whoever called it; since 3.13 `locals()` in
+a function is an independent snapshot, and a snapshot is what this can build
+from the slots it already knows about, unbound names left out as they are
+there.
+
+**Inside an `except`, the exception is on record.** `sys.exc_info()` answered
+`None` and an exception raised from a handler got no `__context__`, so a
+traceback lost its "during handling of the above exception" chain. The vetted
+table gains `PyErr_GetHandledException` and `PyErr_SetHandledException`, taking
+it from 84 entry points to 86, and the restore rides the mechanism `finally`
+already uses so it happens whichever way the clause leaves. This is the one
+row that got slower for it: `exception raise/catch` goes from 0.97x to 0.90x,
+which is two C-API calls per handler and is what `sys.exc_info()` costs.
+
+**Async comprehensions** - `[x async for x in it]` and the set and dict forms -
+are written out as the `async for` they are short for before the state machine
+sees them, because the machine cuts at statements and a comprehension is one
+expression.
+
+**Smaller, and measured.** A loop whose sequence is empty runs its `else`
+again: the flag was set up inside the body, which an empty sequence never
+reaches, and it lives in a reused slot, so the `else` read what the last loop
+that broke had left there. A local nothing ever reads shares one slot, which
+removed the last refusal in the 889-program corpus - a generated file with
+67,000 of them needed two slots and asked for 67,001. `inspect.signature`
+spells a literal default as itself rather than as `None`.
+
+**Refused rather than guessed at**, each with a `file:line:col`: an `async def`
+that yields (an async generator is driven by `__aiter__`/`__anext__`, and its
+own yields would have to be told apart from the ones an `await` inside it
+makes); `globals()` (the module's names are C variables, so what came back
+would be a copy, and a write to a copy would be lost); and a one-argument
+`eval` or `exec` (they read the caller's frame - the message names the
+two-argument form that works).
+
+**Still structural**, and unlikely to change: a compiled function is a
+`builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and
+`sys._getframe()` do not answer as they would for a Python function.
+
+Corpus 886 of 889. Suite 1,749 tests.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
@@ -1752,4 +1851,4 @@ the zero-toolchain claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1732-test suite.
+    is checked on every change is the 1749-test suite.
