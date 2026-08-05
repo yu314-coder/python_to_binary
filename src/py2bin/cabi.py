@@ -720,6 +720,10 @@ _PyObject_SetAttrString = _bind(
     "PyObject_SetAttrString", ctypes.c_int, _HANDLE, ctypes.c_char_p, _HANDLE
 )
 _PyErr_SetRaisedException = _bind("PyErr_SetRaisedException", None, _HANDLE)
+_PyErr_GetHandledException = _bind("PyErr_GetHandledException", _HANDLE)
+_PyErr_SetHandledException = _bind(
+    "PyErr_SetHandledException", None, _HANDLE
+)
 _PyBytes_FromStringAndSize = _bind(
     "PyBytes_FromStringAndSize", _HANDLE, ctypes.c_char_p, _SSIZE
 )
@@ -1091,6 +1095,30 @@ def PyErr_SetRaisedException(exception: int) -> None:
     """
 
     _PyErr_SetRaisedException(exception)
+
+
+def PyErr_GetHandledException() -> int:
+    """The exception an enclosing `except` is in the middle of handling.
+
+    What `sys.exc_info()` answers with, and what CPython attaches as
+    ``__context__`` to anything raised while it is set. Returns a new
+    reference, or 0 when nothing is being handled.
+    """
+
+    return _PyErr_GetHandledException()
+
+
+def PyErr_SetHandledException(exception: int) -> None:
+    """Say which exception is being handled, or pass 0 for none.
+
+    Takes a reference of its own rather than stealing one - the opposite of
+    its `Raised` counterpart, and worth stating because assuming otherwise
+    leaks the exception once per handler. Pass 0 for "nothing is being
+    handled". An `except` clause sets this on the way in and puts back what it
+    found on the way out, so the two nest the way Python's do.
+    """
+
+    _PyErr_SetHandledException(exception)
 
 
 def PyObject_SetAttrString(object_handle: int, name: bytes, value: int) -> int:

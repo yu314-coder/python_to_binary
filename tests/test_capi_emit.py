@@ -694,6 +694,73 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_the_exception_being_handled_is_on_record(self):
+        """`sys.exc_info()` said None inside every `except`.
+
+        Taking the exception is what lets the clause run Python at all, but
+        it also took it off the thread's record of what is being handled -
+        and that is what `sys.exc_info()` reads and what a new exception
+        raised from a handler takes its `__context__` from. Both came out
+        empty, so a traceback lost its "during handling of the above
+        exception" chain.
+
+        Restored on the way out whichever way the clause leaves, and
+        restored to what was there rather than cleared, so handlers nest.
+        """
+        self._run(
+            "import sys\n"
+            "def outside():\n"
+            "    return sys.exc_info()[0]\n"
+            "def leaves():\n"
+            "    try:\n"
+            "        raise ValueError('r')\n"
+            "    except ValueError:\n"
+            "        return sys.exc_info()[0].__name__\n"
+            "try:\n"
+            "    raise ValueError('v')\n"
+            "except ValueError:\n"
+            "    print(sys.exc_info()[0].__name__, outside().__name__)\n"
+            "    try:\n"
+            "        raise KeyError('k')\n"
+            "    except KeyError:\n"
+            "        print('nested', sys.exc_info()[0].__name__)\n"
+            "    print('restored', sys.exc_info()[0].__name__)\n"
+            "print('after', sys.exc_info()[0])\n"
+            "try:\n"
+            "    try:\n"
+            "        raise ValueError('a')\n"
+            "    except ValueError:\n"
+            "        raise KeyError('b')\n"
+            "except KeyError as k:\n"
+            "    print('context', type(k.__context__).__name__)\n"
+            "print('returned', leaves(), sys.exc_info()[0])\n",
+            b"ValueError ValueError\nnested KeyError\nrestored ValueError\n"
+            b"after None\ncontext ValueError\nreturned ValueError None\n",
+        )
+
+    def test_putting_the_exception_on_record_does_not_hold_it(self):
+        """`PyErr_SetHandledException` takes its own reference.
+
+        Its `Raised` counterpart steals one, and assuming the same of this
+        left an extra reference per handler: 800,000 of them came to 137 MB
+        against the interpreter's 14.
+        """
+        self._run(
+            "import resource\n"
+            "def go():\n"
+            "    t = 0\n"
+            "    for i in range(800000):\n"
+            "        try:\n"
+            "            raise ValueError('x')\n"
+            "        except ValueError:\n"
+            "            t += 1\n"
+            "    return t\n"
+            "print(go())\n"
+            "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024\n"
+            "print(peak < 35000)\n",
+            b"800000\nTrue\n",
+        )
+
     def test_a_default_is_evaluated_once_where_the_def_is(self):
         """Python evaluates a default when the `def` runs, not per call.
 

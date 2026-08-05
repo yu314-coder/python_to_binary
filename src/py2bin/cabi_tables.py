@@ -53,6 +53,9 @@ VETTED = [
     "PyNumber_Lshift", "PyNumber_Rshift", "PyObject_DelItem",
     "PyErr_GetRaisedException", "PyCFunction_New", "PyTuple_GetItem",
     "PyObject_SetAttrString", "PyErr_SetRaisedException",
+    # What `sys.exc_info()` reads inside an `except`, and what a new
+    # exception raised there takes its `__context__` from.
+    "PyErr_GetHandledException", "PyErr_SetHandledException",
     # The interned-name forms. `...String` builds a fresh str from the
     # char* on every call and hashes it; these take a str built once,
     # which is what makes an attribute in a loop cost a lookup rather

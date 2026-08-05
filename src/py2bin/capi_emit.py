@@ -443,6 +443,8 @@ extern PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
 extern void PyErr_Clear(void);
 extern PyObject *PyErr_GetRaisedException(void);
 extern void PyErr_SetRaisedException(PyObject *exception);
+extern PyObject *PyErr_GetHandledException(void);
+extern void PyErr_SetHandledException(PyObject *exception);
 extern PyObject *PyBytes_FromStringAndSize(const char *text, long long length);
 extern PyObject *PyNumber_Negative(PyObject *value);
 extern PyObject *PyNumber_Positive(PyObject *value);
@@ -5239,11 +5241,7 @@ class CApiEmitter:
                 # be the last clause, so there is never one after it holding a
                 # class that would go unreleased.
                 held = self.bind_exception(clause, indent)
-                self.handling.append(held)
-                with self.settled_within({clause.name} if clause.name else set()):
-                    for statement in clause.body:
-                        self.statement(statement, indent)
-                self.handling.pop()
+                self.run_handler(clause, held, indent)
                 self.emit(f"Py_DecRef({held});", indent)
                 self.emit(f"goto {done};", indent)
                 continue
@@ -5260,11 +5258,7 @@ class CApiEmitter:
                 if later is not None:
                     self.emit(f"Py_DecRef({later});", indent + 1)
             held = self.bind_exception(clause, indent + 1)
-            self.handling.append(held)
-            with self.settled_within({clause.name} if clause.name else set()):
-                for statement in clause.body:
-                    self.statement(statement, indent + 1)
-            self.handling.pop()
+            self.run_handler(clause, held, indent + 1)
             self.emit(f"Py_DecRef({held});", indent + 1)
             self.emit(f"    goto {done};", indent)
             self.emit("}", indent)
@@ -5312,6 +5306,45 @@ class CApiEmitter:
         def emit_clause(_held: str, _protection) -> None:
             for statement in node.finalbody:
                 self.statement(statement, indent)
+
+        self.protect(emit_body, emit_clause, indent)
+
+    def run_handler(self, clause, held: str, indent: int) -> None:
+        """An `except` clause's body, with the exception on record while it runs.
+
+        Taking the exception is what lets the clause run Python at all, but it
+        also took it off the thread's record of what is being *handled* - and
+        that record is what `sys.exc_info()` answers with and what CPython
+        attaches as `__context__` to anything raised from inside a handler. So
+        both came out empty: a traceback lost its "during handling of the
+        above exception" chain, and `sys.exc_info()` said `None` where every
+        piece of logging code expects a type.
+
+        Put back on the way out, whichever way that is - the clause can
+        return, break, or raise - which is what `protect` is for. Restoring
+        what was there rather than clearing it is what lets handlers nest.
+        """
+
+        previous = self.temporary()
+        # `PyErr_SetHandledException` takes a reference of its own rather than
+        # stealing one, which is the opposite of its `Raised` counterpart -
+        # incrementing before the call leaked the exception once per handler,
+        # and 800,000 of them came to 137 MB against the interpreter's 14.
+        # `PyErr_GetHandledException` does hand over a reference, so what it
+        # returns is released once it has been put back.
+        self.emit(f"{previous} = PyErr_GetHandledException();", indent)
+        self.emit(f"PyErr_SetHandledException({held});", indent)
+
+        def emit_body() -> None:
+            self.handling.append(held)
+            with self.settled_within({clause.name} if clause.name else set()):
+                for statement in clause.body:
+                    self.statement(statement, indent)
+            self.handling.pop()
+
+        def emit_clause(_held: str, _protection) -> None:
+            self.emit(f"PyErr_SetHandledException({previous});", indent)
+            self.emit(f"if ({previous}) Py_DecRef({previous});", indent)
 
         self.protect(emit_body, emit_clause, indent)
 

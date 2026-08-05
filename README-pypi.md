@@ -77,15 +77,13 @@ Where it knowingly differs: a generator expression is built eagerly;
 matching it means reading `ob_type` out of an object this treats as opaque -
 which is what lets one binary run against a CPython it was not built against.
 
-**Inside an `except` block, the exception being handled is not on record.**
-`sys.exc_info()` answers `None` there, and an exception raised from a handler
-gets no `__context__` - so a traceback loses its "during handling of the above
-exception" chain. Both come from one thing: the handler *takes* the exception
-rather than also setting it as the thread's handled exception, and CPython's
-`PyErr_SetHandledException` is not in the vetted table. The exception itself,
-its type, message, `__cause__` from an explicit `raise ... from`, and what
-`except` matches are all correct; it is the implicit chaining and the
-introspection that are missing.
+Inside an `except` block the exception being handled **is** on record:
+`sys.exc_info()` answers with it, including through a call made from the
+handler, and an exception raised there takes its `__context__` from it, so a
+traceback keeps its "during handling of the above exception" chain. It is put
+back on the way out whichever way the clause leaves - falling off the end,
+returning, breaking, or raising - and put back to what was there rather than
+cleared, so handlers nest.
 
 **A call that names an argument is no longer slow.** It was the worst row
 here for a long time - `helper(t, step=1)` measured 0.13x the interpreter,

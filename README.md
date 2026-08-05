@@ -693,33 +693,35 @@ in almost every one of them.
 
 ### The interpreter surface it may use
 
-- A fixed table of 84 exported CPython entry points: `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
+- A fixed table of 86 exported CPython entry points:
+  `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
-  `PyErr_GetRaisedException`, `PyErr_Occurred`, `PyErr_Print`,
-  `PyErr_SetObject`, `PyErr_SetRaisedException`, `PyFile_WriteObject`,
-  `PyFile_WriteString`, `PyFloat_AsDouble`, `PyFloat_FromDouble`,
-  `PyImport_AddModule`, `PyImport_ImportModule`, `PyIter_Next`,
-  `PyList_Append`, `PyList_New`, `PyList_SetItem`, `PyLong_AsLongLong`, `PyLong_FromLongLong`,
-  `PyLong_FromString`, `PyNumber_Add`, `PyNumber_And`,
+  `PyErr_GetHandledException`, `PyErr_GetRaisedException`, `PyErr_Occurred`,
+  `PyErr_Print`, `PyErr_SetHandledException`, `PyErr_SetObject`,
+  `PyErr_SetRaisedException`, `PyFile_WriteObject`, `PyFile_WriteString`,
+  `PyFloat_AsDouble`, `PyFloat_FromDouble`, `PyImport_AddModule`,
+  `PyImport_ImportModule`, `PyInstanceMethod_New`, `PyIter_Next`,
+  `PyList_Append`, `PyList_New`, `PyList_SetItem`, `PyLong_AsLongLong`,
+  `PyLong_FromLongLong`, `PyLong_FromString`, `PyNumber_Add`, `PyNumber_And`,
   `PyNumber_FloorDivide`, `PyNumber_Invert`, `PyNumber_Lshift`,
   `PyNumber_Multiply`, `PyNumber_Negative`, `PyNumber_Or`,
   `PyNumber_Positive`, `PyNumber_Power`, `PyNumber_Remainder`,
   `PyNumber_Rshift`, `PyNumber_Subtract`, `PyNumber_TrueDivide`,
   `PyNumber_Xor`, `PyObject_Call`, `PyObject_CallNoArgs`,
-  `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_GetAttr`, `PyObject_GetAttrString`,
-  `PyObject_GetItem`, `PyObject_GetIter`, `PyObject_IsInstance`, `PyObject_IsTrue`,
+  `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_Format`,
+  `PyObject_GetAttr`, `PyObject_GetAttrString`, `PyObject_GetItem`,
+  `PyObject_GetIter`, `PyObject_IsInstance`, `PyObject_IsTrue`,
   `PyObject_Repr`, `PyObject_RichCompare`, `PyObject_RichCompareBool`,
-  `PyObject_SetAttr`, `PyObject_SetAttrString`,
-  `PyObject_Format`, `PyObject_SetItem`, `PyObject_Size`,
-  `PyObject_Str`,
-  `PyObject_Vectorcall`, `PyObject_VectorcallMethod`,
-  `PyInstanceMethod_New`, `PyRun_SimpleString`, `PySequence_Check`, `PySequence_Contains`, `PySequence_GetItem`,
-  `PySlice_New`, `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`,
-  `PyTuple_New`, `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_Concat`, `PyUnicode_DecodeUTF8`, `PyUnicode_InternFromString`,
-  `PyUnicode_Join`,
-  `PyUnicode_FromString`, `Py_DecRef`, `Py_EnterRecursiveCall`,
-  `Py_Finalize`, `Py_IncRef`, `Py_Initialize`, `Py_IsInitialized`,
-  `Py_LeaveRecursiveCall`
+  `PyObject_SetAttr`, `PyObject_SetAttrString`, `PyObject_SetItem`,
+  `PyObject_Size`, `PyObject_Str`, `PyObject_Vectorcall`,
+  `PyObject_VectorcallMethod`, `PyRun_SimpleString`, `PySequence_Check`,
+  `PySequence_Contains`, `PySequence_GetItem`, `PySlice_New`,
+  `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`, `PyTuple_New`,
+  `PyTuple_Pack`, `PyTuple_SetItem`, `PyUnicode_Concat`,
+  `PyUnicode_DecodeUTF8`, `PyUnicode_FromString`,
+  `PyUnicode_InternFromString`, `PyUnicode_Join`, `Py_DecRef`,
+  `Py_EnterRecursiveCall`, `Py_Finalize`, `Py_IncRef`, `Py_Initialize`,
+  `Py_IsInitialized`, `Py_LeaveRecursiveCall`
 - Every one is a real exported function - not a macro, not a `static inline` -
   with a fixed count of word-sized arguments, and a test asserts each is
   exported by the running interpreter's dylib. That is why this compiler never
@@ -1024,15 +1026,13 @@ A compiler that is *nearly* right about semantics is worse than a slow one,
 because the difference shows up as a wrong answer rather than an error. This
 is what `compile-capi` promises, and where it knowingly stops.
 
-**Inside an `except` block, the exception being handled is not on record.**
-`sys.exc_info()` answers `None` there, and an exception raised from a handler
-gets no `__context__` - so a traceback loses its "during handling of the above
-exception" chain. Both come from one thing: the handler *takes* the exception
-rather than also setting it as the thread's handled exception, and CPython's
-`PyErr_SetHandledException` is not in the vetted table. The exception itself,
-its type, message, `__cause__` from an explicit `raise ... from`, and what
-`except` matches are all correct; it is the implicit chaining and the
-introspection that are missing.
+Inside an `except` block the exception being handled **is** on record:
+`sys.exc_info()` answers with it, including through a call made from the
+handler, and an exception raised there takes its `__context__` from it, so a
+traceback keeps its "during handling of the above exception" chain. It is put
+back on the way out whichever way the clause leaves - falling off the end,
+returning, breaking, or raising - and put back to what was there rather than
+cleared, so handlers nest.
 
 **A call that names an argument is no longer slow.** It was the worst row
 here for a long time - `helper(t, step=1)` measured 0.13x the interpreter,
