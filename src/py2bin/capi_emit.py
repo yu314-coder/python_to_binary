@@ -2354,15 +2354,18 @@ class CApiEmitter:
             )
             self.release(container, owned, indent)
             return self.checked(target, indent)
-        key = (
-            self.slice_object(node.slice, indent)
-            if isinstance(node.slice, ast.Slice)
-            else self.expression(node.slice, indent)
-        )
+        # `PyObject_GetItem` borrows the key, and a key is very often a
+        # literal or a local - `d["name"]`, `xs[i]` - which was incremented
+        # and decremented around the lookup. A slice has to be built, so it
+        # is owned either way.
+        if isinstance(node.slice, ast.Slice):
+            key, key_owned = self.slice_object(node.slice, indent), True
+        else:
+            key, key_owned = self.operand(node.slice, indent)
         target = self.temporary()
         self.emit(f"{target} = PyObject_GetItem({container}, {key});", indent)
         self.release(container, owned, indent)
-        self.emit(f"Py_DecRef({key});", indent)
+        self.release(key, key_owned, indent)
         return self.checked(target, indent)
 
     def indexed(
