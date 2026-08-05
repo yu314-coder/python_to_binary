@@ -1900,6 +1900,37 @@ class CApiEmitter:
             return f"g_{self.prefix}{name}"
         return None
 
+    def bound_around(self, name: str) -> bool:
+        """Whether the scope enclosing a closure binds this name itself.
+
+        What decides whether a closure captures a name. A module global is
+        not captured, on purpose: Python reads a global when the closure
+        *runs*, so rebinding it afterwards is meant to be visible, and a
+        captured copy would freeze it.
+
+        The question is which of the two this is, and asking "does the module
+        bind this spelling" answered it the wrong way round - a parameter of
+        the enclosing function shadows a module name, and the closure must
+        take the parameter. It did not, so
+
+            def d(f):
+                def w(): return f() + 1
+                return w
+            @d
+            def f(): return 1
+
+        made a `w` that called the module's `f`, which `@d` had just rebound
+        to `w` - every call recursed until the stack ran out. The same hole
+        let a parameter named after a module-level function be ignored in
+        favour of that function, which answered quietly rather than crashing.
+
+        `reference` already looks in Python's order, so the answer is simply
+        whether what it found is the module's slot or something nearer.
+        """
+
+        slot = self.reference(name)
+        return slot is not None and slot != f"g_{self.prefix}{name}"
+
     def borrowable(self, node: ast.expr) -> str | None:
         """The C slot this name can be read from without taking a reference.
 
@@ -6034,13 +6065,7 @@ class CApiEmitter:
         arguments = node.args
         bound, read = self.scope_names(node)
         captures = tuple(
-            sorted(
-                name
-                for name in read - bound
-                if name not in self.globals
-                and name not in self.known_functions
-                and self.reference(name) is not None
-            )
+            sorted(name for name in read - bound if self.bound_around(name))
         )
         self.refuse_late_binding(node, captures)
         # A name the body reads that this scope has no slot for *yet*, but
@@ -6906,7 +6931,17 @@ class CApiEmitter:
             function.exact_dicts = exact_dicts(node.body, given)
             function.exact_strs = exact_strs(node.body, given)
             function.body_binds = _scope_bindings(node.body)
-            function.shadows = function.body_binds | set(held)
+            # The captured names belong here as much as the parameters do. A
+            # name this closure took from the scope around it is *bound* -
+            # whatever the module happens to call the same spelling. Without
+            # them, `def d(f): def w(): return f() + 1` reached the module's
+            # own `f` rather than the one handed to `d`, and since `@d` had
+            # just rebound that name to `w`, the wrapper called itself until
+            # the stack ran out. Every decorator whose parameter is named
+            # after the function it decorates is that shape.
+            function.shadows = (
+                function.body_binds | set(held) | set(captures)
+            )
         outer, outer_handlers, outer_scope = (
             self.current,
             self.handlers,

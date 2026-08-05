@@ -694,6 +694,61 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_a_decorator_whose_parameter_is_named_for_what_it_wraps(self):
+        """The commonest closure there is, and it recursed until the stack went.
+
+        `d`'s parameter is `f`, and so is the module-level function `@d`
+        decorates. The closure captured names by asking "does the module bind
+        this spelling" - `f` is a module name, so it was not captured, and
+        the body read the module's `f`. `@d` had just rebound that to the
+        wrapper, so the wrapper called itself.
+        """
+        self._run(
+            "def d(f):\n"
+            "    def w():\n"
+            "        return f() + 1\n"
+            "    return w\n"
+            "@d\n"
+            "def f():\n"
+            "    return 1\n"
+            "print(f())\n",
+            b"2\n",
+        )
+
+    def test_a_parameter_named_after_a_module_function_wins(self):
+        # Quieter than the recursion and the same hole: the parameter is
+        # shadowed by a module-level function the compiler can call directly,
+        # so the closure called that one and answered 1 rather than 5.
+        self._run(
+            "def helper():\n"
+            "    return 1\n"
+            "def d(helper):\n"
+            "    def w():\n"
+            "        return helper()\n"
+            "    return w\n"
+            "print(d(lambda: 5)())\n",
+            b"5\n",
+        )
+
+    def test_a_global_a_closure_reads_is_still_read_when_it_runs(self):
+        """The other side of that fix, which it must not break.
+
+        A module global is deliberately *not* captured: Python reads it when
+        the closure runs, so rebinding it afterwards is meant to show. Only a
+        name the enclosing scope binds is taken by value.
+        """
+        self._run(
+            "setting = 'before'\n"
+            "def make():\n"
+            "    def show():\n"
+            "        return setting\n"
+            "    return show\n"
+            "s = make()\n"
+            "setting = 'after'\n"
+            "print(s())\n",
+            b"after\n",
+        )
+
     def test_an_unread_local_still_runs_what_made_it(self):
         """Sharing the slot is a storage decision, not licence to skip work.
 
