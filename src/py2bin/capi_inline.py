@@ -310,6 +310,115 @@ class _Expander(ast.NodeTransformer):
         return node if expanded is None else expanded
 
 
+class _Placer(ast.NodeTransformer):
+    def __init__(self, signatures: dict[str, tuple[tuple[str, ...], int]]):
+        self.signatures = signatures
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if not node.keywords or not isinstance(node.func, ast.Name):
+            return node
+        if any(isinstance(item, ast.Starred) for item in node.args):
+            return node
+        signature = self.signatures.get(node.func.id)
+        if signature is None:
+            return node
+        parameters, positional_only = signature
+        if len(node.args) > len(parameters):
+            return node
+        # A positional-only parameter cannot be reached by name, and these
+        # functions have no `**kwargs` for the name to fall into.
+        nameable = parameters[positional_only:]
+        taken = set(range(len(node.args)))
+        slots: list[int] = []
+        for keyword in node.keywords:
+            if keyword.arg is None or keyword.arg not in nameable:
+                return node
+            slot = parameters.index(keyword.arg)
+            if slot in taken:
+                # Given twice, once by position and once by name. Python calls
+                # that an error, and the call is left as written so it is one.
+                return node
+            taken.add(slot)
+            slots.append(slot)
+        in_order = list(range(len(node.args), len(node.args) + len(slots)))
+        if slots != in_order:
+            # The names are not in the order the parameters are, so writing
+            # them positionally moves them past each other. Python evaluates
+            # arguments in the order written, so this is only the same call
+            # when moving them cannot be noticed.
+            if sorted(slots) != in_order or not all(
+                transparent(keyword.value) for keyword in node.keywords
+            ):
+                return node
+        # A gap - `f(1, c=9)` on `def f(a, b=2, c=3)` - is not a contiguous
+        # run, so it was refused above: there is nothing to write in b's place
+        # that means "the default".
+        ordered = [
+            value
+            for _, value in sorted(
+                zip(slots, [keyword.value for keyword in node.keywords]),
+                key=lambda pair: pair[0],
+            )
+        ]
+        return ast.copy_location(
+            ast.Call(func=node.func, args=[*node.args, *ordered], keywords=[]),
+            node,
+        )
+
+
+def place_keywords(tree: ast.AST) -> ast.AST:
+    """Write `f(a, step=1)` as the `f(a, 1)` it means.
+
+    Naming an argument is a thing said at the call site about the callee's
+    parameters, and both are right here - so it can be settled now rather than
+    by the interpreter on every call. Done to the tree before anything looks
+    at it, because the saving is not the name lookup. A keyword stopped the
+    call being inlined and stopped it being a direct C call, so the argument
+    binding ran per call *and* the loop around it kept everything in objects
+    for want of knowing what came back. `helper(t, step=1)` cost 27.8 ms
+    against the interpreter's 7.7; as `helper(t, 1)` it is the same call the
+    rest of this file already makes fast.
+
+    Only where it is the same call. Anything this cannot settle exactly - a
+    `**mapping`, a name that is not a parameter, a parameter given twice, a
+    gap with no way to say "default here", or a reordering that would move a
+    side effect - is left as written for the interpreter to do at run time.
+    """
+
+    if not isinstance(tree, ast.Module):
+        return tree
+    bound = _bindings(tree)
+    signatures: dict[str, tuple[tuple[str, ...], int]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if bound.get(node.name, 0) != 1:
+            continue  # something else binds this name; the call may not be this
+        arguments = node.args
+        if (
+            node.decorator_list
+            or arguments.vararg
+            or arguments.kwarg
+            or arguments.kwonlyargs
+        ):
+            # A decorator answers with something whose parameters are its own,
+            # and the other three are all places a name could land that is not
+            # one of the parameters listed here.
+            continue
+        signatures[node.name] = (
+            tuple(
+                item.arg for item in (*arguments.posonlyargs, *arguments.args)
+            ),
+            len(arguments.posonlyargs),
+        )
+    if not signatures:
+        return tree
+    tree = _Placer(signatures).visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def expand_module(tree: ast.AST) -> ast.AST:
     """Write every qualifying module-level function out where it is called.
 

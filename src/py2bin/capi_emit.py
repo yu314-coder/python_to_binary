@@ -32,7 +32,7 @@ from pathlib import Path
 
 from .capi_cells import CellError, expand as expand_cells
 from .capi_fold import fold as fold_constants
-from .capi_inline import expand_module as inline_calls
+from .capi_inline import expand_module as inline_calls, place_keywords
 from .capi_exact import exact_dicts, exact_lists, exact_strs
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
@@ -648,6 +648,11 @@ class CApiEmitter:
         self.path = path
         self.functions: list[_Function] = []
         self.known_functions: dict[str, int] = {}
+        #: The parameters of each of those, in order, and how many of them are
+        #: positional-only. A call that names an argument is placed against
+        #: these at compile time rather than at run time, so `f(a, step=1)`
+        #: reaches the same direct C call `f(a, 1)` does.
+        self.known_parameters: dict[str, tuple[tuple[str, ...], int]] = {}
         # Where each of those `def`s sits in the module body, and how far
         # through that body execution has got. A direct call is only correct
         # once the `def` has run: `print(later(3))` above `def later(...)` is
@@ -3270,13 +3275,10 @@ class CApiEmitter:
                 self.emit(f"{target} = PyObject_Str({value});", indent)
                 self.release(value, owned, indent)
             return self.checked(target, indent)
-        # A spread, or any keyword, has to go through the callable form: the
-        # direct C call passes arguments by position and has nowhere to put a
-        # name, which is how `show(1, c=9)` came to answer with c's default.
-        indirect = (
-            any(isinstance(item, ast.Starred) for item in node.args)
-            or bool(node.keywords)
-        )
+        # A spread has to go through the callable form: the direct C call
+        # passes a fixed number of arguments and cannot express one whose
+        # count is not known until it runs.
+        spread = any(isinstance(item, ast.Starred) for item in node.args)
         shadowed_here = (
             self.current is not None and node.func.id in self.current.shadows
         )
@@ -3286,6 +3288,22 @@ class CApiEmitter:
         # to a `g` defined below `f` is refused, since the module could call
         # `f` in between and Python would raise NameError there.
         unborn = self.defined_at.get(node.func.id, 0) > self.reached
+        # Which parameter each named argument is for, worked out here rather
+        # than at run time. A keyword used to force the callable form on its
+        # own, which cost far more than the name: the argument-binding
+        # trampoline ran per call, and - because the call went through a
+        # PyObject - the loop around it could not hold anything in a machine
+        # register either.
+        placed: list[int] | None = None
+        if (
+            node.keywords
+            and not spread
+            and not shadowed_here
+            and not unborn
+            and node.func.id in self.known_parameters
+        ):
+            placed = self.placed_keywords(node)
+        indirect = spread or (bool(node.keywords) and placed is None)
         if (
             node.func.id not in self.known_functions
             or indirect
@@ -3317,17 +3335,34 @@ class CApiEmitter:
             self.release(callable_value, callable_owned, indent)
             return target
         expected, defaulted = self.known_functions[node.func.id]
-        if not expected - defaulted <= len(node.args) <= expected:
-            raise self.fail(
-                node,
-                f"{node.func.id}() takes {expected - defaulted} to {expected} "
-                f"argument(s), {len(node.args)} given",
-            )
-        arguments = [self.expression(item, indent) for item in node.args]
-        # A parameter the call leaves out is passed as NULL and the callee puts
-        # its default in - evaluated there rather than here, so the default
-        # expression exists once however many call sites there are.
-        arguments.extend(["(PyObject *)0"] * (expected - len(node.args)))
+        if placed is None:
+            if not expected - defaulted <= len(node.args) <= expected:
+                raise self.fail(
+                    node,
+                    f"{node.func.id}() takes {expected - defaulted} to "
+                    f"{expected} argument(s), {len(node.args)} given",
+                )
+            arguments = [self.expression(item, indent) for item in node.args]
+            # A parameter the call leaves out is passed as NULL and the callee
+            # puts its default in - evaluated there rather than here, so the
+            # default expression exists once however many call sites there are.
+            arguments.extend(["(PyObject *)0"] * (expected - len(node.args)))
+        else:
+            # Evaluated in the order written, then put where each one belongs.
+            # Python evaluates `f(g(), k=h())` as g() then h() whatever order
+            # the parameters are in, and a keyword cannot precede a positional
+            # argument in the grammar, so writing the positional ones first is
+            # writing them in source order.
+            slotted: dict[int, str] = {}
+            for index, item in enumerate(node.args):
+                slotted[index] = self.expression(item, indent)
+            for keyword, slot in zip(node.keywords, placed):
+                slotted[slot] = self.expression(keyword.value, indent)
+            # A gap is left NULL exactly as a missing tail is: `f(1, c=9)` on
+            # `def f(a, b=2, c=3)` passes NULL for b, and the callee fills it.
+            arguments = [
+                slotted.get(index, "(PyObject *)0") for index in range(expected)
+            ]
         target = self.temporary()
         self.emit(
             f"{target} = f_{self.prefix}{node.func.id}({', '.join(arguments)});",
@@ -3339,6 +3374,45 @@ class CApiEmitter:
             if argument != "(PyObject *)0":
                 self.emit(f"Py_DecRef({argument});", indent)
         return self.checked(target, indent)
+
+    def placed_keywords(self, node: ast.Call) -> list[int] | None:
+        """Which parameter each named argument fills, or None if it cannot say.
+
+        Answering None is always safe: the call goes through the callable
+        instead, which is where it went for every keyword before this existed.
+        So every case this cannot settle - and every case Python would raise
+        for - is refused here rather than guessed at, and the interpreter
+        raises it at run time with the wording it has always used.
+        """
+        parameters, positional_only = self.known_parameters[node.func.id]
+        expected, defaulted = self.known_functions[node.func.id]
+        if len(node.args) > expected:
+            return None
+        filled = [index < len(node.args) for index in range(expected)]
+        # A positional-only parameter cannot be reached by name. These
+        # functions have no `**kwargs` for the name to fall into, so Python
+        # raises TypeError - let it.
+        nameable = parameters[positional_only:]
+        placed: list[int] = []
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                # `**mapping` - what it holds is not known until it runs.
+                return None
+            if keyword.arg not in nameable:
+                return None
+            slot = parameters.index(keyword.arg)
+            if filled[slot]:
+                # Given twice: once by position and once by name. Python calls
+                # that "multiple values for argument", and the callable form
+                # is what says so.
+                return None
+            filled[slot] = True
+            placed.append(slot)
+        if not all(filled[: expected - defaulted]):
+            # A parameter with no default left unfilled. It would arrive NULL,
+            # and the callee increments every parameter it was given.
+            return None
+        return placed
 
     def invoke_spread(
         self, callable_value: str, args: list, keywords: list, indent: int
@@ -6145,6 +6219,83 @@ class CApiEmitter:
         self.functions.append(function)
         self.current = outer
 
+    def refuse_positional_only_by_name(
+        self, names: tuple[str, ...], display: str, indent: int
+    ) -> None:
+        """`def f(a, /)` called as `f(1, a=2)` is an error, and was not one.
+
+        A positional-only parameter is filled from the tuple and never looked
+        for among the keywords, which is right - with a `**kwargs` a keyword
+        of the same spelling belongs to it. Without one there is nowhere for
+        the name to go, and Python says so. Here the name simply went unread:
+        `f(1, a=2)` answered 1, and `f(a=1)` reported the parameter missing
+        rather than the keyword that could not fill it.
+
+        CPython names every offending parameter in one message, in the order
+        the parameters are declared rather than the order the call named them,
+        and reports this ahead of a duplicate, an unknown name or a missing
+        argument - so it is emitted before any of those are looked for.
+        """
+
+        offenders = self.temporary()
+        counter = self.temporary_flag()
+        span = self.temporary_flag()
+        probe = self.temporary()
+        matched = self.temporary_flag()
+        self.emit("if (_kwnames) {", indent)
+        self.emit(f"{span} = (int)PyObject_Size(_kwnames);", indent + 1)
+        self.emit(f"{offenders} = PyList_New(0LL);", indent + 1)
+        self.checked(offenders, indent + 1)
+        # The parameters outside, the passed names inside, so what comes out
+        # is in the order the parameters are declared.
+        for name in names:
+            key = self.interned(name)
+            self.emit(
+                f"for ({counter} = 0; {counter} < {span}; "
+                f"{counter} = {counter} + 1) {{",
+                indent + 1,
+            )
+            self.emit(
+                f"{probe} = PyTuple_GetItem(_kwnames, {counter});", indent + 2
+            )
+            self.emit(f"if (!{probe}) {{ {self.failure()} }}", indent + 2)
+            self.emit(
+                f"{matched} = PyObject_RichCompareBool({probe}, {key}, 2);",
+                indent + 2,
+            )
+            self.emit(f"if ({matched} < 0) {{ {self.failure()} }}", indent + 2)
+            self.emit(
+                f"if ({matched}) {{ PyList_Append({offenders}, {probe}); "
+                f"break; }}",
+                indent + 2,
+            )
+            self.emit("}", indent + 1)
+        found = self.temporary_flag()
+        self.emit(f"{found} = (int)PyObject_Size({offenders});", indent + 1)
+        self.emit(f"if ({found} > 0) {{", indent + 1)
+        separator = self.temporary()
+        joined = self.temporary()
+        self.emit(f'{separator} = PyUnicode_FromString(", ");', indent + 2)
+        self.checked(separator, indent + 2)
+        self.emit(
+            f"{joined} = PyUnicode_Join({separator}, {offenders});", indent + 2
+        )
+        self.emit(f"Py_DecRef({separator});", indent + 2)
+        self.checked(joined, indent + 2)
+        # `raise_counted` spells its middle piece with `str`, and `str` of a
+        # string is that string, so the joined names go straight through.
+        self.raise_counted(
+            "TypeError",
+            f"{display}() got some positional-only arguments passed as "
+            f"keyword arguments: '",
+            joined,
+            "'",
+            indent + 2,
+        )
+        self.emit("}", indent + 1)
+        self.emit(f"Py_DecRef({offenders});", indent + 1)
+        self.emit("}", indent)
+
     def bind_parameters(
         self,
         node: ast.AST,
@@ -6268,6 +6419,11 @@ class CApiEmitter:
                 self.checked(gathered, indent + 1)
                 self.emit("}", indent)
             source = gathered
+
+        if named_from and not arguments.kwarg:
+            self.refuse_positional_only_by_name(
+                positional[:named_from], display, indent
+            )
 
         def from_keywords(name: str, slot: str) -> None:
             if scanning:
@@ -6800,6 +6956,12 @@ class CApiEmitter:
             # name is assigned, and a value arriving from a call tells them
             # nothing. Folding runs first so an inlined body carries constants
             # already computed.
+            #
+            # Named arguments are put in their parameters' places before both,
+            # because inlining and the narrowing analyses each step over a call
+            # that has a keyword on it. Settled here, `f(a, step=1)` is an
+            # ordinary call to everything downstream.
+            tree = place_keywords(tree)
             tree = inline_calls(tree)
             # Does the program ever read `sys.argv`? Only then is recovering
             # it worth what recovering it costs. `argv` under any spelling
@@ -6866,6 +7028,13 @@ class CApiEmitter:
                 self.known_functions[node.name] = (
                     len(arguments.posonlyargs) + len(arguments.args),
                     len(arguments.defaults),
+                )
+                self.known_parameters[node.name] = (
+                    tuple(
+                        item.arg
+                        for item in (*arguments.posonlyargs, *arguments.args)
+                    ),
+                    len(arguments.posonlyargs),
                 )
                 self.defined_at[node.name] = position
 

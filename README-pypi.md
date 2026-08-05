@@ -87,13 +87,22 @@ its type, message, `__cause__` from an explicit `raise ... from`, and what
 `except` matches are all correct; it is the implicit chaining and the
 introspection that are missing.
 
-**A call that names an argument is still slow.** `helper(t, step=1)` measured
-0.13x the interpreter and is now 0.18x. The caller no longer allocates a tuple
-and a dict and rebuild the keyword's name for every call - vectorcall carries
-the values in one array with a tuple of names built at start-up beside it -
-but the *callee* still turns `kwnames` back into a dict and looks each
-parameter up in it. Matching the names directly against the tuple, which is
-what CPython does, is what would close the rest, and it is not done yet.
+**A call that names an argument is no longer slow.** It was the worst row
+here for a long time - `helper(t, step=1)` measured 0.13x the interpreter,
+then 0.18x, then 0.27x as the caller stopped allocating a tuple and a dict
+per call and the callee stopped rebuilding a dict from `kwnames`. All of that
+was work to make the run-time binding cheaper, and the binding did not need
+to happen at run time at all: which parameter a name is for is settled by the
+call site and the `def`, and where both are in the same module both are in
+front of the compiler. Placed there, `f(a, step=1)` is written as `f(a, 1)`
+and is an ordinary call - which means it inlines, and the loop around it
+holds its values in machine registers. The row is **2.26x faster than the
+interpreter**, from 27.8 ms to 3.4 ms.
+
+What is left goes through the callable, as it always did: a `**mapping`, a
+name that is not a parameter, a parameter given twice, a gap with no way to
+say "default here", a reordering that would move a side effect, or a callee
+that is not a plain function in this module.
 
 
 
@@ -377,33 +386,33 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.1 ms | **2.35× faster** |
-| integer arithmetic | **5.2 ms** | 8.5 ms | **1.63× faster** |
-| `while` loop | **4.6 ms** | 6.4 ms | **1.39× faster** |
-| comparisons | **3.7 ms** | 4.7 ms | **1.27× faster** |
-| `try` that does not raise | **3.5 ms** | 3.7 ms | **1.07× faster** |
+| direct function call | **3.0 ms** | 7.1 ms | **2.40× faster** |
+| a call naming an argument | **3.5 ms** | 7.8 ms | **2.26× faster** |
+| integer arithmetic | **5.3 ms** | 8.4 ms | **1.59× faster** |
+| `while` loop | **4.7 ms** | 6.4 ms | **1.38× faster** |
+| comparisons | **3.8 ms** | 4.7 ms | **1.24× faster** |
 | float arithmetic | **5.5 ms** | 5.8 ms | **1.06× faster** |
-| `in` on a list | 9.0 ms | 8.9 ms | 1.00× |
-| list append | 5.2 ms | 5.2 ms | 1.00× |
-| exception raise/catch | 20.0 ms | 19.9 ms | 1.00× |
-| dict store | 8.3 ms | 8.0 ms | 0.96× |
-| comprehension | 5.7 ms | 5.5 ms | 0.96× |
+| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.03× faster** |
+| `in` on a list | 9.0 ms | 9.0 ms | 1.00× |
+| comprehension | 5.7 ms | 5.6 ms | 0.98× |
+| list append | 5.2 ms | 5.1 ms | 0.98× |
+| exception raise/catch | 20.7 ms | 20.0 ms | 0.97× |
+| dict store | 8.5 ms | 7.9 ms | 0.93× |
 | `and` / `or` | 6.2 ms | 5.7 ms | 0.92× |
-| f-string | 22.0 ms | 17.8 ms | 0.81× |
-| `isinstance` | 7.6 ms | 6.2 ms | 0.81× |
-| string concatenation | 16.1 ms | 12.7 ms | 0.79× |
-| dict lookup by name | 6.4 ms | 4.6 ms | 0.72× |
-| module global read | 5.5 ms | 3.8 ms | 0.70× |
-| subscript | 8.7 ms | 6.0 ms | 0.70× |
-| `for` over a list | 4.4 ms | 2.9 ms | 0.66× |
-| attribute read | 6.4 ms | 3.8 ms | 0.59× |
-| chained comparison | 11.9 ms | 6.8 ms | 0.57× |
-| closure call | 12.9 ms | 6.6 ms | 0.52× |
-| attribute write | 6.4 ms | 3.2 ms | 0.50× |
-| instantiation | 37.7 ms | 16.3 ms | 0.43× |
-| tuple unpacking | 15.6 ms | 5.6 ms | 0.36× |
-| method call | 18.6 ms | 6.6 ms | 0.36× |
-| a call naming an argument | 29.4 ms | 8.0 ms | 0.27× |
+| `isinstance` | 7.5 ms | 6.1 ms | 0.81× |
+| f-string | 22.1 ms | 17.7 ms | 0.80× |
+| string concatenation | 16.0 ms | 12.5 ms | 0.78× |
+| module global read | 5.5 ms | 3.7 ms | 0.68× |
+| subscript | 8.9 ms | 6.0 ms | 0.68× |
+| dict lookup by name | 6.9 ms | 4.6 ms | 0.67× |
+| `for` over a list | 4.4 ms | 2.9 ms | 0.65× |
+| attribute read | 6.5 ms | 3.8 ms | 0.58× |
+| chained comparison | 12.2 ms | 6.8 ms | 0.56× |
+| closure call | 13.0 ms | 6.7 ms | 0.51× |
+| attribute write | 6.5 ms | 3.0 ms | 0.46× |
+| instantiation | 37.9 ms | 16.4 ms | 0.43× |
+| tuple unpacking | 15.5 ms | 5.6 ms | 0.36× |
+| method call | 18.8 ms | 6.7 ms | 0.36× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -427,6 +436,28 @@ outright. Most did not a short while ago.
 | list append | 0.28× | 0.72× | a lookup, a bound method and a discarded `None` per call |
 | instantiation | 0.09× | 0.51× | `__init__` was reached through a Python-level wrapper |
 | method call | 0.05× | 0.40× | so was every other method |
+
+**A named argument is placed before anything else looks at the call.** This row
+was worked on three times - the caller stopped building a tuple and a dict per
+call, then stopped rebuilding the keyword's name, then the callee stopped
+turning `kwnames` back into a dict - and after all of it it still sat at 0.28×,
+the worst on the grid. Each fix made the run-time binding cheaper; none asked
+whether it had to happen at run time.
+
+It does not. Which parameter a name is for is decided by the call site and the
+`def`, and when both are in the same module both are in front of the compiler.
+`f(a, step=1)` is written as `f(a, 1)` before any other pass runs. The saving
+is not the matching: a keyword stopped the call being inlined and stopped it
+being a direct C call, so the value came back through a `PyObject` and the loop
+around it kept everything boxed. Placed, the same loop runs on machine
+registers - 27.8 ms to 3.4 ms, against the interpreter's 7.8. A `**mapping`, a
+name that is not a parameter, a parameter given twice, a gap, or a reordering
+that would move a side effect are all left for the interpreter, as before.
+
+Looking at it turned up something that was not about speed: `def f(a, /)`
+called as `f(1, a=2)` was **accepted in silence** and answered 1, where Python
+raises. It now raises what CPython raises, naming every offending parameter in
+declaration order.
 
 The largest wins were not optimisations but mistakes being removed - a wrapper
 written in Python on the method path, a float analysis that did not exist, a
@@ -624,7 +655,7 @@ is the current measurement.
 | `in` on a list | 0.37x | **1.00x** |
 | `try` that does not raise | 0.70x | **1.07x** |
 | tuple unpacking | 0.18x | **0.36x** |
-| a call naming an argument | 0.13x | **0.27x** |
+| a call naming an argument | 0.13x | **2.26x** |
 | `isinstance` | 0.51x | **0.81x** |
 | `and` / `or` | 0.66x | **0.92x** |
 | chained comparison | 0.46x | **0.57x** |

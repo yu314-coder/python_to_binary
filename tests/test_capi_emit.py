@@ -645,9 +645,15 @@ class CApiEmitTests(unittest.TestCase):
         # A tuple *and* a dict were allocated per call, and the keyword's name
         # was built from a C string every time - two allocations and a string
         # build to pass one argument by name.
+        #
+        # The callee here is a builtin, so this is the path a keyword still
+        # takes. A keyword naming a parameter of a function in this same
+        # module no longer reaches it at all - see the placement tests - but
+        # that is the smaller half of the cases, and this is the other half.
         generated = python_to_capi_c(
-            "def helper(v, step):\n    return v + step\n"
-            "print(helper(1, step=2))\n",
+            "def show(values):\n"
+            "    return sorted(values, reverse=True)\n"
+            "print(show([1, 3, 2]))\n",
             "program.py",
         )
         # Scoped to the calling function: `PyObject_Call` still has other
@@ -667,6 +673,85 @@ class CApiEmitTests(unittest.TestCase):
             "    return (a, b, c)\n"
             "print(f(1), f(1, c=3), f(1, b=2, c=3), f(c=3, a=1))\n",
             b"(1, 9, 8) (1, 9, 3) (1, 2, 3) (1, 9, 3)\n",
+        )
+
+    def test_named_arguments_are_still_evaluated_where_they_are_written(self):
+        """Placing them must not move a side effect past another one.
+
+        Python runs `f(b=g(), a=h())` as g() then h(), however the parameters
+        are ordered. Writing that as `f(h(), g())` would swap them, so a call
+        whose named arguments are out of order is only placed when moving
+        them cannot be noticed.
+        """
+        self._run(
+            "order = []\n"
+            "def note(tag, value):\n"
+            "    order.append(tag)\n"
+            "    return value\n"
+            "def f(a, b):\n"
+            "    return (a, b)\n"
+            "print(f(b=note('b', 2), a=note('a', 1)), order)\n",
+            b"(1, 2) ['b', 'a']\n",
+        )
+
+    def test_a_positional_only_parameter_cannot_be_filled_by_name(self):
+        """It was not an error here, and it is one in Python.
+
+        A positional-only parameter is never looked for among the keywords,
+        which is right when there is a `**kwargs` for a name of that spelling
+        to belong to. Without one the name simply went unread: `f(1, a=2)`
+        answered 1 where CPython raises, and `f(a=1)` reported the parameter
+        missing rather than the keyword that could not fill it.
+        """
+        self._run(
+            "def f(a, /):\n"
+            "    return a\n"
+            "for call in (lambda: f(1), lambda: f(1, a=2), lambda: f(a=1)):\n"
+            "    try:\n"
+            "        print(call())\n"
+            "    except TypeError as error:\n"
+            "        print('TypeError:', error)\n",
+            b"1\n"
+            b"TypeError: f() got some positional-only arguments passed as "
+            b"keyword arguments: 'a'\n"
+            b"TypeError: f() got some positional-only arguments passed as "
+            b"keyword arguments: 'a'\n",
+        )
+
+    def test_every_positional_only_name_is_reported_in_order(self):
+        # CPython names all of them in one message, in the order the
+        # parameters are declared rather than the order the call named them.
+        self._run(
+            "def f(a, b, /, c):\n"
+            "    return (a, b, c)\n"
+            "try:\n"
+            "    print(f(b=1, a=2, c=3))\n"
+            "except TypeError as error:\n"
+            "    print('TypeError:', error)\n",
+            b"TypeError: f() got some positional-only arguments passed as "
+            b"keyword arguments: 'a, b'\n",
+        )
+
+    def test_a_starred_parameter_still_takes_that_name(self):
+        # With a `**kwargs` the name is not an error at all: it belongs to
+        # the mapping, and the positional parameter is filled from the tuple.
+        self._run(
+            "def f(a, /, **more):\n"
+            "    return (a, more)\n"
+            "print(f(1, a=2))\n",
+            b"(1, {'a': 2})\n",
+        )
+
+    def test_a_gap_reaches_the_callee_as_a_default(self):
+        # `f(1, c=9)` fills a and c and leaves b. The direct call passes NULL
+        # in b's place and the callee puts its default there, which is the
+        # same thing it does for an argument left off the end.
+        self._run(
+            "def f(a, b=2, c=3):\n"
+            "    total = a + b + c\n"
+            "    return total\n"
+            "print(f(1, c=9), f(1), f(1, b=5))\n",
+            b"12 6 9\n",
         )
 
     def test_a_starred_signature_still_collects_the_rest(self):
