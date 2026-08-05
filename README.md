@@ -33,7 +33,7 @@ with no interpreter anywhere near it. Reach for it when that is the point.
 | **speed** on a 30M-iteration loop | 0.74 s | 0.44 s | **0.05 s** |
 | **artifact** | 24 MB | 50 KB | **32 KB** |
 | **needs Python on the machine?** | no, it carries one | yes, or bundle it | **no** |
-| **how much Python works** | **everything** | most of it: 878 of an 889-program corpus[^corpus] | a small subset |
+| **how much Python works** | **everything** | most of it: 885 of an 889-program corpus[^corpus] | a small subset |
 | **third-party packages** | **carried inside** | any the interpreter can import | none |
 | what actually runs your logic | CPython, interpreting | machine code | machine code |
 
@@ -87,7 +87,7 @@ machines rather than something this repository's test rig can reach.
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
-CPython's. macOS agrees on 878 and differs on 7; a 100-program slice through
+CPython's. macOS agrees on 885 and differs on 4; a 100-program slice through
 Wine agrees on 93 and differs on 5. The differences are the same ones on every
 platform and are inherent rather than open: CPython's "Did you mean" needs a
 Python frame to suggest from, the repr of a compiled function really is a
@@ -662,9 +662,24 @@ A `finally` around a `yield` works, and so does `with`, `async for` and
 cleanup is not emitted as a real `finally:` and what is still refused.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
-889-program corpus, 878 programs produce byte-identical output to CPython; the
-7 that differ do so inherently (CPython's "Did you mean" needs a Python frame,
-`"v" is "v"` depends on interning) and 4 are refused outright.
+889-program corpus, **885 programs produce byte-identical stdout and the same
+exit code as CPython**. Three differ and one is refused, and all four are
+structural rather than open: the repr of a compiled function really is a
+builtin function's (and carries an address, so it never matches twice
+anyway), one program loops forever by design, one drives py2bin through
+`subprocess` to fuzz it, and the refusal is a single 67,000-line function that
+does not fit the fixed stack frame - which it says, with the line and the
+limit.
+
+**Comparing stderr as well, 803 match.** The 82 that do not are one thing:
+CPython prints a traceback - the frames, the source line, the `~~~^^^` caret -
+and a compiled program prints the final `ExceptionType: message` line only,
+because there are no Python frames to walk. In 77 of the 82 that last line is
+character-for-character CPython's; the other five are the "Did you mean"
+suggestion (three), a compile-time `SyntaxWarning` about `is` with a literal
+(one), and a `RecursionError` that says how much stack was used rather than
+naming the depth limit (one), which is the same exception reached by the
+real stack rather than a counter.
 
 ### The interpreter surface it may use
 
@@ -1712,9 +1727,11 @@ under `src/` imports `subprocess`, `multiprocessing`, `pty`, `distutils` or
 `setuptools`, or names an external toolchain as a value - which is what keeps
 the zero-toolchain claim honest rather than aspirational.
 
-[^corpus]: That sweep was last run before the optimisation work described under
-    [how fast each one is](#how-fast-each-one-is), and the harness that ran it
-    was scratch rather than committed, so the figure is reported as measured
-    rather than as currently verified. What is checked on every change is the
-    1529-test suite and a differential set that compiles each program and
-    demands byte-identical output to CPython.
+[^corpus]: Freshly measured, on this machine, at the commit that carries this
+    line: each of the 889 programs compiled with `compile-capi` for the host
+    and run, and its stdout and exit code compared against CPython's. The
+    harness is scratch rather than committed, which is why the method is
+    written out here rather than pointed at. Comparing stderr as well - which
+    means comparing tracebacks a compiled program cannot produce - the figure
+    is 803; see *It behaves as CPython does* for what the other 82 are. What
+    is checked on every change is the 1714-test suite.

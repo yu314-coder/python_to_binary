@@ -694,6 +694,66 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_an_empty_loop_still_runs_its_else(self):
+        """The `else` of a loop whose body never ran.
+
+        A loop's `else` runs unless a `break` left it, and a sequence with
+        nothing in it is the ordinary way to end - so the `else` runs. The
+        flag that records the break was set up *inside* the loop body, which
+        an empty sequence never reaches, and the flag lives in a slot the
+        emitter reuses between statements. So the `else` read whatever the
+        last loop that broke had left there and did not run. It needed an
+        earlier loop that broke to show, which is why a loop on its own
+        looked right.
+        """
+        self._run(
+            "d = {1: 10, 3: 30}\n"
+            "for k in d:\n"
+            "    if k == 1:\n"
+            "        break\n"
+            "else:\n"
+            "    print('not this one')\n"
+            "for i in range(0, 0):\n"
+            "    print('never')\n"
+            "else:\n"
+            "    print('empty-else')\n",
+            b"empty-else\n",
+        )
+
+    def test_every_empty_loop_shape_runs_its_else(self):
+        # A counted range, a range that is empty only at run time, an empty
+        # list, and a `while` whose test is false at once - each after a loop
+        # that broke, because that is what leaves the flag set.
+        self._run(
+            "def broke():\n"
+            "    for x in [1, 2]:\n"
+            "        break\n"
+            "    else:\n"
+            "        print('no')\n"
+            "n = 0\n"
+            "broke()\n"
+            "for i in range(0, 0):\n"
+            "    pass\n"
+            "else:\n"
+            "    print('a')\n"
+            "broke()\n"
+            "for i in range(n, n):\n"
+            "    pass\n"
+            "else:\n"
+            "    print('b')\n"
+            "broke()\n"
+            "for i in []:\n"
+            "    pass\n"
+            "else:\n"
+            "    print('c')\n"
+            "broke()\n"
+            "while n:\n"
+            "    pass\n"
+            "else:\n"
+            "    print('d')\n",
+            b"a\nb\nc\nd\n",
+        )
+
     def test_a_positional_only_parameter_cannot_be_filled_by_name(self):
         """It was not an error here, and it is one in Python.
 

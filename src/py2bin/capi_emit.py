@@ -5537,6 +5537,13 @@ class CApiEmitter:
         # the other is how `for arg in cmd:` came to write `g_arg` and read
         # `v_arg` - a NULL that reached PySequence_Contains and segfaulted.
         target = None
+        # Before the loop opens, not inside it. A loop whose sequence is empty
+        # runs its body no times, so a flag set up in the body is never set up
+        # at all - and the slot is a reused one, so the `else` read whatever
+        # the last loop that broke had left in it and did not run. `for i in
+        # range(0, 0): ... else:` printed nothing after any earlier loop that
+        # broke.
+        broke = self.begin_loop(node, indent)
         self.emit("while (1) {", indent)
         self.emit(f"{item} = PyIter_Next({iterator});", indent + 1)
         # NULL means the sequence ended, or that producing the next item
@@ -5554,7 +5561,6 @@ class CApiEmitter:
             # One target: a name, or a subscript or attribute to store
             # through. bind_target consumes the item either way.
             self.bind_target(node.target, item, indent + 1)
-        broke = self.begin_loop(node, indent)
         self.loop_depth += 1
         try:
             targets = (
@@ -5652,6 +5658,9 @@ class CApiEmitter:
         counter = self.machine_slot()
         self.emit(f"{counter} = {start};", indent)
         item = self.temporary()
+        # Before the loop, for the reason given in `for_loop`: an empty range
+        # never reaches the body, and the flag lives in a reused slot.
+        broke = self.begin_loop(node, indent)
         self.emit("while (1) {", indent)
         self.emit(f"if ({counting}) {{", indent + 1)
         self.emit(f"if ({step} > 0) {{", indent + 2)
@@ -5671,7 +5680,6 @@ class CApiEmitter:
         )
         self.store_object(name, item, indent + 2)
         self.emit("}", indent + 1)
-        broke = self.begin_loop(node, indent)
         self.loop_depth += 1
         try:
             with self.settled_within({name}):
