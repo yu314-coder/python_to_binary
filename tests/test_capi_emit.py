@@ -694,6 +694,93 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_a_default_is_evaluated_once_where_the_def_is(self):
+        """Python evaluates a default when the `def` runs, not per call.
+
+        That is what makes `def f(x=[])` share one list between calls - the
+        memoisation idiom every codebase has somewhere. Defaults were
+        evaluated in the callee here, so each call built a new one and the
+        idiom quietly did nothing, and a default with a side effect ran once
+        per call rather than once ever.
+        """
+        self._run(
+            "def accum(v, into=[]):\n"
+            "    into.append(v)\n"
+            "    return into\n"
+            "seen = []\n"
+            "def note():\n"
+            "    seen.append('once')\n"
+            "    return 0\n"
+            "def g(x=note()):\n"
+            "    return x\n"
+            "print(accum(1), accum(2))\n"
+            "g(); g()\n"
+            "print(seen)\n",
+            b"[1, 2] [1, 2]\n['once']\n",
+        )
+
+    def test_a_nested_def_gets_its_own_defaults_each_time_it_runs(self):
+        """A `def` in a loop makes a new function with new defaults.
+
+        The closure carries them beside what it captured, so the two
+        functions made below hold 0 and 1 rather than both reading whatever
+        the loop variable ended at.
+        """
+        self._run(
+            "def outer():\n"
+            "    def inner(v, into=[]):\n"
+            "        into.append(v)\n"
+            "        return into\n"
+            "    return inner\n"
+            "f = outer()\n"
+            "made = []\n"
+            "for i in range(2):\n"
+            "    def each(x=i):\n"
+            "        return x\n"
+            "    made.append(each)\n"
+            "print(f(1), f(2), [m() for m in made])\n",
+            b"[1, 2] [1, 2] [0, 1]\n",
+        )
+
+    def test_locals_answers_with_the_names_that_are_bound(self):
+        """It answered `None`, and the caller then tried to iterate it.
+
+        The builtin wants the caller's frame and a compiled function has
+        none. It does not need one: since 3.13 `locals()` in a function is an
+        independent snapshot, and a snapshot is what this can build from the
+        slots it already knows about.
+        """
+        self._run(
+            "def basic(p, q=2):\n"
+            "    a = 1\n"
+            "    return sorted(locals())\n"
+            "def unbound(flag):\n"
+            "    a = 1\n"
+            "    if flag:\n"
+            "        b = 2\n"
+            "    return sorted(locals())\n"
+            "def snapshot():\n"
+            "    q = 1\n"
+            "    d = locals()\n"
+            "    d['q'] = 99\n"
+            "    return q, sorted(d)\n"
+            "def with_vars():\n"
+            "    z = 3\n"
+            "    return sorted(vars())\n"
+            "print(basic(1), unbound(False), unbound(True))\n"
+            "print(snapshot(), with_vars())\n",
+            b"['a', 'p', 'q'] ['a', 'flag'] ['a', 'b', 'flag']\n"
+            b"(1, ['q']) ['z']\n",
+        )
+
+    def test_globals_is_refused_rather_than_answered_wrongly(self):
+        # The module's names are C variables, so what could be handed back is
+        # a copy - and a write to a copy would be lost where the real thing
+        # changes the program. Better said at compile time.
+        with self.assertRaises(Exception) as caught:
+            python_to_capi_c("print('x' in globals())\n", "program.py")
+        self.assertIn("globals()", str(caught.exception))
+
     def test_a_decorator_whose_parameter_is_named_for_what_it_wraps(self):
         """The commonest closure there is, and it recursed until the stack went.
 
@@ -2410,8 +2497,9 @@ class CApiEmitTests(unittest.TestCase):
         signature unless its doc begins with one in the shape CPython reads
         `__text_signature__` out of. Anything that introspects refused to work
         with them - pywebview would not bind a single method of a compiled
-        application. Defaults read as None: the format has no spelling for an
-        arbitrary Python expression.
+        application. A default that is a literal is spelled as itself; one
+        that is any other expression has no spelling the format can be parsed
+        back from, and reads as None.
         """
 
         source = (
@@ -2431,12 +2519,21 @@ class CApiEmitTests(unittest.TestCase):
             source,
             b"['a', 'b', 'rest', 'key', 'kw']\n['x', 'y']\nTrue\n",
         )
-        # What does not agree is pinned here rather than left to drift: the
-        # format has no spelling for an arbitrary Python expression, so every
-        # default reads as None.
+        # A literal default is written as itself, so `inspect.signature`
+        # reads back what the source said. Every default used to be spelled
+        # `None` here whatever it was.
         self.assertIn(
-            '"plain(a, b=None, *rest, key=None, **kw)',
+            '"plain(a, b=2, *rest, key=None, **kw)',
             python_to_capi_c(source, "program.py"),
+        )
+        # What still does not agree is pinned rather than left to drift: an
+        # expression that is not a literal has no spelling the format could be
+        # parsed back from.
+        self.assertIn(
+            '"other(a, b=None)',
+            python_to_capi_c(
+                "def other(a, b=[1, 2]):\n    return a\n", "program.py"
+            ),
         )
 
     def test_a_compiled_program_can_be_a_macos_app_with_an_icon(self):

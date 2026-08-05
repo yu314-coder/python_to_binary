@@ -83,6 +83,23 @@ _UNREAD = "v__unread"
 _READS_EVERY_LOCAL = frozenset({"locals", "vars", "eval", "exec", "globals"})
 
 
+def reads_every_local(body: list) -> bool:
+    """Whether this body can look at its locals without naming them.
+
+    `locals()` and `vars()` answer with every slot, so a name held in a
+    machine register rather than an object would be missing from what they
+    hand back. A function that calls one keeps all of its names as objects:
+    the narrowing is a speed decision, and this is a correctness one.
+    """
+
+    for statement in body:
+        for inner in ast.walk(statement):
+            if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
+                if inner.id in _READS_EVERY_LOCAL:
+                    return True
+    return False
+
+
 def write_only_locals(body: list, parameters: set[str]) -> set[str]:
     """Locals this function binds and never reads back.
 
@@ -479,17 +496,31 @@ def _text_signature(name: str, arguments: ast.arguments) -> str:
 
     A compiled function is a builtin function object, and a builtin carries no
     signature unless its doc begins with one in this exact shape: the name, the
-    parameters in brackets, then a line of two dashes. Defaults are written as
-    `=None` whatever they really are - the text is only ever parsed for the
-    shape of the call, and an arbitrary Python expression has no spelling here.
+    parameters in brackets, then a line of two dashes.
+
+    A default that is a literal is written as itself, so `def f(a, b=1)` reads
+    back as `(a, b=1)` rather than the `(a, b=None)` every default used to be
+    spelled as. Anything else - a name, a call, a list - has no spelling that
+    could be parsed back, and stays `None`: the shape of the call is right
+    either way, and that is what most callers are asking for.
     """
+
+    def spelled(default: ast.expr | None) -> str:
+        if isinstance(default, ast.Constant) and (
+            default.value is None
+            or isinstance(default.value, (bool, int, float, complex, str, bytes))
+        ):
+            return repr(default.value)
+        return "None"
 
     parts: list[str] = []
     positional = [*arguments.posonlyargs, *arguments.args]
     required = len(positional) - len(arguments.defaults)
     for offset, argument in enumerate(positional):
         parts.append(
-            argument.arg if offset < required else f"{argument.arg}=None"
+            argument.arg
+            if offset < required
+            else f"{argument.arg}={spelled(arguments.defaults[offset - required])}"
         )
         if arguments.posonlyargs and offset == len(arguments.posonlyargs) - 1:
             parts.append("/")
@@ -501,7 +532,7 @@ def _text_signature(name: str, arguments: ast.arguments) -> str:
         parts.append(
             argument.arg
             if arguments.kw_defaults[offset] is None
-            else f"{argument.arg}=None"
+            else f"{argument.arg}={spelled(arguments.kw_defaults[offset])}"
         )
     if arguments.kwarg:
         parts.append(f"**{arguments.kwarg.arg}")
@@ -677,6 +708,11 @@ class _Function:
         #: out passes NULL and the body fills it in.
         self.defaults = defaults
         self.locals: list[str] = []
+        #: Where this function's defaults were put when its `def` ran, one C
+        #: expression per default, in the order they are declared - positional
+        #: first, then keyword-only. Empty for a function whose defaults are
+        #: still filled in the callee.
+        self.default_cells: list[str] = []
         #: Locals bound here and never read back. They share one slot, because
         #: nothing can tell which of them it holds - see `write_only_locals`.
         self.write_only: set[str] = set()
@@ -715,6 +751,9 @@ class CApiEmitter:
         #: these at compile time rather than at run time, so `f(a, step=1)`
         #: reaches the same direct C call `f(a, 1)` does.
         self.known_parameters: dict[str, tuple[tuple[str, ...], int]] = {}
+        #: Static slots holding what each module-level `def`'s defaults were
+        #: evaluated to, as (base name, how many).
+        self.default_stores: list[tuple[str, int]] = []
         # Where each of those `def`s sits in the module body, and how far
         # through that body execution has got. A direct call is only correct
         # once the `def` has run: `print(later(3))` above `def later(...)` is
@@ -1899,6 +1938,87 @@ class CApiEmitter:
         if name in self.globals:
             return f"g_{self.prefix}{name}"
         return None
+
+    def default_cell(self, index: int | None) -> str | None:
+        """Where this function's `index`-th default was put, if it was."""
+
+        if index is None or self.current is None:
+            return None
+        cells = self.current.default_cells
+        return cells[index] if 0 <= index < len(cells) else None
+
+    def scope_dictionary(self, node: ast.Call, indent: int) -> str:
+        """`locals()` and `vars()` with nothing passed - and why not `globals()`.
+
+        Both answered `None` before this, which the caller then tried to
+        iterate. The builtin needs the frame of whoever called it, and a
+        compiled function has no frame, so it got nothing back.
+
+        It does not need one. Since 3.13 `locals()` in a function answers with
+        an *independent snapshot* - writing to what it returns does not change
+        the local - and a snapshot of the locals is exactly what this can
+        build, because it knows every name the function binds and can look at
+        each slot to see whether it holds anything yet. Unbound names are left
+        out, as they are there.
+
+        `globals()` is refused instead. The module's names are C variables
+        rather than entries in a dictionary, so what could be handed back is a
+        copy - and a copy would take writes and quietly drop them, where the
+        real thing changes the program's globals. That is worth an error at
+        compile time rather than a wrong answer at run time.
+        """
+
+        if node.func.id == "globals" or self.at_module_level:
+            spelled = node.func.id
+            if self.at_module_level and spelled != "globals":
+                # At module scope Python's `locals()` *is* `globals()`, so it
+                # is the same refusal for the same reason.
+                spelled = f"{spelled}() at module level"
+            else:
+                spelled = f"{spelled}()"
+            raise self.fail(
+                node,
+                f"{spelled} is not translated here: this module's globals are "
+                f"C variables rather than a dictionary, so what came back "
+                f"would be a copy, and writing to a copy would be lost. "
+                f"Inside a function, locals() and vars() do work",
+            )
+        assert self.current is not None
+        target = self.temporary()
+        self.emit(f"{target} = PyDict_New();", indent)
+        self.checked(target, indent)
+        for name in self.scope_locals():
+            slot = self.declare(name)
+            key = self.interned(name)
+            # Every slot is tested: a name the function binds further down, or
+            # only on a branch that was not taken, is not a local yet.
+            self.emit(f"if ({slot}) {{", indent)
+            self.emit(
+                f"if (PyDict_SetItem({target}, {key}, {slot}) < 0) "
+                f"{{ {self.failure()} }}",
+                indent + 1,
+            )
+            self.emit("}", indent)
+        return target
+
+    def scope_locals(self) -> list[str]:
+        """The names a `locals()` here should answer with, in Python's order.
+
+        Parameters first and in order, then what the body binds, then what was
+        captured - which is the order a code object lists them in, and so the
+        order the dictionary comes out in.
+        """
+
+        assert self.current is not None
+        ordered: list[str] = []
+        for name in (
+            *self.current.parameters,
+            *sorted(self.current.body_binds - set(self.current.parameters)),
+            *self.current.captures,
+        ):
+            if name not in ordered and name not in self.current.module_names:
+                ordered.append(name)
+        return ordered
 
     def bound_around(self, name: str) -> bool:
         """Whether the scope enclosing a closure binds this name itself.
@@ -3326,6 +3446,14 @@ class CApiEmitter:
                 ),
                 node,
             )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in ("locals", "vars", "globals")
+            and not node.args
+            and not node.keywords
+            and self.builtin_untouched(node.func.id)
+        ):
+            return self.scope_dictionary(node, indent)
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):
@@ -6103,7 +6231,15 @@ class CApiEmitter:
         self.method_table.append((c_name, label, _text_signature(label, node.args)))
 
         held = self.temporary()
-        self.emit(f"{held} = PyTuple_New({len(captures)});", indent)
+        # Python evaluates a default when the `def` runs, once, and every
+        # call afterwards is handed that same object - which is what makes
+        # `def f(x=[])` share one list. They are evaluated here, then, and
+        # travel with the captures in the tuple the callable holds, so a `def`
+        # inside a loop gets a set of its own each time round.
+        given = list(node.args.defaults) + list(node.args.kw_defaults)
+        self.emit(
+            f"{held} = PyTuple_New({len(captures) + len(given)});", indent
+        )
         self.checked(held, indent)
         for offset, name in enumerate(captures):
             source = self.reference(name)
@@ -6111,6 +6247,16 @@ class CApiEmitter:
             # own reference, so one is added for the tuple to consume.
             self.emit(f"Py_IncRef({source});", indent)
             self.emit(f"PyTuple_SetItem({held}, {offset}, {source});", indent)
+        for offset, default in enumerate(given):
+            place = len(captures) + offset
+            if default is None:
+                # A keyword-only parameter with no default keeps its place so
+                # the ones after it do not move. Nothing ever reads it.
+                blank = self.builtin("None", indent)
+                self.emit(f"PyTuple_SetItem({held}, {place}, {blank});", indent)
+                continue
+            value = self.expression(default, indent)
+            self.emit(f"PyTuple_SetItem({held}, {place}, {value});", indent)
         target = self.temporary()
         self.emit(
             f"{target} = PyCFunction_New(&_py2bin_methods[{index}], {held});",
@@ -6661,6 +6807,7 @@ class CApiEmitter:
                     None if offset < required else defaults[offset - required],
                     missing_is_null,
                     display,
+                    None if offset < required else offset - required,
                 )
             if not arguments.vararg:
                 # Too many is as wrong as too few, and was accepted in
@@ -6672,11 +6819,15 @@ class CApiEmitter:
                     display, len(positional), len(defaults), required, indent
                 )
             for offset, name in enumerate(keyword_only):
+                # After the positional ones, one place per keyword-only
+                # parameter whether or not it has a default, so the index does
+                # not move when one of them has none.
                 self.supply_missing(
                     node, name, f"{prefix}{name}", indent,
                     arguments.kw_defaults[offset],
                     missing_is_null,
                     display,
+                    len(defaults) + offset,
                 )
 
         if not arguments.kwarg and source != "0":
@@ -6776,6 +6927,7 @@ class CApiEmitter:
         default: ast.expr | None,
         missing_is_null: bool,
         display: str = "<lambda>",
+        cell: int | None = None,
     ) -> None:
         """What to do when neither the tuple nor the keywords had it."""
 
@@ -6785,8 +6937,17 @@ class CApiEmitter:
                 # so it is filled there rather than twice.
                 return
             self.emit(f"if (!{slot}) {{", indent)
-            value = self.expression(default, indent + 1)
-            self.emit(f"{slot} = {value};", indent + 1)
+            stored = self.default_cell(cell)
+            if stored is not None:
+                # Evaluated once, where the `def` ran. Taking a reference
+                # rather than evaluating again is what makes `def f(x=[])`
+                # share one list across calls, as Python does.
+                self.emit(f"{slot} = {stored};", indent + 1)
+                self.emit(f"if (!{slot}) {{ {self.failure()} }}", indent + 1)
+                self.emit(f"Py_IncRef({slot});", indent + 1)
+            else:
+                value = self.expression(default, indent + 1)
+                self.emit(f"{slot} = {value};", indent + 1)
             self.emit("}", indent)
             return
         self.emit(f"if (!{slot}) {{", indent)
@@ -6919,14 +7080,20 @@ class CApiEmitter:
             # Ahead of both narrowings, and removed from them: holding a name
             # in a register pays for reads, and these have none.
             function.write_only = write_only_locals(node.body, given)
-            function.doubles = (
-                double_locals(node.body, given) - function.write_only
-            )
-            function.unboxed = (
-                unboxable_locals(node.body, given)
-                - function.doubles
-                - function.write_only
-            )
+            if reads_every_local(node.body):
+                # `locals()` has to be able to see every name, and a name in
+                # a machine register is not one it could show.
+                function.doubles = set()
+                function.unboxed = set()
+            else:
+                function.doubles = (
+                    double_locals(node.body, given) - function.write_only
+                )
+                function.unboxed = (
+                    unboxable_locals(node.body, given)
+                    - function.doubles
+                    - function.write_only
+                )
             function.exact_lists = exact_lists(node.body, given)
             function.exact_dicts = exact_dicts(node.body, given)
             function.exact_strs = exact_strs(node.body, given)
@@ -6975,6 +7142,12 @@ class CApiEmitter:
             function.locals.append(f"p_{name}")
         for name in captures:
             function.locals.append(f"c_{name}")
+        function.default_cells = [
+            f"PyTuple_GetItem(_self, {len(captures) + offset})"
+            for offset in range(
+                len(arguments.defaults) + len(arguments.kw_defaults)
+            )
+        ]
         self.bind_parameters(
             node, indent=1, keyword_source=named_rest, display=display
         )
@@ -7224,6 +7397,24 @@ class CApiEmitter:
                 # The body was written above; what happens *here*, where the
                 # `def` is, is the binding - the name starts unbound and this
                 # statement is what gives it a value, exactly as in Python.
+                # The defaults go first: Python evaluates them as the `def`
+                # runs, once, and hands every later call the same object. They
+                # used to be evaluated in the callee, so `def f(x=[])` made a
+                # new list per call and the memoisation idiom quietly did
+                # nothing.
+                given = list(node.args.defaults) + list(node.args.kw_defaults)
+                if given:
+                    base = f"_py2bin_dflt_{self.prefix}{node.name}"
+                    for offset, default in enumerate(given):
+                        if default is None:
+                            continue
+                        value = self.expression(default, indent)
+                        self.emit(
+                            f"if ({base}_{offset}) "
+                            f"Py_DecRef({base}_{offset});",
+                            indent,
+                        )
+                        self.emit(f"{base}_{offset} = {value};", indent)
                 slot = self.note_global(node.name)
                 held = f"_py2bin_fn_{self.prefix}{node.name}"
                 self.emit(f"Py_IncRef({held});", indent)
@@ -7311,34 +7502,48 @@ class CApiEmitter:
         # Ahead of both narrowings, and removed from them: holding a name in
         # a register pays for reads, and these have none.
         function.write_only = write_only_locals(node.body, set(parameters))
-        function.doubles = (
-            double_locals(node.body, set(parameters)) - function.write_only
-        )
-        function.unboxed = (
-            unboxable_locals(node.body, set(parameters))
-            - function.doubles
-            - function.write_only
-        )
+        if reads_every_local(node.body):
+            # See `reads_every_local`: correctness before speed, and only for
+            # the functions that ask.
+            function.doubles = set()
+            function.unboxed = set()
+        else:
+            function.doubles = (
+                double_locals(node.body, set(parameters)) - function.write_only
+            )
+            function.unboxed = (
+                unboxable_locals(node.body, set(parameters))
+                - function.doubles
+                - function.write_only
+            )
         function.exact_lists = exact_lists(node.body, set(parameters))
         function.exact_dicts = exact_dicts(node.body, set(parameters))
         function.exact_strs = exact_strs(node.body, set(parameters))
         function.body_binds = _scope_bindings(node.body)
         function.shadows = function.body_binds | set(parameters)
+        # Where the defaults were put when the `def` ran, which is once - see
+        # `default_cells`. A module-level `def` runs once, so they are ordinary
+        # statics rather than something carried per callable.
+        given = list(node.args.defaults) + list(node.args.kw_defaults)
+        if given:
+            base = f"_py2bin_dflt_{self.prefix}{node.name}"
+            function.default_cells = [
+                f"{base}_{offset}" for offset in range(len(given))
+            ]
+            self.default_stores.append((base, len(given)))
         self.current = function
         self.scope = node.body
         self.scope_path.append((node.name, True))
         self.guards_recursion = True
         self.emit('if (Py_EnterRecursiveCall("")) { return 0; }', 1)
-        # A parameter the call left out arrives as NULL and takes its default
-        # here, before the increments below, so there is one rule for what the
-        # body owns.
+        # A parameter the call left out arrives as NULL and takes the value
+        # its default was evaluated to, before the increments below, so there
+        # is one rule for what the body owns.
         for offset, default in enumerate(defaults):
             name = parameters[len(parameters) - len(defaults) + offset]
             self.emit(f"if (!p_{name}) {{", 1)
-            value = self.expression(default, 2)
-            self.emit(f"    Py_IncRef({value});", 1)
-            self.emit(f"    p_{name} = {value};", 1)
-            self.emit(f"    Py_DecRef({value});", 1)
+            self.emit(f"    p_{name} = {function.default_cells[offset]};", 1)
+            self.emit(f"    if (!p_{name}) {{ {self.failure()} }}", 1)
             self.emit("}", 1)
         # The body owns its parameters, so rebinding one releases what it held
         # rather than dropping a reference the caller still owns.
@@ -7411,6 +7616,11 @@ class CApiEmitter:
             # module name. Only the binding is deferred; the object is not
             # remade each time the `def` is reached.
             out.append(f"static PyObject *_py2bin_fn_{name} = 0;")
+        for base, count in self.default_stores:
+            # One per default, filled where the `def` is and read by
+            # every call that leaves that parameter out.
+            for offset in range(count):
+                out.append(f"static PyObject *{base}_{offset} = 0;")
         for _name, key in self.linked:
             out.append(f"static PyObject *m_{key} = 0;")
         for name, slot in self.cached_builtins.items():
