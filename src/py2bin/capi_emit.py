@@ -154,6 +154,18 @@ def _module_scope_bindings(tree: ast.Module) -> dict[str, int]:
 
     for statement in tree.body:
         walk(statement)
+
+    # A `global x` inside a function binds the module's `x` from a scope this
+    # walk deliberately does not enter. Without it, `def a(...)` whose body
+    # says `global a; a = something` still looked like the only binding of the
+    # name, kept its direct C call, and went on calling itself after Python
+    # would have been calling the replacement. Counted here rather than
+    # by descending, because the declaration is the whole signal: a `global`
+    # that never assigns is a statement with no effect.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                note(name)
     return counts
 
 
@@ -3018,7 +3030,13 @@ class CApiEmitter:
                 # A name the program bound - an imported one, or a value
                 # holding something callable. It wins over the builtin of the
                 # same spelling, exactly as it does in Python.
-                callable_value = self.name(
+                #
+                # Borrowed where the slot allows it. A closure held in a local
+                # was incremented and decremented around every call to it,
+                # which is two writes per call for a slot this function owns
+                # outright. `borrowable` still refuses a global, because
+                # anything the call runs could rebind one.
+                callable_value, callable_owned = self.operand(
                     ast.copy_location(
                         ast.Name(id=node.func.id, ctx=ast.Load()), node
                     ),
@@ -3027,8 +3045,9 @@ class CApiEmitter:
             else:
                 # Not one of ours, so ask the interpreter for it.
                 callable_value = self.program_name(node.func.id, indent)
+                callable_owned = True
             target = self.invoke(callable_value, node.args, indent, node.keywords)
-            self.emit(f"Py_DecRef({callable_value});", indent)
+            self.release(callable_value, callable_owned, indent)
             return target
         expected, defaulted = self.known_functions[node.func.id]
         if not expected - defaulted <= len(node.args) <= expected:
@@ -3349,11 +3368,17 @@ class CApiEmitter:
             self.emit(f"{target} = PyObject_CallNoArgs({callable_value});", indent)
             return self.checked(target, indent)
         if len(args) == 1:
-            argument = self.expression(args[0], indent)
+            # Borrowed, like the two-or-more path below and for the same
+            # reason: `PyObject_CallOneArg` borrows its argument, so a local
+            # or parameter already holding a reference needs no second one.
+            # This path took one anyway - an increment and a decrement per
+            # call, on the commonest call shape there is, arriving back where
+            # it started.
+            argument, owned = self.operand(args[0], indent)
             self.emit(
                 f"{target} = PyObject_CallOneArg({callable_value}, {argument});", indent
             )
-            self.emit(f"Py_DecRef({argument});", indent)
+            self.release(argument, owned, indent)
             return self.checked(target, indent)
         held = [self.operand(item, indent) for item in args]
         values = [value for value, _ in held]
@@ -3540,9 +3565,15 @@ class CApiEmitter:
         elif isinstance(node, ast.ClassDef):
             self.class_definition(node, indent)
         elif isinstance(node, ast.FunctionDef):
+            # The slot is declared *before* the closure is built. A nested
+            # function that calls itself reads its own name, and a name with
+            # no slot yet is not seen as a capture at all - which is why a
+            # nested `fact` raised `NameError` on its first recursive call.
+            # Declaring first makes the capture visible; `make_closure` fills
+            # it in once the callable exists.
+            target = self.declare(node.name)
             value = self.make_closure(node, node.name, indent)
             value = self.apply_decorators(node.decorator_list, value, indent)
-            target = self.declare(node.name)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"{target} = {value};", indent)
             self.publish(node.name, target, indent)
@@ -5548,6 +5579,35 @@ class CApiEmitter:
             )
         )
         self.refuse_late_binding(node, captures)
+        # A name the body reads that this scope has no slot for *yet*, but
+        # binds further down: mutual recursion between two nested functions is
+        # the shape that reaches here. Captures are taken by value when the
+        # closure is made, so the second name is simply absent and the call
+        # failed at run time with a `NameError` naming a function plainly
+        # written above it. Refused with an explanation instead - the same
+        # choice this module makes wherever capture-by-value would disagree
+        # with Python rather than merely be slower.
+        pending = sorted(
+            name
+            for name in (read - bound)
+            if name not in self.globals
+            and name not in self.known_functions
+            and self.reference(name) is None
+            and any(
+                bound_name == name and bound_at > getattr(node, "lineno", 0)
+                for bound_name, bound_at in self.bindings_in(self.scope)
+            )
+        )
+        if pending:
+            raise self.fail(
+                node,
+                f"this closure reads {', '.join(pending)}, which "
+                f"{'are' if len(pending) > 1 else 'is'} bound further down the "
+                "enclosing scope; captures are taken by value when the closure "
+                "is made, so the name would not be there when it ran - write "
+                "the definitions the other way round, or move them to module "
+                "level where the order does not matter",
+            )
 
         index = len(self.method_table)
         c_name = f"_closure{index}_{label}"
@@ -5569,6 +5629,24 @@ class CApiEmitter:
         )
         self.emit(f"Py_DecRef({held});", indent)
         self.checked(target, indent)
+        if label in captures:
+            # A nested function that calls itself. Its own name is a capture,
+            # and at the moment the tuple is filled that name is not bound yet
+            # - the `def` being compiled is what binds it - so the slot took a
+            # NULL and every recursive call failed with `NameError`, for a
+            # shape as ordinary as a nested `fact`.
+            #
+            # The slot is filled with the callable once it exists.
+            # `PyTuple_SetItem` refuses a tuple anything else holds, which is
+            # why this comes *after* the reference above is dropped: the
+            # callable is then the only owner. It leaves a cycle, callable to
+            # tuple to callable, which is collectable and is the same cycle
+            # CPython's own closure cells make.
+            self.emit(f"Py_IncRef({target});", indent)
+            self.emit(
+                f"PyTuple_SetItem({held}, {captures.index(label)}, {target});",
+                indent,
+            )
 
         self.write_closure(
             node, c_name, captures, display or self.qualified(label), label

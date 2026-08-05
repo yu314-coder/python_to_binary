@@ -701,23 +701,23 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.5 ms | **2.49× faster** |
-| integer arithmetic | **5.2 ms** | 8.4 ms | **1.61× faster** |
-| `while` loop | **4.6 ms** | 6.7 ms | **1.43× faster** |
-| comparisons | **3.8 ms** | 4.7 ms | **1.22× faster** |
-| float arithmetic | **5.4 ms** | 5.9 ms | **1.09× faster** |
-| exception raise/catch | **20.1 ms** | 20.4 ms | **1.01× faster** |
-| list append | 5.4 ms | 5.3 ms | 0.99× |
-| comprehension | 5.8 ms | 5.6 ms | 0.97× |
-| dict store | 8.4 ms | 8.0 ms | 0.95× |
-| `and` / `or` | 6.5 ms | 5.9 ms | 0.91× |
-| subscript | 8.2 ms | 6.0 ms | 0.73× |
-| f-string | 24.4 ms | 17.7 ms | 0.73× |
-| string concatenation | 7.0 ms | 4.6 ms | 0.66× |
-| attribute read | 6.5 ms | 4.0 ms | 0.61× |
-| closure call | 12.2 ms | 6.7 ms | 0.55× |
-| method call | 16.3 ms | 6.7 ms | 0.41× |
-| instantiation | 39.8 ms | 16.4 ms | 0.41× |
+| direct function call | **3.0 ms** | 7.1 ms | **2.37× faster** |
+| integer arithmetic | **5.3 ms** | 8.4 ms | **1.59× faster** |
+| `while` loop | **4.7 ms** | 6.7 ms | **1.42× faster** |
+| comparisons | **3.8 ms** | 4.7 ms | **1.23× faster** |
+| float arithmetic | **5.4 ms** | 5.7 ms | **1.07× faster** |
+| exception raise/catch | **19.3 ms** | 20.0 ms | **1.04× faster** |
+| list append | 5.3 ms | 5.1 ms | 0.98× |
+| comprehension | 5.8 ms | 5.5 ms | 0.96× |
+| dict store | 8.4 ms | 8.1 ms | 0.96× |
+| `and` / `or` | 6.4 ms | 5.8 ms | 0.91× |
+| subscript | 8.2 ms | 6.1 ms | 0.74× |
+| f-string | 24.7 ms | 18.2 ms | 0.73× |
+| string concatenation | 6.9 ms | 4.7 ms | 0.68× |
+| closure call | 10.2 ms | 6.7 ms | 0.66× |
+| attribute read | 6.4 ms | 3.9 ms | 0.61× |
+| instantiation | 39.5 ms | 16.5 ms | 0.42× |
+| method call | 16.3 ms | 6.6 ms | 0.40× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -1263,6 +1263,38 @@ runtime and library adapters.
 ## Release notes
 
 Newest first. Older releases are in the repository's history.
+
+### 0.9.1 - a call stops paying for references it already holds
+
+**A one-argument call borrowed nothing.** `PyObject_CallOneArg` borrows what it
+is given, and the two-or-more-argument path beside it already knew that - but
+the single-argument path, the commonest call shape there is, took a reference
+and dropped it again around every call. So did the callable itself: a closure
+held in a local was incremented and decremented on each call to a slot the
+function owns outright. Both are borrowed now, on the same rules that refuse to
+borrow a global. **Closure call 0.55× → 0.66×.**
+
+Three correctness bugs found while testing that, all older than it:
+
+**A nested function could not call itself.** A closure captures by value when
+it is made, and its own name is not bound at that moment - the `def` being
+compiled is what binds it - so the capture took a NULL and the first recursive
+call raised `NameError` naming the function it was standing in. An ordinary
+nested `fact` did not work. The slot is declared before the closure is built
+and filled once the callable exists.
+
+**Mutual recursion between nested functions is refused rather than left to
+fail.** Capture-by-value cannot express it: the second name is simply absent
+when the first closure is made. It used to raise `NameError` at run time
+naming a function plainly written above it. Now the build says so, and says
+what to do instead.
+
+**A function that rebinds itself through `global` kept calling itself.**
+`global a` inside `a` binds the module's `a` from a scope the module-scope
+walk does not enter, so the direct C call survived and the old body went on
+running where Python would have been calling the replacement. This is the
+fourth in the family 0.8.7 opened, and the walk now counts `global`
+declarations wherever they appear.
 
 ### 0.9.0 - a condition wants a verdict, not a value
 

@@ -319,6 +319,66 @@ class CApiEmitTests(unittest.TestCase):
             b"5050\n",
         )
 
+    def test_a_nested_function_can_call_itself(self):
+        # A closure captures by value when it is made, and its own name is not
+        # bound at that moment - the `def` being compiled is what binds it -
+        # so the capture took a NULL and the first recursive call raised
+        # `NameError` naming the function it was standing in. The slot is now
+        # declared before the closure is built and filled once the callable
+        # exists.
+        self._run(
+            "def go():\n"
+            "    def fact(n):\n"
+            "        return 1 if n <= 1 else n * fact(n - 1)\n"
+            "    return fact(10)\n"
+            "print(go())\n",
+            b"3628800\n",
+        )
+
+    def test_a_nested_function_reading_one_defined_below_is_refused(self):
+        # Mutual recursion between two nested functions cannot work under
+        # capture-by-value: the second name is simply absent when the first
+        # closure is made. It used to fail at run time with a NameError
+        # naming a function plainly written above it, which is the worst way
+        # to say so.
+        self._reject(
+            "def go():\n"
+            "    def even(n):\n"
+            "        return True if n == 0 else odd(n - 1)\n"
+            "    def odd(n):\n"
+            "        return False if n == 0 else even(n - 1)\n"
+            "    return even(10)\n",
+            "bound further down the enclosing scope",
+        )
+
+    def test_nested_helpers_in_order_still_work(self):
+        # The refusal above must not cost the ordinary shape, where the
+        # helper is written before what uses it.
+        self._run(
+            "def go():\n"
+            "    def helper(v):\n"
+            "        return v + 1\n"
+            "    def uses(v):\n"
+            "        return helper(v) * 2\n"
+            "    return uses(3)\n"
+            "print(go())\n",
+            b"8\n",
+        )
+
+    def test_a_function_that_rebinds_itself_through_global(self):
+        # `global a` inside `a` binds the module's `a` from a scope the
+        # module-scope walk does not enter, so the direct C call survived and
+        # the function went on calling itself after Python would have been
+        # calling the replacement.
+        self._run(
+            "def a(v):\n"
+            "    global a\n"
+            "    a = lambda x: x * 100\n"
+            "    return v + 1\n"
+            "print(a(1), a(1))\n",
+            b"2 100\n",
+        )
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which
