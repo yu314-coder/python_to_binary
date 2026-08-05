@@ -56,7 +56,7 @@ that runs on the tablet that made it.
 
 Each working target is held to the same standard: an 889-program corpus is
 compiled for it and every program's output and exit code compared against
-CPython's. macOS agrees on 885 and differs on 4; a 100-program slice run
+CPython's. macOS agrees on 886 and differs on 3; a 100-program slice run
 through Wine agrees on 93 and differs on 5. The differences are the same on
 every platform and are inherent rather than open - CPython's "Did you mean"
 needs a Python frame to suggest from, and the repr of a compiled function
@@ -129,7 +129,7 @@ with no interpreter anywhere near it. Reach for it when that is the point.
 | **speed** on a 30M-iteration loop | 0.74 s | 0.44 s | **0.05 s** |
 | **artifact** | 24 MB | 50 KB | **32 KB** |
 | **needs Python on the machine?** | no, it carries one | yes, or bundle it | **no** |
-| **how much Python works** | **everything** | most of it: 885 of an 889-program corpus[^corpus] | a small subset |
+| **how much Python works** | **everything** | most of it: 886 of an 889-program corpus[^corpus] | a small subset |
 | **third-party packages** | **carried inside** | any the interpreter can import | none |
 | what actually runs your logic | CPython, interpreting | machine code | machine code |
 
@@ -370,24 +370,34 @@ A `finally` around a `yield` works, and so do `with`, `async for` and
 for the two shapes that are still refused.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
-889-program corpus, **885 programs produce byte-identical stdout and the same
-exit code as CPython**. Three differ and one is refused, and all four are
+889-program corpus, **886 programs produce byte-identical stdout and the same
+exit code as CPython, and nothing is refused**. The three that differ are
 structural rather than open: the repr of a compiled function really is a
-builtin function's (and carries an address, so it never matches twice
-anyway), one program loops forever by design, one drives py2bin through
-`subprocess` to fuzz it, and the refusal is a single 67,000-line function that
-does not fit the fixed stack frame - which it says, with the line and the
-limit.
+builtin function's and carries an address, so it never matches twice even
+against itself; one program prints forever by design, and agrees for as long
+as both are allowed to run; and one drives py2bin through `subprocess` to
+fuzz it, so what it reaches is the compiled binary rather than an
+interpreter.
 
-**Comparing stderr as well, 803 match.** The 82 that do not are one thing:
+**Comparing stderr as well, 804 match.** The 82 that do not are one thing:
 CPython prints a traceback - the frames, the source line, the `~~~^^^` caret -
 and a compiled program prints the final `ExceptionType: message` line only,
 because there are no Python frames to walk. In 77 of the 82 that last line is
 character-for-character CPython's; the other five are the "Did you mean"
 suggestion (three), a compile-time `SyntaxWarning` about `is` with a literal
 (one), and a `RecursionError` that says how much stack was used rather than
-naming the depth limit (one), which is the same exception reached by the
-real stack rather than a counter.
+naming the depth limit (one), which is the same exception reached by the real
+stack rather than a counter.
+
+**That gap is closed by shipping the source, which is the thing this does not
+do.** Of the 82 tracebacks, 81 echo the line of source under the `File` line
+and 71 draw a caret under the sub-expression that failed. CPython reads that
+line off disk at the moment it prints - give it a filename that is not there
+and it prints the `File` line alone. So a compiled program could match these
+only by carrying its own source and reading it back, which is most of what
+compiling was for. Frames could be synthesised on the unwind path at no cost
+to the working path; the source line and the caret could not be, and they are
+in almost every one of them.
 
 ### How fast each one is
 
@@ -949,4 +959,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 803. What is checked on every change is the 1714-test suite.
+    is 804. What is checked on every change is the 1732-test suite.

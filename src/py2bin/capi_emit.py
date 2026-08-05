@@ -75,6 +75,65 @@ _COMPARISON_CODES = {
 }
 
 
+#: Names that can read a local without naming it. If a function calls any of
+#: these, every local it has may be looked at, so none of them is unread.
+#: The one slot every unread local is written to.
+_UNREAD = "v__unread"
+
+_READS_EVERY_LOCAL = frozenset({"locals", "vars", "eval", "exec", "globals"})
+
+
+def write_only_locals(body: list, parameters: set[str]) -> set[str]:
+    """Locals this function binds and never reads back.
+
+    A name nothing ever loads does not need storage of its own. The value
+    still has to be computed - `v = f()` runs `f` either way, and an
+    expression is not dropped for being unread - but it can go into one slot
+    shared by every such name instead of one slot each.
+
+    That is not usually worth much: a name written and never read is a thing
+    people rarely write. It matters because the frame is a single fixed
+    allocation with a ceiling on it, so a generated file with sixty-seven
+    thousand of them could not be compiled at all. The whole function needed
+    two slots and asked for 67,001.
+
+    Refused for anything that could read a local without naming it, and for
+    the shapes where a binding is observable on its own: `global`/`nonlocal`
+    storage belongs elsewhere, `del` has to have something to delete, a
+    walrus is written for its value, and `except ... as e` unbinds the name
+    when the handler ends.
+    """
+
+    loaded: set[str] = set()
+    stored: set[str] = set()
+    barred: set[str] = set(parameters)
+    for statement in body:
+        for inner in ast.walk(statement):
+            if isinstance(inner, ast.Name):
+                if isinstance(inner.ctx, ast.Load):
+                    if inner.id in _READS_EVERY_LOCAL:
+                        return set()
+                    loaded.add(inner.id)
+                else:
+                    stored.add(inner.id)
+            elif isinstance(inner, (ast.Global, ast.Nonlocal)):
+                barred.update(inner.names)
+            elif isinstance(inner, ast.AugAssign):
+                if isinstance(inner.target, ast.Name):
+                    # `x += 1` reads x before it writes it.
+                    loaded.add(inner.target.id)
+            elif isinstance(inner, ast.NamedExpr):
+                if isinstance(inner.target, ast.Name):
+                    barred.add(inner.target.id)
+            elif isinstance(inner, ast.Delete):
+                for target in inner.targets:
+                    if isinstance(target, ast.Name):
+                        barred.add(target.id)
+            elif isinstance(inner, ast.ExceptHandler) and inner.name:
+                barred.add(inner.name)
+    return stored - loaded - barred
+
+
 def _scope_bindings(body: list) -> set[str]:
     """Every name these statements bind, not looking into nested scopes.
 
@@ -618,6 +677,9 @@ class _Function:
         #: out passes NULL and the body fills it in.
         self.defaults = defaults
         self.locals: list[str] = []
+        #: Locals bound here and never read back. They share one slot, because
+        #: nothing can tell which of them it holds - see `write_only_locals`.
+        self.write_only: set[str] = set()
         self.body: list[str] = []
         self.temporaries = 0
         #: Locals held as a machine integer whenever they contain one. Each
@@ -900,6 +962,13 @@ class CApiEmitter:
             return f"g_{self.prefix}{name}"
         if name in self.current.parameters:
             return f"p_{name}"
+        if name in self.current.write_only:
+            # Nothing reads any of these, so nothing can tell that they share
+            # a slot. Rebinding still releases what was there, which is what
+            # keeps the values from piling up.
+            if _UNREAD not in self.current.locals:
+                self.current.locals.append(_UNREAD)
+            return _UNREAD
         if self.at_module_level:
             # The module body's names are the program's globals, so they live
             # at file scope where a function can reach them.
@@ -6822,8 +6891,17 @@ class CApiEmitter:
         )
         if isinstance(node.body, list):
             given = set(held) | set(captures)
-            function.doubles = double_locals(node.body, given)
-            function.unboxed = unboxable_locals(node.body, given) - function.doubles
+            # Ahead of both narrowings, and removed from them: holding a name
+            # in a register pays for reads, and these have none.
+            function.write_only = write_only_locals(node.body, given)
+            function.doubles = (
+                double_locals(node.body, given) - function.write_only
+            )
+            function.unboxed = (
+                unboxable_locals(node.body, given)
+                - function.doubles
+                - function.write_only
+            )
             function.exact_lists = exact_lists(node.body, given)
             function.exact_dicts = exact_dicts(node.body, given)
             function.exact_strs = exact_strs(node.body, given)
@@ -7195,9 +7273,16 @@ class CApiEmitter:
         # stops it trying. Letting the integer side win gave such a name the
         # three-variable form and then never once took the fast path, since no
         # binding was an integer: all of the cost and none of the saving.
-        function.doubles = double_locals(node.body, set(parameters))
+        # Ahead of both narrowings, and removed from them: holding a name in
+        # a register pays for reads, and these have none.
+        function.write_only = write_only_locals(node.body, set(parameters))
+        function.doubles = (
+            double_locals(node.body, set(parameters)) - function.write_only
+        )
         function.unboxed = (
-            unboxable_locals(node.body, set(parameters)) - function.doubles
+            unboxable_locals(node.body, set(parameters))
+            - function.doubles
+            - function.write_only
         )
         function.exact_lists = exact_lists(node.body, set(parameters))
         function.exact_dicts = exact_dicts(node.body, set(parameters))

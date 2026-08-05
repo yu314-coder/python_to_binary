@@ -694,6 +694,46 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_an_unread_local_still_runs_what_made_it(self):
+        """Sharing the slot is a storage decision, not licence to skip work.
+
+        `x = note(1)` calls `note` whether or not anything reads `x`, and the
+        calls happen in the order they are written.
+        """
+        self._run(
+            "calls = []\n"
+            "def note(v):\n"
+            "    calls.append(v)\n"
+            "    return v\n"
+            "def f():\n"
+            "    a = note(1)\n"
+            "    b = note(2)\n"
+            "    c = note(3)\n"
+            "    return b\n"
+            "print(f(), calls)\n",
+            b"2 [1, 2, 3]\n",
+        )
+
+    def test_unread_locals_do_not_pile_up(self):
+        # They share one slot, so each rebinding has to release what the last
+        # one left there. A thousand of them must not hold a thousand objects.
+        self._run(
+            "class Counted:\n"
+            "    live = 0\n"
+            "    def __init__(self):\n"
+            "        Counted.live = Counted.live + 1\n"
+            "    def __del__(self):\n"
+            "        Counted.live = Counted.live - 1\n"
+            "def f():\n"
+            "    a = Counted()\n"
+            "    b = Counted()\n"
+            "    c = Counted()\n"
+            "    return 0\n"
+            "f()\n"
+            "print(Counted.live)\n",
+            b"0\n",
+        )
+
     def test_an_empty_loop_still_runs_its_else(self):
         """The `else` of a loop whose body never ran.
 
