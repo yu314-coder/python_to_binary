@@ -702,23 +702,31 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **2.9 ms** | 7.1 ms | **2.42× faster** |
-| integer arithmetic | **5.1 ms** | 8.3 ms | **1.62× faster** |
-| `while` loop | **4.6 ms** | 6.3 ms | **1.37× faster** |
-| comparisons | **3.7 ms** | 4.6 ms | **1.24× faster** |
-| exception raise/catch | **19.0 ms** | 19.6 ms | **1.04× faster** |
-| float arithmetic | **5.6 ms** | 5.8 ms | **1.03× faster** |
-| list append | **5.2 ms** | 5.3 ms | **1.01× faster** |
-| comprehension | 5.6 ms | 5.5 ms | 0.98× |
-| dict store | 8.2 ms | 7.9 ms | 0.96× |
-| `and` / `or` | 6.3 ms | 5.7 ms | 0.90× |
-| f-string | 22.2 ms | 17.5 ms | 0.79× |
-| string concatenation | 15.8 ms | 12.5 ms | 0.79× |
+| direct function call | **2.9 ms** | 7.0 ms | **2.46× faster** |
+| integer arithmetic | **5.2 ms** | 8.2 ms | **1.60× faster** |
+| `while` loop | **4.5 ms** | 6.2 ms | **1.38× faster** |
+| comparisons | **3.6 ms** | 4.6 ms | **1.28× faster** |
+| float arithmetic | **5.4 ms** | 5.6 ms | **1.05× faster** |
+| exception raise/catch | **19.0 ms** | 19.6 ms | **1.03× faster** |
+| list append | 5.2 ms | 5.1 ms | 0.98× |
+| comprehension | 5.6 ms | 5.4 ms | 0.96× |
+| dict store | 8.2 ms | 7.8 ms | 0.95× |
+| `and` / `or` | 6.1 ms | 5.7 ms | 0.93× |
+| f-string | 21.6 ms | 17.4 ms | 0.80× |
+| string concatenation | 15.7 ms | 12.2 ms | 0.78× |
 | subscript | 8.4 ms | 6.0 ms | 0.72× |
-| closure call | 10.1 ms | 6.6 ms | 0.65× |
-| attribute read | 6.3 ms | 3.8 ms | 0.59× |
-| instantiation | 37.6 ms | 16.3 ms | 0.43× |
-| method call | 15.4 ms | 6.6 ms | 0.43× |
+| `try` that does not raise | 5.2 ms | 3.6 ms | 0.69× |
+| module global read | 5.4 ms | 3.6 ms | 0.68× |
+| `for` over a list | 4.4 ms | 2.9 ms | 0.65× |
+| dict lookup by name | 7.0 ms | 4.6 ms | 0.65× |
+| closure call | 10.2 ms | 6.6 ms | 0.65× |
+| attribute read | 6.2 ms | 3.6 ms | 0.59× |
+| `isinstance` | 11.8 ms | 6.0 ms | 0.51× |
+| attribute write | 6.7 ms | 3.1 ms | 0.47× |
+| instantiation | 37.4 ms | 16.1 ms | 0.43× |
+| method call | 15.3 ms | 6.6 ms | 0.43× |
+| `in` on a list | 24.3 ms | 9.1 ms | 0.37× |
+| tuple unpacking | 15.3 ms | 5.5 ms | 0.36× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -729,7 +737,7 @@ and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Ten of the seventeen rows above sit at 0.80× or better and seven beat the
+Eleven of the twenty-five rows above sit at 0.80× or better and six beat the
 interpreter outright. Most of them did not a short while ago, and the reason
 each moved is worth having in one place, because none of it was a matter of
 turning something up.
@@ -1264,6 +1272,35 @@ runtime and library adapters.
 ## Release notes
 
 Newest first. Older releases are in the repository's history.
+
+### 0.9.4 - the grid was blind to its own worst rows
+
+**Tuple unpacking ran at 0.18× the interpreter**, and nothing in the grid
+measured it. Deciding whether a two-item tuple has two items boxed the length,
+boxed the expected count twice, ran two `PyObject_RichCompare` calls and asked
+`PyObject_IsTrue` of each answer - eleven C-API calls and five allocations for
+what is one machine comparison. It also called `tuple()` on the value first,
+allocating a copy per unpack and freeing it again.
+
+The length is a machine comparison now, and a value that can answer for itself
+is taken apart where it stands. `tuple()` is still what makes unpacking work
+for *any* iterable, so it is kept for the case that needs it - and both
+questions have to be asked, because `PySequence_Check` is true for a class
+defining only `__getitem__` and such a class has no length. **Tuple unpacking
+0.18× → 0.36×, and `for n, x in enumerate(...)` 0.23× → 0.50×**, since that
+unpacks a two-item tuple every turn.
+
+**Eight shapes were added to the grid**, which now has twenty-five rows. They
+were found by measuring things the suite did not cover, and most of them are
+worse than anything it did: `in` on a list at 0.37×, attribute *write* at
+0.47×, `isinstance` at 0.51×, a dict lookup by name at 0.65×, `for` over a
+list at 0.65×, a module global read at 0.68×, a `try` that never raises at
+0.69×. They are published because a grid showing only the shapes a compiler is
+good at is a grid measuring itself.
+
+Six of the twenty-five rows beat the interpreter and eleven sit at 0.80× or
+better. Those fractions are lower than the seventeen-row grid reported, and
+that is the point: the old set was not representative.
 
 ### 0.9.3 - a branch whose answer is already written down
 

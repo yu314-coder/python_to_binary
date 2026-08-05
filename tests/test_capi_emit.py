@@ -424,6 +424,73 @@ class CApiEmitTests(unittest.TestCase):
             b"ab HIJACKED\n",
         )
 
+    def test_unpacking_checks_its_length_with_a_machine_comparison(self):
+        # Deciding whether a two-item tuple has two items used to box the
+        # length, box the expected count twice, run two `PyObject_RichCompare`
+        # calls and ask `PyObject_IsTrue` of each - eleven C-API calls and five
+        # allocations for one comparison. `a, b = pair` ran at 0.18x the
+        # interpreter and the check was almost all of it.
+        generated = python_to_capi_c(
+            "def f(pair):\n    a, b = pair\n    return a + b\nprint(f((1, 2)))\n",
+            "program.py",
+        )
+        body = generated[generated.index("static PyObject *f_f("):]
+        body = body[: body.index("\n}\n")]
+        self.assertNotIn("PyObject_RichCompare", body)
+
+    def test_unpacking_a_sequence_makes_no_copy_of_it(self):
+        # `tuple()` is what makes unpacking work for any iterable, but for a
+        # tuple or a list - which is what almost every unpack holds - it
+        # allocated a copy per unpack and freed it again.
+        generated = python_to_capi_c(
+            "def f(pair):\n    a, b = pair\n    return a + b\nprint(f((1, 2)))\n",
+            "program.py",
+        )
+        body = generated[generated.index("static PyObject *f_f("):]
+        body = body[: body.index("\n}\n")]
+        self.assertIn("PySequence_Check", body)
+
+    def test_unpacking_still_takes_any_iterable(self):
+        # The fast path may not narrow what unpacking accepts. A generator has
+        # no length and no index and must still come apart.
+        self._run(
+            "def gen():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+            "a, b = gen()\n"
+            "c, d = 'xy'\n"
+            "e, f = range(2)\n"
+            "print(a, b, c, d, e, f)\n",
+            b"1 2 x y 0 1\n",
+        )
+
+    def test_unpacking_something_with_no_length_still_works(self):
+        # `PySequence_Check` is true for a class defining only `__getitem__`,
+        # and such a class has no `__len__` - so the size is tried and a
+        # failure sends it back to the general path rather than out of the
+        # program.
+        self._run(
+            "class Weird:\n"
+            "    def __getitem__(self, i):\n"
+            "        if i > 1:\n"
+            "            raise IndexError\n"
+            "        return i * 5\n"
+            "a, b = Weird()\n"
+            "print(a, b)\n",
+            b"0 5\n",
+        )
+
+    def test_unpacking_the_wrong_length_says_so_the_way_python_does(self):
+        self._run_failing(
+            "a, b = (1, 2, 3)\n", b"too many values to unpack (expected 2, got 3)"
+        )
+
+    def test_unpacking_too_few_says_so_too(self):
+        self._run_failing(
+            "a, b, c = (1, 2)\n",
+            b"not enough values to unpack (expected 3, got 2)",
+        )
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which

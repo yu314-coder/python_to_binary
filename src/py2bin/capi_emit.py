@@ -5010,50 +5010,69 @@ class CApiEmitter:
         # iterable and indexing does not, and the length has to be known to
         # say whether it matches. Indexing the value directly took `a, b` from
         # a three-item tuple without a word, where Python raises ValueError.
-        maker = self.builtin("tuple", indent)
+        # A sequence can be taken apart where it stands. `tuple()` is what
+        # makes this work for *any* iterable - a generator has no length and
+        # no index - but for a tuple or a list, which is what almost every
+        # unpack actually holds, it allocates a copy per unpack and frees it
+        # again. The copy is made only when the value cannot answer for
+        # itself.
+        #
+        # Both questions have to be asked: `PySequence_Check` is true for a
+        # class defining only `__getitem__`, and such a class has no length,
+        # so the size is tried and a failure sends it back to the general
+        # path rather than out of the program.
         items = self.temporary()
-        self.emit(f"{items} = PyObject_CallOneArg({maker}, {value});", indent)
-        self.emit(f"Py_DecRef({maker});", indent)
-        self.checked(items, indent)
+        size = self.machine_slot()
+        direct = self.temporary_flag()
+        held = self.temporary_flag()
+        self.emit(f"{items} = {value};", indent)
+        self.emit(f"{held} = 0;", indent)
+        self.emit(f"{direct} = PySequence_Check({value});", indent)
+        self.emit(f"if ({direct}) {{", indent)
+        self.emit(f"{size} = PyObject_Size({value});", indent + 1)
+        self.emit(
+            f"if ({size} < 0) {{ PyErr_Clear(); {direct} = 0; }}", indent + 1
+        )
+        self.emit("}", indent)
+        self.emit(f"if (!{direct}) {{", indent)
+        maker = self.builtin("tuple", indent + 1)
+        self.emit(f"{items} = PyObject_CallOneArg({maker}, {value});", indent + 1)
+        self.emit(f"Py_DecRef({maker});", indent + 1)
+        self.emit(f"if (!{items}) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"{held} = 1;", indent + 1)
+        self.emit(f"{size} = PyObject_Size({items});", indent + 1)
+        self.emit(f"if ({size} < 0) {{ {self.failure()} }}", indent + 1)
+        self.emit("}", indent)
         wanted = len(target.elts)
-        measured = self.temporary()
-        self.emit(f"{measured} = PyLong_FromLongLong(PyObject_Size({items}));", indent)
-        self.checked(measured, indent)
-        for comparison, message in (
-            # Py_GT is 4 and Py_LT is 0 in the rich-comparison numbering, which
-            # runs Py_LT, Py_LE, Py_EQ, Py_NE, Py_GT, Py_GE.
-            (4, f"too many values to unpack (expected {wanted}, got "),
-            (0, f"not enough values to unpack (expected {wanted}, got "),
+        # How long it is, as a machine integer. This used to box the length,
+        # box the expected count twice, run two `PyObject_RichCompare`s and
+        # ask `PyObject_IsTrue` of each answer - eleven C-API calls and five
+        # allocations to decide whether a two-item tuple has two items, which
+        # is a single comparison. `a, b = pair` measured 0.18x the
+        # interpreter; the check was almost all of it.
+        for test, message in (
+            (f"{size} > {wanted}", f"too many values to unpack (expected {wanted}, got "),
+            (f"{size} < {wanted}", f"not enough values to unpack (expected {wanted}, got "),
         ):
-            expected = self.temporary()
-            self.emit(f"{expected} = PyLong_FromLongLong({wanted}LL);", indent)
-            self.checked(expected, indent)
-            verdict = self.temporary_flag()
-            outcome = self.temporary()
-            self.emit(
-                f"{outcome} = PyObject_RichCompare({measured}, {expected}, "
-                f"{comparison});",
-                indent,
-            )
-            self.emit(f"Py_DecRef({expected});", indent)
-            self.checked(outcome, indent)
-            self.emit(f"{verdict} = PyObject_IsTrue({outcome});", indent)
-            self.emit(f"Py_DecRef({outcome});", indent)
-            self.emit(f"if ({verdict} < 0) {{ {self.failure()} }}", indent)
-            self.emit(f"if ({verdict}) {{", indent)
-            self.raise_value_error(message, measured, indent + 1)
+            self.emit(f"if ({test}) {{", indent)
+            # The count is only boxed on the way to raising, where the cost is
+            # beside the point and the message wants the number.
+            counted = self.temporary()
+            self.emit(f"{counted} = PyLong_FromLongLong({size});", indent + 1)
+            self.checked(counted, indent + 1)
+            self.raise_value_error(message, counted, indent + 1)
             self.emit("}", indent)
-        self.emit(f"Py_DecRef({measured});", indent)
         for position, element in enumerate(target.elts):
-            index = self.temporary()
-            self.emit(f"{index} = PyLong_FromLongLong({position}LL);", indent)
-            self.checked(index, indent)
             item = self.temporary()
-            self.emit(f"{item} = PyObject_GetItem({items}, {index});", indent)
-            self.emit(f"Py_DecRef({index});", indent)
+            # `items` is what `tuple()` just answered, so it is a tuple and
+            # the sequence protocol is the right one - no boxed index, and no
+            # mapping lookup to rule out first.
+            self.emit(
+                f"{item} = PySequence_GetItem({items}, {position}LL);", indent
+            )
             self.checked(item, indent)
             self.bind_target(element, item, indent)
-        self.emit(f"Py_DecRef({items});", indent)
+        self.emit(f"if ({held}) Py_DecRef({items});", indent)
 
     def expression_statement(self, node: ast.Expr, indent: int) -> None:
         if (
