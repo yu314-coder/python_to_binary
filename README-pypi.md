@@ -117,7 +117,8 @@ that is not a plain function in this module.
   to machine code by py2bin's own compiler. Slower to build; no source and no
   bytecode in the result.
 
-That is the whole decision, and it is the only one `py2bin build` asks about.
+That is the whole decision, and it is the only one `py2bin make` (or
+`build.py` in a clone) asks about.
 
 There is a third, `compile`, which is not a general choice: it accepts a small
 subset of the language and no packages at all, in exchange for an artifact
