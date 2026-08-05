@@ -3456,6 +3456,24 @@ class CApiEmitter:
             and self.builtin_untouched(node.func.id)
         ):
             return self.scope_dictionary(node, indent)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in ("eval", "exec")
+            and len(node.args) == 1
+            and not node.keywords
+            and self.builtin_untouched(node.func.id)
+        ):
+            # Given one argument these read the caller's globals and locals
+            # out of its frame, and a compiled function has no frame. It
+            # failed at run time with "must be given globals and locals",
+            # which is true and says nothing about what to do. Given them
+            # both it works, and that is what to do.
+            raise self.fail(
+                node,
+                f"{node.func.id}() with one argument reads the calling frame's "
+                f"globals and locals, and a compiled function has no frame - "
+                f"pass them: {node.func.id}(source, namespace, namespace)",
+            )
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):

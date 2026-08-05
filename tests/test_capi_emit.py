@@ -694,6 +694,67 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_a_generator_method_works(self):
+        """`def items(self): yield` was refused, and it is everywhere.
+
+        A generator becomes a machine class and a maker, and a class inside a
+        class body is not translated - so the machine goes in front of the
+        class instead, where it is bound by the time any method can run. It is
+        not a member of the class anyway; only something the method makes an
+        instance of.
+        """
+        self._run(
+            "class Bag:\n"
+            "    def __init__(self, items):\n"
+            "        self.items = items\n"
+            "    def each(self):\n"
+            "        for v in self.items:\n"
+            "            yield v * 2\n"
+            "    def counted(self, start):\n"
+            "        n = start\n"
+            "        while n < start + 3:\n"
+            "            yield n\n"
+            "            n = n + 1\n"
+            "    def echo(self):\n"
+            "        got = yield 1\n"
+            "        yield got\n"
+            "b = Bag([1, 2, 3])\n"
+            "it = b.echo()\n"
+            "print(list(b.each()), list(b.counted(5)), next(it), it.send('x'))\n",
+            b"[2, 4, 6] [5, 6, 7] 1 x\n",
+        )
+
+    def test_the_machines_receiver_is_not_the_methods_self(self):
+        """Both are spelled `self`, and one was rewritten into the other.
+
+        Every name a generator binds becomes an attribute of the machine's
+        receiver - and for a method one of those names *is* `self`, so the
+        machine's own `self.<state>` became `self.self.<state>`. The state
+        then lived on the instance, never advanced, and iterating yielded the
+        first value for ever rather than answering.
+        """
+        self._run(
+            "class C:\n"
+            "    def gen(self):\n"
+            "        yield 1\n"
+            "        yield 2\n"
+            "print(list(C().gen()))\n",
+            b"[1, 2]\n",
+        )
+
+    def test_an_async_method_works(self):
+        self._run(
+            "import asyncio\n"
+            "class C:\n"
+            "    def __init__(self, v):\n"
+            "        self.v = v\n"
+            "    async def doubled(self):\n"
+            "        await asyncio.sleep(0)\n"
+            "        return self.v * 2\n"
+            "print(asyncio.run(C(4).doubled()))\n",
+            b"8\n",
+        )
+
     def test_an_async_comprehension_is_the_loop_it_is_short_for(self):
         """Refused outright before, and refused twice over.
 

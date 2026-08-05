@@ -564,8 +564,10 @@ CPython, and requiring identical stdout and exit status.
 | `__annotations__` in a class body, so `dataclasses` works | ✅ |
 | `enum`, `dataclasses` | ✅ |
 | `[x async for x in it]`, and the set and dict forms | ✅ |
-| `async def` as a *method* in a class body | ❌ refused |
-| an `async def` generator used as an async iterator | ❌ no `__aiter__` |
+| `def m(self): yield`, and `async def` methods | ✅ |
+| `async def` that yields (an async generator) | ❌ refused |
+| `locals()` / `vars()` inside a function | ✅ |
+| `globals()`, and one-argument `eval` / `exec` | ❌ refused |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |

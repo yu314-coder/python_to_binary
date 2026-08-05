@@ -1677,6 +1677,17 @@ def rewrite(
             node, "a generator taking *args or **kwargs"
         )
     parameters = [argument.arg for argument in node.args.args]
+    if "self" in parameters:
+        # A method's first parameter is spelled the same as the machine's own
+        # receiver, and every name the function binds is rewritten to an
+        # attribute of that receiver - so the machine's own `self.<state>`
+        # was rewritten too, into `self.self.<state>`. The state then lived
+        # on the instance rather than on the machine, never advanced, and
+        # `list(obj.items())` yielded the first value for ever. Renamed here,
+        # before anything is built, so the two never meet.
+        node = _Renamed("self", _RECEIVER).visit(node)
+        ast.fix_missing_locations(node)
+        parameters = [argument.arg for argument in node.args.args]
     node.body = [_WithRewriter().visit(inner) for inner in node.body]
     node.body = [
         statement
@@ -1809,7 +1820,7 @@ def rewrite(
                     )
                 ],
                 value=(
-                    ast.Name(id=name, ctx=ast.Load())
+                    ast.Name(id=_incoming(parameters.index(name)), ctx=ast.Load())
                     if name in parameters
                     else ast.Constant(value=None)
                 ),
@@ -1825,7 +1836,14 @@ def rewrite(
         body=[
             ast.FunctionDef(
                 name="__init__",
-                args=_arguments(["self", *parameters]),
+                # The parameters arrive under names of this machine's own
+                # choosing rather than the ones the function gave them. A
+                # method's first parameter is `self`, and so is the machine's
+                # own receiver - two of them in one signature is not a
+                # signature, which is what refused every generator method.
+                args=_arguments(
+                    ["self", *(_incoming(i) for i in range(len(parameters)))]
+                ),
                 body=setup,
                 decorator_list=[],
                 type_params=[],
@@ -1951,6 +1969,41 @@ def rewrite(
     for tree in (made, maker):
         ast.fix_missing_locations(ast.copy_location(tree, node))
     return made, maker
+
+
+#: What a generator's own `self` parameter is renamed to, so that it cannot be
+#: confused with the machine's receiver of the same spelling.
+_RECEIVER = "_py2bin_recv"
+
+
+class _Renamed(ast.NodeTransformer):
+    """Rename one plain name throughout a function, parameters included."""
+
+    def __init__(self, was: str, now: str) -> None:
+        self.was = was
+        self.now = now
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id == self.was:
+            return ast.copy_location(ast.Name(id=self.now, ctx=node.ctx), node)
+        return node
+
+    def visit_arg(self, node: ast.arg) -> ast.AST:
+        if node.arg == self.was:
+            return ast.copy_location(ast.arg(arg=self.now), node)
+        return node
+
+
+def _incoming(position: int) -> str:
+    """What the machine calls the argument in that position.
+
+    Its own, not the function's: the two meet in `__init__`, and a method's
+    first parameter is spelled the same as the receiver. The value still
+    lands on the attribute the function's name, so the body reads what it
+    always did.
+    """
+
+    return f"_py2bin_in{position}"
 
 
 def _arguments(names: list[str]) -> ast.arguments:
@@ -2092,9 +2145,23 @@ def expand(tree: ast.Module) -> ast.Module:
 
     counter = 0
 
-    def walk(body: list[ast.stmt]) -> list[ast.stmt]:
+    def walk(
+        body: list[ast.stmt], hoist: list[ast.stmt] | None = None
+    ) -> list[ast.stmt]:
+        """Rewrite these statements; `hoist` takes the classes made on the way.
+
+        A generator *method* becomes a machine class and a maker, and a class
+        inside a class body is not something the emitter translates - so
+        `def items(self): yield` and every `async def` method were refused,
+        which is most of the ways either gets written. The machine has no
+        business being in there anyway: it is not a member of the class, only
+        something the method makes an instance of. It goes out in front of the
+        class instead, where it is bound by the time any method can run.
+        """
+
         nonlocal counter
         rebuilt: list[ast.stmt] = []
+        made_here = rebuilt if hoist is None else hoist
         for statement in body:
             if isinstance(statement, ast.AsyncFunctionDef):
                 counter += 1
@@ -2114,17 +2181,39 @@ def expand(tree: ast.Module) -> ast.Module:
                     returns=None,
                 )
                 ast.copy_location(plain, statement)
+                if is_generator(plain):
+                    # An `async def` that yields is an async generator, which
+                    # is a different thing from a coroutine: it is driven by
+                    # `__aiter__`/`__anext__` rather than awaited, and its own
+                    # yields have to be told apart from the ones an `await`
+                    # inside it produces - the machine turns both into the
+                    # same `yield`. Compiled as a coroutine it came out with
+                    # `__iter__` and no `__aiter__`, so `async for` over it
+                    # failed at run time with an AttributeError about a name
+                    # nobody wrote. Said here instead.
+                    raise GeneratorRewriteError(
+                        statement, "an `async def` that yields (an async generator)"
+                    )
                 made, maker = rewrite(plain, counter, awaitable=True)
-                rebuilt.append(made)
+                made_here.append(made)
                 rebuilt.append(maker)
                 continue
             if isinstance(statement, ast.FunctionDef) and is_generator(statement):
                 counter += 1
                 made, maker = rewrite(statement, counter)
-                rebuilt.append(made)
+                made_here.append(made)
                 rebuilt.append(maker)
                 continue
-            if isinstance(statement, (ast.ClassDef, ast.FunctionDef)):
+            if isinstance(statement, ast.ClassDef):
+                lifted: list[ast.stmt] = []
+                statement.body = walk(statement.body, hoist=lifted)
+                # In front of the class, not inside it: the maker names the
+                # machine when it *runs*, so the machine only has to exist by
+                # then - but a class body is not somewhere one can be written.
+                rebuilt.extend(lifted)
+                rebuilt.append(statement)
+                continue
+            if isinstance(statement, ast.FunctionDef):
                 statement.body = walk(statement.body)
             rebuilt.append(statement)
         return rebuilt
