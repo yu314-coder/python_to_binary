@@ -4798,32 +4798,12 @@ class CApiEmitter:
         number = self.current.labels
         handler = f"_handler{number}"
         done = f"_after{number}"
-        # The classes each clause catches are evaluated here, before the body
-        # runs. Building them inside the handler calls into Python while an
-        # exception is set, which CPython refuses - `except (A, B)` failed with
-        # "returned a result with an exception set" until this moved out.
-        caught: list[str | None] = []
-        for clause in node.handlers:
-            caught.append(
-                None if clause.type is None else self.expression(clause.type, indent)
-            )
         self.handlers.append(handler)
         try:
             for statement in node.body:
                 self.statement(statement, indent)
         finally:
             self.handlers.pop()
-        # The classes are finished with the moment the body has run without
-        # raising. They were left held: a `try` that did not raise released
-        # none of them, so `except (ValueError, TypeError)` - whose class
-        # expression builds a fresh tuple every time it is evaluated - leaked
-        # one tuple per execution. Four hundred thousand turns of a loop
-        # measured 40 MB against the interpreter's 15, and it grew with the
-        # count. The handler path releases them itself, clause by clause, and
-        # is not reached from here.
-        for wanted in caught:
-            if wanted is not None:
-                self.emit(f"Py_DecRef({wanted});", indent)
         # The `else` clause runs when the body raised nothing, and is *not*
         # protected by these handlers - an exception in it belongs outside, as
         # it does in Python. The handler label is already popped by here.
@@ -4831,6 +4811,25 @@ class CApiEmitter:
             self.statement(statement, indent)
         self.emit(f"goto {done};", indent)
         self.emit(f"{handler}:", 0)
+        # The classes each clause catches are evaluated *here*, where the body
+        # has already raised - not before it, where every `try` paid for them
+        # whether it needed them or not, and where they were then left held:
+        # `except (ValueError, TypeError)` builds a fresh tuple each time it
+        # is evaluated, so a `try` in a loop leaked one per turn.
+        #
+        # Evaluating them with an exception set is what CPython refuses -
+        # `except (A, B)` failed with "returned a result with an exception
+        # set". So the exception is lifted out first and put back once they
+        # are built, which is what `PyErr_ExceptionMatches` below needs
+        # anyway.
+        pending = self.temporary()
+        self.emit(f"{pending} = PyErr_GetRaisedException();", indent)
+        caught: list[str | None] = []
+        for clause in node.handlers:
+            caught.append(
+                None if clause.type is None else self.expression(clause.type, indent)
+            )
+        self.emit(f"PyErr_SetRaisedException({pending});", indent)
         for clause, wanted in zip(node.handlers, caught):
             if clause.type is None:
                 # A bare except catches whatever is set. Python requires it to

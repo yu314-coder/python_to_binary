@@ -702,31 +702,31 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.1 ms | **2.38× faster** |
-| integer arithmetic | **5.2 ms** | 8.4 ms | **1.61× faster** |
-| `while` loop | **4.6 ms** | 6.5 ms | **1.42× faster** |
+| direct function call | **3.0 ms** | 7.1 ms | **2.39× faster** |
+| integer arithmetic | **5.3 ms** | 8.5 ms | **1.61× faster** |
+| `while` loop | **4.6 ms** | 6.3 ms | **1.37× faster** |
 | comparisons | **3.7 ms** | 4.7 ms | **1.26× faster** |
-| float arithmetic | **5.4 ms** | 5.7 ms | **1.06× faster** |
-| exception raise/catch | **19.6 ms** | 19.9 ms | **1.02× faster** |
-| `in` on a list | **9.0 ms** | 9.1 ms | **1.01× faster** |
-| list append | 5.3 ms | 5.2 ms | 0.98× |
-| comprehension | 5.7 ms | 5.4 ms | 0.96× |
-| dict store | 8.3 ms | 7.9 ms | 0.95× |
-| `and` / `or` | 6.1 ms | 5.7 ms | 0.95× |
-| f-string | 22.1 ms | 17.7 ms | 0.80× |
-| `isinstance` | 7.7 ms | 6.0 ms | 0.79× |
-| string concatenation | 15.9 ms | 12.4 ms | 0.78× |
-| subscript | 8.5 ms | 6.0 ms | 0.71× |
-| dict lookup by name | 6.5 ms | 4.6 ms | 0.70× |
-| module global read | 5.2 ms | 3.7 ms | 0.70× |
-| closure call | 10.1 ms | 6.7 ms | 0.66× |
-| `for` over a list | 4.3 ms | 2.8 ms | 0.65× |
-| `try` that does not raise | 5.6 ms | 3.6 ms | 0.64× |
+| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.05× faster** |
+| float arithmetic | **5.5 ms** | 5.8 ms | **1.04× faster** |
+| `in` on a list | 9.0 ms | 9.0 ms | 1.00× |
+| list append | 5.2 ms | 5.2 ms | 1.00× |
+| exception raise/catch | 20.1 ms | 19.8 ms | 0.98× |
+| comprehension | 5.7 ms | 5.6 ms | 0.98× |
+| dict store | 8.4 ms | 8.0 ms | 0.95× |
+| `and` / `or` | 6.3 ms | 5.8 ms | 0.93× |
+| f-string | 21.9 ms | 17.6 ms | 0.80× |
+| `isinstance` | 7.6 ms | 6.0 ms | 0.80× |
+| string concatenation | 16.0 ms | 12.5 ms | 0.78× |
+| dict lookup by name | 6.5 ms | 4.8 ms | 0.73× |
+| subscript | 8.5 ms | 6.1 ms | 0.71× |
+| module global read | 5.4 ms | 3.7 ms | 0.69× |
+| closure call | 10.2 ms | 6.7 ms | 0.66× |
+| `for` over a list | 4.4 ms | 2.9 ms | 0.66× |
 | attribute read | 6.3 ms | 3.7 ms | 0.59× |
-| attribute write | 6.2 ms | 3.2 ms | 0.52× |
-| instantiation | 33.7 ms | 16.3 ms | 0.48× |
-| method call | 15.8 ms | 6.6 ms | 0.42× |
-| tuple unpacking | 15.4 ms | 5.5 ms | 0.36× |
+| attribute write | 6.0 ms | 3.0 ms | 0.49× |
+| instantiation | 34.4 ms | 16.3 ms | 0.47× |
+| method call | 15.6 ms | 6.7 ms | 0.43× |
+| tuple unpacking | 15.4 ms | 5.6 ms | 0.36× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -737,7 +737,7 @@ and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Twelve of the twenty-five rows above sit at 0.80× or better and seven beat the
+Fourteen of the twenty-five rows above sit at 0.80× or better and six beat the
 interpreter outright. Most of them did not a short while ago, and the reason
 each moved is worth having in one place, because none of it was a matter of
 turning something up.
@@ -940,6 +940,16 @@ outside it.
 A compiler that is *nearly* right about semantics is worse than a slow one,
 because the difference shows up as a wrong answer rather than an error. This
 is what `compile-capi` promises, and where it knowingly stops.
+
+**Inside an `except` block, the exception being handled is not on record.**
+`sys.exc_info()` answers `None` there, and an exception raised from a handler
+gets no `__context__` - so a traceback loses its "during handling of the above
+exception" chain. Both come from one thing: the handler *takes* the exception
+rather than also setting it as the thread's handled exception, and CPython's
+`PyErr_SetHandledException` is not in the vetted table. The exception itself,
+its type, message, `__cause__` from an explicit `raise ... from`, and what
+`except` matches are all correct; it is the implicit chaining and the
+introspection that are missing.
 
 ### It behaves as CPython does
 
@@ -1276,8 +1286,8 @@ Newest first. Older releases are in the repository's history.
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
 The largest release so far, and most of it is correctness that turned up while
-chasing speed. Twelve of the twenty-five measured rows now sit at 0.80x or
-better and seven beat the interpreter.
+chasing speed. Fourteen of the twenty-five measured rows now sit at 0.80x or
+better and six beat the interpreter.
 
 **A condition wants a verdict, not a value.** Four places computed an object
 and then asked what it meant. `if a and b` evaluated the whole chain into a
@@ -1314,15 +1324,21 @@ with the key they look up. All borrowed now, on rules that still refuse to
 borrow a global. **Closure call 0.55x -> 0.66x, attribute write 0.47x ->
 0.53x, dict lookup by name 0.61x -> 0.71x.**
 
-**Every `try` leaked the classes its clauses catch.** They are built before the
-body runs - building them inside the handler calls into Python while an
-exception is set, which CPython refuses - and nothing released them where the
-body raised nothing. `except (ValueError, TypeError)` builds a fresh tuple each
-evaluation, so a `try` in a loop leaked one per turn: 400,000 turns held 40 MB
-against the interpreter's 15, and 800,000 held 65. A clause that matched also
-left every later clause unreleased. Both paths release now, and the row got
-*slower* for it, 0.70x -> 0.65x, because releasing is work that was not being
-done.
+**Every `try` built the classes its clauses catch, and then leaked them.**
+They were built before the body ran, so a `try` paid for them whether it
+needed them or not - and nothing released them where the body raised nothing.
+`except (ValueError, TypeError)` builds a fresh tuple each evaluation, so a
+`try` in a loop leaked one per turn: 400,000 turns held 40 MB against the
+interpreter's 15, and 800,000 held 65.
+
+They are built in the handler now, where the body has already raised. Doing
+that with an exception set is what CPython refuses - `except (A, B)` failed
+with "returned a result with an exception set" - so the exception is lifted
+out with `PyErr_GetRaisedException` and put back once they are built, which is
+what the match needs anyway. A `try` that does not raise now builds nothing at
+all: **0.70x -> 1.04x**, past the interpreter. The raising path pays for the
+lift and costs a little, 1.06x -> 0.97x, which is the right way round for a
+construct whose point is that it usually does not raise.
 
 **A long function no longer needs a bigger stack frame than a short one.**
 Every intermediate the C lowering needed took a stack slot and never gave it
