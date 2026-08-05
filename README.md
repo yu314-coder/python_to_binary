@@ -1273,238 +1273,103 @@ runtime and library adapters.
 
 Newest first. Older releases are in the repository's history.
 
-### 0.9.6 - a `try` gave back what it borrowed
+### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
-Chasing the `try` row found a memory leak rather than a slow path.
+The largest release so far, and most of it is correctness that turned up while
+chasing speed. Twelve of the twenty-five measured rows now sit at 0.80x or
+better and seven beat the interpreter.
+
+**A condition wants a verdict, not a value.** Four places computed an object
+and then asked what it meant. `if a and b` evaluated the whole chain into a
+Python boolean; `if x in xs` looked `True` up *by name on the builtins module*
+and handed it to `PyObject_IsTrue`, when `PySequence_Contains` had already
+answered; `isinstance(x, C)` found the callable and dispatched through it,
+where `PyObject_IsInstance` is what the builtin does; `f"{x}"` asked `str`.
+Each goes straight through now, and the short circuit in `and`/`or` is the C
+`if` guarding the next side, so a side that must not run has no code reached
+rather than a value discarded. **`and`/`or` 0.66x -> 0.94x, `in` on a list
+0.37x -> 1.02x, `isinstance` 0.51x -> 0.80x.**
+
+**A `__bool__` that raised was read as true.** `PyObject_IsTrue` answers -1
+with an exception set, and -1 is true in C, so a class whose `__bool__` raised
+ran the body of the `if` and the program exited 0 where CPython stops. The
+same for a comparison that raised. Every verdict is checked where it is
+produced now. This was there before any of the work above and is the more
+important half of it.
+
+**`f"{x}"` asked `str` where Python asks `__format__`.** For most types those
+agree, because `object.__format__` with an empty specifier defers to `str`;
+for a type that defines `__format__` they do not. `PyObject_Format` is now
+vetted, and an exact `str` skips the call entirely - the same two paths
+CPython's `FORMAT_SIMPLE` takes. **f-string 0.73x -> 0.80x.**
+
+**Calls, literals and stores stopped paying for references they already hold.**
+`PyObject_CallOneArg` borrows its argument and the two-or-more path knew it,
+but the single-argument path - the commonest call shape there is - took a
+reference and dropped it again, and so did the callable. A pooled literal
+lives in a static written once at start-up and was incremented and decremented
+around every use. `obj.field = v` and `d[k] = v` did the same with the object
+and the key. All borrowed now, on rules that still refuse to borrow a global.
+**Closure call 0.55x -> 0.66x, attribute write 0.47x -> 0.53x.**
 
 **Every `try` leaked the classes its clauses catch.** They are built before the
 body runs - building them inside the handler calls into Python while an
-exception is set, which CPython refuses - and nothing released them on the path
-where the body raised nothing. `except (ValueError, TypeError)` builds a fresh
-tuple each time it is evaluated, so a `try` in a loop leaked one tuple per turn:
-four hundred thousand turns held 40 MB against the interpreter's 15, and eight
-hundred thousand held 65. It grew with the count, which is what makes it a leak
-rather than an overhead. A clause that matched also left every clause *after*
-it unreleased, since those are never tested.
+exception is set, which CPython refuses - and nothing released them where the
+body raised nothing. `except (ValueError, TypeError)` builds a fresh tuple each
+evaluation, so a `try` in a loop leaked one per turn: 400,000 turns held 40 MB
+against the interpreter's 15, and 800,000 held 65. A clause that matched also
+left every later clause unreleased. Both paths release now, and the row got
+*slower* for it, 0.70x -> 0.65x, because releasing is work that was not being
+done.
 
-Both paths give them back now, and the row got **slower** for it - 0.70× to
-0.65× - because releasing is work that was not being done. That is the right
-way round.
+**A long function no longer needs a bigger stack frame than a short one.**
+Every intermediate the C lowering needed took a stack slot and never gave it
+back, so a frame grew with a function's *length*: about 1,800 statements in one
+`def` reached the 512 KB budget and the build was refused, which generated code
+walks into without doing anything unusual. Forty thousand statements compile
+now. The float formatter's scratch and any local outlive the statement that
+made them and are excluded, and reclaiming is per statement rather than per
+expression, which is what keeps a loop's condition alive across its own body.
 
-**Attribute writes and subscript keys are borrowed.** `obj.field = v` took a
-reference to the object and dropped it again around a call that borrows it,
-and `d[k] = v` did the same with the key. Attribute write 0.47× → 0.53×.
+**Tuple unpacking was the worst row measured and nothing had measured it.**
+Deciding whether a two-item tuple has two items boxed the length, boxed the
+expected count twice, ran two `PyObject_RichCompare` calls and asked
+`PyObject_IsTrue` of each - eleven C-API calls and five allocations for one
+machine comparison - and called `tuple()` first, allocating a copy per unpack.
+The length is a machine comparison now and a value that can answer for itself
+is taken apart where it stands, with `tuple()` kept for what needs it: a
+generator has neither length nor index. **0.18x -> 0.36x, and
+`for n, x in enumerate(...)` 0.23x -> 0.50x.**
 
-One piece of the fix was deleted again: Python requires a bare `except` to be
-last, so no clause can follow it and there is nothing after it to release. The
-first draft handled that case and the test written for it passed against the
-unfixed compiler, which is how the impossibility came to light. The test is
-still there, checking that a bare `except` after a tuple clause catches - it
-just no longer claims to be about leaks.
+**Four names that were not the program's.** A decorator written without the `@`
+- `greet = trace(greet)` - kept calling the undecorated body, because a
+module-level `def` earned a direct C call keyed on the spelling alone. Reading
+a global above its assignment handed the program a raw NULL instead of raising
+`NameError`, and so did a class used above its `class`. A function that rebound
+itself through `global` kept calling its old body. The rule is positional now:
+a `def` earns the direct call only when it is the one thing binding that name
+at module scope, and only where it is already bound - so a function may still
+call one written below it, and recursion keeps the direct call.
 
-### 0.9.5 - a test wants a verdict, and a builtin has an entry point
+**A nested function could not call itself.** Its own name is not bound when the
+capture is taken - the `def` being compiled is what binds it - so an ordinary
+nested `fact` raised `NameError` on its first recursive call. Mutual recursion
+between nested functions is refused at build time with an explanation, because
+capture-by-value cannot express it and failing at run time naming a function
+written plainly above is the worst way to say so.
 
-Two of the rows added in 0.9.4 turned out to be the same mistake the `and`/`or`
-row was, one level along.
-
-**`if x in xs` built a boolean and then asked what it meant.**
-`PySequence_Contains` answers 1, 0 or -1 - the verdict already - and the
-condition looked `True` up *by name on the builtins module*, made the object,
-and handed it to `PyObject_IsTrue`. It goes straight through now. **0.37× →
-1.02×**, which is the largest single move so far and puts the row past the
-interpreter.
-
-**`isinstance(x, C)` went the long way round.** Finding the callable and
-dispatching through it, where `PyObject_IsInstance` is what the builtin does -
-and in a condition its answer is the verdict, so again no object. **0.51× →
-0.80×.** Only when the program has not bound the name: a module defining its
-own `isinstance` still gets its own, which is the bug class this project has
-now hit six times and which has a test here rather than an argument. The class
-argument is still looked up live.
-
-Thirteen of the twenty-five rows now sit at 0.80× or better and seven beat the
-interpreter, from eleven and six.
-
-Worth recording: `PyObject_IsInstance` was already vetted and already declared,
-so the four-place registration this project requires for a new entry point was
-started and then reverted rather than left as a duplicate the C compiler would
-reject.
-
-### 0.9.4 - the grid was blind to its own worst rows
-
-**Tuple unpacking ran at 0.18× the interpreter**, and nothing in the grid
-measured it. Deciding whether a two-item tuple has two items boxed the length,
-boxed the expected count twice, ran two `PyObject_RichCompare` calls and asked
-`PyObject_IsTrue` of each answer - eleven C-API calls and five allocations for
-what is one machine comparison. It also called `tuple()` on the value first,
-allocating a copy per unpack and freeing it again.
-
-The length is a machine comparison now, and a value that can answer for itself
-is taken apart where it stands. `tuple()` is still what makes unpacking work
-for *any* iterable, so it is kept for the case that needs it - and both
-questions have to be asked, because `PySequence_Check` is true for a class
-defining only `__getitem__` and such a class has no length. **Tuple unpacking
-0.18× → 0.36×, and `for n, x in enumerate(...)` 0.23× → 0.50×**, since that
-unpacks a two-item tuple every turn.
+**Smaller things.** `+` on strings known to be exact skips the `__add__`
+dispatch, and exactness composes so `a + b + c` converts throughout. Branches
+whose condition is already a constant are removed, in function bodies as well
+as the entry point - 24 operations across the benchmark suite, which is a small
+number and is stated rather than implied. The launcher scripts and the
+bootstrapper's PowerShell fallback quote or pass by environment what they were
+given, so nothing py2bin writes into a shell is read as shell.
 
 **Eight shapes were added to the grid**, which now has twenty-five rows. They
-were found by measuring things the suite did not cover, and most of them are
-worse than anything it did: `in` on a list at 0.37×, attribute *write* at
-0.47×, `isinstance` at 0.51×, a dict lookup by name at 0.65×, `for` over a
-list at 0.65×, a module global read at 0.68×, a `try` that never raises at
-0.69×. They are published because a grid showing only the shapes a compiler is
-good at is a grid measuring itself.
-
-Six of the twenty-five rows beat the interpreter and eleven sit at 0.80× or
-better. Those fractions are lower than the seventeen-row grid reported, and
-that is the point: the old set was not representative.
-
-### 0.9.3 - a branch whose answer is already written down
-
-Lowering folds a constant comparison to a constant - `8 == 0` becomes 0 - but
-the *branch* on it survived, so the machine code loaded a constant, compared it
-and jumped. It comes from generated code rather than from anything a person
-writes: `%` and `/` by a literal each guard against a zero and a minus-one
-divisor that the literal has already answered. A false condition is now the
-jump, a true one goes entirely, and what follows an unconditional jump is
-dropped until something labels it.
-
-**Function bodies get the pass too.** They were carried through untouched,
-which is where a compiled program spends its time - the entry point of a
-`compile-capi` build is a few dozen operations and every loop is inside one of
-these.
-
-**It is a small win and the figure is worth stating rather than implying:**
-across the seventeen benchmark cases it removes 24 operations from 8,624. A
-synthetic loop written to isolate it measured 0.23 s against 0.16 s, but that
-shape is not what the emitter produces and the honest number is the small one.
-It is kept because it is strictly less work with nothing traded for it.
-
-### 0.9.2 - a literal is not worth a reference count
-
-**Pooled literals are borrowed.** A literal lives in a static written once at
-start-up that nothing can rebind, and it was being incremented and decremented
-around every use - `t + 1`, `xs[0]`, every piece of an f-string. Two writes to
-arrive back where it started, on some of the commonest operands a program has.
-It is the safest borrow there is, and unlike a local it holds at module level
-too, because nothing about the slot can change.
-
-**`f"{x}"` asked `str` where Python asks `__format__`.** For most types those
-agree, because `object.__format__` with an empty specifier defers to `str`; for
-a type that defines `__format__` they do not, and this quietly answered the
-wrong one. `PyObject_Format` is now vetted - the eighty-fourth entry point -
-and an exact `str` skips the call entirely, which is the same pair of paths
-CPython's own FORMAT_SIMPLE takes. **f-string 0.73× → 0.80×.**
-
-**`+` on strings known to be exact skips the dispatch.** Concatenation goes
-through `PyNumber_Add` because a `str` subclass may override `__add__`, and
-finding that out is most of what the operation costs. Where both sides are
-certainly exact - a literal, an f-string, or a name the new analysis in
-`capi_exact` shows holds nothing else - `PyUnicode_Concat` is what `+` means.
-Exactness composes, so `a + b + c` converts throughout. A `str` subclass with
-its own `__add__` still reaches it, and a test pins that.
-
-**The `string concatenation` row was measuring the wrong thing.** Its case
-concatenated only literals, which are folded at compile time - the generated C
-held no concatenation at all, and the row was named after something it never
-ran. It uses locals now, which is why its figure moved from 0.68× to 0.75×:
-the work is real this time.
-
-### 0.9.1 - a call stops paying for references it already holds
-
-**A one-argument call borrowed nothing.** `PyObject_CallOneArg` borrows what it
-is given, and the two-or-more-argument path beside it already knew that - but
-the single-argument path, the commonest call shape there is, took a reference
-and dropped it again around every call. So did the callable itself: a closure
-held in a local was incremented and decremented on each call to a slot the
-function owns outright. Both are borrowed now, on the same rules that refuse to
-borrow a global. **Closure call 0.55× → 0.66×.**
-
-Three correctness bugs found while testing that, all older than it:
-
-**A nested function could not call itself.** A closure captures by value when
-it is made, and its own name is not bound at that moment - the `def` being
-compiled is what binds it - so the capture took a NULL and the first recursive
-call raised `NameError` naming the function it was standing in. An ordinary
-nested `fact` did not work. The slot is declared before the closure is built
-and filled once the callable exists.
-
-**Mutual recursion between nested functions is refused rather than left to
-fail.** Capture-by-value cannot express it: the second name is simply absent
-when the first closure is made. It used to raise `NameError` at run time
-naming a function plainly written above it. Now the build says so, and says
-what to do instead.
-
-**A function that rebinds itself through `global` kept calling itself.**
-`global a` inside `a` binds the module's `a` from a scope the module-scope
-walk does not enter, so the direct C call survived and the old body went on
-running where Python would have been calling the replacement. This is the
-fourth in the family 0.8.7 opened, and the walk now counts `global`
-declarations wherever they appear.
-
-### 0.9.0 - a condition wants a verdict, not a value
-
-**A `__bool__` that raised was read as true.** `PyObject_IsTrue` answers -1
-with an exception set, and **-1 is true in C**, so a class whose `__bool__`
-raised ran the body of the `if` and the program exited 0 where CPython stops
-with the exception. The same held for a comparison that raised. Every verdict
-is checked once now, where it is produced, so no caller has to remember. This
-was there before any of the work below and is the more important half of this
-release.
-
-**`and` and `or` in a condition no longer build an object.** `if a and b`
-wants a verdict; the whole chain was evaluated into a Python boolean and then
-asked what it meant, which cost each side the machine comparison it would
-otherwise have had. A bare `i > 5` ran at 1.22× the interpreter and
-`i > 5 and i < n` at 0.66× - the price of boxing, not of the `and`. Each side
-goes through the same path as any other condition now, and the short circuit
-is the C `if` that guards the next one, so a side that must not run has no
-code reached rather than a value discarded. **0.66× → 0.91×**, and ten of the
-seventeen measured rows now sit at 0.80× or better where nine did. `not` is
-the same idea one level down.
-
-Twenty programs covering `__bool__`, `__len__`, side-effect order, exceptions
-mid-chain and three-way chains agree with CPython exactly.
-
-**The build-memory grid counts the C toolchain, and now says so.** The sampler
-walks the whole process tree, and reports what held the memory rather than
-asserting a total: on a small Nuitka build that is `clang` 181 MB and `ld`
-150 MB beside Nuitka's own Python; at 3,000 functions the *linker* dominates
-at 1,210 MB. py2bin starts neither, so its tree is one Python process at every
-size. The sampling interval was tightened from 25 ms to 10 ms after measuring
-that clang's short-lived processes were being missed - the same build read
-582 MB at 25 ms and 643 MB at 5 ms - so the published figures had been
-understating Nuitka. Cold, py2bin now wins every row measured, including the
-largest; only against a *warm* Nuitka at 3,000 functions does it turn over.
-
-### 0.8.9 - nothing reaches a shell uninspected
-
-The two low-severity findings from the same scan as 0.8.8, closed for the same
-reason: a value that reaches a shell uninspected is a bug waiting for a context
-where it matters. Neither was a way in for an attacker who did not already have
-one - to steer the URL you must already control the package about to be
-installed, and `--python` is supplied by whoever is running the build.
-
-**The launcher scripts quote what they are given.** `--python` and the bundle's
-name were pasted straight into `/bin/sh`. It could not simply be quoted whole:
-the default is `/usr/bin/env python3`, two words, and quoting the pair would ask
-the shell for one executable whose name contains a space. It is split the way a
-shell would and each word quoted on its own, which leaves every ordinary value
-identical and no metacharacter for the shell to act on. The bundle's name goes
-into a variable as a quoted literal rather than into the middle of a path.
-
-**The bootstrapper's PowerShell fallback interpolates nothing.** The other three
-downloaders take an argument vector, which no shell reads; PowerShell is handed
-one string and parses it itself, so a single quote in a URL ended the quoted
-argument. The URL and the destination now arrive as environment variables -
-nothing is interpolated, so there is nothing to escape and no escaping to get
-wrong later.
-
-Thirteen tests, twelve of which fail against 0.8.8.
-
-Housekeeping: the release notes were four sections sitting in the middle of
-both READMEs, between the reference material and the guarantees. They are one
-section at the end now.
+were found by measuring what the suite did not cover, and most were worse than
+anything in it. They are published because a grid showing only the shapes a
+compiler is good at is a grid measuring itself.
 
 ### 0.8.8 - archives, and what they may not do
 
