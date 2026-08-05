@@ -6346,14 +6346,41 @@ class CApiEmitter:
         ones being copied rather than an approximation of them.
         """
 
-        if node.keywords:
-            raise self.fail(
-                node, "a class with a metaclass is not translated here yet"
-            )
+        # `class A(metaclass=M)` calls M rather than `type` to make the
+        # class; any other keyword in the header is handed to it as well,
+        # which is where `__init_subclass__` reads them from. A metaclass a
+        # *base* carries needs nothing here: `type(name, bases, ns)` works out
+        # the most derived metaclass of the bases itself and hands over to it,
+        # which is why inheriting from one already worked.
+        chosen = None
+        header = []
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                raise self.fail(
+                    node,
+                    "a class header that spreads a mapping is not translated "
+                    "here yet",
+                )
+            if keyword.arg == "metaclass":
+                chosen = keyword.value
+            else:
+                header.append(keyword)
+        # Before the body, which is the order Python does it in - `class
+        # C(f())` calls f first - and which the namespace now depends on:
+        # a metaclass gets to choose what the body is populated into.
+        bases = self.tuple_literal(
+            ast.copy_location(ast.Tuple(elts=node.bases, ctx=ast.Load()), node),
+            indent,
+        )
+        title = self.temporary()
+        self.emit(f"{title} = PyUnicode_FromString({_c_string(node.name)});", indent)
+        self.checked(title, indent)
+        if chosen is None:
+            maker = self.builtin("type", indent)
+        else:
+            maker = self.expression(chosen, indent)
         self.scope_path.append((node.name, False))
-        namespace = self.temporary()
-        self.emit(f"{namespace} = PyDict_New();", indent)
-        self.checked(namespace, indent)
+        namespace = self.class_namespace(node, maker, title, bases, indent)
         binder = None
         for statement in node.body:
             if isinstance(statement, ast.Pass):
@@ -6400,8 +6427,15 @@ class CApiEmitter:
                 isinstance(statement, ast.AnnAssign)
                 and isinstance(statement.target, ast.Name)
             ):
-                # `n: int = 3` in a class body is a class attribute; `n: int`
-                # alone declares nothing that exists at run time.
+                # `n: int = 3` in a class body is a class attribute. `n: int`
+                # alone binds nothing - but both are recorded in the class's
+                # `__annotations__`, which is not decoration: `dataclasses`
+                # reads exactly that to find out what the fields are, and with
+                # no `__annotations__` every dataclass came out with no fields
+                # and an `__init__` taking nothing.
+                self.note_annotation(
+                    namespace, statement.target.id, statement.annotation, indent
+                )
                 if statement.value is None:
                     continue
                 value = self.expression(statement.value, indent)
@@ -6412,20 +6446,24 @@ class CApiEmitter:
                     "only methods and plain attribute assignments are "
                     "translated in a class body yet",
                 )
-            named = self.temporary()
-            self.emit(f"{named} = PyUnicode_FromString({_c_string(key)});", indent)
-            self.checked(named, indent)
-            self.emit(f"PyDict_SetItem({namespace}, {named}, {value});", indent)
-            self.emit(f"Py_DecRef({named});", indent)
+            named = self.interned(key)
+            # Through the mapping protocol: `__prepare__` may have answered
+            # with something that is not a dict, and `enum` does exactly that
+            # - its namespace is what notices a repeated member name.
+            self.emit(
+                f"if (PyObject_SetItem({namespace}, {named}, {value}) < 0) "
+                f"{{ {self.failure()} }}",
+                indent,
+            )
             self.emit(f"Py_DecRef({value});", indent)
         del binder  # `instancemethod` needs nothing fetched and so nothing freed
-        bases = self.tuple_literal(
-            ast.copy_location(ast.Tuple(elts=node.bases, ctx=ast.Load()), node),
-            indent,
-        )
-        title = self.temporary()
-        self.emit(f"{title} = PyUnicode_FromString({_c_string(node.name)});", indent)
-        self.checked(title, indent)
+        # All three were built before the body ran and are released together
+        # below, so each gets a reference of its own for PyTuple_SetItem to
+        # steal. Handing over the only one and releasing it afterwards took
+        # the class apart while `type` was still reading it.
+        self.emit(f"Py_IncRef({title});", indent)
+        self.emit(f"Py_IncRef({bases});", indent)
+        self.emit(f"Py_IncRef({namespace});", indent)
         arguments = self.temporary()
         self.emit(f"{arguments} = PyTuple_New(3);", indent)
         self.checked(arguments, indent)
@@ -6434,11 +6472,32 @@ class CApiEmitter:
         self.emit(f"PyTuple_SetItem({arguments}, 0, {title});", indent)
         self.emit(f"PyTuple_SetItem({arguments}, 1, {bases});", indent)
         self.emit(f"PyTuple_SetItem({arguments}, 2, {namespace});", indent)
-        maker = self.builtin("type", indent)
+        named_arguments = "0"
+        if header:
+            named_arguments = self.temporary()
+            self.emit(f"{named_arguments} = PyDict_New();", indent)
+            self.checked(named_arguments, indent)
+            for keyword in header:
+                value = self.expression(keyword.value, indent)
+                key = self.interned(keyword.arg)
+                self.emit(
+                    f"if (PyDict_SetItem({named_arguments}, {key}, {value}) < 0)"
+                    f" {{ {self.failure()} }}",
+                    indent,
+                )
+                self.emit(f"Py_DecRef({value});", indent)
         made = self.temporary()
-        self.emit(f"{made} = PyObject_Call({maker}, {arguments}, 0);", indent)
+        self.emit(
+            f"{made} = PyObject_Call({maker}, {arguments}, {named_arguments});",
+            indent,
+        )
         self.emit(f"Py_DecRef({maker});", indent)
         self.emit(f"Py_DecRef({arguments});", indent)
+        self.emit(f"Py_DecRef({title});", indent)
+        self.emit(f"Py_DecRef({bases});", indent)
+        self.emit(f"Py_DecRef({namespace});", indent)
+        if named_arguments != "0":
+            self.emit(f"Py_DecRef({named_arguments});", indent)
         self.checked(made, indent)
         self.scope_path.pop()
         made = self.apply_decorators(node.decorator_list, made, indent)
@@ -6446,6 +6505,165 @@ class CApiEmitter:
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {made};", indent)
         self.publish(node.name, target, indent)
+
+    def derive_metaclass(self, maker: str, bases: str, indent: int) -> None:
+        """Replace `maker` with the most derived metaclass among the bases.
+
+        Python's rule, and the same one `type` applies when it makes the
+        class: start from the metaclass named in the header (or `type`), and
+        for each base take its metaclass if that is the more derived of the
+        two. A pair that are unrelated is a conflict, which `type` reports
+        when it gets there - so this simply leaves `maker` alone and lets it.
+        """
+
+        counter = self.temporary_flag()
+        span = self.temporary_flag()
+        base = self.temporary()
+        kind = self.temporary()
+        verdict = self.temporary_flag()
+        checker = self.builtin("issubclass", indent)
+        self.emit(f"{span} = (int)PyObject_Size({bases});", indent)
+        self.emit(
+            f"for ({counter} = 0; {counter} < {span}; "
+            f"{counter} = {counter} + 1) {{",
+            indent,
+        )
+        self.emit(f"{base} = PyTuple_GetItem({bases}, {counter});", indent + 1)
+        self.emit(f"if (!{base}) {{ {self.failure()} }}", indent + 1)
+        self.emit(
+            f'{kind} = PyObject_GetAttrString({base}, "__class__");', indent + 1
+        )
+        self.emit(f"if (!{kind}) {{ {self.failure()} }}", indent + 1)
+        held = self.temporary()
+        # A slot at a time, not PyTuple_Pack: that one is variadic, and on
+        # Apple's arm64 ABI variadic arguments go on the stack where this
+        # backend passes registers, so a fixed prototype reads two addresses
+        # nothing wrote. It does not crash here - it hands `issubclass` two
+        # words of rubbish, which said "arg 1 must be a class".
+        self.emit(f"{held} = PyTuple_New(2LL);", indent + 1)
+        self.emit(f"if (!{held}) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"Py_IncRef({kind});", indent + 1)
+        self.emit(f"PyTuple_SetItem({held}, 0, {kind});", indent + 1)
+        self.emit(f"Py_IncRef({maker});", indent + 1)
+        self.emit(f"PyTuple_SetItem({held}, 1, {maker});", indent + 1)
+        answer = self.temporary()
+        self.emit(
+            f"{answer} = PyObject_Call({checker}, {held}, 0);", indent + 1
+        )
+        self.emit(f"Py_DecRef({held});", indent + 1)
+        self.emit(f"if (!{answer}) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"{verdict} = PyObject_IsTrue({answer});", indent + 1)
+        self.emit(f"Py_DecRef({answer});", indent + 1)
+        self.emit(f"if ({verdict} < 0) {{ {self.failure()} }}", indent + 1)
+        # More derived than what is held, so it wins; otherwise this base has
+        # nothing to add and `kind` is dropped.
+        self.emit(f"if ({verdict}) {{", indent + 1)
+        self.emit(f"Py_DecRef({maker});", indent + 2)
+        self.emit(f"{maker} = {kind};", indent + 2)
+        self.emit("} else {", indent + 1)
+        self.emit(f"Py_DecRef({kind});", indent + 2)
+        self.emit("}", indent + 1)
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({checker});", indent)
+
+    def note_annotation(
+        self, namespace: str, name: str, annotation: ast.expr, indent: int
+    ) -> None:
+        """Record `name: kind` in the class's `__annotations__`.
+
+        Made on first use rather than always, so a class that annotates
+        nothing does not carry an empty dictionary it never had in Python.
+        """
+
+        held = self.temporary()
+        key = self.interned("__annotations__")
+        self.emit(f"{held} = PyObject_GetItem({namespace}, {key});", indent)
+        self.emit(f"if (!{held}) {{", indent)
+        self.emit("PyErr_Clear();", indent + 1)
+        self.emit(f"{held} = PyDict_New();", indent + 1)
+        self.emit(f"if (!{held}) {{ {self.failure()} }}", indent + 1)
+        self.emit(
+            f"if (PyObject_SetItem({namespace}, {key}, {held}) < 0) "
+            f"{{ {self.failure()} }}",
+            indent + 1,
+        )
+        self.emit("}", indent)
+        # The annotation is evaluated, as it is in a class body - `x: int`
+        # looks `int` up there and then.
+        value = self.expression(annotation, indent)
+        self.emit(
+            f"if (PyObject_SetItem({held}, {self.interned(name)}, {value}) < 0)"
+            f" {{ {self.failure()} }}",
+            indent,
+        )
+        self.emit(f"Py_DecRef({value});", indent)
+        self.emit(f"Py_DecRef({held});", indent)
+
+    def class_namespace(
+        self, node: ast.ClassDef, maker: str, title: str, bases: str, indent: int
+    ) -> str:
+        """What the class body is populated into, and what has to be in it first.
+
+        A plain dict is only right when the class is made by `type`. A
+        metaclass may answer `__prepare__` with a mapping of its own, and
+        `enum` does: its namespace is what notices a member name used twice,
+        so populating a dict instead and handing that over made every `Enum`
+        subclass fail. Asked for at run time rather than decided here, because
+        which metaclass it is need not be known until then.
+
+        `__module__` and `__qualname__` go in before the body, as they do in
+        Python. Without them `dataclasses` raised `AttributeError: __module__`
+        the moment it looked at the class it was decorating.
+        """
+
+        namespace = self.temporary()
+        if node.bases:
+            # Which metaclass to ask is the most derived of the ones the bases
+            # carry, not `type` - `class C(Enum)` is made by `EnumMeta`, whose
+            # `__prepare__` answers with a mapping that notices a member name
+            # used twice. Asking `type` got a plain dict and every `Enum`
+            # subclass failed. The *call* below needs none of this: `type`
+            # works the winner out itself and hands over.
+            self.derive_metaclass(maker, bases, indent)
+        prepare = self.temporary()
+        self.emit(
+            f'{prepare} = PyObject_GetAttrString({maker}, "__prepare__");',
+            indent,
+        )
+        self.emit(f"if ({prepare}) {{", indent)
+        packed = self.temporary()
+        # See `derive_metaclass` for why this is not PyTuple_Pack.
+        self.emit(f"{packed} = PyTuple_New(2LL);", indent + 1)
+        self.emit(f"if (!{packed}) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"Py_IncRef({title});", indent + 1)
+        self.emit(f"PyTuple_SetItem({packed}, 0, {title});", indent + 1)
+        self.emit(f"Py_IncRef({bases});", indent + 1)
+        self.emit(f"PyTuple_SetItem({packed}, 1, {bases});", indent + 1)
+        self.emit(
+            f"{namespace} = PyObject_Call({prepare}, {packed}, 0);", indent + 1
+        )
+        self.emit(f"Py_DecRef({packed});", indent + 1)
+        self.emit(f"Py_DecRef({prepare});", indent + 1)
+        self.emit(f"if (!{namespace}) {{ {self.failure()} }}", indent + 1)
+        self.emit("} else {", indent)
+        # Every type has `__prepare__`, so this is the path for a metaclass
+        # that is not a type at all - a plain function used as one.
+        self.emit("PyErr_Clear();", indent + 1)
+        self.emit(f"{namespace} = PyDict_New();", indent + 1)
+        self.emit(f"if (!{namespace}) {{ {self.failure()} }}", indent + 1)
+        self.emit("}", indent)
+        for key, value in (
+            ("__module__", self.program_name("__name__", indent)),
+            ("__qualname__", title),
+        ):
+            self.emit(
+                f"if (PyObject_SetItem({namespace}, {self.interned(key)}, "
+                f"{value}) < 0) {{ {self.failure()} }}",
+                indent,
+            )
+            if key == "__module__":
+                self.emit(f"Py_DecRef({value});", indent)
+        return namespace
 
     def write_wrapper(self, node: ast.FunctionDef) -> None:
         """A Python callable for a module-level `def`.

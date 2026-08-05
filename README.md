@@ -560,6 +560,9 @@ CPython, and requiring identical stdout and exit status.
 | starred unpacking (`a, *b, c = …`) | ✅ |
 | `match`: values, `\|`, captures, sequences, guards | ✅ |
 | `match`: mapping and class patterns, `__match_args__` | ✅ |
+| `class C(metaclass=M)`, and the metaclass a base carries | ✅ |
+| `__annotations__` in a class body, so `dataclasses` works | ✅ |
+| `enum`, `dataclasses` | ✅ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |

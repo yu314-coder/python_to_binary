@@ -694,6 +694,79 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_a_class_can_name_its_metaclass(self):
+        # `class A(metaclass=M)` calls M rather than `type`, and any other
+        # keyword in the header goes to it as well.
+        self._run(
+            "class M(type):\n"
+            "    def __new__(m, n, b, d):\n"
+            "        d['tag'] = 9\n"
+            "        return super().__new__(m, n, b, d)\n"
+            "class A(metaclass=M):\n"
+            "    pass\n"
+            "class Child(A):\n"
+            "    pass\n"
+            "print(A.tag, type(A).__name__, type(Child).__name__)\n",
+            b"9 M M\n",
+        )
+
+    def test_the_metaclass_a_base_carries_prepares_the_namespace(self):
+        """What `enum` needs, and what a plain dict could not give it.
+
+        A class body is populated into whatever `__prepare__` answers with,
+        and which `__prepare__` that is depends on the most derived metaclass
+        of the bases - not on `type`. `EnumType.__prepare__` answers with a
+        mapping that notices a member name used twice, so building a dict
+        instead and handing that over failed every `Enum` subclass.
+        """
+        self._run(
+            "from enum import Enum\n"
+            "class C(Enum):\n"
+            "    A = 1\n"
+            "    B = 2\n"
+            "print(C.A.name, C.A.value, len(list(C)))\n",
+            b"A 1 2\n",
+        )
+
+    def test_a_class_body_records_its_annotations(self):
+        """`dataclasses` reads `__annotations__` to find out what the fields are.
+
+        Without it every dataclass came out with no fields at all and an
+        `__init__` that took none. A bare `x: int` binds nothing and is still
+        recorded, which is where the first field came from.
+        """
+        self._run(
+            "from dataclasses import dataclass, field\n"
+            "@dataclass\n"
+            "class P:\n"
+            "    x: int\n"
+            "    y: str = 'd'\n"
+            "    z: list = field(default_factory=list)\n"
+            "class Ann:\n"
+            "    a: int\n"
+            "    b: str = 's'\n"
+            "print(P(1), P(2, 'b', [3]), sorted(Ann.__annotations__))\n",
+            b"P(x=1, y='d', z=[]) P(x=2, y='b', z=[3]) ['a', 'b']\n",
+        )
+
+    def test_a_class_body_is_populated_after_its_bases_are_built(self):
+        # Python evaluates the bases before the body runs. They used to be
+        # evaluated after it, which put a side effect in one of them in the
+        # wrong place.
+        self._run(
+            "order = []\n"
+            "def base():\n"
+            "    order.append('base')\n"
+            "    return object\n"
+            "def note():\n"
+            "    order.append('body')\n"
+            "    return 1\n"
+            "class C(base()):\n"
+            "    x = note()\n"
+            "print(order, C.x)\n",
+            b"['base', 'body'] 1\n",
+        )
+
     def test_the_exception_being_handled_is_on_record(self):
         """`sys.exc_info()` said None inside every `except`.
 
