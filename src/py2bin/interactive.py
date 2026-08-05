@@ -2,8 +2,8 @@
 
 `build.py` in a clone runs this, and so does `py2bin build` for anyone who
 installed with pip. Same flow either way: which file is the program, which
-machine it is for, what shape it should take - and everything else found or
-downloaded rather than typed.
+machine it is for, and which of the two ways to build it - everything else
+found or downloaded rather than typed.
 """
 
 from __future__ import annotations
@@ -42,29 +42,52 @@ TARGETS = (
     ("linux-arm64", "Linux, 64-bit ARM"),
 )
 
-#: The shapes each target can take, one file first because that is what a
-#: person hands to someone else. A .app is a directory however it is built, so
-#: on macOS the single file is the disk image holding it.
-SHAPES = {
-    "darwin": (
-        ("dmg", "ONE FILE: a .dmg holding the app, ready to hand over"),
-        ("app", "a .app folder, carrying its own interpreter"),
-        ("bin", "a plain executable, needing Python on the machine"),
+#: The two ways py2bin can turn a program into something you hand over, and
+#: there are only two. One ships the program next to a real interpreter; the
+#: other translates it to C and then to machine code. Everything else - a
+#: folder or one file, a .dmg or a .exe - follows from the target and is
+#: decided here rather than asked about.
+#:
+#: There used to be three choices, and all three ran the same compiler. They
+#: differed in *packaging*: a `.app` folder beside the `.dmg` that holds it,
+#: an `.exe` folder beside the one-file `.exe` that unpacks to it. Picking
+#: the one file gives the folder too, so nothing was gained by asking.
+METHODS = (
+    (
+        "freeze",
+        "SHIP PYTHON WITH IT - the program travels beside a real interpreter, "
+        "the way PyInstaller does it.\n      Quickest to build, and runs any "
+        "Python there is.",
     ),
-    "windows": (
-        ("onefile", "ONE FILE: an .exe that unpacks itself when it runs"),
-        ("exe", "a folder holding the .exe and its interpreter"),
-        ("bin", "a plain .exe, needing Python on the machine"),
+    (
+        "compile",
+        "COMPILE IT - Python translated to C, and that C to machine code by "
+        "py2bin's own compiler.\n      Slower to build; no source and no "
+        "bytecode in what comes out.",
     ),
-    "linux": (
-        (
-            "onefile",
-            "ONE FILE: an executable carrying its packages, unpacked on first "
-            "run",
-        ),
-        ("bin", "an executable beside the packages it needs"),
-    ),
-}
+)
+
+#: What the compiled result needs from the machine that runs it. A macOS
+#: bundle carries a Python.framework and a Windows build carries the DLL it
+#: was linked against, so both stand alone. Nothing is published to carry for
+#: Linux, so a compiled Linux program uses the Python that is already there.
+_COMPILED_CARRIES_PYTHON = {"darwin": True, "windows": True, "linux": False}
+
+
+def can_freeze(target: str) -> bool:
+    """Whether this machine can freeze for that one.
+
+    Freezing needs a whole CPython built for the target. One is published for
+    Windows and can be downloaded; for anything else it has to come from a
+    machine like the target, which means the host itself. Asked before the
+    menu is shown, because offering a choice that cannot be carried out is
+    worse than not offering it.
+    """
+    return target.startswith("windows-") or target == host_target()
+
+
+def methods_for(target: str):
+    return METHODS if can_freeze(target) else METHODS[1:]
 
 
 def say(message: str = "") -> None:
@@ -219,22 +242,27 @@ def main(where: str | None = None) -> int:
     ][0]
 
     system = target.split("-")[0]
-    shapes = SHAPES[system]
-    shape = shapes[ask("What shape should it be?", shapes, 1)][0]
+    offered = methods_for(target)
+    if len(offered) == 1:
+        say(
+            f"\n  Compiling it: freezing needs a CPython built for "
+            f"{target}, and\n  one can only be downloaded for Windows or "
+            f"taken from a machine\n  like the target. Build on {system} "
+            f"itself for the other way."
+        )
+        method = offered[0][0]
+    else:
+        method = offered[ask("How should it be built?", offered, 1)][0]
 
-    # A macOS bundle links against a macOS Python.framework, and only a Mac
-    # has one. Said before the build rather than after it, because everything
-    # up to that point takes a while and downloads a good deal.
-    if system == "darwin" and shape in ("app", "dmg"):
-        import platform as _platform
-
-        if _platform.system() != "Darwin":
-            say(
-                "\n  Note: a macOS bundle carries a macOS Python.framework, and\n"
-                "  this is not a Mac. The build will ask for one. A Windows\n"
-                "  target downloads its own interpreter and needs nothing from\n"
-                "  this machine, if that suits."
-            )
+    if method == "compile" and not _COMPILED_CARRIES_PYTHON[system]:
+        # Said before the build rather than after it: everything up to that
+        # point takes a while and downloads a good deal, and finding out at
+        # the end that the target still needs Python is finding out too late.
+        say(
+            "\n  Note: a compiled Linux program uses the Python already on the\n"
+            "  machine that runs it. Only Windows and macOS have an interpreter\n"
+            "  py2bin can carry along."
+        )
 
     from py2bin.requirements import discover
 
@@ -265,14 +293,51 @@ def main(where: str | None = None) -> int:
         say(f"  using {icon.name} as the icon")
 
     windows = target.startswith("windows-")
-    suffix = {
-        "app": ".app",
-        "dmg": ".app",
-        "exe": ".exe",
-        "onefile": ".exe" if windows else "",
-        "bin": ".exe" if windows else "",
-    }[shape]
-    output = here / "dist" / f"{program.stem}{suffix}"
+
+    if method == "freeze":
+        # One file, always: freezing has nothing to gain from a folder, and a
+        # single file is the thing somebody can actually send. The program's
+        # own directory travels with it, so the data directories found above
+        # are already inside and need not be named.
+        output = here / "dist" / f"{program.stem}{'.exe' if windows else ''}"
+        arguments = [
+            "freeze",
+            str(program),
+            "--target",
+            target,
+            "--auto-fetch",
+            "--clean",
+            "--onefile",
+            "--compact",
+            "--name",
+            program.stem,
+        ]
+        if icon is not None:
+            arguments += ["--icon", str(icon)]
+        arguments += ["-o", str(output)]
+
+        say(f"\nFreezing {output.name} for {target}.")
+        say("It carries an interpreter, so this takes a while.")
+        say()
+
+        from py2bin.cli import main as build
+
+        code = build(arguments)
+        if code == 0:
+            # freeze names the file itself when the target has no suffix of
+            # its own, so report what is on disk rather than what was asked
+            # for.
+            final = output if output.exists() else output.with_suffix(".bin")
+            say(f"\n  done: {final}")
+        return code
+
+    # Compiled. The shape follows from the target rather than being asked
+    # about: a Mac gets the disk image, everything else gets the one file.
+    shape = "dmg" if system == "darwin" else "onefile"
+    output = here / "dist" / (
+        f"{program.stem}.app" if shape == "dmg"
+        else f"{program.stem}{'.exe' if windows else ''}"
+    )
     arguments = [
         "compile-capi",
         str(program),
@@ -281,14 +346,14 @@ def main(where: str | None = None) -> int:
         "--crash-log",
         "--clean",
         "--auto-fetch",
+        # Without these a build that carries an interpreter carries the whole
+        # standard library twice over - once as source and once as bytecode -
+        # along with every module the program cannot reach. It is the
+        # difference between 220 MB and about a third of that.
+        "--prune-unused",
+        "--zip-stdlib",
     ]
-    if shape in ("app", "dmg", "exe"):
-        # Without these a bundle carries the whole standard library twice over
-        # - once as source and once as bytecode - along with every module the
-        # program cannot reach. It is the difference between 220 MB and about
-        # a third of that.
-        arguments += ["--prune-unused", "--zip-stdlib"]
-    if shape in ("app", "dmg"):
+    if shape == "dmg":
         # --site is baked into the program when it is compiled, which happens
         # before anything is downloaded, so where the packages will end up has
         # to be said now. It stays relative: it is resolved against the running
@@ -300,14 +365,13 @@ def main(where: str | None = None) -> int:
             "../Resources/site-packages",
             "--name",
             program.stem,
+            "--dmg",
         ]
-    if shape == "dmg":
-        arguments.append("--dmg")
-    if shape == "onefile" and not windows:
+    elif not windows:
         # A target with no bundle folds the program and everything carried
         # beside it into the executable itself. Windows keeps its own path
         # below, which wraps the built folder rather than the program.
-        arguments += ["--onefile", "--prune-unused"]
+        arguments.append("--onefile")
     if icon is not None:
         arguments += ["--icon", str(icon)]
     for path in carried:
@@ -316,12 +380,10 @@ def main(where: str | None = None) -> int:
 
     delivered = {
         "dmg": f"{program.stem}.dmg",
-        "onefile": (
-            f"{program.stem}-onefile.exe" if windows else output.name
-        ),
-    }.get(shape, output.name)
+        "onefile": f"{program.stem}-onefile.exe" if windows else output.name,
+    }[shape]
     say(f"\nBuilding {delivered} for {target}.")
-    if shape in ("app", "dmg", "exe"):
+    if _COMPILED_CARRIES_PYTHON[system]:
         say("It carries an interpreter, so this takes a while.")
     say()
 

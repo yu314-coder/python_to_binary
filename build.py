@@ -5,8 +5,9 @@
 
 Nothing is installed and nothing is downloaded to get started: this runs the
 `src/py2bin` in the clone it lives in. Answer three questions - which file,
-which machine, what shape - and everything else is found or downloaded rather
-than typed.
+which machine, and which of the two ways to build it: ship Python with it the
+way PyInstaller does, or compile it to machine code. Everything else is found
+or downloaded rather than typed.
 
 The questions themselves live in `py2bin.interactive`, so `py2bin make` asks
 exactly the same ones for anyone who installed with pip. This file is the way

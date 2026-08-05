@@ -99,31 +99,36 @@ what CPython does, is what would close the rest, and it is not done yet.
 
 ## The paths through it
 
-Three ways to turn a program into an artifact. They trade the same three things
-against each other, and which one you want depends on which you care about.
+**There are two ways to build, and they are the two you choose between:**
 
-| | `compile` | `compile-capi` | `freeze` |
+- **`freeze` - ship Python with it.** Your program travels beside a real
+  interpreter, the way PyInstaller does it. Quickest to build, and every
+  Python program works.
+- **`compile-capi` - compile it.** Your program is translated to C and that C
+  to machine code by py2bin's own compiler. Slower to build; no source and no
+  bytecode in the result.
+
+That is the whole decision, and it is the only one `py2bin build` asks about.
+
+There is a third, `compile`, which is not a general choice: it accepts a small
+subset of the language and no packages at all, in exchange for an artifact
+with no interpreter anywhere near it. Reach for it when that is the point.
+
+| | `freeze` | `compile-capi` | `compile` |
 |---|---|---|---|
-| **speed** on a 30M-iteration loop | **0.05 s** | 0.44 s | 0.74 s |
-| **artifact** | **32 KB** | 50 KB | 24 MB |
-| **needs Python on the machine?** | **no** | yes, or bundle it | no, it carries one |
-| **how much Python works** | a small subset | most of it: 878 of an 889-program corpus[^corpus] | **everything** |
-| **third-party packages** | none | any the interpreter can import | **carried inside** |
-| what actually runs your logic | machine code | machine code | CPython, interpreting |
-
-**`compile` is the fastest and the smallest.** Python AST → py2bin IR →
-optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
-interpreter in the artifact and none on the machine: 14× faster than CPython on
-that loop, in 32 KB that runs on a bare system. You pay for it in what it will
-accept - integers, floats, strings, control flow, your own functions - and it
-will not import a package at all.
+| **speed** on a 30M-iteration loop | 0.74 s | 0.44 s | **0.05 s** |
+| **artifact** | 24 MB | 50 KB | **32 KB** |
+| **needs Python on the machine?** | no, it carries one | yes, or bundle it | **no** |
+| **how much Python works** | **everything** | most of it: 878 of an 889-program corpus[^corpus] | a small subset |
+| **third-party packages** | **carried inside** | any the interpreter can import | none |
+| what actually runs your logic | CPython, interpreting | machine code | machine code |
 
 **`freeze` is the most complete.** It ships your program beside an interpreter
 that runs it, so NumPy, Torch and a GUI toolkit all work exactly as they do
 now. Nothing is translated, so nothing is faster; the artifact is the largest
 of the three because an interpreter and every dependency are inside it.
 
-**`compile-capi` is the middle, and the one under active work.** It translates
+**`compile-capi` is the one under active work.** It translates
 ordinary Python into C that drives the CPython C API, then compiles that C with
 py2bin's own C compiler - the tier Nuitka occupies, with Nuitka's dependency on
 clang removed. Almost the whole language goes through, and anything the linked
@@ -205,16 +210,23 @@ program may have.
 py2bin make
 ```
 
-It asks which file is the program, which machine it is for, and what shape it
-should take. Everything else is found or downloaded rather than typed - the
-other `.py` files beside it, the libraries it imports, an interpreter for the
-target, `web/` and `assets/` if they are there, and an icon if one is.
+It asks which file is the program, which machine it is for, and which of the
+two ways to build it - ship Python with it, or compile it. Everything else is
+found or downloaded rather than typed - the other `.py` files beside it, the
+libraries it imports, an interpreter for the target, `web/` and `assets/` if
+they are there, and an icon if one is. What shape the result takes is not
+asked about: one file, always, because that is the thing somebody can send.
 
-| the shape offered first | what comes out |
-|---|---|
-| macOS | a compressed `.dmg` holding the app |
-| Windows | one `.exe` that unpacks itself |
-| Linux | one executable |
+| target | ship Python with it | compile it |
+|---|---|---|
+| macOS | one executable, ~14 MB | a compressed `.dmg` holding the app, ~10 MB |
+| Windows | one `.exe`, ~10 MB | one `.exe` that unpacks itself, ~11 MB |
+| Linux | needs a Linux machine to build on | one executable, needing Python there |
+
+Freezing needs a whole CPython built for the target machine. One is published
+for Windows and is downloaded; for anything else it has to come from a machine
+like the target. Where that cannot be done the question is not asked -
+compiling is stated and the build goes on.
 
 Two other ways in ship in the source distribution: `build.py` runs a clone
 with nothing installed, and `get-py2bin.py` fetches py2bin for a machine with
