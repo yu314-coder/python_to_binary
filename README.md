@@ -702,23 +702,23 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.0 ms | **2.34× faster** |
-| integer arithmetic | **5.0 ms** | 8.4 ms | **1.69× faster** |
+| direct function call | **2.9 ms** | 7.1 ms | **2.42× faster** |
+| integer arithmetic | **5.1 ms** | 8.3 ms | **1.62× faster** |
 | `while` loop | **4.6 ms** | 6.3 ms | **1.37× faster** |
-| comparisons | **3.8 ms** | 4.7 ms | **1.25× faster** |
-| float arithmetic | **5.3 ms** | 5.8 ms | **1.09× faster** |
-| exception raise/catch | **19.1 ms** | 19.8 ms | **1.04× faster** |
-| dict store | 8.2 ms | 8.1 ms | 0.98× |
-| comprehension | 5.7 ms | 5.5 ms | 0.97× |
-| list append | 5.4 ms | 5.2 ms | 0.96× |
-| `and` / `or` | 6.2 ms | 5.8 ms | 0.94× |
-| f-string | 22.0 ms | 17.6 ms | 0.80× |
-| string concatenation | 16.6 ms | 12.5 ms | 0.75× |
-| subscript | 8.3 ms | 6.1 ms | 0.73× |
-| closure call | 10.2 ms | 6.7 ms | 0.66× |
-| attribute read | 6.5 ms | 3.7 ms | 0.57× |
-| method call | 15.5 ms | 6.7 ms | 0.43× |
-| instantiation | 38.4 ms | 16.2 ms | 0.42× |
+| comparisons | **3.7 ms** | 4.6 ms | **1.24× faster** |
+| exception raise/catch | **19.0 ms** | 19.6 ms | **1.04× faster** |
+| float arithmetic | **5.6 ms** | 5.8 ms | **1.03× faster** |
+| list append | **5.2 ms** | 5.3 ms | **1.01× faster** |
+| comprehension | 5.6 ms | 5.5 ms | 0.98× |
+| dict store | 8.2 ms | 7.9 ms | 0.96× |
+| `and` / `or` | 6.3 ms | 5.7 ms | 0.90× |
+| f-string | 22.2 ms | 17.5 ms | 0.79× |
+| string concatenation | 15.8 ms | 12.5 ms | 0.79× |
+| subscript | 8.4 ms | 6.0 ms | 0.72× |
+| closure call | 10.1 ms | 6.6 ms | 0.65× |
+| attribute read | 6.3 ms | 3.8 ms | 0.59× |
+| instantiation | 37.6 ms | 16.3 ms | 0.43× |
+| method call | 15.4 ms | 6.6 ms | 0.43× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -729,7 +729,7 @@ and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Ten of the seventeen rows above sit at 0.80× or better and six beat the
+Ten of the seventeen rows above sit at 0.80× or better and seven beat the
 interpreter outright. Most of them did not a short while ago, and the reason
 each moved is worth having in one place, because none of it was a matter of
 turning something up.
@@ -1264,6 +1264,27 @@ runtime and library adapters.
 ## Release notes
 
 Newest first. Older releases are in the repository's history.
+
+### 0.9.3 - a branch whose answer is already written down
+
+Lowering folds a constant comparison to a constant - `8 == 0` becomes 0 - but
+the *branch* on it survived, so the machine code loaded a constant, compared it
+and jumped. It comes from generated code rather than from anything a person
+writes: `%` and `/` by a literal each guard against a zero and a minus-one
+divisor that the literal has already answered. A false condition is now the
+jump, a true one goes entirely, and what follows an unconditional jump is
+dropped until something labels it.
+
+**Function bodies get the pass too.** They were carried through untouched,
+which is where a compiled program spends its time - the entry point of a
+`compile-capi` build is a few dozen operations and every loop is inside one of
+these.
+
+**It is a small win and the figure is worth stating rather than implying:**
+across the seventeen benchmark cases it removes 24 operations from 8,624. A
+synthetic loop written to isolate it measured 0.23 s against 0.16 s, but that
+shape is not what the emitter produces and the honest number is the small one.
+It is kept because it is strictly less work with nothing traded for it.
 
 ### 0.9.2 - a literal is not worth a reference count
 
