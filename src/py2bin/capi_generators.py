@@ -1965,6 +1965,123 @@ def _arguments(names: list[str]) -> ast.arguments:
     )
 
 
+def _is_async_comprehension(node: ast.AST) -> bool:
+    return isinstance(
+        node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    ) and any(clause.is_async for clause in node.generators)
+
+
+class _Unfold(ast.NodeTransformer):
+    """Turn `[x async for x in g()]` into the loop it is short for.
+
+    An async comprehension is refused everywhere below this: the rewriter that
+    turns an `async def` into a state machine will not hoist an `await` out of
+    a comprehension, because a comprehension is one expression and the machine
+    cuts at statements. So it is written out as statements first - a container,
+    an `async for` filling it, and the name in place of the expression - and
+    from there it is `async for`, which is already handled.
+
+    The statements go immediately before the one that held it, so a
+    comprehension inside a loop builds a new container each time round.
+    """
+
+    def __init__(self) -> None:
+        self.made: list[ast.stmt] = []
+        self.count = 0
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+    def visit(self, node):
+        if _is_async_comprehension(node):
+            return self._unfold(node)
+        return super().visit(node)
+
+    def _unfold(self, node):
+        # Inner comprehensions first, so one nested in another is a name by
+        # the time this one is written out.
+        node = super().generic_visit(node)
+        self.count += 1
+        name = f"_py2bin_ac{self.count}"
+        if isinstance(node, ast.DictComp):
+            empty: ast.expr = ast.Dict(keys=[], values=[])
+        elif isinstance(node, ast.SetComp):
+            empty = ast.Call(
+                func=ast.Name(id="set", ctx=ast.Load()), args=[], keywords=[]
+            )
+        else:
+            empty = ast.List(elts=[], ctx=ast.Load())
+        if isinstance(node, ast.DictComp):
+            step: ast.stmt = ast.Assign(
+                targets=[
+                    ast.Subscript(
+                        value=ast.Name(id=name, ctx=ast.Load()),
+                        slice=node.key,
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=node.value,
+            )
+        else:
+            step = ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id=name, ctx=ast.Load()),
+                        attr="add" if isinstance(node, ast.SetComp) else "append",
+                        ctx=ast.Load(),
+                    ),
+                    args=[node.elt],
+                    keywords=[],
+                )
+            )
+        body = [step]
+        for clause in reversed(node.generators):
+            for condition in reversed(clause.ifs):
+                body = [ast.If(test=condition, body=body, orelse=[])]
+            loop = ast.AsyncFor if clause.is_async else ast.For
+            body = [
+                loop(
+                    target=clause.target,
+                    iter=clause.iter,
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
+            ]
+        self.made.append(
+            ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=empty)
+        )
+        self.made.extend(body)
+        return ast.Name(id=name, ctx=ast.Load())
+
+
+def unfold_async_comprehensions(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Write out every async comprehension in these statements, in place."""
+
+    rebuilt: list[ast.stmt] = []
+    for statement in body:
+        for field in _NESTED:
+            held = getattr(statement, field, None)
+            if isinstance(held, list) and held and isinstance(held[0], ast.stmt):
+                setattr(statement, field, unfold_async_comprehensions(held))
+        for handler in getattr(statement, "handlers", ()):
+            handler.body = unfold_async_comprehensions(handler.body)
+        if any(_is_async_comprehension(inner) for inner in ast.walk(statement)):
+            unfolder = _Unfold()
+            statement = unfolder.visit(statement)
+            for made in unfolder.made:
+                ast.fix_missing_locations(made)
+            rebuilt.extend(unfolder.made)
+        rebuilt.append(statement)
+    return rebuilt
+
+
 def expand(tree: ast.Module) -> ast.Module:
     """Replace every generator function in `tree` with its class and maker.
 
@@ -1987,7 +2104,11 @@ def expand(tree: ast.Module) -> ast.Module:
                 plain = ast.FunctionDef(
                     name=statement.name,
                     args=statement.args,
-                    body=statement.body,
+                    # An async comprehension is written out as the `async for`
+                    # it is short for before the machine sees it, because the
+                    # machine cuts at statements and a comprehension is one
+                    # expression.
+                    body=unfold_async_comprehensions(statement.body),
                     decorator_list=statement.decorator_list,
                     type_params=[],
                     returns=None,

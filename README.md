@@ -563,6 +563,9 @@ CPython, and requiring identical stdout and exit status.
 | `class C(metaclass=M)`, and the metaclass a base carries | ✅ |
 | `__annotations__` in a class body, so `dataclasses` works | ✅ |
 | `enum`, `dataclasses` | ✅ |
+| `[x async for x in it]`, and the set and dict forms | ✅ |
+| `async def` as a *method* in a class body | ❌ refused |
+| an `async def` generator used as an async iterator | ❌ no `__aiter__` |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |

@@ -694,6 +694,41 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_an_async_comprehension_is_the_loop_it_is_short_for(self):
+        """Refused outright before, and refused twice over.
+
+        The rewriter that turns an `async def` into a state machine cuts at
+        statements and will not hoist an `await` out of a comprehension,
+        because a comprehension is one expression. So it is written out as
+        statements first - a container, an `async for` filling it, the name in
+        its place - and from there it is `async for`, which was already
+        handled. The statements go immediately before the one that held it, so
+        a comprehension inside a loop builds a new container each time round.
+        """
+        self._run(
+            "import asyncio\n"
+            "async def step(state):\n"
+            "    if state[0] >= state[1]:\n"
+            "        raise StopAsyncIteration\n"
+            "    state[0] = state[0] + 1\n"
+            "    return state[0]\n"
+            "class Counter:\n"
+            "    def __init__(self, n):\n"
+            "        self.state = [0, n]\n"
+            "    def __aiter__(self):\n"
+            "        return self\n"
+            "    def __anext__(self):\n"
+            "        return step(self.state)\n"
+            "async def main():\n"
+            "    listed = [x async for x in Counter(3)]\n"
+            "    filtered = [x async for x in Counter(4) if x % 2 == 0]\n"
+            "    setted = {x async for x in Counter(3)}\n"
+            "    mapped = {x: x * 2 async for x in Counter(2)}\n"
+            "    return listed, filtered, sorted(setted), mapped\n"
+            "print(asyncio.run(main()))\n",
+            b"([1, 2, 3], [2, 4], [1, 2, 3], {1: 2, 2: 4})\n",
+        )
+
     def test_a_class_can_name_its_metaclass(self):
         # `class A(metaclass=M)` calls M rather than `type`, and any other
         # keyword in the header goes to it as well.
