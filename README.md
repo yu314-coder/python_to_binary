@@ -1144,11 +1144,19 @@ python3 benchmarks/vs_nuitka.py
 
 | | this | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | **0.061** | 0.099 | 0.094 |
-| `while` loop | **0.055** | 0.084 | 0.062 |
-| nested loops | **0.021** | 0.025 | 0.027 |
-| function calls | **0.020** | 0.038 | 0.036 |
-| string building | **0.022** | 0.024 | 0.026 |
+| function calls | **0.020** | 0.037 | 0.035 |
+| a call naming an argument | **0.020** | 0.044 | 0.043 |
+| integer arithmetic | **0.062** | 0.101 | 0.095 |
+| `while` loop | **0.056** | 0.084 | 0.061 |
+| nested loops | **0.022** | 0.026 | 0.028 |
+| string building | **0.022** | 0.026 | 0.026 |
+
+The keyword row is new here, and it is the one worth reading twice. Before the
+placement pass it measured **0.109 s** - two and a half times slower than
+Nuitka and slower than not compiling at all. The same case is now 0.020 s,
+which is 2.15x faster than Nuitka rather than 2.5x slower. That is one change
+in the compiler, not a faster machine: both numbers were taken on this one,
+minutes apart, against the same Nuitka build.
 
 Read these as whole-process numbers and not as pure throughput. Two of the
 five rows finish in under thirty milliseconds, and start-up is a large share
@@ -1160,7 +1168,7 @@ The rows are what `run.py` measures at a finer grain, and the two agree:
 calls, integer arithmetic and loops are where this compiler is ahead. Its
 weaknesses do not appear here at all, because a whole-program benchmark of
 five loops does not touch method dispatch or instantiation - for those, read
-the seventeen-row grid above, where they sit at 0.41×. **Put a hot loop at
+the twenty-seven-row grid above, where they sit at 0.36×. **Put a hot loop at
 module level rather than in a function and this advantage disappears**: names
 at module scope are not narrowed into registers, which cost 1.41× → 0.73× on
 the `while` loop when measured directly. Every case here therefore puts its

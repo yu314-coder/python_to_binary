@@ -558,11 +558,19 @@ Apple M4 against **Nuitka 4.1.3 `--standalone`**:
 
 | workload | py2bin | CPython | Nuitka |
 |---|---|---|---|
-| integer arithmetic | **0.061** | 0.099 | 0.094 |
-| `while` loop | **0.055** | 0.084 | 0.062 |
-| nested loops | **0.021** | 0.025 | 0.027 |
-| function calls | **0.020** | 0.038 | 0.036 |
-| string building | **0.022** | 0.024 | 0.026 |
+| function calls | **0.020** | 0.037 | 0.035 |
+| a call naming an argument | **0.020** | 0.044 | 0.043 |
+| integer arithmetic | **0.062** | 0.101 | 0.095 |
+| `while` loop | **0.056** | 0.084 | 0.061 |
+| nested loops | **0.022** | 0.026 | 0.028 |
+| string building | **0.022** | 0.026 | 0.026 |
+
+The keyword row is new here, and it is the one worth reading twice. Before the
+placement pass it measured **0.109 s** - two and a half times slower than
+Nuitka and slower than not compiling at all. The same case is now 0.020 s,
+which is 2.15x faster than Nuitka rather than 2.5x slower. That is one change
+in the compiler, not a faster machine: both numbers were taken on this one,
+minutes apart, against the same Nuitka build.
 
 Two of those rows finish in under thirty milliseconds, so start-up is a large
 share of them - a real difference between the three rather than a distortion.
