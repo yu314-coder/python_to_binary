@@ -951,6 +951,15 @@ its type, message, `__cause__` from an explicit `raise ... from`, and what
 `except` matches are all correct; it is the implicit chaining and the
 introspection that are missing.
 
+**A call that names an argument is still slow.** `helper(t, step=1)` measured
+0.13x the interpreter and is now 0.18x. The caller no longer allocates a tuple
+and a dict and rebuild the keyword's name for every call - vectorcall carries
+the values in one array with a tuple of names built at start-up beside it -
+but the *callee* still turns `kwnames` back into a dict and looks each
+parameter up in it. Matching the names directly against the tuple, which is
+what CPython does, is what would close the rest, and it is not done yet.
+
+
 ### It behaves as CPython does
 
 **Names the program binds are the program's.** `def len(x)` of your own, a
@@ -1312,6 +1321,22 @@ agree, because `object.__format__` with an empty specifier defers to `str`;
 for a type that defines `__format__` they do not. `PyObject_Format` is now
 vetted, and an exact `str` skips the call entirely - the same two paths
 CPython's `FORMAT_SIMPLE` takes. **f-string 0.73x -> 0.80x.**
+
+**A call that names an argument stopped allocating twice.** `f(a, key=b)`
+built a tuple for the positional part *and* a dict for the rest, and made the
+keyword's name from a C string on every call - two allocations and a string
+build to pass one argument by name, which measured 0.13x the interpreter and
+was the worst shape found anywhere. Vectorcall carries the values in one array
+with their names in a tuple beside it, which is what CPython does and what
+every compiled function here already accepts. **0.13x -> 0.18x**; the callee
+still rebuilds a dict from those names, which is what remains.
+
+Found while testing it: `def f(a)` called as `f(1, b=2)` ran and answered
+where CPython raises `TypeError`. A keyword's key was only removed from the
+dict when there was a `**kwargs` to hand the rest to, so nothing could tell a
+keyword that had been taken from one that matched no parameter at all. The
+key is always removed now and whatever is left is refused, naming the first
+one as CPython does.
 
 **Calls, literals, stores and lookups stopped paying for references they
 already hold.** `PyObject_CallOneArg` borrows its argument and the

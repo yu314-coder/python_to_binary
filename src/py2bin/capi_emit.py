@@ -768,6 +768,10 @@ class CApiEmitter:
         #: interned str carries its hash, so the lookup that remains is the
         #: dictionary probe and nothing else.
         self.interned_names: dict[str, str] = {}
+        #: One tuple of keyword names per distinct call shape, built at
+        #: start-up. A call site's names never change, so building the
+        #: tuple per call was building the same object over and over.
+        self.keyword_tuples: dict[tuple[str, ...], str] = {}
         #: Every literal the program mentions, built once at start-up. A
         #: constant was rebuilt at each execution, so a string inside a loop
         #: was decoded from UTF-8 and allocated on every iteration and an
@@ -2941,6 +2945,15 @@ class CApiEmitter:
             self.interned_names[text] = slot
         return slot
 
+    def keyword_names(self, names: tuple[str, ...]) -> str:
+        """The file-scope slot holding these keyword names as a tuple."""
+
+        slot = self.keyword_tuples.get(names)
+        if slot is None:
+            slot = f"_py2bin_kw{len(self.keyword_tuples)}"
+            self.keyword_tuples[names] = slot
+        return slot
+
     def pool(self, value, indent: int) -> str:
         """A literal as an owned reference, taken from the start-up pool.
 
@@ -3321,37 +3334,42 @@ class CApiEmitter:
     def invoke_with_keywords(
         self, callable_value: str, args: list, keywords: list, indent: int
     ) -> str:
-        """`f(a, key=b)` - a tuple for the positional part, a dict for the rest."""
+        """`f(a, key=b)` - one array, with the names in a tuple beside it.
 
-        values = [self.expression(item, indent) for item in args]
-        holder = self.temporary()
-        self.emit(f"{holder} = PyTuple_New({len(values)}LL);", indent)
-        self.checked(holder, indent)
-        for position, value in enumerate(values):
-            # Steals the reference, so the value is not released after this.
-            self.emit(f"PyTuple_SetItem({holder}, {position}LL, {value});", indent)
-        mapping = self.temporary()
-        self.emit(f"{mapping} = PyDict_New();", indent)
-        self.checked(mapping, indent)
+        This built a tuple for the positional part *and* a dict for the rest,
+        and made the keyword's name from a C string on every call - two
+        allocations and a string build to pass one argument by name. It
+        measured 0.13x the interpreter, the worst shape found anywhere.
+
+        Vectorcall takes the keyword values in the same array as the
+        positional ones with their names in a tuple alongside, which is what
+        CPython itself does and what every compiled function here already
+        accepts - the wrapper's signature ends in `kwnames`. The names at a
+        call site never change, so that tuple is built once at start-up.
+        """
+
         for keyword in keywords:
             if keyword.arg is None:
                 raise self.fail(
                     keyword.value, "`**kwargs` at a call is not translated here yet"
                 )
-            key = self.temporary()
-            self.emit(f"{key} = PyUnicode_FromString({_c_string(keyword.arg)});", indent)
-            self.checked(key, indent)
-            value = self.expression(keyword.value, indent)
-            self.emit(f"PyDict_SetItem({mapping}, {key}, {value});", indent)
-            # Does not steal either reference, so both go back.
-            self.emit(f"Py_DecRef({key});", indent)
-            self.emit(f"Py_DecRef({value});", indent)
+        held = [self.operand(item, indent) for item in args]
+        held += [self.operand(keyword.value, indent) for keyword in keywords]
+        holder = self.argument_array(len(held))
+        for position, (value, _owned) in enumerate(held):
+            self.emit(f"{holder}[{position}] = {value};", indent)
+        names = self.keyword_names(tuple(keyword.arg for keyword in keywords))
         target = self.temporary()
+        # `nargsf` counts only the positional ones; the rest are read off the
+        # end of the array by name. Vectorcall borrows every argument, so
+        # each goes back rather than being given away.
         self.emit(
-            f"{target} = PyObject_Call({callable_value}, {holder}, {mapping});", indent
+            f"{target} = PyObject_Vectorcall({callable_value}, {holder}, "
+            f"{len(args)}LL, {names});",
+            indent,
         )
-        self.emit(f"Py_DecRef({holder});", indent)
-        self.emit(f"Py_DecRef({mapping});", indent)
+        for value, owned in held:
+            self.release(value, owned, indent)
         return self.checked(target, indent)
 
     def method_call(self, node: ast.Call, indent: int) -> str:
@@ -6155,8 +6173,12 @@ class CApiEmitter:
             self.emit(f"if (!{slot}) {{", indent + 1)
             self.emit("PyErr_Clear();", indent + 2)
             self.emit("} else {", indent + 1)
-            if keyword_source:
-                self.emit(f"PyObject_DelItem({source}, {key});", indent + 2)
+            # Removed whether or not there is a `**kwargs` to hand the rest
+            # to. Without this nothing could tell a keyword that was taken
+            # from one that matched no parameter at all, and the second kind
+            # was accepted in silence: `def f(a)` called as `f(1, b=2)` ran
+            # and answered where CPython raises TypeError.
+            self.emit(f"PyObject_DelItem({source}, {key});", indent + 2)
             self.emit("}", indent + 1)
             self.emit(f"Py_DecRef({key});", indent + 1)
             self.emit("}", indent)
@@ -6198,6 +6220,31 @@ class CApiEmitter:
                 missing_is_null,
                 display,
             )
+        if not arguments.kwarg and source != "0":
+            # Whatever is left matched no parameter, and there is no `**` to
+            # hand it to. CPython names the first one, and so does this - the
+            # leftovers keep the order they were passed in, because a dict
+            # does.
+            leftover = self.temporary_flag()
+            self.emit(f"if ({source}) {{", indent)
+            self.emit(f"{leftover} = (int)PyObject_Size({source});", indent + 1)
+            self.emit(f"if ({leftover} > 0) {{", indent + 1)
+            walker = self.temporary()
+            self.emit(f"{walker} = PyObject_GetIter({source});", indent + 2)
+            self.checked(walker, indent + 2)
+            first = self.temporary()
+            self.emit(f"{first} = PyIter_Next({walker});", indent + 2)
+            self.emit(f"Py_DecRef({walker});", indent + 2)
+            self.checked(first, indent + 2)
+            self.raise_counted(
+                "TypeError",
+                f"{display}() got an unexpected keyword argument '",
+                first,
+                "'",
+                indent + 2,
+            )
+            self.emit("}", indent + 1)
+            self.emit("}", indent)
         if arguments.vararg:
             # Everything past the named parameters, gathered out of the array.
             # There is no tuple to slice any more, so the tuple is built here -
@@ -6871,6 +6918,8 @@ class CApiEmitter:
             out.append(f"static PyObject *{slot} = 0;  /* {name} */")
         for text, slot in self.interned_names.items():
             out.append(f"static PyObject *{slot} = 0;  /* {text!r} */")
+        for names, slot in self.keyword_tuples.items():
+            out.append(f"static PyObject *{slot} = 0;  /* {names!r:.40} */")
         for value, slot in self.pooled.values():
             out.append(f"static PyObject *{slot} = 0;  /* {value!r:.40} */")
         if self.crash_log:
@@ -6987,6 +7036,16 @@ class CApiEmitter:
             out.append(
                 f"    {slot} = PyUnicode_InternFromString({_c_string(text)});"
             )
+        for names, slot in self.keyword_tuples.items():
+            out.append(f"    {slot} = PyTuple_New({len(names)}LL);")
+            out.append(
+                f"    if (!{slot}) {{ {self._report()}; Py_Finalize(); exit(1); }}"
+            )
+            for position, text in enumerate(names):
+                out.append(
+                    f"    PyTuple_SetItem({slot}, {position}LL, "
+                    f"PyUnicode_InternFromString({_c_string(text)}));"
+                )
         for value, slot in self.pooled.values():
             out.append(f"    {slot} = {self._build_constant(value)};")
             out.append(

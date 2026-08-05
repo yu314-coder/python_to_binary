@@ -616,6 +616,52 @@ class CApiEmitTests(unittest.TestCase):
             b"1000\n",
         )
 
+    def test_an_unexpected_keyword_is_refused(self):
+        # `def f(a)` called as `f(1, b=2)` ran and answered where CPython
+        # raises. Nothing could tell a keyword that had been taken from one
+        # that matched no parameter, because the key was only removed when
+        # there was a `**kwargs` to hand the rest to.
+        self._run_failing(
+            "def f(a):\n    return a\nf(1, b=2)\n",
+            b"got an unexpected keyword argument 'b'",
+        )
+
+    def test_a_keyword_call_passes_names_beside_the_values(self):
+        # A tuple *and* a dict were allocated per call, and the keyword's name
+        # was built from a C string every time - two allocations and a string
+        # build to pass one argument by name.
+        generated = python_to_capi_c(
+            "def helper(v, step):\n    return v + step\n"
+            "print(helper(1, step=2))\n",
+            "program.py",
+        )
+        # Scoped to the calling function: `PyObject_Call` still has other
+        # users - a format specifier, a spread call - and asserting on the
+        # whole file failed against the fixed compiler as readily as the
+        # broken one, which is no test at all.
+        body = generated[generated.index("static PyObject *f__value"):]
+        body = body[: body.index("\n}\n")]
+        self.assertIn("PyObject_Vectorcall", generated)
+        # A tuple of names built once at start-up, not a dict per call.
+        self.assertIn("_py2bin_kw0", generated)
+        self.assertNotIn("PyDict_New()", body)
+
+    def test_keyword_shapes_still_bind_the_way_python_binds_them(self):
+        self._run(
+            "def f(a, b=9, c=8):\n"
+            "    return (a, b, c)\n"
+            "print(f(1), f(1, c=3), f(1, b=2, c=3), f(c=3, a=1))\n",
+            b"(1, 9, 8) (1, 9, 3) (1, 2, 3) (1, 9, 3)\n",
+        )
+
+    def test_a_starred_signature_still_collects_the_rest(self):
+        self._run(
+            "def f(a, *rest, k=0, **more):\n"
+            "    return (a, rest, k, sorted(more.items()))\n"
+            "print(f(1, 2, 3, k=4, z=5))\n",
+            b"(1, (2, 3), 4, [('z', 5)])\n",
+        )
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which
