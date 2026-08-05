@@ -125,6 +125,33 @@ def _certainly(
     }
 
 
+def _str_display(node: ast.expr) -> bool:
+    """True for an expression that certainly makes an exact `str`.
+
+    A literal is one, and an f-string is one however it is spelled: both are
+    built by the interpreter itself and neither can answer a subclass. `str(x)`
+    is deliberately *not* here - it answers whatever `__str__` returned, which
+    a subclass may be.
+    """
+
+    if isinstance(node, ast.JoinedStr):
+        return True
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def exact_strs(body: list[ast.stmt], parameters: set[str]) -> set[str]:
+    """The names in `body` that always hold an exact `str`.
+
+    What this buys is `+`. Concatenation has to go through `PyNumber_Add`,
+    because a `str` subclass may override `__add__` and Python would call it -
+    and that dispatch is most of what the operation costs. Where both sides
+    are certainly exact, there is no `__add__` to find and `PyUnicode_Concat`
+    is simply what `+` means.
+    """
+
+    return _certainly(body, parameters, _str_display)
+
+
 def exact_lists(body: list[ast.stmt], parameters: set[str]) -> set[str]:
     """The names in `body` that always hold an exact `list`."""
 

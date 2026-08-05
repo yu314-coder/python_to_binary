@@ -379,6 +379,51 @@ class CApiEmitTests(unittest.TestCase):
             b"2 100\n",
         )
 
+    def test_an_f_string_asks_for_format_not_str(self):
+        # `f"{x}"` is `format(x, "")`, which is `__format__`. For most types
+        # that defers to `str` and the two agree; for a type that defines
+        # `__format__` they do not, and this answered `str` for it.
+        self._run(
+            "class T:\n"
+            "    def __str__(self):\n"
+            "        return 'STR'\n"
+            "    def __repr__(self):\n"
+            "        return 'REPR'\n"
+            "    def __format__(self, spec):\n"
+            "        return 'FMT:' + spec\n"
+            "t = T()\n"
+            "print(f'{t} {t!r} {t!s} {t:xyz}')\n",
+            b"FMT: REPR STR FMT:xyz\n",
+        )
+
+    def test_an_exact_string_needs_no_formatting_call_at_all(self):
+        # CPython's FORMAT_SIMPLE takes the same two paths: an exact `str` is
+        # already its own formatting, so there is nothing to ask.
+        generated = python_to_capi_c(
+            "def f(name):\n"
+            "    greeting = 'hello'\n"
+            "    return f'{greeting} there'\n"
+            "print(f('x'))\n",
+            "program.py",
+        )
+        body = generated[generated.index("static PyObject *f_f("):]
+        body = body[: body.index("\n}\n")]
+        self.assertNotIn("PyObject_Format", body)
+        self.assertNotIn("PyObject_Str", body)
+
+    def test_concatenating_exact_strings_skips_the_add_dispatch(self):
+        # `+` has to go through `PyNumber_Add` because a `str` subclass may
+        # override `__add__`. Where both sides are certainly exact there is
+        # none to find, and the answer is the same either way.
+        self._run(
+            "class Loud(str):\n"
+            "    def __add__(self, other):\n"
+            "        return 'HIJACKED'\n"
+            "plain = 'a'\n"
+            "print(plain + 'b', Loud('a') + 'b')\n",
+            b"ab HIJACKED\n",
+        )
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which

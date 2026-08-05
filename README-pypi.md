@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.1** makes calls stop paying for references they already hold, and fixes a nested function that could not call itself -
+**0.9.2** borrows pooled literals, and fixes `f"{x}"` asking `str` where Python asks `__format__` -
 see *Release notes* below.
 
 ## Platforms
@@ -342,23 +342,23 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.1 ms | **2.37× faster** |
-| integer arithmetic | **5.3 ms** | 8.4 ms | **1.59× faster** |
-| `while` loop | **4.7 ms** | 6.7 ms | **1.42× faster** |
-| comparisons | **3.8 ms** | 4.7 ms | **1.23× faster** |
-| float arithmetic | **5.4 ms** | 5.7 ms | **1.07× faster** |
-| exception raise/catch | **19.3 ms** | 20.0 ms | **1.04× faster** |
-| list append | 5.3 ms | 5.1 ms | 0.98× |
-| comprehension | 5.8 ms | 5.5 ms | 0.96× |
-| dict store | 8.4 ms | 8.1 ms | 0.96× |
-| `and` / `or` | 6.4 ms | 5.8 ms | 0.91× |
-| subscript | 8.2 ms | 6.1 ms | 0.74× |
-| f-string | 24.7 ms | 18.2 ms | 0.73× |
-| string concatenation | 6.9 ms | 4.7 ms | 0.68× |
+| direct function call | **3.0 ms** | 7.0 ms | **2.34× faster** |
+| integer arithmetic | **5.0 ms** | 8.4 ms | **1.69× faster** |
+| `while` loop | **4.6 ms** | 6.3 ms | **1.37× faster** |
+| comparisons | **3.8 ms** | 4.7 ms | **1.25× faster** |
+| float arithmetic | **5.3 ms** | 5.8 ms | **1.09× faster** |
+| exception raise/catch | **19.1 ms** | 19.8 ms | **1.04× faster** |
+| dict store | 8.2 ms | 8.1 ms | 0.98× |
+| comprehension | 5.7 ms | 5.5 ms | 0.97× |
+| list append | 5.4 ms | 5.2 ms | 0.96× |
+| `and` / `or` | 6.2 ms | 5.8 ms | 0.94× |
+| f-string | 22.0 ms | 17.6 ms | 0.80× |
+| string concatenation | 16.6 ms | 12.5 ms | 0.75× |
+| subscript | 8.3 ms | 6.1 ms | 0.73× |
 | closure call | 10.2 ms | 6.7 ms | 0.66× |
-| attribute read | 6.4 ms | 3.9 ms | 0.61× |
-| instantiation | 39.5 ms | 16.5 ms | 0.42× |
-| method call | 16.3 ms | 6.6 ms | 0.40× |
+| attribute read | 6.5 ms | 3.7 ms | 0.57× |
+| method call | 15.5 ms | 6.7 ms | 0.43× |
+| instantiation | 38.4 ms | 16.2 ms | 0.42× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -564,6 +564,36 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.2 - a literal is not worth a reference count
+
+**Pooled literals are borrowed.** A literal lives in a static written once at
+start-up that nothing can rebind, and it was being incremented and decremented
+around every use - `t + 1`, `xs[0]`, every piece of an f-string. Two writes to
+arrive back where it started, on some of the commonest operands a program has.
+It is the safest borrow there is, and unlike a local it holds at module level
+too, because nothing about the slot can change.
+
+**`f"{x}"` asked `str` where Python asks `__format__`.** For most types those
+agree, because `object.__format__` with an empty specifier defers to `str`; for
+a type that defines `__format__` they do not, and this quietly answered the
+wrong one. `PyObject_Format` is now vetted - the eighty-fourth entry point -
+and an exact `str` skips the call entirely, which is the same pair of paths
+CPython's own FORMAT_SIMPLE takes. **f-string 0.73× → 0.80×.**
+
+**`+` on strings known to be exact skips the dispatch.** Concatenation goes
+through `PyNumber_Add` because a `str` subclass may override `__add__`, and
+finding that out is most of what the operation costs. Where both sides are
+certainly exact - a literal, an f-string, or a name the new analysis in
+`capi_exact` shows holds nothing else - `PyUnicode_Concat` is what `+` means.
+Exactness composes, so `a + b + c` converts throughout. A `str` subclass with
+its own `__add__` still reaches it, and a test pins that.
+
+**The `string concatenation` row was measuring the wrong thing.** Its case
+concatenated only literals, which are folded at compile time - the generated C
+held no concatenation at all, and the row was named after something it never
+ran. It uses locals now, which is why its figure moved from 0.68× to 0.75×:
+the work is real this time.
 
 ### 0.9.1 - a call stops paying for references it already holds
 

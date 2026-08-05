@@ -34,7 +34,8 @@ VETTED = [
     "PyLong_FromLongLong", "PyLong_AsLongLong", "PyUnicode_FromString",
     "PyNumber_Add", "PyNumber_Subtract", "PyNumber_Multiply",
     "PyNumber_TrueDivide", "PyObject_RichCompare", "PyObject_IsTrue", "PyObject_IsInstance",
-    "PyObject_Str", "PyObject_Repr", "PyObject_Size", "PyObject_GetAttrString",
+    "PyObject_Str", "PyObject_Repr", "PyObject_Format", "PyObject_Size",
+    "PyObject_GetAttrString",
     "PyObject_CallNoArgs", "PyObject_CallOneArg", "PyImport_ImportModule",
     # Calls of any arity: the arguments go in a tuple, which is what
     # PyObject_Call takes. PyTuple_SetItem steals its reference, which the

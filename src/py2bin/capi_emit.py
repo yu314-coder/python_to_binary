@@ -33,7 +33,7 @@ from pathlib import Path
 from .capi_cells import CellError, expand as expand_cells
 from .capi_fold import fold as fold_constants
 from .capi_inline import expand_module as inline_calls
-from .capi_exact import exact_dicts, exact_lists
+from .capi_exact import exact_dicts, exact_lists, exact_strs
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
 from .capi_ints import (
     ARITHMETIC as _MACHINE_OPS,
@@ -381,6 +381,7 @@ extern int PyObject_SetItem(PyObject *container, PyObject *key, PyObject *value)
 extern PyObject *PyList_New(long long length);
 extern int PyList_SetItem(PyObject *list, long long index, PyObject *value);
 extern PyObject *PyUnicode_Concat(PyObject *left, PyObject *right);
+extern PyObject *PyObject_Format(PyObject *value, PyObject *spec);
 extern int PyList_Append(PyObject *list, PyObject *value);
 extern PyObject *PyObject_GetIter(PyObject *object);
 extern PyObject *PyIter_Next(PyObject *iterator);
@@ -632,6 +633,7 @@ class _Function:
         #: guard is ever emitted for them.
         self.exact_lists: set[str] = set()
         self.exact_dicts: set[str] = set()
+        self.exact_strs: set[str] = set()
         #: Counter for the `long long` scratch the fast path computes in, wound
         #: back at the end of each statement as the object temporaries are.
         self.machines = 0
@@ -1056,6 +1058,25 @@ class CApiEmitter:
     def is_exact_dict(self, node: ast.expr) -> bool:
         assert self.current is not None
         return self._exactly(node, self.current.exact_dicts)
+
+    def is_exact_str(self, node: ast.expr) -> bool:
+        """Whether this expression is certainly an exact `str`.
+
+        A literal and an f-string are, whatever the surrounding code does;
+        beyond those it is a name the analysis has shown holds nothing else.
+        """
+
+        assert self.current is not None
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # `a + b + c` is `(a + b) + c`, so without this only the innermost
+            # pair was claimed and the rest fell back. Concatenating two exact
+            # strings answers an exact string, so the property composes.
+            return self.is_exact_str(node.left) and self.is_exact_str(node.right)
+        return self._exactly(node, self.current.exact_strs)
 
     def double_slots(self, name: str) -> tuple[str, str, str]:
         """Declare the three variables, and answer with their C names."""
@@ -1770,7 +1791,25 @@ class CApiEmitter:
         way a slot *can* be written in the middle of an expression.
         """
 
-        if self.boxing or self.current is None or self.at_module_level:
+        if self.current is None:
+            return None
+        if (
+            isinstance(node, ast.Constant)
+            # `bool` is a subclass of `int`, and `True`/`False`/`None` are not
+            # pooled at all - they come from the builtins module. Letting them
+            # through here would name a static nothing ever fills.
+            and not isinstance(node.value, bool)
+            and isinstance(node.value, (int, float, str, bytes))
+        ):
+            # A pooled literal is the safest borrow there is: the static is
+            # written once at start-up and never again, by anything. It was
+            # being incremented and decremented around every use - `t + 1`,
+            # `xs[0]`, every piece of an f-string - which is two writes to
+            # arrive back where it started, on some of the commonest operands
+            # a program has. Unlike a local this holds at module level too,
+            # and while boxing, because nothing about the slot can change.
+            return self.pool_slot(node.value)
+        if self.boxing or self.at_module_level:
             return None
         if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
             return None
@@ -1889,6 +1928,28 @@ class CApiEmitter:
         function = _BINARY.get(type(node.op))
         if function is None:
             raise self.fail(node, f"{type(node.op).__name__} is not translated here yet")
+        if (
+            isinstance(node.op, ast.Add)
+            and self.is_exact_str(node.left)
+            and self.is_exact_str(node.right)
+        ):
+            # `PyNumber_Add` has to look for an `__add__` because a `str`
+            # subclass may have one, and finding out is most of what the
+            # operation costs. Where both sides are certainly exact - a
+            # literal, an f-string, or a name the analysis has shown holds
+            # nothing else - there is no `__add__` to find and
+            # `PyUnicode_Concat` is what `+` means.
+            #
+            # Exactness is the whole of the argument: `MyStr("a") + "b"` must
+            # still reach the subclass, and a call is not a display, so a name
+            # bound from one is never claimed here.
+            left, left_owned = self.operand(node.left, indent)
+            right, right_owned = self.operand(node.right, indent)
+            target = self.temporary()
+            self.emit(f"{target} = PyUnicode_Concat({left}, {right});", indent)
+            self.release(left, left_owned, indent)
+            self.release(right, right_owned, indent)
+            return self.checked(target, indent)
         if isinstance(node.op, _DOUBLE_OPS) and self.double_tree(node):
             if any(isinstance(part, ast.Name) for part in ast.walk(node)):
                 real = self.double_expression(node, indent)
@@ -2040,17 +2101,45 @@ class CApiEmitter:
         interpreter does for the same syntax.
         """
 
-        pieces = []
+        # Each piece is carried with whether it has to be released. A literal
+        # piece is a pooled static and a value being formatted is often a
+        # local, and both were incremented and decremented around a use that
+        # cannot outlive them.
+        pieces: list[tuple[str, bool]] = []
         for piece in node.values:
             if isinstance(piece, ast.Constant):
-                rendered = self.constant(piece, indent)
-            elif isinstance(piece, ast.FormattedValue):
-                value = self.expression(piece.value, indent)
+                rendered, rendered_owned = self.operand(piece, indent)
+                pieces.append((rendered, rendered_owned))
+                continue
+            if isinstance(piece, ast.FormattedValue):
+                rendered_owned = True
+                value, value_owned = self.operand(piece.value, indent)
                 # `!r`, `!s`, `!a` - and no conversion, which for a value with
                 # no specifier is str() as well.
                 shaped = {114: "repr", 115: "str", 97: "ascii"}.get(
-                    piece.conversion, "" if piece.format_spec is not None else "str"
+                    piece.conversion, ""
                 )
+                if not shaped and piece.format_spec is None:
+                    # `f"{x}"` is `format(x, "")`, which is `__format__` - not
+                    # `str`. For most types the two agree, because
+                    # `object.__format__` with an empty specifier defers to
+                    # `str`; for a type that defines `__format__` they do not,
+                    # and this answered `str` for it. CPython's own
+                    # FORMAT_SIMPLE takes the same two paths: an exact `str`
+                    # is already its own formatting, and anything else is
+                    # asked.
+                    if self.is_exact_str(piece.value):
+                        rendered, rendered_owned = value, value_owned
+                        pieces.append((rendered, rendered_owned))
+                        continue
+                    converted = self.temporary()
+                    self.emit(
+                        f"{converted} = PyObject_Format({value}, 0);", indent
+                    )
+                    self.release(value, value_owned, indent)
+                    self.checked(converted, indent)
+                    pieces.append((converted, True))
+                    continue
                 if shaped:
                     converted = self.temporary()
                     # `str` and `repr` have their own entry points. Calling the
@@ -2070,11 +2159,13 @@ class CApiEmitter:
                             indent,
                         )
                         self.emit(f"Py_DecRef({caller});", indent)
-                    self.emit(f"Py_DecRef({value});", indent)
+                    self.release(value, value_owned, indent)
+                    value_owned = True
                     self.checked(converted, indent)
                     value = converted
                 if piece.format_spec is None:
                     rendered = value
+                    rendered_owned = value_owned
                 else:
                     # The specifier is itself an f-string, which is how
                     # `{x:.{places}f}` names the width it wants.
@@ -2088,6 +2179,10 @@ class CApiEmitter:
                     # with the two references this is finished with anyway.
                     self.emit(f"{arguments} = PyTuple_New(2);", indent)
                     self.checked(arguments, indent)
+                    if not value_owned:
+                        # `PyTuple_SetItem` steals, so a borrowed value needs
+                        # one of its own to give away.
+                        self.emit(f"Py_IncRef({value});", indent)
                     self.emit(f"PyTuple_SetItem({arguments}, 0, {value});", indent)
                     self.emit(f"PyTuple_SetItem({arguments}, 1, {specifier});", indent)
                     rendered = self.temporary()
@@ -2098,9 +2193,9 @@ class CApiEmitter:
                     self.emit(f"Py_DecRef({caller});", indent)
                     self.emit(f"Py_DecRef({arguments});", indent)
                     self.checked(rendered, indent)
-            else:
-                raise self.fail(node, "unsupported f-string piece")
-            pieces.append(rendered)
+                pieces.append((rendered, rendered_owned))
+                continue
+            raise self.fail(node, "unsupported f-string piece")
 
         if not pieces:
             return self.pool("", indent)
@@ -2108,7 +2203,11 @@ class CApiEmitter:
             # Every piece is already a str - a literal, or the result of
             # `str`/`repr`/`ascii`/`format`, all of which answer one - so
             # joining a single piece would answer that piece.
-            return pieces[0]
+            only, only_owned = pieces[0]
+            if not only_owned:
+                # Handed back as an owned reference, like every expression.
+                self.emit(f"Py_IncRef({only});", indent)
+            return only
         if len(pieces) <= _CONCAT_UNTIL:
             # Concatenated in a chain rather than gathered and joined. The
             # join allocates a tuple to be handed the pieces in and then walks
@@ -2121,23 +2220,26 @@ class CApiEmitter:
             # speed: an f-string *joins* its pieces, and `+` would ask the
             # left piece's type for `__add__` - a str subclass out of a
             # `__repr__` could override it, and CPython's join never asks.
-            target = pieces[0]
-            for following in pieces[1:]:
+            target, target_owned = pieces[0]
+            for following, following_owned in pieces[1:]:
                 joined = self.temporary()
                 self.emit(
                     f"{joined} = PyUnicode_Concat({target}, {following});", indent
                 )
-                self.emit(f"Py_DecRef({target});", indent)
-                self.emit(f"Py_DecRef({following});", indent)
+                self.release(target, target_owned, indent)
+                self.release(following, following_owned, indent)
                 self.checked(joined, indent)
-                target = joined
+                target, target_owned = joined, True
             return target
         gathered = self.temporary()
         self.emit(f"{gathered} = PyTuple_New({len(pieces)});", indent)
         self.checked(gathered, indent)
-        for position, rendered in enumerate(pieces):
+        for position, (rendered, rendered_owned) in enumerate(pieces):
             # PyTuple_SetItem steals, which is what to do with a reference
-            # this is finished with anyway.
+            # this is finished with anyway - and a borrowed piece has to be
+            # given one to hand over.
+            if not rendered_owned:
+                self.emit(f"Py_IncRef({rendered});", indent)
             self.emit(f"PyTuple_SetItem({gathered}, {position}, {rendered});", indent)
         blank = self.pool("", indent)
         target = self.temporary()
@@ -2835,17 +2937,22 @@ class CApiEmitter:
         # every `-0.0` in the program into `0.0` - which is a different float,
         # and the one that decides the sign of the result it is multiplied
         # into. `repr` tells them apart, as it tells `1` from `1.0`.
+        slot = self.pool_slot(value)
+        target = self.temporary()
+        self.emit(f"Py_IncRef({slot});", indent)
+        self.emit(f"{target} = {slot};", indent)
+        return target
+
+    def pool_slot(self, value) -> str:
+        """The static this literal lives in, registered on first mention."""
+
         key = (type(value).__name__, repr(value))
         entry = self.pooled.get(key)
         if entry is None:
             slot = f"_py2bin_k{len(self.pooled)}"
             self.pooled[key] = (value, slot)
-        else:
-            slot = entry[1]
-        target = self.temporary()
-        self.emit(f"Py_IncRef({slot});", indent)
-        self.emit(f"{target} = {slot};", indent)
-        return target
+            return slot
+        return entry[1]
 
     def get_attr(self, owner: str, name: str, indent: int) -> str:
         """`owner.name`, through the interned form. Does not release `owner`."""
@@ -6201,6 +6308,7 @@ class CApiEmitter:
             function.unboxed = unboxable_locals(node.body, given) - function.doubles
             function.exact_lists = exact_lists(node.body, given)
             function.exact_dicts = exact_dicts(node.body, given)
+            function.exact_strs = exact_strs(node.body, given)
             function.body_binds = _scope_bindings(node.body)
             function.shadows = function.body_binds | set(held)
         outer, outer_handlers, outer_scope = (
@@ -6562,6 +6670,7 @@ class CApiEmitter:
         )
         function.exact_lists = exact_lists(node.body, set(parameters))
         function.exact_dicts = exact_dicts(node.body, set(parameters))
+        function.exact_strs = exact_strs(node.body, set(parameters))
         function.body_binds = _scope_bindings(node.body)
         function.shadows = function.body_binds | set(parameters)
         self.current = function

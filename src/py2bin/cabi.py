@@ -660,6 +660,7 @@ _PyObject_IsInstance = _bind(
     "PyObject_IsInstance", ctypes.c_int, _HANDLE, _HANDLE
 )
 _PyObject_Str = _bind("PyObject_Str", _HANDLE, _HANDLE)
+_PyObject_Format = _bind("PyObject_Format", _HANDLE, _HANDLE, _HANDLE)
 _PyObject_Repr = _bind("PyObject_Repr", _HANDLE, _HANDLE)
 _PyObject_Size = _bind("PyObject_Size", _SSIZE, _HANDLE)
 _PyObject_GetAttr = _bind("PyObject_GetAttr", _HANDLE, _HANDLE, _HANDLE)
@@ -819,6 +820,10 @@ def PyObject_IsInstance(handle: int, kind: int) -> int:
 
 def PyObject_Str(handle: int) -> int:
     return _handle(_PyObject_Str(handle))
+
+
+def PyObject_Format(handle: int, spec: int) -> int:
+    return _handle(_PyObject_Format(handle, spec))
 
 
 def PyObject_Repr(handle: int) -> int:
