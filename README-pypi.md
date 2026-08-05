@@ -13,8 +13,11 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.8.9** is a large correctness and speed release - see *Release notes* below.
-see *Release notes* below.
+**0.8.9 is a large correctness and speed release.** Eleven measured operations
+got faster - `in` on a list and a `try` that does not raise now beat the
+interpreter - and several wrong answers were found and fixed on the way,
+including a `__bool__` that raised being read as true and a memory leak in
+every `try`. See *Release notes* below.
 
 ## Platforms
 
