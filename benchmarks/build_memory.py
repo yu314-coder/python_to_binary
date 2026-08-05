@@ -46,34 +46,52 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = Path(__file__).resolve().parent / "vs_nuitka"
-INTERVAL = 0.025
+INTERVAL = 0.010
 
 
-def _tree_kilobytes(root_pid: int) -> int:
-    """Resident set of `root_pid` and every descendant, in KB."""
+def _tree_kilobytes(root_pid: int) -> tuple[int, dict[str, int]]:
+    """Resident set of `root_pid` and every descendant, and who held it.
+
+    The per-command peaks are what make the total answerable rather than
+    asserted. "Does this count the C compiler?" is a fair question about any
+    figure like this, and the answer should come from the tool: on a Nuitka
+    build it reports `clang`, `ld` and `xcodebuild` beside Nuitka's own
+    Python, which is where the hundreds of megabytes are.
+    """
 
     try:
         listing = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True
+            ["ps", "-axo", "pid=,ppid=,rss=,comm="], capture_output=True, text=True
         ).stdout
     except OSError:
-        return 0
+        return 0, {}
     children: dict[int, list[int]] = {}
     resident: dict[int, int] = {}
+    command: dict[int, str] = {}
     for line in listing.splitlines():
-        parts = line.split()
-        if len(parts) != 3:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
             continue
-        pid, parent, rss = (int(p) for p in parts)
+        try:
+            pid, parent, rss = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
         children.setdefault(parent, []).append(pid)
         resident[pid] = rss
+        # `ps` brackets a process whose arguments it cannot read; the name is
+        # the same either way, so the two spellings are folded together.
+        command[pid] = parts[3].rsplit("/", 1)[-1].strip("()")
     total = 0
+    held: dict[str, int] = {}
     pending = [root_pid]
     while pending:
         pid = pending.pop()
-        total += resident.get(pid, 0)
+        size = resident.get(pid, 0)
+        total += size
+        if pid in command:
+            held[command[pid]] = max(held.get(command[pid], 0), size)
         pending.extend(children.get(pid, ()))
-    return total
+    return total, held
 
 
 class _Sampler(threading.Thread):
@@ -81,11 +99,15 @@ class _Sampler(threading.Thread):
         super().__init__(daemon=True)
         self.pid = pid
         self.peak = 0
+        self.held: dict[str, int] = {}
         self.stop = threading.Event()
 
     def run(self) -> None:
         while not self.stop.is_set():
-            self.peak = max(self.peak, _tree_kilobytes(self.pid))
+            total, held = _tree_kilobytes(self.pid)
+            self.peak = max(self.peak, total)
+            for name, size in held.items():
+                self.held[name] = max(self.held.get(name, 0), size)
             self.stop.wait(INTERVAL)
 
 
@@ -116,6 +138,7 @@ def _build(command: list[str], env: dict[str, str] | None = None):
         largest,
         process.returncode == 0,
         output.decode(errors="replace")[-400:],
+        sampler.held,
     )
 
 
@@ -174,6 +197,7 @@ def main(argv: list[str]) -> int:
               f"; py2bin has no build cache either way\n")
         print(f"  {'case':<26} {'py2bin':>9} {'time':>7}   "
               f"{'Nuitka':>9} {'time':>7}")
+        contributors: dict[str, dict[str, int]] = {"py2bin": {}, "nuitka": {}}
         for label, source in sources:
             out = work / (source.stem + ".out")
             ours = _build(
@@ -199,10 +223,26 @@ def main(argv: list[str]) -> int:
                      if theirs[3] else f"{'failed':>9} {'-':>7}")
             print(f"  {label:<26} {ours[1]:8.0f}M {ours[0]:6.1f}s   {shown}")
             for who, result in (("py2bin", ours), ("nuitka", theirs)):
-                if result[3] and result[1] < result[2]:
+                if not result[3]:
+                    continue
+                for name, size in result[5].items():
+                    room = contributors[who]
+                    room[name] = max(room.get(name, 0), size)
+                if result[1] < result[2]:
                     print(f"      (note: {who} sampler saw {result[1]:.0f}M but "
                           f"a single child reached {result[2]:.0f}M - "
                           f"the peak was shorter than the sampling interval)")
+
+        # What actually held the memory. Printed because a whole-tree total is
+        # only believable if it can name its parts - the C toolchain Nuitka
+        # drives is most of its column, and py2bin starts no such thing.
+        for who in ("py2bin", "nuitka"):
+            room = contributors[who]
+            if not room:
+                continue
+            ranked = sorted(room.items(), key=lambda kv: -kv[1])[:6]
+            shown = ", ".join(f"{name} {size/1000:.0f}M" for name, size in ranked)
+            print(f"\n  {who} tree held: {shown}")
     return 0
 
 

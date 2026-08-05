@@ -1387,6 +1387,19 @@ class CApiEmitter:
         )
         return flag, answer
 
+    def verdict(self, decision: str, indent: int) -> str:
+        """A truth flag that is certainly 0 or 1, never a failure.
+
+        `PyObject_IsTrue` and `PyObject_RichCompareBool` answer -1 with an
+        exception set, and **-1 is true in C** - so every condition built on
+        one silently took its branch and threw the exception away. A class
+        whose `__bool__` raised ran the body of the `if` and exited 0 where
+        CPython stops. Checked here, once, so no caller has to remember.
+        """
+
+        self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
+        return decision
+
     def truth(self, node: ast.expr, indent: int) -> str:
         """A C int that is 1 when this expression is true, -1 on failure.
 
@@ -1396,6 +1409,49 @@ class CApiEmitter:
         `if` and every `while` comes through here.
         """
 
+        if isinstance(node, ast.BoolOp):
+            # `if a and b` wants a verdict, and the generic path below built a
+            # *value*: the whole chain was evaluated into a Python object and
+            # then asked what it meant. That cost the machine comparison each
+            # side would otherwise have got - a bare `i > 5` ran at 1.22x the
+            # interpreter and `i > 5 and i < n` at 0.66x, which is the price
+            # of boxing, not of the `and`.
+            #
+            # Each side goes through `truth` instead, so each keeps whatever
+            # fast path it qualifies for, and the short circuit is the C `if`
+            # that guards the next one - a side that must not be evaluated is
+            # not merely discarded, its code never runs.
+            decision = self.temporary_flag()
+            first = self.truth(node.values[0], indent)
+            self.emit(f"{decision} = {first};", indent)
+            opened = 0
+            for value in node.values[1:]:
+                # `and` goes on while the answer is true, `or` while it is
+                # false, and both stop on -1 so a failure is not read as a
+                # verdict.
+                carry_on = (
+                    f"{decision} > 0"
+                    if isinstance(node.op, ast.And)
+                    else f"{decision} == 0"
+                )
+                self.emit(f"if ({carry_on}) {{", indent + opened)
+                opened += 1
+                following = self.truth(value, indent + opened)
+                self.emit(f"{decision} = {following};", indent + opened)
+            while opened:
+                opened -= 1
+                self.emit("}", indent + opened)
+            return decision
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.Not)
+        ):
+            # Same reasoning one level down: `if not x` asked the interpreter
+            # to build `True` or `False` and then asked which it was.
+            inner = self.truth(node.operand, indent)
+            decision = self.temporary_flag()
+            self.emit(f"{decision} = ({inner} < 0) ? -1 : !{inner};", indent)
+            return decision
         if (
             isinstance(node, ast.Compare)
             and len(node.ops) == 1
@@ -1415,6 +1471,7 @@ class CApiEmitter:
                 spelled = self.expression(node, indent + 1)
             self.emit(f"{answer} = PyObject_IsTrue({spelled});", indent + 1)
             self.emit(f"Py_DecRef({spelled});", indent + 1)
+            self.verdict(answer, indent + 1)
             self.emit("}", indent)
             return answer
         if self.double_comparison(node):
@@ -1439,6 +1496,7 @@ class CApiEmitter:
                 spelled = self.expression(node, indent + 1)
             self.emit(f"{answer} = PyObject_IsTrue({spelled});", indent + 1)
             self.emit(f"Py_DecRef({spelled});", indent + 1)
+            self.verdict(answer, indent + 1)
             self.emit("}", indent)
             return answer
         if (
@@ -1459,12 +1517,12 @@ class CApiEmitter:
             )
             self.release(left, left_owned, indent)
             self.release(right, right_owned, indent)
-            return decision
+            return self.verdict(decision, indent)
         decision = self.temporary_flag()
         test = self.expression(node, indent)
         self.emit(f"{decision} = PyObject_IsTrue({test});", indent)
         self.emit(f"Py_DecRef({test});", indent)
-        return decision
+        return self.verdict(decision, indent)
 
     def narrow_assign(self, name: str, value: ast.expr, indent: int) -> bool:
         """Bind a name straight from a register, if both ends allow it.

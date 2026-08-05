@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.8.9** hardens the last two shell paths; **0.8.8** closed five ways a downloaded archive could write outside the build -
+**0.9.0** fixes a raising `__bool__` being read as true, and makes `and`/`or` conditions cost nothing extra -
 see *Release notes* below.
 
 ## Platforms
@@ -342,23 +342,23 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **2.8 ms** | 6.9 ms | **2.50× faster** |
-| integer arithmetic | **5.0 ms** | 8.1 ms | **1.61× faster** |
-| `while` loop | **4.4 ms** | 6.5 ms | **1.46× faster** |
-| comparisons | **3.9 ms** | 4.5 ms | **1.15× faster** |
-| float arithmetic | **5.1 ms** | 5.5 ms | **1.08× faster** |
-| exception raise/catch | **19.0 ms** | 19.2 ms | **1.01× faster** |
-| comprehension | 5.8 ms | 5.6 ms | 0.96× |
-| dict store | 8.1 ms | 7.7 ms | 0.96× |
-| list append | 5.4 ms | 5.1 ms | 0.95× |
-| subscript | 7.9 ms | 5.9 ms | 0.75× |
-| f-string | 23.5 ms | 17.1 ms | 0.73× |
-| string concatenation | 6.5 ms | 4.5 ms | 0.69× |
-| `and` / `or` | 9.0 ms | 5.9 ms | 0.66× |
-| attribute read | 6.9 ms | 4.0 ms | 0.57× |
-| closure call | 12.6 ms | 6.9 ms | 0.55× |
-| instantiation | 37.2 ms | 15.7 ms | 0.42× |
-| method call | 15.8 ms | 6.4 ms | 0.41× |
+| direct function call | **3.0 ms** | 7.5 ms | **2.49× faster** |
+| integer arithmetic | **5.2 ms** | 8.4 ms | **1.61× faster** |
+| `while` loop | **4.6 ms** | 6.7 ms | **1.43× faster** |
+| comparisons | **3.8 ms** | 4.7 ms | **1.22× faster** |
+| float arithmetic | **5.4 ms** | 5.9 ms | **1.09× faster** |
+| exception raise/catch | **20.1 ms** | 20.4 ms | **1.01× faster** |
+| list append | 5.4 ms | 5.3 ms | 0.99× |
+| comprehension | 5.8 ms | 5.6 ms | 0.97× |
+| dict store | 8.4 ms | 8.0 ms | 0.95× |
+| `and` / `or` | 6.5 ms | 5.9 ms | 0.91× |
+| subscript | 8.2 ms | 6.0 ms | 0.73× |
+| f-string | 24.4 ms | 17.7 ms | 0.73× |
+| string concatenation | 7.0 ms | 4.6 ms | 0.66× |
+| attribute read | 6.5 ms | 4.0 ms | 0.61× |
+| closure call | 12.2 ms | 6.7 ms | 0.55× |
+| method call | 16.3 ms | 6.7 ms | 0.41× |
+| instantiation | 39.8 ms | 16.4 ms | 0.41× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -369,7 +369,7 @@ the interpreter, and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Nine of the seventeen rows sit at 0.80× or better and six beat the interpreter
+Ten of the seventeen rows sit at 0.80× or better and six beat the interpreter
 outright. Most did not a short while ago.
 
 | row | before the fix | after it | what it was |
@@ -517,14 +517,35 @@ column is the same in each.
 
 | what is being built | py2bin | | Nuitka | |
 |---|---|---|---|---|
-| a small program | **40-42 MB** | **0.1-0.2 s** | 294-303 MB | 3.6-4.4 s |
-| 200 functions | **186 MB** | **2.0 s** | 417 MB | 4.7 s |
-| 1,000 functions | **601 MB** | **7.3 s** | 762 MB | 7.9 s |
-| 3,000 functions | 1,568 MB | 21.0 s | **1,517 MB** | **17.1 s** |
+| a small program | **42 MB** | **0.1 s** | 296-297 MB | 3.7 s |
+| 200 functions | **188 MB** | **2.0 s** | 423 MB | 4.9 s |
+| 1,000 functions | **603 MB** | **7.4 s** | 713 MB | 8.1 s |
+| 3,000 functions | 1,571 MB | 21.3 s | **1,516 MB** | **17.5 s** |
 
 A small build costs a seventh of a warm Nuitka's and a fifteenth of a cold
 one, which is the whole reason an iPad can run one. The advantage narrows with
-program size: nothing here streams, so the curve is steeper than clang's.
+program size - nothing here streams, so the curve is steeper - but on a cold
+build it survives to the largest case measured. Only against a *warm* Nuitka
+at 3,000 functions does it turn over.
+
+**Yes, the C toolchain is counted** - it is most of Nuitka's column. The
+sampler walks the whole process tree and now reports what held the memory, so
+the total can name its parts rather than be asserted:
+
+| building | py2bin's tree held | Nuitka's tree held |
+|---|---|---|
+| a small program | `Python` 40 MB | `Python` 300 MB, `clang` 181 MB, `ld` 150 MB, `codesign` 8 MB |
+| 3,000 functions | `Python` 1,567 MB | `ld` 1,210 MB, `clang` 608 MB, `Python` 434 MB |
+
+At scale it is the *linker* rather than the compiler that dominates. py2bin
+starts neither: it writes the object code and the container itself, so its tree
+is one Python process at every size.
+
+Sampling finer matters here, and the interval was tightened from 25 ms to
+10 ms after checking: clang processes are short-lived, and at 25 ms the same
+build measured 582 MB where 5 ms saw 643 MB. The published figures were
+understating Nuitka - which flattered it rather than py2bin, but was wrong
+either way.
 
 Startup, `print("x")`, median of 13 runs, same M4:
 
@@ -543,6 +564,41 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.0 - a condition wants a verdict, not a value
+
+**A `__bool__` that raised was read as true.** `PyObject_IsTrue` answers -1
+with an exception set, and **-1 is true in C**, so a class whose `__bool__`
+raised ran the body of the `if` and the program exited 0 where CPython stops
+with the exception. The same held for a comparison that raised. Every verdict
+is checked once now, where it is produced, so no caller has to remember. This
+was there before any of the work below and is the more important half of this
+release.
+
+**`and` and `or` in a condition no longer build an object.** `if a and b`
+wants a verdict; the whole chain was evaluated into a Python boolean and then
+asked what it meant, which cost each side the machine comparison it would
+otherwise have had. A bare `i > 5` ran at 1.22× the interpreter and
+`i > 5 and i < n` at 0.66× - the price of boxing, not of the `and`. Each side
+goes through the same path as any other condition now, and the short circuit
+is the C `if` that guards the next one, so a side that must not run has no
+code reached rather than a value discarded. **0.66× → 0.91×**, and ten of the
+seventeen measured rows now sit at 0.80× or better where nine did. `not` is
+the same idea one level down.
+
+Twenty programs covering `__bool__`, `__len__`, side-effect order, exceptions
+mid-chain and three-way chains agree with CPython exactly.
+
+**The build-memory grid counts the C toolchain, and now says so.** The sampler
+walks the whole process tree, and reports what held the memory rather than
+asserting a total: on a small Nuitka build that is `clang` 181 MB and `ld`
+150 MB beside Nuitka's own Python; at 3,000 functions the *linker* dominates
+at 1,210 MB. py2bin starts neither, so its tree is one Python process at every
+size. The sampling interval was tightened from 25 ms to 10 ms after measuring
+that clang's short-lived processes were being missed - the same build read
+582 MB at 25 ms and 643 MB at 5 ms - so the published figures had been
+understating Nuitka. Cold, py2bin now wins every row measured, including the
+largest; only against a *warm* Nuitka at 3,000 functions does it turn over.
 
 ### 0.8.9 - nothing reaches a shell uninspected
 

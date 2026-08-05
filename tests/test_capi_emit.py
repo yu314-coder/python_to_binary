@@ -319,6 +319,81 @@ class CApiEmitTests(unittest.TestCase):
             b"5050\n",
         )
 
+    def test_a_condition_of_ands_builds_no_boolean_object(self):
+        # `if a and b` wants a verdict, not a value. The whole chain used to be
+        # evaluated into a Python object and then asked what it meant, which
+        # cost each side the machine comparison it would otherwise have had:
+        # `i > 5` ran at 1.22x the interpreter and `i > 5 and i < n` at 0.66x.
+        # Each side goes through the same `truth` path now, and the short
+        # circuit is a C `if` around the next one.
+        generated = python_to_capi_c(
+            "def f(n):\n"
+            "    t = 0\n"
+            "    for i in range(n):\n"
+            "        if i > 5 and i < 15:\n"
+            "            t += 1\n"
+            "    return t\n"
+            "print(f(20))\n",
+            "program.py",
+        )
+        body = generated[generated.index("f_f("):]
+        # The comparisons stay machine comparisons; nothing asks an object.
+        self.assertNotIn("PyObject_IsTrue", body.split("static PyObject *f_")[1])
+
+    def test_short_circuit_still_short_circuits(self):
+        # The side that must not run must not have its code reached, not
+        # merely have its value discarded - `0 and f()` may not call `f`.
+        self._run(
+            "def boom():\n"
+            "    print('ran')\n"
+            "    return True\n"
+            "print(bool(0 and boom()))\n"
+            "print(bool(1 or boom()))\n"
+            "print(bool(1 and boom()))\n",
+            b"False\nTrue\nran\nTrue\n",
+        )
+
+    def test_a_condition_still_consults_dunder_bool_in_order(self):
+        # The fast path is only allowed where it changes nothing. An object
+        # deciding its own truth must still be asked, once, in order.
+        self._run(
+            "class B:\n"
+            "    def __init__(self, v, tag):\n"
+            "        self.v = v\n"
+            "        self.tag = tag\n"
+            "    def __bool__(self):\n"
+            "        print('asked', self.tag)\n"
+            "        return self.v\n"
+            "print(bool(B(False, 'one') and B(True, 'two')))\n"
+            "print(bool(B(False, 'three') or B(True, 'four')))\n",
+            # `one` is asked twice on purpose, and CPython agrees: the `and`
+            # asks to decide whether to short-circuit, and `bool()` then asks
+            # the object the `and` handed back - which is that same object.
+            # The first draft of this test expected one call and was wrong
+            # about Python, not about the compiler.
+            b"asked one\nasked one\nFalse\nasked three\nasked four\nTrue\n",
+        )
+
+    def test_a_failure_inside_a_chain_is_not_read_as_a_verdict(self):
+        # `truth` answers -1 for failure, which is neither true nor false. A
+        # chain that treated it as one would swallow the exception and carry
+        # on with the wrong answer.
+        self._run_failing(
+            "class Angry:\n"
+            "    def __bool__(self):\n"
+            "        raise ValueError('no')\n"
+            "if Angry() and True:\n"
+            "    print('unreachable')\n",
+            b"ValueError",
+        )
+
+    def test_not_is_a_verdict_too(self):
+        self._run(
+            "print(not 0, not 1, not [], not [0], not None, not '')\n"
+            "print(not (1 and 0), not (0 or 1), not not 5)\n",
+            b"True False True False True True\nTrue False True\n",
+        )
+
     def test_a_failing_call_stops_with_the_interpreters_own_message(self):
         # A C-API function answers NULL and leaves an exception set. Letting
         # that NULL travel is how `1 + "x"` came to print `<NULL>` and exit 0
