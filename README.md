@@ -702,31 +702,31 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **2.9 ms** | 7.0 ms | **2.46× faster** |
-| integer arithmetic | **5.2 ms** | 8.2 ms | **1.60× faster** |
-| `while` loop | **4.5 ms** | 6.2 ms | **1.38× faster** |
-| comparisons | **3.6 ms** | 4.6 ms | **1.28× faster** |
-| float arithmetic | **5.4 ms** | 5.6 ms | **1.05× faster** |
-| exception raise/catch | **19.0 ms** | 19.6 ms | **1.03× faster** |
-| list append | 5.2 ms | 5.1 ms | 0.98× |
-| comprehension | 5.6 ms | 5.4 ms | 0.96× |
-| dict store | 8.2 ms | 7.8 ms | 0.95× |
-| `and` / `or` | 6.1 ms | 5.7 ms | 0.93× |
-| f-string | 21.6 ms | 17.4 ms | 0.80× |
-| string concatenation | 15.7 ms | 12.2 ms | 0.78× |
-| subscript | 8.4 ms | 6.0 ms | 0.72× |
-| `try` that does not raise | 5.2 ms | 3.6 ms | 0.69× |
-| module global read | 5.4 ms | 3.6 ms | 0.68× |
-| `for` over a list | 4.4 ms | 2.9 ms | 0.65× |
-| dict lookup by name | 7.0 ms | 4.6 ms | 0.65× |
-| closure call | 10.2 ms | 6.6 ms | 0.65× |
-| attribute read | 6.2 ms | 3.6 ms | 0.59× |
-| `isinstance` | 11.8 ms | 6.0 ms | 0.51× |
-| attribute write | 6.7 ms | 3.1 ms | 0.47× |
-| instantiation | 37.4 ms | 16.1 ms | 0.43× |
-| method call | 15.3 ms | 6.6 ms | 0.43× |
-| `in` on a list | 24.3 ms | 9.1 ms | 0.37× |
-| tuple unpacking | 15.3 ms | 5.5 ms | 0.36× |
+| direct function call | **2.9 ms** | 7.2 ms | **2.49× faster** |
+| integer arithmetic | **5.2 ms** | 8.5 ms | **1.62× faster** |
+| `while` loop | **4.6 ms** | 6.2 ms | **1.35× faster** |
+| comparisons | **3.6 ms** | 4.6 ms | **1.27× faster** |
+| float arithmetic | **5.3 ms** | 5.8 ms | **1.10× faster** |
+| exception raise/catch | **18.8 ms** | 20.0 ms | **1.06× faster** |
+| `in` on a list | **8.9 ms** | 9.0 ms | **1.02× faster** |
+| list append | 5.3 ms | 5.2 ms | 0.99× |
+| comprehension | 5.6 ms | 5.5 ms | 0.98× |
+| dict store | 8.4 ms | 8.0 ms | 0.96× |
+| `and` / `or` | 6.1 ms | 5.8 ms | 0.95× |
+| `isinstance` | 7.4 ms | 6.0 ms | 0.80× |
+| f-string | 22.2 ms | 17.8 ms | 0.80× |
+| string concatenation | 16.0 ms | 12.4 ms | 0.78× |
+| module global read | 5.3 ms | 3.9 ms | 0.73× |
+| subscript | 8.5 ms | 6.0 ms | 0.71× |
+| `try` that does not raise | 5.4 ms | 3.8 ms | 0.70× |
+| closure call | 10.2 ms | 6.7 ms | 0.66× |
+| `for` over a list | 4.3 ms | 2.8 ms | 0.65× |
+| dict lookup by name | 7.5 ms | 4.6 ms | 0.61× |
+| attribute read | 6.2 ms | 3.7 ms | 0.59× |
+| attribute write | 6.5 ms | 3.0 ms | 0.47× |
+| instantiation | 37.6 ms | 16.4 ms | 0.44× |
+| method call | 15.6 ms | 6.5 ms | 0.42× |
+| tuple unpacking | 15.4 ms | 5.5 ms | 0.36× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -737,7 +737,7 @@ and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Eleven of the twenty-five rows above sit at 0.80× or better and six beat the
+Thirteen of the twenty-five rows above sit at 0.80× or better and seven beat the
 interpreter outright. Most of them did not a short while ago, and the reason
 each moved is worth having in one place, because none of it was a matter of
 turning something up.
@@ -1272,6 +1272,34 @@ runtime and library adapters.
 ## Release notes
 
 Newest first. Older releases are in the repository's history.
+
+### 0.9.5 - a test wants a verdict, and a builtin has an entry point
+
+Two of the rows added in 0.9.4 turned out to be the same mistake the `and`/`or`
+row was, one level along.
+
+**`if x in xs` built a boolean and then asked what it meant.**
+`PySequence_Contains` answers 1, 0 or -1 - the verdict already - and the
+condition looked `True` up *by name on the builtins module*, made the object,
+and handed it to `PyObject_IsTrue`. It goes straight through now. **0.37× →
+1.02×**, which is the largest single move so far and puts the row past the
+interpreter.
+
+**`isinstance(x, C)` went the long way round.** Finding the callable and
+dispatching through it, where `PyObject_IsInstance` is what the builtin does -
+and in a condition its answer is the verdict, so again no object. **0.51× →
+0.80×.** Only when the program has not bound the name: a module defining its
+own `isinstance` still gets its own, which is the bug class this project has
+now hit six times and which has a test here rather than an argument. The class
+argument is still looked up live.
+
+Thirteen of the twenty-five rows now sit at 0.80× or better and seven beat the
+interpreter, from eleven and six.
+
+Worth recording: `PyObject_IsInstance` was already vetted and already declared,
+so the four-place registration this project requires for a new entry point was
+started and then reverted rather than left as a duplicate the C compiler would
+reject.
 
 ### 0.9.4 - the grid was blind to its own worst rows
 

@@ -3,152 +3,152 @@
   "rows": [
     {
       "row": "direct function call",
-      "py2bin_ms": 2.86,
-      "cpython_ms": 7.05,
-      "ratio": 2.46
+      "py2bin_ms": 2.9,
+      "cpython_ms": 7.22,
+      "ratio": 2.49
     },
     {
       "row": "integer arithmetic",
-      "py2bin_ms": 5.15,
-      "cpython_ms": 8.25,
-      "ratio": 1.6
+      "py2bin_ms": 5.24,
+      "cpython_ms": 8.48,
+      "ratio": 1.62
     },
     {
       "row": "while loop",
-      "py2bin_ms": 4.5,
-      "cpython_ms": 6.2,
-      "ratio": 1.38
+      "py2bin_ms": 4.57,
+      "cpython_ms": 6.18,
+      "ratio": 1.35
     },
     {
       "row": "comparisons",
-      "py2bin_ms": 3.61,
-      "cpython_ms": 4.61,
-      "ratio": 1.28
+      "py2bin_ms": 3.65,
+      "cpython_ms": 4.62,
+      "ratio": 1.27
     },
     {
       "row": "float arithmetic",
-      "py2bin_ms": 5.36,
-      "cpython_ms": 5.64,
-      "ratio": 1.05
+      "py2bin_ms": 5.32,
+      "cpython_ms": 5.83,
+      "ratio": 1.1
     },
     {
       "row": "exception raise catch",
-      "py2bin_ms": 19.0,
-      "cpython_ms": 19.59,
-      "ratio": 1.03
+      "py2bin_ms": 18.77,
+      "cpython_ms": 19.96,
+      "ratio": 1.06
+    },
+    {
+      "row": "membership list",
+      "py2bin_ms": 8.91,
+      "cpython_ms": 9.04,
+      "ratio": 1.02
     },
     {
       "row": "list append",
-      "py2bin_ms": 5.2,
-      "cpython_ms": 5.11,
-      "ratio": 0.98
+      "py2bin_ms": 5.29,
+      "cpython_ms": 5.25,
+      "ratio": 0.99
     },
     {
       "row": "comprehension",
-      "py2bin_ms": 5.62,
-      "cpython_ms": 5.41,
-      "ratio": 0.96
+      "py2bin_ms": 5.59,
+      "cpython_ms": 5.48,
+      "ratio": 0.98
     },
     {
       "row": "dict store",
-      "py2bin_ms": 8.18,
-      "cpython_ms": 7.81,
-      "ratio": 0.95
+      "py2bin_ms": 8.37,
+      "cpython_ms": 8.03,
+      "ratio": 0.96
     },
     {
       "row": "boolean operators",
       "py2bin_ms": 6.08,
-      "cpython_ms": 5.66,
-      "ratio": 0.93
+      "cpython_ms": 5.75,
+      "ratio": 0.95
+    },
+    {
+      "row": "isinstance check",
+      "py2bin_ms": 7.42,
+      "cpython_ms": 5.96,
+      "ratio": 0.8
     },
     {
       "row": "f string",
-      "py2bin_ms": 21.65,
-      "cpython_ms": 17.39,
+      "py2bin_ms": 22.25,
+      "cpython_ms": 17.77,
       "ratio": 0.8
     },
     {
       "row": "string concatenation",
-      "py2bin_ms": 15.72,
-      "cpython_ms": 12.23,
+      "py2bin_ms": 16.0,
+      "cpython_ms": 12.42,
       "ratio": 0.78
     },
     {
+      "row": "global read",
+      "py2bin_ms": 5.33,
+      "cpython_ms": 3.87,
+      "ratio": 0.73
+    },
+    {
       "row": "subscript",
-      "py2bin_ms": 8.38,
+      "py2bin_ms": 8.51,
       "cpython_ms": 6.03,
-      "ratio": 0.72
+      "ratio": 0.71
     },
     {
       "row": "try no raise",
-      "py2bin_ms": 5.19,
-      "cpython_ms": 3.59,
-      "ratio": 0.69
+      "py2bin_ms": 5.43,
+      "cpython_ms": 3.79,
+      "ratio": 0.7
     },
     {
-      "row": "global read",
-      "py2bin_ms": 5.37,
-      "cpython_ms": 3.65,
-      "ratio": 0.68
+      "row": "closure call",
+      "py2bin_ms": 10.15,
+      "cpython_ms": 6.66,
+      "ratio": 0.66
     },
     {
       "row": "for over list",
-      "py2bin_ms": 4.37,
-      "cpython_ms": 2.85,
+      "py2bin_ms": 4.34,
+      "cpython_ms": 2.84,
       "ratio": 0.65
     },
     {
       "row": "dict lookup str",
-      "py2bin_ms": 7.04,
-      "cpython_ms": 4.58,
-      "ratio": 0.65
-    },
-    {
-      "row": "closure call",
-      "py2bin_ms": 10.17,
-      "cpython_ms": 6.59,
-      "ratio": 0.65
+      "py2bin_ms": 7.53,
+      "cpython_ms": 4.59,
+      "ratio": 0.61
     },
     {
       "row": "attribute read",
-      "py2bin_ms": 6.2,
-      "cpython_ms": 3.64,
+      "py2bin_ms": 6.25,
+      "cpython_ms": 3.71,
       "ratio": 0.59
     },
     {
-      "row": "isinstance check",
-      "py2bin_ms": 11.79,
-      "cpython_ms": 6.04,
-      "ratio": 0.51
-    },
-    {
       "row": "attribute write",
-      "py2bin_ms": 6.65,
-      "cpython_ms": 3.15,
+      "py2bin_ms": 6.51,
+      "cpython_ms": 3.05,
       "ratio": 0.47
     },
     {
       "row": "instantiation",
-      "py2bin_ms": 37.38,
-      "cpython_ms": 16.11,
-      "ratio": 0.43
+      "py2bin_ms": 37.59,
+      "cpython_ms": 16.37,
+      "ratio": 0.44
     },
     {
       "row": "method call",
-      "py2bin_ms": 15.3,
-      "cpython_ms": 6.58,
-      "ratio": 0.43
-    },
-    {
-      "row": "membership list",
-      "py2bin_ms": 24.28,
-      "cpython_ms": 9.08,
-      "ratio": 0.37
+      "py2bin_ms": 15.58,
+      "cpython_ms": 6.5,
+      "ratio": 0.42
     },
     {
       "row": "tuple unpack",
-      "py2bin_ms": 15.27,
-      "cpython_ms": 5.5,
+      "py2bin_ms": 15.44,
+      "cpython_ms": 5.49,
       "ratio": 0.36
     }
   ]

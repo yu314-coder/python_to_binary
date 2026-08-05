@@ -1475,6 +1475,20 @@ class CApiEmitter:
                 opened -= 1
                 self.emit("}", indent + opened)
             return decision
+        if isinstance(node, ast.Call):
+            settled = self.isinstance_verdict(node, indent)
+            if settled is not None:
+                return settled
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.In, ast.NotIn))
+        ):
+            # `PySequence_Contains` answers the verdict directly, so `if x in
+            # xs` needs no object at all. It used to build `True` or `False`
+            # by looking the name up on the builtins module and then ask
+            # `PyObject_IsTrue` what it had built.
+            return self.membership_verdict(node, indent)
         if (
             isinstance(node, ast.UnaryOp)
             and isinstance(node.op, ast.Not)
@@ -3006,22 +3020,69 @@ class CApiEmitter:
         self.emit("}", indent)
         return self.checked(target, indent)
 
-    def membership(self, node: ast.Compare, indent: int) -> str:
-        """`x in xs` - PySequence_Contains, which answers 1, 0 or -1.
+    def isinstance_verdict(self, node: ast.Call, indent: int) -> str | None:
+        """`isinstance(x, C)` as a C int, or None if this call is not that.
+
+        `PyObject_IsInstance` is what the builtin does, so going straight to
+        it skips finding the callable and dispatching through it - and in a
+        condition the 1/0/-1 it answers is already the verdict, with no
+        `True` to build and nothing to ask what it meant.
+
+        Only when the program has not bound the name, as with `len` and
+        `str`. The class argument is still looked up live: replacing
+        `builtins.isinstance` is one thing, and a program naming its own
+        class is another.
+        """
+
+        if (
+            not isinstance(node.func, ast.Name)
+            or node.func.id != "isinstance"
+            or node.keywords
+            or len(node.args) != 2
+            or any(isinstance(item, ast.Starred) for item in node.args)
+            or not self.builtin_untouched("isinstance")
+        ):
+            return None
+        value, value_owned = self.operand(node.args[0], indent)
+        classes, classes_owned = self.operand(node.args[1], indent)
+        decision = self.temporary_flag()
+        self.emit(
+            f"{decision} = PyObject_IsInstance({value}, {classes});", indent
+        )
+        self.release(value, value_owned, indent)
+        self.release(classes, classes_owned, indent)
+        self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
+        return decision
+
+    def membership_verdict(self, node: ast.Compare, indent: int) -> str:
+        """`x in xs` as a C int, which is what `PySequence_Contains` answers.
 
         The -1 is a failure and not a false, so it is tested for separately;
         treating it as false would turn a raised exception into an answer.
         """
 
-        value = self.expression(node.left, indent)
-        container = self.expression(node.comparators[0], indent)
+        value, value_owned = self.operand(node.left, indent)
+        container, container_owned = self.operand(node.comparators[0], indent)
         decision = self.temporary_flag()
         self.emit(f"{decision} = PySequence_Contains({container}, {value});", indent)
-        self.emit(f"Py_DecRef({value});", indent)
-        self.emit(f"Py_DecRef({container});", indent)
+        self.release(value, value_owned, indent)
+        self.release(container, container_owned, indent)
         self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", indent)
         if isinstance(node.ops[0], ast.NotIn):
             self.emit(f"{decision} = !{decision};", indent)
+        return decision
+
+    def membership(self, node: ast.Compare, indent: int) -> str:
+        """`x in xs` as a value - `True` or `False` built from the verdict.
+
+        Only where a *value* was asked for. `if x in xs` goes through `truth`
+        instead, which stops here: the verdict is already the answer, and
+        building `True` out of it - by name, through an attribute lookup on
+        the builtins module - only to ask what it meant was most of what the
+        test cost.
+        """
+
+        decision = self.membership_verdict(node, indent)
         target = self.temporary()
         self.emit(f"if ({decision}) {{", indent)
         self.emit(

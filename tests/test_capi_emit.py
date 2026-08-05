@@ -491,6 +491,62 @@ class CApiEmitTests(unittest.TestCase):
             b"not enough values to unpack (expected 3, got 2)",
         )
 
+    def test_a_membership_test_builds_no_boolean(self):
+        # `PySequence_Contains` answers 1, 0 or -1 - already the verdict. The
+        # condition used to build `True` by looking the name up on the
+        # builtins module, then ask `PyObject_IsTrue` what it had built.
+        generated = python_to_capi_c(
+            "def f(xs):\n    if 5 in xs:\n        return 1\n    return 0\n"
+            "print(f([5]))\n",
+            "program.py",
+        )
+        body = generated[generated.index("static PyObject *f_f("):]
+        body = body[: body.index("\n}\n")]
+        self.assertIn("PySequence_Contains", body)
+        self.assertNotIn('GetAttrString(_py2bin_builtins, "True")', body)
+
+    def test_membership_still_answers_with_a_value_where_one_is_wanted(self):
+        self._run(
+            "xs = [1, 2]\n"
+            "print(1 in xs, 9 in xs, 1 not in xs, 9 not in xs)\n",
+            b"True False False True\n",
+        )
+
+    def test_a_container_that_raises_is_not_read_as_a_verdict(self):
+        # -1 is a failure, not a false. Treating it as one would swallow the
+        # exception and take the wrong branch.
+        self._run_failing(
+            "class Boom:\n"
+            "    def __contains__(self, value):\n"
+            "        raise ValueError('no')\n"
+            "if 1 in Boom():\n"
+            "    print('unreachable')\n",
+            b"ValueError",
+        )
+
+    def test_isinstance_goes_straight_to_the_entry_point(self):
+        generated = python_to_capi_c(
+            "def f(x):\n    if isinstance(x, int):\n        return 1\n    return 0\n"
+            "print(f(1))\n",
+            "program.py",
+        )
+        body = generated[generated.index("static PyObject *f_f("):]
+        body = body[: body.index("\n}\n")]
+        self.assertIn("PyObject_IsInstance", body)
+
+    def test_a_program_with_its_own_isinstance_gets_its_own(self):
+        # The bug class this project has hit five times: a shortcut keyed on a
+        # name must first check the program has not bound that name.
+        self._run(
+            "def isinstance(a, b):\n"
+            "    return 'MINE'\n"
+            "print(isinstance(5, int))\n",
+            b"MINE\n",
+        )
+
+    def test_isinstance_passed_as_a_value_is_still_the_builtin(self):
+        self._run("f = isinstance\nprint(f(5, int))\n", b"True\n")
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which
