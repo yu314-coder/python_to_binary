@@ -13,6 +13,9 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
+**0.8.9** hardens the last two shell paths; **0.8.8** closed five ways a downloaded archive could write outside the build -
+see *Release notes* below.
+
 ## Platforms
 
 What `compile-capi` - the tier that turns your program into machine code that
@@ -57,128 +60,6 @@ needs a Python frame to suggest from, and the repr of a compiled function
 really is a builtin function's.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six.
-
-## Security fixes in 0.8.8
-
-py2bin's safety story is that it never *runs* what it downloads - no
-`setup.py`, no pip, no install hooks. Unpacking is therefore the only moment a
-hostile wheel or runtime pack acts at all, and it was not being guarded well
-enough. Reported by a static scan; each was reproduced before it was fixed.
-
-**A symbolic link in an archive could write outside the build.** Three callers
-each checked containment by resolving where a member would land and comparing
-strings. Both halves fail: `resolve()` runs *before* extraction, so a link the
-archive is about to create is not there to be resolved through - `esc -> ..`
-followed by `esc/passwd` passed both members and `extractall` then followed the
-link it had just made - and `/tmp/outsider` starts with `/tmp/out`. Reproduced
-on Python 3.11, writing a file outside the destination. Python 3.14 happens to
-stop it because `extractall` defaults to the `data` filter there; this project
-supports 3.10 upwards, so on most of that range nothing did.
-
-Extraction now happens member by member through one shared implementation
-(`py2bin.archives`), never `extractall`, with every member judged before
-anything is written. Links are *validated*, not banned: a CPython framework is
-a structure of symbolic links, and a runtime pack that lost them would not run.
-
-**A wheel could escape on Windows through a backslash.** `..\..\x` is a
-single atom to a POSIX path - no `..` part, not absolute, so it passed - and
-then becomes a traversal when Windows splits it again. One of the two copies
-of this rule refused the character and the other did not.
-
-**An archive could expand without limit.** Member *count* was capped, which
-says nothing about size.
-
-**A fetched runtime is no longer trusted silently.** `--fetch-lock` now exists
-on `compile-capi` as well as `freeze`, so the tier most people use can pin what
-it downloads. python.org publishes a GPG signature for the Windows embeddable
-CPython and no SHA-256, so there is nothing to verify against on a first fetch:
-that is now said out loud, with the digest and how to pin it, instead of being
-recorded quietly and compared against on later builds.
-
-A refused download now reports as one line rather than a traceback, and a test
-asserts no fetching path can go back to unpacking its own way.
-
-## New in 0.8.7
-
-**A long function no longer needs a bigger stack frame than a short one.**
-Every intermediate the C lowering needed took a stack slot and never gave it
-back, so a function's frame grew with its *length* rather than with how much
-of it was live at once. About eighteen hundred statements in a single `def`
-reached the 512 KB budget and the build was refused outright - which generated
-code walks into without doing anything unusual. Slots taken for a statement's
-temporaries are handed back when it finishes, and the frame is now built from
-the high-water mark rather than from what happens to be outstanding at the
-end. Forty thousand statements in one function compile and answer correctly,
-where 1,900 was refused before.
-
-Two things had to be got right and both have tests. A local, or the scratch
-area the float formatter allocates the first time a program prints a double,
-outlives the statement that created it - reclaiming those handed a later
-statement slots something still held, which did not print wrong numbers but
-exhausted the heap. And reclaiming is per statement rather than per
-expression, which is what keeps a loop's condition alive across its own body.
-
-**A decorator written without the `@` was skipped.** `greet = trace(greet)`
-kept calling the undecorated body: a module-level `def` became a direct C call
-keyed on the name alone, so a later rebinding of that name was never
-consulted. A `def` now earns the direct call only when it is the one thing
-binding the name at module scope.
-
-Three more of the same shape, all asking *does the module bind this name*
-where the question is *is it bound yet*: `print(y)` above `y = 5` handed the
-program a raw NULL instead of raising `NameError`, the same for a class used
-above its `class`, and a call above its own `def` answered rather than
-raising. The replacement rule is positional, so a function may still call one
-written below it and recursion keeps the direct call. Nine tests pin it, five
-of which fail against 0.8.6; no measurable speed cost.
-
-## New in 0.8.6
-
-**0.8.5 could not build anything through `py2bin make` or `build.py`.** An
-`append` option nobody passed is `None` rather than an empty list, and the
-change that stopped `--exclude` fetching what it excluded read it without a
-default - so every `--auto-fetch` build without `--exclude` stopped with a
-`TypeError`. Fixed, and every `append` option is now checked for a default by
-a test.
-
-The three questions offer six machines rather than five (`linux-x86_64` was
-missing), Linux gains a one-file shape, and all sixteen target-and-shape
-combinations are driven through `build.py` end to end in testing.
-
-A helper naming a module constant, or calling another helper, is now written
-out at its call site: `bump(v)` over `weigh(v)` collapses to `v * SCALE + 1`,
-0.67x to 1.26x against the interpreter.
-
-## New in 0.8.5
-
-A correctness sweep. Each of these produced a *wrong result rather than an
-error*, which is the worst way for a compiler to be wrong; all are now pinned
-by tests.
-
-- A name the program bound was ignored - its own `len`, `str`, `print` or
-  `super` lost to the builtin, and a module-level function called through a
-  rebound name calling the wrong one.
-- A bundle could not find the packages it carried, on Linux: the program asked
-  CPython where it was, and CPython - handed no argument vector - answered with
-  its own installation.
-- `sys.argv` held one entry this compiler had put there, so a command-line tool
-  could not read what it was asked to do. It is taken from the operating system
-  now.
-- `len(5)` answered `-1` instead of raising, leaving the `TypeError` set.
-- A two-piece f-string ran `__add__`; an f-string joins.
-- A wheel's executable bit was dropped, so a package shipping a helper program
-  could not start it.
-
-Two that destroyed things: `--clean` removed whatever was at the output path,
-directory and contents; `--include` removed its own source when the output was
-in the same directory. Both are refused now.
-
-New: `--onefile` for a macOS `.app` and for targets with no bundle;
-`--exclude` reaching the fetch rather than downloading what it excluded; a
-syntax error reported with file, line and column instead of a traceback.
-
-Faster too - seven of sixteen measured operations now beat CPython, where two
-did. See the table below.
 
 ## What it guarantees
 
@@ -658,6 +539,161 @@ rather than on the heap, with the overflow check that falls back to unbounded
 arithmetic when it leaves the word. Calls still lose: an argument is boxed at
 the call and unboxed inside, where the interpreter's specialised call pays
 neither.
+
+## Release notes
+
+Newest first. The full history is in the repository.
+
+### 0.8.9 - nothing reaches a shell uninspected
+
+The two low-severity findings from the same scan as 0.8.8, closed for the same
+reason: a value that reaches a shell uninspected is a bug waiting for a context
+where it matters. Neither was a way in for an attacker who did not already have
+one - to steer the URL you must already control the package about to be
+installed, and `--python` is supplied by whoever is running the build.
+
+**The launcher scripts quote what they are given.** `--python` and the bundle's
+name were pasted straight into `/bin/sh`. It could not simply be quoted whole:
+the default is `/usr/bin/env python3`, two words, and quoting the pair would ask
+the shell for one executable whose name contains a space. It is split the way a
+shell would and each word quoted on its own, which leaves every ordinary value
+identical and no metacharacter for the shell to act on. The bundle's name goes
+into a variable as a quoted literal rather than into the middle of a path.
+
+**The bootstrapper's PowerShell fallback interpolates nothing.** The other three
+downloaders take an argument vector, which no shell reads; PowerShell is handed
+one string and parses it itself, so a single quote in a URL ended the quoted
+argument. The URL and the destination now arrive as environment variables -
+nothing is interpolated, so there is nothing to escape and no escaping to get
+wrong later.
+
+Thirteen tests, twelve of which fail against 0.8.8.
+
+Housekeeping: the release notes were four sections sitting in the middle of
+both READMEs, between the reference material and the guarantees. They are one
+section at the end now.
+
+### 0.8.8 - archives, and what they may not do
+
+py2bin's safety story is that it never *runs* what it downloads - no
+`setup.py`, no pip, no install hooks. Unpacking is therefore the only moment a
+hostile wheel or runtime pack acts at all, and it was not being guarded well
+enough. Reported by a static scan; each was reproduced before it was fixed.
+
+**A symbolic link in an archive could write outside the build.** Three callers
+each checked containment by resolving where a member would land and comparing
+strings. Both halves fail: `resolve()` runs *before* extraction, so a link the
+archive is about to create is not there to be resolved through - `esc -> ..`
+followed by `esc/passwd` passed both members and `extractall` then followed the
+link it had just made - and `/tmp/outsider` starts with `/tmp/out`. Reproduced
+on Python 3.11, writing a file outside the destination. Python 3.14 happens to
+stop it because `extractall` defaults to the `data` filter there; this project
+supports 3.10 upwards, so on most of that range nothing did.
+
+Extraction now happens member by member through one shared implementation
+(`py2bin.archives`), never `extractall`, with every member judged before
+anything is written. Links are *validated*, not banned: a CPython framework is
+a structure of symbolic links, and a runtime pack that lost them would not run.
+
+**A wheel could escape on Windows through a backslash.** `..\..\x` is a
+single atom to a POSIX path - no `..` part, not absolute, so it passed - and
+then becomes a traversal when Windows splits it again. One of the two copies
+of this rule refused the character and the other did not.
+
+**An archive could expand without limit.** Member *count* was capped, which
+says nothing about size.
+
+**A fetched runtime is no longer trusted silently.** `--fetch-lock` now exists
+on `compile-capi` as well as `freeze`, so the tier most people use can pin what
+it downloads. python.org publishes a GPG signature for the Windows embeddable
+CPython and no SHA-256, so there is nothing to verify against on a first fetch:
+that is now said out loud, with the digest and how to pin it, instead of being
+recorded quietly and compared against on later builds.
+
+A refused download now reports as one line rather than a traceback, and a test
+asserts no fetching path can go back to unpacking its own way.
+
+### 0.8.7 - long functions, and names that are not bound yet
+
+**A long function no longer needs a bigger stack frame than a short one.**
+Every intermediate the C lowering needed took a stack slot and never gave it
+back, so a function's frame grew with its *length* rather than with how much
+of it was live at once. About eighteen hundred statements in a single `def`
+reached the 512 KB budget and the build was refused outright - which generated
+code walks into without doing anything unusual. Slots taken for a statement's
+temporaries are handed back when it finishes, and the frame is now built from
+the high-water mark rather than from what happens to be outstanding at the
+end. Forty thousand statements in one function compile and answer correctly,
+where 1,900 was refused before.
+
+Two things had to be got right and both have tests. A local, or the scratch
+area the float formatter allocates the first time a program prints a double,
+outlives the statement that created it - reclaiming those handed a later
+statement slots something still held, which did not print wrong numbers but
+exhausted the heap. And reclaiming is per statement rather than per
+expression, which is what keeps a loop's condition alive across its own body.
+
+**A decorator written without the `@` was skipped.** `greet = trace(greet)`
+kept calling the undecorated body: a module-level `def` became a direct C call
+keyed on the name alone, so a later rebinding of that name was never
+consulted. A `def` now earns the direct call only when it is the one thing
+binding the name at module scope.
+
+Three more of the same shape, all asking *does the module bind this name*
+where the question is *is it bound yet*: `print(y)` above `y = 5` handed the
+program a raw NULL instead of raising `NameError`, the same for a class used
+above its `class`, and a call above its own `def` answered rather than
+raising. The replacement rule is positional, so a function may still call one
+written below it and recursion keeps the direct call. Nine tests pin it, five
+of which fail against 0.8.6; no measurable speed cost.
+
+### 0.8.6 - repairing 0.8.5, and six machines
+
+**0.8.5 could not build anything through `py2bin make` or `build.py`.** An
+`append` option nobody passed is `None` rather than an empty list, and the
+change that stopped `--exclude` fetching what it excluded read it without a
+default - so every `--auto-fetch` build without `--exclude` stopped with a
+`TypeError`. Fixed, and every `append` option is now checked for a default by
+a test.
+
+The three questions offer six machines rather than five (`linux-x86_64` was
+missing), Linux gains a one-file shape, and all sixteen target-and-shape
+combinations are driven through `build.py` end to end in testing.
+
+A helper naming a module constant, or calling another helper, is now written
+out at its call site: `bump(v)` over `weigh(v)` collapses to `v * SCALE + 1`,
+0.67x to 1.26x against the interpreter.
+
+### 0.8.5 - a correctness sweep
+
+A correctness sweep. Each of these produced a *wrong result rather than an
+error*, which is the worst way for a compiler to be wrong; all are now pinned
+by tests.
+
+- A name the program bound was ignored - its own `len`, `str`, `print` or
+  `super` lost to the builtin, and a module-level function called through a
+  rebound name calling the wrong one.
+- A bundle could not find the packages it carried, on Linux: the program asked
+  CPython where it was, and CPython - handed no argument vector - answered with
+  its own installation.
+- `sys.argv` held one entry this compiler had put there, so a command-line tool
+  could not read what it was asked to do. It is taken from the operating system
+  now.
+- `len(5)` answered `-1` instead of raising, leaving the `TypeError` set.
+- A two-piece f-string ran `__add__`; an f-string joins.
+- A wheel's executable bit was dropped, so a package shipping a helper program
+  could not start it.
+
+Two that destroyed things: `--clean` removed whatever was at the output path,
+directory and contents; `--include` removed its own source when the output was
+in the same directory. Both are refused now.
+
+New: `--onefile` for a macOS `.app` and for targets with no bundle;
+`--exclude` reaching the fetch rather than downloading what it excluded; a
+syntax error reported with file, line and column instead of a traceback.
+
+Faster too - seven of sixteen measured operations now beat CPython, where two
+did. See the table below.
 
 ## Licence
 

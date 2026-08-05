@@ -42,9 +42,17 @@ _DOWNLOADERS = (
     ("curl", ["curl", "-fsSL", "--retry", "2", "-o", "{out}", "{url}"]),
     ("wget", ["wget", "-q", "-O", "{out}", "{url}"]),
     ("fetch", ["fetch", "-q", "-o", "{out}", "{url}"]),
+    # The URL and the path are handed over as environment variables rather
+    # than pasted into the command. The other three downloaders take an
+    # argument vector, which no shell reads; PowerShell is given one string
+    # and parses it itself, so a single quote in a URL used to end the quoted
+    # argument and whatever followed was PowerShell's to run. Nothing is
+    # interpolated now, so there is nothing to escape and no escaping to get
+    # wrong later.
     ("powershell", [
         "powershell", "-NoProfile", "-Command",
-        "Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile '{out}'",
+        "Invoke-WebRequest -UseBasicParsing -Uri $env:PY2BIN_FETCH_URL "
+        "-OutFile $env:PY2BIN_FETCH_OUT",
     ]),
 )
 
@@ -62,10 +70,15 @@ def _by_command(url: str, label: str) -> bytes | None:
             command = [
                 part.format(out=str(out), url=url) for part in template
             ]
+            environment = dict(
+                os.environ,
+                PY2BIN_FETCH_URL=url,
+                PY2BIN_FETCH_OUT=str(out),
+            )
             say(f"  (python could not reach the network; trying {name})")
             try:
                 finished = subprocess.run(
-                    command, capture_output=True, timeout=300
+                    command, capture_output=True, timeout=300, env=environment
                 )
             except (OSError, subprocess.SubprocessError):
                 continue

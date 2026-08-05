@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata as metadata
 import json
 import os
+import shlex
 import shutil
 import stat
 import tempfile
@@ -94,11 +95,36 @@ def _write_runtime(stage: Path, config: BuildConfig, analysis) -> Path:
     return manifest_path
 
 
+def _runtime_command(python: str) -> str:
+    """`--python` as words a shell will run, and not as anything else.
+
+    It cannot simply be quoted whole: the default is `/usr/bin/env python3`,
+    two words, and `shlex.quote` on the pair would ask the shell for one
+    executable whose name contains a space. So it is split the way a shell
+    would and each word quoted on its own - which keeps every ordinary value
+    working while leaving no metacharacter for the shell to act on.
+    """
+
+    try:
+        words = shlex.split(python)
+    except ValueError as error:
+        raise ValueError(
+            f"--python is not a command line a shell could read: {python!r}"
+        ) from error
+    if not words:
+        raise ValueError("--python is empty")
+    return " ".join(shlex.quote(word) for word in words)
+
+
 def _launcher(path: Path, bundle: Path, python: str) -> None:
+    # The bundle's name goes into a shell variable as a quoted literal rather
+    # than into the middle of a double-quoted path, where a `$` or a backtick
+    # in it would be read rather than used.
     path.write_text(
         "#!/bin/sh\n"
         "set -eu\n"
-        f'exec {python} "$(dirname "$0")/{bundle.name}/runtime/bootstrap.py" "$@"\n',
+        f"BUNDLE={shlex.quote(bundle.name)}\n"
+        f'exec {_runtime_command(python)} "$(dirname "$0")/$BUNDLE/runtime/bootstrap.py" "$@"\n',
         encoding="utf-8",
         newline="\n",
     )
@@ -123,7 +149,7 @@ def _make_app(
         "#!/bin/sh\n"
         "set -eu\n"
         f'ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../Resources/bundle" && pwd)"\n'
-        f'exec {python} "$ROOT/runtime/bootstrap.py" "$@"\n',
+        f'exec {_runtime_command(python)} "$ROOT/runtime/bootstrap.py" "$@"\n',
         encoding="utf-8",
         newline="\n",
     )
