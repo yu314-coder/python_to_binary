@@ -1479,6 +1479,43 @@ class CApiEmitter:
                 opened -= 1
                 self.emit("}", indent + opened)
             return decision
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) > 1
+            and all(type(operation) in _COMPARISONS for operation in node.ops)
+        ):
+            # A chain of operands that cost nothing to read twice - a name or
+            # a literal - is written out as the `and` Python says it means.
+            # That is worth more than comparing them where they stand: each
+            # link is then an ordinary two-sided comparison, and picks up the
+            # machine comparison that `0 < i` would have had on its own.
+            # Naming the operands is what makes the rewrite safe; anything
+            # that could be evaluated twice keeps the slots below, which is
+            # what the chain is for.
+            if all(
+                isinstance(part, ast.Name)
+                or (isinstance(part, ast.Constant))
+                for part in (node.left, *node.comparators)
+            ):
+                operands = [node.left, *node.comparators]
+                links = [
+                    ast.copy_location(
+                        ast.Compare(
+                            left=operands[index],
+                            ops=[operation],
+                            comparators=[operands[index + 1]],
+                        ),
+                        node,
+                    )
+                    for index, operation in enumerate(node.ops)
+                ]
+                return self.truth(
+                    ast.copy_location(
+                        ast.BoolOp(op=ast.And(), values=links), node
+                    ),
+                    indent,
+                )
+            return self.chain_verdict(node, indent)
         if isinstance(node, ast.Call):
             settled = self.isinstance_verdict(node, indent)
             if settled is not None:
@@ -2087,6 +2124,52 @@ class CApiEmitter:
         for slot in slots:
             self.emit(f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent)
         return target
+
+    def chain_verdict(self, node: ast.Compare, indent: int) -> str:
+        """`0 < i < n` as a C int, with each operand evaluated once.
+
+        The same shape as the value form beside it, with the object left out:
+        every link built a `True` or a `False` through `PyObject_RichCompare`
+        and then asked `PyObject_IsTrue` what it had built, where
+        `PyObject_RichCompareBool` answers 1, 0 or -1 directly. A chained
+        comparison in a condition measured 0.46x the interpreter.
+
+        The middle operand is still computed once however many links mention
+        it - that is what the slots are for - and a link that short-circuits
+        still leaves the later operands unevaluated, which a call with a side
+        effect would notice.
+        """
+
+        operands = [node.left, *node.comparators]
+        slots = [self.temporary() for _ in operands]
+        for slot in slots:
+            self.emit(f"{slot} = 0;", indent)
+        decision = self.temporary_flag()
+        self.emit(f"{decision} = 1;", indent)
+        depth = 0
+        for index, operation in enumerate(node.ops):
+            inner = indent + depth
+            for position in (index, index + 1):
+                if position == index and index > 0:
+                    continue  # already computed as the previous link's right
+                value = self.expression(operands[position], inner)
+                self.emit(f"{slots[position]} = {value};", inner)
+            self.emit(
+                f"{decision} = PyObject_RichCompareBool({slots[index]}, "
+                f"{slots[index + 1]}, {_COMPARISONS[type(operation)]});",
+                inner,
+            )
+            self.emit(f"if ({decision} < 0) {{ {self.failure()} }}", inner)
+            if index + 1 == len(node.ops):
+                break
+            self.emit(f"if ({decision}) {{", inner)
+            depth += 1
+        while depth:
+            depth -= 1
+            self.emit("}", indent + depth)
+        for slot in slots:
+            self.emit(f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent)
+        return decision
 
     def conditional_expression(self, node: ast.IfExp, indent: int) -> str:
         """`a if c else b` - a real branch, so only one arm is evaluated."""
@@ -6163,12 +6246,16 @@ class CApiEmitter:
             source = gathered
 
         def from_keywords(name: str, slot: str) -> None:
-            key = self.temporary()
             if source == "0":
                 return
+            # The parameter's own name, interned once at start-up. This built
+            # it from a C string on every call, for every parameter a keyword
+            # could fill - an allocation and a hash per parameter per call, to
+            # look up a name that never changes. Interning also makes the
+            # dictionary probe a pointer comparison rather than a character
+            # one.
+            key = self.interned(name)
             self.emit(f"if (!{slot} && {source}) {{", indent)
-            self.emit(f"{key} = PyUnicode_FromString({_c_string(name)});", indent + 1)
-            self.checked(key, indent + 1)
             self.emit(f"{slot} = PyObject_GetItem({source}, {key});", indent + 1)
             self.emit(f"if (!{slot}) {{", indent + 1)
             self.emit("PyErr_Clear();", indent + 2)
@@ -6180,7 +6267,6 @@ class CApiEmitter:
             # and answered where CPython raises TypeError.
             self.emit(f"PyObject_DelItem({source}, {key});", indent + 2)
             self.emit("}", indent + 1)
-            self.emit(f"Py_DecRef({key});", indent + 1)
             self.emit("}", indent)
 
         for offset, name in enumerate(positional):

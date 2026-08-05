@@ -662,6 +662,57 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, (2, 3), 4, [('z', 5)])\n",
         )
 
+    def test_a_chained_comparison_in_a_condition_builds_no_object(self):
+        # Every link built a `True` or a `False` through `PyObject_RichCompare`
+        # and then asked `PyObject_IsTrue` what it had built. Where the
+        # operands cost nothing to read twice - a name or a literal - the
+        # chain is written out as the `and` Python says it means, so each link
+        # picks up the machine comparison a two-sided one would have had.
+        generated = python_to_capi_c(
+            "def f(n):\n"
+            "    t = 0\n"
+            "    for i in range(n):\n"
+            "        if 0 < i < 99:\n"
+            "            t += 1\n"
+            "    return t\n"
+            "print(f(10))\n",
+            "program.py",
+        )
+        body = generated[generated.index("static PyObject *f_f("):]
+        body = body[: body.index("\n}\n")]
+        self.assertNotIn("= PyObject_RichCompare(", body)
+
+    def test_a_chain_evaluates_its_middle_operand_once(self):
+        # The rewrite is only allowed where an operand costs nothing to read
+        # twice. A call does not, so it keeps the slots - and `f()` must run
+        # once however many links mention it.
+        self._run(
+            "def f():\n"
+            "    print('called')\n"
+            "    return 5\n"
+            "print(1 < f() < 10)\n",
+            b"called\nTrue\n",
+        )
+
+    def test_a_chain_stops_at_the_first_false_link(self):
+        self._run(
+            "def side(tag, value):\n"
+            "    print('eval', tag)\n"
+            "    return value\n"
+            "print(side('a', 5) < side('b', 1) < side('c', 9))\n",
+            b"eval a\neval b\nFalse\n",
+        )
+
+    def test_a_chain_that_raises_mid_way_is_not_read_as_a_verdict(self):
+        self._run_failing(
+            "class Boom:\n"
+            "    def __lt__(self, other):\n"
+            "        raise ValueError('cmp')\n"
+            "if Boom() < 1 < 2:\n"
+            "    print('unreachable')\n",
+            b"ValueError",
+        )
+
     def test_a_condition_of_ands_builds_no_boolean_object(self):
         # `if a and b` wants a verdict, not a value. The whole chain used to be
         # evaluated into a Python object and then asked what it meant, which

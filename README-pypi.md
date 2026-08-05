@@ -362,31 +362,33 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.1 ms | **2.39× faster** |
+| direct function call | **3.0 ms** | 7.3 ms | **2.47× faster** |
 | integer arithmetic | **5.3 ms** | 8.5 ms | **1.61× faster** |
-| `while` loop | **4.6 ms** | 6.3 ms | **1.37× faster** |
-| comparisons | **3.7 ms** | 4.7 ms | **1.26× faster** |
-| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.05× faster** |
-| float arithmetic | **5.5 ms** | 5.8 ms | **1.04× faster** |
-| `in` on a list | 9.0 ms | 9.0 ms | 1.00× |
-| list append | 5.2 ms | 5.2 ms | 1.00× |
-| exception raise/catch | 20.1 ms | 19.8 ms | 0.98× |
-| comprehension | 5.7 ms | 5.6 ms | 0.98× |
+| `while` loop | **4.5 ms** | 6.3 ms | **1.40× faster** |
+| comparisons | **3.7 ms** | 4.6 ms | **1.27× faster** |
+| float arithmetic | **5.4 ms** | 5.7 ms | **1.06× faster** |
+| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.03× faster** |
+| `in` on a list | **8.9 ms** | 9.1 ms | **1.02× faster** |
+| list append | 5.3 ms | 5.3 ms | 0.99× |
+| exception raise/catch | 20.2 ms | 20.1 ms | 0.99× |
 | dict store | 8.4 ms | 8.0 ms | 0.95× |
-| `and` / `or` | 6.3 ms | 5.8 ms | 0.93× |
-| f-string | 21.9 ms | 17.6 ms | 0.80× |
-| `isinstance` | 7.6 ms | 6.0 ms | 0.80× |
-| string concatenation | 16.0 ms | 12.5 ms | 0.78× |
-| dict lookup by name | 6.5 ms | 4.8 ms | 0.73× |
-| subscript | 8.5 ms | 6.1 ms | 0.71× |
-| module global read | 5.4 ms | 3.7 ms | 0.69× |
-| closure call | 10.2 ms | 6.7 ms | 0.66× |
-| `for` over a list | 4.4 ms | 2.9 ms | 0.66× |
-| attribute read | 6.3 ms | 3.7 ms | 0.59× |
-| attribute write | 6.0 ms | 3.0 ms | 0.49× |
-| instantiation | 34.4 ms | 16.3 ms | 0.47× |
-| method call | 15.6 ms | 6.7 ms | 0.43× |
+| `and` / `or` | 6.1 ms | 5.7 ms | 0.93× |
+| comprehension | 6.1 ms | 5.6 ms | 0.92× |
+| `isinstance` | 7.5 ms | 6.1 ms | 0.81× |
+| f-string | 21.9 ms | 17.7 ms | 0.81× |
+| string concatenation | 16.4 ms | 12.7 ms | 0.78× |
+| subscript | 8.4 ms | 6.0 ms | 0.71× |
+| module global read | 5.4 ms | 3.8 ms | 0.69× |
+| dict lookup by name | 6.7 ms | 4.6 ms | 0.69× |
+| `for` over a list | 4.3 ms | 2.9 ms | 0.67× |
+| closure call | 11.5 ms | 6.7 ms | 0.59× |
+| chained comparison | 11.9 ms | 6.8 ms | 0.58× |
+| attribute read | 6.5 ms | 3.7 ms | 0.57× |
+| attribute write | 6.5 ms | 3.1 ms | 0.48× |
+| instantiation | 35.4 ms | 16.4 ms | 0.46× |
+| method call | 16.7 ms | 6.7 ms | 0.40× |
 | tuple unpacking | 15.4 ms | 5.6 ms | 0.36× |
+| a call naming an argument | 36.8 ms | 8.0 ms | 0.22× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -397,7 +399,7 @@ the interpreter, and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Fourteen of the twenty-five rows sit at 0.80× or better and six beat the interpreter
+Fourteen of the twenty-seven rows sit at 0.80× or better and seven beat the interpreter
 outright. Most did not a short while ago.
 
 | row | before the fix | after it | what it was |
@@ -596,8 +598,8 @@ Newest first. The full history is in the repository.
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
 The largest release so far, and most of it is correctness that turned up while
-chasing speed. Fourteen of the twenty-five measured rows now sit at 0.80x or
-better and six beat the interpreter.
+chasing speed. Fourteen of the twenty-seven measured rows now sit at 0.80x or
+better and seven beat the interpreter.
 
 **A condition wants a verdict, not a value.** Four places computed an object
 and then asked what it meant. `if a and b` evaluated the whole chain into a
@@ -638,6 +640,15 @@ dict when there was a `**kwargs` to hand the rest to, so nothing could tell a
 keyword that had been taken from one that matched no parameter at all. The
 key is always removed now and whatever is left is refused, naming the first
 one as CPython does.
+
+**A chained comparison is written out as the `and` it means.** `0 < i < n`
+built a `True` or a `False` for each link through `PyObject_RichCompare` and
+asked `PyObject_IsTrue` what it had built. Where the operands cost nothing to
+read twice - a name or a literal - the chain becomes the `and` Python says it
+is, so each link picks up the machine comparison a two-sided one would have
+had. Anything that could be evaluated twice keeps the slots, because a call in
+the middle of a chain must run once however many links mention it. **0.46x ->
+0.58x.**
 
 **Calls, literals, stores and lookups stopped paying for references they
 already hold.** `PyObject_CallOneArg` borrows its argument and the
@@ -710,7 +721,7 @@ number and is stated rather than implied. The launcher scripts and the
 bootstrapper's PowerShell fallback quote or pass by environment what they were
 given, so nothing py2bin writes into a shell is read as shell.
 
-**Eight shapes were added to the grid**, which now has twenty-five rows. They
+**Ten shapes were added to the grid**, which now has twenty-seven rows. They
 were found by measuring what the suite did not cover, and most were worse than
 anything in it. They are published because a grid showing only the shapes a
 compiler is good at is a grid measuring itself.
