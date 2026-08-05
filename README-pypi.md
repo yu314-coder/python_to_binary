@@ -362,33 +362,33 @@ The harness and cases are in `benchmarks/` in the repository.
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.3 ms | **2.47× faster** |
-| integer arithmetic | **5.3 ms** | 8.5 ms | **1.61× faster** |
-| `while` loop | **4.5 ms** | 6.3 ms | **1.40× faster** |
-| comparisons | **3.7 ms** | 4.6 ms | **1.27× faster** |
-| float arithmetic | **5.4 ms** | 5.7 ms | **1.06× faster** |
-| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.03× faster** |
-| `in` on a list | **8.9 ms** | 9.1 ms | **1.02× faster** |
-| list append | 5.3 ms | 5.3 ms | 0.99× |
-| exception raise/catch | 20.2 ms | 20.1 ms | 0.99× |
-| dict store | 8.4 ms | 8.0 ms | 0.95× |
-| `and` / `or` | 6.1 ms | 5.7 ms | 0.93× |
-| comprehension | 6.1 ms | 5.6 ms | 0.92× |
-| `isinstance` | 7.5 ms | 6.1 ms | 0.81× |
-| f-string | 21.9 ms | 17.7 ms | 0.81× |
-| string concatenation | 16.4 ms | 12.7 ms | 0.78× |
-| subscript | 8.4 ms | 6.0 ms | 0.71× |
-| module global read | 5.4 ms | 3.8 ms | 0.69× |
-| dict lookup by name | 6.7 ms | 4.6 ms | 0.69× |
-| `for` over a list | 4.3 ms | 2.9 ms | 0.67× |
-| closure call | 11.5 ms | 6.7 ms | 0.59× |
-| chained comparison | 11.9 ms | 6.8 ms | 0.58× |
-| attribute read | 6.5 ms | 3.7 ms | 0.57× |
-| attribute write | 6.5 ms | 3.1 ms | 0.48× |
-| instantiation | 35.4 ms | 16.4 ms | 0.46× |
-| method call | 16.7 ms | 6.7 ms | 0.40× |
-| tuple unpacking | 15.4 ms | 5.6 ms | 0.36× |
-| a call naming an argument | 36.8 ms | 8.0 ms | 0.22× |
+| direct function call | **3.0 ms** | 7.1 ms | **2.35× faster** |
+| integer arithmetic | **5.2 ms** | 8.5 ms | **1.63× faster** |
+| `while` loop | **4.6 ms** | 6.4 ms | **1.39× faster** |
+| comparisons | **3.7 ms** | 4.7 ms | **1.27× faster** |
+| `try` that does not raise | **3.5 ms** | 3.7 ms | **1.07× faster** |
+| float arithmetic | **5.5 ms** | 5.8 ms | **1.06× faster** |
+| `in` on a list | 9.0 ms | 8.9 ms | 1.00× |
+| list append | 5.2 ms | 5.2 ms | 1.00× |
+| exception raise/catch | 20.0 ms | 19.9 ms | 1.00× |
+| dict store | 8.3 ms | 8.0 ms | 0.96× |
+| comprehension | 5.7 ms | 5.5 ms | 0.96× |
+| `and` / `or` | 6.2 ms | 5.7 ms | 0.92× |
+| f-string | 22.0 ms | 17.8 ms | 0.81× |
+| `isinstance` | 7.6 ms | 6.2 ms | 0.81× |
+| string concatenation | 16.1 ms | 12.7 ms | 0.79× |
+| dict lookup by name | 6.4 ms | 4.6 ms | 0.72× |
+| module global read | 5.5 ms | 3.8 ms | 0.70× |
+| subscript | 8.7 ms | 6.0 ms | 0.70× |
+| `for` over a list | 4.4 ms | 2.9 ms | 0.66× |
+| attribute read | 6.4 ms | 3.8 ms | 0.59× |
+| chained comparison | 11.9 ms | 6.8 ms | 0.57× |
+| closure call | 12.9 ms | 6.6 ms | 0.52× |
+| attribute write | 6.4 ms | 3.2 ms | 0.50× |
+| instantiation | 37.7 ms | 16.3 ms | 0.43× |
+| tuple unpacking | 15.6 ms | 5.6 ms | 0.36× |
+| method call | 18.6 ms | 6.6 ms | 0.36× |
+| a call naming an argument | 29.4 ms | 8.0 ms | 0.27× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -399,7 +399,7 @@ the interpreter, and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Fourteen of the twenty-seven rows sit at 0.80× or better and seven beat the interpreter
+Fourteen of the twenty-seven rows sit at 0.80× or better and six beat the interpreter
 outright. Most did not a short while ago.
 
 | row | before the fix | after it | what it was |
@@ -599,7 +599,7 @@ Newest first. The full history is in the repository.
 
 The largest release so far, and most of it is correctness that turned up while
 chasing speed. Fourteen of the twenty-seven measured rows now sit at 0.80x or
-better and seven beat the interpreter.
+better and six beat the interpreter.
 
 **A condition wants a verdict, not a value.** Four places computed an object
 and then asked what it meant. `if a and b` evaluated the whole chain into a
@@ -631,8 +631,19 @@ keyword's name from a C string on every call - two allocations and a string
 build to pass one argument by name, which measured 0.13x the interpreter and
 was the worst shape found anywhere. Vectorcall carries the values in one array
 with their names in a tuple beside it, which is what CPython does and what
-every compiled function here already accepts. **0.13x -> 0.18x**; the callee
-still rebuilds a dict from those names, which is what remains.
+every compiled function here already accepts. **0.13x -> 0.27x.** The callee stopped rebuilding a
+dict too: without a `**` parameter there is nothing to hand leftovers to, so
+each parameter looks through the names tuple instead - which for the one or
+two of each a call really has beats an allocation, a hash per entry and a
+probe per parameter. It is still the worst row measured.
+
+The keyword complaints are worded as CPython words them, which took three
+tries: two of them reported a missing argument, because the defaults were
+supplied before the keywords were judged, and one named the wrong parameter,
+because a count says something went unclaimed but not which. The names that
+found a parameter are tracked a bit each now, and the keyword check runs
+before the defaults are filled in.
+
 
 Found while testing it: `def f(a)` called as `f(1, b=2)` ran and answered
 where CPython raises `TypeError`. A keyword's key was only removed from the

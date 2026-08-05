@@ -63,6 +63,21 @@ _HOST_IS_DARWIN_ARM64 = (
 )
 
 
+
+def _body_of(generated: str, name: str) -> str:
+    """The body of one generated C function, found by its definition.
+
+    Every function is forward-declared before it is defined, so searching for
+    the name alone finds the declaration and slices from there - which is a
+    different function's body, and an assertion about it means nothing.
+    """
+
+    marker = f"{name}(" 
+    start = generated.index(marker, generated.index(marker) + 1)
+    while generated[start:].split("\n", 1)[0].rstrip().endswith(";"):
+        start = generated.index(marker, start + 1)
+    return generated[start : generated.index("\n}\n", start)]
+
 class CApiEmitTests(unittest.TestCase):
     """Translation, then compilation, then the answer held against CPython."""
 
@@ -711,6 +726,55 @@ class CApiEmitTests(unittest.TestCase):
             "if Boom() < 1 < 2:\n"
             "    print('unreachable')\n",
             b"ValueError",
+        )
+
+    def test_a_keyword_call_builds_no_dictionary_in_the_callee(self):
+        # The wrapper turned `kwnames` back into a dict and probed it once per
+        # parameter. Without a `**` there is nothing to hand leftovers to, so
+        # there is nothing a dict is for: each parameter looks through the
+        # tuple instead.
+        generated = python_to_capi_c(
+            "def helper(v, step):\n    return v + step\n"
+            "print(helper(1, step=2))\n",
+            "program.py",
+        )
+        # The *definition*, not the forward declaration that shares its name -
+        # slicing from the first mention took the declaration line and a
+        # neighbouring function, and the assertions then held for reasons
+        # unrelated to the change.
+        wrapper = _body_of(generated, "f__value0_helper")
+        self.assertNotIn("PyDict_New()", wrapper)
+        self.assertIn("PyObject_RichCompareBool", wrapper)
+
+    def test_a_starred_signature_keeps_its_dictionary(self):
+        # `**more` is exactly what a dict is for, so that path is unchanged.
+        generated = python_to_capi_c(
+            "def helper(a, **more):\n    return (a, more)\n"
+            "print(helper(1, z=2))\n",
+            "program.py",
+        )
+        self.assertIn("PyDict_New()", generated)
+
+    def test_the_keyword_complaints_are_worded_as_cpython_words_them(self):
+        # All four of these were wrong at some point in getting here: two
+        # reported a missing argument because the defaults were supplied
+        # before the keywords were judged, and one named the wrong parameter
+        # because a count cannot say *which* name went unclaimed.
+        self._run(
+            "def f(a, b):\n    return (a, b)\n"
+            "def g(a, b=0, *, c=0):\n    return (a, b, c)\n"
+            "for attempt in range(4):\n"
+            "    try:\n"
+            "        if attempt == 0: f(1, c=2)\n"
+            "        elif attempt == 1: f(1, a=2)\n"
+            "        elif attempt == 2: g(1, 2, d=3)\n"
+            "        else: g(1, b=2, a=3)\n"
+            "    except TypeError as e:\n"
+            "        print(e)\n",
+            b"f() got an unexpected keyword argument 'c'\n"
+            b"f() got multiple values for argument 'a'\n"
+            b"g() got an unexpected keyword argument 'd'\n"
+            b"g() got multiple values for argument 'a'\n",
         )
 
     def test_a_condition_of_ands_builds_no_boolean_object(self):

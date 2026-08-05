@@ -6211,7 +6211,31 @@ class CApiEmitter:
             keyword_source or arguments.kwonlyargs or positional[named_from:]
         )
         source = "0"
-        if wants_names:
+        # Without a `**` parameter there is nothing to hand leftovers to, so
+        # there is no reason to build a dict of them. The names arrive as a
+        # tuple; each parameter looks through it. That is O(names x
+        # parameters), which for the one or two of each a call actually has
+        # beats an allocation, a hash per entry and a probe per parameter -
+        # `f(a, key=b)` measured 0.13x the interpreter and the dict was most
+        # of what remained.
+        scanning = wants_names and not keyword_source
+        span = taken = None
+        if scanning:
+            span = self.temporary_flag()
+            taken = self.temporary_flag()
+            # Which names found a parameter, one bit each. A count alone says
+            # that something went unclaimed but not which, and guessing from
+            # "is this a parameter name" named the wrong one: in
+            # `g(1, b=2, a=3)` both `a` and `b` are parameters and only `a` is
+            # the duplicate.
+            claimed = self.machine_slot()
+            self.emit(f"{span} = 0;", indent)
+            self.emit(f"{taken} = 0;", indent)
+            self.emit(f"{claimed} = 0;", indent)
+            self.emit("if (_kwnames) {", indent)
+            self.emit(f"{span} = (int)PyObject_Size(_kwnames);", indent + 1)
+            self.emit("}", indent)
+        if wants_names and not scanning:
             # The names arrive as a tuple beside the values, which is the
             # cheapest thing for a caller to hand over. A dict is built from
             # them only when a call actually passed keywords - almost none do,
@@ -6246,6 +6270,44 @@ class CApiEmitter:
             source = gathered
 
         def from_keywords(name: str, slot: str) -> None:
+            if scanning:
+                # Interned on both sides, so the comparison inside
+                # `PyObject_RichCompareBool` is a pointer test before it is
+                # anything else.
+                key = self.interned(name)
+                counter = self.temporary_flag()
+                matched = self.temporary_flag()
+                probe = self.temporary()
+                self.emit(f"if (!{slot} && {span} > 0) {{", indent)
+                self.emit(
+                    f"for ({counter} = 0; {counter} < {span}; "
+                    f"{counter} = {counter} + 1) {{",
+                    indent + 1,
+                )
+                self.emit(f"{probe} = PyTuple_GetItem(_kwnames, {counter});", indent + 2)
+                self.emit(f"if (!{probe}) {{ {self.failure()} }}", indent + 2)
+                self.emit(
+                    f"{matched} = PyObject_RichCompareBool({probe}, {key}, 2);",
+                    indent + 2,
+                )
+                self.emit(f"if ({matched} < 0) {{ {self.failure()} }}", indent + 2)
+                self.emit(f"if ({matched}) {{", indent + 2)
+                self.emit(f"{slot} = _args[_nargs + {counter}];", indent + 3)
+                self.emit(f"Py_IncRef({slot});", indent + 3)
+                self.emit(f"{taken} = {taken} + 1;", indent + 3)
+                # Past sixty-three the mask has no room; the report falls back
+                # to naming the first name that is not a parameter at all,
+                # which is what it did before there was a mask.
+                self.emit(
+                    f"if ({counter} < 63) {{ {claimed} = {claimed} | "
+                    f"(1LL << {counter}); }}",
+                    indent + 3,
+                )
+                self.emit("break;", indent + 3)
+                self.emit("}", indent + 2)
+                self.emit("}", indent + 1)
+                self.emit("}", indent)
+                return
             if source == "0":
                 return
             # The parameter's own name, interned once at start-up. This built
@@ -6282,30 +6344,83 @@ class CApiEmitter:
             self.emit("}", indent)
             if offset >= named_from:
                 from_keywords(name, slot)
-            self.supply_missing(
-                node, name, slot, indent,
-                None if offset < required else defaults[offset - required],
-                missing_is_null,
-                display,
-            )
-        if not arguments.vararg:
-            # Too many is as wrong as too few, and was accepted in silence:
-            # the extras simply sat unread. The wrapper needs this as much as
-            # the closure does - a module-level function reached *as a value*
-            # has no call site for the build-time check to look at.
-            self.refuse_extra_arguments(
-                display, len(positional), len(defaults), required, indent
-            )
         for offset, name in enumerate(keyword_only):
             # Never read from the tuple: that is what keyword-only means.
-            slot = f"{prefix}{name}"
-            from_keywords(name, slot)
-            self.supply_missing(
-                node, name, slot, indent,
-                arguments.kw_defaults[offset],
-                missing_is_null,
-                display,
+            from_keywords(name, f"{prefix}{name}")
+        if scanning:
+            # Every name should have found a parameter. When one did not, it
+            # is either a keyword the function has no parameter for or one the
+            # caller had already filled positionally, and CPython words those
+            # two differently. Only reached when the counts disagree, so the
+            # second scan costs nothing on the path that works.
+            eligible = [
+                self.interned(name)
+                for name in (*positional[named_from:], *keyword_only)
+            ]
+            self.emit(f"if ({taken} != {span}) {{", indent)
+            counter = self.temporary_flag()
+            probe = self.temporary()
+            known = self.temporary_flag()
+            each = self.temporary_flag()
+            self.emit(
+                f"for ({counter} = 0; {counter} < {span}; "
+                f"{counter} = {counter} + 1) {{",
+                indent + 1,
             )
+            self.emit(f"{probe} = PyTuple_GetItem(_kwnames, {counter});", indent + 2)
+            self.emit(f"if (!{probe}) {{ {self.failure()} }}", indent + 2)
+            # Anything already claimed is not the problem.
+            self.emit(
+                f"if ({counter} < 63 && (({claimed} >> {counter}) & 1LL)) "
+                f"{{ continue; }}",
+                indent + 2,
+            )
+            self.emit(f"{known} = 0;", indent + 2)
+            for key in eligible:
+                self.emit(
+                    f"{each} = PyObject_RichCompareBool({probe}, {key}, 2);",
+                    indent + 2,
+                )
+                self.emit(f"if ({each} < 0) {{ {self.failure()} }}", indent + 2)
+                self.emit(f"if ({each}) {{ {known} = 1; }}", indent + 2)
+            for verdict, message in (
+                (known, f"{display}() got multiple values for argument '"),
+                (f"!{known}", f"{display}() got an unexpected keyword argument '"),
+            ):
+                self.emit(f"if ({verdict}) {{", indent + 2)
+                self.raise_counted("TypeError", message, probe, "'", indent + 3)
+                self.emit("}", indent + 2)
+            self.emit("}", indent + 1)
+            self.emit("}", indent)
+        def supply_all() -> None:
+            # After the keyword check, not before it. `f(1, c=2)` on
+            # `def f(a, b)` said "missing 1 required positional argument: 'b'"
+            # where CPython names the keyword it could not place - both are
+            # true, and CPython reports the one the caller got wrong.
+            for offset, name in enumerate(positional):
+                self.supply_missing(
+                    node, name, f"{prefix}{name}", indent,
+                    None if offset < required else defaults[offset - required],
+                    missing_is_null,
+                    display,
+                )
+            if not arguments.vararg:
+                # Too many is as wrong as too few, and was accepted in
+                # silence: the extras simply sat unread. The wrapper needs
+                # this as much as the closure does - a module-level function
+                # reached *as a value* has no call site for the build-time
+                # check to look at.
+                self.refuse_extra_arguments(
+                    display, len(positional), len(defaults), required, indent
+                )
+            for offset, name in enumerate(keyword_only):
+                self.supply_missing(
+                    node, name, f"{prefix}{name}", indent,
+                    arguments.kw_defaults[offset],
+                    missing_is_null,
+                    display,
+                )
+
         if not arguments.kwarg and source != "0":
             # Whatever is left matched no parameter, and there is no `**` to
             # hand it to. CPython names the first one, and so does this - the
@@ -6331,6 +6446,7 @@ class CApiEmitter:
             )
             self.emit("}", indent + 1)
             self.emit("}", indent)
+        supply_all()
         if arguments.vararg:
             # Everything past the named parameters, gathered out of the array.
             # There is no tuple to slice any more, so the tuple is built here -
