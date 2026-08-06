@@ -587,6 +587,7 @@ CPython, and requiring identical stdout and exit status.
 | `from x import *` at module level | ✅ |
 | `[await f(x) for x in xs]`, and the set and dict forms | ✅ |
 | a string holding a lone surrogate | ✅ |
+| `c and await g()`, `await g() if c else x`, `while await g():` | ✅ |
 | `dir()` with no argument | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |

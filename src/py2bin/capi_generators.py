@@ -1658,8 +1658,15 @@ def _arguments(names: list[str]) -> ast.arguments:
 
 
 def _awaits(node: ast.AST) -> bool:
-    """Whether this expression awaits, not counting a nested function."""
+    """Whether this expression awaits, not counting a nested function.
 
+    The node itself counts: `x and await f()` has the `await` *as* the second
+    value rather than inside it, and looking only at children missed exactly
+    the shape this is asked about.
+    """
+
+    if isinstance(node, ast.Await):
+        return True
     for child in ast.iter_child_nodes(node):
         if isinstance(
             child,
@@ -1777,6 +1784,153 @@ class _Unfold(ast.NodeTransformer):
         return ast.Name(id=name, ctx=ast.Load())
 
 
+class _UnfoldChoices(ast.NodeTransformer):
+    """`c and await g()` and `await g() if c else 1`, written as statements.
+
+    An `await` in one of these runs only when the program reaches it, and
+    lifting it out in front - which is how every other `await` becomes a
+    suspension point the machine can cut at - would run it whether or not the
+    program said to. They were refused for that, and the refusal was right
+    about the lifting and wrong about the construct: an `and` is an `if`, and
+    a conditional expression is an `if` with two arms, so both can be written
+    as the statements they stand for and the awaits inside become ordinary
+    ones.
+    """
+
+    def __init__(self) -> None:
+        self.made: list[ast.stmt] = []
+        self.count = 0
+
+    def _name(self) -> str:
+        self.count += 1
+        return f"_py2bin_pick{self.count}"
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        self.generic_visit(node)
+        if not any(_awaits(value) for value in node.values[1:]):
+            return node
+        held = self._name()
+        # `a and b and c` is `t = a; if t: t = b; if t: t = c`, nested so that
+        # each one is reached only when the one before it allowed it - which
+        # is what the operator means and what the refusal was protecting.
+        statements: list[ast.stmt] = [
+            ast.Assign(
+                targets=[ast.Name(id=held, ctx=ast.Store())], value=node.values[0]
+            )
+        ]
+        innermost = statements
+        for value in node.values[1:]:
+            test: ast.expr = ast.Name(id=held, ctx=ast.Load())
+            if isinstance(node.op, ast.Or):
+                test = ast.UnaryOp(op=ast.Not(), operand=test)
+            branch = ast.If(
+                test=test,
+                body=[
+                    ast.Assign(
+                        targets=[ast.Name(id=held, ctx=ast.Store())], value=value
+                    )
+                ],
+                orelse=[],
+            )
+            innermost.append(branch)
+            innermost = branch.body
+        self.made.extend(statements)
+        return ast.copy_location(ast.Name(id=held, ctx=ast.Load()), node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
+        self.generic_visit(node)
+        if not (_awaits(node.body) or _awaits(node.orelse)):
+            return node
+        held = self._name()
+        self.made.append(
+            ast.If(
+                test=node.test,
+                body=[
+                    ast.Assign(
+                        targets=[ast.Name(id=held, ctx=ast.Store())],
+                        value=node.body,
+                    )
+                ],
+                orelse=[
+                    ast.Assign(
+                        targets=[ast.Name(id=held, ctx=ast.Store())],
+                        value=node.orelse,
+                    )
+                ],
+            )
+        )
+        return ast.copy_location(ast.Name(id=held, ctx=ast.Load()), node)
+
+
+def unfold_conditional_awaits(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Write out every `and`, `or` and `a if c else b` that awaits.
+
+    The statements go in front of the one that held the expression, which is
+    where they run - except for a `while`, whose test runs again every turn
+    and where putting them in front would run them once. That one is left to
+    the refusal it already had.
+    """
+
+    rebuilt: list[ast.stmt] = []
+    for statement in body:
+        for field in _NESTED:
+            held = getattr(statement, field, None)
+            if isinstance(held, list) and held and isinstance(held[0], ast.stmt):
+                setattr(statement, field, unfold_conditional_awaits(held))
+        for handler in getattr(statement, "handlers", ()):
+            handler.body = unfold_conditional_awaits(handler.body)
+        if isinstance(statement, ast.While):
+            if _awaits(statement.test):
+                # A `while` test runs again every turn, so the statements it
+                # unfolds to have to run every turn too - which means inside
+                # the loop rather than in front of it. `while c:` becomes
+                # `while True:` with the test taken at the top and a `break`
+                # when it says no. An `else` runs when the test is what ended
+                # it, so it goes in front of that `break` and not on the path
+                # a `break` in the body takes - which is what `else` means.
+                ending: list[ast.stmt] = list(statement.orelse)
+                ending.append(ast.Break())
+                statement = ast.copy_location(
+                    ast.While(
+                        test=ast.Constant(value=True),
+                        body=[
+                            ast.If(
+                                test=ast.UnaryOp(
+                                    op=ast.Not(), operand=statement.test
+                                ),
+                                body=ending,
+                                orelse=[],
+                            ),
+                            *statement.body,
+                        ],
+                        orelse=[],
+                    ),
+                    statement,
+                )
+                ast.fix_missing_locations(statement)
+                # Its own body is unfolded now that the test lives in it.
+                statement.body = unfold_conditional_awaits(statement.body)
+            rebuilt.append(statement)
+            continue
+        unfolder = _UnfoldChoices()
+        statement = unfolder.visit(statement)
+        if unfolder.made:
+            for made in unfolder.made:
+                ast.fix_missing_locations(made)
+            rebuilt.extend(unfolder.made)
+        rebuilt.append(statement)
+    return rebuilt
+
+
 def unfold_async_comprehensions(body: list[ast.stmt]) -> list[ast.stmt]:
     """Write out every async comprehension in these statements, in place."""
 
@@ -1839,7 +1993,9 @@ def expand(tree: ast.Module) -> ast.Module:
                     # it is short for before the machine sees it, because the
                     # machine cuts at statements and a comprehension is one
                     # expression.
-                    body=unfold_async_comprehensions(statement.body),
+                    body=unfold_async_comprehensions(
+                        unfold_conditional_awaits(statement.body)
+                    ),
                     decorator_list=statement.decorator_list,
                     type_params=[],
                     returns=None,

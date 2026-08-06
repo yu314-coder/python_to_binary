@@ -6220,18 +6220,75 @@ class GeneratorHandlerTests(unittest.TestCase):
             b"caught inside\n",
         )
 
-    def test_awaits_that_cannot_be_lifted_are_refused(self):
-        # Lifting an await out of a conditional would run it unconditionally,
-        # which is a different program. A comprehension used to be refused
-        # for a related reason and is not any more - see below.
-        for source, needle in (
-            ("import asyncio\nasync def f(c):\n    return c and await g()\n", "`and`"),
-            ("import asyncio\nasync def f(c):\n    return await g() if c else 1\n", "arm"),
-        ):
-            with self.subTest(source=source):
-                with self.assertRaises(CApiEmitError) as caught:
-                    python_to_capi_c(source, "program.py")
-                self.assertIn(needle, str(caught.exception))
+    def test_an_await_that_may_not_run_is_written_out(self):
+        """`c and await g()` was refused, and the refusal was half right.
+
+        An `await` in one of these runs only when the program reaches it, and
+        lifting it out in front - which is how every other await becomes a
+        suspension point the machine can cut at - would run it whether or not
+        the program said to. That is true, and the conclusion was wrong: an
+        `and` is an `if`, and a conditional expression is an `if` with two
+        arms, so both are written as the statements they stand for and the
+        awaits inside become ordinary ones.
+
+        The list of calls is the point of the test: it says which awaits
+        actually ran, so a rewrite that quietly ran them all would fail here
+        rather than look right.
+        """
+        self._run(
+            "import asyncio\n"
+            "calls = []\n"
+            "async def g(v):\n"
+            "    calls.append(v)\n"
+            "    await asyncio.sleep(0)\n"
+            "    return v\n"
+            "async def main():\n"
+            "    a = False and await g('a')\n"
+            "    b = True and await g('b')\n"
+            "    c = True or await g('c')\n"
+            "    d = False or await g('d')\n"
+            "    e = await g('e') if True else await g('no')\n"
+            "    f = await g('f1') if False else await g('f2')\n"
+            "    h = 1 and 2 and await g('h')\n"
+            "    return a, b, c, d, e, f, h, calls\n"
+            "print(asyncio.run(main()))\n",
+            b"(False, 'b', True, 'd', 'e', 'f2', 'h', "
+            b"['b', 'd', 'e', 'f2', 'h'])\n",
+        )
+
+    def test_an_await_in_a_while_condition_is_written_out(self):
+        """The test runs again every turn, so its statements must too.
+
+        `while c:` becomes `while True:` with the test taken at the top and a
+        `break` when it says no. An `else` runs when the test is what ended
+        the loop, so it goes in front of that `break` and not on the path a
+        `break` in the body takes - which is what `else` means, and what the
+        second loop below checks.
+        """
+        self._run(
+            "import asyncio\n"
+            "async def below(n, limit):\n"
+            "    await asyncio.sleep(0)\n"
+            "    return n < limit\n"
+            "async def main():\n"
+            "    seen = []\n"
+            "    n = 0\n"
+            "    while await below(n, 3):\n"
+            "        seen.append(n)\n"
+            "        n = n + 1\n"
+            "    else:\n"
+            "        seen.append('else')\n"
+            "    n = 0\n"
+            "    while await below(n, 5):\n"
+            "        if n == 2:\n"
+            "            break\n"
+            "        n = n + 1\n"
+            "    else:\n"
+            "        seen.append('not reached')\n"
+            "    return seen, n\n"
+            "print(asyncio.run(main()))\n",
+            b"([0, 1, 2, 'else'], 2)\n",
+        )
 
     def test_a_comprehension_that_awaits_is_written_out(self):
         """It was refused for the same reason an `async for` one was.
