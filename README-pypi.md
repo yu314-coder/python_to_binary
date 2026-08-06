@@ -14,13 +14,16 @@ Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
 **0.9.0 closes what a compiled function could not do.** Metaclasses, `enum`
-and `dataclasses`, generator and `async def` methods, async comprehensions,
-`locals()`, and `sys.exc_info()` inside an `except`. Two silent wrong answers
-went with them: a default argument was evaluated on every call rather than
-once at the `def`, so `def f(x=[])` did not share its list, and a closure
-could reach a module-level function where a parameter of the same name
-shadowed it. Found by compiling seventy language shapes and comparing each
-against CPython; sixty-four now agree exactly. See *Release notes* below.
+and `dataclasses`, generator and `async def` methods, async generators, async
+comprehensions, `locals()`, a real `globals()`, `eval` and `exec`, and
+`sys.exc_info()` inside an `except`. Two silent wrong answers went with them:
+a default argument was evaluated on every call rather than once at the `def`,
+so `def f(x=[])` did not share its list, and a closure could reach a
+module-level function where a parameter of the same name shadowed it. Found by
+compiling seventy language shapes and comparing each against CPython;
+sixty-seven now agree exactly and the three that do not are one fact - a
+compiled function is a `builtin_function_or_method`, not a Python function.
+See *Release notes* below.
 
 ## Platforms
 
@@ -680,8 +683,8 @@ Newest first. The full history is in the repository.
 
 Found by probing the language a feature at a time - seventy shapes, each
 compiled and its output compared against CPython's - rather than by reading
-code. Sixty-four of the seventy now agree exactly, three are refused by name,
-and three are structural.
+code. Sixty-seven of the seventy now agree exactly. The three that do not are
+one fact rather than three gaps, and it is named at the end.
 
 **Two silent wrong answers, both in code people write every day.**
 

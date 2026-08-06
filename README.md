@@ -1408,8 +1408,8 @@ Newest first. Older releases are in the repository's history.
 
 Found by probing the language a feature at a time - seventy shapes, each
 compiled and its output compared against CPython's - rather than by reading
-code. Sixty-four of the seventy now agree exactly, three are refused by name,
-and three are structural.
+code. Sixty-seven of the seventy now agree exactly. The three that do not are
+one fact rather than three gaps, and it is named at the end.
 
 **Two silent wrong answers, both in code people write every day.**
 
