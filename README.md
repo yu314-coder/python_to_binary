@@ -565,7 +565,7 @@ CPython, and requiring identical stdout and exit status.
 | `enum`, `dataclasses` | ✅ |
 | `[x async for x in it]`, and the set and dict forms | ✅ |
 | `def m(self): yield`, and `async def` methods | ✅ |
-| `async def` that yields (an async generator) | ❌ refused |
+| `async def` that yields (an async generator), `async for` over one | ✅ |
 | `locals()` / `vars()` inside a function | ✅ |
 | `globals()`, and one-argument `eval` / `exec` | ❌ refused |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
@@ -1116,8 +1116,7 @@ CPython it was not built against. The trade is deliberate; the cost is in the
 table above.
 
 **What is still refused is refused by name**, with a `file:line:col`, rather than
-approximated: an `async def` that yields, `globals()`, and a one-argument
-`eval` or `exec`. Each says what to do instead where there is something to do.
+approximated: `globals()` and a one-argument `eval` or `exec`. Each says what to do instead where there is something to do.
 
 ## When it does not work
 
@@ -1485,13 +1484,20 @@ removed the last refusal in the 889-program corpus - a generated file with
 67,000 of them needed two slots and asked for 67,001. `inspect.signature`
 spells a literal default as itself rather than as `None`.
 
-**Refused rather than guessed at**, each with a `file:line:col`: an `async def`
-that yields (an async generator is driven by `__aiter__`/`__anext__`, and its
-own yields would have to be told apart from the ones an `await` inside it
-makes); `globals()` (the module's names are C variables, so what came back
-would be a copy, and a write to a copy would be lost); and a one-argument
-`eval` or `exec` (they read the caller's frame - the message names the
-two-argument form that works).
+**Async generators.** `async def` with a `yield` in it, and `async for` over
+one. The state machine turns a `yield` and an `await` into the same thing,
+and for an async generator the two go to different places - the program's own
+values to whoever is iterating, the awaited ones to the event loop. The
+program's are marked before the pass that expands `await` runs, so what is
+marked is exactly what the program wrote; the object `__anext__` answers with
+drives the machine, passes anything unmarked out to the loop, and returns the
+payload of the first marked value. `asend`, `athrow` and `aclose` are not
+there yet.
+
+**Refused rather than guessed at**, each with a `file:line:col`: `globals()`
+(the module's names are C variables, so what came back would be a copy, and a
+write to a copy would be lost) and a one-argument `eval` or `exec` (they read
+the caller's frame - the message names the two-argument form that works).
 
 **Still structural**, and unlikely to change: a compiled function is a
 `builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and

@@ -1668,9 +1668,17 @@ class _WithRewriter(ast.NodeTransformer):
 
 
 def rewrite(
-    node: ast.FunctionDef, index: int, awaitable: bool = False
+    node: ast.FunctionDef,
+    index: int,
+    awaitable: bool = False,
+    asynchronous: bool = False,
 ) -> tuple[ast.ClassDef, ast.FunctionDef]:
-    """The class that runs the generator, and the function that makes one."""
+    """The class that runs the generator, and the function that makes one.
+
+    `asynchronous` says this is an async generator: driven by `__aiter__` and
+    `__anext__` rather than awaited, with its own yields marked so that the
+    step object can tell them from the ones an `await` inside it makes.
+    """
 
     if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
         raise GeneratorRewriteError(
@@ -1688,6 +1696,16 @@ def rewrite(
         node = _Renamed("self", _RECEIVER).visit(node)
         ast.fix_missing_locations(node)
         parameters = [argument.arg for argument in node.args.args]
+    if asynchronous:
+        # Before the machine is built, and so before the delegation pass turns
+        # every `await` into a `yield`: what is marked is what the program
+        # wrote, and what is left plain belongs to the event loop.
+        # The statements, not the `def`: the pass refuses to descend into a
+        # function so that a nested one keeps its own yields, and handing it
+        # this one would have it refuse immediately.
+        tagger = _TagYields()
+        node.body = [tagger.visit(statement) for statement in node.body]
+        ast.fix_missing_locations(node)
     node.body = [_WithRewriter().visit(inner) for inner in node.body]
     node.body = [
         statement
@@ -1849,13 +1867,54 @@ def rewrite(
                 type_params=[],
                 returns=None,
             ),
-            ast.FunctionDef(
-                name="__iter__",
-                args=_arguments(["self"]),
-                body=[ast.Return(value=ast.Name(id="self", ctx=ast.Load()))],
-                decorator_list=[],
-                type_params=[],
-                returns=None,
+            # An async generator is not iterable, and saying it was would let
+            # `list(agen)` half-work and hand back the marked tuples. It gets
+            # `__aiter__` instead, and an `__anext__` that answers with the
+            # step object rather than a value.
+            *(
+                [
+                    ast.FunctionDef(
+                        name="__aiter__",
+                        args=_arguments(["self"]),
+                        body=[
+                            ast.Return(value=ast.Name(id="self", ctx=ast.Load()))
+                        ],
+                        decorator_list=[],
+                        type_params=[],
+                        returns=None,
+                    ),
+                    ast.FunctionDef(
+                        name="__anext__",
+                        args=_arguments(["self"]),
+                        body=[
+                            ast.Return(
+                                value=ast.Call(
+                                    func=ast.Name(
+                                        id="_py2bin_astep", ctx=ast.Load()
+                                    ),
+                                    args=[ast.Name(id="self", ctx=ast.Load())],
+                                    keywords=[],
+                                )
+                            )
+                        ],
+                        decorator_list=[],
+                        type_params=[],
+                        returns=None,
+                    ),
+                ]
+                if asynchronous
+                else [
+                    ast.FunctionDef(
+                        name="__iter__",
+                        args=_arguments(["self"]),
+                        body=[
+                            ast.Return(value=ast.Name(id="self", ctx=ast.Load()))
+                        ],
+                        decorator_list=[],
+                        type_params=[],
+                        returns=None,
+                    )
+                ]
             ),
             # What `await` asks for. The language defines awaiting an object
             # with `__await__` as delegating to the iterator it answers with,
@@ -1969,6 +2028,68 @@ def rewrite(
     for tree in (made, maker):
         ast.fix_missing_locations(ast.copy_location(tree, node))
     return made, maker
+
+
+#: The name of the sentinel that tells an async generator's own yields from
+#: the ones an `await` inside it produces. Both come out of the same state
+#: machine as a plain `yield`, and the two go to different places: one to
+#: whoever is iterating, the other to the event loop.
+_AGEN_MARK = "_py2bin_agen_mark"
+
+#: The awaitable `__anext__` answers with. It drives the machine, passes
+#: anything untagged out to the loop, and answers with the payload of the
+#: first tagged value it sees - which is `await`'s value, delivered the way
+#: `__await__` delivers one: by returning it.
+_AGEN_HELPER = f"""
+{_AGEN_MARK} = object()
+
+
+class _py2bin_astep:
+
+    def __init__(self, _py2bin_owner):
+        self.owner = _py2bin_owner
+
+    def __await__(self):
+        _py2bin_sent = None
+        while True:
+            try:
+                _py2bin_item = self.owner.send(_py2bin_sent)
+            except StopIteration:
+                raise StopAsyncIteration
+            if type(_py2bin_item) is tuple:
+                if len(_py2bin_item) == 2:
+                    if _py2bin_item[0] is {_AGEN_MARK}:
+                        return _py2bin_item[1]
+            _py2bin_sent = yield _py2bin_item
+"""
+
+
+class _TagYields(ast.NodeTransformer):
+    """Mark this function's own `yield`s, leaving `await` alone.
+
+    Run before the delegation pass turns every `await` into a `yield`, so
+    what it marks is exactly what the program wrote.
+    """
+
+    def visit_Yield(self, node: ast.Yield) -> ast.AST:
+        self.generic_visit(node)
+        payload = node.value if node.value is not None else ast.Constant(value=None)
+        return ast.copy_location(
+            ast.Yield(
+                value=ast.Tuple(
+                    elts=[ast.Name(id=_AGEN_MARK, ctx=ast.Load()), payload],
+                    ctx=ast.Load(),
+                )
+            ),
+            node,
+        )
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
 
 
 #: What a generator's own `self` parameter is renamed to, so that it cannot be
@@ -2144,6 +2265,7 @@ def expand(tree: ast.Module) -> ast.Module:
     """
 
     counter = 0
+    wants_helper = False
 
     def walk(
         body: list[ast.stmt], hoist: list[ast.stmt] | None = None
@@ -2181,20 +2303,19 @@ def expand(tree: ast.Module) -> ast.Module:
                     returns=None,
                 )
                 ast.copy_location(plain, statement)
-                if is_generator(plain):
-                    # An `async def` that yields is an async generator, which
-                    # is a different thing from a coroutine: it is driven by
-                    # `__aiter__`/`__anext__` rather than awaited, and its own
-                    # yields have to be told apart from the ones an `await`
-                    # inside it produces - the machine turns both into the
-                    # same `yield`. Compiled as a coroutine it came out with
-                    # `__iter__` and no `__aiter__`, so `async for` over it
-                    # failed at run time with an AttributeError about a name
-                    # nobody wrote. Said here instead.
-                    raise GeneratorRewriteError(
-                        statement, "an `async def` that yields (an async generator)"
-                    )
-                made, maker = rewrite(plain, counter, awaitable=True)
+                # An `async def` that yields is an async generator, which is
+                # a different thing from a coroutine: driven by `__aiter__`
+                # and `__anext__` rather than awaited. Its own yields are
+                # marked so that the step object can tell them from the ones
+                # an `await` inside it makes - the machine turns both into
+                # the same `yield`, and they go to different places.
+                agen = is_generator(plain)
+                if agen:
+                    nonlocal wants_helper
+                    wants_helper = True
+                made, maker = rewrite(
+                    plain, counter, awaitable=not agen, asynchronous=agen
+                )
                 made_here.append(made)
                 rebuilt.append(maker)
                 continue
@@ -2219,4 +2340,11 @@ def expand(tree: ast.Module) -> ast.Module:
         return rebuilt
 
     tree.body = walk(tree.body)
+    if wants_helper:
+        # In front of everything, because an `async def` at the top of the
+        # file is rewritten into a class whose `__anext__` names it.
+        helper = ast.parse(_AGEN_HELPER).body
+        for statement in helper:
+            ast.fix_missing_locations(statement)
+        tree.body = walk(helper) + tree.body
     return tree

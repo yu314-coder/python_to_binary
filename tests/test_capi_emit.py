@@ -694,6 +694,68 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_an_async_generator_works(self):
+        """`async def` with a `yield` in it - refused until now.
+
+        The machine turns a `yield` and an `await` into the same thing, and
+        for an async generator the two go to different places: the program's
+        own yields to whoever is iterating, the awaited ones to the event
+        loop. So the program's are marked before the delegation pass runs,
+        and the object `__anext__` answers with drives the machine, passes
+        anything unmarked out to the loop, and returns the payload of the
+        first marked value it sees.
+        """
+        self._run(
+            "import asyncio\n"
+            "async def counter(n):\n"
+            "    i = 0\n"
+            "    while i < n:\n"
+            "        i = i + 1\n"
+            "        yield i\n"
+            "async def main():\n"
+            "    out = []\n"
+            "    async for v in counter(3):\n"
+            "        out.append(v)\n"
+            "    return out, [x async for x in counter(2)]\n"
+            "print(asyncio.run(main()))\n",
+            b"([1, 2, 3], [1, 2])\n",
+        )
+
+    def test_an_async_generator_that_awaits_between_yields(self):
+        """The case the marking exists for.
+
+        An `await` inside the body becomes a plain `yield` of whatever the
+        event loop is being asked to wait for. Unmarked, it goes out to the
+        loop; the generator's own values do not. Getting this wrong shows up
+        as `RuntimeError: Task got bad yield`, which is what it did.
+        """
+        self._run(
+            "import asyncio\n"
+            "async def ticks(n):\n"
+            "    i = 0\n"
+            "    while i < n:\n"
+            "        await asyncio.sleep(0)\n"
+            "        i = i + 1\n"
+            "        yield i * 10\n"
+            "async def nothing():\n"
+            "    if False:\n"
+            "        yield 1\n"
+            "async def three():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+            "    yield 3\n"
+            "async def main():\n"
+            "    stopped = []\n"
+            "    async for v in three():\n"
+            "        stopped.append(v)\n"
+            "        if v == 2:\n"
+            "            break\n"
+            "    return ([v async for v in ticks(3)],\n"
+            "            [v async for v in nothing()], stopped)\n"
+            "print(asyncio.run(main()))\n",
+            b"([10, 20, 30], [], [1, 2])\n",
+        )
+
     def test_a_generator_method_works(self):
         """`def items(self): yield` was refused, and it is everywhere.
 
