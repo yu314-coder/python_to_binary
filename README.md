@@ -585,6 +585,8 @@ CPython, and requiring identical stdout and exit status.
 | `xs[1:3] = ys`, `del xs[a:b]`, extended slices | ✅ |
 | a module's own `__doc__` | ✅ |
 | `from x import *` at module level | ✅ |
+| `[await f(x) for x in xs]`, and the set and dict forms | ✅ |
+| a string holding a lone surrogate | ✅ |
 | `dir()` with no argument | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
