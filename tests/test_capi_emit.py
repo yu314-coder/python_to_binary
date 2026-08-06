@@ -890,6 +890,89 @@ class CApiEmitTests(unittest.TestCase):
             b"None None True ellipsis\n",
         )
 
+    def test_except_star_puts_back_what_a_bare_raise_re_raised(self):
+        """The shape of the answer turns on which `raise` the clause wrote.
+
+        A bare `raise` puts the group back as it was; `raise e` nests it
+        inside a new one. CPython tells them apart by the traceback entry
+        `raise e` adds and the bare one does not - a compiled program has no
+        frames and adds no entry either way, so it cannot see the difference
+        at run time. It can see it in the source, which is where the
+        difference is, and that is where this looks.
+        """
+        self._run(
+            "def spell(e):\n"
+            "    if isinstance(e, BaseExceptionGroup):\n"
+            "        return type(e).__name__ + '(' + repr(e.args[0]) + ', [' "
+            "+ ', '.join(spell(x) for x in e.exceptions) + '])'\n"
+            "    return type(e).__name__ + '(' + repr(e.args[0]) + ')'\n"
+            "def bare():\n"
+            "    g = ExceptionGroup('g', [ValueError('a'), TypeError('b')])\n"
+            "    g.add_note('n')\n"
+            "    try:\n"
+            "        raise g\n"
+            "    except* ValueError as e:\n"
+            "        raise\n"
+            "def aliased():\n"
+            "    try:\n"
+            "        raise ExceptionGroup('g', [ValueError('a'), TypeError('b')])\n"
+            "    except* ValueError as e:\n"
+            "        x = e\n"
+            "        raise x\n"
+            "for fn in (bare, aliased):\n"
+            "    try:\n"
+            "        fn()\n"
+            "    except BaseException as out:\n"
+            "        print(spell(out))\n",
+            b"ExceptionGroup('g', [ValueError('a'), TypeError('b')])\n"
+            b"ExceptionGroup('', [ExceptionGroup('g', [ValueError('a')]), "
+            b"ExceptionGroup('g', [TypeError('b')])])\n",
+        )
+
+    def test_except_star_runs_a_clause_with_its_own_match_on_record(self):
+        # `sys.exc_info()` in a clause is the subgroup it matched, not the
+        # whole of what the body raised, and its `__context__` is None.
+        self._run(
+            "import sys\n"
+            "try:\n"
+            "    raise ExceptionGroup('g', [ValueError('a')])\n"
+            "except* ValueError as e:\n"
+            "    print(sys.exc_info()[1] is e, e.__context__ is None)\n",
+            b"True True\n",
+        )
+
+    def test_except_star_refuses_what_python_refuses(self):
+        """`return` in an `except*` block is a SyntaxError in CPython.
+
+        `ast.parse` accepts it - it is the compiler that rejects it - so a
+        program CPython will not run parses perfectly well here and has to be
+        refused, in the same words. A `break` belonging to a loop written
+        inside the block is fine, and so is a `return` in a function defined
+        there.
+        """
+        with self.assertRaises(Exception) as caught:
+            python_to_capi_c(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except* ValueError:\n"
+                "        return 1\n",
+                "program.py",
+            )
+        self.assertIn("cannot appear in an except* block", str(caught.exception))
+        # These two are not refused, because Python does not refuse them.
+        python_to_capi_c(
+            "def f():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except* ValueError:\n"
+            "        for i in []:\n"
+            "            break\n"
+            "        def g():\n"
+            "            return 1\n",
+            "program.py",
+        )
+
     def test_an_async_generator_works(self):
         """`async def` with a `yield` in it - refused until now.
 

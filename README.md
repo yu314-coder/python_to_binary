@@ -578,7 +578,7 @@ CPython, and requiring identical stdout and exit status.
 | `typing.Generic[T]` as a base, and `__mro_entries__` generally | ✅ |
 | a class inside a class body, at any depth | ✅ |
 | `pickle` and `copy` of a compiled class or function | ✅ |
-| `except*` (PEP 654) | ❌ refused |
+| `except*` (PEP 654), exception groups | ✅ |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |

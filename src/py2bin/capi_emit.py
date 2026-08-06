@@ -32,6 +32,10 @@ from pathlib import Path
 
 from .capi_cells import CellError, expand as expand_cells
 from .capi_fold import fold as fold_constants
+from .capi_except_star import (
+    ExceptStarError,
+    expand as expand_except_star,
+)
 from .capi_inline import expand_module as inline_calls, place_keywords
 from .capi_exact import exact_dicts, exact_lists, exact_strs
 from .capi_generators import GeneratorRewriteError, expand as expand_generators
@@ -3620,6 +3624,21 @@ class CApiEmitter:
                 ),
                 node,
             )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_py2bin_set_handled"
+            and len(node.args) == 1
+        ):
+            # Written by the `except*` rewrite, and by nothing else. A clause
+            # runs with what *it* matched on record as the exception being
+            # handled - the subgroup, not the whole of what the body raised -
+            # which is what `sys.exc_info()` answers with there. There is no
+            # spelling for that in Python, so the rewrite asks for it by name
+            # and this is where the name is honoured.
+            value = self.expression(node.args[0], indent)
+            self.emit(f"PyErr_SetHandledException({value});", indent)
+            self.emit(f"Py_DecRef({value});", indent)
+            return self.builtin("None", indent)
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):
@@ -8035,6 +8054,13 @@ class CApiEmitter:
                 and inner.id in ("globals", "eval", "exec")
                 for inner in ast.walk(tree)
             )
+            # Before everything: `except*` becomes ordinary `try`/`except`
+            # calling four small functions, so nothing below this ever sees
+            # a TryStar.
+            try:
+                tree = expand_except_star(tree)
+            except ExceptStarError as error:
+                raise self.fail(error.node, error.message) from None
             tree = place_keywords(tree)
             tree = inline_calls(tree)
             # Does the program ever read `sys.argv`? Only then is recovering
