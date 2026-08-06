@@ -5664,11 +5664,23 @@ class CApiEmitter:
             )
         self.emit(f"Py_DecRef({nothing});", indent + 1)
         self.emit("}", indent)
+        # While `__exit__` runs, the exception the body raised is the one
+        # being handled - so anything `__exit__` raises takes its
+        # `__context__` from it, and a traceback keeps the chain. Without
+        # this, an `__exit__` that raised produced an exception with no
+        # context at all and the original vanished from the report.
+        previous = self.temporary()
+        self.emit(f"{previous} = PyErr_GetHandledException();", indent)
+        self.emit(f"if ({held}) {{", indent)
+        self.emit(f"PyErr_SetHandledException({held});", indent + 1)
+        self.emit("}", indent)
         outcome = self.temporary()
         self.emit(
             f"{outcome} = PyObject_Call({exit_call}, {arguments}, (PyObject *)0);",
             indent,
         )
+        self.emit(f"PyErr_SetHandledException({previous});", indent)
+        self.emit(f"if ({previous}) Py_DecRef({previous});", indent)
         self.emit(f"Py_DecRef({exit_call});", indent)
         self.emit(f"Py_DecRef({arguments});", indent)
         self.checked(outcome, indent)

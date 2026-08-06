@@ -374,14 +374,20 @@ A `finally` around a `yield` works, and so do `with`, `async for` and
 for the two shapes that are still refused.
 
 A refusal is a `file:line:col` error, never a silent approximation. On an
-889-program corpus, **886 programs produce byte-identical stdout and the same
-exit code as CPython, and nothing is refused**. The three that differ are
-structural rather than open: the repr of a compiled function really is a
-builtin function's and carries an address, so it never matches twice even
-against itself; one program prints forever by design, and agrees for as long
-as both are allowed to run; and one drives py2bin through `subprocess` to
-fuzz it, so what it reaches is the compiled binary rather than an
-interpreter.
+889-program corpus, **886 produce byte-identical stdout and the same exit
+code as CPython, nothing is refused, and the other three are not programs
+this comparison can be run on**. Each was checked rather than assumed:
+
+- `nameval` prints a function, and CPython does not match *itself* - two runs
+  give `<function g at 0x104cff530>` and `<function g at 0x10036f530>`. There
+  is no output for anything to agree with.
+- `P17_while_masked` prints forever, in both. Twenty thousand lines of each
+  hash the same; what differs is only where the timeout fell.
+- `fuzz_ws` launches `python3 -m py2bin` through `subprocess` to fuzz the
+  compiler. Compiled, `sys.executable` is the binary rather than an
+  interpreter, so it is testing something that is not there.
+
+So the honest reading is 886 of 886 comparable programs.
 
 **Comparing stderr as well, 804 match.** The 82 that do not are one thing:
 CPython prints a traceback - the frames, the source line, the `~~~^^^` caret -
