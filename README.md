@@ -575,7 +575,8 @@ CPython, and requiring identical stdout and exit status.
 | `__new__`, `__init_subclass__`, `__class_getitem__` bound as Python binds them | ✅ |
 | `lambda i=i:` inside a comprehension | ✅ |
 | a closure capturing a comprehension's target (`lambda: i`) | ❌ refused |
-| a class inside a class body, `except*`, `typing.Generic[T]` as a base | ❌ |
+| `typing.Generic[T]` as a base, and `__mro_entries__` generally | ✅ |
+| a class inside a class body, `except*` | ❌ |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |

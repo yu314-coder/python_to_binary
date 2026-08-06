@@ -6644,10 +6644,30 @@ class CApiEmitter:
             maker = self.builtin("type", indent)
         else:
             maker = self.expression(chosen, indent)
+        # PEP 560, and only now: `__build_class__` evaluates every argument
+        # it is given - the bases *and* the `metaclass=` expression - and runs
+        # `update_bases` inside itself afterwards. Resolving before `maker`
+        # was built would call `__mro_entries__` first, which a program can
+        # see when either expression has a side effect.
+        written = bases
+        if node.bases:
+            bases = self.resolve_mro_entries(bases, indent)
         self.scope_path.append((node.name, False))
         namespace = self.class_namespace(
             node, maker, title, bases, indent, seeded=chosen is None
         )
+        if node.bases:
+            # What the header said, kept under the name `typing` reads to
+            # recover `Generic[T]` from a class whose bases were replaced.
+            # Only when they were: `__build_class__` leaves it off otherwise.
+            self.emit(f"if ({written} != {bases}) {{", indent)
+            self.emit(
+                f"if (PyObject_SetItem({namespace}, "
+                f"{self.interned('__orig_bases__')}, {written}) < 0) "
+                f"{{ {self.failure()} }}",
+                indent + 1,
+            )
+            self.emit("}", indent)
         binder = None
         # What the body has bound so far. A decorator and an attribute's value
         # run as the class is built and can see it; a method body cannot, and
@@ -6922,6 +6942,96 @@ class CApiEmitter:
         )
         self.emit(f"Py_DecRef({value});", indent)
         self.emit(f"Py_DecRef({held});", indent)
+
+    def resolve_mro_entries(self, bases: str, indent: int) -> str:
+        """PEP 560: a base that is not a class says what to put in its place.
+
+        `class Box(Generic[T])` names something that is not a class at all,
+        and `type` said so - "does not support MRO entry resolution". Python
+        asks any such entry for `__mro_entries__`, hands it the whole bases
+        tuple as written, and splices the tuple that comes back in.
+
+        A base that is already a class is passed over untouched rather than
+        asked: `__mro_entries__` looked up on a class would find one defined
+        in a base and call it with the bases tuple as `self`.
+
+        Answers with the same tuple when nothing was replaced, so the caller
+        can tell by comparing - which is how it knows whether to record
+        `__orig_bases__`.
+        """
+
+        gathered = self.temporary()
+        changed = self.temporary_flag()
+        counter = self.temporary_flag()
+        span = self.temporary_flag()
+        base = self.temporary()
+        verdict = self.temporary_flag()
+        entries = self.temporary()
+        answer = self.temporary()
+        inner = self.temporary_flag()
+        reach = self.temporary_flag()
+        piece = self.temporary()
+        kind = self.builtin("type", indent)
+        self.emit(f"{gathered} = PyList_New(0LL);", indent)
+        self.checked(gathered, indent)
+        self.emit(f"{changed} = 0;", indent)
+        self.emit(f"{span} = (int)PyObject_Size({bases});", indent)
+        self.emit(
+            f"for ({counter} = 0; {counter} < {span}; "
+            f"{counter} = {counter} + 1) {{",
+            indent,
+        )
+        self.emit(f"{base} = PyTuple_GetItem({bases}, {counter});", indent + 1)
+        self.emit(f"if (!{base}) {{ {self.failure()} }}", indent + 1)
+        self.emit(
+            f"{verdict} = PyObject_IsInstance({base}, {kind});", indent + 1
+        )
+        self.emit(f"if ({verdict} < 0) {{ {self.failure()} }}", indent + 1)
+        self.emit(f"{entries} = 0;", indent + 1)
+        self.emit(f"if (!{verdict}) {{", indent + 1)
+        self.emit(
+            f'{entries} = PyObject_GetAttrString({base}, "__mro_entries__");',
+            indent + 2,
+        )
+        self.emit(f"if (!{entries}) {{ PyErr_Clear(); }}", indent + 2)
+        self.emit("}", indent + 1)
+        self.emit(f"if (!{entries}) {{", indent + 1)
+        self.emit(f"PyList_Append({gathered}, {base});", indent + 2)
+        self.emit("} else {", indent + 1)
+        # The tuple as written, which is what the hook is told about.
+        self.emit(
+            f"{answer} = PyObject_CallOneArg({entries}, {bases});", indent + 2
+        )
+        self.emit(f"Py_DecRef({entries});", indent + 2)
+        self.emit(f"if (!{answer}) {{ {self.failure()} }}", indent + 2)
+        self.emit(f"{changed} = 1;", indent + 2)
+        self.emit(f"{reach} = (int)PyObject_Size({answer});", indent + 2)
+        self.emit(
+            f"for ({inner} = 0; {inner} < {reach}; {inner} = {inner} + 1) {{",
+            indent + 2,
+        )
+        self.emit(f"{piece} = PyTuple_GetItem({answer}, {inner});", indent + 3)
+        self.emit(f"if (!{piece}) {{ {self.failure()} }}", indent + 3)
+        self.emit(f"PyList_Append({gathered}, {piece});", indent + 3)
+        self.emit("}", indent + 2)
+        self.emit(f"Py_DecRef({answer});", indent + 2)
+        self.emit("}", indent + 1)
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({kind});", indent)
+        settled = self.temporary()
+        self.emit(f"if ({changed}) {{", indent)
+        maker = self.builtin("tuple", indent + 1)
+        self.emit(
+            f"{settled} = PyObject_CallOneArg({maker}, {gathered});", indent + 1
+        )
+        self.emit(f"Py_DecRef({maker});", indent + 1)
+        self.emit(f"if (!{settled}) {{ {self.failure()} }}", indent + 1)
+        self.emit("} else {", indent)
+        self.emit(f"Py_IncRef({bases});", indent + 1)
+        self.emit(f"{settled} = {bases};", indent + 1)
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({gathered});", indent)
+        return settled
 
     def class_namespace(
         self,
