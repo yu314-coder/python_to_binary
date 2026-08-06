@@ -3412,6 +3412,114 @@ class CApiEmitTests(unittest.TestCase):
             )
             self.assertEqual(native.stdout, reference.stdout)
 
+    def test_a_program_of_packages_is_linked_into_one_image(self):
+        """A directory with an `__init__.py` is one of the program's modules.
+
+        Only `name.py` beside the entry was, so a program laid out the way
+        most programs are - a package, submodules, `from . import x` between
+        them - failed at start-up with "No module named 'pkg'". A member is
+        also an attribute of its package, which is what `pkg.thing` reads,
+        and the import system sets that as it loads each one: nothing loads
+        these, so it is set here instead.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg" / "sub").mkdir(parents=True)
+            (root / "pkg" / "__init__.py").write_text(
+                "VERSION = '1.0'\nfrom . import thing\n", encoding="utf-8"
+            )
+            (root / "pkg" / "thing.py").write_text(
+                "from .sub.deeper import go\nname = 'thing'\n", encoding="utf-8"
+            )
+            (root / "pkg" / "sub" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "pkg" / "sub" / "deeper.py").write_text(
+                "def go():\n    return 'deep'\n", encoding="utf-8"
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import pkg\n"
+                "from pkg import thing\n"
+                "from pkg.sub import deeper\n"
+                "print(pkg.VERSION, thing.name, deeper.go(), thing.go())\n"
+                "print(pkg.thing is thing, pkg.sub.deeper is deeper)\n"
+                "print(pkg.__name__, thing.__name__, deeper.__name__)\n",
+                encoding="utf-8",
+            )
+            generated, linked = python_program_to_capi_c(entry)
+            # The member before the package that imports it, and the package
+            # before the member that does not.
+            self.assertEqual(
+                linked, ["pkg.sub", "pkg.sub.deeper", "pkg.thing", "pkg"]
+            )
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            # Where none of the program's source can be found, which is what
+            # proves the package travelled inside the binary.
+            shutil.rmtree(root / "pkg")
+            entry.unlink()
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(
+                native.stdout,
+                b"1.0 thing deep deep\nTrue True\npkg pkg.thing pkg.sub.deeper\n",
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_a_relative_import_is_resolved_where_it_is_written(self):
+        """`from . import x` has no meaning without a frame's `__package__`.
+
+        A compiled module has no frame. The meaning is fixed at compile time
+        anyway - it depends only on where the file sits - so it is written
+        down at compile time, and one that counts out past the top of the
+        program is refused in Python's own words.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg" / "inner").mkdir(parents=True)
+            (root / "pkg" / "__init__.py").write_text(
+                "shared = 'top'\n", encoding="utf-8"
+            )
+            (root / "pkg" / "helper.py").write_text(
+                "def help():\n    return 'helped'\n", encoding="utf-8"
+            )
+            (root / "pkg" / "inner" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "pkg" / "inner" / "deep.py").write_text(
+                "from .. import shared\n"
+                "from ..helper import help\n"
+                "from .. import helper\n"
+                "def go():\n"
+                "    return shared + help() + helper.help()\n",
+                encoding="utf-8",
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "from pkg.inner.deep import go\nprint(go())\n", encoding="utf-8"
+            )
+            generated, linked = python_program_to_capi_c(entry)
+            self.assertIn("pkg.inner.deep", linked)
+            self.assertIn("pkg.helper", linked)
+            (root / "pkg" / "inner" / "deep.py").write_text(
+                "from ... import nothing\n", encoding="utf-8"
+            )
+            with self.assertRaises(CApiEmitError) as caught:
+                python_program_to_capi_c(entry)
+            self.assertIn(
+                "attempted relative import beyond top-level package",
+                str(caught.exception),
+            )
+
     def test_every_module_has_its_dunders(self):
         """`if __name__ == '__main__':` is how a script says where it starts.
 

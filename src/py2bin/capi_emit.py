@@ -9245,6 +9245,21 @@ class CApiEmitter:
             # PyImport_AddModule borrows; sys.modules owns it, and this holds
             # its own reference for as long as the program runs.
             out.append(f"    Py_IncRef(m_{key});")
+        # A member of a package is also an attribute of it, which is what
+        # `pkg.thing` reads and what `from pkg import thing` finds. The import
+        # system sets this as it loads each one; nothing loads these, so it is
+        # set here - before any body runs, because a package's own body is
+        # often what asks for its members.
+        registered = {name for name, _ in self.linked}
+        for name, key in self.linked:
+            parent, _, last = name.rpartition(".")
+            if not parent or parent not in registered:
+                continue
+            out.append(
+                f"    if (PyObject_SetAttrString(m_{parent.replace('.', '_')}, "
+                f"{_c_string(last)}, m_{key}) < 0) "
+                f"{{ {self._report()}; Py_Finalize(); exit(1); }}"
+            )
         for name, key in self.linked:
             out.append(f"    if (!f__module_{key}()) {{")
             out.append("        PyErr_Print(); Py_Finalize(); exit(1);")
@@ -9305,35 +9320,85 @@ class CApiEmitter:
         return lines
 
 
+def _module_file(root: Path, name: str) -> Path | None:
+    """The file the program keeps this dotted module in, if it keeps one.
+
+    `a.b` is `a/b.py` if there is one and `a/b/__init__.py` if there is not -
+    the same two places, in the same order, that the import system looks in.
+    """
+
+    parts = name.split(".")
+    plain = root.joinpath(*parts[:-1]) / f"{parts[-1]}.py"
+    if plain.is_file():
+        return plain
+    package = root.joinpath(*parts) / "__init__.py"
+    if package.is_file():
+        return package
+    return None
+
+
+def _package_of(root: Path, name: str, path: Path) -> str:
+    """What a relative import in this module counts levels from.
+
+    A package counts from itself and a module from the package holding it,
+    which is what makes `from . import x` mean a sibling in one and a member
+    in the other.
+    """
+
+    if path.name == "__init__.py":
+        return name
+    return name.rpartition(".")[0]
+
+
 def local_modules(entry: Path) -> list[tuple[str, Path]]:
     """The program's own modules, in the order their bodies must run.
 
-    A module is "the program's own" when a `.py` of that name sits beside the
-    entry. Everything else - the standard library, installed packages - is left
-    to the interpreter, which is the whole point of this tier. Depth first, so
-    a module is listed after anything it imports.
+    A module is "the program's own" when a file of that name sits beside the
+    entry - `helper.py`, or `pkg/__init__.py`, or `pkg/sub/deeper.py`.
+    Everything else - the standard library, installed packages - is left to
+    the interpreter, which is the whole point of this tier.
+
+    Depth first, so a module is listed after everything it imports, and a
+    package before its members unless the package's own body is what imports
+    them. A name already being looked at is passed over rather than followed,
+    which is what lets two modules import each other without this going round
+    for ever - and is also, near enough, why Python allows it.
     """
 
     root = entry.parent
     ordered: list[tuple[str, Path]] = []
     seen: set[str] = set()
 
-    def visit(path: Path) -> None:
-        for name in sorted(imported_names(path)):
-            candidate = root / f"{name}.py"
-            if name in seen or not candidate.exists() or candidate == entry:
-                continue
-            seen.add(name)
-            # Its own imports first: a module's body may use what it imported.
-            visit(candidate)
-            ordered.append((name, candidate))
+    def take(name: str) -> None:
+        if name in seen:
+            return
+        found = _module_file(root, name)
+        if found is None or found == entry:
+            return
+        seen.add(name)
+        parent = name.rpartition(".")[0]
+        if parent:
+            # `pkg.thing` is not reachable until `pkg` is, so the package's
+            # own body runs first - unless it is the package that imports the
+            # member, which the guard above notices and steps around.
+            take(parent)
+        for wanted in sorted(imported_names(found, _package_of(root, name, found))):
+            take(wanted)
+        ordered.append((name, found))
 
-    visit(entry)
+    for wanted in sorted(imported_names(entry, "")):
+        take(wanted)
     return ordered
 
 
-def imported_names(path: Path) -> set[str]:
-    """The top-level module names this file imports."""
+def imported_names(path: Path, package: str = "") -> set[str]:
+    """Every module name this file imports, dotted, and made absolute.
+
+    `from . import thing` in `pkg/a.py` is `pkg.thing`, and the level counts
+    outwards from ``package``. `from a.b import c` asks for `a.b`, and for
+    `a.b.c` as well, because a `from` import names either an attribute of a
+    module or a module of a package and there is no telling which from here.
+    """
 
     found: set[str] = set()
     # Named, so a syntax error in the program says which file and not
@@ -9342,10 +9407,60 @@ def imported_names(path: Path) -> set[str]:
         ast.parse(path.read_text(encoding="utf-8"), str(path))
     ):
         if isinstance(node, ast.Import):
-            found.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            found.add(node.module.split(".")[0])
+            for alias in node.names:
+                found.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            base = resolved_import(node, package)
+            if base is None:
+                continue
+            if base:
+                found.add(base)
+            for alias in node.names:
+                if alias.name != "*":
+                    found.add(f"{base}.{alias.name}" if base else alias.name)
     return found
+
+
+def resolved_import(node: ast.ImportFrom, package: str) -> str | None:
+    """What module a `from ... import` names, counted out from ``package``.
+
+    None where the level reaches past the top of the program, which is a
+    program CPython refuses too - "attempted relative import beyond
+    top-level package".
+    """
+
+    if not node.level:
+        return node.module or ""
+    parts = package.split(".") if package else []
+    if node.level > len(parts):
+        return None
+    base = ".".join(parts[: len(parts) - node.level + 1])
+    if node.module:
+        return f"{base}.{node.module}" if base else node.module
+    return base
+
+
+class _Absolute(ast.NodeTransformer):
+    """Write this module's relative imports out as the absolute ones they are.
+
+    The emitter hands every import to the interpreter as a name, and a
+    relative one has no meaning without the frame's `__package__` - which a
+    compiled module does not have. Where the meaning is fixed at compile time
+    anyway, it is written down at compile time.
+    """
+
+    def __init__(self, package: str) -> None:
+        self.package = package
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
+        if not node.level:
+            return node
+        base = resolved_import(node, self.package)
+        if base is None:
+            return node
+        return ast.copy_location(
+            ast.ImportFrom(module=base or None, names=node.names, level=0), node
+        )
 
 
 def python_program_to_capi_c(
@@ -9361,10 +9476,13 @@ def python_program_to_capi_c(
     emitter = CApiEmitter(entry)
     emitter.extra_paths = list(extra_paths)
     emitter.crash_log = crash_log
-    trees = [
-        (name, ast.parse(path.read_text(encoding="utf-8")), str(path))
-        for name, path in modules
-    ]
+    root = entry.parent
+    trees = []
+    for name, path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = _Absolute(_package_of(root, name, path)).visit(tree)
+        ast.fix_missing_locations(tree)
+        trees.append((name, tree, str(path)))
     trees.append(
         (entry.stem, ast.parse(entry.read_text(encoding="utf-8")), str(entry))
     )

@@ -536,8 +536,23 @@ wins over whatever the linked interpreter happens to have.
 **A program is more than its entry file.** Compiling only the module named on
 the command line left every other `.py` of the same program to be found as
 source beside the binary - so a three-file application was one file compiled
-and two interpreted, which is not what "compiled" should mean. Every `.py`
-beside the entry that it imports is now compiled into the same image.
+and two interpreted, which is not what "compiled" should mean. Every module of
+the program that the entry reaches is now compiled into the same image -
+`helper.py` beside it, and `pkg/__init__.py`, and `pkg/sub/deeper.py`.
+
+A package is found the way the import system finds one: `a.b` is `a/b.py` if
+there is one and `a/b/__init__.py` if there is not. A member of a package is
+also an attribute of it, which is what `pkg.thing` reads and what `from pkg
+import thing` finds; the import system sets that as it loads each module, and
+nothing loads these, so it is set at start-up instead - before any body runs,
+because a package's own body is often what asks for its members.
+
+Relative imports are resolved where they are written. `from . import x` has no
+meaning without a frame's `__package__` and a compiled module has no frame,
+but the meaning depends only on where the file sits, so it is settled at
+compile time and the emitter only ever sees absolute names. One that counts
+out past the top of the program is refused in Python's own words: "attempted
+relative import beyond top-level package".
 
 Each linked module gets a C name prefix, because two modules may each define a
 function or a global of the same name. Its body becomes a function of its own,

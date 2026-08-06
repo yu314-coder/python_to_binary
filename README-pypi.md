@@ -318,7 +318,7 @@ CPython, and requiring identical stdout and exit status.
 | `try` / `except` / `finally`, `with` | ✅ |
 | `import`, `from … import`, relative imports | ✅ |
 | `global` / `nonlocal`, tuple unpacking | ✅ |
-| the whole program: every `.py` beside the entry is compiled in | ✅ |
+| the whole program: modules, packages and relative imports compiled in | ✅ |
 | `__name__`, `__file__`, `inspect.signature` on compiled functions | ✅ |
 | walrus (`:=`) | ✅ |
 | `raise … from …` | ✅ |
