@@ -2010,13 +2010,22 @@ class CApiEmitter:
             self.current.locals.remove(target)
             return self.pool(node.value, indent)
         if isinstance(node.value, str):
-            encoded = node.value.encode("utf-8")
-            if b"\0" in encoded:
+            # `surrogatepass`, because a Python string may hold a lone
+            # surrogate - `'a\udcffb'` is what a name that came off a
+            # filesystem in some other encoding looks like - and plain UTF-8
+            # refuses to encode one. The compiler stopped with the codec's
+            # own complaint and no position, on a string the program is
+            # perfectly entitled to write.
+            encoded = node.value.encode("utf-8", "surrogatepass")
+            if b"\0" in encoded or encoded != node.value.encode(
+                "utf-8", "replace"
+            ):
                 # A zero byte is a character in Python and an end in C, so the
                 # text goes through the decoder that is told how long it is.
                 self.emit(
                     f"{target} = PyUnicode_DecodeUTF8("
-                    f"{_c_bytes(encoded)}, {len(encoded)}LL, 0);",
+                    f"{_c_bytes(encoded)}, {len(encoded)}LL, "
+                    f'"surrogatepass");',
                     indent,
                 )
             else:
@@ -9002,11 +9011,15 @@ class CApiEmitter:
             return (
                 f"PyBytes_FromStringAndSize({_c_bytes(value)}, {len(value)}LL)"
             )
-        encoded = value.encode("utf-8")
-        if b"\0" in encoded:
-            # A zero byte is a character in Python and an end in C, so this
-            # text goes through the decoder that is told how long it is.
-            return f"PyUnicode_DecodeUTF8({_c_bytes(encoded)}, {len(encoded)}LL, 0)"
+        encoded = value.encode("utf-8", "surrogatepass")
+        if b"\0" in encoded or encoded != value.encode("utf-8", "replace"):
+            # A zero byte is a character in Python and an end in C, and a lone
+            # surrogate is not UTF-8 at all - both go through the decoder,
+            # which is told how long the text is and how to read it back.
+            return (
+                f"PyUnicode_DecodeUTF8({_c_bytes(encoded)}, "
+                f'{len(encoded)}LL, "surrogatepass")'
+            )
         return f"PyUnicode_FromString({_c_string(value)})"
 
     @staticmethod

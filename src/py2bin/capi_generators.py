@@ -1657,10 +1657,34 @@ def _arguments(names: list[str]) -> ast.arguments:
     )
 
 
+def _awaits(node: ast.AST) -> bool:
+    """Whether this expression awaits, not counting a nested function."""
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(
+            child,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+        ):
+            continue
+        if isinstance(child, ast.Await) or _awaits(child):
+            return True
+    return False
+
+
 def _is_async_comprehension(node: ast.AST) -> bool:
-    return isinstance(
+    """A comprehension the state machine cannot leave as one expression.
+
+    Either it iterates something asynchronously, or it awaits somewhere
+    inside - `[await one(i) for i in xs]` is as much a suspension point as
+    `[x async for x in xs]`, and the machine cuts at statements, so both have
+    to be written out as statements.
+    """
+
+    if not isinstance(
         node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-    ) and any(clause.is_async for clause in node.generators)
+    ):
+        return False
+    return any(clause.is_async for clause in node.generators) or _awaits(node)
 
 
 class _Unfold(ast.NodeTransformer):

@@ -6222,16 +6222,44 @@ class GeneratorHandlerTests(unittest.TestCase):
 
     def test_awaits_that_cannot_be_lifted_are_refused(self):
         # Lifting an await out of a conditional would run it unconditionally,
-        # and out of a comprehension would run it once instead of many times.
+        # which is a different program. A comprehension used to be refused
+        # for a related reason and is not any more - see below.
         for source, needle in (
             ("import asyncio\nasync def f(c):\n    return c and await g()\n", "`and`"),
             ("import asyncio\nasync def f(c):\n    return await g() if c else 1\n", "arm"),
-            ("import asyncio\nasync def f(xs):\n    return [await g(x) for x in xs]\n", "comprehension"),
         ):
             with self.subTest(source=source):
                 with self.assertRaises(CApiEmitError) as caught:
                     python_to_capi_c(source, "program.py")
                 self.assertIn(needle, str(caught.exception))
+
+    def test_a_comprehension_that_awaits_is_written_out(self):
+        """It was refused for the same reason an `async for` one was.
+
+        A comprehension is one expression and the state machine cuts at
+        statements, so an `await` inside could not be lifted out of it - out
+        would have run it once where the comprehension runs it per item. It
+        is written out as the loop it is instead, which is where the awaits
+        become statements of their own.
+        """
+        self._run(
+            "import asyncio\n"
+            "async def one(v):\n"
+            "    await asyncio.sleep(0)\n"
+            "    return v * 2\n"
+            "async def gen(n):\n"
+            "    for i in range(n):\n"
+            "        yield i\n"
+            "async def main():\n"
+            "    a = [await one(i) for i in range(3)]\n"
+            "    b = {await one(i) for i in range(2)}\n"
+            "    c = {i: await one(i) for i in range(2)}\n"
+            "    d = [await one(x) async for x in gen(2)]\n"
+            "    e = [await one(i) for i in range(4) if i % 2 == 0]\n"
+            "    return a, sorted(b), c, d, e\n"
+            "print(asyncio.run(main()))\n",
+            b"([0, 2, 4], [0, 2], {0: 0, 1: 2}, [0, 2], [0, 4])\n",
+        )
 
 
 class DelegationReturnTests(unittest.TestCase):
