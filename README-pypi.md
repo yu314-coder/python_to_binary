@@ -77,7 +77,7 @@ Floats stay floats and `-0.0` stays distinct. Evaluation order is Python's, and
 a `__len__` or `__getitem__` runs exactly once. Exceptions - class, message,
 `__cause__`, traceback, what `except` matches - are the interpreter's.
 
-Where it knowingly differs: a generator expression is built eagerly;
+Where it knowingly differs:
 `builtins.len` and `builtins.str` replaced at run time are not observed
 (`print` is); attribute access is slower than the interpreter's, because
 matching it means reading `ob_type` out of an object this treats as opaque -

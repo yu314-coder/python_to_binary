@@ -6220,6 +6220,74 @@ class GeneratorHandlerTests(unittest.TestCase):
             b"caught inside\n",
         )
 
+    def test_a_generator_expression_waits_to_be_asked(self):
+        """It was gathered into a list, which is right for the values and
+        wrong for when they are computed.
+
+        The whole sequence ran before anything asked for the first item, so
+        side effects happened too early, a large sequence was built in full,
+        and an endless one never came back at all - `(x * 2 for x in
+        count())` did not return. CPython makes a genexp a function, and so
+        does this: the first iterable is evaluated where the expression is
+        written, and everything else waits.
+        """
+        self._run(
+            "import itertools\n"
+            "calls = []\n"
+            "def note(v):\n"
+            "    calls.append(v)\n"
+            "    return v\n"
+            "g = (note(i) for i in range(3))\n"
+            "print('before', calls)\n"
+            "print(next(g), calls)\n"
+            "endless = (x * 2 for x in itertools.count())\n"
+            "print(next(endless), next(endless))\n",
+            b"before []\n0 [0]\n0 2\n",
+        )
+
+    def test_a_generator_written_inside_something_is_still_rewritten(self):
+        """Only a `def` and a `class` were descended into.
+
+        So a generator written inside an `if`, a `for` or a `try` never
+        became its machine and reached the emitter still yielding - `if
+        True:` around a `def` was enough to do it. A generator inside another
+        generator failed for a second reason: the check for "does this
+        statement yield" said yes to a nested `def`, whose yields are its own.
+        """
+        self._run(
+            "def outer():\n"
+            "    def inner(n):\n"
+            "        yield from range(n)\n"
+            "    for i in inner(2):\n"
+            "        yield i * 10\n"
+            "if True:\n"
+            "    def guarded():\n"
+            "        yield 1\n"
+            "        yield 2\n"
+            "print(list(outer()), list(guarded()))\n",
+            b"[0, 10] [1, 2]\n",
+        )
+
+    def test_an_unhashable_key_is_reported_where_it_was_used(self):
+        """The store's answer was thrown away.
+
+        `{[1]: 2}` built a dict, carried on, and left a TypeError set for
+        whatever ran next to trip over. A dict display says which of the two
+        places it was, and so does this.
+        """
+        self._run(
+            "try:\n"
+            "    d = {[1]: 2}\n"
+            "except TypeError as e:\n"
+            "    print('dict:', e)\n"
+            "try:\n"
+            "    s = {[1]}\n"
+            "except TypeError as e:\n"
+            "    print('set:', e)\n",
+            b"dict: cannot use 'list' as a dict key (unhashable type: 'list')\n"
+            b"set: cannot use 'list' as a set element (unhashable type: 'list')\n",
+        )
+
     def test_an_await_that_may_not_run_is_written_out(self):
         """`c and await g()` was refused, and the refusal was half right.
 

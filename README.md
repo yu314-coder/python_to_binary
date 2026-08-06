@@ -588,6 +588,8 @@ CPython, and requiring identical stdout and exit status.
 | `[await f(x) for x in xs]`, and the set and dict forms | ✅ |
 | a string holding a lone surrogate | ✅ |
 | `c and await g()`, `await g() if c else x`, `while await g():` | ✅ |
+| a generator expression, evaluated when asked rather than at once | ✅ |
+| a generator `def` inside an `if`, a `for`, or another generator | ✅ |
 | `dir()` with no argument | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |

@@ -370,6 +370,19 @@ def _awaited(value: ast.expr) -> ast.expr:
 
 
 def _yields(node: ast.AST) -> bool:
+    """Whether this suspends the function it is written in.
+
+    A nested `def` does not, however many yields are inside it - they belong
+    to that function. The walk below already skips a function it meets as a
+    *child*; being handed one directly is the same question and was answered
+    the other way, so `def outer(): def inner(): yield` made the machine
+    treat the inner `def` as a statement containing a yield and refuse it.
+    """
+
+    if isinstance(
+        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    ):
+        return False
     if isinstance(node, (ast.Yield, ast.YieldFrom)):
         return True
     for child in ast.iter_child_nodes(node):
@@ -1871,6 +1884,101 @@ class _UnfoldChoices(ast.NodeTransformer):
         return ast.copy_location(ast.Name(id=held, ctx=ast.Load()), node)
 
 
+class _Genexps(ast.NodeTransformer):
+    """`(elt for x in it)` written as the generator function it is.
+
+    It was gathered into a list and an iterator handed back over that, which
+    is right for the values and wrong for when they are computed: the whole
+    sequence ran before anything asked for the first item. Side effects
+    happened too early, a large sequence was built in full, and an endless one
+    - `(x * 2 for x in count())` - never came back at all.
+
+    CPython makes a genexp a function, and so does this. The first iterable
+    is evaluated where the expression is written, as it is there, and passed
+    in; everything else waits to be asked for.
+    """
+
+    def __init__(self) -> None:
+        self.made: list[ast.stmt] = []
+        self.count = 0
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> ast.AST:
+        # Inner ones first, so a genexp inside another is already a call.
+        self.generic_visit(node)
+        if any(clause.is_async for clause in node.generators):
+            # An async one is a different animal and is unfolded elsewhere.
+            return node
+        self.count += 1
+        name = f"_py2bin_ge{self.count}"
+        source = "_py2bin_ge_src"
+        body: list[ast.stmt] = [ast.Expr(value=ast.Yield(value=node.elt))]
+        for index, clause in enumerate(reversed(node.generators)):
+            for condition in reversed(clause.ifs):
+                body = [ast.If(test=condition, body=body, orelse=[])]
+            first = index == len(node.generators) - 1
+            body = [
+                ast.For(
+                    target=clause.target,
+                    iter=(
+                        ast.Name(id=source, ctx=ast.Load())
+                        if first
+                        else clause.iter
+                    ),
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
+            ]
+        self.made.append(
+            ast.FunctionDef(
+                name=name,
+                args=_arguments([source]),
+                body=body,
+                decorator_list=[],
+                type_params=[],
+                returns=None,
+            )
+        )
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Name(id=name, ctx=ast.Load()),
+                args=[node.generators[0].iter],
+                keywords=[],
+            ),
+            node,
+        )
+
+
+def expand_genexps(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Write out every generator expression in these statements."""
+
+    rebuilt: list[ast.stmt] = []
+    for statement in body:
+        for field in _NESTED:
+            held = getattr(statement, field, None)
+            if isinstance(held, list) and held and isinstance(held[0], ast.stmt):
+                setattr(statement, field, expand_genexps(held))
+        for handler in getattr(statement, "handlers", ()):
+            handler.body = expand_genexps(handler.body)
+        maker = _Genexps()
+        statement = maker.visit(statement)
+        if maker.made:
+            for made in maker.made:
+                ast.fix_missing_locations(made)
+            rebuilt.extend(maker.made)
+        rebuilt.append(statement)
+    return rebuilt
+
+
 def unfold_conditional_awaits(body: list[ast.stmt]) -> list[ast.stmt]:
     """Write out every `and`, `or` and `a if c else b` that awaits.
 
@@ -1960,6 +2068,7 @@ def expand(tree: ast.Module) -> ast.Module:
     to compile, and a function that returns an instance of it.
     """
 
+    tree.body = expand_genexps(tree.body)
     counter = 0
     wants_helper = False
 
@@ -1993,8 +2102,10 @@ def expand(tree: ast.Module) -> ast.Module:
                     # it is short for before the machine sees it, because the
                     # machine cuts at statements and a comprehension is one
                     # expression.
-                    body=unfold_async_comprehensions(
-                        unfold_conditional_awaits(statement.body)
+                    body=walk(
+                        unfold_async_comprehensions(
+                            unfold_conditional_awaits(statement.body)
+                        )
                     ),
                     decorator_list=statement.decorator_list,
                     type_params=[],
@@ -2019,6 +2130,10 @@ def expand(tree: ast.Module) -> ast.Module:
                 continue
             if isinstance(statement, ast.FunctionDef) and is_generator(statement):
                 counter += 1
+                # Its own body first: a generator written inside a generator
+                # has to become its machine before this one is cut into
+                # blocks, or the blocks would hold a `def` that still yields.
+                statement.body = walk(statement.body)
                 made, maker = rewrite(statement, counter)
                 made_here.append(made)
                 rebuilt.append(maker)
@@ -2034,6 +2149,22 @@ def expand(tree: ast.Module) -> ast.Module:
                 continue
             if isinstance(statement, ast.FunctionDef):
                 statement.body = walk(statement.body)
+                rebuilt.append(statement)
+                continue
+            # Every other body a statement holds. Only `def` and `class` were
+            # descended into, so a generator written inside an `if`, a `for`
+            # or a `try` was never turned into its machine and reached the
+            # emitter still yielding - `if True:` around a `def` was enough.
+            for field in _NESTED:
+                held = getattr(statement, field, None)
+                if (
+                    isinstance(held, list)
+                    and held
+                    and isinstance(held[0], ast.stmt)
+                ):
+                    setattr(statement, field, walk(held))
+            for handler in getattr(statement, "handlers", ()):
+                handler.body = walk(handler.body)
             rebuilt.append(statement)
         return rebuilt
 

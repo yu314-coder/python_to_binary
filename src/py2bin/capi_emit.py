@@ -3369,6 +3369,81 @@ class CApiEmitter:
             self.emit(f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent)
         self.emit(f"Py_DecRef({iterator});", indent)
 
+    def wrap_unhashable(self, key: str, where: str, indent: int) -> None:
+        """Say which place an unhashable value was being used as.
+
+        `PyDict_SetItem` reports `unhashable type: 'list'`; a dict display
+        reports `cannot use 'list' as a dict key (unhashable type: 'list')`,
+        which says where. Only a TypeError is rewritten - anything else the
+        store raised is the program's and travels as it is.
+        """
+
+        matched = self.temporary_flag()
+        kind = self.builtin_raw("TypeError", indent)
+        self.emit(f"{matched} = PyErr_ExceptionMatches({kind});", indent)
+        self.emit(f"if ({matched}) {{", indent)
+        held = self.temporary()
+        self.emit("PyErr_Clear();", indent + 1)
+        self.emit(
+            f'{held} = PyObject_GetAttrString({key}, "__class__");', indent + 1
+        )
+        self.emit(f"if ({held}) {{", indent + 1)
+        named = self.temporary()
+        self.emit(
+            f'{named} = PyObject_GetAttrString({held}, "__name__");', indent + 2
+        )
+        self.emit(f"Py_DecRef({held});", indent + 2)
+        self.emit(f"if ({named}) {{", indent + 2)
+        built = self.temporary()
+        piece = self.temporary()
+        self.emit(f"{built} = 0;", indent + 3)
+        for literal, insert in (
+            ("cannot use '", True),
+            (f"' as {where} (unhashable type: '", True),
+            ("')", False),
+        ):
+            self.emit(
+                f"{piece} = PyUnicode_FromString({_c_string(literal)});",
+                indent + 3,
+            )
+            self.emit(f"if (!{built}) {{", indent + 3)
+            self.emit(f"{built} = {piece};", indent + 4)
+            self.emit("} else {", indent + 3)
+            joined = self.temporary()
+            self.emit(
+                f"{joined} = PyNumber_Add({built}, {piece});", indent + 4
+            )
+            self.emit(f"Py_DecRef({built});", indent + 4)
+            self.emit(f"Py_DecRef({piece});", indent + 4)
+            self.emit(f"{built} = {joined};", indent + 4)
+            self.emit("}", indent + 3)
+            if insert:
+                self.emit(f"if ({built}) {{", indent + 3)
+                added = self.temporary()
+                self.emit(
+                    f"{added} = PyNumber_Add({built}, {named});", indent + 4
+                )
+                self.emit(f"Py_DecRef({built});", indent + 4)
+                self.emit(f"{built} = {added};", indent + 4)
+                self.emit("}", indent + 3)
+        self.emit(f"Py_DecRef({named});", indent + 3)
+        self.emit(f"if ({built}) {{", indent + 3)
+        raised = self.temporary()
+        self.emit(
+            f"{raised} = PyObject_CallOneArg({kind}, {built});", indent + 4
+        )
+        self.emit(f"Py_DecRef({built});", indent + 4)
+        self.emit(f"if ({raised}) {{", indent + 4)
+        self.emit(f"PyErr_SetObject({kind}, {raised});", indent + 5)
+        self.emit(f"Py_DecRef({raised});", indent + 5)
+        self.emit("}", indent + 4)
+        self.emit("}", indent + 3)
+        self.emit("}", indent + 2)
+        self.emit("}", indent + 1)
+        self.emit("}", indent)
+        self.emit(f"Py_DecRef({kind});", indent)
+        self.emit(self.failure(), indent)
+
     def dict_literal(self, node: ast.Dict, indent: int) -> str:
         """`{k: v}` - an empty dict, then each pair set into it."""
 
@@ -3385,7 +3460,17 @@ class CApiEmitter:
                 continue
             key = self.expression(key_node, indent)
             value = self.expression(value_node, indent)
-            self.emit(f"PyDict_SetItem({target}, {key}, {value});", indent)
+            outcome = self.temporary_flag()
+            self.emit(
+                f"{outcome} = PyDict_SetItem({target}, {key}, {value});", indent
+            )
+            # The answer was thrown away, and an unhashable key leaves an
+            # exception set: `{[1]: 2}` built a dict, carried on, and the
+            # TypeError surfaced later attached to whatever ran next. A dict
+            # display says which of the two it was, and so does this.
+            self.emit(f"if ({outcome} < 0) {{", indent)
+            self.wrap_unhashable(key, "a dict key", indent + 1)
+            self.emit("}", indent)
             # PyDict_SetItem does not steal either reference, so both go back.
             self.emit(f"Py_DecRef({key});", indent)
             self.emit(f"Py_DecRef({value});", indent)
