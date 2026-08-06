@@ -6615,7 +6615,9 @@ class CApiEmitter:
         else:
             maker = self.expression(chosen, indent)
         self.scope_path.append((node.name, False))
-        namespace = self.class_namespace(node, maker, title, bases, indent)
+        namespace = self.class_namespace(
+            node, maker, title, bases, indent, seeded=chosen is None
+        )
         binder = None
         # What the body has bound so far. A decorator and an attribute's value
         # run as the class is built and can see it; a method body cannot, and
@@ -6776,15 +6778,37 @@ class CApiEmitter:
         self.emit(f"{target} = {made};", indent)
         self.publish(node.name, target, indent)
 
-    def derive_metaclass(self, maker: str, bases: str, indent: int) -> None:
+    def derive_metaclass(
+        self, maker: str, bases: str, indent: int, seeded: bool = False
+    ) -> None:
         """Replace `maker` with the most derived metaclass among the bases.
 
-        Python's rule, and the same one `type` applies when it makes the
-        class: start from the metaclass named in the header (or `type`), and
-        for each base take its metaclass if that is the more derived of the
-        two. A pair that are unrelated is a conflict, which `type` reports
-        when it gets there - so this simply leaves `maker` alone and lets it.
+        Python's rule: for each base take its metaclass if that is the more
+        derived of the two. A pair that are unrelated is a conflict, which
+        `type` reports when it gets there - so this leaves `maker` alone and
+        lets it.
+
+        Where the header names no metaclass, `__build_class__` starts from
+        the type of the *first base* rather than from `type`, and only then
+        compares the rest. Starting from `type` is not the same thing when a
+        base is not a class at all: for `class Bad(42)` the first base's type
+        is `int`, which is not a subclass of `type`, so nothing ever replaced
+        `type` and the conflict message came out - where CPython gets as far
+        as calling `int` and answers `int expected at most 2 arguments, got
+        3`. Two different complaints about the same program, and CPython's is
+        the one about what the program actually did.
         """
+
+        if seeded:
+            first = self.temporary()
+            self.emit(f"{first} = PyTuple_GetItem({bases}, 0);", indent)
+            self.emit(f"if (!{first}) {{ {self.failure()} }}", indent)
+            self.emit(f"Py_DecRef({maker});", indent)
+            self.emit(
+                f'{maker} = PyObject_GetAttrString({first}, "__class__");',
+                indent,
+            )
+            self.emit(f"if (!{maker}) {{ {self.failure()} }}", indent)
 
         counter = self.temporary_flag()
         span = self.temporary_flag()
@@ -6870,7 +6894,13 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({held});", indent)
 
     def class_namespace(
-        self, node: ast.ClassDef, maker: str, title: str, bases: str, indent: int
+        self,
+        node: ast.ClassDef,
+        maker: str,
+        title: str,
+        bases: str,
+        indent: int,
+        seeded: bool = False,
     ) -> str:
         """What the class body is populated into, and what has to be in it first.
 
@@ -6894,7 +6924,7 @@ class CApiEmitter:
             # used twice. Asking `type` got a plain dict and every `Enum`
             # subclass failed. The *call* below needs none of this: `type`
             # works the winner out itself and hands over.
-            self.derive_metaclass(maker, bases, indent)
+            self.derive_metaclass(maker, bases, indent, seeded=seeded)
         prepare = self.temporary()
         self.emit(
             f'{prepare} = PyObject_GetAttrString({maker}, "__prepare__");',
@@ -6922,8 +6952,22 @@ class CApiEmitter:
         self.emit(f"{namespace} = PyDict_New();", indent + 1)
         self.emit(f"if (!{namespace}) {{ {self.failure()} }}", indent + 1)
         self.emit("}", indent)
+        # The program's own `__name__`, read as the name it is. Asking
+        # `program_name` for it found `builtins.__name__` first - that
+        # function tries the builtins before the program, because for `len`
+        # and `Exception` it cannot fail - so every compiled class said it
+        # was defined in `builtins`, and `print(SomeClass)` answered
+        # `<class 'Plain'>` where CPython says `<class '__main__.Plain'>`.
         for key, value in (
-            ("__module__", self.program_name("__name__", indent)),
+            (
+                "__module__",
+                self.expression(
+                    ast.copy_location(
+                        ast.Name(id="__name__", ctx=ast.Load()), node
+                    ),
+                    indent,
+                ),
+            ),
             ("__qualname__", title),
         ):
             self.emit(
@@ -7883,6 +7927,15 @@ class CApiEmitter:
         for node in tree.body:
             self.note_module_bindings(node)
 
+        # Registered before any body is written, not when the module body
+        # reaches them. A function - or a class body - written earlier that
+        # reads `__name__` would otherwise not find it among the module's
+        # globals and would go on to the builtins, where `__name__` also
+        # exists and answers "builtins".
+        for dunder in ("__name__", "__file__"):
+            self.note_global(dunder)
+            self.certain_globals.add(dunder)
+            self.certain_at.setdefault(dunder, -1)
         for position, node in enumerate(tree.body):
             if isinstance(node, ast.FunctionDef) and node.name in self.known_functions:
                 # A body runs only after its own `def` has, so every earlier
