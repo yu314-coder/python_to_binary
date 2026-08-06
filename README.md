@@ -577,6 +577,7 @@ CPython, and requiring identical stdout and exit status.
 | a closure capturing a comprehension's target (`lambda: i`) | ❌ refused |
 | `typing.Generic[T]` as a base, and `__mro_entries__` generally | ✅ |
 | a class inside a class body, at any depth | ✅ |
+| `pickle` and `copy` of a compiled class or function | ✅ |
 | `except*` (PEP 654) | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |

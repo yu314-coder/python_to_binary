@@ -4524,6 +4524,35 @@ class CApiEmitter:
             target, "only a name, an attribute or a subscript is assigned to here"
         )
 
+    def show_on_module(self, name: str, slot: str, indent: int) -> None:
+        """Put a module-level class or function on the module object too.
+
+        `pickle` does not store a class; it stores the path to one, and gets
+        it back by importing the module named in `__module__` and looking up
+        `__qualname__` on it - then checks that what it found *is* the class.
+        py2bin keeps a module's globals in C variables, so the class was
+        nowhere on the module and pickling any instance failed with "when
+        serializing P object".
+
+        Only a `def` and a `class`, and only at module level: those run once,
+        so the extra store costs nothing measurable, and they are the two
+        things `pickle` looks up by name. Every other global stays where it
+        was - mirroring all of them would put a store in front of every
+        assignment to a global, which is a loop's worth of work for something
+        almost no program asks for. A module that does ask - one that mentions
+        `globals()` - already keeps everything in the module's dictionary.
+        """
+
+        if self.prefix or self.globals_in_dict or not slot.startswith("g_"):
+            # A linked module has `publish` for this, and a module whose
+            # globals live in the dictionary is already there.
+            return
+        self.emit(
+            f'PyObject_SetAttrString(PyImport_AddModule("__main__"), '
+            f"{_c_string(name)}, {slot});",
+            indent,
+        )
+
     def publish(self, name: str, slot: str, indent: int) -> None:
         """Show a linked module's global on the module object as well.
 
@@ -6594,6 +6623,8 @@ class CApiEmitter:
         self.emit(f"if ({target}) Py_DecRef({target});", indent)
         self.emit(f"{target} = {made};", indent)
         self.publish(node.name, target, indent)
+        if self.at_module_level:
+            self.show_on_module(node.name, target, indent)
 
     def build_class(self, node: ast.ClassDef, indent: int) -> str:
         """`class C(Base):` - the namespace built, then handed to `type`.
@@ -8178,6 +8209,7 @@ class CApiEmitter:
                 self.emit(f"Py_IncRef({held});", indent)
                 self.emit(f"{slot} = {held};", indent)
                 self.publish(node.name, slot, indent)
+                self.show_on_module(node.name, slot, indent)
                 continue
             # A `def` this could not give a fixed C shape is written here, as
             # a closure bound to its name like any other value.
