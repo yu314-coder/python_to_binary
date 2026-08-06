@@ -579,6 +579,9 @@ CPython, and requiring identical stdout and exit status.
 | a class inside a class body, at any depth | ✅ |
 | `pickle` and `copy` of a compiled class or function | ✅ |
 | `except*` (PEP 654), exception groups | ✅ |
+| `if` / `for` / `try` in a class body | ✅ |
+| complex numbers, `f = lambda self: ...` as a method | ✅ |
+| `dir()` with no argument | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |

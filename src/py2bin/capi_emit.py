@@ -26,6 +26,7 @@ more here than one that saves an increment in places.
 from __future__ import annotations
 
 import ast
+import copy
 import builtins
 import contextlib
 from pathlib import Path
@@ -153,6 +154,57 @@ def write_only_locals(body: list, parameters: set[str]) -> set[str]:
             elif isinstance(inner, ast.ExceptHandler) and inner.name:
                 barred.add(inner.name)
     return stored - loaded - barred
+
+
+class _Renamed(ast.NodeTransformer):
+    """Rename a set of plain names throughout one statement.
+
+    Stops at anything that makes a scope of its own: a name a nested
+    function binds is that function's, not the class body's.
+    """
+
+    def __init__(self, mapping: dict[str, str]) -> None:
+        self.mapping = mapping
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        replacement = self.mapping.get(node.id)
+        if replacement is None:
+            return node
+        return ast.copy_location(
+            ast.Name(id=replacement, ctx=node.ctx), node
+        )
+
+    def visit_alias(self, node: ast.alias) -> ast.AST:
+        # An import binds through here rather than through a Name, so the
+        # rename has to reach it too - otherwise the statement binds the
+        # ordinary name and the class body never sees what it imported.
+        spelled = node.asname or node.name.split(".")[0]
+        replacement = self.mapping.get(spelled)
+        if replacement is None:
+            return node
+        return ast.alias(name=node.name, asname=replacement)
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+
+def _dotted_plain_import(statement: ast.stmt) -> str | None:
+    """`import a.b` with no `as`, which binds `a` and cannot be renamed.
+
+    `import a.b as x` binds the submodule and `import a.b` binds the package,
+    so giving the second one an `as` to rename it changes what it means.
+    """
+
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is None and "." in alias.name:
+                    return alias.name
+    return None
 
 
 def _scope_bindings(body: list) -> set[str]:
@@ -1963,6 +2015,32 @@ class CApiEmitter:
                 indent,
             )
             return self.checked(target, indent)
+        if isinstance(node.value, complex):
+            # `1+2j` is folded to a single constant before it gets here, so
+            # there is nothing to add for the arithmetic - only a way to say
+            # the value, which is the two halves handed to `complex`.
+            maker = self.builtin("complex", indent)
+            real = self.temporary()
+            imaginary = self.temporary()
+            self.emit(
+                f"{real} = PyFloat_FromDouble({node.value.real!r});", indent
+            )
+            self.checked(real, indent)
+            self.emit(
+                f"{imaginary} = PyFloat_FromDouble({node.value.imag!r});",
+                indent,
+            )
+            self.checked(imaginary, indent)
+            held = self.temporary()
+            self.emit(f"{held} = PyTuple_New(2LL);", indent)
+            self.checked(held, indent)
+            self.emit(f"PyTuple_SetItem({held}, 0, {real});", indent)
+            self.emit(f"PyTuple_SetItem({held}, 1, {imaginary});", indent)
+            target = self.temporary()
+            self.emit(f"{target} = PyObject_Call({maker}, {held}, 0);", indent)
+            self.emit(f"Py_DecRef({maker});", indent)
+            self.emit(f"Py_DecRef({held});", indent)
+            return self.checked(target, indent)
         if node.value is Ellipsis:
             # `...` is a singleton like None and True, and it is how a stub
             # body is written - `def f(self): ...` is most of an abstract
@@ -2033,6 +2111,15 @@ class CApiEmitter:
         compile time rather than a wrong answer at run time.
         """
 
+        if node.func.id == "dir":
+            # `dir()` with nothing passed lists the calling frame's names,
+            # and a compiled function has no frame - it answered with a
+            # SystemError about one not existing. `dir(x)` is untouched.
+            raise self.fail(
+                node,
+                "dir() with no argument lists the calling frame's names, and "
+                "a compiled function has no frame - pass what you want listed",
+            )
         if node.func.id == "globals" or self.at_module_level:
             # At module scope Python's `locals()` *is* `globals()`, and this
             # is the module's own dictionary rather than a copy of it, so a
@@ -3584,7 +3671,7 @@ class CApiEmitter:
             )
         if (
             isinstance(node.func, ast.Name)
-            and node.func.id in ("locals", "vars", "globals")
+            and node.func.id in ("locals", "vars", "globals", "dir")
             and not node.args
             and not node.keywords
             and self.builtin_untouched(node.func.id)
@@ -6806,6 +6893,18 @@ class CApiEmitter:
                     value = self.expression(statement.value, indent)
                 finally:
                     self.class_scope.pop()
+                if isinstance(statement.value, ast.Lambda):
+                    # `f = lambda self: ...` in a class body is a method, and
+                    # binds like one. A compiled function is a PyCFunction and
+                    # does not bind itself, so it arrived unbound and the call
+                    # said `self` was missing - the same wrapping a `def` in
+                    # the same place already gets.
+                    bound = self.temporary()
+                    self.emit(
+                        f"{bound} = PyInstanceMethod_New({value});", indent
+                    )
+                    self.emit(f"Py_DecRef({value});", indent)
+                    value = self.checked(bound, indent)
                 key = statement.targets[0].id
             elif isinstance(statement, ast.ClassDef):
                 # A class in a class body is a value the body binds, like an
@@ -6837,11 +6936,12 @@ class CApiEmitter:
                     self.class_scope.pop()
                 key = statement.target.id
             else:
-                raise self.fail(
-                    statement,
-                    "only methods and plain attribute assignments are "
-                    "translated in a class body yet",
-                )
+                # Anything else - an `if` guarding a platform, a `for`
+                # filling a table, a `try` around an optional import. It runs
+                # as ordinary statements and whatever it binds is moved into
+                # the namespace afterwards.
+                self.class_body_statement(statement, namespace, known, indent)
+                continue
             known.add(key)
             named = self.interned(key)
             # Through the mapping protocol: `__prepare__` may have answered
@@ -7013,6 +7113,67 @@ class CApiEmitter:
         )
         self.emit(f"Py_DecRef({value});", indent)
         self.emit(f"Py_DecRef({held});", indent)
+
+    def class_body_statement(
+        self, statement: ast.stmt, namespace: str, known: set[str], indent: int
+    ) -> None:
+        """A statement in a class body that is not simply binding a name.
+
+        A class body is code, and only its *bindings* are special - they end
+        up in the namespace the class is made from rather than in a scope.
+        Everything else is ordinary: `if TYPE_CHECKING:` around an
+        annotation, a `for` filling a table of constants, a `try` around an
+        optional import. All of it was refused.
+
+        The names it binds are renamed to ones nothing else uses, so running
+        it cannot disturb a name of the same spelling in the scope around the
+        class - `v = 99` outside and `v = 1` inside a class body are two
+        different names, and Python keeps them apart. What each one ends up
+        holding is moved into the namespace afterwards, and only if it was
+        bound at all: an `if` with no `else` binds nothing down the other
+        branch.
+        """
+
+        # Every name it *may* bind, not only the ones it certainly binds:
+        # an `if` with two branches binds a name down either, and which one
+        # ran is not known here.
+        dotted = _dotted_plain_import(statement)
+        if dotted is not None:
+            raise self.fail(
+                statement,
+                f"`import {dotted}` inside a class body's `if`, `for` or "
+                f"`try` is not translated here yet - it binds "
+                f"{dotted.split('.')[0]!r}, and the rename that keeps a class "
+                f"body's names out of the scope around it cannot express "
+                f"that. Give the import an alias, so it binds a name of "
+                f"its own, and it compiles.",
+            )
+        bound = sorted(_scope_bindings([statement]))
+        renamed = {name: f"_py2bin_cls{id(statement) & 0xFFFF}_{name}" for name in bound}
+        if renamed:
+            statement = _Renamed(renamed).visit(
+                copy.deepcopy(statement)
+            )
+            ast.fix_missing_locations(statement)
+        self.class_scope.append((namespace, known))
+        try:
+            self.statement(statement, indent)
+        finally:
+            self.class_scope.pop()
+        for name in bound:
+            slot = self.declare(renamed[name])
+            self.emit(f"if ({slot}) {{", indent)
+            self.emit(
+                f"if (PyObject_SetItem({namespace}, {self.interned(name)}, "
+                f"{slot}) < 0) {{ {self.failure()} }}",
+                indent + 1,
+            )
+            # Let go of it here: it was only ever somewhere to put the value
+            # between the statement running and the namespace taking it.
+            self.emit(f"Py_DecRef({slot});", indent + 1)
+            self.emit(f"{slot} = 0;", indent + 1)
+            self.emit("}", indent)
+            known.add(name)
 
     def resolve_mro_entries(self, bases: str, indent: int) -> str:
         """PEP 560: a base that is not a class says what to put in its place.

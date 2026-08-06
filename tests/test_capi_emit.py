@@ -1131,6 +1131,55 @@ class CApiEmitTests(unittest.TestCase):
             b"([1, 2, 3], [2, 4], [1, 2, 3], {1: 2, 2: 4})\n",
         )
 
+    def test_a_class_body_can_hold_statements(self):
+        """An `if`, a `for`, a `try` - all refused, and all ordinary.
+
+        A class body is code, and only its *bindings* are special: they end
+        up in the namespace the class is made from rather than in a scope.
+        The names it binds are renamed to ones nothing else uses first, so a
+        `v` in the class body cannot disturb a `v` beside the class - Python
+        keeps those apart and so does this.
+        """
+        self._run(
+            "import sys\n"
+            "OUTER = 99\n"
+            "class C:\n"
+            "    if sys.platform:\n"
+            "        v = 1\n"
+            "    else:\n"
+            "        v = 2\n"
+            "    vs = []\n"
+            "    for i in (1, 2):\n"
+            "        vs.append(i)\n"
+            "    try:\n"
+            "        import json\n"
+            "        have = True\n"
+            "    except ImportError:\n"
+            "        have = False\n"
+            "    OUTER = 'inner'\n"
+            "print(C.v, C.vs, C.have, C.i, C.OUTER, OUTER, hasattr(C, 'json'))\n",
+            b"1 [1, 2] True 2 inner 99 True\n",
+        )
+
+    def test_a_lambda_in_a_class_body_is_a_method(self):
+        # A compiled function is a PyCFunction and does not bind itself, so
+        # one assigned in a class body arrived unbound and the call said
+        # `self` was missing. A `def` in the same place was already wrapped.
+        self._run(
+            "class A:\n"
+            "    f = lambda self: 2\n"
+            "    g = lambda self, x: x * 3\n"
+            "print(A().f(), A().g(2))\n",
+            b"2 6\n",
+        )
+
+    def test_a_complex_constant_is_a_constant(self):
+        self._run(
+            "c = 1 + 2j\n"
+            "print(c, c.real, c.imag, abs(3 + 4j), (1 + 2j) * (1 + 2j), complex(0, -1))\n",
+            b"(1+2j) 1.0 2.0 5.0 (-3+4j) -1j\n",
+        )
+
     def test_a_class_can_name_its_metaclass(self):
         # `class A(metaclass=M)` calls M rather than `type`, and any other
         # keyword in the header goes to it as well.
