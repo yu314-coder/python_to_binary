@@ -1448,6 +1448,16 @@ def rewrite(
             # it; `close` is `throw(GeneratorExit)` and the language's rules
             # about what the generator may do with it. Both are written out
             # as Python and compiled like the rest of the class.
+            # A generator that has not run yet has nowhere to put what
+            # `send` is given: there is no suspended `yield` waiting for it.
+            # Python says so; this accepted the value and dropped it.
+            *ast.parse(
+                f"def _py2bin_refuse_send(self, _py2bin_value):\n"
+                f"    if self.{STATE} == 0:\n"
+                f"        if _py2bin_value is not None:\n"
+                f"            raise TypeError("
+                f"'can\\'t send non-None value to a just-started generator')\n"
+            ).body,
             *ast.parse(
                 f"def throw(self, _py2bin_exc):\n"
                 f"    self.{THROWN} = _py2bin_exc\n"
@@ -1466,6 +1476,17 @@ def rewrite(
                 name="send",
                 args=_arguments(["self", "value"]),
                 body=[
+                    ast.Expr(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr="_py2bin_refuse_send",
+                                ctx=ast.Load(),
+                            ),
+                            args=[ast.Name(id="value", ctx=ast.Load())],
+                            keywords=[],
+                        )
+                    ),
                     ast.Assign(
                         targets=[
                             ast.Attribute(

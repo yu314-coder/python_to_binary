@@ -726,6 +726,28 @@ class CApiEmitTests(unittest.TestCase):
             )
         self.assertIn("comprehension around it", str(caught.exception))
 
+    def test_send_before_the_first_yield_is_refused(self):
+        """A generator that has not run yet has nowhere to put the value.
+
+        There is no suspended `yield` waiting for it, and Python says so.
+        This took the value and dropped it, so `it.send(5)` on a fresh
+        generator quietly behaved like `next(it)`.
+        """
+        self._run(
+            "def g():\n"
+            "    x = yield 1\n"
+            "    yield x\n"
+            "it = g()\n"
+            "try:\n"
+            "    it.send(5)\n"
+            "except TypeError as e:\n"
+            "    print(e)\n"
+            "print(g().send(None))\n"
+            "second = g()\n"
+            "print(next(second), second.send(7))\n",
+            b"can't send non-None value to a just-started generator\n1\n1 7\n",
+        )
+
     def test_a_generator_can_be_thrown_into_and_closed(self):
         """`throw` raises *at the suspension point*, which is a block here.
 
