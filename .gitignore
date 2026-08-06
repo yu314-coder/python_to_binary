@@ -10,3 +10,6 @@ dist/
 # local build/test scratch on disk D
 .py2bin-work/
 dist_release/
+
+# Worktrees a background workflow makes: each is a copy of this repo.
+.claude/worktrees/
