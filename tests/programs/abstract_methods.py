@@ -8,10 +8,11 @@ from abc import ABC, abstractmethod
 class Shape(ABC):
     @abstractmethod
     def area(self):
-        ...
+        """How much of it there is."""
 
     @abstractmethod
     def name(self):
+        """What it is called."""
         return "shape"
 
     def described(self):
@@ -95,3 +96,6 @@ class Uses(Calls):
 
 
 print(Uses().base())
+# An abstract method still answers for itself: its name, and its docstring.
+print(Shape.area.__isabstractmethod__, Shape.area.__doc__)
+print(Shape.name.__doc__, Square(2).name(), Square(2).area())

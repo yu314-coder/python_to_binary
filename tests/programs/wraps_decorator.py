@@ -57,3 +57,6 @@ class Holder:
 print(greet(3), greet.__name__, greet.__doc__)
 print(greet.__wrapped__(3), plain(), plain.__name__)
 print(valued(), valued.__name__, Holder().method(1))
+# Read off the instance, which is where a bound one is asked for its name.
+print(Holder().method.__name__, Holder.method.__name__)
+print(greet.__doc__, Holder().method.__doc__)

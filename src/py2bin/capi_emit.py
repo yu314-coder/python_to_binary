@@ -715,18 +715,31 @@ _IMPLICITLY_WRAPPED = {
 _ABSTRACT_HOLDER = '''
 class _py2bin_bound_abstract:
 
-    def __init__(self, _py2bin_fn, _py2bin_obj):
-        self.fn = _py2bin_fn
+    def __init__(self, _py2bin_owner, _py2bin_obj):
+        self.owner = _py2bin_owner
         self.obj = _py2bin_obj
+        # Every object has a `__doc__` from its class, so `__getattr__` is
+        # never asked for one: it has to be put here or `help()` on a bound
+        # method would describe this wrapper instead of the method.
+        self.__doc__ = _py2bin_owner.__doc__
 
     def __call__(self, *_py2bin_args, **_py2bin_named):
-        return self.fn(self.obj, *_py2bin_args, **_py2bin_named)
+        return self.owner.__func__(self.obj, *_py2bin_args, **_py2bin_named)
+
+    def __getattr__(self, _py2bin_wanted):
+        # Read off the object it came from, which is where `wraps` wrote
+        # `__name__` and the rest: `obj.method.__name__` asks the bound one.
+        _py2bin_held = self.__dict__.get("owner")
+        if _py2bin_held is None:
+            raise AttributeError(_py2bin_wanted)
+        return getattr(_py2bin_held, _py2bin_wanted)
 
 
 class _py2bin_abstract:
 
     def __init__(self, _py2bin_fn):
         self.__func__ = _py2bin_fn
+        self.__doc__ = _py2bin_fn.__doc__
 
     def __get__(self, _py2bin_obj, _py2bin_owner=None):
         if _py2bin_obj is None:
@@ -736,10 +749,18 @@ class _py2bin_abstract:
             # callable and takes the same arguments, which is what reading a
             # method off a class gives you either way.
             return self
-        return _py2bin_bound_abstract(self.__func__, _py2bin_obj)
+        return _py2bin_bound_abstract(self, _py2bin_obj)
 
     def __call__(self, *_py2bin_args, **_py2bin_named):
         return self.__func__(*_py2bin_args, **_py2bin_named)
+
+    def __getattr__(self, _py2bin_wanted):
+        # Whatever was not written on this - `__name__` on a method only
+        # marked abstract, say - the function inside still answers.
+        _py2bin_held = self.__dict__.get("__func__")
+        if _py2bin_held is None:
+            raise AttributeError(_py2bin_wanted)
+        return getattr(_py2bin_held, _py2bin_wanted)
 '''
 
 #: The in-place form of each operator, for `x += y` and its relatives. The
