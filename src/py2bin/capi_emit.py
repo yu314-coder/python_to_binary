@@ -221,6 +221,59 @@ def _dotted_plain_import(statement: ast.stmt) -> str | None:
     return None
 
 
+def _handles_exceptions(body: list) -> bool:
+    """Whether these statements can change which exception is being handled.
+
+    A `try` and a `with` can; nothing else does. A nested `def` is compiled
+    to a C function of its own and looks after itself, so it is not looked
+    into - a class body is, because it is written out where it stands.
+    """
+
+    def look(node: ast.AST) -> bool:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+            ):
+                continue
+            if isinstance(child, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)):
+                return True
+            if look(child):
+                return True
+        return False
+
+    return look(ast.Module(body=list(body), type_ignores=[]))
+
+
+def _jumps_out(body: list) -> bool:
+    """Whether these statements can leave the block they are written in.
+
+    `return` anywhere leaves; `break` and `continue` leave only if there is
+    no loop of their own around them here. A function or class written in the
+    block is not looked into - a `return` there returns from *it*, later and
+    somewhere else.
+    """
+
+    def look(node: ast.AST, in_loop: bool) -> bool:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+            ):
+                continue
+            if isinstance(child, ast.Return):
+                return True
+            if isinstance(child, (ast.Break, ast.Continue)) and not in_loop:
+                return True
+            if look(
+                child,
+                in_loop or isinstance(child, (ast.For, ast.While, ast.AsyncFor)),
+            ):
+                return True
+        return False
+
+    return look(ast.Module(body=list(body), type_ignores=[]), False)
+
+
 def _scope_bindings(body: list) -> set[str]:
     """Every name these statements bind, not looking into nested scopes.
 
@@ -793,6 +846,10 @@ class _Function:
         #: True once something in the body takes the failure path, which is
         #: what puts the `_unwind` label at the end of the C function.
         self.unwinds = False
+        #: Where the exception being handled when this call began is kept, in
+        #: a body that can change it - or None in one that cannot, which is
+        #: most of them and is why this is not paid for everywhere.
+        self.entry_handled: str | None = None
         #: `arity -> C name` for the argument arrays a call passes. One per
         #: arity per function is enough: the arguments are all computed before
         #: any of them is stored, so a nested call has finished with the array
@@ -1049,6 +1106,23 @@ class CApiEmitter:
         """How this program reports a fatal error."""
 
         return "_py2bin_crash_report()" if self.crash_log else "PyErr_Print()"
+
+    def remember_handled(self, body: list) -> None:
+        """Keep the caller's handled exception, in a body that can lose it.
+
+        Only a body with a `try` or a `with` of its own can put a different
+        exception on record, so only those pay for this - see `leave`, which
+        is where it is put back.
+        """
+
+        assert self.current is not None
+        # A `lambda`'s body is one expression rather than a list, and an
+        # expression holds no `try` and no `with`.
+        if not isinstance(body, list) or not _handles_exceptions(body):
+            return
+        held = self.temporary()
+        self.emit(f"{held} = PyErr_GetHandledException();", 1)
+        self.current.entry_handled = held
 
     def failure(self) -> str:
         """What to do where a C-API call has just failed.
@@ -3838,6 +3912,23 @@ class CApiEmitter:
             self.emit(f"PyErr_SetHandledException({value});", indent)
             self.emit(f"Py_DecRef({value});", indent)
             return self.builtin("None", indent)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_py2bin_get_handled"
+            and not node.args
+        ):
+            # The other half, for the generator rewrite: a handler there runs
+            # in a block of its own rather than inside the C `except`, so it
+            # has to put back what was on record itself, and first it has to
+            # be able to ask. None where nothing is being handled, which is
+            # what `PyErr_SetHandledException` takes to mean the same.
+            answer = self.temporary()
+            self.emit(f"{answer} = PyErr_GetHandledException();", indent)
+            self.emit(f"if (!{answer}) {{", indent)
+            blank = self.builtin("None", indent + 1)
+            self.emit(f"{answer} = {blank};", indent + 1)
+            self.emit("}", indent)
+            return answer
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
         if not isinstance(node.func, ast.Name):
@@ -5816,9 +5907,32 @@ class CApiEmitter:
                 for statement in node.body:
                     self.statement(statement, indent)
 
-        def emit_clause(_held: str, _protection) -> None:
+        def emit_clause(held: str, _protection) -> None:
+            # A `finally` that runs while an exception is on its way out runs
+            # with that exception on record as the one being handled, exactly
+            # as an `except` body does - so anything the clause raises takes
+            # its `__context__` from it. Without this, `finally: raise K()`
+            # over a body that raised V threw away every trace of V.
+            #
+            # Only where the clause cannot jump out of itself. `return` or
+            # `break` in a `finally` leaves without passing the line that puts
+            # the record back, and a function that returned with someone
+            # else's exception on record would misreport `sys.exc_info()` for
+            # its caller. Those keep the old behaviour, which is no record at
+            # all rather than a wrong one.
+            chaining = not _jumps_out(node.finalbody)
+            previous = None
+            if chaining:
+                previous = self.temporary()
+                self.emit(f"{previous} = PyErr_GetHandledException();", indent)
+                self.emit(f"if ({held}) {{", indent)
+                self.emit(f"PyErr_SetHandledException({held});", indent + 1)
+                self.emit("}", indent)
             for statement in node.finalbody:
                 self.statement(statement, indent)
+            if previous is not None:
+                self.emit(f"PyErr_SetHandledException({previous});", indent)
+                self.emit(f"if ({previous}) Py_DecRef({previous});", indent)
 
         self.protect(emit_body, emit_clause, indent)
 
@@ -6612,6 +6726,17 @@ class CApiEmitter:
         deeper than it is and refuse calls that are perfectly fine.
         """
 
+        if self.current is not None and self.current.entry_handled:
+            # Which exception is being handled belongs to the call, not to the
+            # thread: CPython keeps it per frame and gives the caller's back
+            # when a frame ends. A body whose `except` or `finally` raised
+            # something of its own left this call's exception on record for
+            # good, and `sys.exc_info()` in the caller then answered with it
+            # long after it had been dealt with. Only bodies that can change
+            # it save anything here, so an ordinary call pays nothing.
+            held = self.current.entry_handled
+            self.emit(f"PyErr_SetHandledException({held});", indent)
+            self.emit(f"if ({held}) Py_DecRef({held});", indent)
         if self.guards_recursion:
             self.emit("Py_LeaveRecursiveCall();", indent)
         self.emit(f"return {value};", indent)
@@ -7033,6 +7158,17 @@ class CApiEmitter:
         # run as the class is built and can see it; a method body cannot, and
         # is written with this off.
         known: set[str] = set()
+        # `global x` in a class body means what it means anywhere: the name
+        # belongs to the module, and binding it here binds it there. It is
+        # not an attribute of the class - Python leaves it off entirely - so
+        # every statement below that binds one of these names is emitted as
+        # an ordinary statement instead of being routed into the namespace.
+        declared: set[str] = {
+            name
+            for statement in node.body
+            if isinstance(statement, ast.Global)
+            for name in statement.names
+        }
         for statement in node.body:
             if isinstance(statement, ast.Pass):
                 continue
@@ -7040,6 +7176,18 @@ class CApiEmitter:
                 statement.value, ast.Constant
             ):
                 continue  # a docstring
+            binds = _scope_bindings([statement])
+            if binds and binds <= declared:
+                # Only module names, so it is not the class's business: run
+                # it where it stands. The namespace is still in scope while
+                # it runs, because `global x; x = y + 1` may read a `y` the
+                # body bound above.
+                self.class_scope.append((namespace, known))
+                try:
+                    self.statement(statement, indent)
+                finally:
+                    self.class_scope.pop()
+                continue
             if isinstance(statement, ast.FunctionDef):
                 binder = True
                 first = (
@@ -7146,7 +7294,9 @@ class CApiEmitter:
                 # filling a table, a `try` around an optional import. It runs
                 # as ordinary statements and whatever it binds is moved into
                 # the namespace afterwards.
-                self.class_body_statement(statement, namespace, known, indent)
+                self.class_body_statement(
+                    statement, namespace, known, indent, declared
+                )
                 continue
             known.add(key)
             named = self.interned(key)
@@ -7321,7 +7471,12 @@ class CApiEmitter:
         self.emit(f"Py_DecRef({held});", indent)
 
     def class_body_statement(
-        self, statement: ast.stmt, namespace: str, known: set[str], indent: int
+        self,
+        statement: ast.stmt,
+        namespace: str,
+        known: set[str],
+        indent: int,
+        declared: set[str] | None = None,
     ) -> None:
         """A statement in a class body that is not simply binding a name.
 
@@ -7354,7 +7509,9 @@ class CApiEmitter:
                 f"that. Give the import an alias, so it binds a name of "
                 f"its own, and it compiles.",
             )
-        bound = sorted(_scope_bindings([statement]))
+        # A name the body declared `global` is the module's, not the class's:
+        # it keeps its own spelling and no copy of it is put in the namespace.
+        bound = sorted(_scope_bindings([statement]) - (declared or set()))
         renamed = {name: f"_py2bin_cls{id(statement) & 0xFFFF}_{name}" for name in bound}
         if renamed:
             statement = _Renamed(renamed).visit(
@@ -8292,6 +8449,7 @@ class CApiEmitter:
         # Before anything is acquired, so the failure path is a plain return
         # rather than the unwind label - nothing has been entered to leave.
         self.emit('if (Py_EnterRecursiveCall("")) { return 0; }', 1)
+        self.remember_handled(node.body)
         # The parameters arrive in a tuple rather than as C arguments, so they
         # are locals here and are declared alongside the rest.
         for name in held:
@@ -8755,6 +8913,7 @@ class CApiEmitter:
         self.scope_path.append((node.name, True))
         self.guards_recursion = True
         self.emit('if (Py_EnterRecursiveCall("")) { return 0; }', 1)
+        self.remember_handled(node.body)
         # A parameter the call left out arrives as NULL and takes the value
         # its default was evaluated to, before the increments below, so there
         # is one rule for what the body owns.

@@ -748,6 +748,125 @@ class CApiEmitTests(unittest.TestCase):
             b"can't send non-None value to a just-started generator\n1\n1 7\n",
         )
 
+    def test_the_two_states_with_no_block_of_their_own(self):
+        """Before the first `yield` and after the last one, there is no block.
+
+        The dispatch is a chain of `if state == N`, one arm per block, and
+        neither end has one. Arriving at either fell off the bottom of the
+        chain and went round the loop again - `next` on a generator already
+        exhausted stopped answering, which is not an unusual thing to write.
+        """
+        self._run(
+            "def g():\n"
+            "    yield 1\n"
+            "it = g()\n"
+            "print(next(it))\n"
+            "for _ in range(3):\n"
+            "    try:\n"
+            "        next(it)\n"
+            "    except StopIteration:\n"
+            "        print('stopped')\n"
+            "fresh = g()\n"
+            "print(fresh.close(), fresh.close())\n"
+            "def r():\n"
+            "    raise ValueError('boom')\n"
+            "    yield\n"
+            "broken = r()\n"
+            "try:\n"
+            "    next(broken)\n"
+            "except ValueError:\n"
+            "    print('raised')\n"
+            "print(list(broken))\n",
+            b"1\nstopped\nstopped\nstopped\nNone None\nraised\n[]\n",
+        )
+
+    def test_delegation_passes_close_and_throw_on(self):
+        """A delegating generator is not the one suspended - the inner is.
+
+        So closing it has to close the sub-iterator, or that one's `finally`
+        never runs. PEP 380 says the same by putting `close` and `throw` in
+        the expansion; both are asked for by name, because delegating to a
+        list is allowed and a list has neither.
+        """
+        self._run(
+            "def inner():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "    finally:\n"
+            "        print('cleaned')\n"
+            "def outer():\n"
+            "    yield from inner()\n"
+            "it = outer()\n"
+            "print(next(it))\n"
+            "it.close()\n"
+            "def catching():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "    except ValueError:\n"
+            "        yield 2\n"
+            "def over():\n"
+            "    yield from catching()\n"
+            "second = over()\n"
+            "next(second)\n"
+            "print(second.throw(ValueError('v')))\n"
+            "def listed():\n"
+            "    yield from [1, 2]\n"
+            "third = listed()\n"
+            "next(third)\n"
+            "third.close()\n"
+            "print('a list has neither')\n",
+            b"1\ncleaned\n2\na list has neither\n",
+        )
+
+    def test_global_in_a_class_body_binds_the_module_name(self):
+        """It is not an attribute of the class - Python leaves it off.
+
+        The body's bindings are otherwise moved into the namespace the class
+        is made from, and a `global` name was going in there too: `x` came
+        out a class attribute and the module's `x` was never touched.
+        """
+        self._run(
+            "x = 1\n"
+            "class C:\n"
+            "    global x\n"
+            "    x = 2\n"
+            "print(x, hasattr(C, 'x'))\n"
+            "total = 0\n"
+            "class D:\n"
+            "    global total\n"
+            "    for step in range(3):\n"
+            "        total += 1\n"
+            "print(total, D.step, hasattr(D, 'total'))\n",
+            b"2 False\n3 2 False\n",
+        )
+
+    def test_a_finally_raising_keeps_what_it_interrupted(self):
+        """The clause runs with the exception on record, as an `except` does.
+
+        So what the clause raises takes its `__context__` from it. Without
+        that, `finally: raise K()` over a body that raised V threw away every
+        trace of V - the report said only that a KeyError happened.
+        """
+        self._run(
+            "def f():\n"
+            "    try:\n"
+            "        raise ValueError('a')\n"
+            "    finally:\n"
+            "        raise KeyError('b')\n"
+            "try:\n"
+            "    f()\n"
+            "except KeyError as e:\n"
+            "    print(type(e).__name__, type(e.__context__).__name__)\n"
+            "import sys\n"
+            "def g():\n"
+            "    try:\n"
+            "        pass\n"
+            "    finally:\n"
+            "        print(sys.exc_info()[0])\n"
+            "g()\n",
+            b"KeyError ValueError\nNone\n",
+        )
+
     def test_a_generator_can_be_thrown_into_and_closed(self):
         """`throw` raises *at the suspension point*, which is a block here.
 

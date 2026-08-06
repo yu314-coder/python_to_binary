@@ -94,11 +94,17 @@ def is_generator(node: ast.FunctionDef) -> bool:
     return any(_yields(statement) for statement in node.body)
 
 
-#: PEP 380's expansion of `yield from`, less the `throw` and `close`
-#: passthrough - which would need `throw` and `close` on the generator this
-#: compiles to, and it has neither. What is here is the half that matters for
-#: ordinary use and for `await`: values sent in reach the sub-iterator, and the
-#: sub-iterator's return value is the value of the expression.
+#: PEP 380's expansion of `yield from`, whole: values sent in reach the
+#: sub-iterator, its return value is the value of the expression, and what is
+#: thrown or closed at the delegating generator is passed on to it.
+#:
+#: The passthrough is the part that reads oddly, and it is the part that
+#: matters for cleanup. While a generator is delegating it is not itself
+#: suspended at a `yield` of its own - the sub-iterator is - so closing it has
+#: to close the sub-iterator, or that one's `finally` never runs. Python says
+#: the same by putting `close` and `throw` in the expansion; both are asked
+#: for by name rather than assumed, because a plain iterator has neither and
+#: delegating to a list is allowed.
 _DELEGATION = """
 _py2bin_i{n} = iter(_py2bin_src{n})
 _py2bin_r{n} = None
@@ -109,15 +115,35 @@ except StopIteration as _py2bin_e{n}:
     _py2bin_r{n} = _py2bin_e{n}.value
     _py2bin_go{n} = 0
 while _py2bin_go{n}:
-    _py2bin_s{n} = yield _py2bin_y{n}
+    _py2bin_s{n} = None
+    _py2bin_t{n} = None
     try:
-        if _py2bin_s{n} is None:
-            _py2bin_y{n} = next(_py2bin_i{n})
-        else:
-            _py2bin_y{n} = _py2bin_i{n}.send(_py2bin_s{n})
-    except StopIteration as _py2bin_e{n}:
-        _py2bin_r{n} = _py2bin_e{n}.value
-        _py2bin_go{n} = 0
+        _py2bin_s{n} = yield _py2bin_y{n}
+    except GeneratorExit as _py2bin_g{n}:
+        _py2bin_c{n} = getattr(_py2bin_i{n}, "close", None)
+        if _py2bin_c{n} is not None:
+            _py2bin_c{n}()
+        raise _py2bin_g{n}
+    except BaseException as _py2bin_b{n}:
+        _py2bin_t{n} = _py2bin_b{n}
+    if _py2bin_t{n} is None:
+        try:
+            if _py2bin_s{n} is None:
+                _py2bin_y{n} = next(_py2bin_i{n})
+            else:
+                _py2bin_y{n} = _py2bin_i{n}.send(_py2bin_s{n})
+        except StopIteration as _py2bin_e{n}:
+            _py2bin_r{n} = _py2bin_e{n}.value
+            _py2bin_go{n} = 0
+    else:
+        _py2bin_h{n} = getattr(_py2bin_i{n}, "throw", None)
+        if _py2bin_h{n} is None:
+            raise _py2bin_t{n}
+        try:
+            _py2bin_y{n} = _py2bin_h{n}(_py2bin_t{n})
+        except StopIteration as _py2bin_e{n}:
+            _py2bin_r{n} = _py2bin_e{n}.value
+            _py2bin_go{n} = 0
 """
 
 
@@ -254,11 +280,10 @@ def _hoist_head(statement: ast.stmt, hoister: "_Hoister") -> ast.stmt:
 class _DelegationRewriter(ast.NodeTransformer):
     """Write `yield from` out as the loop the language defines it to be.
 
-    PEP 380 gives `yield from` a formal expansion in terms of `yield`, `next`
-    and `send`, and that expansion is ordinary Python - so it is written out
-    here and the state machine never has to know delegation exists. What is
-    left out is the `throw` and `close` passthrough, which would need a
-    `throw` and a `close` on the thing this compiles to.
+    PEP 380 gives `yield from` a formal expansion in terms of `yield`, `next`,
+    `send`, `throw` and `close`, and that expansion is ordinary Python - so it
+    is written out here and the state machine never has to know delegation
+    exists.
 
     `await x` is the same expansion over `x.__await__()`, which is what the
     language says an `await` of an object with `__await__` means.
@@ -808,9 +833,26 @@ class _Machine:
             for handler, entry in zip(statement.handlers, entries):
                 if handler.name:
                     self.names.add(handler.name)
-                self.blocks[self._emit(handler.body, entry)].extend(
-                    self._goto(leave)
+                # A clause here runs in a block of its own, reached after the
+                # C `except` that caught the exception has already ended - so
+                # nothing had it on record while the clause ran, and
+                # `sys.exc_info()` inside one answered None where Python
+                # answers with the exception, and a `raise` there was chained
+                # to nothing. The record is put on at the top of the block and
+                # taken off where the block hands control on.
+                self.names.add(_kept(entry))
+                self.names.add(_before(entry))
+                self.blocks[entry][:0] = ast.parse(
+                    f"self.{_before(entry)} = _py2bin_get_handled()\n"
+                    f"_py2bin_set_handled(self.{_kept(entry)})\n"
+                ).body
+                ending = self._emit(handler.body, entry)
+                self.blocks[ending].extend(
+                    ast.parse(
+                        f"_py2bin_set_handled(self.{_before(entry)})\n"
+                    ).body
                 )
+                self.blocks[ending].extend(self._goto(leave))
             return after
         if isinstance(statement, ast.Return):
             self.blocks[block].extend(self._stop(statement.value))
@@ -1177,7 +1219,22 @@ def rewrite(
         ):
             caught = []
             for handler, entry in zip(handlers, entries):
-                jump: list[ast.stmt] = []
+                # Always named, even where the clause did not name it: the
+                # block that runs the clause needs the object to put on
+                # record as the one being handled, and this is the only
+                # place it is in hand.
+                jump: list[ast.stmt] = [
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr=_kept(entry),
+                                ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Name(id="_py2bin_caught", ctx=ast.Load()),
+                    )
+                ]
                 if handler.name:
                     # The caught object outlives this call, so it is kept
                     # where every other local of the generator is kept.
@@ -1197,7 +1254,7 @@ def rewrite(
                 caught.append(
                     ast.ExceptHandler(
                         type=handler.type,
-                        name="_py2bin_caught" if handler.name else None,
+                        name="_py2bin_caught",
                         body=jump,
                     )
                 )
@@ -1409,7 +1466,46 @@ def rewrite(
             ast.FunctionDef(
                 name="_py2bin_run",
                 args=_arguments(["self"]),
-                body=[ast.While(test=ast.Constant(value=True), body=dispatch, orelse=[])],
+                body=[
+                    *_edges(),
+                    # Anything that leaves the machine leaves it finished.
+                    # A `yield` is a `return` from here and never comes this
+                    # way; an exception the body did not catch does, and
+                    # Python does not offer a generator that raised a second
+                    # chance to raise the same thing again.
+                    ast.Try(
+                        body=[
+                            ast.While(
+                                test=ast.Constant(value=True),
+                                body=dispatch,
+                                orelse=[],
+                            )
+                        ],
+                        handlers=[
+                            ast.ExceptHandler(
+                                type=ast.Name(id="BaseException", ctx=ast.Load()),
+                                name=None,
+                                body=[
+                                    ast.Assign(
+                                        targets=[
+                                            ast.Attribute(
+                                                value=ast.Name(
+                                                    id="self", ctx=ast.Load()
+                                                ),
+                                                attr=STATE,
+                                                ctx=ast.Store(),
+                                            )
+                                        ],
+                                        value=ast.Constant(value=-1),
+                                    ),
+                                    ast.Raise(exc=None, cause=None),
+                                ],
+                            )
+                        ],
+                        orelse=[],
+                        finalbody=[],
+                    ),
+                ],
                 decorator_list=[],
                 type_params=[],
                 returns=None,
@@ -1642,6 +1738,49 @@ def _raise_thrown() -> list[ast.stmt]:
         f"    _py2bin_e = self.{THROWN}\n"
         f"    self.{THROWN} = None\n"
         f"    raise _py2bin_e\n"
+    ).body
+
+
+def _kept(entry: int) -> str:
+    """Where the exception a clause caught is kept while the clause runs."""
+
+    return f"_py2bin_kept{entry}"
+
+
+def _before(entry: int) -> str:
+    """Where what was being handled before a clause began is kept."""
+
+    return f"_py2bin_before{entry}"
+
+
+def _edges() -> list[ast.stmt]:
+    """The two states with no block of their own: not started, and finished.
+
+    The dispatch below is a chain of `if self.<state> == N`, one arm per
+    block, and there is no arm for either end. Before this, arriving at
+    either fell off the bottom of the chain and went round the `while True`
+    again, which is a program that stops answering - `next` on a generator
+    already exhausted did it, and that is not an unusual thing to write.
+
+    Both ends are also where `throw` lands when it is given a generator that
+    has nothing suspended to raise *at*. Python does not run the body in
+    that case: there is no `yield` waiting, so the exception simply comes
+    back out of `throw`, and the generator is finished afterwards either
+    way. `close` is `throw(GeneratorExit)`, so a generator closed before it
+    ever ran gets its GeneratorExit straight back here without its body
+    running - which is what Python does, and why closing one twice is quiet
+    rather than a complaint that it ignored the exit.
+    """
+
+    return ast.parse(
+        f"if self.{STATE} == 0 or self.{STATE} == -1:\n"
+        f"    if self.{THROWN} is not None:\n"
+        f"        _py2bin_e = self.{THROWN}\n"
+        f"        self.{THROWN} = None\n"
+        f"        self.{STATE} = -1\n"
+        f"        raise _py2bin_e\n"
+        f"if self.{STATE} == -1:\n"
+        f"    raise StopIteration\n"
     ).body
 
 
