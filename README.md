@@ -1181,6 +1181,46 @@ than accepting the flag in silence.
 
 ## Measured against Nuitka
 
+### Against Nuitka, on getting Python right
+
+Speed is measured further down; this is the other question. Seventy-eight
+whole programs, each compiled by both and its output compared against what
+CPython answers for the same source - stdout and exit code, character for
+character. **Nuitka 4.1.3**, macOS arm64, CPython 3.14.3, the same source and
+the same machine for all three columns. Nuitka warns that 3.14 is only
+experimentally supported by that release, which is worth knowing before
+reading the two it gets wrong.
+
+| | py2bin | Nuitka |
+|---|---|---|
+| answers exactly what CPython answers | **69** | **76** |
+| answers something else | 6 | 2 |
+| refuses, with a `file:line:col` | 3 | 0 |
+
+Nuitka is ahead, and it should be: it is a mature project that reimplements
+CPython's semantics rather than restricting them. Where the two differ:
+
+| program | py2bin | Nuitka | what it is |
+|---|---|---|---|
+| `abc.abstractmethod` | ✗ | ✓ | sets an attribute on a function; a compiled one is a `PyCFunction` and has nowhere to put it |
+| `functools.wraps` | ✗ | ✓ | the same, for `__name__` |
+| `typing.Generic[T]` as a base | ✗ | ✓ | `__mro_entries__` is not resolved |
+| pickling a compiled class | ✗ | ✓ | needs a qualname path back to the class |
+| a class inside a class body | refused | ✓ | not translated yet |
+| `lambda: i` capturing a comprehension's target | refused | ✓ | captures are by value here, so Python's answer would need cells |
+| `except*` (PEP 654) | refused | ✗ | py2bin says it cannot; Nuitka compiles it and answers differently |
+| `return` inside `finally` | ✗ | ✗ | **neither** emits CPython's `SyntaxWarning`; both answer 2, which is the value CPython gives |
+
+Four of py2bin's six are one fact: a compiled function is a
+`builtin_function_or_method`, which has no `__dict__` and takes no
+attributes. That is what makes a direct call 2.4x faster than the
+interpreter, and it is why `functools.wraps` cannot work. The trade is
+deliberate and it is the tier.
+
+The corpus is [`tests/programs`](tests/programs) and it runs on every push -
+see [`.github/workflows/checks.yml`](.github/workflows/checks.yml).
+
+
 **Apple M4** (10 cores - 4 performance, 6 efficiency - 24 GB, macOS 27.0,
 arm64), same CPython 3.14.3 python.org framework build for all three columns,
 same source. **Nuitka 4.1.3** with `--standalone`, driving Apple's clang; this

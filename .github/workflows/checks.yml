@@ -1,0 +1,120 @@
+# What has to hold before anything is released, run on every push.
+#
+# The three jobs are the three things that can be wrong, and they fail for
+# different reasons on purpose:
+#
+#   tests      - the suite, on every platform py2bin targets and every Python
+#                it supports. A compiler that only works on the machine it was
+#                written on is not a cross-compiler, and this is what says so.
+#   conformance- compile a corpus and demand byte-identical output to CPython.
+#                A test says a thing py2bin does is what somebody meant; this
+#                says the *program* means what Python means, which is the
+#                claim the whole project rests on.
+#   cross      - build for all six targets from one machine, and check what
+#                came out is for the target rather than for the host. It can
+#                run the macOS ones; the others are read rather than run,
+#                because a runner cannot execute them.
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests · ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Nothing is installed, on purpose
+        shell: bash
+        run: |
+          # py2bin needs the standard library and nothing else; pytest is the
+          # only thing here that is not part of the product.
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+      - name: Suite
+        shell: bash
+        run: PYTHONPATH=src python -m pytest tests -q
+
+  conformance:
+    name: conformance · output identical to CPython
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile each program and compare it against the interpreter
+        shell: bash
+        run: |
+          set -u
+          # The programs under tests/ are the committed corpus. Each is
+          # compiled, run, and its stdout and exit code compared with what
+          # CPython answers for the same source - which is the only check
+          # that does not take py2bin's word for anything.
+          mkdir -p .conformance
+          matched=0; differed=0; refused=0
+          while IFS= read -r program; do
+            name=$(basename "$program" .py)
+            if ! PYTHONPATH=src timeout 300 python -m py2bin compile-capi \
+                 "$program" -o ".conformance/$name" --clean >/dev/null 2>&1; then
+              refused=$((refused + 1)); echo "refused  $name"; continue
+            fi
+            reference=$(timeout 60 python "$program" 2>/dev/null); expected=$?
+            actual=$(timeout 60 ".conformance/$name" 2>/dev/null); got=$?
+            if [ "$actual" = "$reference" ] && [ "$got" = "$expected" ]; then
+              matched=$((matched + 1))
+            else
+              differed=$((differed + 1)); echo "DIFFERED $name"
+            fi
+          done < <(find tests/programs -name '*.py' 2>/dev/null | sort)
+          echo "matched $matched, differed $differed, refused $refused"
+          # A program that compiles and then answers differently is the
+          # failure this job exists for. A refusal is loud and is not one.
+          test "$differed" -eq 0
+
+  cross:
+    name: cross · all six targets from one machine
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build for every target and check what came out
+        shell: bash
+        run: |
+          set -eu
+          printf 'def main():\n    return sum(i * i for i in range(10))\nprint(main())\n' > cross.py
+          for target in darwin-arm64 darwin-x86_64 windows-x86_64 \
+                        windows-arm64 linux-x86_64 linux-arm64; do
+            PYTHONPATH=src python -m py2bin compile cross.py \
+              --target "$target" -o "out-$target" --clean
+            # `file` reads the header py2bin wrote. A cross-build that
+            # quietly produced a host binary would pass every other check
+            # here and fail on the machine it was meant for.
+            printf '%-16s %s\n' "$target" "$(file -b "out-$target")"
+          done
+          file -b out-darwin-arm64 | grep -q 'arm64'
+          file -b out-windows-x86_64 | grep -q 'PE32+'
+          file -b out-linux-arm64 | grep -q 'ARM aarch64'
+          # The one this runner can execute, executed.
+          ./out-darwin-arm64

@@ -1115,11 +1115,12 @@ def rewrite(
     step object can tell them from the ones an `await` inside it makes.
     """
 
-    if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
-        raise GeneratorRewriteError(
-            node, "a generator taking *args or **kwargs"
-        )
-    parameters = [argument.arg for argument in node.args.args]
+    # Every name the signature binds, in the order the maker will hand them
+    # over. `*rest` and `**more` need nothing special: by the time the maker
+    # runs they are an ordinary tuple and dict in ordinary locals, and the
+    # machine stores them like any other parameter. Refusing them refused
+    # `async def __aexit__(self, *exc)`, which is how that method is written.
+    parameters = _every_parameter(node.args)
     if "self" in parameters:
         # A method's first parameter is spelled the same as the machine's own
         # receiver, and every name the function binds is rewritten to an
@@ -1130,7 +1131,7 @@ def rewrite(
         # before anything is built, so the two never meet.
         node = _Renamed("self", _RECEIVER).visit(node)
         ast.fix_missing_locations(node)
-        parameters = [argument.arg for argument in node.args.args]
+        parameters = _every_parameter(node.args)
     if asynchronous:
         # Before the machine is built, and so before the delegation pass turns
         # every `await` into a `yield`: what is marked is what the program
@@ -1608,6 +1609,28 @@ def _raise_thrown() -> list[ast.stmt]:
         f"    self.{THROWN} = None\n"
         f"    raise _py2bin_e\n"
     ).body
+
+
+def _every_parameter(arguments: ast.arguments) -> list[str]:
+    """Every name the signature binds, in the order the maker hands them over.
+
+    `*rest` and `**more` need nothing special: by the time the maker runs
+    they are an ordinary tuple and dict in ordinary locals, and the machine
+    stores them like any other parameter. Refusing them refused `async def
+    __aexit__(self, *exc)`, which is how that method is written.
+    """
+
+    names = [
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs
+        )
+    ]
+    if arguments.vararg:
+        names.append(arguments.vararg.arg)
+    if arguments.kwarg:
+        names.append(arguments.kwarg.arg)
+    return names
 
 
 def _incoming(position: int) -> str:

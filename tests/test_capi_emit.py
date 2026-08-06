@@ -5673,14 +5673,39 @@ class GeneratorTests(unittest.TestCase):
             b"1 2 [1, 2, 3] True\n",
         )
 
-    def test_the_shapes_it_cannot_express_are_refused_by_name(self):
-        for source, needle in (
-            ("def f(*xs):\n    yield 1\n", "*args"),
-        ):
-            with self.subTest(source=source):
-                with self.assertRaises(CApiEmitError) as caught:
-                    python_to_capi_c(source, "program.py")
-                self.assertIn(needle, str(caught.exception))
+    def test_a_generator_can_take_starred_arguments(self):
+        """It could not, and `async def __aexit__(self, *exc)` is how that
+        method is written - so `async with` was refused for a reason that had
+        nothing to do with `async with`.
+
+        `*rest` and `**more` need nothing special: by the time the maker runs
+        they are an ordinary tuple and dict in ordinary locals, and the
+        machine stores them like any other parameter.
+        """
+        self._run(
+            "def counted(*values, scale=1, **rest):\n"
+            "    for v in values:\n"
+            "        yield v * scale\n"
+            "    yield len(rest)\n"
+            "print(list(counted(1, 2, scale=3, extra=9)))\n",
+            b"[3, 6, 1]\n",
+        )
+
+    def test_async_with_calls_a_starred_aexit(self):
+        self._run(
+            "import asyncio\n"
+            "class Res:\n"
+            "    async def __aenter__(self):\n"
+            "        return 5\n"
+            "    async def __aexit__(self, *exc):\n"
+            "        print('exited', len(exc))\n"
+            "        return False\n"
+            "async def main():\n"
+            "    async with Res() as v:\n"
+            "        return v\n"
+            "print(asyncio.run(main()))\n",
+            b"exited 3\n5\n",
+        )
 
 
 class GeneratorDelegationTests(unittest.TestCase):
