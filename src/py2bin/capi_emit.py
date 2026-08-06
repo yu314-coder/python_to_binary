@@ -4396,6 +4396,15 @@ class CApiEmitter:
             )
             self.emit("}", indent)
             self.checked(target, indent)
+            # Through `publish`, like every other binding. Writing the slot
+            # and stopping was invisible until `globals()` began answering
+            # with the module's real dictionary: reads go through that
+            # dictionary in this mode, so a name bound only in its C slot was
+            # not there to be read, and `from dataclasses import dataclass`
+            # followed by a `globals()` anywhere in the file raised NameError
+            # on the decorator. `import x` already went through here; this is
+            # the sibling that did not.
+            self.publish(alias.asname or alias.name, target, indent)
         self.emit(f"Py_DecRef({module});", indent)
 
     def assignment(self, node: ast.Assign, indent: int) -> None:
@@ -4580,6 +4589,16 @@ class CApiEmitter:
                 self.emit("}", indent)
                 self.emit(f"Py_DecRef({slot});", indent)
                 self.emit(f"{slot} = 0;", indent)
+                if self.globals_in_dict and slot.startswith("g_"):
+                    # Emptying the slot is not enough when reads come from the
+                    # dictionary: the entry would stay, so `globals()` listed
+                    # a name the program had let go and reading it answered
+                    # with the value it was supposed to have lost.
+                    self.emit(
+                        f"if (PyObject_DelItem(_py2bin_globals, "
+                        f"{self.interned(target.id)}) < 0) PyErr_Clear();",
+                        indent,
+                    )
                 assert self.current is not None
                 self.current.certain.discard(target.id)
                 self.certain_globals.discard(target.id)

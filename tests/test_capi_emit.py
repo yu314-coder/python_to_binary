@@ -1267,6 +1267,41 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, ['q']) ['z']\n",
         )
 
+    def test_an_imported_name_reaches_the_globals_dictionary(self):
+        """`from X import Y` wrote the slot and stopped.
+
+        Invisible until `globals()` began answering with the module's real
+        dictionary: reads go through that dictionary in this mode, so a name
+        bound only in its C slot was not there to be read. A file with
+        `from dataclasses import dataclass` and a `globals()` anywhere in it
+        raised NameError on the decorator. `import x` already went through
+        `publish`; this is the sibling that did not.
+
+        `del` had the other half of it - emptying the slot left the entry, so
+        `globals()` listed a name the program had let go.
+        """
+        self._run(
+            "import os\n"
+            "from os import sep, linesep as nl\n"
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Row:\n"
+            "    key: str\n"
+            "    count: int = 0\n"
+            "print(Row('a', 3), isinstance(sep, str), isinstance(nl, str))\n"
+            "print(sorted(n for n in globals() if not n.startswith('_')))\n"
+            "del nl\n"
+            "print('nl' in globals())\n"
+            "try:\n"
+            "    print(nl)\n"
+            "except NameError as e:\n"
+            "    print(e)\n",
+            b"Row(key='a', count=3) True True\n"
+            b"['Row', 'dataclass', 'nl', 'os', 'sep']\n"
+            b"False\n"
+            b"name 'nl' is not defined\n",
+        )
+
     def test_globals_is_the_modules_own_dictionary(self):
         """Not a copy of it - a write through it changes the program.
 
