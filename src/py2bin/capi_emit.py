@@ -6587,6 +6587,15 @@ class CApiEmitter:
         return target
 
     def class_definition(self, node: ast.ClassDef, indent: int) -> None:
+        """`class C: ...` at a place where a name is bound."""
+
+        made = self.build_class(node, indent)
+        target = self.declare(node.name)
+        self.emit(f"if ({target}) Py_DecRef({target});", indent)
+        self.emit(f"{target} = {made};", indent)
+        self.publish(node.name, target, indent)
+
+    def build_class(self, node: ast.ClassDef, indent: int) -> str:
         """`class C(Base):` - the namespace built, then handed to `type`.
 
         A class is what `type(name, bases, namespace)` answers, and that is
@@ -6653,8 +6662,16 @@ class CApiEmitter:
         if node.bases:
             bases = self.resolve_mro_entries(bases, indent)
         self.scope_path.append((node.name, False))
+        # `__qualname__` is the path, not the bare name: `Outer.Inner`, and
+        # `make.<locals>.Local` for one made in a function. It is what `repr`
+        # of the class and of every instance shows, so a nested class printed
+        # as though it were at module level until now. The scope path already
+        # has this class on it - `qualified` wants the *name*, so it is asked
+        # for the one below.
+        walked = self.qualified("")[:-1] or node.name
         namespace = self.class_namespace(
-            node, maker, title, bases, indent, seeded=chosen is None
+            node, maker, title, bases, indent,
+            seeded=chosen is None, qualname=walked,
         )
         if node.bases:
             # What the header said, kept under the name `typing` reads to
@@ -6740,6 +6757,14 @@ class CApiEmitter:
                 finally:
                     self.class_scope.pop()
                 key = statement.targets[0].id
+            elif isinstance(statement, ast.ClassDef):
+                # A class in a class body is a value the body binds, like an
+                # attribute - it is made here and put in the namespace under
+                # its own name. Refusing it refused `class Outer: class
+                # Inner`, which is how a nested enum or a config block is
+                # usually written.
+                value = self.build_class(statement, indent)
+                key = statement.name
             elif (
                 isinstance(statement, ast.AnnAssign)
                 and isinstance(statement.target, ast.Name)
@@ -6822,11 +6847,7 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({named_arguments});", indent)
         self.checked(made, indent)
         self.scope_path.pop()
-        made = self.apply_decorators(node.decorator_list, made, indent)
-        target = self.declare(node.name)
-        self.emit(f"if ({target}) Py_DecRef({target});", indent)
-        self.emit(f"{target} = {made};", indent)
-        self.publish(node.name, target, indent)
+        return self.apply_decorators(node.decorator_list, made, indent)
 
     def derive_metaclass(
         self, maker: str, bases: str, indent: int, seeded: bool = False
@@ -7041,6 +7062,7 @@ class CApiEmitter:
         bases: str,
         indent: int,
         seeded: bool = False,
+        qualname: str | None = None,
     ) -> str:
         """What the class body is populated into, and what has to be in it first.
 
@@ -7108,7 +7130,10 @@ class CApiEmitter:
                     indent,
                 ),
             ),
-            ("__qualname__", title),
+            (
+                "__qualname__",
+                title if qualname is None else self.interned(qualname),
+            ),
         ):
             self.emit(
                 f"if (PyObject_SetItem({namespace}, {self.interned(key)}, "
