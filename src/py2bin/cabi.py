@@ -655,12 +655,16 @@ _PyNumber_InPlaceMultiply = _bind("PyNumber_InPlaceMultiply", _HANDLE, _HANDLE, 
 _PyNumber_InPlaceTrueDivide = _bind("PyNumber_InPlaceTrueDivide", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_InPlaceFloorDivide = _bind("PyNumber_InPlaceFloorDivide", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_InPlaceRemainder = _bind("PyNumber_InPlaceRemainder", _HANDLE, _HANDLE, _HANDLE)
-_PyNumber_InPlacePower = _bind("PyNumber_InPlacePower", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlacePower = _bind(
+    "PyNumber_InPlacePower", _HANDLE, _HANDLE, _HANDLE, _HANDLE
+)
 _PyNumber_InPlaceLshift = _bind("PyNumber_InPlaceLshift", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_InPlaceRshift = _bind("PyNumber_InPlaceRshift", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_InPlaceAnd = _bind("PyNumber_InPlaceAnd", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_InPlaceOr = _bind("PyNumber_InPlaceOr", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_InPlaceXor = _bind("PyNumber_InPlaceXor", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_MatrixMultiply = _bind("PyNumber_MatrixMultiply", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceMatrixMultiply = _bind("PyNumber_InPlaceMatrixMultiply", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_Subtract = _bind("PyNumber_Subtract", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_Multiply = _bind("PyNumber_Multiply", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_TrueDivide = _bind("PyNumber_TrueDivide", _HANDLE, _HANDLE, _HANDLE)
@@ -838,9 +842,9 @@ def PyNumber_InPlaceRemainder(left: int, right: int) -> int:
     return _handle(_PyNumber_InPlaceRemainder(left, right))
 
 
-def PyNumber_InPlacePower(left: int, right: int) -> int:
-    """`left **= right`, which may change `left` rather than answer anew."""
-    return _handle(_PyNumber_InPlacePower(left, right))
+def PyNumber_InPlacePower(left: int, right: int, modulus: int) -> int:
+    """`left **= right`, with the modulus `pow` takes as a third argument."""
+    return _handle(_PyNumber_InPlacePower(left, right, modulus))
 
 
 def PyNumber_InPlaceLshift(left: int, right: int) -> int:
@@ -866,6 +870,17 @@ def PyNumber_InPlaceOr(left: int, right: int) -> int:
 def PyNumber_InPlaceXor(left: int, right: int) -> int:
     """`left ^= right`, which may change `left` rather than answer anew."""
     return _handle(_PyNumber_InPlaceXor(left, right))
+
+
+def PyNumber_MatrixMultiply(left: int, right: int) -> int:
+    """`left @ right` - the product operator, which the language leaves to
+    whoever defines it."""
+    return _handle(_PyNumber_MatrixMultiply(left, right))
+
+
+def PyNumber_InPlaceMatrixMultiply(left: int, right: int) -> int:
+    """`left @= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceMatrixMultiply(left, right))
 
 
 def PyNumber_Subtract(left: int, right: int) -> int:

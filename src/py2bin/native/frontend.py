@@ -297,12 +297,17 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "PyNumber_InPlaceTrueDivide": ("PyNumber_InPlaceTrueDivide", ("ptr", "ptr")),
     "PyNumber_InPlaceFloorDivide": ("PyNumber_InPlaceFloorDivide", ("ptr", "ptr")),
     "PyNumber_InPlaceRemainder": ("PyNumber_InPlaceRemainder", ("ptr", "ptr")),
-    "PyNumber_InPlacePower": ("PyNumber_InPlacePower", ("ptr", "ptr")),
+    # Ternary, like its `Power` twin: the third is the modulus that
+    # `pow(a, b, m)` takes. Declared with two, the call read a third
+    # argument nothing wrote, and `n **= 2` was a segfault.
+    "PyNumber_InPlacePower": ("PyNumber_InPlacePower", ("ptr", "ptr", "ptr")),
     "PyNumber_InPlaceLshift": ("PyNumber_InPlaceLshift", ("ptr", "ptr")),
     "PyNumber_InPlaceRshift": ("PyNumber_InPlaceRshift", ("ptr", "ptr")),
     "PyNumber_InPlaceAnd": ("PyNumber_InPlaceAnd", ("ptr", "ptr")),
     "PyNumber_InPlaceOr": ("PyNumber_InPlaceOr", ("ptr", "ptr")),
     "PyNumber_InPlaceXor": ("PyNumber_InPlaceXor", ("ptr", "ptr")),
+    "PyNumber_MatrixMultiply": ("PyNumber_MatrixMultiply", ("ptr", "ptr")),
+    "PyNumber_InPlaceMatrixMultiply": ("PyNumber_InPlaceMatrixMultiply", ("ptr", "ptr")),
     "PyNumber_Subtract": ("PyNumber_Subtract", ("ptr", "ptr")),
     "PyNumber_Multiply": ("PyNumber_Multiply", ("ptr", "ptr")),
     "PyNumber_TrueDivide": ("PyNumber_TrueDivide", ("ptr", "ptr")),
@@ -436,6 +441,8 @@ _CABI_RESULTS: dict[str, str] = {
     "PyNumber_InPlaceAnd": "ptr",
     "PyNumber_InPlaceOr": "ptr",
     "PyNumber_InPlaceXor": "ptr",
+    "PyNumber_MatrixMultiply": "ptr",
+    "PyNumber_InPlaceMatrixMultiply": "ptr",
     "PyNumber_Subtract": "ptr",
     "PyNumber_Multiply": "ptr",
     "PyNumber_TrueDivide": "ptr",

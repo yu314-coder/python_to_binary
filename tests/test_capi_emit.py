@@ -807,6 +807,73 @@ class CApiEmitTests(unittest.TestCase):
             b"new set ('item', <class 'int'>)\n",
         )
 
+    def test_every_augmented_operator_works(self):
+        """`n **= 2` was a segfault.
+
+        `PyNumber_InPlacePower` takes three arguments, like the `pow(a, b, m)`
+        it serves - and it had been declared with two, so the call read a
+        third that nothing had written. The other eleven are binary and were
+        right; this is the one that is not, and the only way to find it was
+        to use it.
+        """
+        self._run(
+            "n = 20\n"
+            "n -= 3\n"
+            "n *= 2\n"
+            "n //= 3\n"
+            "n %= 7\n"
+            "n **= 2\n"
+            "n <<= 1\n"
+            "n >>= 1\n"
+            "n |= 8\n"
+            "n &= 12\n"
+            "n ^= 5\n"
+            "f = 2.0\n"
+            "f /= 4\n"
+            "s = 'a'\n"
+            "s *= 3\n"
+            "print(n, f, s)\n",
+            b"13 0.5 aaa\n",
+        )
+
+    def test_a_slice_can_be_assigned_to(self):
+        # `xs[1:3] = ys` is a store through the mapping protocol with a slice
+        # object for the key, built the way reading one builds it.
+        self._run(
+            "xs = [1, 2, 3, 4]\n"
+            "xs[1:3] = [9]\n"
+            "print(xs)\n"
+            "del xs[0:1]\n"
+            "print(xs)\n"
+            "xs[::2] = [7]\n"
+            "print(xs)\n",
+            b"[1, 9, 4]\n[9, 4]\n[7, 4]\n",
+        )
+
+    def test_the_matrix_operator_is_an_operator(self):
+        self._run(
+            "class M:\n"
+            "    def __matmul__(self, o):\n"
+            "        return 'mm'\n"
+            "    def __imatmul__(self, o):\n"
+            "        return 'imm'\n"
+            "m = M()\n"
+            "print(m @ m)\n"
+            "m @= m\n"
+            "print(m)\n",
+            b"mm\nimm\n",
+        )
+
+    def test_a_module_has_its_own_docstring(self):
+        # `__doc__` unset was looked for among the builtins, where it exists
+        # and is the builtins module's - so `print(__doc__)` printed a page
+        # about built-in functions.
+        self._run(
+            '"""A module docstring."""\nprint(repr(__doc__))\n',
+            b"'A module docstring.'\n",
+        )
+        self._run("print(__doc__)\n", b"None\n")
+
     def test_augmented_assignment_lets_the_object_answer(self):
         """`x += y` is not `x = x + y`.
 

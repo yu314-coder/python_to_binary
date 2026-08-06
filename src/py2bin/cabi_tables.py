@@ -71,6 +71,9 @@ VETTED = [
     "PyNumber_InPlaceAnd",
     "PyNumber_InPlaceOr",
     "PyNumber_InPlaceXor",
+    # `@`, which numpy and anything like it uses for a product.
+    "PyNumber_MatrixMultiply",
+    "PyNumber_InPlaceMatrixMultiply",
     # The interned-name forms. `...String` builds a fresh str from the
     # char* on every call and hashes it; these take a str built once,
     # which is what makes an attribute in a loop cost a lookup rather

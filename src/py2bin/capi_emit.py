@@ -436,12 +436,14 @@ extern PyObject *PyNumber_InPlaceMultiply(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceTrueDivide(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceFloorDivide(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceRemainder(PyObject *left, PyObject *right);
-extern PyObject *PyNumber_InPlacePower(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlacePower(PyObject *left, PyObject *right, PyObject *modulus);
 extern PyObject *PyNumber_InPlaceLshift(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceRshift(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceAnd(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceOr(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_InPlaceXor(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_MatrixMultiply(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceMatrixMultiply(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_Subtract(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_Multiply(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_TrueDivide(PyObject *left, PyObject *right);
@@ -570,6 +572,7 @@ _IN_PLACE = {
     ast.BitAnd: "PyNumber_InPlaceAnd",
     ast.BitOr: "PyNumber_InPlaceOr",
     ast.BitXor: "PyNumber_InPlaceXor",
+    ast.MatMult: "PyNumber_InPlaceMatrixMultiply",
 }
 
 _BINARY = {
@@ -579,6 +582,7 @@ _BINARY = {
     ast.LShift: "PyNumber_Lshift",
     ast.RShift: "PyNumber_Rshift",
     ast.Add: "PyNumber_Add",
+    ast.MatMult: "PyNumber_MatrixMultiply",
     ast.Sub: "PyNumber_Subtract",
     ast.Mult: "PyNumber_Multiply",
     ast.Div: "PyNumber_TrueDivide",
@@ -4603,19 +4607,23 @@ class CApiEmitter:
             self.emit(f"if ({outcome} < 0) {{ {self.failure()} }}", indent)
             return
         if isinstance(target, ast.Subscript):
-            if isinstance(target.slice, ast.Slice):
-                raise self.fail(
-                    target, "assigning to a slice is not translated here yet"
-                )
             container, owned = self.operand(target.value, indent)
-            key, key_owned = self.operand(target.slice, indent)
+            if isinstance(target.slice, ast.Slice):
+                # `xs[1:3] = ys` is a store through the mapping protocol like
+                # any other, with a slice object for the key - which is built
+                # the same way reading one builds it. Refusing it refused
+                # `xs[:] = ...` and every splice.
+                key, key_owned = self.slice_object(target.slice, indent), True
+            else:
+                key, key_owned = self.operand(target.slice, indent)
             outcome = self.temporary_flag()
             # `d[k] = v` on a name that always holds an exact dict skips the
             # mapping-protocol dispatch; an unhashable key raises through
             # either spelling.
             store = (
                 "PyDict_SetItem"
-                if self.is_exact_dict(target.value)
+                if not isinstance(target.slice, ast.Slice)
+                and self.is_exact_dict(target.value)
                 else "PyObject_SetItem"
             )
             self.emit(
@@ -5827,15 +5835,30 @@ class CApiEmitter:
         if operator is None:
             return None
         assert isinstance(node.target, ast.Name)
+        name = node.target.id
+        # Always the in-place operator, even where the name looks numeric.
+        # Branching on the narrowing flag was tried and measured *worse*: the
+        # flag is only set while the value is a machine number, and the first
+        # `t += x` with an object on the right puts an object in the slot and
+        # clears it - so the branch never took the fast side again and every
+        # turn paid for the test. What that row costs is written down under
+        # "how fast each one is"; it is what `x += y` meaning what Python
+        # means is worth.
         held = self.expression(
-            ast.copy_location(
-                ast.Name(id=node.target.id, ctx=ast.Load()), node
-            ),
-            indent,
+            ast.copy_location(ast.Name(id=name, ctx=ast.Load()), node), indent
         )
         right = self.expression(node.value, indent)
         target = self.temporary()
-        self.emit(f"{target} = {operator}({held}, {right});", indent)
+        if isinstance(node.op, ast.Pow):
+            # `PyNumber_InPlacePower` takes the modulus `pow(a, b, m)` does,
+            # and `a **= b` passes None for it.
+            blank = self.builtin("None", indent)
+            self.emit(
+                f"{target} = {operator}({held}, {right}, {blank});", indent
+            )
+            self.emit(f"Py_DecRef({blank});", indent)
+        else:
+            self.emit(f"{target} = {operator}({held}, {right});", indent)
         self.emit(f"Py_DecRef({held});", indent)
         self.emit(f"Py_DecRef({right});", indent)
         return self.checked(target, indent)
@@ -5853,7 +5876,12 @@ class CApiEmitter:
         # has to extend it rather than put a different list back. The write
         # below still happens - Python does it too, and it is what makes the
         # difference for something that answers with a *new* object.
-        function = _IN_PLACE.get(type(node.op)) or _BINARY.get(type(node.op))
+        # `**` is left to the binary form here: its in-place twin takes a
+        # third argument and this path passes two.
+        function = None
+        if not isinstance(node.op, ast.Pow):
+            function = _IN_PLACE.get(type(node.op))
+        function = function or _BINARY.get(type(node.op))
         if function is None:
             raise self.fail(
                 node, f"{type(node.op).__name__} is not translated here yet"
@@ -8315,7 +8343,7 @@ class CApiEmitter:
         # reads `__name__` would otherwise not find it among the module's
         # globals and would go on to the builtins, where `__name__` also
         # exists and answers "builtins".
-        for dunder in ("__name__", "__file__"):
+        for dunder in ("__name__", "__file__", "__doc__"):
             self.note_global(dunder)
             self.certain_globals.add(dunder)
             self.certain_at.setdefault(dunder, -1)
@@ -8341,6 +8369,23 @@ class CApiEmitter:
         # `if __name__ == "__main__":` is how a script says where it starts,
         # and `os.path.dirname(os.path.abspath(__file__))` is how it finds
         # what sits beside it.
+        # The module's own docstring, or None where it has none. Left unset
+        # it was looked for among the builtins, where `__doc__` exists and
+        # is the builtins module's own - so `print(__doc__)` printed a page
+        # about built-in functions.
+        written = ast.get_docstring(tree, clean=False)
+        self.certain_globals.add("__doc__")
+        self.certain_at["__doc__"] = -1
+        slot = self.note_global("__doc__")
+        if written is None:
+            blank = self.builtin("None", indent)
+            self.emit(f"{slot} = {blank};", indent)
+        else:
+            self.emit(
+                f"{slot} = PyUnicode_FromString({_c_string(written)});", indent
+            )
+            self.checked(slot, indent)
+        self.publish("__doc__", slot, indent)
         for dunder, text in (("__name__", name), ("__file__", origin)):
             self.certain_globals.add(dunder)
             self.certain_at[dunder] = -1

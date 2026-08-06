@@ -581,7 +581,10 @@ CPython, and requiring identical stdout and exit status.
 | `except*` (PEP 654), exception groups | ✅ |
 | `if` / `for` / `try` in a class body | ✅ |
 | complex numbers, `f = lambda self: ...` as a method | ✅ |
-| `dir()` with no argument | ❌ refused |
+| `x @ y` and `x @= y`, and every augmented operator | ✅ |
+| `xs[1:3] = ys`, `del xs[a:b]`, extended slices | ✅ |
+| a module's own `__doc__` | ✅ |
+| `dir()` with no argument, `from x import *` | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
@@ -716,7 +719,7 @@ in almost every one of them.
 
 ### The interpreter surface it may use
 
-- A fixed table of 98 exported CPython entry points:
+- A fixed table of 100 exported CPython entry points:
   `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetHandledException`, `PyErr_GetRaisedException`, `PyErr_Occurred`,
@@ -728,20 +731,20 @@ in almost every one of them.
   `PyLong_FromLongLong`, `PyLong_FromString`, `PyNumber_Add`, `PyNumber_And`,
   `PyNumber_FloorDivide`, `PyNumber_InPlaceAdd`, `PyNumber_InPlaceAnd`,
   `PyNumber_InPlaceFloorDivide`, `PyNumber_InPlaceLshift`,
-  `PyNumber_InPlaceMultiply`, `PyNumber_InPlaceOr`, `PyNumber_InPlacePower`,
-  `PyNumber_InPlaceRemainder`, `PyNumber_InPlaceRshift`,
-  `PyNumber_InPlaceSubtract`, `PyNumber_InPlaceTrueDivide`,
-  `PyNumber_InPlaceXor`, `PyNumber_Invert`, `PyNumber_Lshift`,
-  `PyNumber_Multiply`, `PyNumber_Negative`, `PyNumber_Or`,
-  `PyNumber_Positive`, `PyNumber_Power`, `PyNumber_Remainder`,
-  `PyNumber_Rshift`, `PyNumber_Subtract`, `PyNumber_TrueDivide`,
-  `PyNumber_Xor`, `PyObject_Call`, `PyObject_CallNoArgs`,
-  `PyObject_CallOneArg`, `PyObject_DelItem`, `PyObject_Format`,
-  `PyObject_GetAttr`, `PyObject_GetAttrString`, `PyObject_GetItem`,
-  `PyObject_GetIter`, `PyObject_IsInstance`, `PyObject_IsTrue`,
-  `PyObject_Repr`, `PyObject_RichCompare`, `PyObject_RichCompareBool`,
-  `PyObject_SetAttr`, `PyObject_SetAttrString`, `PyObject_SetItem`,
-  `PyObject_Size`, `PyObject_Str`, `PyObject_Vectorcall`,
+  `PyNumber_InPlaceMatrixMultiply`, `PyNumber_InPlaceMultiply`,
+  `PyNumber_InPlaceOr`, `PyNumber_InPlacePower`, `PyNumber_InPlaceRemainder`,
+  `PyNumber_InPlaceRshift`, `PyNumber_InPlaceSubtract`,
+  `PyNumber_InPlaceTrueDivide`, `PyNumber_InPlaceXor`, `PyNumber_Invert`,
+  `PyNumber_Lshift`, `PyNumber_MatrixMultiply`, `PyNumber_Multiply`,
+  `PyNumber_Negative`, `PyNumber_Or`, `PyNumber_Positive`, `PyNumber_Power`,
+  `PyNumber_Remainder`, `PyNumber_Rshift`, `PyNumber_Subtract`,
+  `PyNumber_TrueDivide`, `PyNumber_Xor`, `PyObject_Call`,
+  `PyObject_CallNoArgs`, `PyObject_CallOneArg`, `PyObject_DelItem`,
+  `PyObject_Format`, `PyObject_GetAttr`, `PyObject_GetAttrString`,
+  `PyObject_GetItem`, `PyObject_GetIter`, `PyObject_IsInstance`,
+  `PyObject_IsTrue`, `PyObject_Repr`, `PyObject_RichCompare`,
+  `PyObject_RichCompareBool`, `PyObject_SetAttr`, `PyObject_SetAttrString`,
+  `PyObject_SetItem`, `PyObject_Size`, `PyObject_Str`, `PyObject_Vectorcall`,
   `PyObject_VectorcallMethod`, `PyRun_SimpleString`, `PySequence_Check`,
   `PySequence_Contains`, `PySequence_GetItem`, `PySlice_New`,
   `PySys_GetObject`, `PySys_WriteStdout`, `PyTuple_GetItem`, `PyTuple_New`,
@@ -779,33 +782,33 @@ python3 benchmarks/run.py
 
 | feature | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **3.0 ms** | 7.1 ms | **2.40× faster** |
-| a call naming an argument | **3.5 ms** | 7.8 ms | **2.26× faster** |
-| integer arithmetic | **5.3 ms** | 8.4 ms | **1.59× faster** |
-| `while` loop | **4.7 ms** | 6.4 ms | **1.38× faster** |
-| comparisons | **3.8 ms** | 4.7 ms | **1.24× faster** |
-| float arithmetic | **5.5 ms** | 5.8 ms | **1.06× faster** |
-| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.03× faster** |
-| `in` on a list | 9.0 ms | 9.0 ms | 1.00× |
-| comprehension | 5.7 ms | 5.6 ms | 0.98× |
-| list append | 5.2 ms | 5.1 ms | 0.98× |
-| exception raise/catch | 20.7 ms | 20.0 ms | 0.97× |
-| dict store | 8.5 ms | 7.9 ms | 0.93× |
-| `and` / `or` | 6.2 ms | 5.7 ms | 0.92× |
-| `isinstance` | 7.5 ms | 6.1 ms | 0.81× |
-| f-string | 22.1 ms | 17.7 ms | 0.80× |
-| string concatenation | 16.0 ms | 12.5 ms | 0.78× |
-| module global read | 5.5 ms | 3.7 ms | 0.68× |
-| subscript | 8.9 ms | 6.0 ms | 0.68× |
-| dict lookup by name | 6.9 ms | 4.6 ms | 0.67× |
-| `for` over a list | 4.4 ms | 2.9 ms | 0.65× |
-| attribute read | 6.5 ms | 3.8 ms | 0.58× |
-| chained comparison | 12.2 ms | 6.8 ms | 0.56× |
-| closure call | 13.0 ms | 6.7 ms | 0.51× |
-| attribute write | 6.5 ms | 3.0 ms | 0.46× |
-| instantiation | 37.9 ms | 16.4 ms | 0.43× |
-| tuple unpacking | 15.5 ms | 5.6 ms | 0.36× |
-| method call | 18.8 ms | 6.7 ms | 0.36× |
+| direct function call | **2.9 ms** | 7.1 ms | **2.48× faster** |
+| a call naming an argument | **3.4 ms** | 7.8 ms | **2.27× faster** |
+| integer arithmetic | **5.1 ms** | 8.3 ms | **1.62× faster** |
+| `while` loop | **4.6 ms** | 6.2 ms | **1.36× faster** |
+| comparisons | **3.7 ms** | 4.6 ms | **1.26× faster** |
+| float arithmetic | **5.4 ms** | 5.7 ms | **1.05× faster** |
+| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.04× faster** |
+| `in` on a list | **8.9 ms** | 9.0 ms | **1.01× faster** |
+| comprehension | 5.6 ms | 5.6 ms | 1.00× |
+| list append | 5.2 ms | 5.2 ms | 0.99× |
+| dict store | 8.2 ms | 7.8 ms | 0.96× |
+| `and` / `or` | 6.1 ms | 5.7 ms | 0.93× |
+| exception raise/catch | 21.9 ms | 19.6 ms | 0.90× |
+| f-string | 21.6 ms | 17.6 ms | 0.81× |
+| `isinstance` | 7.5 ms | 6.0 ms | 0.81× |
+| string concatenation | 15.6 ms | 12.4 ms | 0.80× |
+| subscript | 8.4 ms | 6.0 ms | 0.72× |
+| module global read | 5.4 ms | 3.7 ms | 0.68× |
+| dict lookup by name | 6.8 ms | 4.6 ms | 0.67× |
+| attribute read | 6.3 ms | 3.7 ms | 0.60× |
+| chained comparison | 11.8 ms | 6.7 ms | 0.57× |
+| `for` over a list | 5.3 ms | 2.8 ms | 0.54× |
+| attribute write | 6.1 ms | 3.3 ms | 0.54× |
+| closure call | 12.6 ms | 6.6 ms | 0.52× |
+| instantiation | 37.0 ms | 16.0 ms | 0.43× |
+| tuple unpacking | 15.3 ms | 5.5 ms | 0.36× |
+| method call | 18.5 ms | 6.6 ms | 0.36× |
 
 Ratios are computed from the unrounded timings, so dividing the millisecond
 figures as shown gives a slightly different number in the last decimal.
@@ -816,8 +819,13 @@ and by roughly how much, does not.
 
 ### Where those numbers came from
 
-Fifteen of the twenty-seven rows above sit at 0.80× or better and seven beat
-the interpreter outright. Most of them did not a short while ago, and the reason
+Sixteen of the twenty-seven rows above sit at 0.80× or better and eight beat
+the interpreter outright. One row moved the other way and is worth saying so:
+`for` over a list went from 0.66× to 0.54× when `x += y` started meaning what
+Python means. Its inner statement is `t += x`, and the in-place operator asks
+the value for a slot an integer does not have. Branching on the narrowing flag
+to skip that was tried and measured *worse* - the flag is cleared by the first
+turn - so the cost stands, and it is what the correct answer is worth. Most of them did not a short while ago, and the reason
 each moved is worth having in one place, because none of it was a matter of
 turning something up.
 
