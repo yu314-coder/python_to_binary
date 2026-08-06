@@ -807,6 +807,9 @@ class CApiEmitter:
         #: A method body sees none of it, so this is only set around the
         #: pieces that run as the class is built.
         self.class_scope: list[tuple[str, set[str]]] = []
+        #: The class scope a comprehension's first iterable is evaluated in,
+        #: which is the one around it rather than the comprehension's own.
+        self.first_iterable_scope: list[tuple[str, set[str]]] = []
         # Where each of those `def`s sits in the module body, and how far
         # through that body execution has got. A direct call is only correct
         # once the `def` has run: `print(later(3))` above `def later(...)` is
@@ -2933,6 +2936,23 @@ class CApiEmitter:
             self.emit(f"Py_DecRef({source});", indent)
             return self.checked(target, indent)
 
+        # A comprehension has a scope of its own, and a class body's names
+        # are not in it: `class C: size = 3; rows = [size for _ in r]` is a
+        # NameError in Python, and answered `[3, 3]` here. The one exception
+        # is the *first* iterable, which is evaluated in the scope the
+        # comprehension is written in - that is what lets `[v * 2 for v in
+        # xs]` read the `xs` beside it - so that one keeps the class scope
+        # and everything else is written without it.
+        outer_class_scope = self.class_scope
+        self.class_scope = []
+        self.first_iterable_scope = outer_class_scope
+        try:
+            return self.comprehension_body(node, indent)
+        finally:
+            self.class_scope = outer_class_scope
+            self.first_iterable_scope = []
+
+    def comprehension_body(self, node, indent: int) -> str:
         target = self.temporary()
         if isinstance(node, ast.DictComp):
             # Built as a dict from the start; there is no list shape a
@@ -3171,7 +3191,17 @@ class CApiEmitter:
         # May be empty: `for d[k] in ...` stores through a subscript and binds
         # no name of its own, which needs no scope but is perfectly legal.
         names = _bound_names(clause.target)
-        sequence = self.expression(clause.iter, indent)
+        if position == 0:
+            # See `comprehension_body`: this one, and only this one, is
+            # evaluated in the scope around the comprehension.
+            held = self.class_scope
+            self.class_scope = self.first_iterable_scope
+            try:
+                sequence = self.expression(clause.iter, indent)
+            finally:
+                self.class_scope = held
+        else:
+            sequence = self.expression(clause.iter, indent)
         iterator = self.temporary()
         self.emit(f"{iterator} = PyObject_GetIter({sequence});", indent)
         self.checked(iterator, indent)
