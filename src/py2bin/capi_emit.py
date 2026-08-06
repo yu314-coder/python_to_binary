@@ -3844,6 +3844,19 @@ class CApiEmitter:
             # implied. The class is read when the method runs, by which time it
             # exists; at the moment the method is written it does not yet.
             owner, first = self.methods_of[-1]
+            if (
+                self.current is not None
+                and first not in self.current.parameters
+                and first not in self.current.captures
+            ):
+                # A `def` written inside a method is not itself a method, and
+                # the two values `super()` stands for are not in reach there:
+                # CPython gives the nested frame no `__class__` cell and no
+                # first argument to read. It says so - "super(): no arguments"
+                # - where this said the first parameter's name was not
+                # defined, which points at a name the program never wrote.
+                self.raise_named("RuntimeError", "super(): no arguments", indent)
+                return self.builtin("None", indent)
             node = ast.copy_location(
                 ast.Call(
                     func=node.func,

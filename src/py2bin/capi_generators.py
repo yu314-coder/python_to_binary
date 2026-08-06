@@ -1417,11 +1417,16 @@ def rewrite(
                         type_params=[],
                         returns=None,
                     ),
-                    # The same step object with something to send, and the
-                    # shutdown the language pairs with it.
+                    # The same step object with something to send, the one
+                    # that raises at the suspension point instead, and the
+                    # shutdown the language pairs with them. All three are
+                    # awaited rather than called, which is why each is an
+                    # object with an `__await__` and not a method that runs.
                     *ast.parse(
                         "def asend(self, _py2bin_value):\n"
                         "    return _py2bin_astep(self, _py2bin_value)\n"
+                        "def athrow(self, _py2bin_exc):\n"
+                        "    return _py2bin_athrow(self, _py2bin_exc)\n"
                         "def aclose(self):\n"
                         "    return _py2bin_aclose(self)\n"
                     ).body,
@@ -1664,6 +1669,29 @@ class _py2bin_astep:
                     if _py2bin_item[0] is {_AGEN_MARK}:
                         return _py2bin_item[1]
             _py2bin_sent = yield _py2bin_item
+
+
+class _py2bin_athrow:
+
+    def __init__(self, _py2bin_owner, _py2bin_exc):
+        self.owner = _py2bin_owner
+        self.exc = _py2bin_exc
+
+    def __await__(self):
+        try:
+            _py2bin_item = self.owner.throw(self.exc)
+        except StopIteration:
+            raise StopAsyncIteration
+        while True:
+            if type(_py2bin_item) is tuple:
+                if len(_py2bin_item) == 2:
+                    if _py2bin_item[0] is {_AGEN_MARK}:
+                        return _py2bin_item[1]
+            _py2bin_sent = yield _py2bin_item
+            try:
+                _py2bin_item = self.owner.send(_py2bin_sent)
+            except StopIteration:
+                raise StopAsyncIteration
 
 
 class _py2bin_aclose:
