@@ -490,6 +490,15 @@ _COMPARISONS = {
     ast.GtE: 5,
 }
 
+#: Methods Python wraps for you, whatever the class body says. `__new__` is
+#: called before there is an instance, and the other two are asked of the
+#: class itself.
+_IMPLICITLY_WRAPPED = {
+    "__new__": "staticmethod",
+    "__init_subclass__": "classmethod",
+    "__class_getitem__": "classmethod",
+}
+
 #: The in-place form of each operator, for `x += y` and its relatives. The
 #: object gets to answer for itself: a list extends, a number rebuilds.
 _IN_PLACE = {
@@ -6607,6 +6616,24 @@ class CApiEmitter:
                         )
                     finally:
                         self.class_scope.pop()
+                elif statement.name in _IMPLICITLY_WRAPPED:
+                    # Python wraps three of these itself, whether or not the
+                    # class says so: `__new__` is a staticmethod and
+                    # `__init_subclass__` and `__class_getitem__` are
+                    # classmethods. Bound as ordinary methods they were handed
+                    # an instance that does not exist yet, and
+                    # `__init_subclass__` reported `cls` missing.
+                    wrapper = self.builtin(
+                        _IMPLICITLY_WRAPPED[statement.name], indent
+                    )
+                    value = self.temporary()
+                    self.emit(
+                        f"{value} = PyObject_CallOneArg({wrapper}, {body});",
+                        indent,
+                    )
+                    self.emit(f"Py_DecRef({wrapper});", indent)
+                    self.emit(f"Py_DecRef({body});", indent)
+                    self.checked(value, indent)
                 else:
                     value = self.temporary()
                     self.emit(f"{value} = PyInstanceMethod_New({body});", indent)

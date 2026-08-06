@@ -571,8 +571,10 @@ CPython, and requiring identical stdout and exit status.
 | `x += y` through `__iadd__`, in place | ✅ |
 | `@property` with a `@v.setter` | ✅ |
 | `...` as a stub body | ✅ |
-| `gen.throw` / `gen.close`, `asend` / `aclose` | ❌ |
-| a class inside a class body, `except*`, `__init_subclass__` kwargs | ❌ |
+| `gen.throw` / `gen.close`, `asend` / `aclose` | ✅ |
+| `__new__`, `__init_subclass__`, `__class_getitem__` bound as Python binds them | ✅ |
+| a class inside a class body, `except*`, `typing.Generic[T]` as a base | ❌ |
+| `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |

@@ -694,6 +694,87 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_a_generator_can_be_thrown_into_and_closed(self):
+        """`throw` raises *at the suspension point*, which is a block here.
+
+        A machine resumes at the top of the block a `yield` comes back to,
+        and that block is wrapped in whatever `try` surrounded the `yield` -
+        so leaving the exception for the resume point to raise puts it
+        exactly where the program's own `except` and `finally` can see it.
+        `close` is `throw(GeneratorExit)` and the rules about what the
+        generator may do with it.
+        """
+        self._run(
+            "def caught():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "    except ValueError:\n"
+            "        yield 'caught'\n"
+            "def cleaned():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "    finally:\n"
+            "        print('cleanup')\n"
+            "def escapes():\n"
+            "    yield 1\n"
+            "it = caught()\n"
+            "next(it)\n"
+            "print(it.throw(ValueError()))\n"
+            "second = cleaned()\n"
+            "next(second)\n"
+            "second.close()\n"
+            "third = escapes()\n"
+            "next(third)\n"
+            "try:\n"
+            "    third.throw(KeyError('boom'))\n"
+            "except KeyError as e:\n"
+            "    print('escaped:', e)\n",
+            b"caught\ncleanup\nescaped: 'boom'\n",
+        )
+
+    def test_an_async_generator_can_be_sent_to_and_closed(self):
+        self._run(
+            "import asyncio\n"
+            "async def echo():\n"
+            "    x = yield 1\n"
+            "    yield x * 2\n"
+            "async def cleaned():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "    finally:\n"
+            "        print('closed')\n"
+            "async def main():\n"
+            "    it = echo()\n"
+            "    first = await it.asend(None)\n"
+            "    second = await it.asend(5)\n"
+            "    other = cleaned()\n"
+            "    await other.__anext__()\n"
+            "    await other.aclose()\n"
+            "    return first, second\n"
+            "print(asyncio.run(main()))\n",
+            b"closed\n(1, 10)\n",
+        )
+
+    def test_python_wraps_three_methods_whether_the_class_says_so_or_not(self):
+        # `__new__` is a staticmethod and `__init_subclass__` and
+        # `__class_getitem__` are classmethods. Bound as ordinary methods they
+        # were handed an instance that does not exist yet.
+        self._run(
+            "class A:\n"
+            "    def __new__(cls, *args):\n"
+            "        made = super().__new__(cls)\n"
+            "        made.tag = 'new'\n"
+            "        return made\n"
+            "    def __init_subclass__(cls, **kw):\n"
+            "        cls.sub = 'set'\n"
+            "    def __class_getitem__(cls, item):\n"
+            "        return ('item', item)\n"
+            "class B(A):\n"
+            "    pass\n"
+            "print(A().tag, B.sub, A[int])\n",
+            b"new set ('item', <class 'int'>)\n",
+        )
+
     def test_augmented_assignment_lets_the_object_answer(self):
         """`x += y` is not `x = x + y`.
 

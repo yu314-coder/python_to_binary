@@ -62,6 +62,8 @@ STATE = "_py2bin_state"
 ITERATOR = "_py2bin_iter"
 #: What `send` last put in, which a resumed `x = yield` reads.
 SENT = "_py2bin_sent"
+#: What `throw` left for the machine to raise where it was suspended.
+THROWN = "_py2bin_thrown"
 
 
 def _suspends(body: list[ast.stmt]) -> bool:
@@ -559,6 +561,11 @@ class _Machine:
                     ast.Return(value=value),
                 ]
             )
+            # A `yield` whose value nobody wanted still suspends, so `throw`
+            # has to be able to reach it - the block a resume lands in is
+            # wrapped in whatever `try` surrounded the `yield`, which is what
+            # puts the exception where the program's own `except` can see it.
+            self.blocks[resume].extend(_raise_thrown())
             return resume
         if isinstance(statement, ast.Assign) and isinstance(
             statement.value, ast.Yield
@@ -582,6 +589,10 @@ class _Machine:
                     ast.Return(value=value),
                 ]
             )
+            # `throw` leaves the exception here and resumes; the language
+            # says it is raised *at the suspension point*, which is exactly
+            # the top of the block a `yield` comes back to.
+            self.blocks[resume].extend(_raise_thrown())
             # What `send` put there, which `__next__` leaves as None.
             self.blocks[resume].append(
                 ast.Assign(
@@ -1250,6 +1261,16 @@ def rewrite(
             ],
             value=ast.Constant(value=None),
         ),
+        ast.Assign(
+            targets=[
+                ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=THROWN,
+                    ctx=ast.Store(),
+                )
+            ],
+            value=ast.Constant(value=None),
+        ),
     ]
     for name in sorted(machine.names):
         setup.append(
@@ -1325,6 +1346,14 @@ def rewrite(
                         type_params=[],
                         returns=None,
                     ),
+                    # The same step object with something to send, and the
+                    # shutdown the language pairs with it.
+                    *ast.parse(
+                        "def asend(self, _py2bin_value):\n"
+                        "    return _py2bin_astep(self, _py2bin_value)\n"
+                        "def aclose(self):\n"
+                        "    return _py2bin_aclose(self)\n"
+                    ).body,
                 ]
                 if asynchronous
                 else [
@@ -1401,6 +1430,24 @@ def rewrite(
                 type_params=[],
                 returns=None,
             ),
+            # `throw` puts the exception where the resume block will find
+            # it; `close` is `throw(GeneratorExit)` and the language's rules
+            # about what the generator may do with it. Both are written out
+            # as Python and compiled like the rest of the class.
+            *ast.parse(
+                f"def throw(self, _py2bin_exc):\n"
+                f"    self.{THROWN} = _py2bin_exc\n"
+                f"    self.{SENT} = None\n"
+                f"    return self._py2bin_run()\n"
+                f"def close(self):\n"
+                f"    try:\n"
+                f"        self.throw(GeneratorExit())\n"
+                f"    except GeneratorExit:\n"
+                f"        return None\n"
+                f"    except StopIteration:\n"
+                f"        return None\n"
+                f"    raise RuntimeError('generator ignored GeneratorExit')\n"
+            ).body,
             ast.FunctionDef(
                 name="send",
                 args=_arguments(["self", "value"]),
@@ -1470,11 +1517,12 @@ _AGEN_HELPER = f"""
 
 class _py2bin_astep:
 
-    def __init__(self, _py2bin_owner):
+    def __init__(self, _py2bin_owner, _py2bin_first=None):
         self.owner = _py2bin_owner
+        self.first = _py2bin_first
 
     def __await__(self):
-        _py2bin_sent = None
+        _py2bin_sent = self.first
         while True:
             try:
                 _py2bin_item = self.owner.send(_py2bin_sent)
@@ -1485,6 +1533,18 @@ class _py2bin_astep:
                     if _py2bin_item[0] is {_AGEN_MARK}:
                         return _py2bin_item[1]
             _py2bin_sent = yield _py2bin_item
+
+
+class _py2bin_aclose:
+
+    def __init__(self, _py2bin_owner):
+        self.owner = _py2bin_owner
+
+    def __await__(self):
+        if False:
+            yield None
+        self.owner.close()
+        return None
 """
 
 
@@ -1537,6 +1597,17 @@ class _Renamed(ast.NodeTransformer):
         if node.arg == self.was:
             return ast.copy_location(ast.arg(arg=self.now), node)
         return node
+
+
+def _raise_thrown() -> list[ast.stmt]:
+    """`if self.<thrown> is not None: raise it` - the top of a resume block."""
+
+    return ast.parse(
+        f"if self.{THROWN} is not None:\n"
+        f"    _py2bin_e = self.{THROWN}\n"
+        f"    self.{THROWN} = None\n"
+        f"    raise _py2bin_e\n"
+    ).body
 
 
 def _incoming(position: int) -> str:
