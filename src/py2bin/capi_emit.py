@@ -29,6 +29,9 @@ import ast
 import copy
 import builtins
 import contextlib
+import sys
+import textwrap
+import warnings
 from pathlib import Path
 
 from .capi_cells import CellError, expand as expand_cells
@@ -242,6 +245,74 @@ def _handles_exceptions(body: list) -> bool:
         return False
 
     return look(ast.Module(body=list(body), type_ignores=[]))
+
+
+def _writes_on_functions(decorator: ast.expr) -> bool:
+    """Whether this decorator sets an attribute on the function it is given.
+
+    `abstractmethod` sets `__isabstractmethod__`; `wraps` sets `__name__`,
+    `__doc__` and four more. Both are read from the spelling - what a name
+    holds cannot be known until the program runs, and by then the function
+    has already been built one way or the other. A program that binds one of
+    these names to something else gets a function wrapped for no reason,
+    which still calls and still binds.
+
+    `abstractproperty` and its relatives are the same thing with a wrapper
+    around it, which is why the test is on the prefix.
+    """
+
+    if isinstance(decorator, ast.Call):
+        # `@wraps(f)`: the decorator is what the call answers with.
+        decorator = decorator.func
+    if isinstance(decorator, ast.Attribute):
+        spelled = decorator.attr
+    elif isinstance(decorator, ast.Name):
+        spelled = decorator.id
+    else:
+        return False
+    return spelled.startswith("abstract") or spelled == "wraps"
+
+
+def _reaches_for_main(tree: ast.Module) -> bool:
+    """Whether this module asks for `__main__` as a module object.
+
+    `import __main__`, `from __main__ import x`, `sys.modules["__main__"]`.
+    Not `__name__ == "__main__"`, which every second file contains and which
+    asks for nothing - reading that as a request would put half the programs
+    there are into a slower mode for no reason.
+    """
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == "__main__" for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__main__":
+                return True
+        elif isinstance(node, ast.Call):
+            if _named_import(node) == "__main__":
+                return True
+        elif isinstance(node, ast.Subscript):
+            index = node.slice
+            if (
+                isinstance(index, ast.Constant)
+                and index.value == "__main__"
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "modules"
+            ):
+                return True
+    return False
+
+
+def _uses_abstract(tree: ast.Module) -> bool:
+    """Whether anything in this module decorates a function that way."""
+
+    return any(
+        _writes_on_functions(decorator)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for decorator in node.decorator_list
+    )
 
 
 def _jumps_out(body: list) -> bool:
@@ -624,6 +695,53 @@ _IMPLICITLY_WRAPPED = {
     "__class_getitem__": "classmethod",
 }
 
+#: What an `@abstractmethod` is given to mark, compiled with the program.
+#:
+#: `abc.abstractmethod(f)` does one thing: it sets `f.__isabstractmethod__`
+#: and hands `f` back. A compiled function is a `PyCFunction` and has no
+#: `__dict__`, so that assignment failed and the whole program stopped at its
+#: first `class Shape(ABC)` - which is how a great many programs begin.
+#:
+#: So a method the class body marks abstract is handed over inside this
+#: instead: an ordinary object, with a dictionary to hold the mark and a
+#: `__get__` to bind like a method. `ABCMeta` then reads the mark where it
+#: expects to, and - because the mark travels with the value - a subclass
+#: that does not override the method is still abstract, which is the part
+#: that setting `__abstractmethods__` from the outside cannot get right.
+#:
+#: Only marked methods are wrapped. They exist to be overridden and their
+#: bodies are usually empty, so what the wrapping costs to call is beside the
+#: point; every other method stays what it was.
+_ABSTRACT_HOLDER = '''
+class _py2bin_bound_abstract:
+
+    def __init__(self, _py2bin_fn, _py2bin_obj):
+        self.fn = _py2bin_fn
+        self.obj = _py2bin_obj
+
+    def __call__(self, *_py2bin_args, **_py2bin_named):
+        return self.fn(self.obj, *_py2bin_args, **_py2bin_named)
+
+
+class _py2bin_abstract:
+
+    def __init__(self, _py2bin_fn):
+        self.__func__ = _py2bin_fn
+
+    def __get__(self, _py2bin_obj, _py2bin_owner=None):
+        if _py2bin_obj is None:
+            # Itself, not the function inside: read off the class is exactly
+            # how `ABCMeta` asks whether an inherited method is still
+            # abstract, and the function inside cannot hold the answer. It is
+            # callable and takes the same arguments, which is what reading a
+            # method off a class gives you either way.
+            return self
+        return _py2bin_bound_abstract(self.__func__, _py2bin_obj)
+
+    def __call__(self, *_py2bin_args, **_py2bin_named):
+        return self.__func__(*_py2bin_args, **_py2bin_named)
+'''
+
 #: The in-place form of each operator, for `x += y` and its relatives. The
 #: object gets to answer for itself: a list extends, a number rebuilds.
 _IN_PLACE = {
@@ -658,12 +776,41 @@ _BINARY = {
 }
 
 
-def _text_signature(name: str, arguments: ast.arguments) -> str:
+def _own_doc(node: ast.AST) -> str | None:
+    """A function's own docstring, spelled the way its compiler spells it.
+
+    Since 3.13 CPython's compiler takes the common indent off every line of a
+    docstring after the first, and before that it kept the source exactly.
+    Which one is right depends on the interpreter, so this asks the one doing
+    the building - the same one the comparison runs against, and the same
+    line the artifact links.
+    """
+
+    if not isinstance(
+        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+    ):
+        # A `lambda` is one expression and has no docstring to have.
+        return None
+    written = ast.get_docstring(node, clean=False)
+    if written is None or sys.version_info < (3, 13):
+        return written
+    first, newline, rest = written.partition("\n")
+    return first + newline + textwrap.dedent(rest)
+
+
+def _text_signature(
+    name: str, arguments: ast.arguments, written: str | None = None
+) -> str:
     """The doc string CPython reads `__text_signature__` out of.
 
     A compiled function is a builtin function object, and a builtin carries no
     signature unless its doc begins with one in this exact shape: the name, the
     parameters in brackets, then a line of two dashes.
+
+    What the function's own docstring says goes after those dashes, which is
+    where CPython reads `__doc__` from once it has taken the signature off the
+    front. Left out, `help(f)` said nothing about any compiled function and
+    `functools.wraps` copied a `__doc__` of None onto every wrapper.
 
     A default that is a literal is written as itself, so `def f(a, b=1)` reads
     back as `(a, b=1)` rather than the `(a, b=None)` every default used to be
@@ -703,7 +850,7 @@ def _text_signature(name: str, arguments: ast.arguments) -> str:
         )
     if arguments.kwarg:
         parts.append(f"**{arguments.kwarg.arg}")
-    return f"{name}({', '.join(parts)})\n--\n\n"
+    return f"{name}({', '.join(parts)})\n--\n\n{written or ''}"
 
 
 def _c_bytes(data: bytes) -> str:
@@ -983,6 +1130,9 @@ class CApiEmitter:
         #: `(python name, C key)` for each module compiled alongside the entry,
         #: in the order their bodies must run.
         self.linked: list[tuple[str, str]] = []
+        #: True when another module in the program imports `__main__` and so
+        #: expects to read the entry's globals off it.
+        self.entry_is_read = False
         #: The bare module-level names each linked module binds, so its module
         #: object can be given them once its body has run.
         self.module_globals: dict[str, set[str]] = {}
@@ -4650,6 +4800,7 @@ class CApiEmitter:
             # it in once the callable exists.
             target = self.declare(node.name)
             value = self.make_closure(node, node.name, indent)
+            value = self.hold_attributes(node.decorator_list, value, indent)
             value = self.apply_decorators(node.decorator_list, value, indent)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"{target} = {value};", indent)
@@ -6902,6 +7053,32 @@ class CApiEmitter:
                 "quietly disagreeing",
             )
 
+    def hold_attributes(self, decorators, value: str, indent: int) -> str:
+        """Hand a decorator that writes on a function something it can write on.
+
+        `abstractmethod` sets `__isabstractmethod__` and `wraps` sets
+        `__name__`, `__doc__` and four more. A compiled function is a
+        `PyCFunction` with no `__dict__`, so both failed - and between them
+        they are how a great many programs begin and how nearly every
+        decorator is written. Wrapped like this, both work.
+
+        Only where the decorator is one of those two, by the name it is
+        spelled: everything else keeps the plain compiled function, and the
+        extra hop this costs to call is paid by nobody else. See
+        `_ABSTRACT_HOLDER`.
+        """
+
+        if not any(_writes_on_functions(decorator) for decorator in decorators):
+            return value
+        holder = self.expression(
+            ast.Name(id="_py2bin_abstract", ctx=ast.Load()), indent
+        )
+        kept = self.temporary()
+        self.emit(f"{kept} = PyObject_CallOneArg({holder}, {value});", indent)
+        self.emit(f"Py_DecRef({holder});", indent)
+        self.emit(f"Py_DecRef({value});", indent)
+        return self.checked(kept, indent)
+
     def apply_decorators(self, decorators, value: str, indent: int) -> str:
         """`@a` then `@b` on a `def` is `a(b(f))`.
 
@@ -7005,7 +7182,11 @@ class CApiEmitter:
 
         index = len(self.method_table)
         c_name = f"_closure{index}_{label}"
-        self.method_table.append((c_name, label, _text_signature(label, node.args)))
+        self.method_table.append(
+            (c_name, label, _text_signature(
+                label, node.args, _own_doc(node)
+            ))
+        )
 
         held = self.temporary()
         # Python evaluates a default when the `def` runs, once, and every
@@ -7213,6 +7394,9 @@ class CApiEmitter:
                     body = self.make_closure(statement, statement.name, indent)
                 finally:
                     self.methods_of.pop()
+                body = self.hold_attributes(
+                    statement.decorator_list, body, indent
+                )
                 if statement.decorator_list:
                     self.class_scope.append((namespace, known))
                     # The decorator is handed the plain callable, not the
@@ -7729,6 +7913,24 @@ class CApiEmitter:
             )
             if key == "__module__":
                 self.emit(f"Py_DecRef({value});", indent)
+        # The class's own docstring, which `type` takes out of the namespace.
+        # The body loop passes over it as a statement that binds nothing, and
+        # nothing else put it anywhere - so `C.__doc__` was None and `help(C)`
+        # had nothing to say about any compiled class.
+        written = _own_doc(node)
+        if written is not None:
+            doc = self.temporary()
+            self.emit(
+                f"{doc} = PyUnicode_FromString({_c_string(written)});", indent
+            )
+            self.checked(doc, indent)
+            self.emit(
+                f"if (PyObject_SetItem({namespace}, "
+                f"{self.interned('__doc__')}, {doc}) < 0) "
+                f"{{ {self.failure()} }}",
+                indent,
+            )
+            self.emit(f"Py_DecRef({doc});", indent)
         return namespace
 
     def write_wrapper(self, node: ast.FunctionDef) -> None:
@@ -7755,7 +7957,15 @@ class CApiEmitter:
         index = len(self.method_table)
         function = _Function(f"_value{index}_{node.name}", (), closure=True)
         self.method_table.append(
-            (function.name, node.name, _text_signature(node.name, node.args))
+            (
+                function.name,
+                node.name,
+                _text_signature(
+                    node.name,
+                    node.args,
+                    _own_doc(node),
+                ),
+            )
         )
         self.value_functions.append((self.prefix + node.name, index))
         outer = self.current
@@ -8535,6 +8745,9 @@ class CApiEmitter:
         """
 
         *imported, entry_tree = modules
+        self.entry_is_read = any(
+            _reaches_for_main(tree) for _, tree, _ in imported
+        )
         for name, tree, origin in imported:
             key = name.replace(".", "_")
             self.prefix = f"{key}_"
@@ -8563,6 +8776,11 @@ class CApiEmitter:
         # Before anything else looks at the tree: a generator becomes a class
         # and a function that makes one, so nothing below ever sees a `yield`.
         try:
+            # Before anything reads the tree, so the two small classes are
+            # compiled like the program's own - which they now are.
+            if _uses_abstract(tree):
+                tree.body = ast.parse(_ABSTRACT_HOLDER).body + tree.body
+                ast.fix_missing_locations(tree)
             # Before the generators: a `nonlocal` inside one has to become
             # a cell while it is still an ordinary function body.
             try:
@@ -8602,6 +8820,14 @@ class CApiEmitter:
                 )
                 for inner in ast.walk(tree)
             )
+            if entry and self.entry_is_read:
+                # Something else in the program reaches for `__main__` and
+                # reads names off it. The entry's globals live in C slots and
+                # only its classes and functions are shown on the module
+                # object, so those reads found nothing. Asked for, they go
+                # in the dictionary like any other module's - and nothing
+                # that does not ask pays for it.
+                self.globals_in_dict = True
             # Before everything: `except*` becomes ordinary `try`/`except`
             # calling four small functions, so nothing below this ever sees
             # a TryStar.
@@ -8657,9 +8883,11 @@ class CApiEmitter:
         # What `__package__` would hold. A package's `__init__` is in itself;
         # any other module is in the package above it. `__main__` is in none,
         # which is why a relative import in a script is an error in Python too.
+        shown = origin.replace("\\", "/")
         self.module_package = (
             name
-            if origin.replace("\\", "/").endswith("__init__.py")
+            # A package: its `__init__`, or a directory with none - PEP 420.
+            if shown.endswith("__init__.py") or not shown.endswith(".py")
             else name.rpartition(".")[0]
         )
 
@@ -8741,7 +8969,7 @@ class CApiEmitter:
         # it was looked for among the builtins, where `__doc__` exists and
         # is the builtins module's own - so `print(__doc__)` printed a page
         # about built-in functions.
-        written = ast.get_docstring(tree, clean=False)
+        written = _own_doc(tree)
         self.certain_globals.add("__doc__")
         self.certain_at["__doc__"] = -1
         slot = self.note_global("__doc__")
@@ -8763,11 +8991,19 @@ class CApiEmitter:
                 # path meant `os.path.dirname(__file__)` named a directory on
                 # the machine that compiled it, so a moved bundle looked for
                 # its own files somewhere that did not exist.
+                #
+                # A linked module keeps the shape it had in the source tree -
+                # `pkg/thing.py`, not `thing.py` - because
+                # `os.path.basename(os.path.dirname(__file__))` is a common
+                # way to ask what package a module is in, and flattening it
+                # answered with the directory the binary happens to sit in.
+                place = Path(text)
+                tail = place.name if place.is_absolute() else place.as_posix()
                 where = self.builtin("_py2bin_dir", indent)
                 separator = self.temporary()
                 self.emit(
                     f"{separator} = PyUnicode_FromString("
-                    f"{_c_string('/' + Path(text).name)});",
+                    f"{_c_string('/' + tail)});",
                     indent,
                 )
                 self.checked(separator, indent)
@@ -9320,6 +9556,49 @@ class CApiEmitter:
         return lines
 
 
+def search_roots(entry: Path) -> list[Path]:
+    """Where to look for the program's own modules.
+
+    Beside the entry, first and always. Then any directory the program puts
+    on `sys.path` itself, which is how the layout with everything under
+    `src/` reaches its own package - `sys.path.insert(0,
+    os.path.join(os.path.dirname(__file__), "src"))` and the several ways of
+    spelling the same thing.
+
+    The expression is not worked out; the strings written in it are read, and
+    one is taken only when a directory of that name is really there beside
+    the entry. That covers every spelling at once - `os.path.join`, a `+`, a
+    `Path` divided - without this having to know any of them.
+    """
+
+    root = entry.parent
+    roots = [root]
+    tree = ast.parse(entry.read_text(encoding="utf-8"), str(entry))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = node.func
+        if not isinstance(called, ast.Attribute):
+            continue
+        if called.attr not in ("insert", "append"):
+            continue
+        holder = called.value
+        if not (isinstance(holder, ast.Attribute) and holder.attr == "path"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Constant):
+                continue
+            if not isinstance(inner.value, str) or not inner.value:
+                continue
+            for part in inner.value.replace("\\", "/").split("/"):
+                if not part or part in (".", ".."):
+                    continue
+                candidate = root / part
+                if candidate.is_dir() and candidate not in roots:
+                    roots.append(candidate)
+    return roots
+
+
 def _module_file(root: Path, name: str) -> Path | None:
     """The file the program keeps this dotted module in, if it keeps one.
 
@@ -9343,7 +9622,7 @@ def _module_file(root: Path, name: str) -> Path | None:
     return None
 
 
-def _package_of(root: Path, name: str, path: Path) -> str:
+def _package_of(name: str, path: Path) -> str:
     """What a relative import in this module counts levels from.
 
     A package counts from itself and a module from the package holding it,
@@ -9371,14 +9650,21 @@ def local_modules(entry: Path) -> list[tuple[str, Path]]:
     for ever - and is also, near enough, why Python allows it.
     """
 
-    root = entry.parent
+    roots = search_roots(entry)
     ordered: list[tuple[str, Path]] = []
     seen: set[str] = set()
+
+    def look(name: str) -> Path | None:
+        for root in roots:
+            found = _module_file(root, name)
+            if found is not None:
+                return found
+        return None
 
     def take(name: str) -> None:
         if name in seen:
             return
-        found = _module_file(root, name)
+        found = look(name)
         if found is None or found == entry:
             return
         seen.add(name)
@@ -9388,7 +9674,7 @@ def local_modules(entry: Path) -> list[tuple[str, Path]]:
             # own body runs first - unless it is the package that imports the
             # member, which the guard above notices and steps around.
             take(parent)
-        for wanted in sorted(imported_names(found, _package_of(root, name, found))):
+        for wanted in sorted(imported_names(found, _package_of(name, found))):
             take(wanted)
         ordered.append((name, found))
 
@@ -9518,22 +9804,117 @@ def python_program_to_capi_c(
     emitter = CApiEmitter(entry)
     emitter.extra_paths = list(extra_paths)
     emitter.crash_log = crash_log
-    root = entry.parent
+    roots = search_roots(entry)
     trees = []
     for name, path in modules:
+        # Where it sat in the source tree, which is the shape `__file__`
+        # keeps - see `write_module`. Relative, so nothing about the machine
+        # that compiled it travels in the binary.
+        shown = path.name
+        for root in roots:
+            if path.is_relative_to(root):
+                shown = path.relative_to(root).as_posix()
+                break
         if path.is_dir():
             # A namespace package has no body; it exists so that its members
             # have something to hang off.
-            trees.append((name, ast.Module(body=[], type_ignores=[]), str(path)))
+            trees.append((name, ast.Module(body=[], type_ignores=[]), shown))
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        tree = _Absolute(_package_of(root, name, path)).visit(tree)
+        warn_as_python_would(tree, shown)
+        tree = _Absolute(_package_of(name, path)).visit(tree)
         ast.fix_missing_locations(tree)
-        trees.append((name, tree, str(path)))
-    trees.append(
-        (entry.stem, ast.parse(entry.read_text(encoding="utf-8")), str(entry))
-    )
+        trees.append((name, tree, shown))
+    entry_tree = ast.parse(entry.read_text(encoding="utf-8"))
+    warn_as_python_would(entry_tree, entry)
+    trees.append((entry.stem, entry_tree, str(entry)))
     return emitter.program(trees), [name for name, _ in modules]
+
+
+def _note_identity(node: ast.Compare, note) -> None:
+    """`x is 1` compares what a thing *is* against a value spelled fresh.
+
+    CPython warns because the answer depends on whether the interpreter
+    happened to keep one of those around, which is not something to write a
+    program against.
+    """
+
+    for operator, right in zip(node.ops, node.comparators):
+        if not isinstance(operator, (ast.Is, ast.IsNot)):
+            continue
+        for side in (node.left, right):
+            if not isinstance(side, ast.Constant):
+                continue
+            if isinstance(side.value, bool) or not isinstance(
+                side.value, (int, float, complex, str, bytes)
+            ):
+                continue
+            spelled = "is" if isinstance(operator, ast.Is) else "is not"
+            note(
+                node,
+                f'"{spelled}" with \'{type(side.value).__name__}\' literal. '
+                f'Did you mean "=="?',
+            )
+            break
+
+
+def warn_as_python_would(tree: ast.Module, path: Path | str) -> None:
+    """The `SyntaxWarning`s CPython's compiler gives, given at compile time.
+
+    CPython raises these while compiling, which for a script is the moment
+    before it runs - so the person running it sees them. Compiling happens
+    earlier here, and nobody was ever told: a program built with py2bin lost
+    `assert (a, b)` and `'return' in a 'finally' block`, both of which are
+    almost always a mistake and both of which the compiler is the only thing
+    placed to notice.
+
+    Said here, in CPython's own words and at CPython's own line, so the same
+    program warns the same way whichever compiles it. It is a build-time
+    message rather than a run-time one, which is where a compiled language
+    puts them.
+    """
+
+    where = str(path)
+
+    def note(node: ast.AST, message: str) -> None:
+        warnings.warn_explicit(
+            message, SyntaxWarning, where, getattr(node, "lineno", 0)
+        )
+
+    def look(node: ast.AST, in_finally: bool, in_loop: bool) -> None:
+        if in_finally:
+            if isinstance(node, ast.Return):
+                note(node, "'return' in a 'finally' block")
+            elif isinstance(node, ast.Break) and not in_loop:
+                note(node, "'break' in a 'finally' block")
+            elif isinstance(node, ast.Continue) and not in_loop:
+                note(node, "'continue' in a 'finally' block")
+        if (
+            isinstance(node, ast.Assert)
+            and isinstance(node.test, ast.Tuple)
+            and node.test.elts
+        ):
+            note(node, "assertion is always true, perhaps remove parentheses?")
+        if isinstance(node, ast.Compare):
+            _note_identity(node, note)
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+        ):
+            # Its own block: a `return` written there returns from it.
+            for child in ast.iter_child_nodes(node):
+                look(child, False, False)
+            return
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            for inner in (*node.body, *node.handlers, *node.orelse):
+                look(inner, in_finally, in_loop)
+            for inner in node.finalbody:
+                look(inner, True, False)
+            return
+        deeper = in_loop or isinstance(node, (ast.For, ast.While, ast.AsyncFor))
+        for child in ast.iter_child_nodes(node):
+            look(child, in_finally, deeper)
+
+    look(tree, False, False)
 
 
 def python_to_capi_c(source: str, path: Path | str = "<string>") -> str:

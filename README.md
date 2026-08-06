@@ -591,7 +591,13 @@ CPython, and requiring identical stdout and exit status.
 | a generator expression, evaluated when asked rather than at once | ✅ |
 | a generator `def` inside an `if`, a `for`, or another generator | ✅ |
 | `dir()` with no argument | ❌ refused |
-| `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
+| `abc.abstractmethod`, `functools.wraps` - both write on a function | ✅ |
+| `f.__doc__` and a class's, so `help()` and `inspect.getdoc` answer | ✅ |
+| packages, `pkg/sub/deeper.py`, `from . import x`, PEP 420 directories | ✅ |
+| `importlib.import_module("pkg.thing")` with the name written down | ✅ |
+| a program that puts its own `src/` on `sys.path` | ✅ |
+| CPython's compile-time `SyntaxWarning`s, at compile time | ✅ |
+| `f.__annotations__`, `type(f).__name__`, `sys._getframe()` | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
@@ -1159,7 +1165,17 @@ table above.
 approximated. What is left is `type(f).__name__`, `f.__annotations__` and
 `sys._getframe()`, and those are structural rather than unfinished: a
 compiled function is a `builtin_function_or_method`, which has no `__dict__`,
-takes no attributes, cannot be subclassed and makes no frame. Each says what to do instead where there is something to do.
+takes no attributes, cannot be subclassed and makes no frame. Each says what
+to do instead where there is something to do.
+
+Two decorators used to be on that list because they write on the function
+they are given - `abc.abstractmethod` sets one attribute, `functools.wraps`
+sets six - and between them they are how a great many programs begin and how
+nearly every decorator is written. A function the source decorates with
+either is now handed over inside a small object that can hold what they
+write and binds like a method afterwards. Only those two, by the name they
+are spelled: every other function stays the plain compiled one, and the extra
+hop this costs to call is paid by nobody else.
 
 ## When it does not work
 
@@ -1228,20 +1244,21 @@ CPython's semantics rather than restricting them. Where the two differ:
 
 | program | py2bin | Nuitka | what it is |
 |---|---|---|---|
-| `abc.abstractmethod` | ✗ | ✓ | sets an attribute on a function; a compiled one is a `PyCFunction` and has nowhere to put it |
-| `functools.wraps` | ✗ | ✓ | the same, for `__name__` |
-| `typing.Generic[T]` as a base | ✗ | ✓ | `__mro_entries__` is not resolved |
-| pickling a compiled class | ✗ | ✓ | needs a qualname path back to the class |
-| a class inside a class body | refused | ✓ | not translated yet |
+| `f.__annotations__`, `type(f).__name__` | ✗ | ✓ | a compiled function is a `PyCFunction`: no `__dict__`, no attributes |
+| `typing.get_type_hints(f)`, `@f.register` on an annotated function | ✗ | ✓ | the same fact, read through `typing` |
+| `sys._getframe()` | ✗ | ✓ | a compiled function makes no frame |
+| a traceback naming a source line | ✗ | ✓ | there is no source beside the binary to name |
 | `lambda: i` capturing a comprehension's target | refused | ✓ | captures are by value here, so Python's answer would need cells |
-| `except*` (PEP 654) | refused | ✗ | py2bin says it cannot; Nuitka compiles it and answers differently |
-| `return` inside `finally` | ✗ | ✗ | **neither** emits CPython's `SyntaxWarning`; both answer 2, which is the value CPython gives |
+| `dir()` with no argument | refused | ✓ | there is no frame to enumerate |
+| `except*` (PEP 654) | ✓ | ✗ | py2bin rewrites it and agrees with CPython on 42,100 shapes; Nuitka answers differently |
 
-Four of py2bin's six are one fact: a compiled function is a
-`builtin_function_or_method`, which has no `__dict__` and takes no
-attributes. That is what makes a direct call 2.4x faster than the
-interpreter, and it is why `functools.wraps` cannot work. The trade is
-deliberate and it is the tier.
+Everything left is one fact and its consequences: a compiled function is a
+`builtin_function_or_method`, which has no `__dict__`, takes no attributes
+and makes no frame. That is what makes a direct call 2.7x faster than the
+interpreter. Two decorators that write on functions - `abc.abstractmethod`
+and `functools.wraps` - used to fall foul of it and no longer do: a function
+the source decorates with either is handed over inside something that can
+hold what they write, and nothing else pays for it.
 
 The corpus is [`tests/programs`](tests/programs) and it runs on every push -
 see [`.github/workflows/checks.yml`](.github/workflows/checks.yml).
@@ -1601,11 +1618,107 @@ answers `builtin_function_or_method`, `f.__annotations__` raises, and
 it is an interpreted call in front of every call, which is the two fastest
 rows on the grid.
 
+**Two decorators that write on functions, which used to be fatal.**
+
+`abc.abstractmethod(f)` does exactly one thing: it sets
+`f.__isabstractmethod__` and hands `f` back. `functools.wraps` does the same
+six times over. A compiled function has no `__dict__`, so both assignments
+failed - and between them they are how a great many programs begin and how
+nearly every decorator in Python is written. `class Shape(ABC)` stopped the
+whole program at import time.
+
+A function the source decorates with either is now handed over inside a small
+object that holds what they write and binds like a method afterwards. The
+mark travels with the value, which is what keeps a subclass overriding only
+half of an interface abstract - the part that setting `__abstractmethods__`
+from outside cannot get right. Only those two, recognised by the name they
+are spelled: every other function stays the plain compiled one.
+
+**A compiled function had no docstring at all.** Its doc slot carries the
+signature `inspect` reads, and nothing after it - so `help()` said nothing
+about anything, and `functools.wraps` copied a `__doc__` of None onto every
+wrapper. What the function itself says now goes after the signature, which is
+where CPython reads `__doc__` from; classes and modules keep theirs too, and
+the indent comes off the way the interpreter's own compiler takes it off.
+
+**A program is more than a flat directory of files.** `compile-capi` looked
+for the program's own modules in one place: a `.py` of that name beside the
+entry. So `import helper` was compiled in and `import pkg` was not - a
+program laid out the way most programs are failed at start-up with "No module
+named 'pkg'". Four things are now found the way the import system finds them:
+
+- `a.b` is `a/b.py` if there is one and `a/b/__init__.py` if there is not, and
+  the package is taken before its members unless the package's own body is
+  what imports them, which is the order those bodies have to run in;
+- a directory with no `__init__.py` is a package all the same - PEP 420 - and
+  is compiled in because it is what its members hang off;
+- `importlib.import_module("pkg.thing")` and `__import__("helper")` import as
+  surely as the statement does, and are followed wherever the name is written
+  down. A name computed at run time cannot be, and is not guessed at;
+- everything under `src/`, reached the way programs reach it. The expression
+  the program uses to build that path is not worked out - the strings written
+  in it are read, and one is taken only when a directory of that name is
+  really there, which covers every spelling of the idiom at once.
+
+Relative imports are resolved where they are written: `from . import x` has no
+meaning without a frame's `__package__` and a compiled module has no frame,
+but the meaning depends only on where the file sits. One that counts out past
+the top of the program is refused in Python's own words. A linked module's
+`__file__` keeps the shape it had in the tree - `pkg/thing.py`, not
+`thing.py` - because asking a module what package it is in by way of
+`os.path.dirname` is common, and flattening it answered with whatever
+directory the binary happened to sit in. Checked against CPython on
+twenty-eight laid-out programs, from a package four deep to a local `json.py`
+shadowing the standard library's.
+
+**The two ends of a generator's life had no block of their own.** The dispatch
+is a chain of `if state == N`, one arm per block, and neither end has one -
+so `next` on a generator already exhausted fell off the bottom of the chain
+and went round the loop again, and stopped answering. Both ends are also
+where `throw` lands when there is nothing suspended to raise at, and Python
+does not run the body there, which is why closing a generator twice is quiet
+rather than a complaint that it ignored the exit. A generator that raised is
+finished afterwards, too, and does not raise the same thing again.
+
+**A delegating generator is not the one suspended** - the sub-iterator is. So
+closing it has to close the sub-iterator, or that one's `finally` never runs:
+a cancelled `asyncio` task ran no cleanup at all. PEP 380's expansion says
+this by including `close` and `throw`, and both are now in the expansion here,
+asked for by name because delegating to a list is allowed and a list has
+neither. An async generator gained the third of the three ways to drive one:
+`asend` and `aclose` were there and `athrow` was not.
+
+**Which exception is being handled belongs to the call, not to the thread.** A
+`finally` now runs with the exception it interrupted on record, so what it
+raises is chained to it - `finally: raise K()` over a body that raised V threw
+away every trace of V. And a body whose `except` or `finally` raised something
+of its own used to leave its exception on record for good, so
+`sys.exc_info()` in the caller answered with it long after it had been dealt
+with; every call now gives the caller's back on the way out. Only bodies with
+a `try` or a `with` save anything, so an ordinary call pays nothing and the
+benchmark is unmoved. An `except` in a generator whose `try` holds a `yield`
+runs in a block of its own, reached after the `except` that caught the
+exception has ended, and now puts it on record itself.
+
+**Smaller things, each found the same way.** `global x` in a class body binds
+the module's name, not an attribute of the class. `send` on a generator that
+has not started is refused, as Python refuses it - there is no suspended
+`yield` to give the value to. `super()` in a `def` written inside a method
+says "super(): no arguments", which is what Python says, rather than naming
+a parameter the program never wrote. A module that imports `__main__` can
+read the entry's globals off it. And the `SyntaxWarning`s CPython's compiler
+gives - `assert (a, b)`, `'return' in a 'finally' block`, `"is"` with a
+literal - are given here too, in CPython's words and at CPython's line, at
+the moment a compiled language gives them: build time.
+
 **Still structural**, and unlikely to change: a compiled function is a
 `builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and
-`sys._getframe()` do not answer as they would for a Python function.
+`sys._getframe()` do not answer as they would for a Python function, and a
+traceback names no source line because there is no source beside the binary
+to name.
 
-Corpus 886 of 889. Suite 1,749 tests.
+Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
+103 programs run against CPython on every push.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 

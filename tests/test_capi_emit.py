@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from py2bin.capi_emit import (
@@ -3311,26 +3312,38 @@ class CApiEmitTests(unittest.TestCase):
             b"stat 1 stat 2\nC 3 C 4\nprop plain\n",
         )
 
-    def test_functools_wraps_cannot_rename_a_compiled_function(self):
-        """A compiled function is a builtin function object.
+    def test_functools_wraps_renames_the_wrapper(self):
+        """`wraps` assigns `__name__` and five more onto the wrapper.
 
-        `functools.wraps` copies `__name__` onto the wrapper by assigning it,
-        and that attribute is read-only on this kind of object. The failure is
-        an AttributeError naming the attribute, which is the truth rather than
-        a silent difference - but it does mean the idiom does not work here.
+        A compiled function is a builtin function object with no `__dict__`,
+        so every one of those assignments failed and the idiom - which is how
+        nearly every decorator in Python is written - raised at import time.
+        A function the source decorates with `wraps` is handed over inside
+        something that can hold what `wraps` writes.
         """
 
         source = (
             "import functools\n"
-            "def shout(f):\n"
+            "from functools import wraps\n"
+            "def double(f):\n"
             "    @functools.wraps(f)\n"
             "    def wrapper(n):\n"
-            "        return f(n)\n"
+            "        return f(n) * 2\n"
             "    return wrapper\n"
-            "@shout\n"
+            "@double\n"
             "def greet(n):\n"
+            "    'says hello'\n"
             "    return n\n"
-            "print(greet(1))\n"
+            "def keep(f):\n"
+            "    @wraps(f)\n"
+            "    def inner(*a):\n"
+            "        return f(*a)\n"
+            "    return inner\n"
+            "@keep\n"
+            "def plain():\n"
+            "    return 'p'\n"
+            "print(greet(3), greet.__name__, greet.__doc__)\n"
+            "print(greet.__wrapped__(3), plain(), plain.__name__)\n"
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3348,12 +3361,68 @@ class CApiEmitTests(unittest.TestCase):
             reference = subprocess.run(
                 [sys.executable, str(entry)], capture_output=True
             )
-            # This one is asserted as a *difference*, not a shared failure:
-            # under CPython the program runs, and here it does not.
-            self.assertEqual(reference.returncode, 0)
-            self.assertEqual(native.returncode, 1)
-            self.assertIn(b"AttributeError", native.stderr)
-            self.assertIn(b"__name__", native.stderr)
+            self.assertEqual(
+                native.stdout, b"6 greet says hello\n3 p plain\n"
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_abstract_methods_are_marked_and_enforced(self):
+        """`abc.abstractmethod(f)` sets `f.__isabstractmethod__` and no more.
+
+        A compiled function has no `__dict__`, so that one assignment failed
+        and the program stopped at its first `class Shape(ABC)` - which is
+        how a great many programs begin. The mark travels with the value,
+        which is what keeps a subclass that overrides only half of them
+        abstract.
+        """
+
+        source = (
+            "from abc import ABC, abstractmethod\n"
+            "class Shape(ABC):\n"
+            "    @abstractmethod\n"
+            "    def area(self): ...\n"
+            "    @abstractmethod\n"
+            "    def name(self): return 'shape'\n"
+            "class Square(Shape):\n"
+            "    def area(self): return 4\n"
+            "    def name(self): return 'square'\n"
+            "class Half(Shape):\n"
+            "    def area(self): return 0\n"
+            "print(Square().name(), Square().area())\n"
+            "for kind in (Shape, Half):\n"
+            "    try:\n"
+            "        kind()\n"
+            "    except TypeError:\n"
+            "        print(kind.__name__, sorted(kind.__abstractmethods__))\n"
+        )
+        self._run(
+            source,
+            b"square 4\nShape ['area', 'name']\nHalf ['name']\n",
+        )
+
+    def test_a_compiled_function_says_what_its_docstring_says(self):
+        """The doc slot carries the signature `inspect` reads, and then this.
+
+        CPython takes the signature off the front and what is left is
+        `__doc__`. Nothing was left, so `help()` said nothing about any
+        compiled function and `functools.wraps` copied a `__doc__` of None
+        onto every wrapper it made.
+        """
+
+        self._run(
+            "def one():\n"
+            "    'says one thing'\n"
+            "    return 1\n"
+            "class C:\n"
+            "    'class doc'\n"
+            "    def m(self):\n"
+            "        'method doc'\n"
+            "class D: pass\n"
+            "import inspect\n"
+            "print(one.__doc__, C.__doc__, C.m.__doc__, D.__doc__)\n"
+            "print(str(inspect.signature(one)))\n",
+            b"says one thing class doc method doc None\n()\n",
+        )
 
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
@@ -3543,6 +3612,132 @@ class CApiEmitTests(unittest.TestCase):
             entry.unlink()
             native = subprocess.run([str(binary)], capture_output=True, cwd=root)
             self.assertEqual(native.stdout, b"namespace True ns\n")
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_a_program_that_puts_its_own_source_on_sys_path(self):
+        """Everything under `src/` is how a great many programs are laid out.
+
+        The package is not beside the entry, so nothing found it and the
+        binary stopped at "No module named 'app'". The expression the program
+        uses to build the path is not worked out - the strings written in it
+        are read, and one is taken only when a directory of that name is
+        really there, which covers every spelling of the idiom at once.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src" / "app").mkdir(parents=True)
+            (root / "src" / "app" / "__init__.py").write_text(
+                "from .core import run\n", encoding="utf-8"
+            )
+            (root / "src" / "app" / "core.py").write_text(
+                "def run():\n    return 'from src layout'\n", encoding="utf-8"
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import os, sys\n"
+                "sys.path.insert(0, os.path.join(\n"
+                "    os.path.dirname(os.path.abspath(__file__)), 'src'))\n"
+                "import app\n"
+                "print(app.run(), app.__name__)\n",
+                encoding="utf-8",
+            )
+            generated, linked = python_program_to_capi_c(entry)
+            self.assertEqual(linked, ["app.core", "app"])
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            shutil.rmtree(root / "src")
+            entry.unlink()
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(native.stdout, b"from src layout app\n")
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_a_linked_module_keeps_the_shape_it_had_in_the_tree(self):
+        """`os.path.basename(os.path.dirname(__file__))` asks what package.
+
+        `__file__` points beside the binary, wherever that is now - but it
+        was flattened to the file's own name, so a module in a package
+        answered with the directory the binary happened to sit in.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "__init__.py").write_text(
+                "import os\n"
+                "def where():\n"
+                "    return os.path.basename(os.path.dirname(__file__))\n",
+                encoding="utf-8",
+            )
+            (root / "pkg" / "deep.py").write_text(
+                "import os\n"
+                "def where():\n"
+                "    return os.path.basename(__file__)\n",
+                encoding="utf-8",
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import pkg, pkg.deep\nprint(pkg.where(), pkg.deep.where())\n",
+                encoding="utf-8",
+            )
+            generated, _ = python_program_to_capi_c(entry)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            shutil.rmtree(root / "pkg")
+            entry.unlink()
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(native.stdout, b"pkg deep.py\n")
+            self.assertEqual(native.stdout, reference.stdout)
+
+    def test_the_entry_shows_its_globals_when_something_asks_for_main(self):
+        """`import __main__` in another module reads the entry's names off it.
+
+        The entry's globals live in C slots and only its classes and
+        functions were shown on the module object, so those reads found
+        nothing. A module that asks is what puts the entry's globals in its
+        dictionary; `__name__ == '__main__'` is not asking, and half the
+        files there are contain it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "back.py").write_text(
+                "def read():\n"
+                "    import __main__\n"
+                "    return getattr(__main__, 'VALUE', 'not yet')\n",
+                encoding="utf-8",
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import back\nVALUE = 'main value'\nprint(back.read())\n",
+                encoding="utf-8",
+            )
+            generated, _ = python_program_to_capi_c(entry)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(native.stdout, b"main value\n")
             self.assertEqual(native.stdout, reference.stdout)
 
     def test_a_relative_import_is_resolved_where_it_is_written(self):
@@ -6936,4 +7131,87 @@ class ComprehensionTargetTests(unittest.TestCase):
         # its own d, shadowing the dictionary being written to.
         python_to_capi_c(
             "d = {}\nk = 'a'\nprint([1 for d[k] in [9]], d)\n", "program.py"
+        )
+
+
+class SyntaxWarningTests(unittest.TestCase):
+    """The warnings CPython's compiler gives, given where compiling happens.
+
+    CPython raises these while compiling, which for a script is the moment
+    before it runs. Compiling happens earlier here and nobody was ever told,
+    so a program built with py2bin lost warnings that are almost always
+    pointing at a real mistake.
+    """
+
+    def _warnings(self, source: str) -> list[str]:
+        from py2bin.capi_emit import warn_as_python_would
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            warn_as_python_would(ast.parse(source), "program.py")
+        return [str(entry.message) for entry in caught]
+
+    def test_an_assertion_on_a_tuple_is_always_true(self):
+        self.assertEqual(
+            self._warnings("assert (1, 2)\n"),
+            ["assertion is always true, perhaps remove parentheses?"],
+        )
+        self.assertEqual(self._warnings("assert ()\n"), [])
+        self.assertEqual(self._warnings("assert 1 == 2\n"), [])
+
+    def test_a_jump_out_of_a_finally_block(self):
+        self.assertEqual(
+            self._warnings(
+                "def f():\n"
+                "    try:\n"
+                "        return 1\n"
+                "    finally:\n"
+                "        return 2\n"
+            ),
+            ["'return' in a 'finally' block"],
+        )
+        # A loop written in the clause is the `break`'s own, and fine.
+        self.assertEqual(
+            self._warnings(
+                "try:\n"
+                "    pass\n"
+                "finally:\n"
+                "    for _ in range(1):\n"
+                "        break\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            self._warnings(
+                "for _ in range(1):\n"
+                "    try:\n"
+                "        pass\n"
+                "    finally:\n"
+                "        break\n"
+            ),
+            ["'break' in a 'finally' block"],
+        )
+
+    def test_identity_against_a_literal(self):
+        self.assertEqual(
+            self._warnings("print(1 is 1)\n"),
+            ['"is" with \'int\' literal. Did you mean "=="?'],
+        )
+        self.assertEqual(
+            self._warnings("print('a' is not 'b')\n"),
+            ['"is not" with \'str\' literal. Did you mean "=="?'],
+        )
+        # `is None` and `is True` are how those two are meant to be written.
+        self.assertEqual(self._warnings("print(x is None, x is True)\n"), [])
+
+    def test_a_function_written_in_a_finally_is_its_own_block(self):
+        self.assertEqual(
+            self._warnings(
+                "try:\n"
+                "    pass\n"
+                "finally:\n"
+                "    def inner():\n"
+                "        return 1\n"
+            ),
+            [],
         )

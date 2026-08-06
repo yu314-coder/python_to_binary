@@ -13,17 +13,26 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.0 closes what a compiled function could not do.** Metaclasses, `enum`
-and `dataclasses`, generator and `async def` methods, async generators, async
-comprehensions, `locals()`, a real `globals()`, `eval` and `exec`, and
-`sys.exc_info()` inside an `except`. Two silent wrong answers went with them:
-a default argument was evaluated on every call rather than once at the `def`,
-so `def f(x=[])` did not share its list, and a closure could reach a
-module-level function where a parameter of the same name shadowed it. Found by
-compiling seventy language shapes and comparing each against CPython;
-sixty-seven now agree exactly and the three that do not are one fact - a
-compiled function is a `builtin_function_or_method`, not a Python function.
-See *Release notes* below.
+**0.9.0 closes what a compiled function could not do, and what a compiled
+*program* could not be.** Metaclasses, `enum` and `dataclasses`, generator and
+`async def` methods, async generators, `locals()`, a real `globals()`, `eval`
+and `exec`, `sys.exc_info()` inside an `except` - and now `abc.abstractmethod`
+and `functools.wraps`, the two decorators that write on the function they are
+given, which between them are how a great many programs begin and how nearly
+every decorator is written.
+
+A program is also more than a flat directory of files: packages, submodules,
+`from . import x`, PEP 420 directories, `importlib.import_module("pkg.thing")`
+and everything under `src/` are all compiled into the image now, where before
+only a `.py` sitting beside the entry was. Along with them, `f.__doc__`, a
+`finally` that keeps the exception it interrupted, the two ends of a
+generator's life, `athrow` on an async generator, and the `SyntaxWarning`s
+CPython's compiler gives.
+
+Found by compiling language shapes one at a time and comparing each against
+CPython - some four hundred of them across this release. What is left is one
+fact: a compiled function is a `builtin_function_or_method`, not a Python
+function. See *Release notes* below.
 
 ## Platforms
 
@@ -317,6 +326,13 @@ CPython, and requiring identical stdout and exit status.
 | decorators | ✅ |
 | `try` / `except` / `finally`, `with` | ✅ |
 | `import`, `from … import`, relative imports | ✅ |
+| packages, `pkg/sub/deeper.py`, `from . import x`, PEP 420 directories | ✅ |
+| `importlib.import_module("pkg.thing")` with the name written down | ✅ |
+| a program that puts its own `src/` on `sys.path` | ✅ |
+| `abc.abstractmethod`, `functools.wraps` - both write on a function | ✅ |
+| `f.__doc__` and a class's, so `help()` and `inspect.getdoc` answer | ✅ |
+| CPython's compile-time `SyntaxWarning`s, at compile time | ✅ |
+| `athrow` / `asend` / `aclose` on an async generator | ✅ |
 | `global` / `nonlocal`, tuple unpacking | ✅ |
 | the whole program: modules, packages and relative imports compiled in | ✅ |
 | `__name__`, `__file__`, `inspect.signature` on compiled functions | ✅ |
@@ -350,9 +366,18 @@ interpreted at run time.
 That covers `yield` as a statement or as a value, `send`, `yield from`,
 straight-line code, `if`/`else`, `while`, `for`, `break`, `continue` and a bare
 `return`. `next(g)` is `g.send(None)` here as it is in the protocol, and
-`yield from` is written as the loop it is before the body is cut - which
-forwards iteration but not a `send` into the sub-generator, so a `yield from`
-whose value is used is refused rather than quietly answering None.
+`yield from` is written out as PEP 380's own expansion before the body is cut
+- the whole of it, so a value sent in reaches the sub-iterator, its return
+value is the value of the expression, and what is thrown or closed at the
+delegating generator is passed on to it. That last part is what makes a
+cancelled `asyncio` task run its `finally`: while a generator is delegating
+it is not the one suspended, so closing it has to close the sub-iterator.
+
+The two ends of a generator's life are handled where they have no block of
+their own: `next` on one already exhausted raises `StopIteration` rather than
+going round the dispatch again, `throw` into one that has not started comes
+straight back out without running the body, closing one twice is quiet, and
+`send` before the first `yield` is refused as Python refuses it.
 
 A `try`/`except` around a `yield` works, and the way it works is worth saying,
 because "the handler has to survive the suspension" sounds like it needs
@@ -394,10 +419,10 @@ CPython prints a traceback - the frames, the source line, the `~~~^^^` caret -
 and a compiled program prints the final `ExceptionType: message` line only,
 because there are no Python frames to walk. In 77 of the 82 that last line is
 character-for-character CPython's; the other five are the "Did you mean"
-suggestion (three), a compile-time `SyntaxWarning` about `is` with a literal
-(one), and a `RecursionError` that says how much stack was used rather than
-naming the depth limit (one), which is the same exception reached by the real
-stack rather than a counter.
+suggestion (three), a `SyntaxWarning` about `is` with a literal that is now
+given at compile time instead (one), and a `RecursionError` that says how much
+stack was used rather than naming the depth limit (one), which is the same
+exception reached by the real stack rather than a counter.
 
 **That gap is closed by shipping the source, which is the thing this does not
 do.** Of the 82 tracebacks, 81 echo the line of source under the `File` line
@@ -802,11 +827,63 @@ answers `builtin_function_or_method`, `f.__annotations__` raises, and
 it is an interpreted call in front of every call, which is the two fastest
 rows on the grid.
 
+**Two decorators that write on functions, which used to be fatal.**
+`abc.abstractmethod(f)` does exactly one thing: it sets
+`f.__isabstractmethod__` and hands `f` back. `functools.wraps` does the same
+six times over. A compiled function has no `__dict__`, so both failed - and
+between them they are how a great many programs begin and how nearly every
+decorator is written; `class Shape(ABC)` stopped the whole program at import
+time. A function the source decorates with either is now handed over inside a
+small object that holds what they write and binds like a method afterwards.
+The mark travels with the value, which is what keeps a subclass overriding
+only half of an interface abstract. Only those two, by the name they are
+spelled: every other function stays the plain compiled one.
+
+**A compiled function had no docstring.** Its doc slot carries the signature
+`inspect` reads and nothing after it, so `help()` said nothing about anything
+and `wraps` copied a `__doc__` of None onto every wrapper. What the function
+says now follows the signature, which is where CPython reads `__doc__` from;
+classes and modules keep theirs too.
+
+**A program is more than a flat directory of files.** Modules were looked for
+in one place - a `.py` beside the entry - so `import helper` was compiled in
+and `import pkg` was not, and a program laid out the way most programs are
+failed at start-up. Now: `a.b` is `a/b.py` or `a/b/__init__.py`, taken in
+that order; a directory with no `__init__.py` is a package all the same (PEP
+420); `importlib.import_module("pkg.thing")` and `__import__("helper")` are
+followed wherever the name is written down; and everything under `src/` is
+reached the way programs reach it, by reading the strings in the
+`sys.path.insert` rather than working the expression out. Relative imports are
+resolved where they are written, and one that counts past the top of the
+program is refused in Python's own words. A linked module's `__file__` keeps
+the shape it had in the tree. Checked against CPython on twenty-eight
+laid-out programs.
+
+**Which exception is being handled belongs to the call, not the thread.** A
+`finally` now runs with the exception it interrupted on record, so what it
+raises is chained to it. A body whose `except` or `finally` raised something
+of its own used to leave its exception on record for good, so
+`sys.exc_info()` in the caller answered with it long afterwards; every call
+now gives the caller's back on the way out, and only bodies with a `try` or a
+`with` save anything, so an ordinary call pays nothing.
+
+**Smaller things, each found the same way.** `global x` in a class body binds
+the module's name. `super()` in a `def` written inside a method says
+"super(): no arguments", which is what Python says. A module that imports
+`__main__` can read the entry's globals off it. An async generator gained
+`athrow`. And the `SyntaxWarning`s CPython's compiler gives - `assert (a,
+b)`, `'return' in a 'finally' block`, `"is"` with a literal - are given here
+too, in CPython's words and at CPython's line, at the moment a compiled
+language gives them: build time.
+
 **Still structural**, and unlikely to change: a compiled function is a
 `builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and
-`sys._getframe()` do not answer as they would for a Python function.
+`sys._getframe()` do not answer as they would for a Python function, and a
+traceback names no source line because there is no source beside the binary
+to name.
 
-Corpus 886 of 889. Suite 1,749 tests.
+Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
+103 programs run against CPython on every push.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
