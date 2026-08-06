@@ -756,6 +756,12 @@ class CApiEmitter:
         #: Static slots holding what each module-level `def`'s defaults were
         #: evaluated to, as (base name, how many).
         self.default_stores: list[tuple[str, int]] = []
+        #: True when this module asks for its globals as a dictionary -
+        #: `globals()`, or an `eval`/`exec` that would read one. The names
+        #: then live in the module's own `__dict__` as well as in their C
+        #: slots, and are *read* from there, so a write through the
+        #: dictionary is seen by the program and the other way round.
+        self.globals_in_dict = False
         # Where each of those `def`s sits in the module body, and how far
         # through that body execution has got. A direct call is only correct
         # once the `def` has run: `print(later(3))` above `def later(...)` is
@@ -1971,20 +1977,13 @@ class CApiEmitter:
         """
 
         if node.func.id == "globals" or self.at_module_level:
-            spelled = node.func.id
-            if self.at_module_level and spelled != "globals":
-                # At module scope Python's `locals()` *is* `globals()`, so it
-                # is the same refusal for the same reason.
-                spelled = f"{spelled}() at module level"
-            else:
-                spelled = f"{spelled}()"
-            raise self.fail(
-                node,
-                f"{spelled} is not translated here: this module's globals are "
-                f"C variables rather than a dictionary, so what came back "
-                f"would be a copy, and writing to a copy would be lost. "
-                f"Inside a function, locals() and vars() do work",
-            )
+            # At module scope Python's `locals()` *is* `globals()`, and this
+            # is the module's own dictionary rather than a copy of it, so a
+            # write through what comes back changes the program's globals.
+            held = self.temporary()
+            self.emit("Py_IncRef(_py2bin_globals);", indent)
+            self.emit(f"{held} = _py2bin_globals;", indent)
+            return held
         assert self.current is not None
         target = self.temporary()
         self.emit(f"{target} = PyDict_New();", indent)
@@ -2021,6 +2020,19 @@ class CApiEmitter:
             if name not in ordered and name not in self.current.module_names:
                 ordered.append(name)
         return ordered
+
+    def borrowing_allowed(self, name: str) -> bool:
+        """Whether this name's slot may be read without taking a reference.
+
+        Not a global in dictionary mode: the slot is written but not read
+        there, so borrowing from it would hand back a value the dictionary
+        may since have replaced.
+        """
+
+        return not (
+            self.globals_in_dict
+            and self.reference(name) == f"g_{self.prefix}{name}"
+        )
 
     def bound_around(self, name: str) -> bool:
         """Whether the scope enclosing a closure binds this name itself.
@@ -2131,6 +2143,31 @@ class CApiEmitter:
 
     def name(self, node: ast.Name, indent: int) -> str:
         assert self.current is not None
+        held = self.reference(node.id)
+        if self.globals_in_dict and (
+            held is None or held == f"g_{self.prefix}{node.id}"
+        ):
+            # Read from the module's dictionary rather than from the C slot,
+            # so that `globals()['x'] = 1` and `del globals()['x']` are seen -
+            # which is the whole of what makes `globals()` real rather than a
+            # copy. The slot still holds the value and still owns it; it is
+            # simply not what anything reads.
+            fetched = self.temporary()
+            self.emit(
+                f"{fetched} = PyObject_GetItem(_py2bin_globals, "
+                f"{self.interned(node.id)});",
+                indent,
+            )
+            # A name the module never binds may still be a builtin, and one
+            # it binds at run time - `globals()['y'] = 9` - is in the
+            # dictionary and nowhere else, which is why the lookup is by name
+            # rather than by what the compiler knew.
+            self.emit(f"if (!{fetched}) {{", indent)
+            self.emit("PyErr_Clear();", indent + 1)
+            fallback = self.program_name(node.id, indent + 1)
+            self.emit(f"{fetched} = {fallback};", indent + 1)
+            self.emit("}", indent)
+            return fetched
         if self.is_unboxed(node.id):
             return self.read_unboxed(node, indent)
         if self.is_double(node.id):
@@ -3468,11 +3505,27 @@ class CApiEmitter:
             # failed at run time with "must be given globals and locals",
             # which is true and says nothing about what to do. Given them
             # both it works, and that is what to do.
-            raise self.fail(
+            # Given one argument these read the caller's frame. A compiled
+            # function has none, so the module's own globals are passed
+            # instead - which is what the frame of a module-level `eval` would
+            # have answered with anyway.
+            node = ast.copy_location(
+                ast.Call(
+                    func=node.func,
+                    args=[
+                        node.args[0],
+                        ast.copy_location(
+                            ast.Call(
+                                func=ast.Name(id="globals", ctx=ast.Load()),
+                                args=[],
+                                keywords=[],
+                            ),
+                            node,
+                        ),
+                    ],
+                    keywords=[],
+                ),
                 node,
-                f"{node.func.id}() with one argument reads the calling frame's "
-                f"globals and locals, and a compiled function has no frame - "
-                f"pass them: {node.func.id}(source, namespace, namespace)",
             )
         if isinstance(node.func, ast.Attribute):
             return self.method_call(node, indent)
@@ -4378,6 +4431,15 @@ class CApiEmitter:
         imports `__main__`.
         """
 
+        if self.globals_in_dict and slot.startswith("g_"):
+            # The module's dictionary is what a global is read from in this
+            # mode, so every binding has to reach it - this is the one place
+            # every global binding passes through.
+            self.emit(
+                f"if (PyObject_SetItem(_py2bin_globals, {self.interned(name)}, "
+                f"{slot}) < 0) {{ {self.failure()} }}",
+                indent,
+            )
         if not self.prefix or not slot.startswith("g_"):
             return
         key = self.prefix[:-1]
@@ -5363,6 +5425,22 @@ class CApiEmitter:
         def emit_clause(_held: str, _protection) -> None:
             self.emit(f"PyErr_SetHandledException({previous});", indent)
             self.emit(f"if ({previous}) Py_DecRef({previous});", indent)
+            if clause.name is not None:
+                # Python unbinds the name when the handler ends, however it
+                # ends - `except E as e` leaves no `e` behind, and reading one
+                # afterwards is a NameError. It stayed bound here, which
+                # nothing could see until `globals()` began answering with the
+                # real dictionary and listed a name the program had let go.
+                slot = self.declare(clause.name)
+                self.emit(
+                    f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent
+                )
+                if self.globals_in_dict and slot.startswith("g_"):
+                    self.emit(
+                        f"if (PyObject_DelItem(_py2bin_globals, "
+                        f"{self.interned(clause.name)}) < 0) PyErr_Clear();",
+                        indent,
+                    )
 
         self.protect(emit_body, emit_clause, indent)
 
@@ -7524,6 +7602,15 @@ class CApiEmitter:
             # because inlining and the narrowing analyses each step over a call
             # that has a keyword on it. Settled here, `f(a, step=1)` is an
             # ordinary call to everything downstream.
+            # Does this module ask for its globals as a dictionary? Only
+            # then do they live in one - a dictionary read per global costs
+            # more than a C slot, and almost no module asks.
+            self.globals_in_dict = any(
+                isinstance(inner, ast.Name)
+                and isinstance(inner.ctx, ast.Load)
+                and inner.id in ("globals", "eval", "exec")
+                for inner in ast.walk(tree)
+            )
             tree = place_keywords(tree)
             tree = inline_calls(tree)
             # Does the program ever read `sys.argv`? Only then is recovering
@@ -7871,6 +7958,8 @@ class CApiEmitter:
         # from the one main fills in, so a method that reached for a builtin
         # dereferenced whatever that slot happened to hold.
         out.append("static PyObject *_py2bin_builtins = 0;")
+        if self.globals_in_dict:
+            out.append("static PyObject *_py2bin_globals = 0;")
         if self.method_table:
             # Declared empty and filled at startup: the C front end does not
             # initialise a file-scope struct, and the address has to be stable
@@ -7917,13 +8006,30 @@ class CApiEmitter:
         out.append("int main(void) {")
         out.append("    Py_Initialize();")
         out.append('    _py2bin_builtins = PyImport_ImportModule("builtins");')
+        if self.globals_in_dict:
+            # The running module's own dictionary, not a new one: what
+            # `globals()` answers with has to *be* the program's globals.
+            out.append(
+                '    _py2bin_globals = PyObject_GetAttrString('
+                'PyImport_AddModule("__main__"), "__dict__");'
+            )
+            out.append(
+                "    if (!_py2bin_globals) { PyErr_Print(); exit(1); }"
+            )
         out.append(
             "    if (!_py2bin_builtins) { PyErr_Print(); exit(1); }"
         )
         # An embedded interpreter picks its own stdout encoding, and it is not
         # always UTF-8; a program that prints text outside ASCII would stop
         # with a UnicodeEncodeError that has nothing to do with the program.
-        setup = "import sys; sys.stdout.reconfigure(encoding='utf-8')"
+        # `del` on the end for the same reason the anchor below runs inside a
+        # function: this is py2bin's doing, not the program's, and `globals()`
+        # would otherwise list a `sys` nobody imported.
+        setup = (
+            "import sys\n"
+            "sys.stdout.reconfigure(encoding='utf-8')\n"
+            "del sys\n"
+        )
         out.append(f"    PyRun_SimpleString({_c_string(setup)});")
         # Where this binary is, right now, rather than where it was built. An
         # embedded interpreter resolves sys.executable to the host program, so
@@ -8007,6 +8113,19 @@ class CApiEmitter:
                 "if _found:\n"
                 "    sys.argv = _found\n"
             )
+        # Run inside a function, so that what it needs to do its job -
+        # `sys`, `os`, `builtins`, the couple of working names - does not stay
+        # bound in the program's own module. Nothing could see the difference
+        # until `globals()` started answering with the real dictionary, and
+        # then a program's own `globals()` listed three names it never wrote.
+        anchor = (
+            "def _py2bin_boot():\n"
+            + "".join(
+                f"    {line}\n" for line in anchor.splitlines()
+            )
+            + "_py2bin_boot()\n"
+            "del _py2bin_boot\n"
+        )
         out.append(f"    PyRun_SimpleString({_c_string(anchor)});")
         # Before the builtins, and before any body runs: an interned name
         # is what those lookups are about to be spelled with.

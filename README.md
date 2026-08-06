@@ -567,7 +567,7 @@ CPython, and requiring identical stdout and exit status.
 | `def m(self): yield`, and `async def` methods | ✅ |
 | `async def` that yields (an async generator), `async for` over one | ✅ |
 | `locals()` / `vars()` inside a function | ✅ |
-| `globals()`, and one-argument `eval` / `exec` | ❌ refused |
+| `globals()`, one-argument `eval` / `exec` | ✅ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
@@ -1116,7 +1116,10 @@ CPython it was not built against. The trade is deliberate; the cost is in the
 table above.
 
 **What is still refused is refused by name**, with a `file:line:col`, rather than
-approximated: `globals()` and a one-argument `eval` or `exec`. Each says what to do instead where there is something to do.
+approximated. What is left is `type(f).__name__`, `f.__annotations__` and
+`sys._getframe()`, and those are structural rather than unfinished: a
+compiled function is a `builtin_function_or_method`, which has no `__dict__`,
+takes no attributes, cannot be subclassed and makes no frame. Each says what to do instead where there is something to do.
 
 ## When it does not work
 
@@ -1494,10 +1497,29 @@ drives the machine, passes anything unmarked out to the loop, and returns the
 payload of the first marked value. `asend`, `athrow` and `aclose` are not
 there yet.
 
-**Refused rather than guessed at**, each with a `file:line:col`: `globals()`
-(the module's names are C variables, so what came back would be a copy, and a
-write to a copy would be lost) and a one-argument `eval` or `exec` (they read
-the caller's frame - the message names the two-argument form that works).
+**`globals()` is the module's own dictionary**, not a copy of one, so a write
+through it changes the program and a `del` through it unbinds. The names live
+in C slots for speed and a copy would take writes and drop them - so a module
+that asks for `globals()`, or for an `eval`/`exec` that would want one, keeps
+its names in the module's dictionary as well and *reads* them from there. Only
+the modules that ask pay for it; nothing else changes. One-argument `eval` and
+`exec` are given that dictionary, which is what the frame of a module-level
+`eval` would have held.
+
+Two things showed up the moment `globals()` started answering truthfully, both
+of them ours. py2bin's own start-up left `sys`, `os` and `builtins` bound in
+the program's module, so `globals()` listed three names the program never
+wrote; it now runs inside a function and cleans up after itself. And an
+`except E as e` left `e` bound after the handler, where Python unbinds it
+however the handler ends - reading it afterwards is a NameError now, as it is
+there.
+
+**Still structural**, with the reason rather than a shrug: `type(f).__name__`
+answers `builtin_function_or_method`, `f.__annotations__` raises, and
+`sys._getframe()` finds nothing. A compiled function is a `PyCFunction` - no
+`__dict__`, no attributes, not subclassable, no frame - and the only way round
+it is an interpreted call in front of every call, which is the two fastest
+rows on the grid.
 
 **Still structural**, and unlikely to change: a compiled function is a
 `builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and

@@ -1071,13 +1071,56 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, ['q']) ['z']\n",
         )
 
-    def test_globals_is_refused_rather_than_answered_wrongly(self):
-        # The module's names are C variables, so what could be handed back is
-        # a copy - and a write to a copy would be lost where the real thing
-        # changes the program. Better said at compile time.
-        with self.assertRaises(Exception) as caught:
-            python_to_capi_c("print('x' in globals())\n", "program.py")
-        self.assertIn("globals()", str(caught.exception))
+    def test_globals_is_the_modules_own_dictionary(self):
+        """Not a copy of it - a write through it changes the program.
+
+        The names live in C slots for speed, and a copy would take writes and
+        drop them. A module that asks for `globals()` (or an `eval`/`exec`
+        that would want one) keeps its names in the module's own dictionary as
+        well, and *reads* them from there, so the two cannot disagree. Only
+        the modules that ask pay for it.
+        """
+        self._run(
+            "x = 1\n"
+            "print('x' in globals(), globals()['x'])\n"
+            "globals()['y'] = 9\n"
+            "print(y)\n"
+            "x = 2\n"
+            "print(globals()['x'])\n"
+            "del globals()['y']\n"
+            "try:\n"
+            "    print(y)\n"
+            "except NameError as gone:\n"
+            "    print(gone)\n",
+            b"True 1\n9\n2\nname 'y' is not defined\n",
+        )
+
+    def test_eval_and_exec_are_given_the_modules_globals(self):
+        # With one argument they read the caller's frame, and a compiled
+        # function has none. The module's own globals are passed instead,
+        # which is what the frame of a module-level `eval` would have held.
+        self._run(
+            "x = 4\n"
+            "print(eval('x + 1'))\n"
+            "exec('z = x * 2')\n"
+            "print(z)\n",
+            b"5\n8\n",
+        )
+
+    def test_an_except_name_is_unbound_when_the_handler_ends(self):
+        # Python deletes it however the handler ends, and reading it
+        # afterwards is a NameError.
+        self._run(
+            "try:\n"
+            "    raise ValueError('v')\n"
+            "except ValueError as e:\n"
+            "    print('inside:', e)\n"
+            "try:\n"
+            "    print(e)\n"
+            "except NameError as n:\n"
+            "    print('after:', n)\n",
+            b"inside: v\nafter: name 'e' is not defined\n",
+        )
 
     def test_a_decorator_whose_parameter_is_named_for_what_it_wraps(self):
         """The commonest closure there is, and it recursed until the stack went.
@@ -4155,10 +4198,15 @@ class ProgramLocationTests(unittest.TestCase):
         # installation. It may still be the last resort, but it must not be
         # the only source.
         written = python_to_capi_c("print(1)\n", "program.py")
-        start = written.index("PyRun_SimpleString(\"import sys, os, builtins")
-        anchor = written[start : start + 900]
+        # The anchor runs inside a function so that what it imports does not
+        # stay bound in the program's own module, which is why the text is
+        # found by the `def` rather than by the import.
+        start = written.index("PyRun_SimpleString(\"def _py2bin_boot")
+        anchor = written[start : start + 1200]
         self.assertIn("proc/self/exe", anchor)
         self.assertIn("realpath", anchor)
+        # Nothing it needed is left behind for `globals()` to report.
+        self.assertIn("del _py2bin_boot", anchor)
 
     def test_a_compiled_program_finds_its_own_directory(self):
         # Not through `_run`: that compares the compiled output against
