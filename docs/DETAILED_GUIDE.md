@@ -554,6 +554,17 @@ compile time and the emitter only ever sees absolute names. One that counts
 out past the top of the program is refused in Python's own words: "attempted
 relative import beyond top-level package".
 
+Two more shapes count as modules. A directory with no `__init__.py` is a
+package all the same - PEP 420 - with no body of its own; it is compiled in
+because it is what its members hang off. And a module named only by a string,
+`importlib.import_module("pkg.thing")` or `__import__("helper")`, is compiled
+in whenever that string is written down in the source: it imports as surely as
+the statement does, and the interpreter would find a file for it that a
+compiled program does not have. A name computed at run time cannot be found
+this way and is not guessed at - a program that loads plugins by whatever
+string it is handed needs those modules beside the binary, which is what
+`freeze` is for.
+
 Each linked module gets a C name prefix, because two modules may each define a
 function or a global of the same name. Its body becomes a function of its own,
 and `main` creates the module object with `PyImport_AddModule` - which also

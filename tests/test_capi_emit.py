@@ -3474,6 +3474,77 @@ class CApiEmitTests(unittest.TestCase):
             )
             self.assertEqual(native.stdout, reference.stdout)
 
+    def test_a_module_named_only_by_a_string_is_still_found(self):
+        """`importlib.import_module("pkg.thing")` imports as surely as `import`.
+
+        The interpreter finds the file for it; a compiled program has none,
+        so a module reached only this way has to be compiled in - and it can
+        be, whenever the name is written down. A name computed at run time
+        cannot be, and is not guessed at.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "pkg" / "thing.py").write_text(
+                "v = 'named'\n", encoding="utf-8"
+            )
+            (root / "helper.py").write_text("w = 'h'\n", encoding="utf-8")
+            entry = root / "program.py"
+            entry.write_text(
+                "import importlib\n"
+                "print(importlib.import_module('pkg.thing').v)\n"
+                "print(__import__('helper').w)\n",
+                encoding="utf-8",
+            )
+            _, linked = python_program_to_capi_c(entry)
+            self.assertEqual(linked, ["helper", "pkg", "pkg.thing"])
+            entry.write_text(
+                "import importlib, sys\n"
+                "print(importlib.import_module(sys.argv[1] if False else 'x'))\n",
+                encoding="utf-8",
+            )
+            # Computed, so there is nothing to find and nothing is invented.
+            _, linked = python_program_to_capi_c(entry)
+            self.assertEqual(linked, [])
+
+    def test_a_directory_with_no_init_is_a_package_all_the_same(self):
+        """PEP 420: a namespace package has no body, and still has members.
+
+        It has to exist as a module because it is what its members hang off -
+        `from ns import thing` reads `thing` as an attribute of `ns`.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ns").mkdir()
+            (root / "ns" / "thing.py").write_text(
+                "v = 'namespace'\n", encoding="utf-8"
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "from ns import thing\nimport ns.thing\n"
+                "print(thing.v, ns.thing is thing, ns.__name__)\n",
+                encoding="utf-8",
+            )
+            generated, linked = python_program_to_capi_c(entry)
+            self.assertEqual(linked, ["ns", "ns.thing"])
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            shutil.rmtree(root / "ns")
+            entry.unlink()
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(native.stdout, b"namespace True ns\n")
+            self.assertEqual(native.stdout, reference.stdout)
+
     def test_a_relative_import_is_resolved_where_it_is_written(self):
         """`from . import x` has no meaning without a frame's `__package__`.
 

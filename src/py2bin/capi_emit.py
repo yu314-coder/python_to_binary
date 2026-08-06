@@ -9331,9 +9331,15 @@ def _module_file(root: Path, name: str) -> Path | None:
     plain = root.joinpath(*parts[:-1]) / f"{parts[-1]}.py"
     if plain.is_file():
         return plain
-    package = root.joinpath(*parts) / "__init__.py"
+    folder = root.joinpath(*parts)
+    package = folder / "__init__.py"
     if package.is_file():
         return package
+    if folder.is_dir():
+        # A directory with no `__init__.py` is a package all the same - PEP
+        # 420 - with no body of its own. It still has to exist as a module,
+        # because it is what its members hang off.
+        return folder
     return None
 
 
@@ -9345,7 +9351,7 @@ def _package_of(root: Path, name: str, path: Path) -> str:
     in the other.
     """
 
-    if path.name == "__init__.py":
+    if path.is_dir() or path.name == "__init__.py":
         return name
     return name.rpartition(".")[0]
 
@@ -9401,11 +9407,18 @@ def imported_names(path: Path, package: str = "") -> set[str]:
     """
 
     found: set[str] = set()
+    if path.is_dir():
+        # A namespace package: a directory and nothing in it that runs.
+        return found
     # Named, so a syntax error in the program says which file and not
     # "<unknown>", which is what `ast.parse` calls a source with no filename.
     for node in ast.walk(
         ast.parse(path.read_text(encoding="utf-8"), str(path))
     ):
+        if isinstance(node, ast.Call):
+            named = _named_import(node)
+            if named is not None:
+                found.add(named)
         if isinstance(node, ast.Import):
             for alias in node.names:
                 found.add(alias.name)
@@ -9419,6 +9432,35 @@ def imported_names(path: Path, package: str = "") -> set[str]:
                 if alias.name != "*":
                     found.add(f"{base}.{alias.name}" if base else alias.name)
     return found
+
+
+def _named_import(node: ast.Call) -> str | None:
+    """The module a call asks for by name, where the name is written down.
+
+    `importlib.import_module("pkg.thing")` imports as surely as `import
+    pkg.thing` does, and the interpreter finds the file for it. A compiled
+    program has no file to find, so a module reached only this way has to be
+    compiled in - and it can be, whenever the name is a literal.
+
+    A name computed at run time cannot be, and is not guessed at: a program
+    that loads plugins by whatever string it is handed needs those modules
+    beside the binary, and that is what `freeze` is for.
+    """
+
+    if not node.args or not isinstance(node.args[0], ast.Constant):
+        return None
+    wanted = node.args[0].value
+    if not isinstance(wanted, str) or not wanted:
+        return None
+    called = node.func
+    if isinstance(called, ast.Name) and called.id in (
+        "__import__",
+        "import_module",
+    ):
+        return wanted
+    if isinstance(called, ast.Attribute) and called.attr == "import_module":
+        return wanted
+    return None
 
 
 def resolved_import(node: ast.ImportFrom, package: str) -> str | None:
@@ -9479,6 +9521,11 @@ def python_program_to_capi_c(
     root = entry.parent
     trees = []
     for name, path in modules:
+        if path.is_dir():
+            # A namespace package has no body; it exists so that its members
+            # have something to hang off.
+            trees.append((name, ast.Module(body=[], type_ignores=[]), str(path)))
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         tree = _Absolute(_package_of(root, name, path)).visit(tree)
         ast.fix_missing_locations(tree)
