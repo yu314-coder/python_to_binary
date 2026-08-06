@@ -649,6 +649,18 @@ _PyLong_FromLongLong = _bind("PyLong_FromLongLong", _HANDLE, ctypes.c_longlong)
 _PyLong_AsLongLong = _bind("PyLong_AsLongLong", ctypes.c_longlong, _HANDLE)
 _PyUnicode_FromString = _bind("PyUnicode_FromString", _HANDLE, ctypes.c_char_p)
 _PyNumber_Add = _bind("PyNumber_Add", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceAdd = _bind("PyNumber_InPlaceAdd", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceSubtract = _bind("PyNumber_InPlaceSubtract", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceMultiply = _bind("PyNumber_InPlaceMultiply", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceTrueDivide = _bind("PyNumber_InPlaceTrueDivide", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceFloorDivide = _bind("PyNumber_InPlaceFloorDivide", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceRemainder = _bind("PyNumber_InPlaceRemainder", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlacePower = _bind("PyNumber_InPlacePower", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceLshift = _bind("PyNumber_InPlaceLshift", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceRshift = _bind("PyNumber_InPlaceRshift", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceAnd = _bind("PyNumber_InPlaceAnd", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceOr = _bind("PyNumber_InPlaceOr", _HANDLE, _HANDLE, _HANDLE)
+_PyNumber_InPlaceXor = _bind("PyNumber_InPlaceXor", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_Subtract = _bind("PyNumber_Subtract", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_Multiply = _bind("PyNumber_Multiply", _HANDLE, _HANDLE, _HANDLE)
 _PyNumber_TrueDivide = _bind("PyNumber_TrueDivide", _HANDLE, _HANDLE, _HANDLE)
@@ -794,6 +806,66 @@ def PyUnicode_FromString(text: bytes | str) -> int:
 
 def PyNumber_Add(left: int, right: int) -> int:
     return _handle(_PyNumber_Add(left, right))
+
+
+def PyNumber_InPlaceAdd(left: int, right: int) -> int:
+    """`left += right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceAdd(left, right))
+
+
+def PyNumber_InPlaceSubtract(left: int, right: int) -> int:
+    """`left -= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceSubtract(left, right))
+
+
+def PyNumber_InPlaceMultiply(left: int, right: int) -> int:
+    """`left *= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceMultiply(left, right))
+
+
+def PyNumber_InPlaceTrueDivide(left: int, right: int) -> int:
+    """`left /= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceTrueDivide(left, right))
+
+
+def PyNumber_InPlaceFloorDivide(left: int, right: int) -> int:
+    """`left //= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceFloorDivide(left, right))
+
+
+def PyNumber_InPlaceRemainder(left: int, right: int) -> int:
+    """`left %= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceRemainder(left, right))
+
+
+def PyNumber_InPlacePower(left: int, right: int) -> int:
+    """`left **= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlacePower(left, right))
+
+
+def PyNumber_InPlaceLshift(left: int, right: int) -> int:
+    """`left <<= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceLshift(left, right))
+
+
+def PyNumber_InPlaceRshift(left: int, right: int) -> int:
+    """`left >>= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceRshift(left, right))
+
+
+def PyNumber_InPlaceAnd(left: int, right: int) -> int:
+    """`left &= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceAnd(left, right))
+
+
+def PyNumber_InPlaceOr(left: int, right: int) -> int:
+    """`left |= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceOr(left, right))
+
+
+def PyNumber_InPlaceXor(left: int, right: int) -> int:
+    """`left ^= right`, which may change `left` rather than answer anew."""
+    return _handle(_PyNumber_InPlaceXor(left, right))
 
 
 def PyNumber_Subtract(left: int, right: int) -> int:

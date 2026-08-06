@@ -56,6 +56,21 @@ VETTED = [
     # What `sys.exc_info()` reads inside an `except`, and what a new
     # exception raised there takes its `__context__` from.
     "PyErr_GetHandledException", "PyErr_SetHandledException",
+    # `x += y` is not `x = x + y`: a list extends itself and every
+    # other name for it sees that, where rebuilding it leaves them
+    # holding the old one.
+    "PyNumber_InPlaceAdd",
+    "PyNumber_InPlaceSubtract",
+    "PyNumber_InPlaceMultiply",
+    "PyNumber_InPlaceTrueDivide",
+    "PyNumber_InPlaceFloorDivide",
+    "PyNumber_InPlaceRemainder",
+    "PyNumber_InPlacePower",
+    "PyNumber_InPlaceLshift",
+    "PyNumber_InPlaceRshift",
+    "PyNumber_InPlaceAnd",
+    "PyNumber_InPlaceOr",
+    "PyNumber_InPlaceXor",
     # The interned-name forms. `...String` builds a fresh str from the
     # char* on every call and hashes it; these take a str built once,
     # which is what makes an attribute in a loop cost a lookup rather

@@ -694,6 +694,89 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_augmented_assignment_lets_the_object_answer(self):
+        """`x += y` is not `x = x + y`.
+
+        A list extends itself and every other name for it sees that;
+        rebuilding it leaves them holding the old one. `xs += [2]` gave `xs`
+        the new list and left an alias on the first, where Python has both -
+        a wrong answer in code as ordinary as it gets. A class with
+        `__iadd__` never had it called at all.
+        """
+        self._run(
+            "xs = [1]\n"
+            "alias = xs\n"
+            "xs += [2]\n"
+            "print(xs, alias, xs is alias)\n"
+            "class A:\n"
+            "    def __init__(self):\n"
+            "        self.v = 0\n"
+            "    def __iadd__(self, o):\n"
+            "        self.v += o\n"
+            "        return self\n"
+            "a = A()\n"
+            "a += 3\n"
+            "print(a.v)\n",
+            b"[1, 2] [1, 2] True\n3\n",
+        )
+
+    def test_augmented_assignment_to_a_place_does_too(self):
+        # `d['k'] += [2]` and `b.v += [2]` read, combine and write back - and
+        # what they read may be a list, which has to extend rather than be
+        # replaced.
+        self._run(
+            "d = {'k': [1]}\n"
+            "held = d['k']\n"
+            "d['k'] += [2]\n"
+            "class Box:\n"
+            "    def __init__(self):\n"
+            "        self.v = [1]\n"
+            "b = Box()\n"
+            "kept = b.v\n"
+            "b.v += [2]\n"
+            "n = 5\n"
+            "n += 2\n"
+            "n *= 3\n"
+            "print(d['k'] is held, b.v is kept, n)\n",
+            b"True True 21\n",
+        )
+
+    def test_a_property_setter_sees_the_property(self):
+        """`@v.setter` reads the `v` the class body just bound.
+
+        A decorator runs as the class is built, so it sees what the body has
+        bound so far - and `v` is in the namespace being built, nowhere else.
+        It was looked for in the enclosing scope and reported undefined, so
+        every property with a setter failed to compile.
+        """
+        self._run(
+            "class A:\n"
+            "    def __init__(self):\n"
+            "        self._v = 1\n"
+            "    @property\n"
+            "    def v(self):\n"
+            "        return self._v\n"
+            "    @v.setter\n"
+            "    def v(self, x):\n"
+            "        self._v = x * 2\n"
+            "a = A()\n"
+            "print(a.v)\n"
+            "a.v = 5\n"
+            "print(a.v)\n",
+            b"1\n10\n",
+        )
+
+    def test_ellipsis_is_a_constant_like_any_other(self):
+        # `...` is how a stub body is written, so refusing it refused every
+        # `def f(self): ...` - most of a Protocol or an abstract method.
+        self._run(
+            "def stub(): ...\n"
+            "class P:\n"
+            "    def f(self): ...\n"
+            "print(stub(), P().f(), ... is Ellipsis, type(...).__name__)\n",
+            b"None None True ellipsis\n",
+        )
+
     def test_an_async_generator_works(self):
         """`async def` with a `yield` in it - refused until now.
 

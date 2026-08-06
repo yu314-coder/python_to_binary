@@ -374,6 +374,18 @@ extern PyObject *PyLong_FromLongLong(long long value);
 extern long long PyLong_AsLongLong(PyObject *value);
 extern PyObject *PyUnicode_FromString(const char *text);
 extern PyObject *PyNumber_Add(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceAdd(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceSubtract(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceMultiply(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceTrueDivide(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceFloorDivide(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceRemainder(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlacePower(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceLshift(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceRshift(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceAnd(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceOr(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_InPlaceXor(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_Subtract(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_Multiply(PyObject *left, PyObject *right);
 extern PyObject *PyNumber_TrueDivide(PyObject *left, PyObject *right);
@@ -476,6 +488,23 @@ _COMPARISONS = {
     ast.NotEq: 3,
     ast.Gt: 4,
     ast.GtE: 5,
+}
+
+#: The in-place form of each operator, for `x += y` and its relatives. The
+#: object gets to answer for itself: a list extends, a number rebuilds.
+_IN_PLACE = {
+    ast.Add: "PyNumber_InPlaceAdd",
+    ast.Sub: "PyNumber_InPlaceSubtract",
+    ast.Mult: "PyNumber_InPlaceMultiply",
+    ast.Div: "PyNumber_InPlaceTrueDivide",
+    ast.FloorDiv: "PyNumber_InPlaceFloorDivide",
+    ast.Mod: "PyNumber_InPlaceRemainder",
+    ast.Pow: "PyNumber_InPlacePower",
+    ast.LShift: "PyNumber_InPlaceLshift",
+    ast.RShift: "PyNumber_InPlaceRshift",
+    ast.BitAnd: "PyNumber_InPlaceAnd",
+    ast.BitOr: "PyNumber_InPlaceOr",
+    ast.BitXor: "PyNumber_InPlaceXor",
 }
 
 _BINARY = {
@@ -762,6 +791,13 @@ class CApiEmitter:
         #: slots, and are *read* from there, so a write through the
         #: dictionary is seen by the program and the other way round.
         self.globals_in_dict = False
+        #: While a class body is being written, the namespace it is going
+        #: into and the keys already in it. A decorator and an attribute's
+        #: value are evaluated *in* the class body, so they can see what the
+        #: body has bound so far - which is what `@v.setter` is reading.
+        #: A method body sees none of it, so this is only set around the
+        #: pieces that run as the class is built.
+        self.class_scope: list[tuple[str, set[str]]] = []
         # Where each of those `def`s sits in the module body, and how far
         # through that body execution has got. A direct call is only correct
         # once the `def` has run: `print(later(3))` above `def later(...)` is
@@ -1911,6 +1947,11 @@ class CApiEmitter:
                 indent,
             )
             return self.checked(target, indent)
+        if node.value is Ellipsis:
+            # `...` is a singleton like None and True, and it is how a stub
+            # body is written - `def f(self): ...` is most of an abstract
+            # method or a Protocol, so refusing it refused those whole shapes.
+            return self.builtin("Ellipsis", indent)
         raise self.fail(node, f"a {type(node.value).__name__} constant is not translated here yet")
 
     def reference(self, name: str) -> str | None:
@@ -2143,6 +2184,19 @@ class CApiEmitter:
 
     def name(self, node: ast.Name, indent: int) -> str:
         assert self.current is not None
+        if self.class_scope and node.id in self.class_scope[-1][1]:
+            # A name the class body has already bound. `@property` puts `v`
+            # in the namespace, and the `@v.setter` under it reads that same
+            # `v` - from the class body, where nothing else can see it. It was
+            # looked for in the enclosing scope and reported as undefined.
+            namespace = self.class_scope[-1][0]
+            fetched = self.temporary()
+            self.emit(
+                f"{fetched} = PyObject_GetItem({namespace}, "
+                f"{self.interned(node.id)});",
+                indent,
+            )
+            return self.checked(fetched, indent)
         held = self.reference(node.id)
         if self.globals_in_dict and (
             held is None or held == f"g_{self.prefix}{node.id}"
@@ -5549,7 +5603,9 @@ class CApiEmitter:
         )
         if self.narrow_assign(node.target.id, rewritten, indent):
             return
-        value = self.expression(rewritten, indent)
+        value = self.in_place(node, indent)
+        if value is None:
+            value = self.expression(rewritten, indent)
         if self.is_unboxed(node.target.id):
             self.store_object(node.target.id, value, indent)
             return
@@ -5561,6 +5617,36 @@ class CApiEmitter:
         self.emit(f"{target} = {value};", indent)
         self.publish(node.target.id, target, indent)
 
+    def in_place(self, node: ast.AugAssign, indent: int) -> str | None:
+        """`x += y` through the operator that lets `x` answer for itself.
+
+        `x += y` is not `x = x + y`. A list extends itself and every other
+        name for it sees that; rebuilding it leaves them holding the old one,
+        which is what happened here - `xs += [2]` gave `xs` the new list and
+        left an alias on the first, where Python has both. A class with
+        `__iadd__` never had it called at all.
+
+        Answers None for an operator with no in-place form here, and the
+        caller falls back to building the value.
+        """
+
+        operator = _IN_PLACE.get(type(node.op))
+        if operator is None:
+            return None
+        assert isinstance(node.target, ast.Name)
+        held = self.expression(
+            ast.copy_location(
+                ast.Name(id=node.target.id, ctx=ast.Load()), node
+            ),
+            indent,
+        )
+        right = self.expression(node.value, indent)
+        target = self.temporary()
+        self.emit(f"{target} = {operator}({held}, {right});", indent)
+        self.emit(f"Py_DecRef({held});", indent)
+        self.emit(f"Py_DecRef({right});", indent)
+        return self.checked(target, indent)
+
     def augmented_place(self, node: ast.AugAssign, indent: int) -> None:
         """`xs[k] += v` and `a.b += v` - read, combine, write back.
 
@@ -5569,7 +5655,12 @@ class CApiEmitter:
         Python does not.
         """
 
-        function = _BINARY.get(type(node.op))
+        # The in-place form for the same reason a plain name gets one: what
+        # is read out of the container may be a list, and `xs['k'] += [2]`
+        # has to extend it rather than put a different list back. The write
+        # below still happens - Python does it too, and it is what makes the
+        # difference for something that answers with a *new* object.
+        function = _IN_PLACE.get(type(node.op)) or _BINARY.get(type(node.op))
         if function is None:
             raise self.fail(
                 node, f"{type(node.op).__name__} is not translated here yet"
@@ -6478,6 +6569,10 @@ class CApiEmitter:
         self.scope_path.append((node.name, False))
         namespace = self.class_namespace(node, maker, title, bases, indent)
         binder = None
+        # What the body has bound so far. A decorator and an attribute's value
+        # run as the class is built and can see it; a method body cannot, and
+        # is written with this off.
+        known: set[str] = set()
         for statement in node.body:
             if isinstance(statement, ast.Pass):
                 continue
@@ -6498,6 +6593,7 @@ class CApiEmitter:
                 finally:
                     self.methods_of.pop()
                 if statement.decorator_list:
+                    self.class_scope.append((namespace, known))
                     # The decorator is handed the plain callable, not the
                     # bound wrapper. `staticmethod`, `classmethod` and
                     # `property` are descriptors that do their own binding,
@@ -6505,9 +6601,12 @@ class CApiEmitter:
                     # function - which binds by itself and passes the instance
                     # as the first argument, which is where a compiled method
                     # reads it from anyway.
-                    value = self.apply_decorators(
-                        statement.decorator_list, body, indent
-                    )
+                    try:
+                        value = self.apply_decorators(
+                            statement.decorator_list, body, indent
+                        )
+                    finally:
+                        self.class_scope.pop()
                 else:
                     value = self.temporary()
                     self.emit(f"{value} = PyInstanceMethod_New({body});", indent)
@@ -6517,7 +6616,11 @@ class CApiEmitter:
             elif isinstance(statement, ast.Assign) and len(
                 statement.targets
             ) == 1 and isinstance(statement.targets[0], ast.Name):
-                value = self.expression(statement.value, indent)
+                self.class_scope.append((namespace, known))
+                try:
+                    value = self.expression(statement.value, indent)
+                finally:
+                    self.class_scope.pop()
                 key = statement.targets[0].id
             elif (
                 isinstance(statement, ast.AnnAssign)
@@ -6534,7 +6637,11 @@ class CApiEmitter:
                 )
                 if statement.value is None:
                     continue
-                value = self.expression(statement.value, indent)
+                self.class_scope.append((namespace, known))
+                try:
+                    value = self.expression(statement.value, indent)
+                finally:
+                    self.class_scope.pop()
                 key = statement.target.id
             else:
                 raise self.fail(
@@ -6542,6 +6649,7 @@ class CApiEmitter:
                     "only methods and plain attribute assignments are "
                     "translated in a class body yet",
                 )
+            known.add(key)
             named = self.interned(key)
             # Through the mapping protocol: `__prepare__` may have answered
             # with something that is not a dict, and `enum` does exactly that

@@ -568,6 +568,11 @@ CPython, and requiring identical stdout and exit status.
 | `async def` that yields (an async generator), `async for` over one | ✅ |
 | `locals()` / `vars()` inside a function | ✅ |
 | `globals()`, one-argument `eval` / `exec` | ✅ |
+| `x += y` through `__iadd__`, in place | ✅ |
+| `@property` with a `@v.setter` | ✅ |
+| `...` as a stub body | ✅ |
+| `gen.throw` / `gen.close`, `asend` / `aclose` | ❌ |
+| a class inside a class body, `except*`, `__init_subclass__` kwargs | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
@@ -701,7 +706,7 @@ in almost every one of them.
 
 ### The interpreter surface it may use
 
-- A fixed table of 86 exported CPython entry points:
+- A fixed table of 98 exported CPython entry points:
   `PyBytes_FromStringAndSize`, `PyCFunction_New`, `PyDict_New`,
   `PyDict_SetItem`, `PyErr_Clear`, `PyErr_ExceptionMatches`,
   `PyErr_GetHandledException`, `PyErr_GetRaisedException`, `PyErr_Occurred`,
@@ -711,7 +716,12 @@ in almost every one of them.
   `PyImport_ImportModule`, `PyInstanceMethod_New`, `PyIter_Next`,
   `PyList_Append`, `PyList_New`, `PyList_SetItem`, `PyLong_AsLongLong`,
   `PyLong_FromLongLong`, `PyLong_FromString`, `PyNumber_Add`, `PyNumber_And`,
-  `PyNumber_FloorDivide`, `PyNumber_Invert`, `PyNumber_Lshift`,
+  `PyNumber_FloorDivide`, `PyNumber_InPlaceAdd`, `PyNumber_InPlaceAnd`,
+  `PyNumber_InPlaceFloorDivide`, `PyNumber_InPlaceLshift`,
+  `PyNumber_InPlaceMultiply`, `PyNumber_InPlaceOr`, `PyNumber_InPlacePower`,
+  `PyNumber_InPlaceRemainder`, `PyNumber_InPlaceRshift`,
+  `PyNumber_InPlaceSubtract`, `PyNumber_InPlaceTrueDivide`,
+  `PyNumber_InPlaceXor`, `PyNumber_Invert`, `PyNumber_Lshift`,
   `PyNumber_Multiply`, `PyNumber_Negative`, `PyNumber_Or`,
   `PyNumber_Positive`, `PyNumber_Power`, `PyNumber_Remainder`,
   `PyNumber_Rshift`, `PyNumber_Subtract`, `PyNumber_TrueDivide`,
