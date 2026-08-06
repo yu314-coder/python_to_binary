@@ -807,6 +807,31 @@ class CApiEmitTests(unittest.TestCase):
             b"new set ('item', <class 'int'>)\n",
         )
 
+    def test_a_spread_import_binds_what_the_module_offers(self):
+        """`from m import *` was refused, and the reason it can work now is
+        that a module's globals can live in the module's own dictionary.
+
+        Which names a spread binds is the other module's business and is not
+        known until it has been imported - its `__all__` if it has one, and
+        otherwise everything public. There is no set of C slots to put them
+        in, so a module that writes one keeps its globals in the dictionary,
+        which it already does for `globals()`.
+        """
+        self._run(
+            "from math import *\n"
+            "from os.path import *\n"
+            "print(int(sqrt(16)), int(pi), basename('/a/b.txt'), join('a', 'b'))\n",
+            b"4 3 b.txt a/b\n",
+        )
+
+    def test_a_spread_import_is_refused_where_python_refuses_it(self):
+        # Python allows one only at module level, and says so when compiling.
+        with self.assertRaises(Exception) as caught:
+            python_to_capi_c(
+                "def f():\n    from math import *\n", "program.py"
+            )
+        self.assertIn("import * only allowed at module level", str(caught.exception))
+
     def test_every_augmented_operator_works(self):
         """`n **= 2` was a segfault.
 

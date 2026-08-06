@@ -584,7 +584,8 @@ CPython, and requiring identical stdout and exit status.
 | `x @ y` and `x @= y`, and every augmented operator | ✅ |
 | `xs[1:3] = ys`, `del xs[a:b]`, extended slices | ✅ |
 | a module's own `__doc__` | ✅ |
-| `dir()` with no argument, `from x import *` | ❌ refused |
+| `from x import *` at module level | ✅ |
+| `dir()` with no argument | ❌ refused |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |

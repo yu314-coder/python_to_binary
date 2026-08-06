@@ -82,6 +82,20 @@ _COMPARISON_CODES = {
 
 #: Names that can read a local without naming it. If a function calls any of
 #: these, every local it has may be looked at, so none of them is unread.
+#: What `from m import *` binds, worked out where the strings are easy.
+_SPREAD_HELPER = """
+def _py2bin_spread(_py2bin_module):
+    _py2bin_into = globals()
+    _py2bin_names = getattr(_py2bin_module, "__all__", None)
+    if _py2bin_names is None:
+        _py2bin_names = []
+        for _py2bin_n in dir(_py2bin_module):
+            if not _py2bin_n.startswith("_"):
+                _py2bin_names.append(_py2bin_n)
+    for _py2bin_n in _py2bin_names:
+        _py2bin_into[_py2bin_n] = getattr(_py2bin_module, _py2bin_n)
+"""
+
 #: The one slot every unread local is written to.
 _UNREAD = "v__unread"
 
@@ -3831,6 +3845,21 @@ class CApiEmitter:
                     ),
                     indent,
                 )
+            elif self.globals_in_dict:
+                # The module keeps its globals in the module's dictionary, so
+                # a name this compiler never saw bound may still be there -
+                # `from m import *` puts them there at run time. Reading it
+                # as a name looks in the dictionary first and falls back to
+                # the builtins, where reaching for the builtins directly
+                # skipped everything a spread had bound and answered with a
+                # NameError for `sqrt`.
+                callable_value = self.name(
+                    ast.copy_location(
+                        ast.Name(id=node.func.id, ctx=ast.Load()), node
+                    ),
+                    indent,
+                )
+                callable_owned = True
             else:
                 # Not one of ours, so ask the interpreter for it.
                 callable_value = self.program_name(node.func.id, indent)
@@ -4499,6 +4528,42 @@ class CApiEmitter:
         base = ".".join(parts[: len(parts) - (node.level - 1)])
         return f"{base}.{node.module}" if node.module else base
 
+    def spread_module(self, module: str, indent: int) -> None:
+        """`from m import *` - every public name of `m`, bound here.
+
+        Which names those are is `m`'s business and is not known until it has
+        been imported: its `__all__` if it has one, and otherwise everything
+        it holds that does not begin with an underscore. So there is no set
+        of C slots to put them in, and a module that writes one keeps its
+        globals in the module's own dictionary instead - which it has to do
+        anyway for `globals()`, and which is what makes this a few lines
+        rather than a new mechanism.
+
+        The work is done by a function written in Python and compiled with
+        the program. It reaches the dictionary through `globals()`, which
+        answers with the very one this module's names live in.
+        """
+
+        self.needs_spread = True
+        maker = self.temporary()
+        self.emit(
+            f"{maker} = PyObject_GetItem(_py2bin_globals, "
+            f"{self.interned('_py2bin_spread')});",
+            indent,
+        )
+        self.checked(maker, indent)
+        held = self.temporary()
+        self.emit(f"{held} = PyTuple_New(1LL);", indent)
+        self.checked(held, indent)
+        self.emit(f"Py_IncRef({module});", indent)
+        self.emit(f"PyTuple_SetItem({held}, 0, {module});", indent)
+        answer = self.temporary()
+        self.emit(f"{answer} = PyObject_Call({maker}, {held}, 0);", indent)
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.emit(f"Py_DecRef({held});", indent)
+        self.checked(answer, indent)
+        self.emit(f"Py_DecRef({answer});", indent)
+
     def import_names(self, node: ast.ImportFrom, indent: int) -> None:
         """`from x import a, b` - import the module, then read the names off it.
 
@@ -4515,7 +4580,14 @@ class CApiEmitter:
         self.checked(module, indent)
         for alias in node.names:
             if alias.name == "*":
-                raise self.fail(node, "`import *` is not translated here yet")
+                if not self.at_module_level:
+                    # Python refuses one anywhere else, and says so at compile
+                    # time: there is nowhere for the names to go.
+                    raise self.fail(
+                        node, "import * only allowed at module level"
+                    )
+                self.spread_module(module, indent)
+                continue
             target = self.declare(alias.asname or alias.name)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(
@@ -8238,14 +8310,33 @@ class CApiEmitter:
             # then do they live in one - a dictionary read per global costs
             # more than a C slot, and almost no module asks.
             self.globals_in_dict = any(
-                isinstance(inner, ast.Name)
-                and isinstance(inner.ctx, ast.Load)
-                and inner.id in ("globals", "eval", "exec")
+                (
+                    isinstance(inner, ast.Name)
+                    and isinstance(inner.ctx, ast.Load)
+                    and inner.id in ("globals", "eval", "exec")
+                )
+                or (
+                    # `from m import *` binds names nobody wrote down, so
+                    # there is no set of C slots to put them in - they go in
+                    # the module's dictionary, which means every global in
+                    # this module does.
+                    isinstance(inner, ast.ImportFrom)
+                    and any(alias.name == "*" for alias in inner.names)
+                )
                 for inner in ast.walk(tree)
             )
             # Before everything: `except*` becomes ordinary `try`/`except`
             # calling four small functions, so nothing below this ever sees
             # a TryStar.
+            if any(
+                isinstance(inner, ast.ImportFrom)
+                and any(alias.name == "*" for alias in inner.names)
+                for inner in ast.walk(tree)
+            ):
+                # The function that works out what a spread binds, compiled
+                # with the program because the question is about strings.
+                tree.body = ast.parse(_SPREAD_HELPER).body + tree.body
+                ast.fix_missing_locations(tree)
             try:
                 tree = expand_except_star(tree)
             except ExceptStarError as error:
