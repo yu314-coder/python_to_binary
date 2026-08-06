@@ -6425,6 +6425,26 @@ class CApiEmitter:
             sorted(name for name in read - bound if self.bound_around(name))
         )
         self.refuse_late_binding(node, captures)
+        for scope in self.shadowed:
+            caught = [name for name in captures if name in scope]
+            if caught:
+                # A comprehension binds its target once and rebinds it each
+                # turn, so a closure made inside one shares that binding and
+                # every closure sees the last value - `[lambda: i for i in
+                # range(3)]` is `[2, 2, 2]`. Captures here are taken by value
+                # when the closure is made, which would answer `[0, 1, 2]`.
+                # Refused rather than answered differently; `lambda i=i: i`
+                # says the other thing and compiles.
+                raise self.fail(
+                    node,
+                    f"this closure captures {', '.join(sorted(caught))} from "
+                    f"the comprehension around it, which rebinds it on every "
+                    f"turn - captures are taken by value here, so every "
+                    f"closure would see a different value where Python gives "
+                    f"them all the last one. Write it as a default "
+                    f"(`lambda {sorted(caught)[0]}={sorted(caught)[0]}: ...`) "
+                    f"to say the by-value thing",
+                )
         # A name the body reads that this scope has no slot for *yet*, but
         # binds further down: mutual recursion between two nested functions is
         # the shape that reaches here. Captures are taken by value when the
@@ -7596,6 +7616,15 @@ class CApiEmitter:
             self.handlers,
             self.scope,
         )
+        # The comprehension scopes around the `def` are not this function's.
+        # A comprehension gives its target a slot of its own and records that
+        # here; a nested function that happens to use the same name has its
+        # own parameter, and `reference` looks in these before it looks at
+        # parameters - so `[lambda i=i: i for i in xs]` compiled a lambda
+        # whose body read the comprehension's slot rather than its own `i`,
+        # naming a C variable that does not exist in it. Put back below.
+        outer_shadowed = self.shadowed
+        self.shadowed = []
         self.current, self.handlers = function, []
         self.scope = node.body if isinstance(node.body, list) else []
         # A closure is not inside the region that encloses its definition. Its
@@ -7658,6 +7687,7 @@ class CApiEmitter:
             # scope's handler stack replaced turned the refusal into an
             # IndexError from an unrelated `try`, which said nothing about
             # what the program actually did.
+            self.shadowed = outer_shadowed
             self.current, self.handlers, self.scope = (
                 outer,
                 outer_handlers,

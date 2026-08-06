@@ -694,6 +694,38 @@ class CApiEmitTests(unittest.TestCase):
             b"(1, 2) ['b', 'a']\n",
         )
 
+    def test_a_closure_in_a_comprehension_has_its_own_parameters(self):
+        """`[lambda i=i: i for i in xs]` did not compile at all.
+
+        A comprehension gives its target a slot of its own and records that,
+        and name resolution looked there before it looked at the function's
+        own parameters - so the lambda's body read the comprehension's slot
+        rather than its `i`, naming a C variable that does not exist inside
+        it. A nested function does not see the comprehension around it; only
+        its captures cross, and those are resolved where the closure is made.
+        """
+        self._run(
+            "fs = [lambda i=i: i for i in range(3)]\n"
+            "pairs = {k: (lambda k=k: k * 2) for k in (1, 2)}\n"
+            "print([f() for f in fs], {k: f() for k, f in pairs.items()})\n",
+            b"[0, 1, 2] {1: 2, 2: 4}\n",
+        )
+
+    def test_capturing_a_comprehension_target_is_refused(self):
+        """The wrong answer that fix uncovered, refused rather than given.
+
+        A comprehension rebinds its target every turn and a closure made
+        inside one shares that binding, so Python gives every closure the
+        last value. Captures are taken by value here, which would answer with
+        a different value each - so it is refused, and the message names the
+        `lambda i=i:` spelling that says the by-value thing on purpose.
+        """
+        with self.assertRaises(Exception) as caught:
+            python_to_capi_c(
+                "fs = [lambda: i for i in range(3)]\nprint(fs)\n", "program.py"
+            )
+        self.assertIn("comprehension around it", str(caught.exception))
+
     def test_a_generator_can_be_thrown_into_and_closed(self):
         """`throw` raises *at the suspension point*, which is a block here.
 

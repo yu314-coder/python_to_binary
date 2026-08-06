@@ -573,6 +573,8 @@ CPython, and requiring identical stdout and exit status.
 | `...` as a stub body | ✅ |
 | `gen.throw` / `gen.close`, `asend` / `aclose` | ✅ |
 | `__new__`, `__init_subclass__`, `__class_getitem__` bound as Python binds them | ✅ |
+| `lambda i=i:` inside a comprehension | ✅ |
+| a closure capturing a comprehension's target (`lambda: i`) | ❌ refused |
 | a class inside a class body, `except*`, `typing.Generic[T]` as a base | ❌ |
 | `functools.wraps`, `abc.abstractmethod` - both set an attribute on a function | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
