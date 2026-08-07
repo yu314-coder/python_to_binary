@@ -1128,6 +1128,23 @@ def _freeze_current_runtime(
         if not executable_source.is_file():
             executable_source = framework_executable
         shutil.copy2(executable_source, executable)
+        # Some framework builds ship a `bin/python3` that is a stub: it finds
+        # the real interpreter at `Resources/Python.app/Contents/MacOS/Python`
+        # and hands over to it. Homebrew's is one - 52 KB, with that path
+        # written inside it - so a bundle carrying only `bin/python3` built
+        # cleanly, reported success, and then died at start-up with a
+        # `posix_spawn` error naming a file the bundle did not have.
+        #
+        # Asked of the executable rather than assumed of the distribution:
+        # the stub says where it is going, so the test is whether it says so.
+        # A build whose `bin/python3` is the interpreter itself carries
+        # nothing extra.
+        app_relative = Path("Resources") / "Python.app"
+        source_app = Path(sys.base_prefix) / app_relative
+        if source_app.is_dir() and b"Resources/Python.app/Contents/MacOS/Python" in (
+            executable_source.read_bytes()
+        ):
+            shutil.copytree(source_app, version_root / app_relative)
         _copy_stdlib(stdlib, version_root / "lib" / f"python{version}", compact)
         return executable, {
             "PYTHONHOME": str(version_root.relative_to(destination.parent)),

@@ -4,6 +4,7 @@ import platform
 import plistlib
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -523,3 +524,56 @@ class FrozenEntryDundersTests(unittest.TestCase):
             "module.__builtins__ = builtins",
         ):
             self.assertIn(line, written)
+
+
+class FrameworkStubTests(unittest.TestCase):
+    """Some `bin/python3` is a stub that hands over to another file.
+
+    Homebrew's is: 52 KB, with `Resources/Python.app/Contents/MacOS/Python`
+    written inside it. A bundle carrying only `bin/python3` built cleanly,
+    reported success, and died at start-up with a `posix_spawn` error naming
+    a file it did not have - so the tier billed as "every Python program
+    works" did not work at all for anyone whose Python came from Homebrew.
+    """
+
+    def test_the_stub_target_is_carried_when_the_stub_names_it(self):
+        import inspect
+
+        from py2bin import freezer
+
+        written = inspect.getsource(freezer._freeze_current_runtime)
+        # Asked of the executable, not assumed of the distribution: the stub
+        # says where it is going, so the test is whether it says so.
+        self.assertIn(
+            b"Resources/Python.app/Contents/MacOS/Python", written.encode()
+        )
+        self.assertIn("executable_source.read_bytes()", written)
+        self.assertIn("shutil.copytree(source_app", written)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin", "framework layout is macOS only"
+    )
+    def test_this_python_would_produce_a_runnable_bundle(self):
+        """Whatever Python is running the suite, its runtime copies whole.
+
+        Reading the two files rather than building a bundle: a freeze takes
+        seconds and this is the part that was wrong.
+        """
+
+        import sysconfig
+
+        if not sysconfig.get_config_var("PYTHONFRAMEWORK"):
+            self.skipTest("not a framework build")
+        source = Path(sys.executable).resolve()
+        if not source.is_file():
+            self.skipTest("no resolvable executable")
+        names_the_app = (
+            b"Resources/Python.app/Contents/MacOS/Python" in source.read_bytes()
+        )
+        if not names_the_app:
+            return
+        app = Path(sys.base_prefix) / "Resources" / "Python.app"
+        self.assertTrue(
+            app.is_dir(),
+            f"{source} hands over to {app}, which is not there to carry",
+        )

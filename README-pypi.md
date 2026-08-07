@@ -13,7 +13,10 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.5 fixes what a frozen program's `__main__` looked like** - `__package__`
+**0.9.5 makes `freeze` work on Homebrew's Python**, which it did not: the
+bundle carried a `bin/python3` that is a stub handing over to a file the
+bundle did not have, so it built cleanly and died at start-up. It also fixes
+what a frozen program's `__main__` looked like** - `__package__`
 was the empty string where a script has None, and `__builtins__` the
 dictionary where `__main__` has the module - and says plainly, where the tiers
 are chosen between, that the native `compile` tier's integers wrap at 64 bits.
@@ -758,6 +761,22 @@ shapes had it: the ordinary bundle and the onefile archive.
 Seventy-three probes were run through `freeze` to find that, and everything
 else it does matches the interpreter, which is what that tier is for.
 
+**And `freeze` did not work at all on Homebrew's Python.** Some framework
+builds ship a `bin/python3` that is a stub - it finds the real interpreter at
+`Resources/Python.app/Contents/MacOS/Python` and hands over to it. Homebrew's
+is one: 52 KB, with that path written inside it. The bundle carried only
+`bin/python3`, so it built cleanly, reported success, and then died at
+start-up with a `posix_spawn` error naming a file it did not have. On a
+python.org Python the same build worked, which is why it went unnoticed - and
+it means the tier billed as "every Python program works" worked for nobody
+whose Python came from Homebrew.
+
+The stub says where it is going, so the bundle now reads it and carries what
+it names. Asked of the executable rather than assumed of the distribution,
+and a build whose `bin/python3` is the interpreter itself carries nothing
+extra. Checked across both distributions, with and without a virtualenv, in
+both bundle shapes - eight combinations, all of which now run.
+
 **The native tier's integers wrap at 64 bits, and the README did not say so.**
 The guide did. Forty-five probes over the native subset found no other silent
 difference - negative division and modulo signs, shifts, float promotion,
@@ -765,7 +784,7 @@ difference - negative division and modulo signs, shifts, float promotion,
 that one property is the whole of it, and it is now stated where the tiers
 are chosen between rather than only deep in the guide.
 
-Suite 1,811 tests.
+Suite 1,813 tests.
 
 ### 0.9.4 - what a clause holds when it leaves early
 
