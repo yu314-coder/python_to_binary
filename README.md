@@ -592,12 +592,14 @@ CPython, and requiring identical stdout and exit status.
 | a generator `def` inside an `if`, a `for`, or another generator | ✅ |
 | `dir()` with no argument | ❌ refused |
 | `abc.abstractmethod`, `functools.wraps` - both write on a function | ✅ |
+| `f.__annotations__`, `typing.get_type_hints`, `singledispatch` | ✅ |
 | `f.__doc__` and a class's, so `help()` and `inspect.getdoc` answer | ✅ |
+| `globals()` in any module of the program, answering with its own | ✅ |
 | packages, `pkg/sub/deeper.py`, `from . import x`, PEP 420 directories | ✅ |
 | `importlib.import_module("pkg.thing")` with the name written down | ✅ |
 | a program that puts its own `src/` on `sys.path` | ✅ |
 | CPython's compile-time `SyntaxWarning`s, at compile time | ✅ |
-| `f.__annotations__`, `type(f).__name__`, `sys._getframe()` | ❌ |
+| `type(f).__name__`, `sys._getframe()` | ❌ |
 | generators: `yield`, `send`, `yield from`, `return value` | ✅ |
 | `async def` / `await`, driven by a real event loop | ✅ |
 | `match`: starred sequence patterns (`[a, *rest]`) | ✅ |
@@ -1162,20 +1164,25 @@ CPython it was not built against. The trade is deliberate; the cost is in the
 table above.
 
 **What is still refused is refused by name**, with a `file:line:col`, rather than
-approximated. What is left is `type(f).__name__`, `f.__annotations__` and
-`sys._getframe()`, and those are structural rather than unfinished: a
-compiled function is a `builtin_function_or_method`, which has no `__dict__`,
-takes no attributes, cannot be subclassed and makes no frame. Each says what
-to do instead where there is something to do.
+approximated. What is left is `type(f).__name__` and `sys._getframe()`, and
+those are structural rather than unfinished: a compiled function is a
+`builtin_function_or_method`, which is not spelled `function` and makes no
+frame. Each says what to do instead where there is something to do.
 
-Two decorators used to be on that list because they write on the function
-they are given - `abc.abstractmethod` sets one attribute, `functools.wraps`
-sets six - and between them they are how a great many programs begin and how
-nearly every decorator is written. A function the source decorates with
-either is now handed over inside a small object that can hold what they
-write and binds like a method afterwards. Only those two, by the name they
-are spelled: every other function stays the plain compiled one, and the extra
-hop this costs to call is paid by nobody else.
+Three things used to be on that list because they write on the function they
+are given: `abc.abstractmethod` sets one attribute, `functools.wraps` sets
+six, and a `def` with annotated parameters writes `__annotations__`. Between
+them they are how a great many programs begin, how nearly every decorator is
+written, and how most modern Python is typed. A function the source decorates
+with either of the first two - or annotates, in a program that reads
+annotations anywhere - is now handed over inside a small object that can hold
+what they write and binds like a method afterwards.
+
+Only in those cases: every other function stays the plain compiled one, and
+the extra hop this costs to call is paid by nobody else. Annotations are
+recognised separately from the two decorators because annotating a parameter
+is far commoner than asking what the annotation was, and a program that never
+asks compiles to exactly what it compiled to before.
 
 ## When it does not work
 
@@ -1244,21 +1251,26 @@ CPython's semantics rather than restricting them. Where the two differ:
 
 | program | py2bin | Nuitka | what it is |
 |---|---|---|---|
-| `f.__annotations__`, `type(f).__name__` | ✗ | ✓ | a compiled function is a `PyCFunction`: no `__dict__`, no attributes |
-| `typing.get_type_hints(f)`, `@f.register` on an annotated function | ✗ | ✓ | the same fact, read through `typing` |
+| `type(f).__name__`, `repr(f)` | ✗ | ✓ | a compiled function is a `PyCFunction`, or a holder where one is needed |
 | `sys._getframe()` | ✗ | ✓ | a compiled function makes no frame |
 | a traceback naming a source line | ✗ | ✓ | there is no source beside the binary to name |
 | `lambda: i` capturing a comprehension's target | refused | ✓ | captures are by value here, so Python's answer would need cells |
 | `dir()` with no argument | refused | ✓ | there is no frame to enumerate |
 | `except*` (PEP 654) | ✓ | ✗ | py2bin rewrites it and agrees with CPython on 42,100 shapes; Nuitka answers differently |
 
-Everything left is one fact and its consequences: a compiled function is a
-`builtin_function_or_method`, which has no `__dict__`, takes no attributes
-and makes no frame. That is what makes a direct call 2.7x faster than the
-interpreter. Two decorators that write on functions - `abc.abstractmethod`
-and `functools.wraps` - used to fall foul of it and no longer do: a function
-the source decorates with either is handed over inside something that can
-hold what they write, and nothing else pays for it.
+What is left is one fact and two consequences of it: a compiled function is a
+`builtin_function_or_method`, so it is not spelled `function` and it makes no
+frame. That is what makes a direct call 2.7x faster than the interpreter.
+
+Everything that *needs* a function to hold something now gets one that can.
+`abc.abstractmethod` writes one attribute, `functools.wraps` writes six, and
+a `def` with annotated parameters writes `__annotations__` - all three used
+to fall foul of the fact and none of them do now. A function the source
+decorates with either of the first two, or annotates in a program that reads
+annotations, is handed over inside a small object that holds what they write
+and binds like a method. Nothing else pays for it, and calls to a
+module-level function are untouched either way: one of those is called
+directly in C and never goes through the name at all.
 
 The corpus is [`tests/programs`](tests/programs) and it runs on every push -
 see [`.github/workflows/checks.yml`](.github/workflows/checks.yml).
@@ -1712,13 +1724,56 @@ literal - are given here too, in CPython's words and at CPython's line, at
 the moment a compiled language gives them: build time.
 
 **Still structural**, and unlikely to change: a compiled function is a
-`builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and
-`sys._getframe()` do not answer as they would for a Python function, and a
-traceback names no source line because there is no source beside the binary
-to name.
+`builtin_function_or_method`, so `type(f).__name__` and `sys._getframe()` do
+not answer as they would for a Python function, and a traceback names no
+source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 103 programs run against CPython on every push.
+
+### 0.9.1 - what a function knows about itself
+
+The rest of what a compiled function could not say, and one module-level
+mistake found on the way there.
+
+**`f.__annotations__` needed the function to hold a dictionary**, and a
+compiled function has no `__dict__`. So every read of it raised - and with it
+`typing.get_type_hints`, and `functools.singledispatch`, which reads the
+annotation on a registered implementation to decide what it is for. That is
+most of what annotating a function is *for*, so most modern Python lost the
+use of it.
+
+Annotations are now carried in the same holder that `abc.abstractmethod` and
+`functools.wraps` write on. Evaluated where the `def` is, as Python evaluates
+them, or written down as their own source where the module said `from
+__future__ import annotations`; `__globals__` goes on beside them, because
+that is what `get_type_hints` resolves a written-down annotation against.
+Since 3.14 what asks a function about its annotations asks for `__annotate__`
+and calls it - PEP 649 - so that is set too, and `singledispatch` works
+again.
+
+Only where the program *asks*. Annotating a parameter is far commoner than
+asking what the annotation was, so the trigger is a mention of
+`__annotations__`, `get_type_hints` or `singledispatch` anywhere in the
+program; without one, an annotated program compiles to exactly what it
+compiled to before. And calls are untouched either way: a module-level
+function is called directly in C and never goes through the name that holds
+the holder. The benchmark is unmoved - 11 of 27 rows still ahead of CPython.
+
+A generator and an `async def` reported every annotation but `return`. Both
+are rewritten into a class and a function that makes one, and the signature
+is reused as it stands - which carries the parameters - while the return
+annotation is written separately, and was being dropped.
+
+**`globals()` outside the entry module read the entry's.** There was one slot
+for the program where there wanted to be one per module, so a helper's
+`globals()` answered with `__main__`'s names; and where the entry did not
+need one at all, the slot was never declared and a program whose *helper*
+used `globals()` would not compile. Each module that keeps its globals in a
+dictionary now has its own, which is also what makes `__globals__` above
+mean anything.
+
+Corpus 886 of 886 comparable. Suite 1,803 tests, conformance corpus 105.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 

@@ -247,6 +247,53 @@ def _handles_exceptions(body: list) -> bool:
     return look(ast.Module(body=list(body), type_ignores=[]))
 
 
+def _annotations_of(node: ast.AST) -> list:
+    """`(name, written)` for every annotation on this `def`, in Python's order.
+
+    Parameters first in the order they are declared - positional-only, plain,
+    `*rest`, keyword-only, `**more` - and `return` last, which is the order
+    `f.__annotations__` comes out in.
+    """
+
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
+    arguments = node.args
+    found = []
+    for argument in (
+        *arguments.posonlyargs,
+        *arguments.args,
+        *( [arguments.vararg] if arguments.vararg else [] ),
+        *arguments.kwonlyargs,
+        *( [arguments.kwarg] if arguments.kwarg else [] ),
+    ):
+        if argument.annotation is not None:
+            found.append((argument.arg, argument.annotation))
+    if node.returns is not None:
+        found.append(("return", node.returns))
+    return found
+
+
+def _reads_annotations(tree: ast.Module) -> bool:
+    """Whether anything here asks a function what its annotations were.
+
+    Reading one directly, or through `typing.get_type_hints`, or through
+    `singledispatch`, which reads them to decide what a registered
+    implementation is for. Annotating a parameter is far commoner than asking
+    about it, so a program that never asks keeps the plain compiled function
+    everywhere and pays nothing.
+    """
+
+    wanted = {"__annotations__", "get_type_hints", "singledispatch"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in wanted:
+            return True
+        if isinstance(node, ast.Name) and node.id in wanted:
+            return True
+        if isinstance(node, ast.alias) and node.name in wanted:
+            return True
+    return False
+
+
 def _writes_on_functions(decorator: ast.expr) -> bool:
     """Whether this decorator sets an attribute on the function it is given.
 
@@ -713,6 +760,17 @@ _IMPLICITLY_WRAPPED = {
 #: bodies are usually empty, so what the wrapping costs to call is beside the
 #: point; every other method stays what it was.
 _ABSTRACT_HOLDER = '''
+class _py2bin_annotate:
+
+    def __init__(self, _py2bin_table):
+        self.table = _py2bin_table
+
+    def __call__(self, _py2bin_format=1):
+        if _py2bin_format != 1:
+            raise NotImplementedError
+        return self.table
+
+
 class _py2bin_bound_abstract:
 
     def __init__(self, _py2bin_owner, _py2bin_obj):
@@ -1154,6 +1212,20 @@ class CApiEmitter:
         #: True when another module in the program imports `__main__` and so
         #: expects to read the entry's globals off it.
         self.entry_is_read = False
+        #: `(python name, C slot)` for each module whose globals live in its
+        #: dictionary. One per module: a module's globals are its own.
+        self.globals_dicts: list[tuple[str, str]] = []
+        #: The slot the module being written reads its globals out of.
+        self.globals_name = "_py2bin_globals"
+        #: True when some module of the program asks a function what its
+        #: annotations were, which is what makes them worth carrying.
+        self.reads_annotations = False
+        #: True in a module that said `from __future__ import annotations`,
+        #: where an annotation is kept as its own source and evaluated by
+        #: whoever asks rather than at the `def`.
+        self.postponed_annotations = False
+        #: The Python name of the module being written.
+        self.module_name = "__main__"
         #: The bare module-level names each linked module binds, so its module
         #: object can be given them once its body has run.
         self.module_globals: dict[str, set[str]] = {}
@@ -2397,8 +2469,8 @@ class CApiEmitter:
             # is the module's own dictionary rather than a copy of it, so a
             # write through what comes back changes the program's globals.
             held = self.temporary()
-            self.emit("Py_IncRef(_py2bin_globals);", indent)
-            self.emit(f"{held} = _py2bin_globals;", indent)
+            self.emit(f"Py_IncRef({self.globals_name});", indent)
+            self.emit(f"{held} = {self.globals_name};", indent)
             return held
         assert self.current is not None
         target = self.temporary()
@@ -2583,7 +2655,7 @@ class CApiEmitter:
             # simply not what anything reads.
             fetched = self.temporary()
             self.emit(
-                f"{fetched} = PyObject_GetItem(_py2bin_globals, "
+                f"{fetched} = PyObject_GetItem({self.globals_name}, "
                 f"{self.interned(node.id)});",
                 indent,
             )
@@ -4821,7 +4893,7 @@ class CApiEmitter:
             # it in once the callable exists.
             target = self.declare(node.name)
             value = self.make_closure(node, node.name, indent)
-            value = self.hold_attributes(node.decorator_list, value, indent)
+            value = self.hold_attributes(node, node.decorator_list, value, indent)
             value = self.apply_decorators(node.decorator_list, value, indent)
             self.emit(f"if ({target}) Py_DecRef({target});", indent)
             self.emit(f"{target} = {value};", indent)
@@ -4917,7 +4989,7 @@ class CApiEmitter:
         self.needs_spread = True
         maker = self.temporary()
         self.emit(
-            f"{maker} = PyObject_GetItem(_py2bin_globals, "
+            f"{maker} = PyObject_GetItem({self.globals_name}, "
             f"{self.interned('_py2bin_spread')});",
             indent,
         )
@@ -5123,7 +5195,7 @@ class CApiEmitter:
             # mode, so every binding has to reach it - this is the one place
             # every global binding passes through.
             self.emit(
-                f"if (PyObject_SetItem(_py2bin_globals, {self.interned(name)}, "
+                f"if (PyObject_SetItem({self.globals_name}, {self.interned(name)}, "
                 f"{slot}) < 0) {{ {self.failure()} }}",
                 indent,
             )
@@ -5210,7 +5282,7 @@ class CApiEmitter:
                     # a name the program had let go and reading it answered
                     # with the value it was supposed to have lost.
                     self.emit(
-                        f"if (PyObject_DelItem(_py2bin_globals, "
+                        f"if (PyObject_DelItem({self.globals_name}, "
                         f"{self.interned(target.id)}) < 0) PyErr_Clear();",
                         indent,
                     )
@@ -6169,7 +6241,7 @@ class CApiEmitter:
                 )
                 if self.globals_in_dict and slot.startswith("g_"):
                     self.emit(
-                        f"if (PyObject_DelItem(_py2bin_globals, "
+                        f"if (PyObject_DelItem({self.globals_name}, "
                         f"{self.interned(clause.name)}) < 0) PyErr_Clear();",
                         indent,
                     )
@@ -7074,22 +7146,31 @@ class CApiEmitter:
                 "quietly disagreeing",
             )
 
-    def hold_attributes(self, decorators, value: str, indent: int) -> str:
-        """Hand a decorator that writes on a function something it can write on.
+    def hold_attributes(
+        self, node: ast.AST, decorators, value: str, indent: int
+    ) -> str:
+        """Hand something that writes on a function what it can write on.
 
-        `abstractmethod` sets `__isabstractmethod__` and `wraps` sets
-        `__name__`, `__doc__` and four more. A compiled function is a
-        `PyCFunction` with no `__dict__`, so both failed - and between them
-        they are how a great many programs begin and how nearly every
-        decorator is written. Wrapped like this, both work.
+        Three things do. `abstractmethod` sets `__isabstractmethod__`; `wraps`
+        sets `__name__`, `__doc__` and four more; and the `def` itself writes
+        `__annotations__` when its parameters are annotated. A compiled
+        function is a `PyCFunction` with no `__dict__`, so all three failed -
+        and between them they are how a great many programs begin, how nearly
+        every decorator is written, and how most modern Python is typed.
+        Wrapped like this, all three work.
 
-        Only where the decorator is one of those two, by the name it is
-        spelled: everything else keeps the plain compiled function, and the
-        extra hop this costs to call is paid by nobody else. See
-        `_ABSTRACT_HOLDER`.
+        The first two are read from the spelling of the decorator. The third
+        is only paid for when the program *reads* annotations somewhere -
+        `f.__annotations__`, `get_type_hints`, `singledispatch` - because
+        annotating a parameter is far commoner than asking what the
+        annotation was, and a function nobody asks about should stay the
+        plain compiled one. See `_ABSTRACT_HOLDER`.
         """
 
-        if not any(_writes_on_functions(decorator) for decorator in decorators):
+        annotated = self.reads_annotations and _annotations_of(node)
+        if not annotated and not any(
+            _writes_on_functions(decorator) for decorator in decorators
+        ):
             return value
         holder = self.expression(
             ast.Name(id="_py2bin_abstract", ctx=ast.Load()), indent
@@ -7098,7 +7179,82 @@ class CApiEmitter:
         self.emit(f"{kept} = PyObject_CallOneArg({holder}, {value});", indent)
         self.emit(f"Py_DecRef({holder});", indent)
         self.emit(f"Py_DecRef({value});", indent)
-        return self.checked(kept, indent)
+        self.checked(kept, indent)
+        if annotated:
+            self.write_annotations(node, annotated, kept, indent)
+        return kept
+
+    def write_annotations(
+        self, node: ast.AST, annotated: list, target: str, indent: int
+    ) -> None:
+        """`f.__annotations__`, built where the `def` is, as Python builds it.
+
+        The annotations are expressions and Python evaluates them at the
+        `def` - unless the module said `from __future__ import annotations`,
+        in which case it keeps the source of each and evaluates nothing. Both
+        are done here, the second by writing down what was parsed.
+
+        `__globals__` goes on as well, because that is what `get_type_hints`
+        evaluates a written-down annotation against. It is the module's own
+        dictionary, which is why a module read this way keeps its globals
+        there.
+        """
+
+        built = ast.Dict(
+            keys=[ast.Constant(value=name) for name, _ in annotated],
+            values=[
+                ast.Constant(value=ast.unparse(written))
+                if self.postponed_annotations
+                else written
+                for _, written in annotated
+            ],
+        )
+        ast.copy_location(built, node)
+        ast.fix_missing_locations(built)
+        table = self.expression(built, indent)
+        self.emit(
+            f'if (PyObject_SetAttrString({target}, "__annotations__", '
+            f"{table}) < 0) {{ {self.failure()} }}",
+            indent,
+        )
+        # And the same thing as a callable. Since 3.14 - PEP 649 - what asks
+        # a function about its annotations asks for `__annotate__` and calls
+        # it, so `functools.singledispatch` saw a function with none. Set only
+        # where there are annotations to report: a holder that has one is
+        # taken to be an annotated function, and one that reports nothing
+        # would be read as an empty signature rather than as no signature.
+        maker = self.expression(
+            ast.copy_location(
+                ast.Name(id="_py2bin_annotate", ctx=ast.Load()), node
+            ),
+            indent,
+        )
+        answering = self.temporary()
+        self.emit(
+            f"{answering} = PyObject_CallOneArg({maker}, {table});", indent
+        )
+        self.emit(f"Py_DecRef({maker});", indent)
+        self.emit(f"Py_DecRef({table});", indent)
+        self.checked(answering, indent)
+        self.emit(
+            f'if (PyObject_SetAttrString({target}, "__annotate__", '
+            f"{answering}) < 0) {{ {self.failure()} }}",
+            indent,
+        )
+        self.emit(f"Py_DecRef({answering});", indent)
+        where = self.temporary()
+        self.emit(
+            f"{where} = PyObject_GetAttrString(PyImport_AddModule("
+            f'{_c_string(self.module_name)}), "__dict__");',
+            indent,
+        )
+        self.checked(where, indent)
+        self.emit(
+            f'if (PyObject_SetAttrString({target}, "__globals__", '
+            f"{where}) < 0) {{ {self.failure()} }}",
+            indent,
+        )
+        self.emit(f"Py_DecRef({where});", indent)
 
     def apply_decorators(self, decorators, value: str, indent: int) -> str:
         """`@a` then `@b` on a `def` is `a(b(f))`.
@@ -7415,9 +7571,13 @@ class CApiEmitter:
                     body = self.make_closure(statement, statement.name, indent)
                 finally:
                     self.methods_of.pop()
+                plain = body
                 body = self.hold_attributes(
-                    statement.decorator_list, body, indent
+                    statement, statement.decorator_list, body, indent
                 )
+                # A holder is a descriptor with a `__get__` of its own, so
+                # wrapping it in an instance method as well would bind twice.
+                binds_itself = body != plain
                 if statement.decorator_list:
                     self.class_scope.append((namespace, known))
                     # The decorator is handed the plain callable, not the
@@ -7451,6 +7611,8 @@ class CApiEmitter:
                     self.emit(f"Py_DecRef({wrapper});", indent)
                     self.emit(f"Py_DecRef({body});", indent)
                     self.checked(value, indent)
+                elif binds_itself:
+                    value = body
                 else:
                     value = self.temporary()
                     self.emit(f"{value} = PyInstanceMethod_New({body});", indent)
@@ -8752,6 +8914,7 @@ class CApiEmitter:
     def module(self, tree: ast.Module) -> str:
         """One module, compiled on its own. The shape a single file has."""
 
+        self.reads_annotations = _reads_annotations(tree)
         self.write_module(tree, entry=True, origin=str(self.path))
         return self.render()
 
@@ -8768,6 +8931,9 @@ class CApiEmitter:
         *imported, entry_tree = modules
         self.entry_is_read = any(
             _reaches_for_main(tree) for _, tree, _ in imported
+        )
+        self.reads_annotations = any(
+            _reads_annotations(tree) for _, tree, _ in modules
         )
         for name, tree, origin in imported:
             key = name.replace(".", "_")
@@ -8799,7 +8965,10 @@ class CApiEmitter:
         try:
             # Before anything reads the tree, so the two small classes are
             # compiled like the program's own - which they now are.
-            if _uses_abstract(tree):
+            if _uses_abstract(tree) or (
+                self.reads_annotations
+                and any(_annotations_of(inner) for inner in ast.walk(tree))
+            ):
                 tree.body = ast.parse(_ABSTRACT_HOLDER).body + tree.body
                 ast.fix_missing_locations(tree)
             # Before the generators: a `nonlocal` inside one has to become
@@ -8849,6 +9018,27 @@ class CApiEmitter:
                 # in the dictionary like any other module's - and nothing
                 # that does not ask pays for it.
                 self.globals_in_dict = True
+            self.module_name = name
+            self.postponed_annotations = any(
+                isinstance(inner, ast.ImportFrom)
+                and inner.module == "__future__"
+                and any(
+                    alias.name == "annotations" for alias in inner.names
+                )
+                for inner in tree.body
+            )
+            if self.reads_annotations and any(
+                _annotations_of(inner) for inner in ast.walk(tree)
+            ):
+                # `get_type_hints` evaluates a written-down annotation
+                # against the function's `__globals__`, which is this
+                # module's dictionary - so what is in it has to be complete.
+                self.globals_in_dict = True
+            self.globals_name = (
+                "_py2bin_globals" if entry else f"_py2bin_globals_{key}"
+            )
+            if self.globals_in_dict:
+                self.globals_dicts.append((name, self.globals_name))
             # Before everything: `except*` becomes ordinary `try`/`except`
             # calling four small functions, so nothing below this ever sees
             # a TryStar.
@@ -9064,7 +9254,16 @@ class CApiEmitter:
                 slot = self.note_global(node.name)
                 held = f"_py2bin_fn_{self.prefix}{node.name}"
                 self.emit(f"Py_IncRef({held});", indent)
-                self.emit(f"{slot} = {held};", indent)
+                # What the *name* holds may need to answer questions the
+                # callable cannot - see `hold_attributes`. Calls to it are
+                # unaffected: a function of this shape is called directly in
+                # C and never goes through the name at all.
+                carried = self.temporary()
+                self.emit(f"{carried} = {held};", indent)
+                carried = self.hold_attributes(
+                    node, node.decorator_list, carried, indent
+                )
+                self.emit(f"{slot} = {carried};", indent)
                 self.publish(node.name, slot, indent)
                 self.show_on_module(node.name, slot, indent)
                 continue
@@ -9250,8 +9449,13 @@ class CApiEmitter:
         # from the one main fills in, so a method that reached for a builtin
         # dereferenced whatever that slot happened to hold.
         out.append("static PyObject *_py2bin_builtins = 0;")
-        if self.globals_in_dict:
-            out.append("static PyObject *_py2bin_globals = 0;")
+        # One per module that keeps its globals in a dictionary, not one for
+        # the program: a module's globals are its own. A single slot held the
+        # entry's dictionary, so `globals()` in any other module read
+        # `__main__`'s - and where the entry did not need one at all, the slot
+        # was never declared and the C would not compile.
+        for _name, slot in self.globals_dicts:
+            out.append(f"static PyObject *{slot} = 0;")
         if self.method_table:
             # Declared empty and filled at startup: the C front end does not
             # initialise a file-scope struct, and the address has to be stable
@@ -9298,16 +9502,14 @@ class CApiEmitter:
         out.append("int main(void) {")
         out.append("    Py_Initialize();")
         out.append('    _py2bin_builtins = PyImport_ImportModule("builtins");')
-        if self.globals_in_dict:
+        for name, slot in self.globals_dicts:
             # The running module's own dictionary, not a new one: what
-            # `globals()` answers with has to *be* the program's globals.
+            # `globals()` answers with has to *be* that module's globals.
             out.append(
-                '    _py2bin_globals = PyObject_GetAttrString('
-                'PyImport_AddModule("__main__"), "__dict__");'
+                f"    {slot} = PyObject_GetAttrString("
+                f"PyImport_AddModule({_c_string(name)}), \"__dict__\");"
             )
-            out.append(
-                "    if (!_py2bin_globals) { PyErr_Print(); exit(1); }"
-            )
+            out.append(f"    if (!{slot}) {{ PyErr_Print(); exit(1); }}")
         out.append(
             "    if (!_py2bin_builtins) { PyErr_Print(); exit(1); }"
         )

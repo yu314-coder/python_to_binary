@@ -1630,7 +1630,11 @@ def rewrite(
         ],
         decorator_list=node.decorator_list,
         type_params=[],
-        returns=None,
+        # What the `def` said it answers with. The parameters keep their
+        # annotations because the signature is reused as it stands; this one
+        # is written separately and was being dropped, so a generator or an
+        # `async def` reported every annotation but `return`.
+        returns=node.returns,
     )
     for tree in (made, maker):
         ast.fix_missing_locations(ast.copy_location(tree, node))
@@ -2297,7 +2301,9 @@ def expand(tree: ast.Module) -> ast.Module:
                     ),
                     decorator_list=statement.decorator_list,
                     type_params=[],
-                    returns=None,
+                    # Kept, so the machine's maker can carry it: an `async
+                    # def` reported every annotation but `return`.
+                    returns=statement.returns,
                 )
                 ast.copy_location(plain, statement)
                 # An `async def` that yields is an async generator, which is

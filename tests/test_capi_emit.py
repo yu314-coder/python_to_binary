@@ -3424,6 +3424,102 @@ class CApiEmitTests(unittest.TestCase):
             b"says one thing class doc method doc None\n()\n",
         )
 
+    def test_a_function_says_what_its_annotations_were(self):
+        """`f.__annotations__` needs the function to hold a dictionary.
+
+        A compiled one has no `__dict__`, so every read raised - and with it
+        `typing.get_type_hints` and `singledispatch`, which is most of what
+        annotations are for. Carried in the same holder that `wraps` and
+        `abstractmethod` write on, and only where the program asks: annotating
+        a parameter is far commoner than asking what the annotation was.
+        """
+
+        self._run(
+            "from typing import get_type_hints, List, Optional\n"
+            "def f(a: int, b: str = 'x') -> bool: return True\n"
+            "def g(a, *r: int, k: float = 1.0, **m: str) -> None: pass\n"
+            "def h(a: int, b: 'Optional[str]' = None) -> 'List[int]': return [a]\n"
+            "class C:\n"
+            "    def m(self, v: int) -> str: return str(v)\n"
+            "print(f.__annotations__)\n"
+            "print(g.__annotations__)\n"
+            "print(get_type_hints(h))\n"
+            "print(C.m.__annotations__, C().m(1))\n",
+            b"{'a': <class 'int'>, 'b': <class 'str'>, "
+            b"'return': <class 'bool'>}\n"
+            b"{'r': <class 'int'>, 'k': <class 'float'>, "
+            b"'m': <class 'str'>, 'return': None}\n"
+            b"{'a': <class 'int'>, 'b': str | None, "
+            b"'return': typing.List[int]}\n"
+            b"{'v': <class 'int'>, 'return': <class 'str'>} 1\n",
+        )
+
+    def test_a_program_that_never_asks_keeps_the_plain_function(self):
+        """The holder costs a hop to call, so nobody who does not ask pays it.
+
+        A program with annotations and no interest in them compiles to the
+        same thing it did before.
+        """
+
+        generated = python_to_capi_c(
+            "def f(a: int) -> bool:\n    return True\nprint(f(1))\n"
+        )
+        self.assertNotIn("_py2bin_abstract", generated)
+        generated = python_to_capi_c(
+            "def f(a: int) -> bool:\n    return True\n"
+            "print(f.__annotations__)\n"
+        )
+        self.assertIn("_py2bin_abstract", generated)
+
+    def test_each_module_reads_its_own_globals(self):
+        """A module's globals are its own, and `globals()` says so.
+
+        One slot held the entry's dictionary, so `globals()` anywhere else
+        read `__main__`'s - and where the entry needed none the slot was never
+        declared, so a program whose *helper* used `globals()` would not
+        compile at all.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "helper.py").write_text(
+                "HELPER_ONLY = 'helper'\n"
+                "def names():\n"
+                "    return sorted(\n"
+                "        k for k in globals() if not k.startswith('__')\n"
+                "    )\n"
+                "def reads():\n"
+                "    return (\n"
+                "        globals().get('MAIN_ONLY', 'absent'),\n"
+                "        globals().get('HELPER_ONLY'),\n"
+                "    )\n",
+                encoding="utf-8",
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import helper\n"
+                "MAIN_ONLY = 'main'\n"
+                "print(helper.names())\n"
+                "print(helper.reads())\n",
+                encoding="utf-8",
+            )
+            generated, _ = python_program_to_capi_c(entry)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(
+                native.stdout,
+                b"['HELPER_ONLY', 'names', 'reads']\n('absent', 'helper')\n",
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 

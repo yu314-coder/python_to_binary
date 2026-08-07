@@ -13,7 +13,15 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.0 closes what a compiled function could not do, and what a compiled
+**0.9.1 finishes what a compiled function can say about itself:**
+`f.__annotations__`, and with it `typing.get_type_hints` and
+`functools.singledispatch`, which is most of what annotating a function is
+for. Only where the program asks - an annotated program that never reads its
+annotations compiles to exactly what it compiled to before, and calls are
+untouched either way. `globals()` in a module other than the entry now
+answers with that module's own names rather than `__main__`'s.
+
+**0.9.0 closed what a compiled function could not do, and what a compiled
 *program* could not be.** Metaclasses, `enum` and `dataclasses`, generator and
 `async def` methods, async generators, `locals()`, a real `globals()`, `eval`
 and `exec`, `sys.exc_info()` inside an `except` - and now `abc.abstractmethod`
@@ -330,7 +338,9 @@ CPython, and requiring identical stdout and exit status.
 | `importlib.import_module("pkg.thing")` with the name written down | ✅ |
 | a program that puts its own `src/` on `sys.path` | ✅ |
 | `abc.abstractmethod`, `functools.wraps` - both write on a function | ✅ |
+| `f.__annotations__`, `typing.get_type_hints`, `singledispatch` | ✅ |
 | `f.__doc__` and a class's, so `help()` and `inspect.getdoc` answer | ✅ |
+| `globals()` in any module of the program, answering with its own | ✅ |
 | CPython's compile-time `SyntaxWarning`s, at compile time | ✅ |
 | `athrow` / `asend` / `aclose` on an async generator | ✅ |
 | `global` / `nonlocal`, tuple unpacking | ✅ |
@@ -710,6 +720,35 @@ neither.
 
 Newest first. The full history is in the repository.
 
+### 0.9.1 - what a function knows about itself
+
+**`f.__annotations__` needed the function to hold a dictionary**, and a
+compiled function has no `__dict__`. Every read of it raised - and with it
+`typing.get_type_hints` and `functools.singledispatch`, which reads the
+annotation on a registered implementation to decide what it is for.
+
+Annotations are now carried in the same holder that `abc.abstractmethod` and
+`functools.wraps` write on: evaluated where the `def` is, or written down as
+their own source where the module said `from __future__ import annotations`,
+with `__globals__` beside them because that is what `get_type_hints` resolves
+a written-down annotation against. Since 3.14 what asks a function about its
+annotations asks for `__annotate__` and calls it - PEP 649 - so that is set
+too.
+
+Only where the program asks: the trigger is a mention of `__annotations__`,
+`get_type_hints` or `singledispatch` anywhere in it, and without one an
+annotated program compiles to what it compiled to before. Calls are untouched
+either way - a module-level function is called directly in C and never goes
+through the name. A generator and an `async def` were reporting every
+annotation but `return`, which the rewrite into a machine was dropping.
+
+**`globals()` outside the entry module read the entry's.** One slot for the
+program where there wanted to be one per module - so a helper's `globals()`
+answered with `__main__`'s names, and where the entry needed none at all the
+slot was never declared and the program would not compile.
+
+Corpus 886 of 886 comparable. Suite 1,803 tests, conformance corpus 105.
+
 ### 0.9.0 - what a compiled function could not do, and now can
 
 Found by probing the language a feature at a time - seventy shapes, each
@@ -877,10 +916,9 @@ too, in CPython's words and at CPython's line, at the moment a compiled
 language gives them: build time.
 
 **Still structural**, and unlikely to change: a compiled function is a
-`builtin_function_or_method`, so `type(f).__name__`, `f.__annotations__` and
-`sys._getframe()` do not answer as they would for a Python function, and a
-traceback names no source line because there is no source beside the binary
-to name.
+`builtin_function_or_method`, so `type(f).__name__` and `sys._getframe()` do
+not answer as they would for a Python function, and a traceback names no
+source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 103 programs run against CPython on every push.
