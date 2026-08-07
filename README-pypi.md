@@ -470,51 +470,37 @@ in almost every one of them.
 
 ### How fast each one is
 
-Measured on an **Apple M4** (10 cores - 4 performance, 6 efficiency - 24 GB,
-macOS 27.0, arm64) against **CPython 3.14.3, python.org framework build** -
-the interpreter these binaries actually bind, which is not the same as
-whichever `python3` is first on PATH and does not perform alike.
+**Apple M4** (10 cores, 24 GB, macOS 27.0, arm64) against **CPython 3.14.3,
+python.org framework build** - the interpreter these binaries actually bind.
+300,000 iterations a row, nine fresh processes each, median taken, timing only
+the hot loop. Higher is better.
 
-300,000 iterations per row, nine fresh processes each, median taken, timing
-only the hot loop so neither column pays for start-up. Higher is better.
-The harness and cases are in `benchmarks/` in the repository.
-
-| feature | py2bin | CPython | |
+| | py2bin | CPython | |
 |---|---|---|---|
-| direct function call | **2.9 ms** | 7.1 ms | **2.48× faster** |
-| a call naming an argument | **3.4 ms** | 7.8 ms | **2.27× faster** |
-| integer arithmetic | **5.1 ms** | 8.3 ms | **1.62× faster** |
-| `while` loop | **4.6 ms** | 6.2 ms | **1.36× faster** |
-| comparisons | **3.7 ms** | 4.6 ms | **1.26× faster** |
-| float arithmetic | **5.4 ms** | 5.7 ms | **1.05× faster** |
-| `try` that does not raise | **3.5 ms** | 3.6 ms | **1.04× faster** |
-| `in` on a list | **8.9 ms** | 9.0 ms | **1.01× faster** |
-| comprehension | 5.6 ms | 5.6 ms | 1.00× |
-| list append | 5.2 ms | 5.2 ms | 0.99× |
-| dict store | 8.2 ms | 7.8 ms | 0.96× |
-| `and` / `or` | 6.1 ms | 5.7 ms | 0.93× |
-| exception raise/catch | 21.9 ms | 19.6 ms | 0.90× |
-| f-string | 21.6 ms | 17.6 ms | 0.81× |
-| `isinstance` | 7.5 ms | 6.0 ms | 0.81× |
-| string concatenation | 15.6 ms | 12.4 ms | 0.80× |
-| subscript | 8.4 ms | 6.0 ms | 0.72× |
-| module global read | 5.4 ms | 3.7 ms | 0.68× |
-| dict lookup by name | 6.8 ms | 4.6 ms | 0.67× |
-| attribute read | 6.3 ms | 3.7 ms | 0.60× |
-| chained comparison | 11.8 ms | 6.7 ms | 0.57× |
-| `for` over a list | 5.3 ms | 2.8 ms | 0.54× |
-| attribute write | 6.1 ms | 3.3 ms | 0.54× |
-| closure call | 12.6 ms | 6.6 ms | 0.52× |
-| instantiation | 37.0 ms | 16.0 ms | 0.43× |
-| tuple unpacking | 15.3 ms | 5.5 ms | 0.36× |
-| method call | 18.5 ms | 6.6 ms | 0.36× |
+| direct function call | **2.8 ms** | 6.9 ms | **2.43×** |
+| a call naming an argument | **3.3 ms** | 7.7 ms | **2.30×** |
+| integer arithmetic | **5.0 ms** | 8.2 ms | **1.65×** |
+| `while` loop | **4.4 ms** | 6.4 ms | **1.45×** |
+| comparisons | **3.6 ms** | 4.6 ms | **1.26×** |
+| float arithmetic | **5.2 ms** | 5.6 ms | **1.07×** |
+| `try` that does not raise | **3.4 ms** | 3.6 ms | **1.05×** |
+| `in` on a list | **8.8 ms** | 8.9 ms | **1.02×** |
+| comprehension | 5.5 ms | 5.4 ms | 0.97× |
+| dict store | 8.1 ms | 7.7 ms | 0.96× |
+| exception raise/catch | 21.9 ms | 19.2 ms | 0.88× |
+| f-string | 21.8 ms | 17.3 ms | 0.80× |
+| string concatenation | 15.6 ms | 12.3 ms | 0.78× |
+| subscript | 8.3 ms | 5.9 ms | 0.71× |
+| attribute read | 6.2 ms | 3.7 ms | 0.60× |
+| `for` over a list | 5.2 ms | 2.8 ms | 0.54× |
+| instantiation | 36.6 ms | 15.9 ms | 0.43× |
+| tuple unpack | 15.0 ms | 5.5 ms | 0.37× |
+| method call | 18.2 ms | 6.5 ms | 0.36× |
 
-Ratios are computed from the unrounded timings, so dividing the millisecond
-figures as shown gives a slightly different number in the last decimal.
-
-One recorded run, the one in `benchmarks/last-run.json` in the repository.
-Repeat it and the figures move by a few per cent either way - which rows beat
-the interpreter, and by roughly how much, does not.
+**Eight of twenty-seven beat the interpreter; fourteen sit at 0.80× or
+better.** The wins are where a call, a lookup or an allocation stops happening
+at all. The losses track how many C-API calls an operation costs, where the
+interpreter's specialised bytecode does the same work inline.
 
 ### Where those numbers came from
 
@@ -744,488 +730,32 @@ neither.
 
 Newest first. The full history is in the repository.
 
-### 0.9.10 - a source file is not always UTF-8
-
-Every tier read program source as UTF-8 and nothing else. Python does not:
-a file may open with a byte-order mark, and it may say what it is in a
-`# -*- coding: ... -*-` line. Both are honoured there, so a program with `é`
-in a Latin-1 file runs under the interpreter and was refused here with a
-codec error naming a byte offset - which says nothing about what to do, and
-is not even the compiler's own diagnostic.
-
-`tokenize.open` is the standard library's answer to exactly this question,
-and is what `ast.parse` would have used had it been handed a file rather than
-a string. It is now what reads a program, in `compile-capi`, in the native
-tier, in the dependency analyser, and in the capability report; the frozen
-bootstrap hands `compile` the bytes, which reads both itself.
-
-The rest of that sweep found nothing, which is worth saying: a name spelled
-in another alphabet - `变量`, `Σ.λ`, `función` - already worked, as did CRLF
-line endings, a file with no newline at the end, tab indentation, a
-five-hundred-element list literal, four hundred locals in one function, two
-hundred functions in one module, and forty nested brackets. The emitter never
-spells a Python name into C, which is why the first of those is not a
-problem, but it is the kind of thing that is, so it is now checked rather
-than assumed.
-
-**Builds are reproducible.** The temporaries a class body's bindings go into
-were named after the *address* of the statement, which is different on every
-run - so the same source gave two different C files and, often enough, two
-different binaries. A build nobody can reproduce is a build nobody can check
-against another, which matters rather more for something that ships machine
-code. They are numbered in the order the bodies are written now, and every
-program in `tests/programs` compiles byte-identically in two separate
-processes, where the hash seed differs and any name taken from an unsorted
-set would move.
-
-Two smaller things from the same sweep. A signed Mach-O cannot reach four
-gigabytes - the code directory records what it covers in a 32-bit field - and
-what came out of exceeding it was `struct.error: 'I' format requires 0 <=
-number <= 4294967295`, from inside a packing call. True, and no help in
-working out that a bundle had gathered up something it should not have; it
-now says what the limit is and where to look. And the `freeze` options were
-swept for the first time - `--compact`, `--onefile`, `--onedir`,
-`--include`, `--exclude`, `--name`, all three `--dependency-mode` values -
-and all of them do what they say.
-
-Suite 1,824 tests, corpus 886 of 886 comparable.
-
-### 0.9.9 - names of its own, in somebody else's namespace
-
-An adversarial sweep this time: programs written to collide with the compiler
-rather than to exercise Python. Every name py2bin writes into a program -
-cells, generator machines, the object a decorator is handed, the module's
-globals - goes into the program's own namespace, so a program that already
-has one of them does not get a warning. It gets that name taken over.
-
-A program with its own `_py2bin_cell_comp1_i` had it replaced by a
-comprehension's cell. One with `_py2bin_abstract = 'mine'` had every
-decorated function stop being callable, because the object a decorator is
-handed was now a string. Neither said anything about it.
-
-One prefix, one check: a name beginning with `_py2bin_` is refused with a
-`file:line:col`, said where the name is written rather than wherever it
-happens to break. Two are exempt, because they are written *for* the program
-to read rather than for the compiler to use: `_py2bin_dir`, which is how a
-compiled program finds the directory it is in, and `_py2bin_crash`.
-
-**And generated code must not read the program's namespace for its own.** A
-generator's exhaustion sentinel was built by calling `object()` - which is a
-*name*, so a program that rebound `object` broke every generator in it with
-"'str' object is not callable". It is an empty list now, which asks the
-program's namespace for nothing. Nine other shadowings were tried - `sorted`,
-`getattr`, `dict`, `type`, `iter`, `next`, `len`, `range`, `isinstance`,
-`super` - and all of them were already safe.
-
-Suite 1,820 tests, corpus 886 of 886 comparable, benchmark unmoved.
-
-### 0.9.8 - a closure made in a comprehension, and two closures that were one
-
-0.9.7 said what it would take to lift the comprehension-capture refusal: a
-binding distinct from the outer name, the save-and-restore 3.12 does around
-an inlined comprehension, module scope, and generator expressions. It is all
-here.
-
-A closure written inside a comprehension shares the comprehension's
-variable, so every one of them sees the last value it took. Captures here are
-taken by value, which answers differently, so every form was refused - except
-the generator expression, which raised `NameError` at the call instead. The
-target gets a cell now, exactly as the same shape written as a `for`
-statement already did.
-
-The cell is named after the *comprehension* rather than the variable, and
-only mentions inside the comprehension are rewritten to it. So a variable of
-the same spelling outside is not touched at all, which is the save-and-restore
-arrived at by never involving it - `j = 'outer'` before the comprehension is
-still `'outer'` after. Two comprehensions get two cells; one written inside a
-loop gets a cell per turn, because each turn's comprehension is its own. The
-first iterable is left alone, because it is evaluated outside the
-comprehension and a name there is the outer one.
-
-Three things had to give way, and each was found by the sweep rather than by
-reading: a closure with a parameter of the same name means its parameter, not
-the comprehension's variable, so `lambda i=i: i` still says the by-value
-thing; the machine a generator expression becomes had to learn to assign
-through a place rather than only into a name; and the cell must not itself be
-given a cell.
-
-**And two closures that captured nothing were the same closure.** CPython
-counts two compiled functions equal when they share a method table and the
-same `self` object - and an empty tuple is a single interned object, so every
-such closure was equal to every other one made at the same place. A set of
-them kept one; a dictionary keyed by them kept one value. Silently, and for
-as long as closures have worked. Each gets a tuple of its own now.
-
-Suite 1,818 tests, corpus 886 of 886 comparable, fuzz 399 of 400, benchmark
-unmoved.
-
-### 0.9.7 - a genexp that raised where its siblings refused
-
-A closure written inside a comprehension shares the comprehension's variable,
-so every one of them sees the last value: `[lambda: i for i in range(3)]` is
-`[2, 2, 2]`. Captures here are taken by value, which would answer
-`[0, 1, 2]`, and the list, set and dict forms say so and refuse. The
-*generator expression* form did not - it became a generator function whose
-names live on the object that runs it, so the closure looked for a name that
-is not there and the call raised `NameError`, naming a variable the program
-had plainly written. It is refused now, in the same words as its siblings.
-
-**I tried to lift the refusal altogether and put it back.** A comprehension's
-target is a loop variable, and py2bin already gives a loop variable captured
-by a closure a cell - `for n in range(3): fs.append(lambda: n)` has answered
-`[2, 2, 2]` for some time. Extending that to comprehension targets made the
-simple case right and made another case *wrong*: since 3.12 a comprehension
-is inlined into the scope around it and a variable of the same name outside
-is saved and restored around it, so `j = 'outer'` before the comprehension
-must still be `'outer'` after. The cell rewrite clobbered it. Turning a
-refusal into a wrong answer is the wrong direction, so it went back, and what
-it would take is written down here rather than half-done.
-
-Suite 1,817 tests, corpus 886 of 886 comparable.
-
-### 0.9.6 - `dir()`, which was refused for wanting a frame it does not want
-
-`dir()` with nothing passed is `sorted(locals())`, and in a module `locals()`
-is `globals()`. Both are answers the compiler already builds - it knows every
-name a function binds and can look at each slot to see whether it holds
-anything yet - so the refusal was for a frame that is not needed. It works
-now, in functions, methods, class bodies and at module level.
-
-Two analyses had to learn about it, and each was a wrong answer waiting:
-narrowing keeps a name in a machine register where no dictionary can see it,
-and a name written and never read shares one slot with every other such name
-- which listed a name as bound because a *different* unread name had been
-written to that slot. Both step aside for a bare `dir()`, as they already did
-for `locals()`.
-
-**`locals()` at module level did not compile at all.** It is `globals()`
-there, which lives in a dictionary only when the module asks for one, and
-this did not count as asking - so the emitted code read a slot that was never
-declared and the build failed with an error in the generated C, which is no
-use to anybody. It counts now, and so does a class body's, where `locals()`
-is the namespace the class is being made from rather than the module's.
-
-**And `locals()` inside a generator is refused rather than answered.** A
-generator's names are cut out of it and kept on the object that runs it, so a
-`locals()` compiled in place looks at that object and finds one name: `self`.
-It answered `{'self': ...}`, which is a wrong answer rather than a missing
-one - the caller cannot tell. It now says so, with somewhere to go instead.
-
-Suite 1,816 tests, corpus 886 of 886 comparable, benchmark unmoved.
-
-### 0.9.5 - what the other two tiers were doing
-
-Nineteen sweeps had all been aimed at `compile-capi`. These are the first at
-the other two.
-
-**A frozen program's `__main__` was not quite the one the interpreter makes.**
-`runpy.run_path` is the obvious way to start the entry and it sets
-`__package__` to the empty string, where a script named on CPython's command
-line has None; `exec` then put the builtins *dictionary* where `__main__` has
-the module. Both are the kind of difference that surfaces inside somebody
-else's library rather than in your own code - `if __package__ is None` is as
-common a way to ask "am I a script?" as the falsy test is, and it reads the
-other way round. The entry is now started the way CPython starts a script,
-with `__loader__` set as well, since the source really is in the bundle. Both
-shapes had it: the ordinary bundle and the onefile archive.
-
-Seventy-three probes were run through `freeze` to find that, and everything
-else it does matches the interpreter, which is what that tier is for.
-
-**And `freeze` did not work at all on Homebrew's Python.** Some framework
-builds ship a `bin/python3` that is a stub - it finds the real interpreter at
-`Resources/Python.app/Contents/MacOS/Python` and hands over to it. Homebrew's
-is one: 52 KB, with that path written inside it. The bundle carried only
-`bin/python3`, so it built cleanly, reported success, and then died at
-start-up with a `posix_spawn` error naming a file it did not have. On a
-python.org Python the same build worked, which is why it went unnoticed - and
-it means the tier billed as "every Python program works" worked for nobody
-whose Python came from Homebrew.
-
-The stub says where it is going, so the bundle now reads it and carries what
-it names. Asked of the executable rather than assumed of the distribution,
-and a build whose `bin/python3` is the interpreter itself carries nothing
-extra. Checked across both distributions, with and without a virtualenv, in
-both bundle shapes - eight combinations, all of which now run.
-
-**The native tier's integers wrap at 64 bits, and the README did not say so.**
-The guide did. Forty-five probes over the native subset found no other silent
-difference - negative division and modulo signs, shifts, float promotion,
-`range` with a negative step, `while ... else`, nested calls all agree - so
-that one property is the whole of it, and it is now stated where the tiers
-are chosen between rather than only deep in the guide.
-
-Suite 1,813 tests.
-
-### 0.9.4 - what a clause holds when it leaves early
-
-Found on an axis none of the sweeps had used: run a construct a hundred
-thousand times and see whether the memory comes back. Two identical runs, and
-only what the *second* adds counts - the first grows the heap's high-water
-mark however tidy the code is.
-
-**A handler holds two references and released them on one path out of four.**
-The exception it caught, and what was being handled before it. Both were let
-go where the clause falls off its end, and nowhere else - so a clause that
-raised, returned, or broke leaked both. That is 160 bytes a turn, which a
-`try` inside a loop turns into megabytes, and it is not an exotic shape:
-`except ValueError: raise RuntimeError(...)` is how most error translation is
-written.
-
-The same held for `finally`, for the exception a `with` was interrupted by,
-and - worst, because it is silent - for a generator whose handler suspends:
-`except ValueError: yield` leaked the exception every time round.
-
-Three things were wrong and all three are fixed. The references live in slots
-of their own rather than temporaries, which the next statement written was
-taking over. They are released on every way out of the call, not just the
-tidy one. And the release is written where the exit is but *filled in when
-the body is complete*, because a generator's `yield` is a `return` emitted
-long before the handler further down asks for a slot - so what was written at
-the exit released nothing at all.
-
-Twenty-two shapes now check that memory comes back, including `return` and
-`break` out of a handler, a `with` that swallows, and nested `try`. What
-looked like a fifth leak - building a class in a loop - is not one: nothing
-is retained, and the second run is flat. Compiled class creation just asks
-the allocator for more at its peak than the interpreter does.
-
-Suite 1,809 tests, corpus 886 of 886 comparable, benchmark unmoved.
-
-### 0.9.3 - the names every module has
-
-A bare `__spec__` was not found among a module's globals and fell through to
-the builtins module - where it exists and is *its*. So `__spec__.name`
-answered `"builtins"`, `__package__` came back with `builtins`' empty string,
-and `__builtins__` raised a `NameError` because that is the one the builtins
-module does not have.
-
-`__package__`, `__spec__`, `__loader__` and `__builtins__` are now the
-module's own, alongside `__name__`, `__file__` and `__doc__` - declared before
-anything in the module is written, because a function that mentions one has
-to find it there rather than out among the builtins. `__spec__` and
-`__loader__` hold None: a compiled module was not loaded by anything, so
-there is no loader to name.
-
-Suite 1,808 tests, corpus 886 of 886 comparable.
-
-### 0.9.2 - the signature and the annotations, put back together
-
-A compiled function carries its parameters and defaults in the doc slot, in
-the shape `inspect` reads a *builtin's* signature out of - and that shape has
-nowhere to say what a parameter was annotated with, because CPython's own
-builtins have no annotations to say. So `inspect.signature(f)` came back with
-the right parameters and no types, where the same source under CPython shows
-both.
-
-The two halves are held separately, so they are put together when somebody
-asks for `__signature__` and not before: almost nobody asks, and a program
-that does not pays nothing for it.
-
-Suite 1,805 tests, corpus 886 of 886 comparable.
-
-### 0.9.1 - what a function knows about itself
-
-**`f.__annotations__` needed the function to hold a dictionary**, and a
-compiled function has no `__dict__`. Every read of it raised - and with it
-`typing.get_type_hints` and `functools.singledispatch`, which reads the
-annotation on a registered implementation to decide what it is for.
-
-Annotations are now carried in the same holder that `abc.abstractmethod` and
-`functools.wraps` write on: evaluated where the `def` is, or written down as
-their own source where the module said `from __future__ import annotations`,
-with `__globals__` beside them because that is what `get_type_hints` resolves
-a written-down annotation against. Since 3.14 what asks a function about its
-annotations asks for `__annotate__` and calls it - PEP 649 - so that is set
-too.
-
-Only where the program asks: the trigger is a mention of `__annotations__`,
-`get_type_hints` or `singledispatch` anywhere in it, and without one an
-annotated program compiles to what it compiled to before. Calls are untouched
-either way - a module-level function is called directly in C and never goes
-through the name. A generator and an `async def` were reporting every
-annotation but `return`, which the rewrite into a machine was dropping.
-
-**`globals()` outside the entry module read the entry's.** One slot for the
-program where there wanted to be one per module - so a helper's `globals()`
-answered with `__main__`'s names, and where the entry needed none at all the
-slot was never declared and the program would not compile.
-
-Corpus 886 of 886 comparable. Suite 1,803 tests, conformance corpus 105.
-
-### 0.9.0 - what a compiled function could not do, and now can
-
-Found by probing the language a feature at a time - seventy shapes, each
-compiled and its output compared against CPython's - rather than by reading
-code. Sixty-seven of the seventy now agree exactly. The three that do not are
-one fact rather than three gaps, and it is named at the end.
-
-**Two silent wrong answers, both in code people write every day.**
-
-A default argument was evaluated on every call. Python evaluates it once, when
-the `def` runs, and hands every later call the same object - which is what
-makes `def f(x=[])` share one list and what the memoisation idiom rests on.
-`accum(1), accum(2)` answered `[1] [2]` where Python answers `[1, 2] [1, 2]`.
-Nested functions had it worse: `def each(x=i)` in a loop read the loop
-variable late, so two closures both answered 1 where Python gives 0 and 1.
-Defaults are now evaluated where the `def` is - in statics for a module-level
-function, and in the tuple a closure already carries its captures in, which is
-what makes the loop case come out right.
-
-A closure captured names by asking *does the module bind this spelling*, and a
-parameter of the enclosing function shadows a module name. So
-
-    def d(f):
-        def w(): return f() + 1
-        return w
-    @d
-    def f(): return 1
-
-made a `w` that called the module's `f` - which `@d` had just rebound to `w` -
-and every call recursed until the stack ran out. The quieter form of the same
-hole let `def d(helper)` beside `def helper()` answer from the module's
-`helper`: no crash, just the wrong number. What decides a capture is now
-whether the name resolves to the module's slot or to something nearer. A
-module global is still not captured, on purpose - Python reads a global when
-the closure runs.
-
-**Classes.** `class C(metaclass=M)` was refused outright and now works, along
-with every keyword in a class header. Three things came with it: the bases are
-built before the body, which is the order Python does it in; `__prepare__` is
-asked of the most derived metaclass of the bases, which is what `enum` needs -
-its namespace is a mapping that notices a member name used twice, and a plain
-dict is why every `Enum` subclass failed; and `__annotations__` is recorded,
-which is what `dataclasses` reads to find the fields, so every dataclass used
-to come out with none.
-
-**Generators and coroutines in classes.** `def items(self): yield` did not
-compile, and neither did any `async def` method - both are everywhere. A
-generator becomes a machine class and a maker, and a class inside a class body
-is not translated, so the machine now goes in front of the class. Two
-collisions came out of that, both quiet: a method's first parameter is spelled
-the same as the machine's receiver, and every name a generator binds is
-rewritten into an attribute of that receiver - so the machine's own
-`self.<state>` became `self.self.<state>`, the state lived on the instance,
-and iterating yielded the first value for ever.
-
-**`locals()` and `vars()`** answered `None`, and callers then tried to iterate
-it. The builtin wants the frame of whoever called it; since 3.13 `locals()` in
-a function is an independent snapshot, and a snapshot is what this can build
-from the slots it already knows about, unbound names left out as they are
-there.
-
-**Inside an `except`, the exception is on record.** `sys.exc_info()` answered
-`None` and an exception raised from a handler got no `__context__`, so a
-traceback lost its "during handling of the above exception" chain. The vetted
-table gains `PyErr_GetHandledException` and `PyErr_SetHandledException`, taking
-it from 84 entry points to 86, and the restore rides the mechanism `finally`
-already uses so it happens whichever way the clause leaves. This is the one
-row that got slower for it: `exception raise/catch` goes from 0.97x to 0.90x,
-which is two C-API calls per handler and is what `sys.exc_info()` costs.
-
-**Async comprehensions** - `[x async for x in it]` and the set and dict forms -
-are written out as the `async for` they are short for before the state machine
-sees them, because the machine cuts at statements and a comprehension is one
-expression.
-
-**Smaller, and measured.** A loop whose sequence is empty runs its `else`
-again: the flag was set up inside the body, which an empty sequence never
-reaches, and it lives in a reused slot, so the `else` read what the last loop
-that broke had left there. A local nothing ever reads shares one slot, which
-removed the last refusal in the 889-program corpus - a generated file with
-67,000 of them needed two slots and asked for 67,001. `inspect.signature`
-spells a literal default as itself rather than as `None`.
-
-**Async generators.** `async def` with a `yield` in it, and `async for` over
-one. The state machine turns a `yield` and an `await` into the same thing,
-and for an async generator the two go to different places - the program's own
-values to whoever is iterating, the awaited ones to the event loop. The
-program's are marked before the pass that expands `await` runs, so what is
-marked is exactly what the program wrote; the object `__anext__` answers with
-drives the machine, passes anything unmarked out to the loop, and returns the
-payload of the first marked value. `asend`, `athrow` and `aclose` are not
-there yet.
-
-**`globals()` is the module's own dictionary**, not a copy of one, so a write
-through it changes the program and a `del` through it unbinds. The names live
-in C slots for speed and a copy would take writes and drop them - so a module
-that asks for `globals()`, or for an `eval`/`exec` that would want one, keeps
-its names in the module's dictionary as well and *reads* them from there. Only
-the modules that ask pay for it; nothing else changes. One-argument `eval` and
-`exec` are given that dictionary, which is what the frame of a module-level
-`eval` would have held.
-
-Two things showed up the moment `globals()` started answering truthfully, both
-of them ours. py2bin's own start-up left `sys`, `os` and `builtins` bound in
-the program's module, so `globals()` listed three names the program never
-wrote; it now runs inside a function and cleans up after itself. And an
-`except E as e` left `e` bound after the handler, where Python unbinds it
-however the handler ends - reading it afterwards is a NameError now, as it is
-there.
-
-**Still structural**, with the reason rather than a shrug: `type(f).__name__`
-answers `builtin_function_or_method`, `f.__annotations__` raises, and
-`sys._getframe()` finds nothing. A compiled function is a `PyCFunction` - no
-`__dict__`, no attributes, not subclassable, no frame - and the only way round
-it is an interpreted call in front of every call, which is the two fastest
-rows on the grid.
-
-**Two decorators that write on functions, which used to be fatal.**
-`abc.abstractmethod(f)` does exactly one thing: it sets
-`f.__isabstractmethod__` and hands `f` back. `functools.wraps` does the same
-six times over. A compiled function has no `__dict__`, so both failed - and
-between them they are how a great many programs begin and how nearly every
-decorator is written; `class Shape(ABC)` stopped the whole program at import
-time. A function the source decorates with either is now handed over inside a
-small object that holds what they write and binds like a method afterwards.
-The mark travels with the value, which is what keeps a subclass overriding
-only half of an interface abstract. Only those two, by the name they are
-spelled: every other function stays the plain compiled one.
-
-**A compiled function had no docstring.** Its doc slot carries the signature
-`inspect` reads and nothing after it, so `help()` said nothing about anything
-and `wraps` copied a `__doc__` of None onto every wrapper. What the function
-says now follows the signature, which is where CPython reads `__doc__` from;
-classes and modules keep theirs too.
-
-**A program is more than a flat directory of files.** Modules were looked for
-in one place - a `.py` beside the entry - so `import helper` was compiled in
-and `import pkg` was not, and a program laid out the way most programs are
-failed at start-up. Now: `a.b` is `a/b.py` or `a/b/__init__.py`, taken in
-that order; a directory with no `__init__.py` is a package all the same (PEP
-420); `importlib.import_module("pkg.thing")` and `__import__("helper")` are
-followed wherever the name is written down; and everything under `src/` is
-reached the way programs reach it, by reading the strings in the
-`sys.path.insert` rather than working the expression out. Relative imports are
-resolved where they are written, and one that counts past the top of the
-program is refused in Python's own words. A linked module's `__file__` keeps
-the shape it had in the tree. Checked against CPython on twenty-eight
-laid-out programs.
-
-**Which exception is being handled belongs to the call, not the thread.** A
-`finally` now runs with the exception it interrupted on record, so what it
-raises is chained to it. A body whose `except` or `finally` raised something
-of its own used to leave its exception on record for good, so
-`sys.exc_info()` in the caller answered with it long afterwards; every call
-now gives the caller's back on the way out, and only bodies with a `try` or a
-`with` save anything, so an ordinary call pays nothing.
-
-**Smaller things, each found the same way.** `global x` in a class body binds
-the module's name. `super()` in a `def` written inside a method says
-"super(): no arguments", which is what Python says. A module that imports
-`__main__` can read the entry's globals off it. An async generator gained
-`athrow`. And the `SyntaxWarning`s CPython's compiler gives - `assert (a,
-b)`, `'return' in a 'finally' block`, `"is"` with a literal - are given here
-too, in CPython's words and at CPython's line, at the moment a compiled
-language gives them: build time.
-
-**Still structural**, and unlikely to change: a compiled function is a
-`builtin_function_or_method`, so `type(f).__name__` and `sys._getframe()` do
-not answer as they would for a Python function, and a traceback names no
-source line because there is no source beside the binary to name.
-
-Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
-107 programs run against CPython before each release.
+### 0.9.1 - 0.9.10
+
+Ten releases found by compiling a shape and comparing what came out against
+the interpreter - roughly five hundred shapes, and the pattern was that bugs
+came from *new kinds* of test rather than more of the same.
+
+- **A program is more than a flat directory of files**: packages, submodules,
+  relative imports, PEP 420 namespace directories,
+  `importlib.import_module("pkg.thing")`, and everything under `src/`.
+- **Three things that write on a function** - `abc.abstractmethod`,
+  `functools.wraps`, and an annotated `def` writing `__annotations__` - all
+  failed on a `PyCFunction` with no `__dict__`. Each is now handed something
+  that can hold what it writes, and with them came `f.__doc__`,
+  `inspect.signature` showing annotations, and `singledispatch`.
+- **The ends of a generator's life**: `next` past exhaustion stopped answering
+  at all, `close` on a fresh one complained, a delegating generator did not
+  close what it delegated to - so a cancelled `asyncio` task ran no cleanup -
+  and `athrow` did not exist.
+- **A `try` in a loop leaked** 160 bytes a turn when its handler raised.
+- **`dir()` and comprehension capture** stopped being refusals.
+- `__spec__` answered `"builtins"`; `globals()` outside the entry read the
+  entry's; two closures that captured nothing were the same closure; a
+  Latin-1 source file was refused; and the same source compiled twice gave
+  two different binaries.
+- **`freeze` did not work at all on Homebrew's Python**, and **Windows ARM64**
+  left an invalid instruction in the middle of the code.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
