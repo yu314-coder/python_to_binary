@@ -681,7 +681,7 @@ class _Machine:
                 raise GeneratorRewriteError(
                     statement, "a `for ... else` containing `yield`"
                 )
-            if not isinstance(statement.target, ast.Name):
+            if not isinstance(statement.target, (ast.Name, ast.Subscript)):
                 raise GeneratorRewriteError(
                     statement, "a `for` over a tuple target containing `yield`"
                 )
@@ -691,7 +691,12 @@ class _Machine:
             self.loops += 1
             holder = f"{ITERATOR}{self.loops}"
             self.names.add(holder)
-            self.names.add(statement.target.id)
+            # A target that is not a plain name is a place rather than a
+            # binding - `for cell[0] in ...`, which is what a comprehension
+            # whose target a closure captures becomes. It needs no slot on
+            # the machine; the assignment goes through it as written.
+            if isinstance(statement.target, ast.Name):
+                self.names.add(statement.target.id)
             probe = f"{holder}_item"
             self.names.add(probe)
             test = self._new_block()
@@ -746,7 +751,11 @@ class _Machine:
             )
             self.blocks[body].append(
                 ast.Assign(
-                    targets=[self._self(statement.target.id, store=True)],
+                    targets=[
+                        self._self(statement.target.id, store=True)
+                        if isinstance(statement.target, ast.Name)
+                        else statement.target
+                    ],
                     value=self._self(probe),
                 )
             )
@@ -2125,7 +2134,7 @@ def _refuse_capturing_the_target(node: ast.GeneratorExp) -> None:
         name.id
         for clause in node.generators
         for name in ast.walk(clause.target)
-        if isinstance(name, ast.Name)
+        if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
     }
     for inner in ast.walk(node):
         if not isinstance(inner, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):

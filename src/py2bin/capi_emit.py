@@ -34,7 +34,11 @@ import textwrap
 import warnings
 from pathlib import Path
 
-from .capi_cells import CellError, expand as expand_cells
+from .capi_cells import (
+    CellError,
+    expand as expand_cells,
+    expand_comprehension_cells,
+)
 from .capi_fold import fold as fold_constants
 from .capi_except_star import (
     ExceptStarError,
@@ -7579,10 +7583,20 @@ class CApiEmitter:
         # travel with the captures in the tuple the callable holds, so a `def`
         # inside a loop gets a set of its own each time round.
         given = list(node.args.defaults) + list(node.args.kw_defaults)
-        self.emit(
-            f"{held} = PyTuple_New({len(captures) + len(given)});", indent
-        )
+        # One more slot than there is anything to put in it, when there is
+        # nothing at all. Two compiled functions are the same function to
+        # CPython when they share a method table and the *same* `self`
+        # object - and an empty tuple is a single interned object, so every
+        # closure that captured nothing was equal to every other one. A set
+        # of them kept one, and a dictionary keyed by them kept one value.
+        # A tuple of its own is a tuple of its own, and nothing reads past
+        # what was put in it.
+        carried = len(captures) + len(given)
+        self.emit(f"{held} = PyTuple_New({carried or 1});", indent)
         self.checked(held, indent)
+        if not carried:
+            blank = self.builtin("None", indent)
+            self.emit(f"PyTuple_SetItem({held}, 0, {blank});", indent)
         for offset, name in enumerate(captures):
             source = self.reference(name)
             # PyTuple_SetItem steals, and the enclosing scope still needs its
@@ -9178,6 +9192,11 @@ class CApiEmitter:
             ):
                 tree.body = ast.parse(_ABSTRACT_HOLDER).body + tree.body
                 ast.fix_missing_locations(tree)
+            # Before the generators, and before the capture analysis that
+            # used to refuse this: a closure made inside a comprehension
+            # shares the comprehension's variable, which a cell gives it.
+            tree.body = expand_comprehension_cells(tree.body)
+            ast.fix_missing_locations(tree)
             # Before the generators: a `nonlocal` inside one has to become
             # a cell while it is still an ordinary function body.
             try:

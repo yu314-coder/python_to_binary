@@ -1266,7 +1266,6 @@ CPython's semantics rather than restricting them. Where the two differ:
 | `sys._getframe()`, `sys.settrace` | ✗ | ✓ | Nuitka builds real frames; a py2bin function makes none, which is part of why its calls are faster |
 | a traceback naming a source line | ✗ | ✓ | Nuitka carries code objects with filenames; py2bin prints the exception line alone |
 | `inspect.getsource` | ✗ | ✓ | there is no source beside the binary to read |
-| `lambda: i` capturing a comprehension's target | refused | ✓ | captures are by value here, so Python's answer would need cells |
 | `locals()` inside a generator | refused | ✓ | its names live on the object that runs it, so an answer would be the wrong one |
 | `except*` (PEP 654) | ✓ | ✗ | py2bin rewrites it and agrees with CPython on 42,100 shapes; Nuitka answers differently |
 
@@ -1772,6 +1771,46 @@ source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 107 programs run against CPython before each release.
+
+### 0.9.8 - a closure made in a comprehension, and two closures that were one
+
+0.9.7 said what it would take to lift the comprehension-capture refusal: a
+binding distinct from the outer name, the save-and-restore 3.12 does around
+an inlined comprehension, module scope, and generator expressions. It is all
+here.
+
+A closure written inside a comprehension shares the comprehension's
+variable, so every one of them sees the last value it took. Captures here are
+taken by value, which answers differently, so every form was refused - except
+the generator expression, which raised `NameError` at the call instead. The
+target gets a cell now, exactly as the same shape written as a `for`
+statement already did.
+
+The cell is named after the *comprehension* rather than the variable, and
+only mentions inside the comprehension are rewritten to it. So a variable of
+the same spelling outside is not touched at all, which is the save-and-restore
+arrived at by never involving it - `j = 'outer'` before the comprehension is
+still `'outer'` after. Two comprehensions get two cells; one written inside a
+loop gets a cell per turn, because each turn's comprehension is its own. The
+first iterable is left alone, because it is evaluated outside the
+comprehension and a name there is the outer one.
+
+Three things had to give way, and each was found by the sweep rather than by
+reading: a closure with a parameter of the same name means its parameter, not
+the comprehension's variable, so `lambda i=i: i` still says the by-value
+thing; the machine a generator expression becomes had to learn to assign
+through a place rather than only into a name; and the cell must not itself be
+given a cell.
+
+**And two closures that captured nothing were the same closure.** CPython
+counts two compiled functions equal when they share a method table and the
+same `self` object - and an empty tuple is a single interned object, so every
+such closure was equal to every other one made at the same place. A set of
+them kept one; a dictionary keyed by them kept one value. Silently, and for
+as long as closures have worked. Each gets a tuple of its own now.
+
+Suite 1,818 tests, corpus 886 of 886 comparable, fuzz 399 of 400, benchmark
+unmoved.
 
 ### 0.9.7 - a genexp that raised where its siblings refused
 

@@ -712,21 +712,6 @@ class CApiEmitTests(unittest.TestCase):
             b"[0, 1, 2] {1: 2, 2: 4}\n",
         )
 
-    def test_capturing_a_comprehension_target_is_refused(self):
-        """The wrong answer that fix uncovered, refused rather than given.
-
-        A comprehension rebinds its target every turn and a closure made
-        inside one shares that binding, so Python gives every closure the
-        last value. Captures are taken by value here, which would answer with
-        a different value each - so it is refused, and the message names the
-        `lambda i=i:` spelling that says the by-value thing on purpose.
-        """
-        with self.assertRaises(Exception) as caught:
-            python_to_capi_c(
-                "fs = [lambda: i for i in range(3)]\nprint(fs)\n", "program.py"
-            )
-        self.assertIn("comprehension around it", str(caught.exception))
-
     def test_send_before_the_first_yield_is_refused(self):
         """A generator that has not run yet has nowhere to put the value.
 
@@ -3775,28 +3760,72 @@ class CApiEmitTests(unittest.TestCase):
             b"['x']\nTrue\n",
         )
 
-    def test_a_closure_capturing_a_genexp_target_is_refused(self):
-        """The list, set and dict forms were refused; this one raised.
+    def test_a_closure_can_capture_a_comprehension_target(self):
+        """Every closure made in a comprehension shares its variable.
 
-        A genexp becomes a generator function here and its names become
-        attributes of the object that runs it - so a closure written inside
-        one looked for a name that is not there and the *call* raised
-        `NameError`, naming a variable the program had plainly written. It
-        is the same disagreement the other comprehension forms refuse, and it
-        says so now instead.
+        So they all see the last value it took: `[lambda: i for i in
+        range(3)]` is `[2, 2, 2]`. Captures here are by value, which would
+        answer `[0, 1, 2]`, and this used to be refused in every
+        comprehension form - except the generator expression, where it was
+        not refused and raised `NameError` at the call instead.
+
+        The comprehension's target gets a cell, exactly as the same shape
+        written as a `for` statement already did. The cell is named after the
+        comprehension rather than the variable, so a variable of the same
+        spelling outside is not touched - which is what 3.12 onwards does by
+        saving and restoring it around an inlined comprehension, arrived at
+        here by never involving it.
         """
 
-        with self.assertRaises(CApiEmitError) as caught:
-            python_to_capi_c(
-                "fs = list((lambda: i) for i in range(3))\n"
-                "print([f() for f in fs])\n"
-            )
-        self.assertIn("generator expression around it", str(caught.exception))
-        # The ordinary shapes are untouched.
         self._run(
-            "print(sum(i for i in range(5)), list(i * 2 for i in range(3)))\n"
-            "print([f() for f in [lambda i=i: i for i in range(3)]])\n",
-            b"10 [0, 2, 4]\n[0, 1, 2]\n",
+            "fs = [lambda: i for i in range(3)]\n"
+            "print([f() for f in fs])\n"
+            "i = 'outer'\n"
+            "gs = [lambda: i for i in range(2)]\n"
+            "print([f() for f in gs], repr(i))\n"
+            "print([f() for f in list((lambda: q) for q in range(3))])\n"
+            "print([f() for f in [lambda i=i: i for i in range(3)]])\n"
+            "print({k: v() for k, v in {n: (lambda: n) for n in range(2)}.items()})\n",
+            b"[2, 2, 2]\n[1, 1] 'outer'\n[2, 2, 2]\n[0, 1, 2]\n{0: 1, 1: 1}\n",
+        )
+
+    def test_a_comprehension_cell_does_not_reach_outside_it(self):
+        """The name outside keeps its value, and two of them do not collide."""
+
+        self._run(
+            "def g():\n"
+            "    j = 'outer'\n"
+            "    fs = [lambda: j for j in range(3)]\n"
+            "    return [f() for f in fs], j\n"
+            "print(g())\n"
+            "a = [lambda: i for i in range(2)]\n"
+            "b = [lambda: i for i in range(3)]\n"
+            "print([f() for f in a], [f() for f in b])\n"
+            "out = []\n"
+            "for r in range(2):\n"
+            "    out.append([lambda: i for i in range(2)])\n"
+            "print([[f() for f in fs] for fs in out])\n",
+            b"([2, 2, 2], 'outer')\n[1, 1] [2, 2, 2]\n[[1, 1], [1, 1]]\n",
+        )
+
+    def test_two_closures_are_two_objects(self):
+        """Two compiled functions sharing a method table and a `self` are one.
+
+        That is CPython's rule for a builtin function, and an empty tuple is
+        a single interned object - so every closure that captured nothing was
+        equal to every other one made at the same place. A set of them kept
+        one and a dictionary keyed by them kept one value, silently. Each
+        gets a tuple of its own now.
+        """
+
+        self._run(
+            "fs = []\n"
+            "for n in range(3):\n"
+            "    fs.append(lambda: n)\n"
+            "print(len(set(fs)), fs[0] == fs[1], fs[0] == fs[0])\n"
+            "gs = [lambda: 1 for _ in range(3)]\n"
+            "print(len(set(gs)), len({g: 1 for g in gs}))\n",
+            b"3 False True\n3 3\n",
         )
 
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
