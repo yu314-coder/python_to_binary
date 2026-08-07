@@ -13,7 +13,10 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.1 finishes what a compiled function can say about itself:**
+**0.9.2 puts a function's signature and its annotations back together**, so
+`inspect.signature(f)` shows the types the source wrote.
+
+**0.9.1 finished what a compiled function can say about itself:**
 `f.__annotations__`, and with it `typing.get_type_hints` and
 `functools.singledispatch`, which is most of what annotating a function is
 for. Only where the program asks - an annotated program that never reads its
@@ -719,6 +722,21 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.2 - the signature and the annotations, put back together
+
+A compiled function carries its parameters and defaults in the doc slot, in
+the shape `inspect` reads a *builtin's* signature out of - and that shape has
+nowhere to say what a parameter was annotated with, because CPython's own
+builtins have no annotations to say. So `inspect.signature(f)` came back with
+the right parameters and no types, where the same source under CPython shows
+both.
+
+The two halves are held separately, so they are put together when somebody
+asks for `__signature__` and not before: almost nobody asks, and a program
+that does not pays nothing for it.
+
+Suite 1,805 tests, corpus 886 of 886 comparable.
 
 ### 0.9.1 - what a function knows about itself
 

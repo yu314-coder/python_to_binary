@@ -830,7 +830,38 @@ class _py2bin_abstract:
         # marked abstract, say - the function inside still answers.
         if _py2bin_wanted == "_py2bin_held":
             raise AttributeError(_py2bin_wanted)
+        if _py2bin_wanted == "__signature__":
+            return self._py2bin_signature()
         return getattr(self._py2bin_held, _py2bin_wanted)
+
+    def _py2bin_signature(self):
+        """The signature the function inside has, with the annotations put back.
+
+        A compiled function carries its parameters and defaults in the doc
+        slot, in the shape `inspect` reads a builtin's signature out of - and
+        that shape has nowhere to say what a parameter was annotated with,
+        because CPython's own builtins have no annotations to say. The two
+        halves are held separately here, so this puts them together. Worked
+        out when asked and not before: almost nobody asks.
+        """
+
+        import inspect
+
+        _py2bin_base = inspect.signature(self._py2bin_held)
+        _py2bin_notes = self.__dict__.get("__annotations__")
+        if not _py2bin_notes:
+            return _py2bin_base
+        _py2bin_parts = []
+        for _py2bin_p in _py2bin_base.parameters.values():
+            if _py2bin_p.name in _py2bin_notes:
+                _py2bin_p = _py2bin_p.replace(
+                    annotation=_py2bin_notes[_py2bin_p.name]
+                )
+            _py2bin_parts.append(_py2bin_p)
+        _py2bin_back = _py2bin_notes.get("return", _py2bin_base.empty)
+        return _py2bin_base.replace(
+            parameters=_py2bin_parts, return_annotation=_py2bin_back
+        )
 '''
 
 #: The in-place form of each operator, for `x += y` and its relatives. The

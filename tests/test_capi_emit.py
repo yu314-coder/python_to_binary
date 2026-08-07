@@ -3454,6 +3454,26 @@ class CApiEmitTests(unittest.TestCase):
             b"{'v': <class 'int'>, 'return': <class 'str'>} 1\n",
         )
 
+    def test_a_signature_shows_what_the_parameters_were_annotated_with(self):
+        """The doc slot carries names and defaults and cannot carry these.
+
+        It is the shape `inspect` reads a *builtin's* signature out of, and
+        CPython's own builtins have no annotations to say. The two halves are
+        held separately here, so they are put back together when somebody
+        asks - and not before, because almost nobody does.
+        """
+
+        self._run(
+            "import inspect\n"
+            "def f(a: int, b: str = 'x', *r: float, k: bool = True) -> None:\n"
+            "    pass\n"
+            "def bare(a, b=1): pass\n"
+            "print(str(inspect.signature(f)))\n"
+            "print(str(inspect.signature(bare)), f.__annotations__['a'])\n",
+            b"(a: int, b: str = 'x', *r: float, k: bool = True) -> None\n"
+            b"(a, b=1) <class 'int'>\n",
+        )
+
     def test_wraps_over_a_holder_does_not_take_the_function_with_it(self):
         """`wraps` copies the whole of the wrapped object's `__dict__` over.
 

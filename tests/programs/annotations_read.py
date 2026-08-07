@@ -153,6 +153,16 @@ class Point:
 
 print(Point(1), Point(1).shift(2), Point.shift.__annotations__)
 
+# The parameters and defaults live in the doc slot, in the shape `inspect`
+# reads a builtin's signature out of - which has nowhere to say what a
+# parameter was annotated with. The two halves are put back together when
+# somebody asks, and not before.
+import inspect
+
+print(str(inspect.signature(plain)))
+print(str(inspect.signature(every_shape)))
+print(str(inspect.signature(Holder.method)))
+
 # Calls are untouched by any of this: a function of a fixed shape is called
 # directly in C and never goes through the name.
 total = 0

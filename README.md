@@ -1731,6 +1731,21 @@ source line because there is no source beside the binary to name.
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 103 programs run against CPython on every push.
 
+### 0.9.2 - the signature and the annotations, put back together
+
+A compiled function carries its parameters and defaults in the doc slot, in
+the shape `inspect` reads a *builtin's* signature out of - and that shape has
+nowhere to say what a parameter was annotated with, because CPython's own
+builtins have no annotations to say. So `inspect.signature(f)` came back with
+the right parameters and no types, where the same source under CPython shows
+both.
+
+The two halves are held separately, so they are put together when somebody
+asks for `__signature__` and not before: almost nobody asks, and a program
+that does not pays nothing for it.
+
+Suite 1,805 tests, corpus 886 of 886 comparable.
+
 ### 0.9.1 - what a function knows about itself
 
 The rest of what a compiled function could not say, and one module-level
