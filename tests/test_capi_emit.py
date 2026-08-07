@@ -3775,6 +3775,30 @@ class CApiEmitTests(unittest.TestCase):
             b"['x']\nTrue\n",
         )
 
+    def test_a_closure_capturing_a_genexp_target_is_refused(self):
+        """The list, set and dict forms were refused; this one raised.
+
+        A genexp becomes a generator function here and its names become
+        attributes of the object that runs it - so a closure written inside
+        one looked for a name that is not there and the *call* raised
+        `NameError`, naming a variable the program had plainly written. It
+        is the same disagreement the other comprehension forms refuse, and it
+        says so now instead.
+        """
+
+        with self.assertRaises(CApiEmitError) as caught:
+            python_to_capi_c(
+                "fs = list((lambda: i) for i in range(3))\n"
+                "print([f() for f in fs])\n"
+            )
+        self.assertIn("generator expression around it", str(caught.exception))
+        # The ordinary shapes are untouched.
+        self._run(
+            "print(sum(i for i in range(5)), list(i * 2 for i in range(3)))\n"
+            "print([f() for f in [lambda i=i: i for i in range(3)]])\n",
+            b"10 [0, 2, 4]\n[0, 1, 2]\n",
+        )
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 

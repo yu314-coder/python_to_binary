@@ -2106,6 +2106,49 @@ class _UnfoldChoices(ast.NodeTransformer):
         return ast.copy_location(ast.Name(id=held, ctx=ast.Load()), node)
 
 
+def _refuse_capturing_the_target(node: ast.GeneratorExp) -> None:
+    """A closure written inside a genexp cannot capture what the genexp binds.
+
+    Python closes over the variable, so every such closure sees the last
+    value the genexp produced - `list((lambda: i) for i in range(3))` is
+    `[2, 2, 2]`. A genexp here becomes a generator function and its names
+    become attributes of the object that runs it, so the closure looked for
+    `i` where there is none and the call raised `NameError` naming a variable
+    the program had plainly written.
+
+    Refused where the list, set and dict forms are already refused, and for
+    the same reason: capturing by value would answer `[0, 1, 2]`, and a
+    disagreement is worth saying rather than arriving at.
+    """
+
+    bound = {
+        name.id
+        for clause in node.generators
+        for name in ast.walk(clause.target)
+        if isinstance(name, ast.Name)
+    }
+    for inner in ast.walk(node):
+        if not isinstance(inner, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        read = {
+            name.id
+            for name in ast.walk(inner)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load)
+        }
+        caught = sorted(read & bound)
+        if caught:
+            spelled = ", ".join(caught)
+            raise GeneratorRewriteError(
+                inner,
+                f"this closure captures {spelled} from the generator "
+                f"expression around it, which rebinds it on every turn - "
+                f"captures are taken by value here, so every closure would "
+                f"see a different value where Python gives them all the last "
+                f"one. Write it as a default (`lambda {caught[0]}="
+                f"{caught[0]}: ...`) to say the by-value thing",
+            )
+
+
 class _Genexps(ast.NodeTransformer):
     """`(elt for x in it)` written as the generator function it is.
 
@@ -2136,6 +2179,7 @@ class _Genexps(ast.NodeTransformer):
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> ast.AST:
         # Inner ones first, so a genexp inside another is already a call.
         self.generic_visit(node)
+        _refuse_capturing_the_target(node)
         if any(clause.is_async for clause in node.generators):
             # An async one is a different animal and is unfolded elsewhere.
             return node

@@ -1773,6 +1773,30 @@ source line because there is no source beside the binary to name.
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 107 programs run against CPython before each release.
 
+### 0.9.7 - a genexp that raised where its siblings refused
+
+A closure written inside a comprehension shares the comprehension's variable,
+so every one of them sees the last value: `[lambda: i for i in range(3)]` is
+`[2, 2, 2]`. Captures here are taken by value, which would answer
+`[0, 1, 2]`, and the list, set and dict forms say so and refuse. The
+*generator expression* form did not - it became a generator function whose
+names live on the object that runs it, so the closure looked for a name that
+is not there and the call raised `NameError`, naming a variable the program
+had plainly written. It is refused now, in the same words as its siblings.
+
+**I tried to lift the refusal altogether and put it back.** A comprehension's
+target is a loop variable, and py2bin already gives a loop variable captured
+by a closure a cell - `for n in range(3): fs.append(lambda: n)` has answered
+`[2, 2, 2]` for some time. Extending that to comprehension targets made the
+simple case right and made another case *wrong*: since 3.12 a comprehension
+is inlined into the scope around it and a variable of the same name outside
+is saved and restored around it, so `j = 'outer'` before the comprehension
+must still be `'outer'` after. The cell rewrite clobbered it. Turning a
+refusal into a wrong answer is the wrong direction, so it went back, and what
+it would take is written down here rather than half-done.
+
+Suite 1,817 tests, corpus 886 of 886 comparable.
+
 ### 0.9.6 - `dir()`, which was refused for wanting a frame it does not want
 
 `dir()` with nothing passed is `sorted(locals())`, and in a module `locals()`
