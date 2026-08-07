@@ -108,10 +108,13 @@ _READS_EVERY_LOCAL = frozenset({"locals", "vars", "eval", "exec", "globals"})
 def reads_every_local(body: list) -> bool:
     """Whether this body can look at its locals without naming them.
 
-    `locals()` and `vars()` answer with every slot, so a name held in a
-    machine register rather than an object would be missing from what they
-    hand back. A function that calls one keeps all of its names as objects:
-    the narrowing is a speed decision, and this is a correctness one.
+    `locals()`, `vars()` and a bare `dir()` answer with every slot, so a name
+    held in a machine register rather than an object would be missing from
+    what they hand back. A function that calls one keeps all of its names as
+    objects: the narrowing is a speed decision, and this is a correctness one.
+
+    `dir(x)` asks about `x` and nothing about this function, so only the form
+    with nothing in the brackets counts.
     """
 
     for statement in body:
@@ -119,6 +122,14 @@ def reads_every_local(body: list) -> bool:
             if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
                 if inner.id in _READS_EVERY_LOCAL:
                     return True
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "dir"
+                and not inner.args
+                and not inner.keywords
+            ):
+                return True
     return False
 
 
@@ -148,6 +159,17 @@ def write_only_locals(body: list, parameters: set[str]) -> set[str]:
     barred: set[str] = set(parameters)
     for statement in body:
         for inner in ast.walk(statement):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "dir"
+                and not inner.args
+                and not inner.keywords
+            ):
+                # A bare `dir()` reads every local without naming one, so a
+                # shared slot would list a name as bound because a *different*
+                # unread name had been written to it.
+                return set()
             if isinstance(inner, ast.Name):
                 if isinstance(inner.ctx, ast.Load):
                     if inner.id in _READS_EVERY_LOCAL:
@@ -2588,19 +2610,30 @@ class CApiEmitter:
         compile time rather than a wrong answer at run time.
         """
 
-        if node.func.id == "dir":
-            # `dir()` with nothing passed lists the calling frame's names,
-            # and a compiled function has no frame - it answered with a
-            # SystemError about one not existing. `dir(x)` is untouched.
-            raise self.fail(
-                node,
-                "dir() with no argument lists the calling frame's names, and "
-                "a compiled function has no frame - pass what you want listed",
-            )
-        if node.func.id == "globals" or self.at_module_level:
+        # `dir()` with nothing passed is `sorted(locals())`, and in a module
+        # `locals()` is `globals()` - so it is the same two answers this
+        # already builds, with the names taken out and put in order. It was
+        # refused for wanting a frame it does not want.
+        wants_names = node.func.id == "dir"
+        if self.class_scope and node.func.id != "globals":
+            # A class body's `locals()` is the namespace the class is being
+            # made from, not the module's - `dir()` there lists what the body
+            # has bound so far, which is what `enum` and `dataclasses`-style
+            # introspection in a class body is asking for.
+            namespace = self.class_scope[-1][0]
+            held = self.temporary()
+            self.emit(f"Py_IncRef({namespace});", indent)
+            self.emit(f"{held} = {namespace};", indent)
+            return self.sorted_names(held, indent) if wants_names else held
+        if node.func.id == "globals" or (wants_names and self.at_module_level):
             # At module scope Python's `locals()` *is* `globals()`, and this
             # is the module's own dictionary rather than a copy of it, so a
             # write through what comes back changes the program's globals.
+            held = self.temporary()
+            self.emit(f"Py_IncRef({self.globals_name});", indent)
+            self.emit(f"{held} = {self.globals_name};", indent)
+            return self.sorted_names(held, indent) if wants_names else held
+        if self.at_module_level:
             held = self.temporary()
             self.emit(f"Py_IncRef({self.globals_name});", indent)
             self.emit(f"{held} = {self.globals_name};", indent)
@@ -2621,7 +2654,21 @@ class CApiEmitter:
                 indent + 1,
             )
             self.emit("}", indent)
-        return target
+        return self.sorted_names(target, indent) if wants_names else target
+
+    def sorted_names(self, mapping: str, indent: int) -> str:
+        """The keys of a scope, in order - which is what `dir()` answers with.
+
+        The interpreter's own `sorted`, not whatever the program may have
+        bound that name to: what `dir()` answers does not depend on it.
+        """
+
+        order = self.builtin("sorted", indent)
+        listed = self.temporary()
+        self.emit(f"{listed} = PyObject_CallOneArg({order}, {mapping});", indent)
+        self.emit(f"Py_DecRef({order});", indent)
+        self.emit(f"Py_DecRef({mapping});", indent)
+        return self.checked(listed, indent)
 
     def scope_locals(self) -> list[str]:
         """The names a `locals()` here should answer with, in Python's order.
@@ -9159,6 +9206,21 @@ class CApiEmitter:
                     isinstance(inner, ast.Name)
                     and isinstance(inner.ctx, ast.Load)
                     and inner.id in ("globals", "eval", "exec")
+                )
+                or (
+                    # At module level `locals()` *is* `globals()`, and a bare
+                    # `dir()` is `sorted()` of it - so the names have to be in
+                    # a dictionary to be handed back or listed. Reading one
+                    # without this emitted a read of a slot that was never
+                    # declared, and the failure came out as an error in the
+                    # generated C rather than as anything a reader could act
+                    # on. The form with an argument asks nothing of this
+                    # module and does not count.
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id in ("dir", "locals", "vars")
+                    and not inner.args
+                    and not inner.keywords
                 )
                 or (
                     # `from m import *` binds names nobody wrote down, so

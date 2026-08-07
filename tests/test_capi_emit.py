@@ -3712,6 +3712,69 @@ class CApiEmitTests(unittest.TestCase):
         )
         self._run(source, b"settled True\n")
 
+    def test_dir_with_no_argument_lists_the_scope(self):
+        """It is `sorted(locals())`, and in a module `sorted(globals())`.
+
+        Both are answers this already builds, so the refusal was for a frame
+        it does not need. The two analyses that let a name go missing have to
+        know about it as well: narrowing would keep a name in a register
+        where no dictionary can see it, and a name written and never read
+        shares one slot with every other such name - which would list a name
+        as bound because a *different* one had been written to it.
+        """
+
+        self._run(
+            "def f(a, b=2):\n"
+            "    c = a + b\n"
+            "    print(dir())\n"
+            "    d = 'x'\n"
+            "    never_read = 1\n"
+            "    print(dir())\n"
+            "    return c, d\n"
+            "f(1)\n"
+            "class C:\n"
+            "    x = 1\n"
+            "    seen = [n for n in dir() if not n.startswith('_')]\n"
+            "print(C.seen)\n"
+            "alpha = 2\n"
+            "print([n for n in dir() if not n.startswith('_')])\n",
+            b"['a', 'b', 'c']\n"
+            b"['a', 'b', 'c', 'd', 'never_read']\n"
+            b"['x']\n"
+            b"['C', 'alpha', 'f']\n",
+        )
+
+    def test_a_scope_read_in_a_generator_is_refused(self):
+        """A generator's names live on the object that runs it.
+
+        So `locals()` compiled in place looks at that object and finds one
+        name, `self`. Answering that is worse than not answering: the caller
+        cannot tell. Refused with somewhere to go instead.
+        """
+
+        for spelling in ("locals()", "dir()", "vars()"):
+            with self.assertRaises(CApiEmitError) as caught:
+                python_to_capi_c(
+                    f"def g():\n    a = 1\n    yield {spelling}\n"
+                    "print(list(g()))\n"
+                )
+            self.assertIn("the object that runs it", str(caught.exception))
+
+    def test_a_module_level_locals_is_the_module(self):
+        """It used to fail in the generated C rather than anywhere useful.
+
+        `locals()` at module level is `globals()`, which lives in a
+        dictionary only when the module asks for one - and this did not count
+        as asking, so the emitted code read a slot that was never declared.
+        """
+
+        self._run(
+            "x = 1\n"
+            "print([n for n in locals() if not n.startswith('_')])\n"
+            "print(locals() is globals())\n",
+            b"['x']\nTrue\n",
+        )
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 

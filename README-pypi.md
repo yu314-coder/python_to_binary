@@ -13,7 +13,9 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.5 makes `freeze` work on Homebrew's Python**, which it did not: the
+**0.9.6 makes `dir()` work** in every scope, and stops `locals()` at module level failing to compile.
+
+**0.9.5 made `freeze` work on Homebrew's Python**, which it did not: the
 bundle carried a `bin/python3` that is a stub handing over to a file the
 bundle did not have, so it built cleanly and died at start-up. It also fixes
 what a frozen program's `__main__` looked like** - `__package__`
@@ -741,6 +743,36 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.6 - `dir()`, which was refused for wanting a frame it does not want
+
+`dir()` with nothing passed is `sorted(locals())`, and in a module `locals()`
+is `globals()`. Both are answers the compiler already builds - it knows every
+name a function binds and can look at each slot to see whether it holds
+anything yet - so the refusal was for a frame that is not needed. It works
+now, in functions, methods, class bodies and at module level.
+
+Two analyses had to learn about it, and each was a wrong answer waiting:
+narrowing keeps a name in a machine register where no dictionary can see it,
+and a name written and never read shares one slot with every other such name
+- which listed a name as bound because a *different* unread name had been
+written to that slot. Both step aside for a bare `dir()`, as they already did
+for `locals()`.
+
+**`locals()` at module level did not compile at all.** It is `globals()`
+there, which lives in a dictionary only when the module asks for one, and
+this did not count as asking - so the emitted code read a slot that was never
+declared and the build failed with an error in the generated C, which is no
+use to anybody. It counts now, and so does a class body's, where `locals()`
+is the namespace the class is being made from rather than the module's.
+
+**And `locals()` inside a generator is refused rather than answered.** A
+generator's names are cut out of it and kept on the object that runs it, so a
+`locals()` compiled in place looks at that object and finds one name: `self`.
+It answered `{'self': ...}`, which is a wrong answer rather than a missing
+one - the caller cannot tell. It now says so, with somewhere to go instead.
+
+Suite 1,816 tests, corpus 886 of 886 comparable, benchmark unmoved.
 
 ### 0.9.5 - what the other two tiers were doing
 

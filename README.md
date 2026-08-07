@@ -599,7 +599,7 @@ CPython, and requiring identical stdout and exit status.
 | `c and await g()`, `await g() if c else x`, `while await g():` | ✅ |
 | a generator expression, evaluated when asked rather than at once | ✅ |
 | a generator `def` inside an `if`, a `for`, or another generator | ✅ |
-| `dir()` with no argument | ❌ refused |
+| `dir()` with no argument, in any scope | ✅ |
 | `abc.abstractmethod`, `functools.wraps` - both write on a function | ✅ |
 | `f.__annotations__`, `typing.get_type_hints`, `singledispatch` | ✅ |
 | `f.__doc__` and a class's, so `help()` and `inspect.getdoc` answer | ✅ |
@@ -1267,7 +1267,7 @@ CPython's semantics rather than restricting them. Where the two differ:
 | a traceback naming a source line | ✗ | ✓ | Nuitka carries code objects with filenames; py2bin prints the exception line alone |
 | `inspect.getsource` | ✗ | ✓ | there is no source beside the binary to read |
 | `lambda: i` capturing a comprehension's target | refused | ✓ | captures are by value here, so Python's answer would need cells |
-| `dir()` with no argument | refused | ✓ | there is no frame to enumerate |
+| `locals()` inside a generator | refused | ✓ | its names live on the object that runs it, so an answer would be the wrong one |
 | `except*` (PEP 654) | ✓ | ✗ | py2bin rewrites it and agrees with CPython on 42,100 shapes; Nuitka answers differently |
 
 What is left is one fact and its consequences: a compiled function is a
@@ -1772,6 +1772,36 @@ source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 107 programs run against CPython before each release.
+
+### 0.9.6 - `dir()`, which was refused for wanting a frame it does not want
+
+`dir()` with nothing passed is `sorted(locals())`, and in a module `locals()`
+is `globals()`. Both are answers the compiler already builds - it knows every
+name a function binds and can look at each slot to see whether it holds
+anything yet - so the refusal was for a frame that is not needed. It works
+now, in functions, methods, class bodies and at module level.
+
+Two analyses had to learn about it, and each was a wrong answer waiting:
+narrowing keeps a name in a machine register where no dictionary can see it,
+and a name written and never read shares one slot with every other such name
+- which listed a name as bound because a *different* unread name had been
+written to that slot. Both step aside for a bare `dir()`, as they already did
+for `locals()`.
+
+**`locals()` at module level did not compile at all.** It is `globals()`
+there, which lives in a dictionary only when the module asks for one, and
+this did not count as asking - so the emitted code read a slot that was never
+declared and the build failed with an error in the generated C, which is no
+use to anybody. It counts now, and so does a class body's, where `locals()`
+is the namespace the class is being made from rather than the module's.
+
+**And `locals()` inside a generator is refused rather than answered.** A
+generator's names are cut out of it and kept on the object that runs it, so a
+`locals()` compiled in place looks at that object and finds one name: `self`.
+It answered `{'self': ...}`, which is a wrong answer rather than a missing
+one - the caller cannot tell. It now says so, with somewhere to go instead.
+
+Suite 1,816 tests, corpus 886 of 886 comparable, benchmark unmoved.
 
 ### 0.9.5 - what the other two tiers were doing
 

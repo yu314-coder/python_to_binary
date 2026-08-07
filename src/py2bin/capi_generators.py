@@ -1157,6 +1157,35 @@ class _WithRewriter(ast.NodeTransformer):
         ]
 
 
+def _refuse_scope_calls(node: ast.FunctionDef) -> None:
+    """`locals()` here would answer with the machine's names, not the body's.
+
+    A generator's locals are cut out of it and kept as attributes of the
+    object that runs it, so a `locals()` compiled in place looks at that
+    object and finds one name: `self`. It answered `{'self': ...}` and a bare
+    `dir()` answered `['self']`, which is a wrong answer rather than a
+    missing one - the caller has no way to tell.
+
+    Refused with somewhere to go instead. Naming what you want listed works,
+    and so does reading the names directly.
+    """
+
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
+            continue
+        if not isinstance(inner.func, ast.Name):
+            continue
+        if inner.func.id not in ("locals", "vars", "dir"):
+            continue
+        raise GeneratorRewriteError(
+            inner,
+            f"`{inner.func.id}()` with nothing passed, inside a generator or "
+            "`async def` - the body's names are kept on the object that runs "
+            "it, so this would answer with that object's names rather than "
+            "the body's. Name what you want listed",
+        )
+
+
 def rewrite(
     node: ast.FunctionDef,
     index: int,
@@ -1176,6 +1205,7 @@ def rewrite(
     # machine stores them like any other parameter. Refusing them refused
     # `async def __aexit__(self, *exc)`, which is how that method is written.
     parameters = _every_parameter(node.args)
+    _refuse_scope_calls(node)
     if "self" in parameters:
         # A method's first parameter is spelled the same as the machine's own
         # receiver, and every name the function binds is rewritten to an
