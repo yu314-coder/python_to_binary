@@ -3977,6 +3977,43 @@ class CApiEmitTests(unittest.TestCase):
             "2 10 3\n\U0001f40d python 1\n".encode("utf-8"),
         )
 
+    def test_the_same_source_compiles_to_the_same_c(self):
+        """A build nobody can reproduce is a build nobody can check.
+
+        The temporaries a class body's bindings go into were named after the
+        *address* of the statement, which is different on every run - so the
+        same source gave two different C files and, often enough, two
+        different binaries. Numbered in the order the bodies are written now.
+
+        Compiled twice in this one process, which is the weaker half of the
+        check; the stronger half is that every program in `tests/programs`
+        compiles identically in two *separate* processes, where the hash seed
+        differs and any name taken from an unsorted set would move.
+        """
+
+        source = (
+            "class C:\n"
+            "    if True:\n"
+            "        made = 1\n"
+            "        other = 2\n"
+            "    for i in range(2):\n"
+            "        pass\n"
+            "class D:\n"
+            "    try:\n"
+            "        held = 3\n"
+            "    except Exception:\n"
+            "        held = 4\n"
+            "def f(a, b=1):\n"
+            "    return a + b\n"
+            "print(C.made, D.held, f(1))\n"
+        )
+        first = python_to_capi_c(source, "program.py")
+        second = python_to_capi_c(source, "program.py")
+        self.assertEqual(first, second)
+        # And nothing in it is named after where an object happened to sit.
+        self.assertNotIn("_py2bin_cls0_", first)
+        self.assertIn("_py2bin_cls1_", first)
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 

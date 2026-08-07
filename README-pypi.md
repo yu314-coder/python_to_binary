@@ -768,7 +768,17 @@ spells a Python name into C, which is why the first of those is not a
 problem, but it is the kind of thing that is, so it is now checked rather
 than assumed.
 
-Suite 1,823 tests, corpus 886 of 886 comparable.
+**Builds are reproducible.** The temporaries a class body's bindings go into
+were named after the *address* of the statement, which is different on every
+run - so the same source gave two different C files and, often enough, two
+different binaries. A build nobody can reproduce is a build nobody can check
+against another, which matters rather more for something that ships machine
+code. They are numbered in the order the bodies are written now, and every
+program in `tests/programs` compiles byte-identically in two separate
+processes, where the hash seed differs and any name taken from an unsorted
+set would move.
+
+Suite 1,824 tests, corpus 886 of 886 comparable.
 
 ### 0.9.9 - names of its own, in somebody else's namespace
 

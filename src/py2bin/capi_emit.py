@@ -1386,6 +1386,10 @@ class CApiEmitter:
         #: `(python name, C key)` for each module compiled alongside the entry,
         #: in the order their bodies must run.
         self.linked: list[tuple[str, str]] = []
+        #: How many class-body statements have been written, which is what
+        #: names the temporaries each one's bindings go into. A counter
+        #: rather than an address, so the same source compiles to the same C.
+        self.class_bodies = 0
         #: True when another module in the program imports `__main__` and so
         #: expects to read the entry's globals off it.
         self.entry_is_read = False
@@ -8176,7 +8180,14 @@ class CApiEmitter:
         # A name the body declared `global` is the module's, not the class's:
         # it keeps its own spelling and no copy of it is put in the namespace.
         bound = sorted(_scope_bindings([statement]) - (declared or set()))
-        renamed = {name: f"_py2bin_cls{id(statement) & 0xFFFF}_{name}" for name in bound}
+        # Numbered in the order the bodies are written, not by the address of
+        # the statement. An address is different on every run, so the same
+        # source compiled twice gave two different C files and two different
+        # binaries - a build nobody could reproduce or check against another.
+        self.class_bodies += 1
+        renamed = {
+            name: f"_py2bin_cls{self.class_bodies}_{name}" for name in bound
+        }
         if renamed:
             statement = _Renamed(renamed).visit(
                 copy.deepcopy(statement)
