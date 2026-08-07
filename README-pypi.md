@@ -744,6 +744,32 @@ neither.
 
 Newest first. The full history is in the repository.
 
+### 0.9.10 - a source file is not always UTF-8
+
+Every tier read program source as UTF-8 and nothing else. Python does not:
+a file may open with a byte-order mark, and it may say what it is in a
+`# -*- coding: ... -*-` line. Both are honoured there, so a program with `é`
+in a Latin-1 file runs under the interpreter and was refused here with a
+codec error naming a byte offset - which says nothing about what to do, and
+is not even the compiler's own diagnostic.
+
+`tokenize.open` is the standard library's answer to exactly this question,
+and is what `ast.parse` would have used had it been handed a file rather than
+a string. It is now what reads a program, in `compile-capi`, in the native
+tier, in the dependency analyser, and in the capability report; the frozen
+bootstrap hands `compile` the bytes, which reads both itself.
+
+The rest of that sweep found nothing, which is worth saying: a name spelled
+in another alphabet - `变量`, `Σ.λ`, `función` - already worked, as did CRLF
+line endings, a file with no newline at the end, tab indentation, a
+five-hundred-element list literal, four hundred locals in one function, two
+hundred functions in one module, and forty nested brackets. The emitter never
+spells a Python name into C, which is why the first of those is not a
+problem, but it is the kind of thing that is, so it is now checked rather
+than assumed.
+
+Suite 1,823 tests, corpus 886 of 886 comparable.
+
 ### 0.9.9 - names of its own, in somebody else's namespace
 
 An adversarial sweep this time: programs written to collide with the compiler

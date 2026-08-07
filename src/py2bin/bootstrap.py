@@ -86,7 +86,9 @@ def _run_as_script(entry: Path) -> None:
         "__main__", str(entry)
     )
     sys.modules["__main__"] = module
-    code = compile(entry.read_text(encoding="utf-8"), str(entry), "exec")
+    # From bytes: `compile` reads a byte-order mark and a coding line
+    # itself, where decoding as UTF-8 first would refuse a Latin-1 file.
+    code = compile(entry.read_bytes(), str(entry), "exec")
     exec(code, module.__dict__)
 
 

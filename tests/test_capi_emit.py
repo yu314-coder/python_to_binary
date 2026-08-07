@@ -25,6 +25,7 @@ from pathlib import Path
 
 from py2bin.capi_emit import (
     CApiEmitter,
+    read_source,
     CApiEmitError,
     python_program_to_capi_c,
     python_to_capi_c,
@@ -3872,6 +3873,108 @@ class CApiEmitTests(unittest.TestCase):
             "    yield 2\n"
             "print(list(gen()), object, type(1))\n",
             b"[1, 2] mine mine-type\n",
+        )
+
+    def test_source_is_decoded_the_way_python_decodes_it(self):
+        """Not UTF-8 and nothing else.
+
+        A file may open with a byte-order mark and may say what it is in a
+        `# -*- coding: ... -*-` line - Python honours both, so a program with
+        `\u00e9` in a Latin-1 file runs there. Here it was refused with a
+        codec error naming a byte offset, which says nothing about the
+        program. `tokenize.open` is the standard library's own answer.
+        """
+
+        from py2bin.capi_emit import read_source
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marked = root / "bom.py"
+            marked.write_bytes(b"\xef\xbb\xbfx = 2\n")
+            self.assertEqual(read_source(marked), "x = 2\n")
+            declared = root / "latin.py"
+            declared.write_bytes(
+                b"# -*- coding: latin-1 -*-\ns = '\xe9'\n"
+            )
+            self.assertIn("\u00e9", read_source(declared))
+            plain = root / "plain.py"
+            plain.write_text("s = '\u00e9'\n", encoding="utf-8")
+            self.assertIn("\u00e9", read_source(plain))
+
+    def test_a_name_need_not_be_ascii(self):
+        """A Python identifier is not a C identifier, and need not look like one."""
+
+        self._run(
+            "def funci\u00f3n(x):\n"
+            "    return x + 1\n"
+            "\u53d8\u91cf = 5\n"
+            "class \u03a3:\n"
+            "    \u03bb\u03ac\u03bc\u03b4\u03b1 = 3\n"
+            "    def \u03bc\u03ad\u03b8\u03bf\u03b4\u03bf\u03c2(self):\n"
+            "        return \u03a3.\u03bb\u03ac\u03bc\u03b4\u03b1\n"
+            "print(funci\u00f3n(\u53d8\u91cf), \u03a3().\u03bc\u03ad\u03b8\u03bf\u03b4\u03bf\u03c2())\n",
+            "6 3\n".encode("utf-8"),
+        )
+
+    def test_source_is_decoded_the_way_python_decodes_it(self):
+        """Not UTF-8 and nothing else.
+
+        A file may open with a byte-order mark, and it may say what it is in
+        a `# -*- coding: ... -*-` line. Python honours both, so a program
+        with `é` in a Latin-1 file runs there - and was refused here with a
+        codec error naming a byte offset, which says nothing about what to do.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            written = {
+                "bom.py": "\ufeffx = 2\nprint('bom', x)\n".encode("utf-8"),
+                "latin.py": (
+                    b"# -*- coding: latin-1 -*-\n"
+                    b"s = '\xe9t\xe9'\nprint(s, len(s))\n"
+                ),
+                "crlf.py": b"x = 1\r\ndef f():\r\n    return x + 1\r\nprint(f())\r\n",
+                "bare.py": b"print('no newline at the end')",
+            }
+            for name, data in written.items():
+                (root / name).write_bytes(data)
+            for name in written:
+                entry = root / name
+                generated = python_to_capi_c(read_source(entry), str(entry))
+                self.assertIn("main", generated)
+                if not _HOST_IS_DARWIN_ARM64:
+                    continue
+                source = root / f"{entry.stem}.c"
+                source.write_text(generated, encoding="utf-8", newline="\n")
+                binary = root / f"{entry.stem}.bin"
+                compile_c_native(
+                    source, binary, target="darwin-arm64", clean=True
+                )
+                native = subprocess.run([str(binary)], capture_output=True)
+                reference = subprocess.run(
+                    [sys.executable, str(entry)], capture_output=True
+                )
+                self.assertEqual(native.stdout, reference.stdout, name)
+
+    def test_a_name_the_source_spells_in_another_alphabet(self):
+        """A Python name is not an ASCII name, and a C name is.
+
+        Nothing here goes wrong by accident - the emitter never spells a
+        Python name into C - but it is the kind of thing that does, so it is
+        checked rather than assumed.
+        """
+
+        self._run(
+            "def f(x):\n"
+            "    return x + 1\n"
+            "\u53d8\u91cf = 5\n"
+            "def \u51fd\u6570(\u503c):\n"
+            "    return \u503c * 2\n"
+            "class \u03a3:\n"
+            "    \u03bb = 3\n"
+            "print(f(1), \u51fd\u6570(\u53d8\u91cf), \u03a3.\u03bb)\n"
+            "print('\U0001f40d python', len('\U0001f40d'))\n",
+            "2 10 3\n\U0001f40d python 1\n".encode("utf-8"),
         )
 
     def test_a_program_of_several_modules_is_linked_into_one_image(self):

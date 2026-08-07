@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import tokenize
 import builtins
 import contextlib
 import sys
@@ -523,6 +524,22 @@ def _refuse_reserved_names(tree: ast.Module, emitter) -> None:
                 f"generator machines, and the object a decorator writes on "
                 f"all live there. Spell it another way",
             )
+
+
+def read_source(path: Path) -> str:
+    """A source file's text, decoded the way Python decodes one.
+
+    Not UTF-8 and nothing else. A file may start with a byte-order mark, and
+    it may say what it is in a `# -*- coding: ... -*-` line - and Python
+    honours both, so a program with `é` in a Latin-1 file runs there and was
+    refused here with a codec error naming a byte offset. `tokenize.open`
+    is the standard library's own answer to this question, and is what
+    `ast.parse` would have used had it been given a file rather than a
+    string.
+    """
+
+    with tokenize.open(path) as stream:
+        return stream.read()
 
 
 def _module_scope_bindings(tree: ast.Module) -> dict[str, int]:
@@ -10149,7 +10166,7 @@ def search_roots(entry: Path) -> list[Path]:
 
     root = entry.parent
     roots = [root]
-    tree = ast.parse(entry.read_text(encoding="utf-8"), str(entry))
+    tree = ast.parse(read_source(entry), str(entry))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -10275,7 +10292,7 @@ def imported_names(path: Path, package: str = "") -> set[str]:
     # Named, so a syntax error in the program says which file and not
     # "<unknown>", which is what `ast.parse` calls a source with no filename.
     for node in ast.walk(
-        ast.parse(path.read_text(encoding="utf-8"), str(path))
+        ast.parse(read_source(path), str(path))
     ):
         if isinstance(node, ast.Call):
             named = _named_import(node)
@@ -10396,12 +10413,12 @@ def python_program_to_capi_c(
             # have something to hang off.
             trees.append((name, ast.Module(body=[], type_ignores=[]), shown))
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = ast.parse(read_source(path))
         warn_as_python_would(tree, shown)
         tree = _Absolute(_package_of(name, path)).visit(tree)
         ast.fix_missing_locations(tree)
         trees.append((name, tree, shown))
-    entry_tree = ast.parse(entry.read_text(encoding="utf-8"))
+    entry_tree = ast.parse(read_source(entry))
     warn_as_python_would(entry_tree, entry)
     trees.append((entry.stem, entry_tree, str(entry)))
     return emitter.program(trees), [name for name, _ in modules]

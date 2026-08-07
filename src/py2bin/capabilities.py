@@ -6,12 +6,25 @@ deciding whether a build is possible.
 """
 
 from __future__ import annotations
+import tokenize
 
 import ast
 import dataclasses
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+def _read_source(path):
+    """A source file's text, decoded the way Python decodes one.
+
+    A file may open with a byte-order mark and may say what it is in a
+    `# -*- coding: ... -*-` line; Python honours both, so reading everything
+    as UTF-8 refused a Latin-1 file with a codec error naming a byte offset.
+    """
+
+    with tokenize.open(path) as stream:
+        return stream.read()
+
 
 from .native.frontend import NativeCompileError, lower
 
@@ -412,7 +425,7 @@ def assess_entry(
     entry = entry.expanduser().resolve()
     if not entry.is_file():
         raise FileNotFoundError(f"entry script does not exist: {entry}")
-    source = entry.read_text(encoding="utf-8")
+    source = _read_source(entry)
     tree = ast.parse(source, filename=str(entry))
     imports = _imports(tree)
     try:

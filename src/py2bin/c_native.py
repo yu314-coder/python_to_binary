@@ -14,12 +14,25 @@ hand-written .c file takes.
 """
 
 from __future__ import annotations
+import tokenize
 
 import ast
 import copy
 import dataclasses
 import re
 from pathlib import Path
+
+def _read_source(path):
+    """A source file's text, decoded the way Python decodes one.
+
+    A file may open with a byte-order mark and may say what it is in a
+    `# -*- coding: ... -*-` line; Python honours both, so reading everything
+    as UTF-8 refused a Latin-1 file with a codec error naming a byte offset.
+    """
+
+    with tokenize.open(path) as stream:
+        return stream.read()
+
 
 from .c_frontend import CCompileError, compile_c_to_ir
 from .csource import compile_to_c
@@ -1278,7 +1291,7 @@ def compile_c_native(
     if not entry.is_file():
         raise FileNotFoundError(f"C source does not exist: {entry}")
     resolved = target or host_target()
-    source = entry.read_text(encoding="utf-8")
+    source = _read_source(entry)
     module, _report = optimize(
         compile_c_to_ir(
             source,
@@ -1319,7 +1332,7 @@ def compile_python_via_c(
         raise ValueError("--c-output and native --output must be different paths")
     if c_artifact is not None and c_artifact.exists() and not clean:
         raise FileExistsError(f"output already exists: {c_artifact} (use --clean)")
-    c_source = compile_to_c(entry.read_text(encoding="utf-8"), str(entry))
+    c_source = compile_to_c(_read_source(entry), str(entry))
     # The generated C goes through py2bin's real C compiler, so this path
     # inherits everything that compiler can do -- division, floating point,
     # structs -- rather than the narrower shape the canonical-C bridge accepts.

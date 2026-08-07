@@ -1,4 +1,5 @@
 from __future__ import annotations
+import tokenize
 
 import ast
 import importlib.metadata as metadata
@@ -7,6 +8,18 @@ import re
 import sys
 from collections import deque
 from pathlib import Path
+
+def _read_source(path):
+    """A source file's text, decoded the way Python decodes one.
+
+    A file may open with a byte-order mark and may say what it is in a
+    `# -*- coding: ... -*-` line; Python honours both, so reading everything
+    as UTF-8 refused a Latin-1 file with a codec error naming a byte offset.
+    """
+
+    with tokenize.open(path) as stream:
+        return stream.read()
+
 
 from .hooks import hooks_for
 from .model import ImportAnalysis
@@ -17,7 +30,7 @@ _REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 def _imports_in(path: Path) -> tuple[set[str], list[tuple[int, str | None, tuple[str, ...]]]]:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = ast.parse(_read_source(path), filename=str(path))
     except (OSError, SyntaxError, UnicodeDecodeError):
         return set(), []
     found: set[str] = set()
