@@ -1278,6 +1278,26 @@ and binds like a method. Nothing else pays for it, and calls to a
 module-level function are untouched either way: one of those is called
 directly in C and never goes through the name at all.
 
+**And a corpus somebody wrote covers what somebody thought of.**
+[`tools/fuzz.py`](tools/fuzz.py) covers what nobody thought of: programs drawn
+at random from the grammar - nested control flow, classes, generators,
+`try`/`except`/`finally`, comprehensions, f-strings, augmented assignment -
+compiled, run, and compared with the interpreter character for character.
+Seeds are program numbers, so anything it finds is reproducible.
+
+Of 1,500 generated programs, **1,494 match exactly and none is refused**. The
+six that differ are all one thing: the program printed a function object,
+where CPython says `<function f at 0x...>` and a compiled program says
+`<built-in function f>`. That is the `PyCFunction` fact again, and it is the
+only difference this has ever turned up.
+
+The generator has two rules, both about the *program* being deterministic
+even though its shape is not: nothing that prints an address, a time, or a
+set of strings - string hashing is randomised per process, so a set of them
+does not iterate the same way twice under CPython either - and every loop
+bounded by a literal, with nothing that could be a counter ever augmented.
+A program that does not stop cannot be compared with itself.
+
 The corpus is [`tests/programs`](tests/programs). It is run against CPython
 before every release, on the machine described above, and
 [`.github/workflows/checks.yml`](.github/workflows/checks.yml) is set up to
