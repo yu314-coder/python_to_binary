@@ -472,3 +472,54 @@ class ExcludedModuleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             roots = self._roots(Path(directory))
             self.assertEqual(_drop_excluded(roots, ("PIL.NotThere",)), 0)
+
+
+class FrozenEntryDundersTests(unittest.TestCase):
+    """A frozen program's `__main__` is the one the interpreter would make.
+
+    `runpy.run_path` is the obvious way to start the entry and is not quite
+    what CPython does with a script named on its command line - it sets
+    `__package__` to the empty string where a script has None, and `exec`
+    puts the builtins *dictionary* where `__main__` has the module. Both are
+    the kind of difference that only shows up inside somebody else's library.
+    """
+
+    def _bootstrap(self) -> str:
+        """The bootstrap the freezer writes, without running a whole build."""
+
+        import inspect
+
+        from py2bin import freezer
+
+        source = inspect.getsource(freezer)
+        start = source.index('(stage / "py2bin_bootstrap.py").write_text(')
+        return source[start : source.index("encoding=", start)]
+
+    def test_the_entry_is_run_the_way_a_script_is_run(self):
+        written = self._bootstrap()
+        # The call, not the prose: the comment beside it explains why it
+        # is not used, and says the name.
+        self.assertNotIn("runpy.run_path(", written)
+        self.assertIn("module.__package__ = None", written)
+        self.assertIn("module.__spec__ = None", written)
+        self.assertIn("module.__builtins__ = builtins", written)
+        self.assertIn("SourceFileLoader", written)
+        # Where it is written, and both ways in - the plain launcher and the
+        # one that reports a crash to a log - going through the same starter.
+        self.assertIn("def _run(entry):", written)
+        self.assertEqual(written.count("_run(entry)"), 3)
+
+    def test_the_archive_bootstrap_agrees_with_it(self):
+        """`bootstrap.py` starts the onefile shape and had the same bug."""
+
+        root = Path(__file__).resolve().parents[1]
+        written = (root / "src" / "py2bin" / "bootstrap.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("runpy.run_path(", written)
+        for line in (
+            "module.__package__ = None",
+            "module.__spec__ = None",
+            "module.__builtins__ = builtins",
+        ):
+            self.assertIn(line, written)

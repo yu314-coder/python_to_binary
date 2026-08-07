@@ -28,6 +28,15 @@ There is a third, `compile`, which is not a general choice: it accepts a small
 subset of the language and no packages at all, in exchange for an artifact
 with no interpreter anywhere near it. Reach for it when that is the point.
 
+**Its integers are 64 bits wide and they wrap.** That is the one place in
+py2bin where a program can be quietly wrong rather than refused, so it is
+worth saying plainly: a runtime integer in the native tier is a machine word,
+and `v = v * 2` run seventy times answers 0 where Python answers
+1180591620717411303424. Constants are folded exactly - `2 ** 70` written down
+is right - so it is only values the program computes as it runs. The other
+two tiers use the interpreter's own arithmetic and are exact. If your program
+counts past 2^63 anywhere, this is not the tier for it.
+
 | | `freeze` | `compile-capi` | `compile` |
 |---|---|---|---|
 | **speed** on a 30M-iteration loop | 0.74 s | 0.44 s | **0.05 s** |
@@ -1763,6 +1772,34 @@ source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 107 programs run against CPython before each release.
+
+### 0.9.5 - what the other two tiers were doing
+
+Nineteen sweeps had all been aimed at `compile-capi`. These are the first at
+the other two.
+
+**A frozen program's `__main__` was not quite the one the interpreter makes.**
+`runpy.run_path` is the obvious way to start the entry and it sets
+`__package__` to the empty string, where a script named on CPython's command
+line has None; `exec` then put the builtins *dictionary* where `__main__` has
+the module. Both are the kind of difference that surfaces inside somebody
+else's library rather than in your own code - `if __package__ is None` is as
+common a way to ask "am I a script?" as the falsy test is, and it reads the
+other way round. The entry is now started the way CPython starts a script,
+with `__loader__` set as well, since the source really is in the bundle. Both
+shapes had it: the ordinary bundle and the onefile archive.
+
+Seventy-three probes were run through `freeze` to find that, and everything
+else it does matches the interpreter, which is what that tier is for.
+
+**The native tier's integers wrap at 64 bits, and the README did not say so.**
+The guide did. Forty-five probes over the native subset found no other silent
+difference - negative division and modulo signs, shifts, float promotion,
+`range` with a negative step, `while ... else`, nested calls all agree - so
+that one property is the whole of it, and it is now stated where the tiers
+are chosen between rather than only deep in the guide.
+
+Suite 1,811 tests.
 
 ### 0.9.4 - what a clause holds when it leaves early
 

@@ -13,7 +13,12 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.4 stops a `try` in a loop leaking.** A handler holds the exception it
+**0.9.5 fixes what a frozen program's `__main__` looked like** - `__package__`
+was the empty string where a script has None, and `__builtins__` the
+dictionary where `__main__` has the module - and says plainly, where the tiers
+are chosen between, that the native `compile` tier's integers wrap at 64 bits.
+
+**0.9.4 stopped a `try` in a loop leaking.** A handler holds the exception it
 caught and what was being handled before it, and released them only when the
 clause fell off its end - so `except E: raise F(...)`, a `return` out of a
 handler, and a generator whose handler suspends all leaked 160 bytes a turn.
@@ -733,6 +738,34 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.5 - what the other two tiers were doing
+
+Nineteen sweeps had all been aimed at `compile-capi`. These are the first at
+the other two.
+
+**A frozen program's `__main__` was not quite the one the interpreter makes.**
+`runpy.run_path` is the obvious way to start the entry and it sets
+`__package__` to the empty string, where a script named on CPython's command
+line has None; `exec` then put the builtins *dictionary* where `__main__` has
+the module. Both are the kind of difference that surfaces inside somebody
+else's library rather than in your own code - `if __package__ is None` is as
+common a way to ask "am I a script?" as the falsy test is, and it reads the
+other way round. The entry is now started the way CPython starts a script,
+with `__loader__` set as well, since the source really is in the bundle. Both
+shapes had it: the ordinary bundle and the onefile archive.
+
+Seventy-three probes were run through `freeze` to find that, and everything
+else it does matches the interpreter, which is what that tier is for.
+
+**The native tier's integers wrap at 64 bits, and the README did not say so.**
+The guide did. Forty-five probes over the native subset found no other silent
+difference - negative division and modulo signs, shifts, float promotion,
+`range` with a negative step, `while ... else`, nested calls all agree - so
+that one property is the whole of it, and it is now stated where the tiers
+are chosen between rather than only deep in the guide.
+
+Suite 1,811 tests.
 
 ### 0.9.4 - what a clause holds when it leaves early
 

@@ -1803,9 +1803,33 @@ def freeze(
         bootstrap_entry = repr(entry_relative)
         bootstrap_app_id = repr(windows_app_id)
         (stage / "py2bin_bootstrap.py").write_text(
-            "import os, runpy, sys\n"
+            "import os, sys\n"
             f"_ENTRY = {bootstrap_entry}\n"
             f"_WINDOWS_APP_ID = {bootstrap_app_id}\n"
+            # `runpy.run_path` is the obvious way to start the entry and is
+            # not quite what the interpreter does with a script named on its
+            # command line: it sets `__package__` to the empty string where a
+            # script has None. Small, and the kind of difference that only
+            # shows up inside somebody else's library - `if __package__ is
+            # None` is as common a way to ask "am I a script?" as the falsy
+            # test is, and it reads the other way. `__loader__` is set for the
+            # same reason: the source really is in the bundle.
+            "def _run(entry):\n"
+            "    import builtins, importlib.machinery, types\n"
+            "    module = types.ModuleType('__main__')\n"
+            # In `__main__` this is the builtins *module*; anywhere else it is
+            # that module's dictionary. `exec` puts the dictionary in when the
+            # globals have none, so it has to be set before rather than after.
+            "    module.__builtins__ = builtins\n"
+            "    module.__file__ = entry\n"
+            "    module.__package__ = None\n"
+            "    module.__spec__ = None\n"
+            "    module.__loader__ = importlib.machinery.SourceFileLoader(\n"
+            "        '__main__', entry)\n"
+            "    sys.modules['__main__'] = module\n"
+            "    with open(entry, 'rb') as stream:\n"
+            "        source = stream.read()\n"
+            "    exec(compile(source, entry, 'exec'), module.__dict__)\n"
             "def main(from_site=False):\n"
             "    root = os.path.dirname(os.path.abspath(__file__))\n"
             "    if _WINDOWS_APP_ID and sys.platform == 'win32':\n"
@@ -1823,11 +1847,11 @@ def freeze(
             "    sys.argv[0] = entry\n"
             "    os.environ['PY2BIN_BUNDLE_ROOT'] = root\n"
             "    if not from_site:\n"
-            "        runpy.run_path(entry, run_name='__main__')\n"
+            "        _run(entry)\n"
             "        return\n"
             "    status = 0\n"
             "    try:\n"
-            "        runpy.run_path(entry, run_name='__main__')\n"
+            "        _run(entry)\n"
             "    except SystemExit as error:\n"
             "        status = error.code if isinstance(error.code, int) else 1\n"
             "    except BaseException:\n"
