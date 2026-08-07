@@ -1246,6 +1246,7 @@ def rewrite(
     machine = _Machine(node)
     machine.names.update(parameters)
     machine.build()
+    _refuse_closures_over_locals(node, machine.names)
     rename = _ToAttributes(machine.names)
     dispatch: list[ast.stmt] = []
     for number in reversed(range(len(machine.blocks))):
@@ -1816,6 +1817,62 @@ def _raise_thrown() -> list[ast.stmt]:
     ).body
 
 
+def _refuse_closures_over_locals(node: ast.AST, held: set[str]) -> None:
+    """A closure written in a generator cannot reach the generator's names.
+
+    They are cut out of it and kept as attributes of the object that runs it,
+    so a `lambda` compiled in place looks for a plain local that is not there.
+    What came out was a `NameError` at the moment the closure was called,
+    naming a variable written plainly two lines above it - and for a
+    comprehension, a `SystemError` about a function returning NULL without an
+    exception, which says nothing to anybody.
+
+    A closure reaching *outwards*, past the generator to a name in the scope
+    around it, is untouched: that name is a capture like any other.
+    """
+
+    for inner in ast.walk(node):
+        if inner is node or not isinstance(
+            inner, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        bound = {
+            argument.arg
+            for arguments in [inner.args]
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                *([arguments.vararg] if arguments.vararg else []),
+                *([arguments.kwarg] if arguments.kwarg else []),
+            )
+        }
+        body = inner.body if isinstance(inner.body, list) else [inner.body]
+        for statement in body:
+            for name in ast.walk(statement):
+                if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store):
+                    bound.add(name.id)
+        wanted = sorted(
+            {
+                name.id
+                for statement in body
+                for name in ast.walk(statement)
+                if isinstance(name, ast.Name)
+                and isinstance(name.ctx, ast.Load)
+                and name.id in held
+                and name.id not in bound
+            }
+        )
+        if wanted:
+            raise GeneratorRewriteError(
+                inner,
+                f"this closure reads {', '.join(wanted)}, which belongs to the "
+                f"generator around it - a generator's names are kept on the "
+                f"object that runs it, so the closure would look for a local "
+                f"that is not there. Pass it in, as a default or an argument",
+            )
+
+
 def _kept(entry: int) -> str:
     """Where the exception a clause caught is kept while the clause runs."""
 
@@ -2252,6 +2309,13 @@ def expand_genexps(body: list[ast.stmt]) -> list[ast.stmt]:
         statement = maker.visit(statement)
         if maker.made:
             for made in maker.made:
+                # Where the expression it came from was written. Without a
+                # line of its own it was given line one, and the check that
+                # refuses a capture whose value is still moving then saw
+                # every name in the scope as bound *after* it - so
+                # `list(f(v) for v in xs)`, with `f` defined just above, was
+                # refused for a disagreement that was not there.
+                ast.copy_location(made, statement)
                 ast.fix_missing_locations(made)
             rebuilt.extend(maker.made)
         rebuilt.append(statement)

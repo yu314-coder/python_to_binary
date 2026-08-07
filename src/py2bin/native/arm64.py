@@ -1014,7 +1014,13 @@ def encode_windows(
                 words.extend(_mov(0, -11 if operation.fd == 1 else -12))
                 call("GetStdHandle")
                 string_index = len(words)
-                words.append(0)  # adr x1, data
+                # Two words: `adrp` then `add`. A single `adr` reaches about
+                # a megabyte, and the literals of a large program sit further
+                # away than that - which is where "arm64 literal is outside
+                # ADR range" came from, on Windows only, because every other
+                # target already used the pair.
+                words.append(0)  # adrp x1, page(data)
+                words.append(0)  # add  x1, x1, #offset-in-page
                 string_references.append((string_index, operation.data))
                 words.extend(_mov(2, len(operation.data)))
                 words.append(0x910003E3)  # mov x3, sp
@@ -1095,8 +1101,16 @@ def encode_windows(
     for instruction_index, name in refs.addresses:
         if name not in offsets:
             raise ValueError(f"address taken of undefined function {name!r}")
-        words[instruction_index] = _adr(
-            0, (offsets[name] - instruction_index) * 4
+        # Two words are reserved for this - see where `addresses` is
+        # recorded - and every other target fills both with `adrp`/`add`.
+        # This filled the first with a single `adr`, which reaches about a
+        # megabyte, and left the second as a zero word: an invalid
+        # instruction sitting in the middle of the code, waiting for a
+        # program large enough to reach it.
+        words[instruction_index], words[instruction_index + 1] = _adrp_add(
+            0,
+            code_address + instruction_index * 4,
+            code_address + offsets[name] * 4,
         )
     image = bytearray(struct.pack(f"<{len(words)}I", *words))
     for instruction_index, symbol in function_references:
@@ -1117,10 +1131,10 @@ def encode_windows(
         instruction_address = code_address + instruction_index * 4
         data_address = code_address + len(image)
         struct.pack_into(
-            "<I",
+            "<II",
             image,
             instruction_index * 4,
-            _adr(1, data_address - instruction_address),
+            *_adrp_add(1, instruction_address, data_address),
         )
         image.extend(data)
     if image_statics:

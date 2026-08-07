@@ -911,6 +911,13 @@ class _py2bin_bound_abstract:
         # `__name__` and the rest: `obj.method.__name__` asks the bound one.
         if _py2bin_wanted in ("owner", "obj"):
             raise AttributeError(_py2bin_wanted)
+        if _py2bin_wanted == "__signature__":
+            # The first parameter is the instance, and a bound method does
+            # not take it. Asking the owner gives the whole signature, `self`
+            # and all, which is what an *unbound* one has.
+            _py2bin_whole = self.owner.__signature__
+            _py2bin_rest = list(_py2bin_whole.parameters.values())[1:]
+            return _py2bin_whole.replace(parameters=_py2bin_rest)
         return getattr(self.owner, _py2bin_wanted)
 
 

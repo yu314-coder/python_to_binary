@@ -4014,6 +4014,78 @@ class CApiEmitTests(unittest.TestCase):
         self.assertNotIn("_py2bin_cls0_", first)
         self.assertIn("_py2bin_cls1_", first)
 
+    def test_a_closure_over_a_generators_own_name_is_refused(self):
+        """A generator's names are kept on the object that runs it.
+
+        So a `lambda` compiled in place looks for a plain local that is not
+        there. What came out was a `NameError` at the moment the closure was
+        called, naming a variable written plainly two lines above it - and
+        for a comprehension, a `SystemError` about a function returning NULL
+        without setting an exception, which says nothing to anybody.
+        """
+
+        with self.assertRaises(CApiEmitError) as caught:
+            python_to_capi_c(
+                "def g():\n"
+                "    base = 10\n"
+                "    yield (lambda: base)()\n"
+                "print(list(g()))\n"
+            )
+        self.assertIn("belongs to the generator around it", str(caught.exception))
+
+        # A generator expression reaches the same wall by another road: it
+        # becomes a function of its own, and the check that refuses a capture
+        # still moving gets there first. Refused either way, which is what
+        # matters - it used to compile and fail at the call.
+        with self.assertRaises(CApiEmitError):
+            python_to_capi_c(
+                "def g():\n"
+                "    def helper(n):\n"
+                "        return n * 2\n"
+                "    yield list(helper(v) for v in (1, 2))\n"
+                "print(list(g()))\n"
+            )
+
+        # A list comprehension is written out where it stands rather than
+        # becoming a function of its own, so it reads the generator's names
+        # directly and is right.
+        self._run(
+            "def g():\n"
+            "    def helper(n):\n"
+            "        return n * 2\n"
+            "    yield [helper(v) for v in (1, 2)]\n"
+            "print(list(g()))\n",
+            b"[[2, 4]]\n",
+        )
+
+        # Reaching *outwards*, past the generator, is an ordinary capture.
+        self._run(
+            "OUTSIDE = 10\n"
+            "def g():\n"
+            "    yield (lambda: OUTSIDE)()\n"
+            "    yield [OUTSIDE + v for v in (1, 2)]\n"
+            "print(list(g()))\n",
+            b"[10, [11, 12]]\n",
+        )
+
+    def test_a_genexp_calling_a_local_function_is_not_refused(self):
+        """The function it hoists had no line, so it looked like line one.
+
+        The check that refuses a capture whose value is still moving then saw
+        every name in the scope as bound *after* it, and
+        `list(f(v) for v in xs)` with `f` defined just above was refused for a
+        disagreement that was not there.
+        """
+
+        self._run(
+            "def outer():\n"
+            "    def one(n):\n"
+            "        return n * 2\n"
+            "    return list(one(v) for v in range(4))\n"
+            "print(outer())\n",
+            b"[0, 2, 4, 6]\n",
+        )
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 
