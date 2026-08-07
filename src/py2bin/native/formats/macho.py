@@ -32,6 +32,20 @@ def _adhoc_signature(
     identifier = b"local.py2bin.native\0"
     if page_size <= 0 or page_size & (page_size - 1):
         raise ValueError("code-signature page size must be a power of two")
+    # A code directory records how much it covers in a 32-bit field, so a
+    # signed Mach-O cannot be four gigabytes or more. Said here, because what
+    # came out otherwise was `struct.error: 'I' format requires 0 <= number
+    # <= 4294967295` from inside a packing call - true, and no help at all in
+    # working out that a bundle had swallowed something it should not have.
+    if code_limit >= 1 << 32:
+        raise ValueError(
+            f"the image is {code_limit / (1 << 30):.1f} GB, and a signed "
+            f"Mach-O cannot reach four - the code directory records what it "
+            f"covers in a 32-bit field. Something the bundle picked up is "
+            f"far larger than expected: check what is beside the entry, "
+            f"since a build written into the source directory is gathered up "
+            f"by the next one"
+        )
     page_exponent = page_size.bit_length() - 1
     slots = (code_limit + page_size - 1) // page_size
     directory_header_size = 88

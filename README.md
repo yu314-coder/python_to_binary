@@ -1806,6 +1806,16 @@ program in `tests/programs` compiles byte-identically in two separate
 processes, where the hash seed differs and any name taken from an unsorted
 set would move.
 
+Two smaller things from the same sweep. A signed Mach-O cannot reach four
+gigabytes - the code directory records what it covers in a 32-bit field - and
+what came out of exceeding it was `struct.error: 'I' format requires 0 <=
+number <= 4294967295`, from inside a packing call. True, and no help in
+working out that a bundle had gathered up something it should not have; it
+now says what the limit is and where to look. And the `freeze` options were
+swept for the first time - `--compact`, `--onefile`, `--onedir`,
+`--include`, `--exclude`, `--name`, all three `--dependency-mode` values -
+and all of them do what they say.
+
 Suite 1,824 tests, corpus 886 of 886 comparable.
 
 ### 0.9.9 - names of its own, in somebody else's namespace

@@ -577,3 +577,31 @@ class FrameworkStubTests(unittest.TestCase):
             app.is_dir(),
             f"{source} hands over to {app}, which is not there to carry",
         )
+
+
+class SignatureLimitTests(unittest.TestCase):
+    """A signed Mach-O cannot reach four gigabytes, and should say so.
+
+    The code directory records how much it covers in a 32-bit field. What
+    came out of exceeding it was `struct.error: 'I' format requires 0 <=
+    number <= 4294967295`, from inside a packing call - true, and no help at
+    all in working out that a bundle had gathered up something it should not
+    have.
+    """
+
+    def test_an_image_past_four_gigabytes_says_what_is_wrong(self):
+        from py2bin.native.formats.macho import _adhoc_signature
+
+        with self.assertRaises(ValueError) as caught:
+            _adhoc_signature(b"", 1 << 32, 16384, 1 << 32, page_size=16384)
+        said = str(caught.exception)
+        self.assertIn("four", said)
+        self.assertIn("32-bit", said)
+        # And points at the likeliest cause rather than stopping at the fact.
+        self.assertIn("source directory", said)
+
+    def test_an_ordinary_image_is_signed_without_complaint(self):
+        from py2bin.native.formats.macho import _adhoc_signature
+
+        signature = _adhoc_signature(b"\0" * 4096, 4096, 0, 4096)
+        self.assertTrue(signature)
