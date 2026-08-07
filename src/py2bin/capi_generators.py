@@ -1359,7 +1359,11 @@ def rewrite(
                     ctx=ast.Store(),
                 )
             ],
-            value=ast.Call(func=ast.Name(id="object", ctx=ast.Load()), args=[], keywords=[]),
+            # An empty list rather than `object()`: a fresh object is all
+            # this needs, and building one through a *name* meant a program
+            # that rebound `object` broke every generator in it. A list
+            # literal asks the program's namespace for nothing.
+            value=ast.List(elts=[], ctx=ast.Load()),
         ),
         ast.Assign(
             targets=[

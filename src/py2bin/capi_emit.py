@@ -479,6 +479,52 @@ _MODULE_DUNDERS = (
 )
 
 
+#: The prefix every name this compiler writes into a program begins with.
+_RESERVED = "_py2bin_"
+
+#: Except these, which it writes *for* the program to read. `_py2bin_dir` is
+#: how a compiled program finds the directory it is sitting in, and
+#: `_py2bin_crash` is what the crash report reads; both are part of what this
+#: hands over rather than part of how it works.
+_PUBLISHED = frozenset({"_py2bin_dir", "_py2bin_crash"})
+
+
+def _refuse_reserved_names(tree: ast.Module, emitter) -> None:
+    """A program may not use the names the compiler writes for itself.
+
+    Cells, generator machines, the holder a decorator writes on, the module's
+    globals slot - all of them are named with one prefix, and all of them go
+    into the program's own namespace. A program that already has a name of
+    that shape does not get a warning, it gets that name taken over: the
+    variable replaced by a cell, or a decorated function that is no longer
+    callable because `_py2bin_abstract` is now a string.
+
+    One prefix, one check, said where the name is written rather than
+    wherever it happens to break.
+    """
+
+    for node in ast.walk(tree):
+        spelled = None
+        if isinstance(node, ast.Name):
+            spelled = node.id
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            spelled = node.name
+        elif isinstance(node, ast.arg):
+            spelled = node.arg
+        elif isinstance(node, ast.alias):
+            spelled = node.asname or node.name
+        elif isinstance(node, ast.Attribute):
+            spelled = node.attr
+        if spelled and spelled.startswith(_RESERVED) and spelled not in _PUBLISHED:
+            raise emitter.fail(
+                node,
+                f"{spelled!r} begins with {_RESERVED!r}, which this compiler "
+                f"reserves for the names it writes into a program - cells, "
+                f"generator machines, and the object a decorator writes on "
+                f"all live there. Spell it another way",
+            )
+
+
 def _module_scope_bindings(tree: ast.Module) -> dict[str, int]:
     """How many times each name is bound *at module scope*.
 
@@ -9184,6 +9230,12 @@ class CApiEmitter:
         # Before anything else looks at the tree: a generator becomes a class
         # and a function that makes one, so nothing below ever sees a `yield`.
         try:
+            # Before anything else at all: everything below this writes
+            # names of its own into the tree, and a program that already has
+            # one of them would have it quietly taken over - a comprehension
+            # cell replacing the program's variable of that name, a rebound
+            # `_py2bin_abstract` making every decorated function uncallable.
+            _refuse_reserved_names(tree, self)
             # Before anything reads the tree, so the two small classes are
             # compiled like the program's own - which they now are.
             if _uses_abstract(tree) or (

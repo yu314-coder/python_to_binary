@@ -3828,6 +3828,52 @@ class CApiEmitTests(unittest.TestCase):
             b"3 False True\n3 3\n",
         )
 
+    def test_the_compilers_own_prefix_is_reserved(self):
+        """Every name this writes into a program begins with one prefix.
+
+        Cells, generator machines, the object a decorator is handed - all of
+        them go into the program's own namespace. A program that already has
+        a name of that shape did not get a warning, it got that name taken
+        over: a variable replaced by a cell, or a decorated function that was
+        no longer callable because `_py2bin_abstract` had become a string.
+        """
+
+        for source in (
+            "_py2bin_cell_i = 'mine'\nprint(_py2bin_cell_i)\n",
+            "_py2bin_state = 1\nprint(_py2bin_state)\n",
+            "def _py2bin_thing():\n    return 1\nprint(_py2bin_thing())\n",
+            "class C:\n    def m(_py2bin_recv):\n        return 1\n",
+            "import os as _py2bin_os\nprint(_py2bin_os)\n",
+        ):
+            with self.assertRaises(CApiEmitError) as caught:
+                python_to_capi_c(source)
+            self.assertIn("reserves for the names it writes", str(caught.exception))
+        # The two it writes *for* the program are not reserved from it -
+        # `ProgramLocationTests` compiles and runs one of them.
+        python_to_capi_c(
+            "import builtins\nprint(builtins._py2bin_dir)\n"
+        )
+
+    def test_a_program_may_rebind_what_the_compiler_leans_on(self):
+        """Generated code must not read the program's namespace for its own.
+
+        A generator's exhaustion sentinel was built by calling `object()`,
+        which is a *name* - so a program that rebound `object` broke every
+        generator in it with "'str' object is not callable". It asks the
+        program's namespace for nothing now.
+        """
+
+        self._run(
+            "object = 'mine'\n"
+            "type = lambda *a: 'mine-type'\n"
+            "iter = lambda *a: 'mine'\n"
+            "def gen():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+            "print(list(gen()), object, type(1))\n",
+            b"[1, 2] mine mine-type\n",
+        )
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 

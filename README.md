@@ -1772,6 +1772,35 @@ source line because there is no source beside the binary to name.
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 107 programs run against CPython before each release.
 
+### 0.9.9 - names of its own, in somebody else's namespace
+
+An adversarial sweep this time: programs written to collide with the compiler
+rather than to exercise Python. Every name py2bin writes into a program -
+cells, generator machines, the object a decorator is handed, the module's
+globals - goes into the program's own namespace, so a program that already
+has one of them does not get a warning. It gets that name taken over.
+
+A program with its own `_py2bin_cell_comp1_i` had it replaced by a
+comprehension's cell. One with `_py2bin_abstract = 'mine'` had every
+decorated function stop being callable, because the object a decorator is
+handed was now a string. Neither said anything about it.
+
+One prefix, one check: a name beginning with `_py2bin_` is refused with a
+`file:line:col`, said where the name is written rather than wherever it
+happens to break. Two are exempt, because they are written *for* the program
+to read rather than for the compiler to use: `_py2bin_dir`, which is how a
+compiled program finds the directory it is in, and `_py2bin_crash`.
+
+**And generated code must not read the program's namespace for its own.** A
+generator's exhaustion sentinel was built by calling `object()` - which is a
+*name*, so a program that rebound `object` broke every generator in it with
+"'str' object is not callable". It is an empty list now, which asks the
+program's namespace for nothing. Nine other shadowings were tried - `sorted`,
+`getattr`, `dict`, `type`, `iter`, `next`, `len`, `range`, `isinstance`,
+`super` - and all of them were already safe.
+
+Suite 1,820 tests, corpus 886 of 886 comparable, benchmark unmoved.
+
 ### 0.9.8 - a closure made in a comprehension, and two closures that were one
 
 0.9.7 said what it would take to lift the comprehension-capture refusal: a
