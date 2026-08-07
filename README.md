@@ -1278,8 +1278,15 @@ and binds like a method. Nothing else pays for it, and calls to a
 module-level function are untouched either way: one of those is called
 directly in C and never goes through the name at all.
 
-The corpus is [`tests/programs`](tests/programs) and it runs on every push -
-see [`.github/workflows/checks.yml`](.github/workflows/checks.yml).
+The corpus is [`tests/programs`](tests/programs). It is run against CPython
+before every release, on the machine described above, and
+[`.github/workflows/checks.yml`](.github/workflows/checks.yml) is set up to
+run it on every push as well - the suite on three operating systems and three
+Pythons, the corpus on Linux, and a cross-build for all six targets. **That
+workflow has not actually executed**: runs queue and never start on this
+account, so every number quoted here comes from running it locally rather
+than from a green tick. The workflow is what it says; what has not been
+demonstrated is the automation.
 
 
 **Apple M4** (10 cores - 4 performance, 6 efficiency - 24 GB, macOS 27.0,
@@ -1735,7 +1742,7 @@ not answer as they would for a Python function, and a traceback names no
 source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
-103 programs run against CPython on every push.
+107 programs run against CPython before each release.
 
 ### 0.9.4 - what a clause holds when it leaves early
 

@@ -1002,7 +1002,7 @@ not answer as they would for a Python function, and a traceback names no
 source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
-103 programs run against CPython on every push.
+107 programs run against CPython before each release.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
