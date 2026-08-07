@@ -3454,6 +3454,36 @@ class CApiEmitTests(unittest.TestCase):
             b"{'v': <class 'int'>, 'return': <class 'str'>} 1\n",
         )
 
+    def test_wraps_over_a_holder_does_not_take_the_function_with_it(self):
+        """`wraps` copies the whole of the wrapped object's `__dict__` over.
+
+        So anything the holder keeps there travels onto the wrapper. The
+        function it stands for is kept in a slot for exactly this reason:
+        with it in `__dict__`, a wrapper made by `wraps` came away holding
+        the function it was meant to be wrapping, and calling the wrapper ran
+        that function directly and skipped the wrapper's own body.
+        """
+
+        self._run(
+            "from functools import wraps\n"
+            "from typing import get_type_hints\n"
+            "ran = []\n"
+            "def watched(f):\n"
+            "    @wraps(f)\n"
+            "    def inner(*a):\n"
+            "        ran.append(1)\n"
+            "        return f(*a)\n"
+            "    return inner\n"
+            "class C:\n"
+            "    @watched\n"
+            "    def annotated(self, n: int) -> int: return n * 2\n"
+            "    @watched\n"
+            "    def bare(self, n): return n * 3\n"
+            "print(C().annotated(3), C().bare(3), len(ran))\n"
+            "print(C.annotated.__name__, C().annotated.__name__)\n",
+            b"6 9 2\nannotated annotated\n",
+        )
+
     def test_a_program_that_never_asks_keeps_the_plain_function(self):
         """The holder costs a hop to call, so nobody who does not ask pays it.
 

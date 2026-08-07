@@ -66,6 +66,35 @@ def decorated(x: int) -> str:
 
 print(decorated(1), decorated.__name__, decorated.__annotations__)
 
+# `wraps` copies the whole of the wrapped object's `__dict__` onto the
+# wrapper, so anything the holder keeps there travels with it. The function
+# it stands for is kept out of `__dict__` for exactly this reason: with it in
+# there, calling the wrapper ran the wrapped function and skipped the
+# wrapper's own body, and this counter stayed at nought.
+ran = []
+
+
+def watched(f):
+    @wraps(f)
+    def inner(*args):
+        ran.append(1)
+        return f(*args)
+
+    return inner
+
+
+class Watched:
+    @watched
+    def annotated(self, n: int) -> int:
+        return n * 2
+
+    @watched
+    def bare(self, n):
+        return n * 3
+
+
+print(Watched().annotated(3), Watched().bare(3), len(ran))
+
 
 class Interface(ABC):
     @abstractmethod

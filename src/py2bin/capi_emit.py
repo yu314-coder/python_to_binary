@@ -773,6 +773,8 @@ class _py2bin_annotate:
 
 class _py2bin_bound_abstract:
 
+    __slots__ = ("owner", "obj", "__dict__")
+
     def __init__(self, _py2bin_owner, _py2bin_obj):
         self.owner = _py2bin_owner
         self.obj = _py2bin_obj
@@ -782,21 +784,32 @@ class _py2bin_bound_abstract:
         self.__doc__ = _py2bin_owner.__doc__
 
     def __call__(self, *_py2bin_args, **_py2bin_named):
-        return self.owner.__func__(self.obj, *_py2bin_args, **_py2bin_named)
+        return self.owner._py2bin_held(
+            self.obj, *_py2bin_args, **_py2bin_named
+        )
 
     def __getattr__(self, _py2bin_wanted):
         # Read off the object it came from, which is where `wraps` wrote
         # `__name__` and the rest: `obj.method.__name__` asks the bound one.
-        _py2bin_held = self.__dict__.get("owner")
-        if _py2bin_held is None:
+        if _py2bin_wanted in ("owner", "obj"):
             raise AttributeError(_py2bin_wanted)
-        return getattr(_py2bin_held, _py2bin_wanted)
+        return getattr(self.owner, _py2bin_wanted)
 
 
 class _py2bin_abstract:
 
+    # The function is held in a slot rather than in `__dict__`, and this is
+    # not tidiness. `functools.wraps` copies the whole of the wrapped
+    # object's `__dict__` onto the wrapper - so with the function in there, a
+    # wrapper made by `wraps` came away holding the function it was meant to
+    # be wrapping, and calling the wrapper ran the wrapped function directly
+    # and skipped the wrapper's own body. `__dict__` is kept alongside the
+    # slot because everything `wraps` and `abstractmethod` write has to land
+    # somewhere.
+    __slots__ = ("_py2bin_held", "__dict__")
+
     def __init__(self, _py2bin_fn):
-        self.__func__ = _py2bin_fn
+        self._py2bin_held = _py2bin_fn
         self.__doc__ = _py2bin_fn.__doc__
 
     def __get__(self, _py2bin_obj, _py2bin_owner=None):
@@ -810,15 +823,14 @@ class _py2bin_abstract:
         return _py2bin_bound_abstract(self, _py2bin_obj)
 
     def __call__(self, *_py2bin_args, **_py2bin_named):
-        return self.__func__(*_py2bin_args, **_py2bin_named)
+        return self._py2bin_held(*_py2bin_args, **_py2bin_named)
 
     def __getattr__(self, _py2bin_wanted):
         # Whatever was not written on this - `__name__` on a method only
         # marked abstract, say - the function inside still answers.
-        _py2bin_held = self.__dict__.get("__func__")
-        if _py2bin_held is None:
+        if _py2bin_wanted == "_py2bin_held":
             raise AttributeError(_py2bin_wanted)
-        return getattr(_py2bin_held, _py2bin_wanted)
+        return getattr(self._py2bin_held, _py2bin_wanted)
 '''
 
 #: The in-place form of each operator, for `x += y` and its relatives. The
