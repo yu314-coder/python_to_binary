@@ -13,7 +13,12 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.3 gives every module the names every module has.** A bare `__spec__`
+**0.9.4 stops a `try` in a loop leaking.** A handler holds the exception it
+caught and what was being handled before it, and released them only when the
+clause fell off its end - so `except E: raise F(...)`, a `return` out of a
+handler, and a generator whose handler suspends all leaked 160 bytes a turn.
+
+**0.9.3 gave every module the names every module has.** A bare `__spec__`
 fell through to the builtins module and answered with *its* spec, so
 `__spec__.name` said `"builtins"` - a confident wrong answer to "where am
 I?". `__package__`, `__spec__`, `__loader__` and `__builtins__` are the
@@ -728,6 +733,41 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.4 - what a clause holds when it leaves early
+
+Found on an axis none of the sweeps had used: run a construct a hundred
+thousand times and see whether the memory comes back. Two identical runs, and
+only what the *second* adds counts - the first grows the heap's high-water
+mark however tidy the code is.
+
+**A handler holds two references and released them on one path out of four.**
+The exception it caught, and what was being handled before it. Both were let
+go where the clause falls off its end, and nowhere else - so a clause that
+raised, returned, or broke leaked both. That is 160 bytes a turn, which a
+`try` inside a loop turns into megabytes, and it is not an exotic shape:
+`except ValueError: raise RuntimeError(...)` is how most error translation is
+written.
+
+The same held for `finally`, for the exception a `with` was interrupted by,
+and - worst, because it is silent - for a generator whose handler suspends:
+`except ValueError: yield` leaked the exception every time round.
+
+Three things were wrong and all three are fixed. The references live in slots
+of their own rather than temporaries, which the next statement written was
+taking over. They are released on every way out of the call, not just the
+tidy one. And the release is written where the exit is but *filled in when
+the body is complete*, because a generator's `yield` is a `return` emitted
+long before the handler further down asks for a slot - so what was written at
+the exit released nothing at all.
+
+Twenty-two shapes now check that memory comes back, including `return` and
+`break` out of a handler, a `with` that swallows, and nested `try`. What
+looked like a fifth leak - building a class in a loop - is not one: nothing
+is retained, and the second run is flat. Compiled class creation just asks
+the allocator for more at its peak than the interpreter does.
+
+Suite 1,809 tests, corpus 886 of 886 comparable, benchmark unmoved.
 
 ### 0.9.3 - the names every module has
 

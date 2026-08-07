@@ -3664,6 +3664,54 @@ class CApiEmitTests(unittest.TestCase):
             )
             self.assertEqual(native.stdout, reference.stdout)
 
+    def test_a_clause_that_leaves_early_lets_go_of_what_it_held(self):
+        """An owned reference has to be released however the clause ends.
+
+        A handler holds the exception it caught and what was being handled
+        before it; both were released on the one path that falls off the end
+        of the clause, and on none of the others. So a handler that raised,
+        returned or broke leaked both - 160 bytes a turn, which a `try` in a
+        loop turns into megabytes. Each is in a slot of its own now, and
+        `leave` releases whatever is still held on the way out of the call.
+
+        The slots are filled in when the body is complete rather than where
+        the exit is written: a generator's `yield` is a `return` written long
+        before the handler further down asks for a slot, so what was written
+        at the exit released nothing.
+        """
+
+        source = (
+            "import gc, resource\n"
+            "def rss():\n"
+            "    gc.collect()\n"
+            "    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+            "def raises():\n"
+            "    try:\n"
+            "        raise ValueError('a')\n"
+            "    except ValueError:\n"
+            "        raise KeyError('b')\n"
+            "def suspends():\n"
+            "    try:\n"
+            "        yield 1\n"
+            "    except ValueError:\n"
+            "        yield 2\n"
+            "def work(n):\n"
+            "    for _ in range(n):\n"
+            "        try:\n"
+            "            raises()\n"
+            "        except KeyError:\n"
+            "            pass\n"
+            "        it = suspends()\n"
+            "        next(it)\n"
+            "        it.throw(ValueError('x'))\n"
+            "work(500)\n"
+            "work(40000)\n"
+            "before = rss()\n"
+            "work(40000)\n"
+            "print('settled', (rss() - before) < 1024 * 1024)\n"
+        )
+        self._run(source, b"settled True\n")
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 

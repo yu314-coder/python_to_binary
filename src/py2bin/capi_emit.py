@@ -437,6 +437,11 @@ _NEVER = 1 << 30
 #: The names every module has besides the ones its own statements bind.
 #: Declared before anything in the module is written, because a function that
 #: mentions one has to find it here rather than among the builtins.
+#: Stands in for the release of everything an `owned_slot` still holds, at
+#: each way out of a call. Replaced by `render` once the body is complete.
+_ESAVE_MARK = "/*_py2bin_esave*/"
+
+
 _MODULE_DUNDERS = (
     "__name__",
     "__file__",
@@ -1148,6 +1153,17 @@ class _Function:
         #: a body that can change it - or None in one that cannot, which is
         #: most of them and is why this is not paid for everywhere.
         self.entry_handled: str | None = None
+        #: Where in `body` the release-on-the-way-out cleanup belongs. Every
+        #: exit writes one; `render` fills them in once the slots are known.
+        self.esave_marks: list[int] = []
+        #: Slots holding a reference to what *was* being handled while a
+        #: clause runs. Each is put back and released where the clause ends -
+        #: but a clause can also raise, return or break out of itself, and
+        #: those paths leave by `leave`, which releases whatever is still
+        #: held. Their own slots rather than temporaries, because a temporary
+        #: is reused by the next statement and this has to stay valid until
+        #: the call ends.
+        self.exception_saves: list[str] = []
         #: `arity -> C name` for the argument arrays a call passes. One per
         #: arity per function is enough: the arguments are all computed before
         #: any of them is stored, so a nested call has finished with the array
@@ -1421,6 +1437,51 @@ class CApiEmitter:
         """How this program reports a fatal error."""
 
         return "_py2bin_crash_report()" if self.crash_log else "PyErr_Print()"
+
+    def owned_slot(self, indent: int) -> str:
+        """A slot holding a reference that has to survive a whole construct.
+
+        A temporary will not do: the count winds back at the end of each
+        statement, so the next statement written is handed the same slot -
+        and the statements of a clause are written between taking one of
+        these and letting it go. Nor is the ordinary release enough, because
+        a clause can leave by raising, returning or breaking and never reach
+        it; `leave` releases whatever is still held on the way out of the
+        call. Zeroed once dealt with, so the two never both fire.
+        """
+
+        assert self.current is not None
+        slot = f"_esave{len(self.current.exception_saves) + 1}"
+        self.current.locals.append(slot)
+        self.current.exception_saves.append(slot)
+        return slot
+
+    def release_slot(self, slot: str, indent: int) -> None:
+        """Let go of what an `owned_slot` holds, and mark it dealt with."""
+
+        self.emit(f"if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}", indent)
+
+    def save_handled(self, indent: int) -> str:
+        """Take what is being handled now, to be put back when a clause ends.
+
+        The reference this owns is released either where the clause ends
+        normally - see `restore_handled` - or, if the clause leaves by
+        raising, returning or breaking, on the way out of the call. A clause
+        that raised used to leak the exception it interrupted: 160 bytes a
+        turn, which a loop around a `try` turns into megabytes.
+        """
+
+        slot = self.owned_slot(indent)
+        self.emit(f"{slot} = PyErr_GetHandledException();", indent)
+        return slot
+
+    def restore_handled(self, slot: str, indent: int) -> None:
+        """Put back what `save_handled` took, and let go of it."""
+
+        self.emit(f"PyErr_SetHandledException({slot});", indent)
+        self.emit(f"if ({slot}) Py_DecRef({slot});", indent)
+        # Emptied, so the way out of the call knows it has been dealt with.
+        self.emit(f"{slot} = 0;", indent)
 
     def remember_handled(self, body: list) -> None:
         """Keep the caller's handled exception, in a body that can lose it.
@@ -6175,7 +6236,7 @@ class CApiEmitter:
                 # class that would go unreleased.
                 held = self.bind_exception(clause, indent)
                 self.run_handler(clause, held, indent)
-                self.emit(f"Py_DecRef({held});", indent)
+                self.release_slot(held, indent)
                 self.emit(f"goto {done};", indent)
                 continue
             # PyErr_ExceptionMatches takes a tuple as readily as a class.
@@ -6192,7 +6253,7 @@ class CApiEmitter:
                     self.emit(f"Py_DecRef({later});", indent + 1)
             held = self.bind_exception(clause, indent + 1)
             self.run_handler(clause, held, indent + 1)
-            self.emit(f"Py_DecRef({held});", indent + 1)
+            self.release_slot(held, indent + 1)
             self.emit(f"    goto {done};", indent)
             self.emit("}", indent)
         # Nothing matched, so the exception carries on outward.
@@ -6252,16 +6313,14 @@ class CApiEmitter:
             chaining = not _jumps_out(node.finalbody)
             previous = None
             if chaining:
-                previous = self.temporary()
-                self.emit(f"{previous} = PyErr_GetHandledException();", indent)
+                previous = self.save_handled(indent)
                 self.emit(f"if ({held}) {{", indent)
                 self.emit(f"PyErr_SetHandledException({held});", indent + 1)
                 self.emit("}", indent)
             for statement in node.finalbody:
                 self.statement(statement, indent)
             if previous is not None:
-                self.emit(f"PyErr_SetHandledException({previous});", indent)
-                self.emit(f"if ({previous}) Py_DecRef({previous});", indent)
+                self.restore_handled(previous, indent)
 
         self.protect(emit_body, emit_clause, indent)
 
@@ -6281,14 +6340,19 @@ class CApiEmitter:
         what was there rather than clearing it is what lets handlers nest.
         """
 
-        previous = self.temporary()
         # `PyErr_SetHandledException` takes a reference of its own rather than
         # stealing one, which is the opposite of its `Raised` counterpart -
         # incrementing before the call leaked the exception once per handler,
         # and 800,000 of them came to 137 MB against the interpreter's 14.
         # `PyErr_GetHandledException` does hand over a reference, so what it
         # returns is released once it has been put back.
-        self.emit(f"{previous} = PyErr_GetHandledException();", indent)
+        #
+        # A slot of its own, not a temporary: the clause's own statements are
+        # written between here and the line that puts it back, and a
+        # temporary is handed to the next statement that wants one. So this
+        # was being clobbered by the body it was meant to outlive - putting
+        # back whatever happened to be in the slot, and letting go of nothing.
+        previous = self.save_handled(indent)
         self.emit(f"PyErr_SetHandledException({held});", indent)
 
         def emit_body() -> None:
@@ -6299,8 +6363,7 @@ class CApiEmitter:
             self.handling.pop()
 
         def emit_clause(_held: str, _protection) -> None:
-            self.emit(f"PyErr_SetHandledException({previous});", indent)
-            self.emit(f"if ({previous}) Py_DecRef({previous});", indent)
+            self.restore_handled(previous, indent)
             if clause.name is not None:
                 # Python unbinds the name when the handler ends, however it
                 # ends - `except E as e` leaves no `e` behind, and reading one
@@ -6336,7 +6399,12 @@ class CApiEmitter:
         protection = _Protected(
             clause, self.temporary_flag(), self.temporary(), self.loop_depth
         )
-        held = self.temporary()
+        # A slot of its own: the clause's statements are written between the
+        # line that takes this and the line that puts it back, and a clause
+        # that raises something of its own never reaches the second - so the
+        # exception it interrupted was leaked. `leave` releases whatever is
+        # still held on the way out of the call.
+        held = self.owned_slot(indent)
         self.emit(f"{protection.why} = 0;", indent)
         self.emit(f"{protection.answer} = 0;", indent)
         self.emit(f"{held} = 0;", indent)
@@ -6360,8 +6428,13 @@ class CApiEmitter:
         emit_clause(held, protection)
         if _PROPAGATING in protection.reasons:
             self.emit(f"if ({protection.why} == {_PROPAGATING}) {{", indent)
-            # It steals the reference, so nothing is released after it.
-            self.emit(f"PyErr_SetRaisedException({held});", indent + 1)
+            # It steals the reference, so the slot is emptied first rather
+            # than released after - and emptied so that the way out of the
+            # call does not let go of it a second time.
+            handing = self.temporary()
+            self.emit(f"{handing} = {held};", indent + 1)
+            self.emit(f"{held} = 0;", indent + 1)
+            self.emit(f"PyErr_SetRaisedException({handing});", indent + 1)
             self.emit(self.failure(), indent + 1)
             self.emit("}", indent)
         if _RETURNING in protection.reasons:
@@ -6392,10 +6465,16 @@ class CApiEmitter:
         differ only in whether the object also gets a name.
         """
 
-        caught = self.temporary()
         # Taken rather than cleared even when the clause does not name it: a
         # bare `raise` in the body sets this same object again, and clearing
         # would have thrown away the only thing it could re-raise.
+        #
+        # Held in a slot of its own rather than a temporary, and released on
+        # the way out of the call if the clause never gets to the line that
+        # releases it. A handler that raised something of its own leaked the
+        # exception it had caught - 160 bytes each, which a `try` in a loop
+        # turns into megabytes.
+        caught = self.owned_slot(indent)
         self.emit(f"{caught} = PyErr_GetRaisedException();", indent)
         if clause.name is not None:
             target = self.declare(clause.name)
@@ -7055,6 +7134,15 @@ class CApiEmitter:
         deeper than it is and refuse calls that are perfectly fine.
         """
 
+        if self.current is not None:
+            # A marker rather than the cleanup itself: which slots exist is
+            # not known yet. A generator's `yield` is a `return` written long
+            # before the handler further down the body asks for a slot, so
+            # writing what is known here released nothing on the way out of
+            # exactly the paths that needed it. Filled in by `render`, once
+            # the whole body has been written.
+            self.current.esave_marks.append(len(self.current.body))
+            self.emit(_ESAVE_MARK, indent)
         if self.current is not None and self.current.entry_handled:
             # Which exception is being handled belongs to the call, not to the
             # thread: CPython keeps it per frame and gives the caller's back
@@ -9554,6 +9642,8 @@ class CApiEmitter:
 
         out = [_PROTOTYPES]
         for function in self.functions:
+            _fill_esave_marks(function)
+        for function in self.functions:
             if function.name == _ENTRY_BODY:
                 continue
             out.append(f"static PyObject *f_{function.name}({signature(function)});")
@@ -9890,6 +9980,23 @@ class CApiEmitter:
             else:
                 lines.append(f"{pad}PyObject *{name} = 0;")
         return lines
+
+
+def _fill_esave_marks(function: "_Function") -> None:
+    """Write the release-on-the-way-out cleanup where `leave` marked it.
+
+    Left until here because a function's slots are not all known when its
+    first exit is written - a generator's `yield` is a `return`, and the
+    handler that needs a slot may be a hundred lines further down.
+    """
+
+    for index in function.esave_marks:
+        line = function.body[index]
+        pad = line[: len(line) - len(line.lstrip())]
+        function.body[index] = "\n".join(
+            f"{pad}if ({slot}) {{ Py_DecRef({slot}); {slot} = 0; }}"
+            for slot in function.exception_saves
+        )
 
 
 def search_roots(entry: Path) -> list[Path]:
