@@ -434,6 +434,20 @@ def _scope_bindings(body: list) -> set[str]:
 _NEVER = 1 << 30
 
 
+#: The names every module has besides the ones its own statements bind.
+#: Declared before anything in the module is written, because a function that
+#: mentions one has to find it here rather than among the builtins.
+_MODULE_DUNDERS = (
+    "__name__",
+    "__file__",
+    "__doc__",
+    "__package__",
+    "__spec__",
+    "__loader__",
+    "__builtins__",
+)
+
+
 def _module_scope_bindings(tree: ast.Module) -> dict[str, int]:
     """How many times each name is bound *at module scope*.
 
@@ -9160,6 +9174,16 @@ class CApiEmitter:
             else name.rpartition(".")[0]
         )
 
+        # Declared before any function body is written, or a function that
+        # mentions one would not find it among this module's globals and
+        # would fall through to the builtins module - where most of these
+        # exist and are *its*. That is how `__package__` inside a function
+        # came to answer with the empty string, which is `builtins`' own.
+        for dunder in _MODULE_DUNDERS:
+            self.certain_globals.add(dunder)
+            self.certain_at[dunder] = -1
+            self.note_global(dunder)
+
         module_bindings = _module_scope_bindings(tree)
         for position, node in enumerate(tree.body):
             if isinstance(node, ast.FunctionDef):
@@ -9284,6 +9308,37 @@ class CApiEmitter:
                     f"{slot} = PyUnicode_FromString({_c_string(text)});", indent
                 )
             self.checked(slot, indent)
+            self.publish(dunder, slot, indent)
+        # The four other names every module has. Without them a bare mention
+        # was not found among this module's globals and fell through to the
+        # builtins module - where three of them exist and are *its* - so
+        # `__spec__` answered with the spec of `builtins`, whose `.name` is
+        # "builtins", and `__builtins__` answered with a NameError. A wrong
+        # module is worse than a missing one: code that reads `__spec__.name`
+        # to find out where it is got a confident wrong answer.
+        #
+        # `__spec__` and `__loader__` are None because a compiled module was
+        # not loaded by anything - there is no loader to name. That is what
+        # CPython says for `__main__` run as a script, which is the shape a
+        # compiled program has.
+        slot = self.note_global("__builtins__")
+        self.emit(f"Py_IncRef(_py2bin_builtins);", indent)
+        self.emit(f"{slot} = _py2bin_builtins;", indent)
+        self.publish("__builtins__", slot, indent)
+        for dunder, held in (
+            ("__package__", self.module_package or None),
+            ("__spec__", None),
+            ("__loader__", None),
+        ):
+            slot = self.note_global(dunder)
+            if held is None:
+                blank = self.builtin("None", indent)
+                self.emit(f"{slot} = {blank};", indent)
+            else:
+                self.emit(
+                    f"{slot} = PyUnicode_FromString({_c_string(held)});", indent
+                )
+                self.checked(slot, indent)
             self.publish(dunder, slot, indent)
         for position, node in enumerate(tree.body):
             self.reached = position

@@ -13,7 +13,13 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.2 puts a function's signature and its annotations back together**, so
+**0.9.3 gives every module the names every module has.** A bare `__spec__`
+fell through to the builtins module and answered with *its* spec, so
+`__spec__.name` said `"builtins"` - a confident wrong answer to "where am
+I?". `__package__`, `__spec__`, `__loader__` and `__builtins__` are the
+module's own now.
+
+**0.9.2 put a function's signature and its annotations back together**, so
 `inspect.signature(f)` shows the types the source wrote.
 
 **0.9.1 finished what a compiled function can say about itself:**
@@ -722,6 +728,23 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.3 - the names every module has
+
+A bare `__spec__` was not found among a module's globals and fell through to
+the builtins module - where it exists and is *its*. So `__spec__.name`
+answered `"builtins"`, `__package__` came back with `builtins`' empty string,
+and `__builtins__` raised a `NameError` because that is the one the builtins
+module does not have.
+
+`__package__`, `__spec__`, `__loader__` and `__builtins__` are now the
+module's own, alongside `__name__`, `__file__` and `__doc__` - declared before
+anything in the module is written, because a function that mentions one has
+to find it there rather than out among the builtins. `__spec__` and
+`__loader__` hold None: a compiled module was not loaded by anything, so
+there is no loader to name.
+
+Suite 1,808 tests, corpus 886 of 886 comparable.
 
 ### 0.9.2 - the signature and the annotations, put back together
 

@@ -1251,16 +1251,22 @@ CPython's semantics rather than restricting them. Where the two differ:
 
 | program | py2bin | Nuitka | what it is |
 |---|---|---|---|
-| `type(f).__name__`, `repr(f)` | ✗ | ✓ | a compiled function is a `PyCFunction`, or a holder where one is needed |
-| `sys._getframe()` | ✗ | ✓ | a compiled function makes no frame |
-| a traceback naming a source line | ✗ | ✓ | there is no source beside the binary to name |
+| `type(f).__name__` | ✗ | ✗ | **neither** says `function`: py2bin says `builtin_function_or_method`, Nuitka says `compiled_function` ([its own `tp_name`](https://github.com/Nuitka/Nuitka/blob/develop/nuitka/build/static_src/CompiledFunctionType.c)) |
+| `f.__code__.co_code` | ✗ | ✗ | **neither** has bytecode to give. Nuitka [says so](https://nuitka.net/user-documentation/user-manual.html); py2bin has no code object at all |
+| a debugger attached to a compiled function | ✗ | ✗ | **neither**: there is no tracing to attach to |
+| `sys._getframe()`, `sys.settrace` | ✗ | ✓ | Nuitka builds real frames; a py2bin function makes none, which is part of why its calls are faster |
+| a traceback naming a source line | ✗ | ✓ | Nuitka carries code objects with filenames; py2bin prints the exception line alone |
+| `inspect.getsource` | ✗ | ✓ | there is no source beside the binary to read |
 | `lambda: i` capturing a comprehension's target | refused | ✓ | captures are by value here, so Python's answer would need cells |
 | `dir()` with no argument | refused | ✓ | there is no frame to enumerate |
 | `except*` (PEP 654) | ✓ | ✗ | py2bin rewrites it and agrees with CPython on 42,100 shapes; Nuitka answers differently |
 
-What is left is one fact and two consequences of it: a compiled function is a
-`builtin_function_or_method`, so it is not spelled `function` and it makes no
-frame. That is what makes a direct call 2.7x faster than the interpreter.
+What is left is one fact and its consequences: a compiled function is a
+`builtin_function_or_method`, so it is not spelled `function`, has no code
+object, and makes no frame. That is what makes a direct call 2.7x faster than
+the interpreter - the frame is most of what a call costs, and Nuitka builds
+one. Two of these rows are not a py2bin problem at all: **neither** compiler
+says `function`, and neither has bytecode to hand back.
 
 Everything that *needs* a function to hold something now gets one that can.
 `abc.abstractmethod` writes one attribute, `functools.wraps` writes six, and
@@ -1730,6 +1736,28 @@ source line because there is no source beside the binary to name.
 
 Corpus 886 of 886 comparable. Suite 1,800 tests, and a conformance corpus of
 103 programs run against CPython on every push.
+
+### 0.9.3 - the names every module has
+
+A bare `__spec__` was not found among a module's globals and fell through to
+the builtins module - where it exists and is *its*. So `__spec__.name`
+answered `"builtins"`: a confident wrong answer to "where am I?", which is
+worse than not answering. `__package__` did the same and came back with
+`builtins`' empty string, and `__builtins__` raised a `NameError` because
+that is the one the builtins module does not have.
+
+`__package__`, `__spec__`, `__loader__` and `__builtins__` are now the
+module's own, alongside `__name__`, `__file__` and `__doc__`. Declared before
+anything in the module is written, because a function that mentions one has
+to find it there rather than out among the builtins - which is why
+`__package__` read inside a function was the empty string while the same name
+at the module body was right.
+
+`__spec__` and `__loader__` hold None: a compiled module was not loaded by
+anything, so there is no loader to name. That is what CPython says for
+`__main__` run as a script, which is the shape a compiled program has.
+
+Suite 1,808 tests, corpus 886 of 886 comparable.
 
 ### 0.9.2 - the signature and the annotations, put back together
 

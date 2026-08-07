@@ -3598,6 +3598,72 @@ class CApiEmitTests(unittest.TestCase):
             )
             self.assertEqual(native.stdout, reference.stdout)
 
+    def test_a_module_has_the_names_every_module_has(self):
+        """A bare mention used to fall through to the builtins module.
+
+        Most of these exist there and are *its*, so the answer was confident
+        and wrong: `__spec__` gave the spec of `builtins`, whose `.name` is
+        "builtins", and `__package__` gave its empty string. They are
+        declared before anything in the module is written, because a function
+        that mentions one has to find it here rather than out there.
+        """
+
+        self._run(
+            "print(__name__, __package__, __spec__, __debug__)\n"
+            "print(type(__builtins__).__name__)\n"
+            "def inside():\n"
+            "    return (__name__, __package__, __spec__)\n"
+            "print(inside())\n",
+            b"__main__ None None True\nmodule\n('__main__', None, None)\n",
+        )
+
+    def test_a_module_in_a_package_knows_which_package(self):
+        """`__package__` is the package a module is in, read from anywhere.
+
+        Inside a function it was the empty string - which is `builtins`' own,
+        found by falling through - so relative reasoning about where a module
+        sits gave the wrong answer everywhere but at the module body.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg" / "sub").mkdir(parents=True)
+            (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "pkg" / "sub" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "pkg" / "sub" / "deep.py").write_text(
+                "def where():\n"
+                "    return (__name__, __package__)\n"
+                "AT_BODY = (__name__, __package__)\n",
+                encoding="utf-8",
+            )
+            entry = root / "program.py"
+            entry.write_text(
+                "import pkg.sub.deep as d\n"
+                "print(d.where())\n"
+                "print(d.AT_BODY)\n",
+                encoding="utf-8",
+            )
+            generated, _ = python_program_to_capi_c(entry)
+            if not _HOST_IS_DARWIN_ARM64:
+                return
+            source = root / "program.c"
+            source.write_text(generated, encoding="utf-8", newline="\n")
+            binary = root / "program.bin"
+            compile_c_native(source, binary, target="darwin-arm64", clean=True)
+            reference = subprocess.run(
+                [sys.executable, str(entry)], capture_output=True, cwd=root
+            )
+            shutil.rmtree(root / "pkg")
+            entry.unlink()
+            native = subprocess.run([str(binary)], capture_output=True, cwd=root)
+            self.assertEqual(
+                native.stdout,
+                b"('pkg.sub.deep', 'pkg.sub')\n('pkg.sub.deep', 'pkg.sub')\n",
+            )
+            self.assertEqual(native.stdout, reference.stdout)
+
     def test_a_program_of_several_modules_is_linked_into_one_image(self):
         """The entry's own imports are compiled, not read as source.
 
