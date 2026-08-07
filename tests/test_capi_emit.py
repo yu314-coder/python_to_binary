@@ -3474,6 +3474,34 @@ class CApiEmitTests(unittest.TestCase):
             b"(a, b=1) <class 'int'>\n",
         )
 
+    def test_a_signature_is_read_through_what_wraps_left_behind(self):
+        """`inspect` follows `__wrapped__` when nothing defines `__signature__`.
+
+        Defining one is what stops it doing so - so a function behind a
+        `wraps` decorator reported the wrapper's own `(*args)` where Python
+        reports the signature being stood in for.
+        """
+
+        self._run(
+            "import inspect\n"
+            "from functools import wraps\n"
+            "def keep(f):\n"
+            "    @wraps(f)\n"
+            "    def inner(*a):\n"
+            "        return f(*a)\n"
+            "    return inner\n"
+            "class C:\n"
+            "    @keep\n"
+            "    def m(self, n: int) -> int:\n"
+            "        return n\n"
+            "@keep\n"
+            "def free(a: int, b: str = 'x') -> bool:\n"
+            "    return True\n"
+            "print(str(inspect.signature(C.m)))\n"
+            "print(str(inspect.signature(free)), free(1))\n",
+            b"(self, n: int) -> int\n(a: int, b: str = 'x') -> bool True\n",
+        )
+
     def test_wraps_over_a_holder_does_not_take_the_function_with_it(self):
         """`wraps` copies the whole of the wrapped object's `__dict__` over.
 

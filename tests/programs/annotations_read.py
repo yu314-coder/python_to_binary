@@ -162,6 +162,10 @@ import inspect
 print(str(inspect.signature(plain)))
 print(str(inspect.signature(every_shape)))
 print(str(inspect.signature(Holder.method)))
+# Through what `wraps` left behind, which is what `inspect` does when nothing
+# defines `__signature__` - and defining one is what stops it doing so.
+print(str(inspect.signature(decorated)))
+print(str(inspect.signature(Watched.annotated)))
 
 # Calls are untouched by any of this: a function of a fixed shape is called
 # directly in C and never goes through the name.

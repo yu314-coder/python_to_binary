@@ -277,13 +277,23 @@ def _reads_annotations(tree: ast.Module) -> bool:
     """Whether anything here asks a function what its annotations were.
 
     Reading one directly, or through `typing.get_type_hints`, or through
-    `singledispatch`, which reads them to decide what a registered
-    implementation is for. Annotating a parameter is far commoner than asking
-    about it, so a program that never asks keeps the plain compiled function
-    everywhere and pays nothing.
+    `inspect.signature`, or through `singledispatch`, which reads them to
+    decide what a registered implementation is for. Annotating a parameter is
+    far commoner than asking about it, so a program that never asks keeps the
+    plain compiled function everywhere and pays nothing.
+
+    A name is enough to count as asking, so a program with a variable called
+    `signature` carries annotations it never looks at. That costs it a little
+    speed and nothing else, which is the right way round for a guess.
     """
 
-    wanted = {"__annotations__", "get_type_hints", "singledispatch"}
+    wanted = {
+        "__annotations__",
+        "get_type_hints",
+        "singledispatch",
+        "signature",
+        "getfullargspec",
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr in wanted:
             return True
@@ -847,7 +857,12 @@ class _py2bin_abstract:
 
         import inspect
 
-        _py2bin_base = inspect.signature(self._py2bin_held)
+        # Through `__wrapped__` where `wraps` left one. That is what `inspect`
+        # does when nothing defines `__signature__`, and defining one is what
+        # stops it doing so - so a decorated function reported the wrapper's
+        # own `(*args)` where Python reports the signature being stood in for.
+        _py2bin_inner = self.__dict__.get("__wrapped__", self._py2bin_held)
+        _py2bin_base = inspect.signature(_py2bin_inner)
         _py2bin_notes = self.__dict__.get("__annotations__")
         if not _py2bin_notes:
             return _py2bin_base
