@@ -154,6 +154,17 @@ def _powershell_script(
     return (
         _fixed_assignment("off", offset, powershell=True)
         + "$ErrorActionPreference='Stop';"
+        # Without this, "Preparing modules for first use." is written to the
+        # error stream, and PowerShell serialises that stream as CLIXML when it
+        # is redirected. A user who redirects the program's output gets a page
+        # of XML in front of it.
+        "$ProgressPreference='SilentlyContinue';"
+        # Everything below runs inside a try. Anything that goes wrong here -
+        # a truncated payload, a full disk, a launcher missing from the archive
+        # - used to end the process with no message at all, because the error
+        # went to the error stream as CLIXML and looked like noise. The message
+        # is written to stdout instead, which is not serialised.
+        "try{"
         "$s=$env:PY2BIN_ONEFILE_SELF;$c=$env:PY2BIN_ONEFILE_COMMAND;"
         "$env:PY2BIN_ONEFILE_SELF=$null;$env:PY2BIN_ONEFILE_COMMAND=$null;"
         "if(!$s -or !$c){throw 'one-file launcher environment is missing'};"
@@ -189,7 +200,15 @@ def _powershell_script(
         f"$si.FileName=[IO.Path]::Combine($r,'{launcher_ps}');"
         "$si.Arguments=$raw;$si.UseShellExecute=$false;$si.CreateNoWindow=$true;"
         "$child=[Diagnostics.Process]::Start($si);$child.WaitForExit();"
-        "exit $child.ExitCode"
+        "$code=$child.ExitCode"
+        # `exit` is left outside the try: inside one it unwinds through a flow
+        # exception rather than a normal one, which is a needless thing to have
+        # to reason about next to a catch.
+        "}catch{"
+        "[Console]::Out.WriteLine('py2bin one-file launcher failed: '"
+        "+$_.Exception.Message);"
+        "exit 3};"
+        "exit $code"
     )
 
 

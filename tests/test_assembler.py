@@ -356,13 +356,18 @@ class AssemblerTests(unittest.TestCase):
             marker_at = image.index(marker)
             payload_at = image.index(b"\n", marker_at + len(marker)) + 1
             with zipfile.ZipFile(io.BytesIO(image[payload_at:])) as archive:
+                # Beside the interpreter, not at the bundle root: the
+                # launcher is a copy of python.exe and imports pythonXY.dll by
+                # name, which Windows resolves from the directory the
+                # executable is in. At the root it was apart from that DLL and
+                # CreateProcess refused to start it.
                 python_path = archive.read(
-                    "Demo-0.2.1._pth"
+                    "runtime/bin/Demo-0.2.1._pth"
                 ).decode("utf-8")
                 dll_path = archive.read(
                     "runtime/bin/python311._pth"
                 ).decode("utf-8")
-                inner_image = archive.read("Demo-0.2.1.exe")
+                inner_image = archive.read("runtime/bin/Demo-0.2.1.exe")
                 manifest = json.loads(
                     archive.read("py2bin-freeze.json").decode("utf-8")
                 )
@@ -459,6 +464,51 @@ class AssemblerTests(unittest.TestCase):
             )
             self.assertEqual(bootstrap_run.stdout, "bootstrap-ok\n")
 
+    def test_the_windows_launcher_sits_beside_the_interpreter(self):
+        """A copy of python.exe has to be in the directory holding its DLLs.
+
+        Windows resolves an executable's imported DLLs from the directory the
+        executable is in. A launcher at the bundle root with pythonXY.dll one
+        level down in the pack's own `runtime/` cannot start at all -
+        CreateProcess fails with ERROR_MOD_NOT_FOUND before any of the
+        program's code runs, so nothing is printed and there is nothing to
+        compare. This only ever worked because a bundle built *on* Windows
+        stages the runtime at the bundle root, making root and beside the same
+        directory.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "main.py"
+            entry.write_text("print('hello')\n", encoding="utf-8")
+            pack = self._runtime_pack(root, target="windows-x86_64")
+            result = freeze(
+                entry,
+                root / "Demo",
+                root,
+                dependency_mode="none",
+                runtime_pack=pack,
+                target="windows-x86_64",
+                onefile=False,
+            )
+            interpreter = result.bundle / "runtime" / "bin" / "python3"
+            launcher = result.bundle / "runtime" / "bin" / "Demo.exe"
+            self.assertTrue(launcher.is_file(), f"no launcher at {launcher}")
+            self.assertEqual(launcher.parent, interpreter.parent)
+
+            # And every path-file entry has to name somewhere real, relative to
+            # the file's own directory - which is no longer the bundle root.
+            path_file = launcher.with_suffix("._pth")
+            for line in path_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("import "):
+                    continue
+                named = (path_file.parent / line.replace("\\", "/")).resolve()
+                self.assertTrue(
+                    result.bundle.resolve() == named or result.bundle.resolve() in named.parents,
+                    f"{line!r} escapes the bundle: {named}",
+                )
+
     def test_windows_app_onedir_uses_windowed_runtime_without_extraction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -479,7 +529,8 @@ class AssemblerTests(unittest.TestCase):
             )
             self.assertFalse(result.onefile)
             self.assertTrue(result.bundle.is_dir())
-            launcher = result.bundle / "Demo.exe"
+            # Beside the interpreter - see the onefile test above.
+            launcher = result.bundle / "runtime" / "bin" / "Demo.exe"
             image = launcher.read_bytes()
             layout = _pe_layout(image)
             resources = _existing_resources(image, layout)

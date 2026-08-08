@@ -1897,7 +1897,19 @@ def freeze(
             newline="\n",
         )
         if bundle_target.startswith("windows-"):
-            launcher = stage / f"{name}.exe"
+            # Beside the interpreter, not at the bundle root. This launcher is
+            # a copy of python.exe, so it imports pythonXY.dll by name, and
+            # Windows resolves an executable's imports from the directory the
+            # executable is in. Moving it to the root left it apart from that
+            # DLL - and from pythonXY.zip, which its path file names - so
+            # CreateProcess failed outright and nothing ever ran.
+            #
+            # It only ever worked because of where the runtime is staged: built
+            # on Windows the runtime *is* the bundle root, so root and beside
+            # were the same place. Cross-built, the pack keeps its own
+            # `runtime/` directory and they are not. The freeze tier had only
+            # been run natively.
+            launcher = runtime_executable.parent / f"{name}.exe"
             runtime_path_files = tuple(
                 runtime_executable.parent.glob("python*._pth")
             )
@@ -1911,9 +1923,21 @@ def freeze(
                 launcher_source = windowed_runtime
             launcher_source.replace(launcher)
             major, minor = runtime_python_version.split(".")[:2]
+            # Every entry is relative to the directory holding the path file,
+            # which is now the interpreter's. `pythonXY.zip` and `Lib` are in
+            # there with it; the application, its dependencies and the
+            # bootstrap are one level up whenever the interpreter is nested.
+            if launcher.parent == stage:
+                outer, bundle_root = "", "."
+            else:
+                outer, bundle_root = "..\\", ".."
             isolated_path = (
                 f"python{major}{minor}.zip\n"
-                "Lib\nsite-packages\napp\n.\nimport site\n"
+                "Lib\n"
+                f"{outer}site-packages\n"
+                f"{outer}app\n"
+                f"{bundle_root}\n"
+                "import site\n"
             )
             for path_file in (
                 *runtime_path_files,
