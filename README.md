@@ -1214,6 +1214,25 @@ Both are now checked by reading the generated image the way the loader reads
 it - resolving every import RVA and asserting it lands in the data section, on
 a program deliberately larger than one page.
 
+**Then the second run found the third.** With the native tier passing, the
+frozen executable still exited 1 with nothing to say. Its launcher is a copy
+of `python.exe`, and Windows resolves an executable's imported DLLs from the
+directory that executable is in - but the launcher was moved to the bundle
+root while the runtime pack kept its own `runtime/` directory, leaving
+`pythonXY.dll` one level down. `CreateProcess` fails outright in that case,
+before any of the program's code runs.
+
+It had always worked when built *on* Windows, because there the runtime is
+staged at the bundle root and "root" and "beside the interpreter" are the same
+directory. Cross-built they are not. The launcher now goes beside the
+interpreter wherever that is; a bundle built on Windows is unchanged.
+
+The one-file launcher also said nothing when it failed, which is why this took
+a second run to see: its PowerShell stage wrote errors to the error stream,
+and PowerShell serialises that stream as CLIXML when it is redirected, so a
+failure arrived as a page of XML containing only a progress record. Errors are
+now written to stdout as a sentence.
+
 ### 0.9.0 - what a compiled function could not do
 
 Metaclasses, `enum` and `dataclasses`, generator and `async def` methods,
