@@ -1145,6 +1145,77 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.11 - the Windows binaries had never been started on Windows
+
+Every release before this one was found by compiling a program and comparing
+its output against CPython, on macOS and Linux. The Windows images had only
+ever been *read* - parsed, checked against the format, disassembled - and
+never started, because there is no Windows machine here.
+
+Then somebody started one. Four bugs, over four runs on real hardware. Every
+one was fatal to every Windows program the compiler produced, and not one
+could have been caught by comparing output, because in all four the program
+never reached a `print`. They are worth reading as a set: they are all the
+same kind of mistake, and none of them is in the compiled code.
+
+*Every native-tier `.exe` was unloadable.* The import table's own addresses -
+the DLL name, the lookup table, the address table - were computed against a
+data section fixed at `0x2000`, which was correct only while the code fitted in
+one page. Real programs are forty times that, so the section moved and those
+addresses pointed into the middle of the code. Windows read machine code as a
+DLL name and refused the image. A sibling bug, the two sections overlapping,
+had been found and fixed earlier; the addresses *inside* the table were left
+pointing at the old place. Both architectures, every program.
+
+*A frozen `.exe` threw away everything it printed.* The launcher started the
+real program with `bInheritHandles` false and `CREATE_NO_WINDOW` set, so the
+child inherited none of the launcher's standard handles and got no console
+either. It failed on its first `print`, and the traceback went to the same
+missing handle. From outside: a silent exit 1 with two empty files.
+
+Both are now checked by reading the generated image the way the loader reads
+it - resolving every import RVA and asserting it lands in the data section, on
+a program deliberately larger than one page.
+
+**Then the second run found the third.** With the native tier passing, the
+frozen executable still exited 1 with nothing to say. Its launcher is a copy
+of `python.exe`, and Windows resolves an executable's imported DLLs from the
+directory that executable is in - but the launcher was moved to the bundle
+root while the runtime pack kept its own `runtime/` directory, leaving
+`pythonXY.dll` one level down. `CreateProcess` fails outright in that case,
+before any of the program's code runs.
+
+It had always worked when built *on* Windows, because there the runtime is
+staged at the bundle root and "root" and "beside the interpreter" are the same
+directory. Cross-built they are not. The launcher now goes beside the
+interpreter wherever that is; a bundle built on Windows is unchanged.
+
+The one-file launcher also said nothing when it failed, which is why this took
+a second run to see: its PowerShell stage wrote errors to the error stream,
+and PowerShell serialises that stream as CLIXML when it is redirected, so a
+failure arrived as a page of XML containing only a progress record. Errors are
+now written to stdout as a sentence.
+
+**And the third run found the same bug a third time.** With the layout fixed
+the frozen program ran and exited 0 - printing nothing. Its PowerShell stage
+started the program with `CreateNoWindow`, which is the mistake the launcher
+stub made one level up: a console program denied a console has nowhere to
+write. The program was correct every time; its output was being thrown away.
+It is set now only for a windowed build, where suppressing a console is the
+point.
+
+Three failures, one shape. A child process is not given its parent's console
+by default - not by `CreateProcess`, and not by the .NET wrapper over it - and
+a program that cannot write looks exactly like a program with nothing to say.
+
+**The fourth run passed.** All three tiers, on a physical x86-64 Windows
+machine: the native `.exe`, the frozen `.exe` carrying its own CPython, and
+the C-API `.exe` driving a CPython 3.14 it downloaded itself. Linux passes the
+same way. What is worth keeping from it is that the compiled programs were
+right on every one of those runs - all four bugs were in where the executable
+was put and what its children were allowed to write to. Reading a generated
+image tells you it is well formed. It does not tell you it runs.
+
 ### 0.9.1 - 0.9.10
 
 Ten releases in one sitting, all of them found by compiling a shape and
@@ -1205,70 +1276,6 @@ cleanly and died at start-up. It survived every earlier test because the
 **Windows ARM64 wrote one word where two were reserved**, leaving an invalid
 instruction in the middle of the code that any large enough program would
 reach.
-
-**Then somebody ran the Windows binaries on Windows.** Everything above was
-found by compiling and comparing output on macOS and Linux; the Windows images
-had been checked by reading them, never by starting one. The first real run
-found two bugs, and neither could have been caught any other way, because in
-both the program never got far enough to print.
-
-*Every native-tier `.exe` was unloadable.* The import table's own addresses -
-the DLL name, the lookup table, the address table - were computed against a
-data section fixed at `0x2000`, which was correct only while the code fitted in
-one page. Real programs are forty times that, so the section moved and those
-addresses pointed into the middle of the code. Windows read machine code as a
-DLL name and refused the image. A sibling bug, the two sections overlapping,
-had been found and fixed earlier; the addresses *inside* the table were left
-pointing at the old place. Both architectures, every program.
-
-*A frozen `.exe` threw away everything it printed.* The launcher started the
-real program with `bInheritHandles` false and `CREATE_NO_WINDOW` set, so the
-child inherited none of the launcher's standard handles and got no console
-either. It failed on its first `print`, and the traceback went to the same
-missing handle. From outside: a silent exit 1 with two empty files.
-
-Both are now checked by reading the generated image the way the loader reads
-it - resolving every import RVA and asserting it lands in the data section, on
-a program deliberately larger than one page.
-
-**Then the second run found the third.** With the native tier passing, the
-frozen executable still exited 1 with nothing to say. Its launcher is a copy
-of `python.exe`, and Windows resolves an executable's imported DLLs from the
-directory that executable is in - but the launcher was moved to the bundle
-root while the runtime pack kept its own `runtime/` directory, leaving
-`pythonXY.dll` one level down. `CreateProcess` fails outright in that case,
-before any of the program's code runs.
-
-It had always worked when built *on* Windows, because there the runtime is
-staged at the bundle root and "root" and "beside the interpreter" are the same
-directory. Cross-built they are not. The launcher now goes beside the
-interpreter wherever that is; a bundle built on Windows is unchanged.
-
-The one-file launcher also said nothing when it failed, which is why this took
-a second run to see: its PowerShell stage wrote errors to the error stream,
-and PowerShell serialises that stream as CLIXML when it is redirected, so a
-failure arrived as a page of XML containing only a progress record. Errors are
-now written to stdout as a sentence.
-
-**And the third run found the same bug a third time.** With the layout fixed
-the frozen program ran and exited 0 - printing nothing. Its PowerShell stage
-started the program with `CreateNoWindow`, which is the mistake the launcher
-stub made one level up: a console program denied a console has nowhere to
-write. The program was correct every time; its output was being thrown away.
-It is set now only for a windowed build, where suppressing a console is the
-point.
-
-Three failures, one shape. A child process is not given its parent's console
-by default - not by `CreateProcess`, and not by the .NET wrapper over it - and
-a program that cannot write looks exactly like a program with nothing to say.
-
-**The fourth run passed.** All three tiers, on a physical x86-64 Windows
-machine: the native `.exe`, the frozen `.exe` carrying its own CPython, and
-the C-API `.exe` driving a CPython 3.14 it downloaded itself. Linux passes the
-same way. What is worth keeping from it is that the compiled programs were
-right on every one of those runs - all four bugs were in where the executable
-was put and what its children were allowed to write to. Reading a generated
-image tells you it is well formed. It does not tell you it runs.
 
 ### 0.9.0 - what a compiled function could not do
 

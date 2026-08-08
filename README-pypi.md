@@ -13,6 +13,18 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
+**0.9.11 is the first release whose Windows binaries have been run on
+Windows.** Until now they were only ever *read* here - parsed and checked
+against the format, never started, because there is no Windows machine on
+which to start one. Four runs on real hardware found four bugs, each fatal to
+every Windows program the compiler produced: a native `.exe` the loader
+refused outright, a frozen one that discarded everything it printed, a
+cross-built bundle that put `python.exe` where it could not find its own DLLs,
+and a launcher stage that threw its child's output away. None was visible to
+output comparison, because in all four the program never reached a `print` -
+and none was in the compiled code. Windows x86-64 now passes all three tiers
+on real hardware, and so does Linux. **If you build for Windows, upgrade.**
+
 **0.9.6 makes `dir()` work** in every scope, and stops `locals()` at module level failing to compile.
 
 **0.9.5 made `freeze` work on Homebrew's Python**, which it did not: the
@@ -730,6 +742,38 @@ neither.
 
 Newest first. The full history is in the repository.
 
+### 0.9.11 - the Windows binaries had never been started on Windows
+
+Every release before this one was found by compiling a program and
+comparing its output against CPython, on macOS and Linux. The Windows
+images had only ever been *read*, never started - there is no Windows
+machine here. Then somebody started one.
+
+Four bugs over four runs on real hardware. Each was fatal to every Windows
+program the compiler produced, and none could have been caught by
+comparing output, because in all four the program never reached a
+`print`:
+
+- **Every native-tier `.exe` was unloadable.** The addresses *inside* the
+  import table were computed against a data section fixed at `0x2000`, true
+  only while the code fitted in one page. Past that, they pointed into the
+  middle of `.text` and Windows read machine code as a DLL name.
+- **The frozen launcher gave its child no standard handles** and no console,
+  so the program failed on its first `print` and the traceback went to the
+  same missing handle.
+- **A cross-built bundle put `python.exe` away from its DLLs.** The launcher
+  went to the bundle root while the runtime pack kept its own `runtime/`
+  directory. Windows resolves an executable's imports from its own directory,
+  so `CreateProcess` refused it outright. Built *on* Windows the two are the
+  same directory, which is why it had always worked.
+- **The one-file stage then discarded the output** of the program it started,
+  with `CreateNoWindow` on a console program - the same mistake one level
+  down. The program ran, passed, and exited 0 having printed nothing.
+
+All four are fixed and covered by tests that read the generated image the way
+the loader does. Windows x86-64 now passes all three tiers on real hardware.
+The compiled code was correct throughout; every one of these was packaging.
+
 ### 0.9.1 - 0.9.10
 
 Ten releases found by compiling a shape and comparing what came out against
@@ -756,31 +800,6 @@ came from *new kinds* of test rather than more of the same.
   two different binaries.
 - **`freeze` did not work at all on Homebrew's Python**, and **Windows ARM64**
   left an invalid instruction in the middle of the code.
-
-**Then the Windows binaries were run on Windows** - they had only ever been
-read here, never started. Four bugs, all fatal to every Windows program the
-compiler produced, none of them visible to output comparison because in each
-one the program never reached a `print`:
-
-- **Every native-tier `.exe` was unloadable.** The addresses *inside* the
-  import table were computed against a data section fixed at `0x2000`, true
-  only while the code fitted in one page. Past that, they pointed into the
-  middle of `.text` and Windows read machine code as a DLL name.
-- **The frozen launcher gave its child no standard handles** and no console,
-  so the program failed on its first `print` and the traceback went to the
-  same missing handle.
-- **A cross-built bundle put `python.exe` away from its DLLs.** The launcher
-  went to the bundle root while the runtime pack kept its own `runtime/`
-  directory. Windows resolves an executable's imports from its own directory,
-  so `CreateProcess` refused it outright. Built *on* Windows the two are the
-  same directory, which is why it had always worked.
-- **The one-file stage then discarded the output** of the program it started,
-  with `CreateNoWindow` on a console program - the same mistake one level
-  down. The program ran, passed, and exited 0 having printed nothing.
-
-All four are fixed and covered by tests that read the generated image the way
-the loader does. Windows x86-64 now passes all three tiers on real hardware.
-The compiled code was correct throughout; every one of these was packaging.
 
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
