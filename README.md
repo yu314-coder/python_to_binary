@@ -1233,6 +1233,18 @@ and PowerShell serialises that stream as CLIXML when it is redirected, so a
 failure arrived as a page of XML containing only a progress record. Errors are
 now written to stdout as a sentence.
 
+**And the third run found the same bug a third time.** With the layout fixed
+the frozen program ran and exited 0 - printing nothing. Its PowerShell stage
+started the program with `CreateNoWindow`, which is the mistake the launcher
+stub made one level up: a console program denied a console has nowhere to
+write. The program was correct every time; its output was being thrown away.
+It is set now only for a windowed build, where suppressing a console is the
+point.
+
+Three failures, one shape. A child process is not given its parent's console
+by default - not by `CreateProcess`, and not by the .NET wrapper over it - and
+a program that cannot write looks exactly like a program with nothing to say.
+
 ### 0.9.0 - what a compiled function could not do
 
 Metaclasses, `enum` and `dataclasses`, generator and `async def` methods,

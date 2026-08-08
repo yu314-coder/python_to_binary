@@ -145,6 +145,7 @@ def _powershell_script(
     offset: int,
     digest: str,
     launcher: str,
+    windowed: bool = False,
 ) -> str:
     launcher_ps = launcher.replace("'", "''").replace("/", "\\")
     mutex = f"Local\\py2bin_{digest}"
@@ -198,7 +199,12 @@ def _powershell_script(
         "}}finally{$mx.ReleaseMutex();$mx.Dispose()}};"
         "$si=[Diagnostics.ProcessStartInfo]::new();"
         f"$si.FileName=[IO.Path]::Combine($r,'{launcher_ps}');"
-        "$si.Arguments=$raw;$si.UseShellExecute=$false;$si.CreateNoWindow=$true;"
+        "$si.Arguments=$raw;$si.UseShellExecute=$false;"
+        # Only a windowed build wants this. For a console program it is
+        # the same mistake the launcher stub made one level up: a child
+        # denied a console has nowhere to write, so the program runs, its
+        # output is discarded, and it exits 0 having printed nothing.
+        f"$si.CreateNoWindow=${str(windowed).lower()};"
         "$child=[Diagnostics.Process]::Start($si);$child.WaitForExit();"
         "$code=$child.ExitCode"
         # `exit` is left outside the try: inside one it unwinds through a flow
@@ -325,6 +331,7 @@ def create_onefile(
                     offset=0,
                     digest=digest,
                     launcher=relative_launcher,
+                    windowed=windows_windowed,
                 )
             )
             stub = _windows_stub(
@@ -341,6 +348,7 @@ def create_onefile(
                     offset=offset,
                     digest=digest,
                     launcher=relative_launcher,
+                    windowed=windows_windowed,
                 )
             )
             final_stub = _windows_stub(

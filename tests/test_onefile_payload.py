@@ -188,3 +188,40 @@ class PackedBesideExecutableTests(unittest.TestCase):
                 onefile.pack_beside_executable(
                     Path(scratch) / "nothing", "linux-x86_64", []
                 )
+
+
+class WindowsChildProcess(unittest.TestCase):
+    """The PowerShell stage has to let the program it starts reach a console.
+
+    This is the same mistake as in the launcher stub the stage is started
+    from, one level further down. `CreateNoWindow` on a console program denies
+    the child the console it writes to, so the program runs correctly, its
+    output is thrown away, and it exits 0 having printed nothing - which reads
+    from outside like a program that produces no output rather than one whose
+    output was discarded.
+    """
+
+    def _script(self, windowed: bool) -> str:
+        from py2bin.onefile import _powershell_script
+
+        return _powershell_script(
+            offset=4096,
+            digest="0" * 64,
+            launcher="runtime/app.exe",
+            windowed=windowed,
+        )
+
+    def test_a_console_build_leaves_the_child_a_console(self) -> None:
+        self.assertIn("$si.CreateNoWindow=$false;", self._script(windowed=False))
+
+    def test_a_windowed_build_still_suppresses_it(self) -> None:
+        self.assertIn("$si.CreateNoWindow=$true;", self._script(windowed=True))
+
+    def test_failures_are_reported_rather_than_serialised(self) -> None:
+        # Errors used to go to PowerShell's error stream, which is serialised
+        # as CLIXML when redirected: a failure arrived as a page of XML.
+        script = self._script(windowed=False)
+        self.assertIn("try{", script)
+        self.assertIn("}catch{", script)
+        self.assertIn("[Console]::Out.WriteLine", script)
+        self.assertIn("$ProgressPreference='SilentlyContinue';", script)
