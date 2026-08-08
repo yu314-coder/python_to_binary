@@ -1189,6 +1189,31 @@ cleanly and died at start-up. It survived every earlier test because the
 instruction in the middle of the code that any large enough program would
 reach.
 
+**Then somebody ran the Windows binaries on Windows.** Everything above was
+found by compiling and comparing output on macOS and Linux; the Windows images
+had been checked by reading them, never by starting one. The first real run
+found two bugs, and neither could have been caught any other way, because in
+both the program never got far enough to print.
+
+*Every native-tier `.exe` was unloadable.* The import table's own addresses -
+the DLL name, the lookup table, the address table - were computed against a
+data section fixed at `0x2000`, which was correct only while the code fitted in
+one page. Real programs are forty times that, so the section moved and those
+addresses pointed into the middle of the code. Windows read machine code as a
+DLL name and refused the image. A sibling bug, the two sections overlapping,
+had been found and fixed earlier; the addresses *inside* the table were left
+pointing at the old place. Both architectures, every program.
+
+*A frozen `.exe` threw away everything it printed.* The launcher started the
+real program with `bInheritHandles` false and `CREATE_NO_WINDOW` set, so the
+child inherited none of the launcher's standard handles and got no console
+either. It failed on its first `print`, and the traceback went to the same
+missing handle. From outside: a silent exit 1 with two empty files.
+
+Both are now checked by reading the generated image the way the loader reads
+it - resolving every import RVA and asserting it lands in the data section, on
+a program deliberately larger than one page.
+
 ### 0.9.0 - what a compiled function could not do
 
 Metaclasses, `enum` and `dataclasses`, generator and `async def` methods,

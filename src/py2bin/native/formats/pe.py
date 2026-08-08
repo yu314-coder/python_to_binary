@@ -268,10 +268,25 @@ def _pe_image(
 
 def _write_pe(module: Module, machine: int, arm64: bool) -> bytes:
     image_base = 0x140000000
-    text_rva, rdata_rva = 0x1000, 0x2000
-    rdata, imports, iat_offset, iat_size = _imports(rdata_rva, image_base)
+    text_rva = 0x1000
     encoder = encode_windows_arm64 if arm64 else encode_windows
-    code = encoder(module, image_base + text_rva, imports)
+    # The same measure-then-place loop the dynamic writers below use, and for
+    # the same reason. `_pe_image` puts the data section after the code, but
+    # the RVAs *inside* the import table - the DLL name, the lookup table, the
+    # address table - are baked in here, so they have to be computed against
+    # the address the section actually gets. Fixing this address at 0x2000 was
+    # right only while the code fitted in one page: past that the loader read
+    # the middle of .text as a DLL name and refused the image, which is a
+    # failure to start rather than anything the program could report.
+    def build(rdata_rva: int) -> tuple[bytes, bytes, int, int]:
+        blob, imports, iat_offset, iat_size = _imports(rdata_rva, image_base)
+        return encoder(module, image_base + text_rva, imports), blob, iat_offset, iat_size
+
+    code, _blob, _io, _is = build(_align(text_rva + 0x1000, 0x1000))
+    settled = _align(text_rva + len(code), 0x1000)
+    code, rdata, iat_offset, iat_size = build(settled)
+    if _align(text_rva + len(code), 0x1000) != settled:
+        raise AssertionError("PE code length changed when the data section moved")
     # An upper bound on how much stack the program can be using at once. The
     # largest single frame is not enough: the C front end emits real calls, so
     # frames nest, and a deep chain lands below the committed region exactly the
@@ -522,6 +537,7 @@ def _x86_64_launcher_code(
     self_environment_address: int,
     command_environment_address: int,
     module_path_address: int,
+    creation_flags: int,
 ) -> bytes:
     code = bytearray()
     calls: list[tuple[int, str]] = []
@@ -568,8 +584,16 @@ def _x86_64_launcher_code(
     code.extend(b"\x31\xc9")  # application name = NULL
     lea(b"\x48\x8d\x15", buffer_address)
     code.extend(b"\x45\x31\xc0\x45\x31\xc9")
-    code.extend(b"\x48\xc7\x44\x24\x20\0\0\0\0")
-    code.extend(b"\x48\xc7\x44\x24\x28\0\0\0\x08")  # CREATE_NO_WINDOW
+    # bInheritHandles = TRUE. With FALSE the child gets none of this process's
+    # standard handles, so a redirected stdout - `frozen.exe > out.txt` - is not
+    # passed down and everything the program prints is written to a handle that
+    # is not there. The child then fails on its first print and the traceback
+    # goes the same nowhere, which reads from outside as a silent exit 1.
+    code.extend(b"\x48\xc7\x44\x24\x20\x01\0\0\0")
+    # CREATE_NO_WINDOW only for a windowed build, where the point is to stop a
+    # console flashing up. For a console build it does the opposite of what is
+    # wanted: it denies the child the console it is supposed to be writing to.
+    code.extend(b"\x48\xc7\x44\x24\x28" + struct.pack("<I", creation_flags))
     code.extend(b"\x48\xc7\x44\x24\x30\0\0\0\0")
     code.extend(b"\x48\xc7\x44\x24\x38\0\0\0\0")
     code.extend(b"\x48\x8d\x44\x24\x60\x48\x89\x44\x24\x40")
@@ -611,6 +635,7 @@ def _arm64_launcher_code(
     self_environment_address: int,
     command_environment_address: int,
     module_path_address: int,
+    creation_flags: int,
 ) -> bytes:
     words: list[int] = [_sub_sp(160)]
     calls: list[tuple[int, str]] = []
@@ -652,8 +677,11 @@ def _arm64_launcher_code(
     words.append(0xB90013E9)  # str w9,[sp,#16]
     words.append(0xAA1F03E0)  # x0 = NULL
     address(1, buffer_address)
-    words.extend((0xAA1F03E2, 0xAA1F03E3, 0xAA1F03E4))
-    words.extend(_mov(5, 0x08000000))
+    words.extend((0xAA1F03E2, 0xAA1F03E3))
+    # x4 is bInheritHandles and x5 the creation flags; see the x86-64 stub above
+    # for why the child has to inherit this process's handles.
+    words.extend(_mov(4, 1))
+    words.extend(_mov(5, creation_flags))
     words.extend((0xAA1F03E6, 0xAA1F03E7))
     words.extend(
         (
@@ -738,6 +766,9 @@ def write_pe_shell_launcher(
         module_path_address,
     ) = _launcher_rdata(command_prefix)
     code_address = 0x140001000
+    # CREATE_NO_WINDOW, and only when windowed: see the stubs for why a console
+    # build must not have it.
+    creation_flags = 0x08000000 if windowed else 0
     if machine == "x86_64":
         code = _x86_64_launcher_code(
             code_address,
@@ -747,6 +778,7 @@ def write_pe_shell_launcher(
             self_environment_address,
             command_environment_address,
             module_path_address,
+            creation_flags,
         )
         machine_id = 0x8664
     elif machine == "arm64":
@@ -758,10 +790,22 @@ def write_pe_shell_launcher(
             self_environment_address,
             command_environment_address,
             module_path_address,
+            creation_flags,
         )
         machine_id = 0xAA64
     else:
         raise ValueError(f"unsupported Windows launcher machine: {machine}")
+    # `_launcher_rdata` placed the data at 0x2000, one page after the code, and
+    # the addresses it handed back are already baked into `code`. That holds
+    # only while the stub fits in a page. It does, with room to spare - but the
+    # same assumption silently produced an unloadable image in the writer above
+    # once the code outgrew it, so say so here rather than emit one again.
+    if len(code) > 0x1000:
+        raise AssertionError(
+            f"the Windows launcher stub grew to {len(code)} bytes, past the one "
+            "page its data section is placed after; give `_launcher_rdata` the "
+            "same measure-then-place loop the other writers use"
+        )
     return _pe_image(
         code,
         rdata,
