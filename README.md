@@ -112,11 +112,20 @@ not reproduce.
 
 All six. Each was built from one program and the three that can run on this
 machine were run - darwin-arm64 natively, both Linux targets in containers -
-answering exactly what CPython answers. The two Windows targets and the Intel
-Mac are built and checked structurally; there is no Windows, no Intel Mac and
-no emulator here, and that is the honest limit of what *this machine* verified.
-Windows x86-64 is no longer only a structural check: a real application built
-for it runs on real Windows, reported by the author rather than measured here.
+answering exactly what CPython answers.
+
+**Windows x86-64 has since been run on real Windows hardware**, all three
+tiers: the native `.exe`, the frozen `.exe` carrying its own CPython, and the
+C-API `.exe` driving a downloaded CPython 3.14. That run is the author's,
+on a physical machine, not something measured here - and it was worth doing.
+It found four bugs that no amount of reading the images had caught, every one
+of them fatal to every Windows program the compiler produced, and every one in
+the packaging rather than in the compiled code. They are fixed and covered by
+tests; the first three releases of this section describe them.
+
+Windows arm64 and the Intel Mac are still built and checked structurally only.
+There is no ARM64 Windows, no Intel Mac and no emulator here, and that is the
+honest limit of what has been verified.
 
 **iOS is not a py2bin target and this grid does not claim it.** ManimStudio
 also ships on iPad and iPhone
@@ -1244,6 +1253,14 @@ point.
 Three failures, one shape. A child process is not given its parent's console
 by default - not by `CreateProcess`, and not by the .NET wrapper over it - and
 a program that cannot write looks exactly like a program with nothing to say.
+
+**The fourth run passed.** All three tiers, on a physical x86-64 Windows
+machine: the native `.exe`, the frozen `.exe` carrying its own CPython, and
+the C-API `.exe` driving a CPython 3.14 it downloaded itself. Linux passes the
+same way. What is worth keeping from it is that the compiled programs were
+right on every one of those runs - all four bugs were in where the executable
+was put and what its children were allowed to write to. Reading a generated
+image tells you it is well formed. It does not tell you it runs.
 
 ### 0.9.0 - what a compiled function could not do
 

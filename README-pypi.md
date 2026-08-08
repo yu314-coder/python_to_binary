@@ -757,6 +757,31 @@ came from *new kinds* of test rather than more of the same.
 - **`freeze` did not work at all on Homebrew's Python**, and **Windows ARM64**
   left an invalid instruction in the middle of the code.
 
+**Then the Windows binaries were run on Windows** - they had only ever been
+read here, never started. Four bugs, all fatal to every Windows program the
+compiler produced, none of them visible to output comparison because in each
+one the program never reached a `print`:
+
+- **Every native-tier `.exe` was unloadable.** The addresses *inside* the
+  import table were computed against a data section fixed at `0x2000`, true
+  only while the code fitted in one page. Past that, they pointed into the
+  middle of `.text` and Windows read machine code as a DLL name.
+- **The frozen launcher gave its child no standard handles** and no console,
+  so the program failed on its first `print` and the traceback went to the
+  same missing handle.
+- **A cross-built bundle put `python.exe` away from its DLLs.** The launcher
+  went to the bundle root while the runtime pack kept its own `runtime/`
+  directory. Windows resolves an executable's imports from its own directory,
+  so `CreateProcess` refused it outright. Built *on* Windows the two are the
+  same directory, which is why it had always worked.
+- **The one-file stage then discarded the output** of the program it started,
+  with `CreateNoWindow` on a console program - the same mistake one level
+  down. The program ran, passed, and exited 0 having printed nothing.
+
+All four are fixed and covered by tests that read the generated image the way
+the loader does. Windows x86-64 now passes all three tiers on real hardware.
+The compiled code was correct throughout; every one of these was packaging.
+
 ### 0.8.9 - verdicts, borrowed references, and a leak in every `try`
 
 The largest release so far, and most of it is correctness that turned up while
