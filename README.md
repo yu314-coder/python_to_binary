@@ -110,9 +110,9 @@ Python frame to suggest from, the repr of a compiled function really is a
 builtin function's, and `"v" is "v"` depends on an interning the compiler does
 not reproduce.
 
-All six. Each was built from one program and the three that can run on this
-machine were run - darwin-arm64 natively, both Linux targets in containers -
-answering exactly what CPython answers.
+All six. Each was built from one program, and the four that can be run on this
+machine were run - darwin-arm64 natively, both Linux targets in containers, and
+darwin-x86_64 under Rosetta 2 - answering exactly what CPython answers.
 
 **Windows x86-64 has since been run on real Windows hardware**, all three
 tiers: the native `.exe`, the frozen `.exe` carrying its own CPython, and the
@@ -123,9 +123,17 @@ of them fatal to every Windows program the compiler produced, and every one in
 the packaging rather than in the compiled code. They are fixed and covered by
 tests; the first three releases of this section describe them.
 
-Windows arm64 and the Intel Mac are still built and checked structurally only.
-There is no ARM64 Windows, no Intel Mac and no emulator here, and that is the
-honest limit of what has been verified.
+**darwin-x86_64 passes all three tiers under Rosetta 2** on the Apple Silicon
+machine this is developed on - the native binary, the frozen one, and the
+C-API one linking the x86-64 half of a universal2 framework. Rosetta translates
+rather than being an Intel CPU, so this is weaker evidence than a physical
+machine; it is much stronger than the structural check it replaces, because
+the generated x86-64 instruction stream really is executed and really does
+produce the right answers.
+
+Windows arm64 is still built and checked structurally only. No ARM64 Windows
+machine has ever started one of these images, and that is the honest limit of
+what has been verified.
 
 **iOS is not a py2bin target and this grid does not claim it.** ManimStudio
 also ships on iPad and iPhone
