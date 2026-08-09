@@ -22,8 +22,10 @@ refused outright, a frozen one that discarded everything it printed, a
 cross-built bundle that put `python.exe` where it could not find its own DLLs,
 and a launcher stage that threw its child's output away. None was visible to
 output comparison, because in all four the program never reached a `print` -
-and none was in the compiled code. Windows x86-64 now passes all three tiers
-on real hardware, and so does Linux. **If you build for Windows, upgrade.**
+and none was in the compiled code. Both Windows targets now pass all three
+tiers on real hardware, as do Linux and macOS, so **every one of the six
+targets has now been run rather than only built and inspected.**
+**If you build for Windows, upgrade.**
 
 **0.9.6 makes `dir()` work** in every scope, and stops `locals()` at module level failing to compile.
 
@@ -771,8 +773,10 @@ comparing output, because in all four the program never reached a
   down. The program ran, passed, and exited 0 having printed nothing.
 
 All four are fixed and covered by tests that read the generated image the way
-the loader does. Windows x86-64 now passes all three tiers on real hardware.
-The compiled code was correct throughout; every one of these was packaging.
+the loader does. Windows x86-64 passes all three tiers on physical hardware
+and Windows arm64 on an ARM64 virtual machine - the target nothing had ever
+started before this release. The compiled code was correct throughout; every
+one of these was packaging.
 
 ### 0.9.1 - 0.9.10
 

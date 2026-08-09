@@ -111,8 +111,9 @@ builtin function's, and `"v" is "v"` depends on an interning the compiler does
 not reproduce.
 
 All six. Each was built from one program, and the four that can be run on this
-machine were run - darwin-arm64 natively, both Linux targets in containers, and
-darwin-x86_64 under Rosetta 2 - answering exactly what CPython answers.
+machine were run here - darwin-arm64 natively, both Linux targets in
+containers, and darwin-x86_64 under Rosetta 2 - answering exactly what CPython
+answers. The two Windows targets were run on the author's machines; see below.
 
 **Windows x86-64 has since been run on real Windows hardware**, all three
 tiers: the native `.exe`, the frozen `.exe` carrying its own CPython, and the
@@ -131,9 +132,16 @@ machine; it is much stronger than the structural check it replaces, because
 the generated x86-64 instruction stream really is executed and really does
 produce the right answers.
 
-Windows arm64 is still built and checked structurally only. No ARM64 Windows
-machine has ever started one of these images, and that is the honest limit of
-what has been verified.
+**Windows arm64 passes too**, on a Windows 11 ARM64 virtual machine - which
+runs ARM64 instructions on an ARM64 processor, so the generated code is
+executed rather than translated. The author's report, like the x86-64 one.
+
+That closes the grid. **Every one of the six targets has now had its output
+compared against CPython's on a machine that actually ran it** - four here
+(darwin-arm64 natively, darwin-x86_64 under Rosetta, both Linux targets in
+containers) and both Windows targets on the author's hardware. Until this
+release two of the six had only ever been *read*, and reading them is exactly
+what missed four bugs that made every Windows binary unusable.
 
 **iOS is not a py2bin target and this grid does not claim it.** ManimStudio
 also ships on iPad and iPhone
@@ -1211,10 +1219,14 @@ a program that cannot write looks exactly like a program with nothing to say.
 **The fourth run passed.** All three tiers, on a physical x86-64 Windows
 machine: the native `.exe`, the frozen `.exe` carrying its own CPython, and
 the C-API `.exe` driving a CPython 3.14 it downloaded itself. Linux passes the
-same way. What is worth keeping from it is that the compiled programs were
-right on every one of those runs - all four bugs were in where the executable
-was put and what its children were allowed to write to. Reading a generated
-image tells you it is well formed. It does not tell you it runs.
+same way, and so does Windows arm64 on an ARM64 virtual machine - the target
+that had never once been started until this release.
+
+So all six targets have now been *run*, not merely built and inspected. What
+is worth keeping is that the compiled programs were right on every one of
+those runs: all four bugs were in where the executable was put and what its
+children were allowed to write to. Reading a generated image tells you it is
+well formed. It does not tell you it runs.
 
 ### 0.9.1 - 0.9.10
 
