@@ -13,19 +13,20 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**0.9.11 is the first release whose Windows binaries have been run on
-Windows.** Until now they were only ever *read* here - parsed and checked
-against the format, never started, because there is no Windows machine on
-which to start one. Four runs on real hardware found four bugs, each fatal to
-every Windows program the compiler produced: a native `.exe` the loader
-refused outright, a frozen one that discarded everything it printed, a
-cross-built bundle that put `python.exe` where it could not find its own DLLs,
-and a launcher stage that threw its child's output away. None was visible to
-output comparison, because in all four the program never reached a `print` -
-and none was in the compiled code. Both Windows targets now pass all three
-tiers on real hardware, as do Linux and macOS, so **every one of the six
-targets has now been run rather than only built and inspected.**
-**If you build for Windows, upgrade.**
+**Every one of py2bin's six targets has now been run**, not merely built and
+inspected - as of 0.9.12, with Windows arm64 the last to be tried.
+
+That sentence was not true a week ago, and **0.9.11 is the release that made
+it true**. Both Windows targets had until then only ever been *read* here -
+parsed and checked against the format, never started, because there is no
+Windows machine on which to start one. The first four runs on real hardware
+found four bugs, each fatal to every Windows program the compiler produced: a
+native `.exe` the loader refused outright, a frozen one that discarded
+everything it printed, a cross-built bundle that put `python.exe` where it
+could not find its own DLLs, and a launcher stage that threw its child's
+output away. None was visible to output comparison, because in all four the
+program never reached a `print` - and none was in the compiled code.
+**If you build for Windows, upgrade from anything before 0.9.11.**
 
 **0.9.6 makes `dir()` work** in every scope, and stops `locals()` at module level failing to compile.
 
@@ -743,6 +744,20 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.12 - all six targets have now been run
+
+No change to the compiler; it records a verification result 0.9.11 was
+published too early to carry. Windows arm64 - the one target nothing had ever
+started - has since passed on a Windows 11 ARM64 virtual machine, which runs
+ARM64 instructions on an ARM64 processor rather than translating them.
+
+Every target has now had its output compared against CPython's on a machine
+that actually ran it: darwin-arm64 natively, darwin-x86_64 under Rosetta 2,
+both Linux targets in containers, and both Windows targets on the author's
+hardware. Until 0.9.11 the two Windows targets had only ever been *read* - and
+that gap is exactly where four bugs lived, each fatal to every Windows binary
+py2bin produced, none of them in the compiled code.
 
 ### 0.9.11 - the Windows binaries had never been started on Windows
 

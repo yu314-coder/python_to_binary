@@ -1153,6 +1153,29 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.12 - all six targets have now been run
+
+No change to the compiler. This records a verification result that 0.9.11 was
+published too early to carry.
+
+py2bin has six targets, and until 0.9.11 two of them - both Windows - had only
+ever been *read*: parsed, checked against the format, disassembled, never
+started, because there is no Windows machine here. 0.9.11 fixed the four bugs
+that came out the first time somebody started one. Windows arm64 was still
+untried when it went out, and has since passed on a Windows 11 ARM64 virtual
+machine, which runs ARM64 instructions on an ARM64 processor - the code is
+executed, not translated.
+
+So every target has now had its output compared against CPython's on a machine
+that actually ran it: darwin-arm64 natively, darwin-x86_64 under Rosetta 2,
+both Linux targets in containers, and both Windows targets on the author's
+hardware.
+
+Worth saying plainly, because it is the whole lesson of 0.9.11: reading a
+generated image tells you it is well formed, and tells you nothing about
+whether it runs. Four bugs lived in that gap, every one of them fatal to every
+Windows binary py2bin produced, and not one of them in the compiled code.
+
 ### 0.9.11 - the Windows binaries had never been started on Windows
 
 Every release before this one was found by compiling a program and comparing
