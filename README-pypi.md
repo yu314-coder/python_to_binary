@@ -126,6 +126,36 @@ really is a builtin function's.
 
 The **native** tier (`py2bin compile`, no CPython at all) targets all six.
 
+### One macOS binary for both machines
+
+`darwin-universal2` writes a single artifact holding an Intel slice and an
+Apple silicon slice:
+
+```sh
+py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
+```
+
+A universal binary is the two programs, whole and unaltered, behind a table
+saying where each begins - arithmetic rather than a second compiler. Each slice
+keeps its own ad-hoc signature, and the `.app` is sealed over both at once; it
+passes `codesign --deep --strict`. The code is there twice; the interpreter is
+not, since python.org's framework is already universal2 and a universal bundle
+simply stops discarding half of it.
+
+`freeze` can do it from a pack that kept both slices - `runtime-pack
+--universal`, then `--target darwin-universal2 --onedir`. A universal *one-file*
+build is refused with a reason: the payload sits at an offset the launcher is
+told about, and two launchers cannot both be told an offset that is not settled
+until after both exist. The native `compile` tier's x86-64 half is unsigned
+(Intel macOS never required one), so use `compile-capi` for anything you hand
+over - it signs both.
+
+**A 16 KB alignment rule is the thing worth knowing.** A code-signed x86-64
+slice on a 4 KB boundary - what `lipo` historically recorded - is killed at
+exec on Apple silicon, whose pages are 16 KB, while `codesign` still calls the
+file valid and the same bytes run fine on their own. Every slice is placed on
+2**14, as Apple's own universal2 builds are.
+
 ## What it guarantees
 
 Names the program binds are the program's. Integers do not stop at 64 bits.

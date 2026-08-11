@@ -156,6 +156,60 @@ targets py2bin can build - iOS forbids the JIT-adjacent and dynamic-linking
 freedoms every py2bin tier depends on, and reaching it needs an embedded
 interpreter and an Xcode toolchain instead.
 
+### One macOS binary for both machines
+
+`darwin-universal2` writes a single artifact holding an Intel slice and an
+Apple silicon slice, the way Apple's own universal2 builds do:
+
+```sh
+py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
+py2bin compile      app.py --target darwin-universal2 -o app
+```
+
+A universal binary is not a merged program. It is the two programs, whole and
+unaltered, behind a small table saying where each begins - which is why this is
+arithmetic rather than a second compiler. Each slice keeps its own ad-hoc
+signature, because a signature covers the bytes of the image it was written
+over and knows nothing about the wrapper they were later placed in. The `.app`
+is sealed afterwards over both slices at once, and passes
+`codesign --deep --strict`.
+
+What it costs is size: the code is there twice. The interpreter is not - the
+python.org framework is already universal2, and a universal bundle simply stops
+throwing half of it away.
+
+**`freeze` can do it too**, from a runtime pack that has kept both slices:
+
+```sh
+py2bin runtime-pack --universal -o pack
+py2bin freeze app.py --runtime-pack pack --target darwin-universal2 --app --onedir -o App.app
+```
+
+`--universal` is asked for rather than detected. python.org's framework is
+universal whether or not anyone wants a universal bundle out of it, and quietly
+keeping both slices would double the size of every bundle built the way they
+always were.
+
+Two limits, both refused with a reason rather than silently mishandled. A
+universal **one-file** build is not implemented: one file carries its payload
+at an offset the launcher is told about, and a universal launcher is two
+launchers that would each have to be told the same offset into a file whose
+layout is not settled until after both are built. And the native `compile`
+tier's x86-64 half carries no signature - Intel macOS does not require one, so
+that writer never wrote one - which means a universal artifact from the native
+and `freeze` launchers runs on both machines but reports as unsigned. The
+`compile-capi` tier signs both, and is the one to use for something you hand
+over.
+
+**A 16 KB alignment rule is the thing worth knowing here.** A code-signed
+x86-64 slice placed on a 4 KB boundary - which is what `lipo` historically
+recorded - is killed at exec on Apple silicon, whose pages are 16 KB. Nothing
+about the file says so: `codesign` calls it valid, and the same bytes copied
+back out to a file of their own run perfectly. Only in place, at the wrong
+offset, does it die, and an *unsigned* slice survives it, which is what makes
+the symptom so misleading. Every slice is placed on 2**14, as Apple's own
+universal2 builds are.
+
 ### Building on an iPad
 
 iOS cannot *run* a py2bin binary. It can *produce* one - and this has been

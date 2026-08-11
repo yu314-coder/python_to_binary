@@ -21,6 +21,7 @@ from .builder import _copy_distribution, _copy_project
 from .icons import install_macos_icon, macos_info_plist
 from .native.compiler import host_target
 from .native.launcher import macos_shell_launcher
+from .native.compiler import UNIVERSAL_SLICES, UNIVERSAL_TARGET
 from .onefile import create_onefile
 from .runtime_packs import (
     RuntimePackInfo,
@@ -535,7 +536,7 @@ def embed_cpython_in_app(
         *bundle.rglob("*.dylib"),
         carried_version / carried_name,
     ):
-        if binary.is_file():
+        if binary.is_file() and _BUNDLE_ARCHITECTURES[target] is not None:
             _thin_to_arm64(binary, _BUNDLE_ARCHITECTURES[target])
     return sum(
         item.stat().st_size
@@ -775,8 +776,47 @@ _CPU_TYPE_X86_64 = 0x01000007
 _BUNDLE_ARCHITECTURES = {
     "darwin-arm64": _CPU_TYPE_ARM64,
     "darwin-x86_64": _CPU_TYPE_X86_64,
+    # A universal bundle keeps both, which is the one case where the answer to
+    # "which slice do we keep" is "do not do this at all".
+    UNIVERSAL_TARGET: None,
 }
 
+
+
+def _macos_launcher_image(
+    command: str,
+    target: str,
+    info_plist: bytes | None = None,
+    code_resources: bytes | None = None,
+) -> bytes:
+    """The bundle's launcher, thin or universal according to the target.
+
+    A universal bundle needs a universal launcher: it is the file the kernel
+    execs, so if it holds only one architecture the bundle runs on only one
+    machine however universal everything behind it is. Both are built with the
+    same command and the same plist, and each signs that plist into itself.
+    """
+
+    if target != UNIVERSAL_TARGET:
+        return macos_shell_launcher(
+            command,
+            machine=target.rpartition("-")[2],
+            info_plist=info_plist,
+            code_resources=code_resources,
+        )
+    from .native.formats.universal import write_universal
+
+    return write_universal(
+        {
+            architecture: macos_shell_launcher(
+                command,
+                machine=architecture,
+                info_plist=info_plist,
+                code_resources=code_resources,
+            )
+            for architecture in UNIVERSAL_SLICES
+        }
+    )
 
 def _thin_to_arm64(binary: Path, wanted: int = _CPU_TYPE_ARM64) -> bool:
     """Keep only this architecture's slice of a universal file.
@@ -1178,8 +1218,16 @@ def create_runtime_pack(
     *,
     compact: bool = False,
     clean: bool = False,
+    universal: bool = False,
 ) -> RuntimePackResult:
-    """Snapshot the current target-compatible CPython runtime for later reuse."""
+    """Snapshot the current target-compatible CPython runtime for later reuse.
+
+    `universal` labels the pack `darwin-universal2`, which is what stops a
+    bundle built from it being thinned to one architecture. It is asked for
+    rather than detected: python.org's framework is universal whether or not
+    anyone wants a universal bundle out of it, and quietly keeping both slices
+    would double the size of every bundle built the way they always were.
+    """
 
     output = output.expanduser().resolve()
     if output.exists() and not clean:
@@ -1202,6 +1250,21 @@ def create_runtime_pack(
             runtime_root, compact=compact
         )
         target = host_target()
+        if universal:
+            if not target.startswith("darwin-"):
+                raise ValueError(
+                    f"a universal runtime pack is a macOS one; this host is "
+                    f"{target}"
+                )
+            from .native.formats.universal import read_universal
+
+            if not read_universal(executable.read_bytes()):
+                raise ValueError(
+                    f"{executable} carries one architecture, so a pack made "
+                    f"from it cannot be universal. python.org's framework is "
+                    f"universal2; a Homebrew or pyenv interpreter is not."
+                )
+            target = UNIVERSAL_TARGET
         python = (
             f"{sys.version_info.major}.{sys.version_info.minor}."
             f"{sys.version_info.micro}"
@@ -1324,12 +1387,7 @@ def _frozen_macos_app(
         f'exec "$ROOT/{runtime.as_posix()}" -B -s "$ROOT/py2bin_bootstrap.py" "$@"'
     )
     launcher.write_bytes(
-        macos_shell_launcher(
-            command,
-            machine=target.rpartition("-")[2],
-            info_plist=info_plist,
-            code_resources=code_resources,
-        )
+        _macos_launcher_image(command, target, info_plist, code_resources)
     )
     launcher.chmod(0o755)
     (contents / "Info.plist").write_bytes(info_plist)
@@ -1671,6 +1729,15 @@ def freeze(
         if runtime_pack_info is not None
         else f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     )
+    if bundle_target == UNIVERSAL_TARGET and onefile:
+        raise ValueError(
+            "a universal one-file build is not implemented. One file carries "
+            "its payload at an offset the launcher is told about, and a "
+            "universal launcher is two launchers - each would have to be told "
+            "the same offset into a file whose layout is not settled until "
+            "after both are built. Use --onedir for a universal bundle, or "
+            "build one file per architecture."
+        )
     macos_app = app and bundle_target.startswith("darwin-")
     windows_app = app and bundle_target.startswith("windows-")
     if app:

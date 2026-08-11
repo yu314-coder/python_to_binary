@@ -512,6 +512,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     runtime_parser.add_argument("--clean", action="store_true")
+    runtime_parser.add_argument(
+        "--universal",
+        action="store_true",
+        help=(
+            "label the pack darwin-universal2, keeping both Darwin slices of "
+            "every carried binary so a bundle built from it runs on Intel and "
+            "Apple silicon (macOS hosts with a universal2 interpreter)"
+        ),
+    )
     capability_parser = commands.add_parser(
         "capabilities",
         help="report what is native machine code and what still requires CPython",
@@ -1020,7 +1029,10 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command in {"runtime-pack", "pack-runtime"}:
         try:
             result = create_runtime_pack(
-                args.output, compact=args.compact, clean=args.clean
+                args.output,
+                compact=args.compact,
+                clean=args.clean,
+                universal=args.universal,
             )
         except (FileNotFoundError, FileExistsError, ValueError, OSError) as error:
             print(f"py2bin: error: {error}", file=sys.stderr)

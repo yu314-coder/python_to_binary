@@ -248,13 +248,40 @@ def resign(binary: Path, info_plist: bytes | None = None,
 
     The image keeps its layout; only the signature at the end is replaced, and
     the load command that describes it is corrected to the new length.
+
+    A universal executable is handled a slice at a time. Each slice is a whole
+    Mach-O whose signature covers its own bytes, so re-signing one is the
+    ordinary thin case; all the fat file adds is that there are two of them and
+    that they must be laid out again afterwards, a re-signed slice not being
+    the length it was.
     """
+    from .native.formats.universal import read_universal, write_universal
+
+    original = binary.read_bytes()
+    slices = read_universal(original)
+    if slices:
+        signed = write_universal(
+            {
+                architecture: _resigned(image, info_plist, resources)
+                for architecture, image in slices.items()
+            }
+        )
+    else:
+        signed = _resigned(original, info_plist, resources)
+    binary.write_bytes(signed)
+    binary.chmod(binary.stat().st_mode | 0o111)
+
+
+def _resigned(image_bytes: bytes, info_plist: bytes | None,
+              resources: bytes | None) -> bytes:
+    """One thin Mach-O, signed again over the seal it now has to cover."""
+
     from .native.formats.macho import _adhoc_signature
 
-    image = bytearray(binary.read_bytes())
+    image = bytearray(image_bytes)
     span = _signature_span(bytes(image))
     if span is None:
-        raise SealError(f"{binary} carries no signature to replace")
+        raise SealError("this Mach-O carries no signature to replace")
     signature_offset, _old = span
 
     exec_base = exec_size = 0
@@ -307,9 +334,7 @@ def resign(binary: Path, info_plist: bytes | None = None,
         raise SealError("signature length did not settle")
     del image[signature_offset:]
     image.extend(padded)
-
-    binary.write_bytes(bytes(image))
-    binary.chmod(binary.stat().st_mode | 0o111)
+    return bytes(image)
 
 
 def _drop_stale_seals(directory: Path) -> int:

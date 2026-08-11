@@ -36,6 +36,7 @@ _NOT_PROGRAMS = {"src", "tests", "docs", "dist", "build", "__pycache__"}
 TARGETS = (
     ("darwin-arm64", "macOS, Apple silicon"),
     ("darwin-x86_64", "macOS, Intel"),
+    ("darwin-universal2", "macOS, one binary for both"),
     ("windows-x86_64", "Windows, 64-bit Intel/AMD"),
     ("windows-arm64", "Windows on ARM"),
     ("linux-x86_64", "Linux, 64-bit Intel/AMD"),
@@ -83,6 +84,12 @@ def can_freeze(target: str) -> bool:
     menu is shown, because offering a choice that cannot be carried out is
     worse than not offering it.
     """
+    if target == "darwin-universal2":
+        # Freezing universal is possible, but not from three questions: it
+        # needs a runtime pack built with `runtime-pack --universal` from a
+        # universal2 interpreter, and it cannot be one file. Offering it here
+        # would be offering something this flow cannot then carry out.
+        return False
     return target.startswith("windows-") or target == host_target()
 
 

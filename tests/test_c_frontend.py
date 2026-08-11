@@ -24,6 +24,10 @@ from py2bin.c_frontend import CCompileError, compile_c_to_ir
 from py2bin.c_native import compile_c_native
 from py2bin.cli import main
 from py2bin.native import host_target, supported_targets
+# The backends, not what a user may ask for: these lower C against one
+# machine's rules, and `darwin-universal2` is two machines rather than a
+# seventh set of rules. A universal build is two of these compilations.
+from py2bin.native.compiler import TARGETS as MACHINE_TARGETS
 
 
 _HOST_IS_DARWIN_ARM64 = (
@@ -1364,7 +1368,7 @@ int main(void) {
         )
 
     def test_a_format_without_conversions_needs_no_syscall_support(self):
-        for target in supported_targets():
+        for target in MACHINE_TARGETS:
             with self.subTest(target=target):
                 self.build(
                     _STDIO + 'int main(void) { printf("plain\\n"); return 0; }\n',
@@ -1407,7 +1411,7 @@ class RejectionTests(CProgramTestCase):
             "int f(int n) { return n ? f(n - 1) : 0; }\n"
             "int main(void) { return f(3); }\n"
         )
-        for target in supported_targets():
+        for target in MACHINE_TARGETS:
             with self.subTest(target=target):
                 compile_c_to_ir(source, "r.c", target)
 
@@ -1421,7 +1425,7 @@ class RejectionTests(CProgramTestCase):
             "            long long i, long long j) { return a + j; }\n"
             "int main(void) { return s(1,2,3,4,5,6,7,8,9,10); }\n"
         )
-        for target in supported_targets():
+        for target in MACHINE_TARGETS:
             with self.subTest(target=target):
                 compile_c_to_ir(source, "many.c", target)
 
@@ -2447,7 +2451,7 @@ int main(void) {
             root = Path(directory)
             entry = root / "floats.c"
             entry.write_text(self._FLOAT_SOURCE, encoding="utf-8")
-            for target in supported_targets():
+            for target in MACHINE_TARGETS:
                 with self.subTest(target=target):
                     artifact = root / f"floats-{target}.bin"
                     compile_c_native(entry, artifact, target=target, clean=True)
@@ -2591,7 +2595,7 @@ int main(void) {
             root = Path(directory)
             entry = root / "every.c"
             entry.write_text(source, encoding="utf-8")
-            for target in supported_targets():
+            for target in MACHINE_TARGETS:
                 with self.subTest(target=target):
                     artifact = root / f"every-{target}.bin"
                     compile_c_native(entry, artifact, target=target, clean=True)
@@ -3596,7 +3600,7 @@ class FunctionPointerRejectionTests(CProgramTestCase):
             "int add(int a, int b) { return a + b; }\n"
             "int main(void) { int (*p)(int, int) = add; return p(1, 2); }\n"
         )
-        for target in supported_targets():
+        for target in MACHINE_TARGETS:
             with self.subTest(target=target):
                 compile_c_to_ir(source, "p.c", target)
 

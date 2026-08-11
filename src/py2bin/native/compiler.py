@@ -41,6 +41,20 @@ TARGETS = (
     "windows-arm64",
 )
 
+#: One macOS binary holding both Darwin slices. Deliberately not in TARGETS:
+#: that tuple is the set of *backends*, and this is not one - it is the two
+#: Darwin backends run in turn and their images joined. `compile-all` iterates
+#: TARGETS, and a seventh artifact that is only the fifth and sixth
+#: concatenated is not another platform covered.
+UNIVERSAL_TARGET = "darwin-universal2"
+
+#: Which slices it holds, in the order they are written. x86-64 first is the
+#: order Apple's own universal2 builds use.
+UNIVERSAL_SLICES = ("x86_64", "arm64")
+
+#: What a user may ask for, as opposed to what the backends are.
+SELECTABLE_TARGETS = TARGETS + (UNIVERSAL_TARGET,)
+
 OS_ALIASES = {
     "darwin": "darwin",
     "mac": "darwin",
@@ -68,7 +82,12 @@ class NativeResult:
 
 
 def supported_targets() -> tuple[str, ...]:
-    return TARGETS
+    """What a build may be asked for - the six backends, plus the universal.
+
+    Not the same as TARGETS, which is the set of backends `compile-all`
+    iterates. See UNIVERSAL_TARGET.
+    """
+    return SELECTABLE_TARGETS
 
 
 def resolve_target(os_name: str, architecture: str) -> str:
@@ -198,8 +217,10 @@ def compile_native_source(
     entry = entry.expanduser().resolve()
     output = output.expanduser().resolve()
     target = target or host_target()
-    if target not in TARGETS:
-        raise ValueError(f"unknown target {target!r}; supported: {', '.join(TARGETS)}")
+    if target not in SELECTABLE_TARGETS:
+        raise ValueError(
+            f"unknown target {target!r}; supported: {', '.join(SELECTABLE_TARGETS)}"
+        )
     if app:
         if not target.startswith("darwin-"):
             raise ValueError(
@@ -237,8 +258,10 @@ def compile_native_module(
     entry = entry.expanduser().resolve()
     output = output.expanduser().resolve()
     target = target or host_target()
-    if target not in TARGETS:
-        raise ValueError(f"unknown target {target!r}; supported: {', '.join(TARGETS)}")
+    if target not in SELECTABLE_TARGETS:
+        raise ValueError(
+            f"unknown target {target!r}; supported: {', '.join(SELECTABLE_TARGETS)}"
+        )
     if app:
         if not target.startswith("darwin-"):
             raise ValueError(
@@ -365,7 +388,28 @@ def _emit_native_module(
     app_name: str | None = None,
     icon: Path | None = None,
     python_dylib: str | None = None,
-) -> NativeResult:
+    _image_only: bool = False,
+) -> "NativeResult | bytes":
+    """Write one image, or with `_image_only` return it for a caller to join.
+
+    The universal target is the only caller of `_image_only`: it needs the
+    bytes of each slice rather than a file, and every check and every piece of
+    bundle metadata has to be the same for both. Running the whole emitter per
+    slice is what guarantees that - both are validated against their own real
+    target, and both embed the identical Info.plist, which they must, because
+    each slice signs the plist into itself.
+    """
+
+    if target == UNIVERSAL_TARGET:
+        return emit_universal(
+            entry,
+            {architecture: module for architecture in UNIVERSAL_SLICES},
+            output,
+            app=app,
+            app_name=app_name,
+            icon=icon,
+            python_dylib=python_dylib,
+        )
     if module.functions and target not in CALL_CAPABLE_TARGETS:
         # The call ABI (frame with a saved link register, arguments in the
         # platform argument registers, direct branch-and-link) is implemented
@@ -559,6 +603,100 @@ def _emit_native_module(
         platform_name = target.partition("-")[0]
         code = encode(module, platform_name, code_address)
         image = write_elf_x86_64(code) if platform_name == "linux" else write_macho_x86_64(code)
+    if _image_only:
+        return image
+    return _write_native_output(
+        module, output, target, app, executable_name, icon, image,
+        info_plist, code_resources,
+    )
+
+
+
+def emit_universal(
+    entry: Path,
+    modules: "dict[str, Module]",
+    output: Path,
+    *,
+    app: bool = False,
+    app_name: str | None = None,
+    icon: Path | None = None,
+    python_dylib: str | None = None,
+) -> NativeResult:
+    """One universal artifact from one module per Darwin architecture.
+
+    A module per slice rather than one shared module, because the two callers
+    differ on that. Python source lowers to IR that does not know the machine,
+    so both slices compile the same module; C does not - the frontend applies
+    the target's rules while it lowers, so a universal build of C really is two
+    compilations, and this is handed both of them.
+
+    Each slice goes through the ordinary emitter, which is what keeps them
+    consistent: the same checks run against each real target, and the bundle
+    metadata is rebuilt identically for both - it has to be, because each slice
+    signs the Info.plist into itself.
+    """
+
+    from .formats.universal import write_universal
+
+    missing = [name for name in UNIVERSAL_SLICES if name not in modules]
+    if missing:
+        raise ValueError(
+            f"a universal build needs a module for each of "
+            f"{', '.join(UNIVERSAL_SLICES)}; missing {', '.join(missing)}"
+        )
+    image = write_universal(
+        {
+            architecture: _emit_native_module(
+                entry,
+                modules[architecture],
+                output,
+                f"darwin-{architecture}",
+                app,
+                app_name,
+                icon,
+                python_dylib,
+                _image_only=True,
+            )
+            for architecture in UNIVERSAL_SLICES
+        }
+    )
+    executable_name = app_name or entry.stem
+    icon_filename = "AppIcon.icns" if app and icon is not None else None
+    info_plist, code_resources = (
+        _app_metadata(executable_name, app_name, icon_filename)
+        if app
+        else (None, None)
+    )
+    return _write_native_output(
+        modules[UNIVERSAL_SLICES[-1]],
+        output,
+        UNIVERSAL_TARGET,
+        app,
+        executable_name,
+        icon,
+        image,
+        info_plist,
+        code_resources,
+    )
+
+def _write_native_output(
+    module: Module,
+    output: Path,
+    target: str,
+    app: bool,
+    executable_name: str,
+    icon: Path | None,
+    image: bytes,
+    info_plist: bytes | None,
+    code_resources: bytes | None,
+) -> NativeResult:
+    """Put a finished image on disk, as a file or inside a .app bundle.
+
+    Split out from the emitter because a universal build has two images to
+    produce and one of them to write: the slices are built separately and
+    joined, and what is written after that is the same in either case.
+    """
+
     if output.exists():
         if output.is_dir():
             # A directory at the output path is only ever removed when it is

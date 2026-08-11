@@ -17,6 +17,10 @@ SUPPORTED_TARGETS = {
     "darwin-arm64",
     "windows-x86_64",
     "windows-arm64",
+    # A pack whose Mach-Os still carry both Darwin slices. python.org ships the
+    # framework that way; a bundle built from such a pack is thinned to one
+    # architecture unless it is labelled this, in which case it keeps both.
+    "darwin-universal2",
 }
 _ENVIRONMENT_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _COMPACT_PARTS = {

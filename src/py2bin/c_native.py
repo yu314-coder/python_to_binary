@@ -37,7 +37,13 @@ def _read_source(path):
 from .c_frontend import CCompileError, compile_c_to_ir
 from .csource import compile_to_c
 from .native import NativeResult, compile_native_source
-from .native.compiler import compile_native_module, host_target
+from .native.compiler import (
+    UNIVERSAL_SLICES,
+    UNIVERSAL_TARGET,
+    compile_native_module,
+    emit_universal,
+    host_target,
+)
 from .native.optimizer import optimize
 
 
@@ -1292,6 +1298,31 @@ def compile_c_native(
         raise FileNotFoundError(f"C source does not exist: {entry}")
     resolved = target or host_target()
     source = _read_source(entry)
+    if resolved == UNIVERSAL_TARGET:
+        # Two compilations, not one image built twice. The C frontend applies
+        # the target's rules while it lowers - how a string literal used as a
+        # pointer is placed, whether an argument goes in a register or on the
+        # stack - so each slice has to be lowered against its own machine.
+        return emit_universal(
+            entry,
+            {
+                architecture: optimize(
+                    compile_c_to_ir(
+                        source,
+                        str(entry),
+                        f"darwin-{architecture}",
+                        include_dirs=include_dirs,
+                        defines=defines,
+                    )
+                )[0]
+                for architecture in UNIVERSAL_SLICES
+            },
+            output,
+            app=app,
+            app_name=app_name,
+            icon=icon,
+            python_dylib=python_dylib,
+        )
     module, _report = optimize(
         compile_c_to_ir(
             source,
