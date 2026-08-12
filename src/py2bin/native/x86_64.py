@@ -922,7 +922,10 @@ def encode_darwin_extern(
     value in that callee-saved register, not this program's.
     """
 
-    code, refs = _encode_x86(module, "darwin", code_address, image_statics)
+    # LC_MAIN: dyld calls this image rather than jumping to it.
+    code, refs = _encode_x86(
+        module, "darwin", code_address, image_statics, entered_by_call=True
+    )
     return code, refs.externs, refs.statics
 
 
@@ -948,7 +951,11 @@ def encode(module: Module, platform: str, code_address: int) -> bytes:
 
 
 def _encode_x86(
-    module: Module, platform: str, code_address: int, image_statics: bool = False
+    module: Module,
+    platform: str,
+    code_address: int,
+    image_statics: bool = False,
+    entered_by_call: bool = False,
 ) -> tuple[bytes, "_X86Refs"]:
     if platform == "linux":
         write_number, exit_number = 1, 60
@@ -965,7 +972,24 @@ def _encode_x86(
     )
 
     code = bytearray()
-    entry_frame = _frame_bytes(module.stack_slots)
+    # System V wants rsp 16-byte aligned *at the call instruction*, so that the
+    # callee sees rsp+8 aligned once its return address is pushed. Where the
+    # program starts from decides what has to be subtracted to get there.
+    #
+    # An image the kernel starts - a static Mach-O with LC_UNIXTHREAD, or an
+    # ELF at its entry point - begins with rsp already 16-byte aligned, so a
+    # frame that is a multiple of 16 keeps it so. An image entered through
+    # LC_MAIN does not: dyld *calls* it the way it calls any C function, and
+    # its return address is already on the stack, leaving rsp 8 past alignment.
+    # A multiple-of-16 frame preserves that 8 and every call made from here
+    # hands the callee a stack misaligned by exactly that.
+    #
+    # Which is a fault, not a slowdown: the first aligned SSE store in the
+    # callee - `movaps` to a stack slot, which CPython's own start-up does -
+    # raises a general-protection fault. Rosetta does not enforce the
+    # alignment, so this ran perfectly on Apple silicon and segfaulted inside
+    # `_PyRuntimeState_Init` on a real Intel Mac.
+    entry_frame = _frame_bytes(module.stack_slots) + (8 if entered_by_call else 0)
     code.extend(_sub_stack(entry_frame))
     code.extend(b"\x48\x89\xe5")  # mov rbp, rsp; stable variable base
     operations = list(module.operations)

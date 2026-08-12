@@ -215,7 +215,23 @@ it was, and here that would move the payload the launcher has already been told
 the position of. A universal `.app` and a universal one-file each work; it is
 only the two together.
 
-**A 16 KB alignment rule is the thing worth knowing here.** A code-signed
+**Intel found a second alignment bug, and only Intel could.** System V wants
+`rsp` 16-byte aligned *at the call instruction*. An image the kernel starts is
+already aligned; one entered through `LC_MAIN` is not, because dyld *calls* it
+and its return address is already on the stack. The entry frame was a multiple
+of 16, which preserved that 8 and handed every call from the entry a stack
+misaligned by exactly that - and the first `movaps` to a stack slot in the
+callee raises a general-protection fault. CPython's start-up does one, so a
+`compile-capi` binary segfaulted inside `_PyRuntimeState_Init` before printing
+anything.
+
+Rosetta 2 does not enforce the alignment, so this ran perfectly on Apple
+silicon, corpus and all. It took a crash report from a real Intel Mac, where
+`rbp` and `rsp` were both 8 mod 16 in a frame whose prologue leaves `rbp` at 0.
+Internal functions were never affected: they `push rbp` first, which corrects
+the 8 before anything else happens. It was the entry alone.
+
+**A 16 KB alignment rule is the other thing worth knowing here.** A code-signed
 x86-64 slice placed on a 4 KB boundary - which is what `lipo` historically
 recorded - is killed at exec on Apple silicon, whose pages are 16 KB. Nothing
 about the file says so: `codesign` calls it valid, and the same bytes copied
