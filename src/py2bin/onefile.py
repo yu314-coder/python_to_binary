@@ -11,13 +11,18 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .native.compiler import UNIVERSAL_SLICES, UNIVERSAL_TARGET
 from .native.formats.pe import write_pe_shell_launcher
+from .native.formats.universal import write_universal
 from .native.launcher import linux_shell_launcher, macos_shell_launcher
 from .windows_icon import install_windows_identity
 
 
 _MARKER_PREFIX = b"\nPY2BIN-ONEFILE-PAYLOAD-V1:"
 _OFFSET_WIDTH = 20
+#: The page a universal slice is placed on, and so the granularity of the
+#: room left before a one-file payload for a later re-seal to grow into.
+_SLICE_PAGE = 0x4000
 _ZIP_COMPRESSLEVEL = 6
 
 
@@ -386,6 +391,69 @@ def create_onefile(
                     "Linux one-file launcher size changed after patching"
                 )
             _write_executable_parts(output, final_stub, marker, archive_path)
+        elif target == UNIVERSAL_TARGET:
+            # The payload goes *after* both slices rather than inside each of
+            # them. Embedding is what the thin macOS path does - the writer
+            # consumes it as part of __TEXT so the signature covers it - and
+            # doing that here would carry the whole archive twice, once per
+            # architecture, for no gain: an image does not have to contain its
+            # payload, only be told where it is.
+            #
+            # Both slices are told the same absolute position in the finished
+            # file, which is why this is built twice. The position is not known
+            # until the layout is settled, and the layout does not move when
+            # the position changes, because the command pads the number to a
+            # fixed width. The second pass asserts exactly that.
+            def _universal_stub(text: str) -> bytes:
+                # Each slice is given room to be signed again later. Packing an
+                # .app re-seals the launcher once the bundle it describes has
+                # been reduced to two files, and a re-signed slice is not
+                # always the length it was. Growing would move the payload,
+                # whose position is already written into the code being signed,
+                # so the room is reserved here instead. The bytes are past the
+                # end of everything the Mach-O's load commands describe, so the
+                # loader never looks at them.
+                return write_universal(
+                    {
+                        architecture: macos_shell_launcher(
+                            text,
+                            architecture,
+                            info_plist,
+                            code_resources,
+                        )
+                        for architecture in UNIVERSAL_SLICES
+                    }
+                )
+
+            placeholder_command = _posix_command(
+                offset=0,
+                length=archive_size,
+                digest=digest,
+                launcher=relative_launcher,
+            )
+            stub = _universal_stub(placeholder_command)
+            # The payload starts on a page boundary rather than immediately
+            # after the last slice, which leaves that slice room to be signed
+            # again later without anything moving. Padding *inside* a slice
+            # would not do: bytes past the signature are trailing data, and
+            # `codesign --strict` rejects an executable that carries any.
+            reserved = len(stub) + (-len(stub) % _SLICE_PAGE)
+            # tail -c +N uses a one-based byte position.
+            offset = reserved + len(marker) + 1
+            command = _posix_command(
+                offset=offset,
+                length=archive_size,
+                digest=digest,
+                launcher=relative_launcher,
+            )
+            final_stub = _universal_stub(command)
+            if len(final_stub) != len(stub):
+                raise AssertionError(
+                    "universal one-file launcher size changed after patching"
+                )
+            _write_executable_parts(
+                output, final_stub.ljust(reserved, b"\0"), marker, archive_path
+            )
         else:
             # The ARM64 Mach-O ad-hoc signature must cover the embedded payload,
             # so the current Mach-O writer consumes it as part of __TEXT.
@@ -463,6 +531,15 @@ def pack_app_bundle(
     """
 
     bundle = bundle.resolve()
+    if target == UNIVERSAL_TARGET:
+        raise ValueError(
+            "packing a universal .app into one file is not implemented. The "
+            "bundle is sealed again after packing, and a re-signed slice is "
+            "not the length it was - which for a universal one-file would move "
+            "the payload the launcher has already been told the position of. "
+            "A universal .app (without --onefile) and a universal one-file "
+            "(without --app) both work; it is only the two together."
+        )
     contents = bundle / "Contents"
     plist = contents / "Info.plist"
     if not plist.is_file():
@@ -488,12 +565,20 @@ def pack_app_bundle(
         shutil.copytree(bundle, packed_from, symlinks=True)
         launcher = packed_from / inner.relative_to(bundle)
         single = room / "packed"
+        # The resource seal goes in now, even though it is replaced below,
+        # because its *presence* is what fixes the signature's length. Signed
+        # without one and re-signed with one, a slice grows by the size of the
+        # extra hash slot - and for a universal one-file that is fatal: the
+        # payload sits after the slices at a position already written into the
+        # launcher, so nothing may move afterwards.
+        sealed = contents / "_CodeSignature" / "CodeResources"
         create_onefile(
             payload_root=packed_from,
             output=single,
             target=target,
             launcher=launcher,
             info_plist=plist.read_bytes(),
+            code_resources=sealed.read_bytes() if sealed.is_file() else None,
         )
         # The old tree goes only once the new executable exists, so a failure
         # anywhere above leaves the bundle that was already built.

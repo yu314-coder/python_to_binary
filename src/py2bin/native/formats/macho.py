@@ -108,11 +108,24 @@ def _adhoc_signature(
     return bytes(result)
 
 
-def write_macho_x86_64(code: bytes) -> bytes:
-    """Return a static x86-64 Mach-O executable using LC_UNIXTHREAD."""
+def write_macho_x86_64(
+    code: bytes,
+    info_plist: bytes | None = None,
+    code_resources: bytes | None = None,
+) -> bytes:
+    """Return a static x86-64 Mach-O executable using LC_UNIXTHREAD.
+
+    Signed, like the arm64 writer, though Intel macOS does not insist on it.
+    It matters for a universal build: a fat file is only as signed as its least
+    signed slice, so an unsigned x86-64 half made the whole artifact report as
+    unsigned however carefully the arm64 half had been signed - and a bundle
+    that will not validate is a bundle that cannot be handed to anyone.
+    """
+
     page = 0x1000
     base = 0x100000000
     entry = base + page
+    signature_offset = _align(page + len(code), page)
 
     pagezero = struct.pack(
         "<II16sQQQQiiII",
@@ -152,21 +165,65 @@ def write_macho_x86_64(code: bytes) -> bytes:
     registers[16] = entry  # rip
     registers[17] = 0x202  # rflags
     thread = struct.pack("<IIII", 0x5, 184, 4, 42) + struct.pack("<21Q", *registers)
-    commands = pagezero + text_segment + text_section + thread
+    # The signature's length depends on how many pages precede it, not on what
+    # is in them, so a placeholder over the right number of pages sizes the
+    # __LINKEDIT segment before the real one is computed.
+    placeholder_signature = _adhoc_signature(
+        bytes(signature_offset),
+        signature_offset,
+        page,
+        len(code),
+        info_plist,
+        code_resources,
+        page_size=page,
+    )
+    linkedit = struct.pack(
+        "<II16sQQQQiiII",
+        0x19,
+        72,
+        _name("__LINKEDIT"),
+        base + signature_offset,
+        _align(len(placeholder_signature), page),
+        signature_offset,
+        len(placeholder_signature),
+        7,
+        1,
+        0,
+        0,
+    )
+    signature_command = struct.pack(
+        "<IIII", 0x1D, 16, signature_offset, len(placeholder_signature)
+    )
+    commands = (
+        pagezero + text_segment + text_section + linkedit + thread + signature_command
+    )
     header = struct.pack(
         "<IIIIIIII",
         0xFEEDFACF,
         0x01000007,  # CPU_TYPE_X86_64
         3,  # CPU_SUBTYPE_X86_64_ALL
         2,  # MH_EXECUTE
-        3,
+        5,
         len(commands),
         1,  # MH_NOUNDEFS
         0,
     )
     if len(header) + len(commands) > page:
         raise ValueError("Mach-O load commands exceed header page")
-    return header + commands + bytes(page - len(header) - len(commands)) + code
+    image = header + commands + bytes(page - len(header) - len(commands)) + code
+    image += bytes(signature_offset - len(image))
+    signature = _adhoc_signature(
+        image,
+        signature_offset,
+        page,
+        len(code),
+        info_plist,
+        code_resources,
+        page_size=page,
+    )
+    if len(signature) != len(placeholder_signature):
+        raise AssertionError("Mach-O signature sizing changed during finalization")
+    return image + signature
 
 
 def _uleb(value: int) -> bytes:

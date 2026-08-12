@@ -190,16 +190,30 @@ universal whether or not anyone wants a universal bundle out of it, and quietly
 keeping both slices would double the size of every bundle built the way they
 always were.
 
-Two limits, both refused with a reason rather than silently mishandled. A
-universal **one-file** build is not implemented: one file carries its payload
-at an offset the launcher is told about, and a universal launcher is two
-launchers that would each have to be told the same offset into a file whose
-layout is not settled until after both are built. And the native `compile`
-tier's x86-64 half carries no signature - Intel macOS does not require one, so
-that writer never wrote one - which means a universal artifact from the native
-and `freeze` launchers runs on both machines but reports as unsigned. The
-`compile-capi` tier signs both, and is the one to use for something you hand
-over.
+**One file works too**, and stores the payload once rather than per slice:
+
+```sh
+py2bin freeze app.py --runtime-pack pack --target darwin-universal2 --onefile -o app
+```
+
+The archive goes *after* both slices rather than inside each - an image has to
+be told where its payload is, not contain it - and both slices are told the
+same position in the finished file. That position is not known until the layout
+is, and the layout does not move when the position changes, because the command
+pads the number to a fixed width; so the launcher is built twice and the second
+pass asserts the length did not change.
+
+**Every slice is signed**, including x86-64, which was emitted unsigned for
+years because Intel macOS never asked for one. That stopped being harmless when
+the two were joined: a fat file is only as signed as its least signed slice, so
+one unsigned half made a whole bundle report as unsigned however carefully the
+other had been sealed.
+
+One combination is refused with a reason: a universal `.app` **packed into one
+file**. Packing re-seals the bundle, a re-signed slice is not always the length
+it was, and here that would move the payload the launcher has already been told
+the position of. A universal `.app` and a universal one-file each work; it is
+only the two together.
 
 **A 16 KB alignment rule is the thing worth knowing here.** A code-signed
 x86-64 slice placed on a 4 KB boundary - which is what `lipo` historically

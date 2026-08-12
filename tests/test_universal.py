@@ -106,5 +106,55 @@ class TargetNaming(unittest.TestCase):
             self.assertIn(f"darwin-{architecture}", TARGETS)
 
 
+
+class DarwinSignatures(unittest.TestCase):
+    """Both Darwin writers sign, so a universal artifact is signed throughout.
+
+    Intel macOS loads unsigned executables perfectly well, and the x86-64
+    writer emitted none for that reason. It matters once the two are joined: a
+    fat file is only as signed as its least signed slice, so one unsigned half
+    made a whole bundle report as unsigned however carefully the other had been
+    sealed - and a bundle that will not validate is one nobody can be given.
+    """
+
+    def _has_code_signature(self, image: bytes) -> bool:
+        count = struct.unpack_from("<I", image, 16)[0]
+        offset = 32
+        for _ in range(count):
+            command, size = struct.unpack_from("<II", image, offset)
+            if command == 0x1D:  # LC_CODE_SIGNATURE
+                return True
+            offset += size
+        return False
+
+    def test_both_static_writers_sign(self) -> None:
+        from py2bin.native.formats.macho import (
+            write_macho_arm64,
+            write_macho_x86_64,
+        )
+
+        code = b"\x90" * 64
+        for label, image in (
+            ("arm64", write_macho_arm64(code)),
+            ("x86-64", write_macho_x86_64(code)),
+        ):
+            with self.subTest(machine=label):
+                self.assertTrue(
+                    self._has_code_signature(image),
+                    f"the {label} writer emitted no LC_CODE_SIGNATURE",
+                )
+
+    def test_the_x86_64_writer_seals_the_bundle_documents(self) -> None:
+        from py2bin.native.formats.macho import write_macho_x86_64
+
+        code = b"\x90" * 64
+        bare = write_macho_x86_64(code)
+        sealed = write_macho_x86_64(code, b"<plist/>", b"<resources/>")
+        self.assertTrue(self._has_code_signature(sealed))
+        # Sealing two extra documents means extra hash slots, so the images
+        # differ - which is the point: the plist is signed into the binary.
+        self.assertNotEqual(bare, sealed)
+
+
 if __name__ == "__main__":
     unittest.main()

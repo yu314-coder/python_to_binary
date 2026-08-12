@@ -111,6 +111,8 @@ def _x86_64_shell_launcher(
     extra_data: bytes = b"",
     *,
     platform_name: str = "darwin",
+    info_plist: bytes | None = None,
+    code_resources: bytes | None = None,
 ) -> bytes:
     code = bytearray()
     if platform_name == "linux":
@@ -176,7 +178,7 @@ def _x86_64_shell_launcher(
     code.extend(extra_data)
     if platform_name == "linux":
         return write_elf_x86_64(bytes(code))
-    return write_macho_x86_64(bytes(code))
+    return write_macho_x86_64(bytes(code), info_plist, code_resources)
 
 
 def macos_shell_launcher(
@@ -197,15 +199,18 @@ def macos_shell_launcher(
             extra_data,
         )
     if machine in {"x86_64", "AMD64"}:
-        # ``info_plist``/``code_resources`` are accepted but not embedded. On
-        # arm64 macOS every executable must carry a code signature, so the
-        # arm64 launcher embeds an ad-hoc signature sealing those two
-        # documents. Intel macOS still loads unsigned executables, so the
-        # x86-64 launcher is emitted unsigned; the bundle's Info.plist and
-        # _CodeSignature/CodeResources are written as ordinary files by the
-        # caller either way. Such an app runs locally but is not notarized,
-        # and Gatekeeper will quarantine it if it is downloaded.
-        return _x86_64_shell_launcher(command, extra_data)
+        # Signed too, sealing the same two documents the arm64 launcher does.
+        # Intel macOS loads unsigned executables perfectly well, and this was
+        # emitted unsigned for that reason - but a universal binary is only as
+        # signed as its least signed slice, so an unsigned x86-64 half made the
+        # whole bundle report as unsigned however carefully the arm64 half had
+        # been sealed.
+        return _x86_64_shell_launcher(
+            command,
+            extra_data,
+            info_plist=info_plist,
+            code_resources=code_resources,
+        )
     raise ValueError(f"native macOS launcher is not implemented for {machine}")
 
 

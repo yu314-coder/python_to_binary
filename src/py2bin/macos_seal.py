@@ -258,18 +258,98 @@ def resign(binary: Path, info_plist: bytes | None = None,
     from .native.formats.universal import read_universal, write_universal
 
     original = binary.read_bytes()
-    slices = read_universal(original)
-    if slices:
+    placements = _fat_placements(original)
+    if not placements:
+        signed = _resigned(original, info_plist, resources)
+    elif original[max(offset + size for offset, size in placements):]:
+        # Something follows the last slice, and the only thing that ever does
+        # is a one-file payload - whose position is already written into the
+        # code about to be re-signed. Nothing may move.
+        signed = _resigned_in_place(original, placements, info_plist, resources)
+    else:
+        # Nothing after the slices, so they are free to be laid out again. They
+        # need to be: a re-signed slice is not always the length it was, and
+        # here there is no reason to make it fit where it was.
         signed = write_universal(
             {
                 architecture: _resigned(image, info_plist, resources)
-                for architecture, image in slices.items()
+                for architecture, image in read_universal(original).items()
             }
         )
-    else:
-        signed = _resigned(original, info_plist, resources)
     binary.write_bytes(signed)
     binary.chmod(binary.stat().st_mode | 0o111)
+
+
+def _fat_placements(image: bytes) -> "list[tuple[int, int]]":
+    """Where each slice of a universal image sits, or nothing for a thin one."""
+
+    if len(image) < 8:
+        return []
+    magic, count = struct.unpack_from(">II", image, 0)
+    wide = magic == 0xCAFEBABF
+    if magic != 0xCAFEBABE and not wide:
+        return []
+    entry = 32 if wide else 20
+    placements = []
+    for index in range(count):
+        at = 8 + index * entry
+        if at + entry > len(image):
+            break
+        if wide:
+            _cpu, _sub, offset, size = struct.unpack_from(">iiQQ", image, at)
+        else:
+            _cpu, _sub, offset, size = struct.unpack_from(">iiII", image, at)
+        placements.append((offset, size))
+    return placements
+
+
+def _resigned_in_place(
+    image: bytes,
+    placements: "list[tuple[int, int]]",
+    info_plist: bytes | None,
+    resources: bytes | None,
+) -> bytes:
+    """Re-sign each slice without moving anything, and keep what follows.
+
+    Laying the slices out afresh would be the obvious thing and is wrong here.
+    A one-file build appends its payload after the last slice and tells the
+    launcher the byte position to read it from; that number is already inside
+    the code being signed. Re-packing the file moves the payload out from under
+    it, and writing only the slices back loses the payload entirely - which
+    reads, at run time, as `tar: Unrecognized archive format`.
+
+    So every slice is written back into the span it already occupied, and
+    anything after the last one is carried across untouched.
+    """
+
+    end = max(offset + size for offset, size in placements)
+    starts = sorted(offset for offset, _size in placements)
+    rebuilt = bytearray(image[:end])
+    wide = struct.unpack_from(">I", image, 0)[0] == 0xCAFEBABF
+    entry = 32 if wide else 20
+    for index, (offset, size) in enumerate(placements):
+        signed = _resigned(image[offset: offset + size], info_plist, resources)
+        # A slice may grow into the gap before whatever comes next - the next
+        # slice, or the padding left in front of the payload. It may not grow
+        # past that, because the payload's position is already written into the
+        # code that was just signed.
+        following = next((start for start in starts if start > offset), end)
+        room = following - offset
+        if len(signed) > room:
+            raise SealError(
+                f"a re-signed slice needs {len(signed)} bytes where {room} are "
+                f"free, and moving it would move the one-file payload the "
+                f"launcher has already been told the position of"
+            )
+        rebuilt[offset: offset + room] = signed.ljust(room, b"\0")
+        # The fat header records each slice's length, and it is not itself
+        # signed, so it is simply corrected to what the slice now is.
+        at = 8 + index * entry
+        if wide:
+            struct.pack_into(">Q", rebuilt, at + 16, len(signed))
+        else:
+            struct.pack_into(">I", rebuilt, at + 12, len(signed))
+    return bytes(rebuilt) + image[end:]
 
 
 def _resigned(image_bytes: bytes, info_plist: bytes | None,

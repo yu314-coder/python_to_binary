@@ -1729,15 +1729,6 @@ def freeze(
         if runtime_pack_info is not None
         else f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     )
-    if bundle_target == UNIVERSAL_TARGET and onefile:
-        raise ValueError(
-            "a universal one-file build is not implemented. One file carries "
-            "its payload at an offset the launcher is told about, and a "
-            "universal launcher is two launchers - each would have to be told "
-            "the same offset into a file whose layout is not settled until "
-            "after both are built. Use --onedir for a universal bundle, or "
-            "build one file per architecture."
-        )
     macos_app = app and bundle_target.startswith("darwin-")
     windows_app = app and bundle_target.startswith("windows-")
     if app:
