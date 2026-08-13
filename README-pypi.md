@@ -22,7 +22,9 @@ slices, which runs on Intel and Apple silicon from a single file:
 py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
 ```
 
-That has been opened from its `.dmg` on both, carrying its own CPython.
+All three macOS tiers have been run as universal binaries on both an Apple
+silicon Mac and a real Intel one: the native binary, a one-file build, and
+a frozen `.app` carrying its own CPython.
 
 That sentence was not true a week ago, and **0.9.11 is the release that made
 it true**. Both Windows targets had until then only ever been *read* here -

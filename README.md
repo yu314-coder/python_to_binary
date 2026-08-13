@@ -135,13 +135,18 @@ of them fatal to every Windows program the compiler produced, and every one in
 the packaging rather than in the compiled code. They are fixed and covered by
 tests; the first three releases of this section describe them.
 
-**darwin-x86_64 has been run on a real Intel Mac** - a universal `.app`,
-carrying its own CPython, opened from a `.dmg` on a MacBookPro16,1 - and
-passes. It also passes under Rosetta 2 here, and the difference between those
-two sentences is not academic: Rosetta ran it perfectly while it still had an
-ABI bug that a real Intel CPU faults on immediately. Rosetta does not enforce
-SSE alignment. Anything it says about x86-64 is evidence that the program is
-*correct*, and no evidence at all that it is *well formed*.
+**darwin-x86_64 has been run on a real Intel Mac** - a MacBookPro16,1 - across
+all three tiers, each as a universal binary: the native one, a one-file build,
+and a frozen `.app` carrying its own CPython. All pass.
+
+It passes under Rosetta 2 here as well, and the difference between those two
+sentences is the most expensive thing in this section. Rosetta ran these
+perfectly while they carried **two** faults a real Intel CPU refuses outright:
+a misaligned stack at the first call into CPython, and a carried interpreter
+whose code signature no longer described it. Rosetta enforces neither SSE
+alignment nor dylib signatures. What it can tell you is that a program is
+*correct*; it cannot tell you the program is *well formed*, and those are
+different questions.
 
 **Windows arm64 passes too**, on a Windows 11 ARM64 virtual machine - which
 runs ARM64 instructions on an ARM64 processor, so the generated code is
