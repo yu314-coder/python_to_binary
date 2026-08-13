@@ -13,6 +13,12 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
+**0.9.13 fixes two bugs fatal to macOS builds** - a stack misalignment that
+segfaulted every `compile-capi` x86-64 binary, and a carried interpreter whose
+code signature no longer described it, which a real Intel Mac refuses to load
+at all. Both were invisible on Apple silicon and under Rosetta. **If you build
+for macOS, upgrade from 0.9.12 or earlier.**
+
 **Every one of py2bin's six targets has now run on a processor of its own
 architecture** - not merely built, not merely inspected, and not on an
 emulator. macOS can also be built as **one universal binary** holding both
@@ -787,6 +793,25 @@ neither.
 ## Release notes
 
 Newest first. The full history is in the repository.
+
+### 0.9.13 - what a real Intel Mac refuses
+
+Two bugs, both fatal to macOS builds, both invisible on Apple silicon and
+under Rosetta. **If you build for macOS, upgrade.**
+
+- **Every `compile-capi` x86-64 binary segfaulted** before printing anything.
+  An image entered through `LC_MAIN` is *called* by dyld, so `rsp` is 8 past
+  alignment on entry; a frame that is a multiple of 16 preserved that, and the
+  first aligned SSE store in the callee raised a general-protection fault
+  inside CPython's start-up.
+- **Every macOS freeze bundle carried a mis-signed interpreter.** The framework
+  is signed as a bundle, hashing an `Info.plist` and a `_CodeSignature` the
+  bundle does not carry, and the stdlib beside it is pruned. Apple silicon and
+  Rosetta load it anyway; real Intel refuses the dylib and the program dies
+  before it runs. Anything altered is now signed again over what it is.
+
+Not specific to Intel or to universal builds - the signature has been wrong in
+every macOS freeze bundle since pruning was added; arm64 never refused one.
 
 ### 0.9.12 - all six targets have now been run
 

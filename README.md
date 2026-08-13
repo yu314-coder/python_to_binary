@@ -1273,6 +1273,38 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - what a real Intel Mac refuses
+
+Two bugs, both fatal, both invisible on Apple silicon and invisible under
+Rosetta. **If you build anything for macOS, upgrade.**
+
+*Every `compile-capi` x86-64 binary segfaulted before printing anything.*
+System V wants `rsp` 16-byte aligned at the call instruction. An image the
+kernel starts is already aligned; one entered through `LC_MAIN` is not,
+because dyld *calls* it and the return address is already on the stack. The
+entry frame was a multiple of 16, which preserved that 8 and handed every call
+out of the entry a stack misaligned by exactly it - and the first `movaps` to a
+stack slot in the callee raises a general-protection fault. CPython's start-up
+does one, so the crash was inside `_PyRuntimeState_Init`. Only the entry was
+ever wrong: an internal function pushes `rbp` first, and that push corrects the
+8.
+
+*Every macOS freeze bundle carried a mis-signed interpreter.* The framework is
+signed as a *bundle* - its code directory hashes an `Info.plist` and a
+`_CodeSignature` that a freeze bundle does not carry - and the standard library
+beside it is pruned. What shipped was a signature describing something that was
+not there, and `codesign` had been saying so for months: "invalid Info.plist".
+Apple silicon loads it anyway. Rosetta loads it anyway. A real Intel Mac
+refuses the dylib outright, so the program dies before a line of it runs,
+naming a library sitting exactly where the bundle put it. The bytes were never
+corrupt - the shipped framework is byte-identical to python.org's. It was the
+claim attached to it that had stopped being true. Anything this alters is now
+signed again over what it actually is.
+
+This was not specific to Intel, or to universal builds. The signature has been
+wrong in every macOS freeze bundle since the pruning was added; arm64 simply
+never refused one.
+
 ### 0.9.12 - all six targets have now been run
 
 No change to the compiler. This records a verification result that 0.9.11 was
