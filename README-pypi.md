@@ -15,7 +15,14 @@ Source, issues and the full documentation:
 
 **Every one of py2bin's six targets has now run on a processor of its own
 architecture** - not merely built, not merely inspected, and not on an
-emulator.
+emulator. macOS can also be built as **one universal binary** holding both
+slices, which runs on Intel and Apple silicon from a single file:
+
+```sh
+py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
+```
+
+That has been opened from its `.dmg` on both, carrying its own CPython.
 
 That sentence was not true a week ago, and **0.9.11 is the release that made
 it true**. Both Windows targets had until then only ever been *read* here -

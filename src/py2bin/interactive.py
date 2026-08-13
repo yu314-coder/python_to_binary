@@ -251,12 +251,28 @@ def main(where: str | None = None) -> int:
     system = target.split("-")[0]
     offered = methods_for(target)
     if len(offered) == 1:
-        say(
-            f"\n  Compiling it: freezing needs a CPython built for "
-            f"{target}, and\n  one can only be downloaded for Windows or "
-            f"taken from a machine\n  like the target. Build on {system} "
-            f"itself for the other way."
-        )
+        if target == "darwin-universal2":
+            # The general explanation below is wrong for this one, and was
+            # being printed anyway: it said a runtime "can only be taken from
+            # a machine like the target. Build on darwin itself" - on a
+            # machine that *is* darwin. Freezing universal is possible; it is
+            # only more than three questions can set up.
+            say(
+                "\n  Compiling it: a universal bundle can be frozen too, but"
+                "\n  it needs a runtime pack that has kept both slices, which"
+                "\n  is a step this does not do for you:"
+                "\n"
+                "\n      py2bin runtime-pack --universal -o pack"
+                "\n      py2bin freeze prog.py --runtime-pack pack \\"
+                "\n            --target darwin-universal2 --app --onedir"
+            )
+        else:
+            say(
+                f"\n  Compiling it: freezing needs a CPython built for "
+                f"{target}, and\n  one can only be downloaded for Windows or "
+                f"taken from a machine\n  like the target. Build on {system} "
+                f"itself for the other way."
+            )
         method = offered[0][0]
     else:
         method = offered[ask("How should it be built?", offered, 1)][0]
@@ -423,7 +439,36 @@ def main(where: str | None = None) -> int:
         say(f"\n  done: {final}")
         if shape == "dmg":
             say("  (the .app beside it is what the image holds)")
+        _say_what_it_runs_on(output, target)
     return code
+
+
+def _say_what_it_runs_on(output: Path, target: str) -> None:
+    """For a universal build, name the architectures actually in the file.
+
+    Worth reading back rather than restating what was asked for: "universal"
+    is a claim about the bytes, and the bytes are right there. A build that
+    quietly produced one slice would otherwise be indistinguishable from one
+    that produced two.
+    """
+
+    if target != "darwin-universal2":
+        return
+    from .native.formats.universal import read_universal
+
+    binary = output
+    if output.suffix == ".app":
+        holder = output / "Contents" / "MacOS"
+        found = sorted(holder.iterdir()) if holder.is_dir() else []
+        if not found:
+            return
+        binary = found[0]
+    try:
+        slices = read_universal(binary.read_bytes())
+    except OSError:
+        return
+    if slices:
+        say(f"  runs on: {', '.join(sorted(slices))}  (one file, both machines)")
 
 
 if __name__ == "__main__":

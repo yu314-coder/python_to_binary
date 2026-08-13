@@ -10,12 +10,22 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,828 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,850 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
+
+**All six targets have run on a processor of their own architecture** -
+darwin-arm64 here, both Linux targets in containers, and darwin-x86_64,
+windows-x86_64 and windows-arm64 on real machines. Nothing in that claim rests
+on emulation. macOS can also be built as **one universal binary** that holds
+both slices and runs on either machine:
+
+```sh
+py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
+```
 
 ## The paths through it
 
@@ -428,6 +438,21 @@ other `.py` files beside it, the libraries it imports, an interpreter for the
 target, `web/` and `assets/` if they are there, and an `icon.ico` or
 `icon.icns` if one is. What shape the result takes is not asked about: one
 file, always, because that is the thing somebody can send.
+
+The machine list offers **macOS, one binary for both** alongside the six, and
+answering it produces a universal `.app` and `.dmg` in one pass. When a build
+holds more than one architecture the last line reads them back out of the file
+that was written:
+
+```
+  done: dist/app.dmg
+  (the .app beside it is what the image holds)
+  runs on: arm64, x86_64  (one file, both machines)
+```
+
+That last line is read from the bytes rather than restated from the question,
+because "universal" is a claim about the file and a build that quietly
+produced one slice should not look like one that produced two.
 
 | target | ship Python with it | compile it |
 |---|---|---|
