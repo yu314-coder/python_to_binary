@@ -13,8 +13,9 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 Source, issues and the full documentation:
 **https://github.com/yu314-coder/python_to_binary**
 
-**Every one of py2bin's six targets has now been run**, not merely built and
-inspected - as of 0.9.12, with Windows arm64 the last to be tried.
+**Every one of py2bin's six targets has now run on a processor of its own
+architecture** - not merely built, not merely inspected, and not on an
+emulator.
 
 That sentence was not true a week ago, and **0.9.11 is the release that made
 it true**. Both Windows targets had until then only ever been *read* here -
@@ -134,6 +135,9 @@ Apple silicon slice:
 ```sh
 py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
 ```
+
+A universal `.app` built this way, carrying its own CPython, has been opened
+from its `.dmg` on both an Apple silicon Mac and a real Intel one.
 
 A universal binary is the two programs, whole and unaltered, behind a table
 saying where each begins - arithmetic rather than a second compiler. Each slice

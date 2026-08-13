@@ -113,7 +113,8 @@ not reproduce.
 All six. Each was built from one program, and the four that can be run on this
 machine were run here - darwin-arm64 natively, both Linux targets in
 containers, and darwin-x86_64 under Rosetta 2 - answering exactly what CPython
-answers. The two Windows targets were run on the author's machines; see below.
+answers. darwin-x86_64 and the two Windows targets have since been run on real
+hardware of their own architecture; see below.
 
 **Windows x86-64 has since been run on real Windows hardware**, all three
 tiers: the native `.exe`, the frozen `.exe` carrying its own CPython, and the
@@ -124,24 +125,28 @@ of them fatal to every Windows program the compiler produced, and every one in
 the packaging rather than in the compiled code. They are fixed and covered by
 tests; the first three releases of this section describe them.
 
-**darwin-x86_64 passes all three tiers under Rosetta 2** on the Apple Silicon
-machine this is developed on - the native binary, the frozen one, and the
-C-API one linking the x86-64 half of a universal2 framework. Rosetta translates
-rather than being an Intel CPU, so this is weaker evidence than a physical
-machine; it is much stronger than the structural check it replaces, because
-the generated x86-64 instruction stream really is executed and really does
-produce the right answers.
+**darwin-x86_64 has been run on a real Intel Mac** - a universal `.app`,
+carrying its own CPython, opened from a `.dmg` on a MacBookPro16,1 - and
+passes. It also passes under Rosetta 2 here, and the difference between those
+two sentences is not academic: Rosetta ran it perfectly while it still had an
+ABI bug that a real Intel CPU faults on immediately. Rosetta does not enforce
+SSE alignment. Anything it says about x86-64 is evidence that the program is
+*correct*, and no evidence at all that it is *well formed*.
 
 **Windows arm64 passes too**, on a Windows 11 ARM64 virtual machine - which
 runs ARM64 instructions on an ARM64 processor, so the generated code is
 executed rather than translated. The author's report, like the x86-64 one.
 
-That closes the grid. **Every one of the six targets has now had its output
-compared against CPython's on a machine that actually ran it** - four here
-(darwin-arm64 natively, darwin-x86_64 under Rosetta, both Linux targets in
-containers) and both Windows targets on the author's hardware. Until this
-release two of the six had only ever been *read*, and reading them is exactly
-what missed four bugs that made every Windows binary unusable.
+That closes the grid, and closes it properly: **every one of the six targets
+has now run on a processor of its own architecture** - darwin-arm64 here, both
+Linux targets in containers, and darwin-x86_64, windows-x86_64 and
+windows-arm64 on the author's machines. Nothing in that list rests on
+emulation or translation any more.
+
+It took the whole way round to get there. Two of the six had only ever been
+*read*, which missed four bugs that made every Windows binary unusable; and
+the sixth was passing under Rosetta while carrying a fault that stopped it
+dead on the hardware it was built for.
 
 **iOS is not a py2bin target and this grid does not claim it.** ManimStudio
 also ships on iPad and iPhone
@@ -229,7 +234,8 @@ Rosetta 2 does not enforce the alignment, so this ran perfectly on Apple
 silicon, corpus and all. It took a crash report from a real Intel Mac, where
 `rbp` and `rsp` were both 8 mod 16 in a frame whose prologue leaves `rbp` at 0.
 Internal functions were never affected: they `push rbp` first, which corrects
-the 8 before anything else happens. It was the entry alone.
+the 8 before anything else happens. It was the entry alone. **Fixed and
+confirmed on the machine that found it.**
 
 **A 16 KB alignment rule is the other thing worth knowing here.** A code-signed
 x86-64 slice placed on a 4 KB boundary - which is what `lipo` historically
@@ -1251,9 +1257,8 @@ machine, which runs ARM64 instructions on an ARM64 processor - the code is
 executed, not translated.
 
 So every target has now had its output compared against CPython's on a machine
-that actually ran it: darwin-arm64 natively, darwin-x86_64 under Rosetta 2,
-both Linux targets in containers, and both Windows targets on the author's
-hardware.
+that actually ran it: darwin-arm64 natively, both Linux targets in containers,
+and darwin-x86_64 and both Windows targets on the author's hardware.
 
 Worth saying plainly, because it is the whole lesson of 0.9.11: reading a
 generated image tells you it is well formed, and tells you nothing about
