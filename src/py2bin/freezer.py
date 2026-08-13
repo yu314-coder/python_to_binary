@@ -6,6 +6,7 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import stat
 import sys
 import sysconfig
@@ -531,13 +532,19 @@ def embed_cpython_in_app(
         wanted |= _point_at_carried_libraries(module, prefix, carried_libraries)
     _drop_unreferenced_libraries(carried_libraries, prefix, wanted)
     # Thinned last, so the rewriting above worked on the file as shipped.
-    for binary in (
-        *bundle.rglob("*.so"),
-        *bundle.rglob("*.dylib"),
-        carried_version / carried_name,
-    ):
-        if binary.is_file() and _BUNDLE_ARCHITECTURES[target] is not None:
+    altered = [
+        binary
+        for binary in (
+            *bundle.rglob("*.so"),
+            *bundle.rglob("*.dylib"),
+            carried_version / carried_name,
+        )
+        if binary.is_file()
+    ]
+    for binary in altered:
+        if _BUNDLE_ARCHITECTURES[target] is not None:
             _thin_to_arm64(binary, _BUNDLE_ARCHITECTURES[target])
+    _resign_carried(altered)
     return sum(
         item.stat().st_size
         for item in (
@@ -817,6 +824,38 @@ def _macos_launcher_image(
             for architecture in UNIVERSAL_SLICES
         }
     )
+
+
+def _resign_carried(binaries: "list[Path]") -> None:
+    """Sign again everything this bundle altered, over what it now is.
+
+    The interpreter and its extension modules arrive signed by whoever built
+    them, and this pulls that signature out from under them twice over: the
+    standard library is pruned and the framework's `_CodeSignature` goes with
+    it, and library paths inside each `.so` are rewritten in place. What is
+    left is a signature that describes a bundle which is no longer there.
+
+    That was believed to be harmless, and on Apple silicon it is - the arm64
+    bundles run, and have for months, with `codesign` calling the framework
+    "invalid Info.plist". A real Intel Mac refuses it: dyld will not load the
+    dylib at all, and says so before any of the program runs. Rosetta does not
+    refuse it either, so this could only be found on the hardware.
+
+    Signing again with no special slots is what makes it true rather than
+    tolerated: an ad-hoc signature over the bytes as they now stand, naming no
+    Info.plist and no resource seal, so there is nothing left to disagree with.
+    """
+
+    from .macos_seal import SealError, resign
+
+    for binary in binaries:
+        try:
+            resign(binary)
+        except (SealError, OSError, struct.error):
+            # A file this cannot re-sign is left as it was rather than
+            # truncated: it may carry no signature to replace, which is not
+            # something to fail a build over.
+            continue
 
 def _thin_to_arm64(binary: Path, wanted: int = _CPU_TYPE_ARM64) -> bool:
     """Keep only this architecture's slice of a universal file.
@@ -1186,6 +1225,19 @@ def _freeze_current_runtime(
         ):
             shutil.copytree(source_app, version_root / app_relative)
         _copy_stdlib(stdlib, version_root / "lib" / f"python{version}", compact)
+        # The framework arrives signed as a *bundle*: its code directory hashes
+        # an Info.plist and a `_CodeSignature` that are not carried, and the
+        # standard library beside it has been pruned besides. What ships is
+        # therefore a signature describing something that is not there, and
+        # `codesign` says so - "invalid Info.plist".
+        #
+        # That was taken for harmless because the bundles ran. They ran on
+        # Apple silicon, and under Rosetta, neither of which refuses the load.
+        # A real Intel Mac does: dyld will not map the dylib at all, so the
+        # program fails before any of it runs, naming a library that is
+        # sitting right where it was put. Signed again over the bytes as they
+        # now stand, with no special slots, there is nothing left to disagree.
+        _resign_carried([version_root / framework_name, executable])
         return executable, {
             "PYTHONHOME": str(version_root.relative_to(destination.parent)),
             "DYLD_FRAMEWORK_PATH": str(destination.relative_to(destination.parent)),
