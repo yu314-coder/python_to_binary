@@ -175,6 +175,28 @@ exec on Apple silicon, whose pages are 16 KB, while `codesign` still calls the
 file valid and the same bytes run fine on their own. Every slice is placed on
 2**14, as Apple's own universal2 builds are.
 
+### C, and a project of several files
+
+py2bin has its own C compiler, so a C program is a native executable the same
+way a Python one is:
+
+```sh
+py2bin cc main.c util.c parser.c -I include -o app
+```
+
+Name every `.c` file: there is no linker, so the whole program is compiled as
+one translation unit, and a project in several files is joined before it is
+compiled. Headers need nothing special, and a diagnostic still names the file
+the mistake is in. `py2bin make` offers a `.c` program the same way it offers
+a `.py` one.
+
+py2bin's C compiler implements C and ships its own standard headers. It has no
+system include path, and **no C++** - classes, templates, mangling and
+exceptions are a compiler of their own.
+
+There is an npm wrapper, so a Node project can reach the same thing:
+`npx py2bin cc main.c util.c -o app`.
+
 ## What it guarantees
 
 Names the program binds are the program's. Integers do not stop at 64 bits.

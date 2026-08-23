@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,850 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,856 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -427,6 +427,53 @@ py2bin compile-capi app.py --target windows-x86_64 --crash-log \
 | `--crash-log` | write `crash.txt` beside the program if it dies |
 | `--auto-fetch` | download the interpreter instead of being told where one is |
 | `--fetch-package NAME` | download that project's wheel for the target and unpack it in; repeatable |
+
+### C, and a project of several files
+
+py2bin has its own C compiler, so a C program is a native executable the same
+way a Python one is - and with the same absence of a toolchain behind it:
+
+```sh
+py2bin cc main.c util.c parser.c -I include -o app
+```
+
+Name every `.c` file. **There is no linker**, so the whole program is compiled
+as one translation unit; a project split across several files is joined into
+one before it is compiled, the way a unity build has always got a single
+translation unit out of many. Headers need nothing special - an include guard
+is exactly what makes including one twice harmless. A diagnostic still names
+the file the mistake is in, because the joined text is mapped back before
+anything is reported.
+
+Two files that each define the same `static helper` will collide, which
+separate translation units would have allowed. That is reported against the
+real file and line rather than guessed at.
+
+`build.py` and `py2bin make` offer a `.c` program the same way they offer a
+`.py` one: any `.c` beside it that does not define its own `main` is compiled
+with it, and an `include/` directory beside it is searched.
+
+**What it is not.** py2bin's C compiler implements C and ships its own copies
+of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `math.h`,
+`stdint.h`, `inttypes.h`, `limits.h`, `stddef.h`, `stdbool.h`). It has no
+system include path - a real system header uses compiler extensions this does
+not implement - and **no C++**. C++ is not a flag away from C: classes,
+templates, name mangling, exceptions and the standard library are a compiler
+of their own, and py2bin does not have one.
+
+### Reaching it from npm
+
+The compiler is a Python program, which is what lets it cross-build by
+arithmetic rather than by toolchain. `npm/` in this repository is a thin
+wrapper so a Node project can reach it without knowing that:
+
+```sh
+npx py2bin cc main.c util.c -I include -o app
+```
+
+It finds a Python 3.10 or newer, hands the arguments to it, and passes the
+exit code back. If `python-to-binary` is not installed for that interpreter it
+says so, and names the exact command for the one it found.
 
 ### Three questions, and nothing to type
 

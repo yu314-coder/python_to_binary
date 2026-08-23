@@ -133,13 +133,60 @@ def host_target() -> str:
 
 
 def programs(here: Path) -> list[Path]:
-    """The Python files that could be someone's program."""
+    """The files that could be someone's program - Python, or C with a main."""
     found = []
     for path in sorted(here.glob("*.py")):
         if path.name in _OURS or path.name.startswith("_"):
             continue
         found.append(path)
+    found.extend(c_programs(here))
     return found
+
+
+def c_programs(here: Path) -> list[Path]:
+    """The `.c` files that define a `main`, which is what makes one a program.
+
+    A C project is several files and only one of them starts. Offering all of
+    them would be offering to build `util.c`, which has nothing to start.
+    """
+    found = []
+    for path in sorted(here.glob("*.c")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _DEFINES_MAIN.search(text):
+            found.append(path)
+    return found
+
+
+#: `int main(` or `int main (`, at the start of a line so a call or a
+#: declaration inside another function is not mistaken for the definition.
+_DEFINES_MAIN = __import__("re").compile(r"^[ \t]*(?:int|void)[ \t]+main[ \t]*\(", __import__("re").M)
+
+
+def c_sources_beside(program: Path) -> "tuple[list[Path], list[str]]":
+    """Every other `.c` in the project, and where its headers are.
+
+    py2bin has no linker, so the whole program is compiled as one translation
+    unit; the other `.c` files beside the entry are part of it. Any `.c` that
+    defines its own `main` is left out - two of those in one translation unit
+    is a collision, and it means the folder holds two programs rather than one.
+    """
+    here = program.parent
+    others = [
+        path
+        for path in sorted(here.glob("*.c"))
+        if path != program and not _DEFINES_MAIN.search(
+            path.read_text(encoding="utf-8", errors="replace")
+        )
+    ]
+    includes = [str(here)]
+    for name in ("include", "inc", "headers", "src"):
+        folder = here / name
+        if folder.is_dir():
+            includes.append(str(folder))
+    return others, includes
 
 
 def nearby(here: Path) -> list[Path]:
@@ -247,6 +294,9 @@ def main(where: str | None = None) -> int:
             1,
         )
     ][0]
+
+    if program.suffix == ".c":
+        return _build_c(program, target)
 
     system = target.split("-")[0]
     offered = methods_for(target)
@@ -442,6 +492,52 @@ def main(where: str | None = None) -> int:
         _say_what_it_runs_on(output, target)
     return code
 
+
+
+def _build_c(program: Path, target: str) -> int:
+    """Compile a C program, and everything beside it, into one executable.
+
+    There is no second question for C: py2bin has one C compiler and no
+    interpreter to ship with it, so "which of the two ways" does not arise.
+    """
+
+    from .c_native import compile_c_native
+
+    others, includes = c_sources_beside(program)
+    output = program.parent / "dist" / program.stem
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if others:
+        say(
+            f"\n  Compiling {program.name} with "
+            + ", ".join(path.name for path in others)
+            + "."
+        )
+        say(
+            "  py2bin has no linker, so they are compiled together as one\n"
+            "  translation unit - which is what lets a project in several\n"
+            "  files build at all."
+        )
+    else:
+        say(f"\n  Compiling {program.name} for {target}.")
+    try:
+        result = compile_c_native(
+            program,
+            output,
+            target=target,
+            clean=True,
+            include_dirs=tuple(includes),
+            extra_sources=tuple(others),
+        )
+    except Exception as error:  # the C compiler's own located rejection
+        say(f"\n  {error}")
+        say(
+            "\n  py2bin's C compiler implements C itself and ships its own\n"
+            "  standard headers; it has no system include path, and no C++."
+        )
+        return 1
+    say(f"\n  done: {result.artifact}")
+    _say_what_it_runs_on(result.artifact, target)
+    return 0
 
 def _say_what_it_runs_on(output: Path, target: str) -> None:
     """For a universal build, name the architectures actually in the file.

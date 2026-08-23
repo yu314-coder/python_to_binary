@@ -365,7 +365,16 @@ def _parser() -> argparse.ArgumentParser:
             "linker, or C toolchain is used."
         ),
     )
-    cc_parser.add_argument("entry", type=Path, help=".c source file")
+    cc_parser.add_argument(
+        "entry",
+        type=Path,
+        nargs="+",
+        help=(
+            "the .c source files. Name more than one and they are compiled "
+            "together as a single translation unit, which is how a project "
+            "split across several files is built without a linker"
+        ),
+    )
     cc_parser.add_argument(
         "--output",
         "-o",
@@ -1042,7 +1051,11 @@ def _main(argv: list[str] | None = None) -> int:
             f"{result.pack} ({result.files} files, {result.bytes} bytes)"
         )
         return 0
-    entry = args.entry.expanduser().resolve()
+    # `cc` takes a list, since several .c files are compiled together into one
+    # translation unit. Every other command names exactly one entry.
+    entry = (
+        args.entry[0] if isinstance(args.entry, list) else args.entry
+    ).expanduser().resolve()
     try:
         if args.command == "compile-via-c":
             bridge = compile_python_via_c(
@@ -1063,7 +1076,11 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "cc":
             # Defaults chosen so the common case needs no flags at all:
-            # `py2bin cc hello.c` builds ./hello for this machine.
+            # `py2bin cc hello.c` builds ./hello for this machine. The first
+            # file named is the one the executable is named after; the rest
+            # are compiled with it.
+            sources = [path.expanduser().resolve() for path in args.entry]
+            entry = sources[0]
             output = args.output
             if output is None:
                 output = entry.with_suffix("")
@@ -1077,6 +1094,7 @@ def _main(argv: list[str] | None = None) -> int:
                 clean=not args.keep,
                 include_dirs=tuple(args.include_dir),
                 defines=tuple(args.define),
+                extra_sources=tuple(sources[1:]),
             )
             print(
                 f"{result.artifact} ({result.bytes} bytes, {result.target})",

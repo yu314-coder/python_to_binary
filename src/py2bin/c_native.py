@@ -1270,6 +1270,59 @@ def c_to_python_source(source: str, filename: str = "<string>") -> str:
     return ast.unparse(parse_canonical_c(source, filename)) + "\n"
 
 
+
+def unity_source(
+    sources: "tuple[Path, ...]",
+) -> "tuple[str, tuple[tuple[int, Path], ...]]":
+    """Join several .c files into the one translation unit py2bin compiles.
+
+    py2bin has no linker. Every function a program calls has to have its body
+    in the translation unit being compiled, which is why a project split across
+    `main.c` and `util.c` is refused however correct it is. Joining them is the
+    way projects have always got a single translation unit out of several files
+    - a unity build - and it needs nothing py2bin does not already have.
+
+    Answers the joined text and where each file starts in it, so a diagnostic
+    can be put back where it was written: an error in `util.c` has to say
+    `util.c:42`, not an offset into a file the user never wrote. (`#line` would
+    be the obvious way and py2bin's preprocessor refuses it deliberately -
+    it reports the line a token was really written on - so the mapping is done
+    here instead.) Headers look after themselves: an include guard is exactly
+    the mechanism that makes including one twice harmless, and every `.c` here
+    is free to include the same ones.
+
+    What this cannot fix is two files that each define the same name. Separate
+    translation units may each have their own `static helper`; joined, they
+    collide, and the compiler says so against the real file and line.
+    """
+
+    parts: list[str] = []
+    spans: list[tuple[int, Path]] = []
+    at = 1
+    for source in sources:
+        text = _read_source(source)
+        spans.append((at, source))
+        # A trailing newline so a file that does not end in one cannot glue its
+        # last token to the next file's first.
+        body = text if text.endswith("\n") else text + "\n"
+        parts.append(body)
+        at += body.count("\n")
+    return "".join(parts), tuple(spans)
+
+
+def _where_it_was_written(
+    spans: "tuple[tuple[int, Path], ...]", line: int
+) -> "tuple[Path, int]":
+    """Turn a line of the joined source back into a file and a line in it."""
+
+    chosen_start, chosen = spans[0]
+    for start, source in spans:
+        if start <= line:
+            chosen_start, chosen = start, source
+        else:
+            break
+    return chosen, line - chosen_start + 1
+
 def compile_c_native(
     entry: Path,
     output: Path,
@@ -1282,6 +1335,7 @@ def compile_c_native(
     app_name: str | None = None,
     icon: Path | None = None,
     python_dylib: str | None = None,
+    extra_sources: "tuple[Path, ...]" = (),
 ) -> NativeResult:
     """Compile a C file to machine code with only py2bin's own implementation.
 
@@ -1297,7 +1351,14 @@ def compile_c_native(
     if not entry.is_file():
         raise FileNotFoundError(f"C source does not exist: {entry}")
     resolved = target or host_target()
-    source = _read_source(entry)
+    spans: "tuple[tuple[int, Path], ...]" = ()
+    if extra_sources:
+        missing = [str(path) for path in extra_sources if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"C source does not exist: {', '.join(missing)}")
+        source, spans = unity_source((entry, *extra_sources))
+    else:
+        source = _read_source(entry)
     if resolved == UNIVERSAL_TARGET:
         # Two compilations, not one image built twice. The C frontend applies
         # the target's rules while it lowers - how a string literal used as a
@@ -1323,15 +1384,26 @@ def compile_c_native(
             icon=icon,
             python_dylib=python_dylib,
         )
-    module, _report = optimize(
-        compile_c_to_ir(
-            source,
-            str(entry),
-            resolved,
-            include_dirs=include_dirs,
-            defines=defines,
+    try:
+        module, _report = optimize(
+            compile_c_to_ir(
+                source,
+                str(entry),
+                resolved,
+                include_dirs=include_dirs,
+                defines=defines,
+            )
         )
-    )
+    except CCompileError as error:
+        # Several files were joined, so the line the compiler saw is a line of
+        # the joined text. Put it back where the user wrote it; a diagnostic
+        # naming a file and a line that exist is the whole point of doing this.
+        if not spans or error.filename != str(entry):
+            raise
+        written_in, line = _where_it_was_written(spans, error.line)
+        raise CCompileError(
+            str(written_in), line, error.column, error.message
+        ) from None
     return compile_native_module(
         entry,
         module,
