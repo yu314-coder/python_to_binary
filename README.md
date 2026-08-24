@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,868 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,877 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -457,9 +457,11 @@ with it, and an `include/` directory beside it is searched.
 of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `math.h`,
 `stdint.h`, `inttypes.h`, `limits.h`, `stddef.h`, `stdbool.h`). It has no
 system include path - a real system header uses compiler extensions this does
-not implement - and **no C++**. C++ is not a flag away from C: classes,
-templates, name mangling, exceptions and the standard library are a compiler
-of their own, and py2bin does not have one.
+not implement. **C++ goes through a subset**, translated to C rather than
+compiled: classes, members, methods, constructors, destructors and single
+inheritance. Templates, exceptions and the standard library are a compiler of
+their own and are refused by name - see [C++, as far as translating gets
+you](#c-as-far-as-translating-gets-you).
 
 ### A program that is not all one language
 
@@ -497,6 +499,43 @@ Two limits of the C compiler are worth knowing before leaning on this: it
 ships its own standard headers and has no system include path, and a `printf`
 with a runtime conversion is POSIX-only, because that is where it emits the
 write syscall. A format with no conversions works on every target.
+
+### C++, as far as translating gets you
+
+py2bin has a C compiler and no C++ one. Writing a second compiler is a project
+of its own — templates, overload resolution, exceptions and the standard
+library are most of what C++ *is*. What is tractable is what the first C++
+compiler did: **translate**. A class becomes a struct, a member function
+becomes a free function whose first parameter is the object, a constructor
+initialises one in place. Nothing downstream knows C++ happened.
+
+```sh
+py2bin cc main.cpp stack.cpp -o app
+```
+
+**What goes through:** `class` and `struct` with data members and member
+functions, defined in the class or out of it as `Type Class::name`;
+constructors and destructors, including destructors at every exit from a
+scope; `this`, written or implicit; calls through an object, a pointer or
+`this`; single non-virtual inheritance, with the base embedded first so a
+pointer to the derived object is a pointer to the base one and inherited
+members and methods resolve; classes declared in a `.hpp` and used from a
+`.cpp`.
+
+**What is refused, by name:** templates, exceptions, `virtual`, operator
+overloading, `new`/`delete`, multiple inheritance, namespaces, references, and
+the standard library. Each says which construct it was and on which line,
+because C++ mistranslated into C fails somewhere nobody wrote.
+
+`new` is refused for a reason worth stating plainly: py2bin's C compiler has
+no `malloc`. There is no heap to put an object on, so this is not a corner cut
+here - it is the shape of what is underneath.
+
+**Be clear about what this is.** It is a useful subset, not a C++ compiler,
+and it will not build code that uses the standard library - which is most real
+C++. If your program is a few classes with methods and no templates, it will
+go through. If it includes `<vector>`, it will not, and it says so on the line
+that includes it.
 
 ### Reaching it from npm
 

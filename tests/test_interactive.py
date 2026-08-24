@@ -52,7 +52,9 @@ def _target_choice(name: str) -> int:
 
 
 def test_there_are_two_ways_and_only_two():
-    assert [name for name, _ in interactive.METHODS] == ["freeze", "compile"]
+    # Named for the commands they run. The second read "compile" for a long
+    # time and has never built that tier - it runs compile-capi.
+    assert [name for name, _ in interactive.METHODS] == ["freeze", "compile-capi"]
 
 
 def test_the_shape_question_is_gone():
@@ -83,7 +85,7 @@ def test_freezing_is_not_offered_when_it_cannot_be_done(monkeypatch):
     for target in ("linux-x86_64", "linux-arm64", "darwin-x86_64"):
         assert not interactive.can_freeze(target)
         offered = interactive.methods_for(target)
-        assert [name for name, _ in offered] == ["compile"]
+        assert [name for name, _ in offered] == ["compile-capi"]
 
 
 def test_both_are_offered_when_both_work(monkeypatch):

@@ -139,7 +139,7 @@ def host_target() -> str:
 
 
 def programs(here: Path) -> list[Path]:
-    """The files that could be someone's program - Python, or C with a main."""
+    """The files that could be someone's program - Python, or C/C++ with a main."""
     found = []
     for path in sorted(here.glob("*.py")):
         if path.name in _OURS or path.name.startswith("_"):
@@ -149,14 +149,26 @@ def programs(here: Path) -> list[Path]:
     return found
 
 
-def c_programs(here: Path) -> list[Path]:
-    """The `.c` files that define a `main`, which is what makes one a program.
+#: What a C or C++ source is called. The C++ ones are translated to C first;
+#: everything downstream sees C either way.
+_SOURCE_SUFFIXES = (".c", ".cpp", ".cc", ".cxx")
 
-    A C project is several files and only one of them starts. Offering all of
+
+def _sources_in(here: Path) -> "list[Path]":
+    found: list[Path] = []
+    for suffix in _SOURCE_SUFFIXES:
+        found.extend(here.glob("*" + suffix))
+    return sorted(found)
+
+
+def c_programs(here: Path) -> list[Path]:
+    """The C or C++ files that define a `main`, which makes one a program.
+
+    A project is several files and only one of them starts. Offering all of
     them would be offering to build `util.c`, which has nothing to start.
     """
     found = []
-    for path in sorted(here.glob("*.c")):
+    for path in _sources_in(here):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -182,7 +194,7 @@ def c_sources_beside(program: Path) -> "tuple[list[Path], list[str]]":
     here = program.parent
     others = [
         path
-        for path in sorted(here.glob("*.c"))
+        for path in _sources_in(here)
         if path != program and not _DEFINES_MAIN.search(
             path.read_text(encoding="utf-8", errors="replace")
         )
@@ -261,7 +273,7 @@ def main(where: str | None = None) -> int:
     say(f"py2bin {py2bin.__version__}")
 
     start = Path(where).expanduser() if where else Path.cwd()
-    if start.is_file() and start.suffix == ".py":
+    if start.is_file() and start.suffix in (".py", *_SOURCE_SUFFIXES):
         here, forced = start.parent, start
     else:
         here, forced = where_to_build(start), None
@@ -301,7 +313,7 @@ def main(where: str | None = None) -> int:
         )
     ][0]
 
-    if program.suffix == ".c":
+    if program.suffix in _SOURCE_SUFFIXES:
         return _build_c(program, target)
 
     system = target.split("-")[0]
@@ -519,10 +531,11 @@ def main(where: str | None = None) -> int:
 
 
 def _build_c(program: Path, target: str) -> int:
-    """Compile a C program, and everything beside it, into one executable.
+    """Compile a C or C++ program, and everything beside it, into one binary.
 
-    There is no second question for C: py2bin has one C compiler and no
+    There is no second question here: py2bin has one C compiler and no
     interpreter to ship with it, so "which of the two ways" does not arise.
+    C++ is translated to C first and then goes through the same compiler.
     """
 
     from .c_native import compile_c_native

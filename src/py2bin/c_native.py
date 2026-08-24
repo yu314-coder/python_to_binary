@@ -35,6 +35,7 @@ def _read_source(path):
 
 
 from .c_frontend import CCompileError, compile_c_to_ir
+from .cpp_frontend import CppTranslationError, is_cpp, translate_unity
 from .csource import compile_to_c
 from .native import NativeResult, compile_native_source
 from .native.compiler import (
@@ -1352,6 +1353,33 @@ def compile_c_native(
         raise FileNotFoundError(f"C source does not exist: {entry}")
     resolved = target or host_target()
     spans: "tuple[tuple[int, Path], ...]" = ()
+    if is_cpp(entry) or any(is_cpp(path) for path in extra_sources):
+        # C++ is translated to C first and then compiled by the C compiler
+        # below, which is the only compiler there is. Each file is translated
+        # on its own, with this project's headers pasted into it, so a class
+        # declared in a .hpp is in front of the translator when the .cpp that
+        # uses it is read.
+        source = translate_unity((entry, *extra_sources), include_dirs)
+        module, _report = optimize(
+            compile_c_to_ir(
+                source,
+                str(entry),
+                resolved,
+                include_dirs=include_dirs,
+                defines=defines,
+            )
+        )
+        return compile_native_module(
+            entry,
+            module,
+            output,
+            target=resolved,
+            clean=clean,
+            app=app,
+            app_name=app_name,
+            icon=icon,
+            python_dylib=python_dylib,
+        )
     if extra_sources:
         missing = [str(path) for path in extra_sources if not path.is_file()]
         if missing:

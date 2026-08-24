@@ -193,6 +193,26 @@ The C and the Python do not merge into one image - there is no linker - so the
 C is a separate executable inside the bundle and the Python runs it. What is in
 one file is the delivery, not the linkage.
 
+### C++, as far as translating gets you
+
+A class becomes a struct, a member function a free function taking the object,
+a constructor something that initialises one in place - the trick the first
+C++ compiler used, which needs nothing the C backend does not already have:
+
+```sh
+py2bin cc main.cpp stack.cpp -o app
+```
+
+Through: classes with members and methods, in the class or out of it,
+constructors and destructors, `this`, single non-virtual inheritance, and
+classes declared in a `.hpp`. Refused **by name**: templates, exceptions,
+`virtual`, operator overloading, `new`/`delete`, namespaces, references and the
+standard library. `new` is refused because the C compiler has no `malloc` -
+there is no heap to put an object on.
+
+It is a useful subset, not a C++ compiler. Code that uses `<vector>` will not
+build, and says so on the line that includes it.
+
 ### C, and a project of several files
 
 py2bin has its own C compiler, so a C program is a native executable the same
@@ -208,9 +228,10 @@ compiled. Headers need nothing special, and a diagnostic still names the file
 the mistake is in. `py2bin make` offers a `.c` program the same way it offers
 a `.py` one.
 
-py2bin's C compiler implements C and ships its own standard headers. It has no
-system include path, and **no C++** - classes, templates, mangling and
-exceptions are a compiler of their own.
+py2bin's C compiler implements C and ships its own standard headers, with no
+system include path. **C++ goes through a subset**, translated to C - classes,
+methods, constructors, destructors, single inheritance - with templates,
+exceptions and the standard library refused by name.
 
 There is an npm wrapper, so a Node project can reach the same thing:
 `npx py2bin cc main.c util.c -o app`.
