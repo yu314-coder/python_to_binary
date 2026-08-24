@@ -19,7 +19,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ModuleNotFoundError as missing:  # pragma: no cover - no pytest here
+    # The suite is meant to run with nothing installed, and the README says
+    # so. This module wants pytest's fixtures; where there is no pytest, say
+    # that rather than failing to import - `unittest discover` reports a
+    # module that will not import as an error, which reads like a broken
+    # test rather than a missing tool.
+    import unittest as _unittest
+
+    raise _unittest.SkipTest("pytest is not installed") from missing
 
 ROOT = Path(__file__).resolve().parents[1]
 

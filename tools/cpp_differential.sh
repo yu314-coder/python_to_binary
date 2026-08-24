@@ -8,6 +8,9 @@
 # This asks whether the translation preserves meaning, which is the only thing
 # reading the generated C cannot tell you.
 
+# The clone this script is in, so it works wherever the clone is.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
 PASS=0; FAIL=0; REFUSED=0
 for source in "$(dirname "$0")"/cpp_corpus/*.cpp; do
     name=$(basename "$source" .cpp)
@@ -16,7 +19,7 @@ for source in "$(dirname "$0")"/cpp_corpus/*.cpp; do
         continue
     fi
     want=$("/tmp/ref_$name" 2>&1); wantcode=$?
-    got=$(PYTHONPATH=/Volumes/D/github/python_to_binary/src python3 -m py2bin cc \
+    got=$(PYTHONPATH="$ROOT/src" python3 -m py2bin cc \
           "$source" -o "/tmp/p2b_$name" 2>&1)
     if [ $? -ne 0 ]; then
         case "$got" in

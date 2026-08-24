@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,902 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,932 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -457,11 +457,10 @@ with it, and an `include/` directory beside it is searched.
 of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `math.h`,
 `stdint.h`, `inttypes.h`, `limits.h`, `stddef.h`, `stdbool.h`). It has no
 system include path - a real system header uses compiler extensions this does
-not implement. **C++ goes through a subset**, translated to C rather than
-compiled: classes, members, methods, constructors, destructors and single
-inheritance. Templates, exceptions and the standard library are a compiler of
-their own and are refused by name - see [C++, as far as translating gets
-you](#c-as-far-as-translating-gets-you).
+not implement. **C++ is translated to C** rather than compiled:
+classes, inheritance, `virtual`, references, templates, overloading, `new`,
+exceptions, and py2bin's own `<string>`, `<vector>` and `<iostream>` - see
+[C++, translated to C](#c-translated-to-c).
 
 ### A program that is not all one language
 
@@ -495,65 +494,89 @@ the C is a separate executable inside the bundle and the Python reaches it the
 ordinary way - `subprocess`, or `ctypes` for a shared library. What is in one
 file is the *delivery*, not the linkage.
 
-Two limits of the C compiler are worth knowing before leaning on this: it
-ships its own standard headers and has no system include path, and a `printf`
-with a runtime conversion is POSIX-only, because that is where it emits the
-write syscall. A format with no conversions works on every target.
+One limit of the C compiler is worth knowing before leaning on this: it ships
+its own standard headers and has no system include path, so `#include
+<stdio.h>` gets py2bin's copy and there is no `#include <sys/socket.h>` to be
+had. `<stdlib.h>` brings a real `malloc`, written in C on top of one primitive
+the compiler provides, so it can be read rather than taken on trust; it is an
+arena, and `free` keeps its promise not to touch what you hand it.
 
-### C++, as far as translating gets you
+### C++, translated to C
 
-py2bin has a C compiler and no C++ one. Writing a second compiler is a project
-of its own — templates, overload resolution, exceptions and the standard
-library are most of what C++ *is*. What is tractable is what the first C++
-compiler did: **translate**. A class becomes a struct, a member function
-becomes a free function whose first parameter is the object, a constructor
-initialises one in place. Nothing downstream knows C++ happened.
+py2bin has a C compiler and no C++ one. What it has instead is what the first
+C++ compiler was: a **translator**. A class becomes a struct, a member
+function becomes a free function whose first parameter is the object, a
+constructor initialises one in place. Nothing downstream knows C++ happened —
+the C that comes out is compiled by the same backend that compiles C, and
+cross-builds to all six targets the same way.
 
 ```sh
 py2bin cc main.cpp stack.cpp -o app
 ```
 
-**What goes through:** `class` and `struct` with data members and member
-functions, defined in the class or out of it as `Type Class::name`;
+**What goes through.** Classes and structs with data members and member
+functions, written in the class or out of it as `Type Class::name`;
 constructors and destructors, including destructors at every exit from a
-scope; `this`, written or implicit; calls through an object, a pointer or
-`this`; single non-virtual inheritance, with the base embedded first so a
-pointer to the derived object is a pointer to the base one and inherited
-members and methods resolve; classes declared in a `.hpp` and used from a
-`.cpp`.
+scope and at every `return` inside one; `this`, written or implicit; calls
+through an object, a pointer, an array element or `this`; single inheritance,
+with the base embedded first so a pointer to the derived object is a pointer
+to the base one.
 
-**Namespaces go through**, flattened away. py2bin compiles one translation
-unit and has no linker, so scoping is the whole of what a namespace can mean
-here: `N::thing` becomes `thing`, `using namespace N;` becomes nothing, and
-nested, anonymous and re-opened namespaces all work. What flattening cannot
-survive is two namespaces declaring the same name - that is refused by name
-rather than resolved by whichever came last.
+Beyond that, each of these is something a C++ compiler turns into C-shaped
+code before it emits anything, which is where they are done here:
 
-**What is refused, by name:** templates, exceptions, `virtual`, operator
-overloading, `new`/`delete`, multiple inheritance, references, and
-the standard library. Each says which construct it was and on which line,
-because C++ mistranslated into C fails somewhere nobody wrote.
+| | how |
+|---|---|
+| **Overloading** | by how many arguments a call passes, and by their types where that is not enough. `show(1)` and `show("a")` become `show__1__int` and `show__1__char_p` |
+| **`virtual`** | a pointer to a table of the object's own functions, installed by its constructor. Derived tables keep the base's slot order |
+| **References** | a pointer with the dereference written out; call sites take the address |
+| **`new` / `delete`** | malloc from `<stdlib.h>`, then the constructor. `new T[n]` records the count in front of the block so `delete[]` can destroy every element |
+| **Templates** | one copy per set of arguments used, named after them — `Box__int`, not a hash. Arguments a call does not spell out are deduced from literals and from declarations in view |
+| **Namespaces** | flattened. One translation unit, no linker, so scoping is the whole of what a namespace can mean here |
+| **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer |
+| **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
 
-`new` is refused for a reason worth stating plainly: py2bin's C compiler has
-no `malloc`. There is no heap to put an object on, so this is not a corner cut
-here - it is the shape of what is underneath.
+**Three standard headers**, each written in py2bin's own C++ subset and put
+through the same translator as your code — so they are readable, and they are
+not special cases in the compiler:
 
-**How it is checked.** Reading the generated C tells you it is well formed
-and nothing about whether it *means* the same thing - so the corpus in
+* `<string>` — a fixed-capacity string with `assign`, `size`, `c_str`,
+  `append`, `operator+` and comparison.
+* `<vector>` — a template, so one concrete class per element type. It grows
+  by doubling and the old block stays where it is, because the heap under it
+  is an arena that does not reclaim; pretending otherwise would be the
+  dishonest part, not the leak.
+* `<iostream>` — `cout` with one `operator<<` per type it can print, each
+  handing the stream back so the next `<<` in the chain has something to be
+  called on.
+
+```cpp
+#include <iostream>
+int main() { std::cout << "Hello, world!" << std::endl; return 0; }
+```
+
+**What it will not do.** No unwinder, so exception propagation is written out
+in the C and a call that can throw is given a statement of its own — which
+means one behind `&&`, `||` or `?:`, or in a loop's header, is refused with
+the reason rather than moved to where it would run at the wrong time. An
+exception reaching the end of `main` aborts in C++; there is no way to raise a
+signal here, so the program exits with a status of its own instead. Multiple
+inheritance, `dynamic_cast` and RTTI are not implemented. Two overloads that
+differ only in types py2bin cannot read are refused rather than guessed at.
+
+**How it is checked.** Reading the generated C tells you it is well formed and
+nothing about whether it *means* the same thing — so the corpus in
 `tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it, over 33 programs. Ten
-found three bugs on the first run and nine in total, every one of which
-produced C that compiled cleanly and meant something else: a member called `n` rewrote
+the outputs compared. `tools/cpp_differential.sh` runs it, over 66 programs,
+all agreeing. The first run of it found nine bugs, every one of which produced
+C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
-member answered 200 where the answer is 105; a destructor in a nested block was
-emitted at the end of the function. clang++ is the yardstick there and never a
-dependency - py2bin still builds with no toolchain at all.
-
-**Be clear about what this is.** It is a useful subset, not a C++ compiler,
-and it will not build code that uses the standard library - which is most real
-C++. If your program is a few classes with methods and no templates, it will
-go through. If it includes `<vector>`, it will not, and it says so on the line
-that includes it.
+member answered 200 where the answer is 105; a destructor in a nested block
+was emitted at the end of the function. It has gone on finding them —
+`return size * size;` read as a declaration of a pointer named `size`, and a
+`return` inside a block destroying only that block's objects. clang++ is the
+yardstick there and never a dependency; py2bin still builds with no toolchain
+at all.
 
 ### Reaching it from npm
 
@@ -1645,10 +1668,12 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1328 tests, no dependencies, nothing to install. The suite fails if any module
-under `src/` imports `subprocess`, `multiprocessing`, `pty`, `distutils` or
-`setuptools`, or names an external toolchain as a value - which is what keeps
-the zero-toolchain claim honest rather than aspirational.
+1832 tests, no dependencies, nothing to install. Five modules want pytest's
+fixtures and skip themselves without it; `python -m pytest tests` runs those
+too, for 1932. The suite fails if any module under `src/` imports
+`subprocess`, `multiprocessing`, `pty`, `distutils` or `setuptools`, or names
+an external toolchain as a value - which is what keeps the zero-toolchain
+claim honest rather than aspirational.
 
 [^corpus]: Freshly measured, on this machine, at the commit that carries this
     line: each of the 889 programs compiled with `compile-capi` for the host
@@ -1657,4 +1682,4 @@ the zero-toolchain claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1749-test suite.
+    is checked on every change is the 1932-test suite.

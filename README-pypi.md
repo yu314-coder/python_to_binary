@@ -193,7 +193,7 @@ The C and the Python do not merge into one image - there is no linker - so the
 C is a separate executable inside the bundle and the Python runs it. What is in
 one file is the delivery, not the linkage.
 
-### C++, as far as translating gets you
+### C++, translated to C
 
 A class becomes a struct, a member function a free function taking the object,
 a constructor something that initialises one in place - the trick the first
@@ -203,16 +203,31 @@ C++ compiler used, which needs nothing the C backend does not already have:
 py2bin cc main.cpp stack.cpp -o app
 ```
 
-Through: classes with members and methods, in the class or out of it,
-constructors and destructors, `this`, single non-virtual inheritance, and
-classes declared in a `.hpp`. Namespaces go through, flattened away - `N::thing` is `thing` - with two
-namespaces declaring the same name refused rather than silently merged.
-Refused **by name**: templates, exceptions, `virtual`, operator overloading,
-`new`/`delete`, references and the standard library. `new` is refused because the C compiler has no `malloc` -
-there is no heap to put an object on.
+Through: classes, single inheritance, `virtual` (a table of the object's own
+functions, installed by its constructor), references, `new`/`delete` on a real
+`malloc`, overloading (by argument count, and by type where that is not
+enough), templates (one copy per set of arguments, named `Box__int` rather
+than a hash), operators, namespaces, and exceptions - a flag and a return,
+tested by the caller right after the call, with `try`/`catch` as a jump to a
+label.
 
-It is a useful subset, not a C++ compiler. Code that uses `<vector>` will not
-build, and says so on the line that includes it.
+Three standard headers come with it, each written in py2bin's own C++ subset
+and put through the same translator as your code: `<string>`, `<vector>` and
+`<iostream>`. So this builds, and prints what clang++ prints:
+
+```cpp
+#include <iostream>
+int main() { std::cout << "Hello, world!" << std::endl; return 0; }
+```
+
+Not implemented: multiple inheritance, `dynamic_cast` and RTTI. There is no
+unwinder, so a call that can throw gets a statement of its own - one behind
+`&&`, `||` or `?:` is refused with the reason rather than moved to where it
+would run at the wrong time.
+
+It is checked by building `tools/cpp_corpus/` twice, once with py2bin and once
+with `clang++`, and comparing the output: 66 programs, all agreeing. clang++ is
+the yardstick there and never a dependency.
 
 ### C, and a project of several files
 
@@ -230,9 +245,9 @@ the mistake is in. `py2bin make` offers a `.c` program the same way it offers
 a `.py` one.
 
 py2bin's C compiler implements C and ships its own standard headers, with no
-system include path. **C++ goes through a subset**, translated to C - classes,
-methods, constructors, destructors, single inheritance - with templates,
-exceptions and the standard library refused by name.
+system include path; `<stdlib.h>` brings a real `malloc`, written in C on top
+of one primitive the compiler provides. **C++ is translated to C** rather than
+compiled - see above.
 
 There is an npm wrapper, so a Node project can reach the same thing:
 `npx py2bin cc main.c util.c -o app`.
@@ -1244,4 +1259,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 804. What is checked on every change is the 1749-test suite.
+    is 804. What is checked on every change is the 1932-test suite.

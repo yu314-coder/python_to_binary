@@ -2643,27 +2643,38 @@ def _rewrite_body(
         if owner is None:
             continue
         element = _method_by_name(owner, "op_index", classes)
-        held = (element.returns if element else "").replace("&", "").replace("*", "").strip()
+        spelled = (element.returns if element else "").replace("&", "").strip()
+        held = spelled.replace("*", "").strip()
         if held not in classes:
             continue
+        # A container of pointers: `rows[i]->weight()`. The element is already
+        # an address, so the receiver is what the index operator returns
+        # rather than the address of it.
+        indirect = "*" in spelled
+        reach = "->" if indirect else r"\."
         address = variable if variable in pointers else f"&{variable}"
         for method in _reachable_methods(held, classes):
             provider = _find_method(held, method, classes)
             if provider is None:
                 continue
             pattern = (
-                rf"\b{re.escape(variable)}\s*\[([^\]]*)\]\s*\.\s*"
+                rf"\b{re.escape(variable)}\s*\[([^\]]*)\]\s*{reach}\s*"
                 rf"{re.escape(method)}\s*\("
             )
-            # `&` in front, because the dereference pass will follow the
-            # reference the index operator returns and the receiver wants the
-            # address again - the two cancel, which is what C++ was doing.
+            # For a container of values, `&` in front: the dereference pass
+            # will follow the reference the index operator returns and the
+            # receiver wants the address again - the two cancel, which is
+            # what C++ was doing.
+            call = f"{_c_name(owner, 'op_index')}({address}, __I__)"
+            reached = call if indirect else f"&{call}"
             body = _rewrite_pointer_indexed(
                 body,
                 pattern,
-                _name_for(provider, method, classes, scope()),
+                _dispatched(held, method, classes, reached, provider, scope())
+                if indirect
+                else _name_for(provider, method, classes, scope()),
                 variable,
-                f"&{_c_name(owner, 'op_index')}({address}, __I__)",
+                reached,
             )
 
     body = _rewrite_operators(body, classes, known, pointers)
@@ -3858,7 +3869,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
 
 #: `new T`, `new T(a, b)` and `new T[n]`. The type is read as a name so a
 #: qualified one has already been flattened by the time this runs.
-_NEW = re.compile(r"\bnew\s+([A-Za-z_]\w*)\s*(\[|\()?")
+#: The stars are part of the type: `new T[n]` inside a container of pointers
+#: reads `new Row *[n]` once T has been substituted, and taken without them
+#: the `*[n]` was left behind for the C compiler to choke on.
+_NEW = re.compile(r"\bnew\s+([A-Za-z_]\w*(?:\s*\*)*)\s*(\[|\()?")
 #: `delete p;` and `delete[] p;`, to the end of the statement.
 _DELETE = re.compile(r"\bdelete\s*(\[\s*\])?\s*([^;]+);")
 
@@ -3990,7 +4004,7 @@ def _rewrite_new(body: str, classes: "dict[str, Class]", scope: str = "") -> str
     for found in _NEW.finditer(body):
         if found.start() < at:
             continue
-        type_name, opener = found.group(1), found.group(2)
+        type_name, opener = found.group(1).strip(), found.group(2)
         out.append(body[at:found.start()])
         if opener == "[":
             close = body.index("]", found.end() - 1)

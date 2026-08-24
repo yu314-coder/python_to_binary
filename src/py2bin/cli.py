@@ -219,11 +219,11 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PATH",
         action="append",
         default=[],
-        help="compile this C program for the same target and carry it beside "
-        "the executable. PATH is the .c file with the main, or a directory "
-        "holding it; every other .c beside it is compiled in, since there is "
-        "no linker, and an include/ directory beside it is searched. "
-        "Repeatable",
+        help="compile this C or C++ program for the same target and carry it "
+        "beside the executable. PATH is the source file with the main, or a "
+        "directory holding it; every other .c, .cpp, .cc or .cxx beside it is "
+        "compiled in, since there is no linker, and an include/ directory "
+        "beside it is searched. Repeatable",
     )
     capi_parser.add_argument(
         "--auto-fetch",
@@ -368,12 +368,13 @@ def _parser() -> argparse.ArgumentParser:
     via_c_parser.add_argument("--clean", action="store_true")
     cc_parser = commands.add_parser(
         "cc",
-        help="compile a C file to a native executable (the easy front door)",
+        help="compile a C or C++ file to a native executable (the easy front door)",
         description=(
-            "Compile C to machine code. With no --output the executable takes "
-            "the source file's name, and with no --target it is built for this "
-            "machine, so `py2bin cc hello.c` writes ./hello. No assembler, "
-            "linker, or C toolchain is used."
+            "Compile C or C++ to machine code. With no --output the executable "
+            "takes the source file's name, and with no --target it is built for "
+            "this machine, so `py2bin cc hello.c` writes ./hello. A .cpp is "
+            "translated to C first, by py2bin, and compiled the same way. No "
+            "assembler, linker, or C toolchain is used."
         ),
     )
     cc_parser.add_argument(
@@ -381,9 +382,10 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="+",
         help=(
-            "the .c source files. Name more than one and they are compiled "
-            "together as a single translation unit, which is how a project "
-            "split across several files is built without a linker"
+            "the source files: .c, or .cpp/.cc/.cxx for C++. Name more than "
+            "one and they are compiled together as a single translation unit, "
+            "which is how a project split across several files is built "
+            "without a linker"
         ),
     )
     cc_parser.add_argument(
