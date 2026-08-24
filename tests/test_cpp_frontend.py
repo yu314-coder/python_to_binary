@@ -77,10 +77,14 @@ class Translating(unittest.TestCase):
 
 
 class Inheriting(unittest.TestCase):
+    # Shape has a constructor taking nothing on purpose: a base whose only
+    # constructor takes arguments needs an initialiser list, which C++ demands
+    # and this subset does not read - so it is refused, and the fixture stays
+    # inside what is actually accepted.
     _SHAPE = """class Shape {
 public:
     int w;
-    Shape(int a) { w = a; }
+    Shape() { w = 0; }
     int width() { return w; }
 };
 class Box : public Shape {
@@ -193,3 +197,134 @@ class Naming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Subobjects(unittest.TestCase):
+    """A class holding another, and what C does not do for you.
+
+    C++ builds the base and every class-typed member before the constructor
+    body runs. C does nothing at all, so the held object read whatever was on
+    the stack - `car.total()` answered 125732 where it should have answered
+    104. A wrong answer, not a failure, which is the worst kind to ship.
+    """
+
+    _COMPOSED = """class Engine {
+public:
+    int power;
+    Engine() { power = 100; }
+    int rate() { return power; }
+};
+class Car {
+public:
+    Engine motor;
+    int wheels;
+    Car() { wheels = 4; }
+    int total() { return motor.rate() + wheels; }
+};
+int main(void) { Car c; return c.total(); }
+"""
+
+    def test_a_held_object_is_constructed_first(self) -> None:
+        out = translate(self._COMPOSED, "c.cpp")
+        constructor = out[out.index("Car__ctor"):]
+        self.assertIn("Engine__ctor(&this->motor);", constructor)
+        self.assertLess(
+            constructor.index("Engine__ctor"), constructor.index("wheels = 4")
+        )
+
+    def test_a_held_object_is_a_receiver(self) -> None:
+        # `motor.rate()` is a call on a member, which qualifying alone left as
+        # `this->motor.rate()` - a struct with no such field.
+        self.assertIn("Engine__rate(&this->motor)", translate(self._COMPOSED, "c.cpp"))
+
+    def test_the_class_it_holds_is_defined_first(self) -> None:
+        # C needs the complete type to lay the field out, and source order is
+        # not that order.
+        out = translate(self._COMPOSED, "c.cpp")
+        self.assertLess(out.index("struct Engine {"), out.index("struct Car {"))
+
+    def test_a_base_needing_arguments_is_refused(self) -> None:
+        source = """class Base { public: int v; Base(int a) { v = a; } };
+class Derived : public Base { public: Derived() { } };
+int main(void) { Derived d; return 0; }
+"""
+        with self.assertRaisesRegex(CppTranslationError, "initialiser list"):
+            translate(source, "d.cpp")
+
+
+class Arrays(unittest.TestCase):
+    _BANK = """class Cell {
+public:
+    int n;
+    Cell() { n = 5; }
+    int get() { return n; }
+};
+int main(void) { Cell bank[3]; return bank[0].get(); }
+"""
+
+    def test_every_element_is_default_constructed(self) -> None:
+        out = translate(self._BANK, "b.cpp")
+        self.assertIn("Cell__ctor(&bank[", out)
+        self.assertIn("for (", out)
+
+    def test_an_element_is_a_receiver(self) -> None:
+        self.assertIn("Cell__get(&bank[0])", translate(self._BANK, "b.cpp"))
+
+
+class DeepInheritance(unittest.TestCase):
+    _CHAIN = """class A { public: int v; A() { v = 1; } };
+class B : public A { public: B() { v = 2; } };
+class C : public B { public: C() { v = 3; } int deep() { return v; } };
+int main(void) { C c; return c.deep(); }
+"""
+
+    def test_a_name_two_levels_up_walks_both(self) -> None:
+        # One hop named a member the middle class does not have.
+        self.assertIn("this->__base.__base.v", translate(self._CHAIN, "c.cpp"))
+
+
+class Scopes(unittest.TestCase):
+    """A function is a scope, and the file is not one.
+
+    Rewritten as a single body, a variable declared in one function was in
+    scope for every later one - and its destructor was placed at the end of
+    the *last* function in the file. The compiler then named an undeclared
+    variable, pointing into somebody else's function.
+    """
+
+    _TWO = """class T { public: int id; T() { id = 7; } ~T() { id = 0; } };
+int first(void) { T t; int held = t.id; return held; }
+int main(void) { return first(); }
+"""
+
+    def test_a_destructor_stays_in_its_own_function(self) -> None:
+        out = translate(self._TWO, "t.cpp")
+        first = out[out.index("int first"):out.index("int main")]
+        self.assertIn("T__dtor(&t);", first)
+        self.assertNotIn("T__dtor", out[out.index("int main"):])
+
+    def test_a_class_typed_parameter_can_be_called_on(self) -> None:
+        # Declared in the head and used in the body, and the body is all the
+        # rewriter is handed.
+        source = """class I { public: int a; I() { a = 1; } int get() { return a; } };
+int viaPointer(I *p) { return p->get(); }
+int main(void) { I i; return viaPointer(&i); }
+"""
+        self.assertIn("I__get(p)", translate(source, "p.cpp"))
+
+
+class PlainStructs(unittest.TestCase):
+    def test_a_bare_struct_name_is_a_type_in_c_too(self) -> None:
+        """`Plain p;` is C++ and a syntax error in C.
+
+        The struct itself is left exactly as written - it is C already - but
+        the name still has to work, which is what the typedef is for.
+        """
+
+        source = """struct Plain { int f; };
+class K { public: int n; K() { n = 1; } };
+int main(void) { Plain p; p.f = 9; K k; return p.f + k.n; }
+"""
+        out = translate(source, "s.cpp")
+        self.assertIn("typedef struct Plain Plain;", out)
+        self.assertIn("struct Plain { int f; };", out)

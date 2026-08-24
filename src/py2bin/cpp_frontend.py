@@ -279,10 +279,15 @@ def _this_qualified(body: str, owner: Class, classes: "dict[str, Class]") -> str
 
     names = dict.fromkeys(owner.field_names(), "")
     base = owner.base
+    depth = 1
     while base and base in classes:
+        # One `__base.` per level. A name inherited through two classes lives
+        # two bases down, and a single hop named a member the middle class
+        # does not have.
         for name in classes[base].field_names():
-            names.setdefault(name, "__base.")
+            names.setdefault(name, "__base." * depth)
         base = classes[base].base
+        depth += 1
 
     def replace(match: "re.Match[str]") -> str:
         word = match.group(0)
@@ -331,11 +336,97 @@ def _emit_one(found: Class, method: Method, classes: "dict[str, Class]") -> str:
         parameters += ", " + _rewrite_types(method.parameters, classes)
     body = _this_qualified(method.body, found, classes)
     body = _bare_method_calls(body, found, classes)
-    body = _rewrite_body(body, classes, {"this": found.name}, pointers={"this"})
+    known = {"this": found.name}
+    receivers: dict[str, str] = {}
+    for holder, prefix in _reachable_members(found, classes):
+        held = holder.ctype.replace("*", "").strip()
+        if held not in classes:
+            continue
+        # Already qualified above, so the name in the text is `this->motor`.
+        spelled = f"this->{prefix}{holder.name}"
+        known[spelled] = held
+        receivers[spelled] = f"&{spelled}"
+    body = _rewrite_body(
+        body, classes, known, pointers={"this"}, receivers=receivers
+    )
+    if method.name == "":
+        body = _open_with_subobjects(body, found, classes)
+    elif method.name == "~":
+        body = _close_with_subobjects(body, found, classes)
     returns = "void" if method.name in ("", "~") else method.returns
     return f"static {returns} {name}({parameters}) {body}"
 
 
+def _subobjects(found: Class, classes: "dict[str, Class]") -> "list[tuple[str, str]]":
+    """The base and the class-typed members, each with the address to use.
+
+    C++ builds these before the constructor body runs and takes them apart
+    after the destructor body does. C does nothing at all, so a class holding
+    another read whatever was on the stack - which is a wrong answer rather
+    than a failure, and the worst kind to ship.
+    """
+
+    parts: list[tuple[str, str]] = []
+    if found.base and found.base in classes:
+        parts.append((found.base, "&this->__base"))
+    for member in found.members:
+        held = member.ctype.replace("*", "").strip()
+        if "*" not in member.ctype and held in classes:
+            parts.append((held, f"&this->{member.name}"))
+    return parts
+
+
+def _open_with_subobjects(body: str, found: Class, classes: "dict[str, Class]") -> str:
+    calls = []
+    for held, address in _subobjects(found, classes):
+        owner = _find_method(held, "", classes)
+        if owner is None:
+            continue
+        if any(m.name == "" and m.parameters for m in classes[held].methods) and not any(
+            m.name == "" and not m.parameters for m in classes[held].methods
+        ):
+            raise CppTranslationError(
+                "<c++>", 0,
+                f"{found.name} holds a {held}, whose only constructor takes "
+                f"arguments. C++ would name it in an initialiser list, which "
+                f"this subset does not read - give {held} a constructor taking "
+                f"nothing, or hold a pointer",
+            )
+        calls.append(f"{_c_name(owner, '')}({address});")
+    if not calls:
+        return body
+    opening = body.find("{")
+    return body[:opening + 1] + " " + " ".join(calls) + body[opening + 1:]
+
+
+def _close_with_subobjects(body: str, found: Class, classes: "dict[str, Class]") -> str:
+    calls = []
+    for held, address in reversed(_subobjects(found, classes)):
+        owner = _find_method(held, "~", classes)
+        if owner is not None:
+            calls.append(f"{_c_name(owner, '~')}({address});")
+    if not calls:
+        return body
+    closing = body.rfind("}")
+    return body[:closing] + " " + " ".join(calls) + " " + body[closing:]
+
+
+
+
+def _reachable_members(
+    owner: Class, classes: "dict[str, Class]"
+) -> "list[tuple[Member, str]]":
+    """Every data member the class can name, and how far down it lives."""
+
+    found = [(member, "") for member in owner.members]
+    base = owner.base
+    depth = 1
+    while base and base in classes:
+        for member in classes[base].members:
+            found.append((member, "__base." * depth))
+        base = classes[base].base
+        depth += 1
+    return found
 
 def _bare_method_calls(body: str, owner: Class, classes: "dict[str, Class]") -> str:
     """`sum()` inside a member is a call on `this`, and C has no such thing.
@@ -396,6 +487,8 @@ def _rewrite_types(text: str, classes: "dict[str, Class]") -> str:
 _OBJECT = re.compile(r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(\(([^;{}]*)\))?\s*;")
 #: `Vec *p = ...;`
 _OBJECT_POINTER = re.compile(r"\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)")
+#: `Vec bank[3];` - an array of objects, each of which C++ default-constructs.
+_OBJECT_ARRAY = re.compile(r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*;")
 
 
 def _rewrite_body(
@@ -403,12 +496,16 @@ def _rewrite_body(
     classes: "dict[str, Class]",
     known: "dict[str, str]",
     pointers: "set[str]" = frozenset(),
+    receivers: "dict[str, str] | None" = None,
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
     `known` maps a variable to the class it holds; `pointers` says which of
     those are pointers, because a pointer is already the address a method
-    wants and an object has to have one taken.
+    wants and an object has to have one taken. `receivers` gives the address
+    outright for the ones that are not a bare name - a class held as a member
+    is reached as `&this->motor`, and deriving that from the name alone would
+    have dropped the `this->` that qualifying already put there.
     """
 
     known = dict(known)
@@ -433,6 +530,28 @@ def _rewrite_body(
             destroyed.append(variable)
         return constructed
 
+    arrays: dict[str, str] = {}
+
+    def declare_array(match: "re.Match[str]") -> str:
+        type_name, variable, count = match.groups()
+        if type_name not in classes:
+            return match.group(0)
+        arrays[variable] = type_name
+        kept = f"{type_name} {variable}[{count}];"
+        owner = _find_method(type_name, "", classes)
+        if owner is None:
+            return kept
+        # C++ default-constructs every element; C does nothing at all, so the
+        # loop is written out. The index is named so it cannot collide with
+        # anything the program declared.
+        index = f"__py2bin_i_{variable}"
+        kept += (
+            f" {{ int {index}; for ({index} = 0; {index} < {count}; {index}++)"
+            f" {_c_name(owner, '')}(&{variable}[{index}]); }}"
+        )
+        return kept
+
+    body = _OBJECT_ARRAY.sub(declare_array, body)
     body = _OBJECT.sub(declare, body)
 
     def declare_pointer(match: "re.Match[str]") -> str:
@@ -446,10 +565,26 @@ def _rewrite_body(
     body = _OBJECT_POINTER.sub(declare_pointer, body)
 
     # Calls, longest name first so `ab.m()` is not matched inside `xab.m()`.
+    # An element of an array of objects is a receiver like any other; its
+    # address is `&bank[i]`, whatever the index expression happens to be.
+    for variable, holds in arrays.items():
+        for method in _reachable_methods(holds, classes):
+            owner = _find_method(holds, method, classes)
+            if owner is None:
+                continue
+            pattern = (
+                rf"\b{re.escape(variable)}\s*\[([^\]]*)\]\s*\.\s*"
+                rf"{re.escape(method)}\s*\("
+            )
+            body = _rewrite_indexed(body, pattern, _c_name(owner, method), variable)
+
+    given = dict(receivers or {})
     for variable in sorted(known, key=len, reverse=True):
         holds = known[variable]
         arrow = "->" if variable in pointers else r"\."
-        address = variable if variable in pointers else f"&{variable}"
+        address = given.get(
+            variable, variable if variable in pointers else f"&{variable}"
+        )
         for method in _reachable_methods(holds, classes):
             owner = _find_method(holds, method, classes)
             if owner is None:
@@ -467,6 +602,21 @@ def _rewrite_body(
     body = _close_with_destructors(body, destroyed, known, classes)
     return body
 
+
+
+def _rewrite_indexed(body: str, pattern: str, function: str, variable: str) -> str:
+    """`bank[i].rate(` becomes `function(&bank[i]`, keeping the index."""
+
+    out = []
+    at = 0
+    for found in re.finditer(pattern, body):
+        rest = body[found.end():].lstrip()
+        separator = "" if rest.startswith(")") else ", "
+        out.append(body[at:found.start()])
+        out.append(f"{function}(&{variable}[{found.group(1)}]{separator}")
+        at = found.end()
+    out.append(body[at:])
+    return "".join(out)
 
 def _rewrite_calls(body: str, pattern: str, function: str, receiver: str) -> str:
     """Turn each match into `function(receiver` plus a comma only if needed.
@@ -586,6 +736,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
 
     classes: dict[str, Class] = {}
     order: list[str] = []
+    plain: list[str] = []
     pieces: list[tuple[int, int, str]] = []   # start, end, replacement
 
     for head in _CLASS_HEAD.finditer(text):
@@ -600,6 +751,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
         # A `struct` with no methods is C already; leave it exactly as it is.
         inner = text[opening + 1: closing - 1]
         if keyword == "struct" and "(" not in inner:
+            # A struct with no methods is C already and is left exactly as it
+            # is - but C++ lets the bare name be a type and C does not, so it
+            # still needs the typedef emitted below.
+            plain.append(name)
             continue
         found = _split_members(inner, name, filename, _line_of(text, opening))
         found.base = base
@@ -613,7 +768,12 @@ def translate(source: str, filename: str = "<c++>") -> str:
         pieces.append((head.start(), end, ""))
 
     if not classes:
-        return source
+        if not plain:
+            return source
+        # Nothing to translate, but the bare struct names still need to be
+        # types: this file is C++ only in that respect.
+        typedefs = "\n".join(f"typedef struct {name} {name};" for name in plain)
+        return _with_typedefs(text, typedefs)
 
     for name in order:
         found = classes[name]
@@ -672,11 +832,160 @@ def translate(source: str, filename: str = "<c++>") -> str:
         (directives if line.lstrip().startswith("#") else kept_lines).append(line)
     remainder = "\n".join(kept_lines)
 
-    declarations = "\n".join(_emit_class(classes[name], classes) for name in order)
+    # Typedefs first, as forward declarations. `Vec v;` is a declaration in
+    # C++ and a syntax error in C, which wants `struct Vec v;` - and a class
+    # held *inside* another names its type before its own definition is
+    # reached, so the name has to exist before any struct body does.
+    typedefs = "\n".join(
+        f"typedef struct {name} {name};" for name in [*order, *plain]
+    )
+    # A class holding another must be defined after it: C needs the complete
+    # type to lay out the field. Emitting in source order put `Car` before
+    # `Engine` whenever that is how they were written.
+    declarations = "\n".join(
+        _emit_class(classes[name], classes) for name in _by_dependency(order, classes)
+    )
     definitions = "\n".join(_emit_methods(classes[name], classes) for name in order)
-    rewritten = _rewrite_body(remainder, classes, {})
+    rewritten = _rewrite_functions(remainder, classes)
     head = "\n".join(directives)
-    return f"{head}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
+    return f"{head}\n{typedefs}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
+
+
+
+def _by_dependency(order: "list[str]", classes: "dict[str, Class]") -> "list[str]":
+    """Classes ordered so anything held or inherited comes first.
+
+    A field of class type needs the complete type to lay the struct out, and
+    so does an embedded base. Source order is not that order - `Car` can be
+    written above the `Engine` it holds - and C reads top to bottom.
+    """
+
+    placed: list[str] = []
+    seen: set[str] = set()
+
+    def place(name: str, guard: "set[str]") -> None:
+        if name in seen or name not in classes:
+            return
+        if name in guard:
+            raise CppTranslationError(
+                "<c++>", 0,
+                f"{name} contains itself, directly or through another class; "
+                f"a struct cannot hold a complete copy of its own type",
+            )
+        guard.add(name)
+        found = classes[name]
+        if found.base:
+            place(found.base, guard)
+        for member in found.members:
+            held = member.ctype.replace("*", "").strip()
+            # A pointer to a class needs only the name, which the typedef
+            # above already gave; a value needs the whole type.
+            if "*" not in member.ctype and held in classes:
+                place(held, guard)
+        guard.discard(name)
+        seen.add(name)
+        placed.append(name)
+
+    for name in order:
+        place(name, set())
+    return placed
+
+
+#: The head of a function definition at the outermost level: `int f(args) {`.
+_FUNCTION_HEAD = re.compile(r"\)\s*\{")
+
+
+def _rewrite_functions(text: str, classes: "dict[str, Class]") -> str:
+    """Rewrite each function on its own, because a scope is not the file.
+
+    Done to the whole remainder at once, a variable declared in one function
+    was in scope for every later one, and - worse - its destructor was placed
+    at the end of the *last* function in the file rather than its own. The
+    compiler then reported a name that is not declared, pointing at a line in
+    somebody else's function.
+    """
+
+    out = []
+    at = 0
+    while True:
+        head = _FUNCTION_HEAD.search(text, at)
+        if head is None:
+            break
+        opening = head.end() - 1
+        if _depth_at(text, opening) != 0:
+            at = head.end()
+            continue
+        try:
+            closing = _matching(text, opening)
+        except ValueError:
+            break
+        head = text[at:opening]
+        known, pointers = _parameters_of(head, classes)
+        out.append(_rewrite_declarations(head, classes))
+        out.append(
+            _rewrite_body(text[opening:closing], classes, known, pointers)
+        )
+        at = closing
+    out.append(_rewrite_declarations(text[at:], classes))
+    return "".join(out)
+
+
+
+def _parameters_of(
+    head: str, classes: "dict[str, Class]"
+) -> "tuple[dict[str, str], set[str]]":
+    """The class-typed parameters of a function, which its body can call on.
+
+    A parameter is declared in the head and used in the body, and the body is
+    all the rewriter is handed - so `p->sum()` on an `Inline *p` was left
+    alone and the compiler reported a struct with no such member.
+    """
+
+    opening = head.rfind("(")
+    if opening < 0:
+        return {}, set()
+    known: dict[str, str] = {}
+    pointers: set[str] = set()
+    for part in head[opening + 1:].split(","):
+        words = part.replace("*", " * ").split()
+        if len(words) < 2:
+            continue
+        name = words[-1].strip("()")
+        held = words[0]
+        if held not in classes or not name.isidentifier():
+            continue
+        known[name] = held
+        if "*" in part:
+            pointers.add(name)
+    return known, pointers
+
+def _depth_at(text: str, index: int) -> int:
+    """How many braces are open just before `index`."""
+
+    return text.count("{", 0, index) - text.count("}", 0, index)
+
+
+def _rewrite_declarations(text: str, classes: "dict[str, Class]") -> str:
+    """Outside any function: a class named as a type is all there is to do.
+
+    A file-scope object would want its constructor run before `main`, which C
+    has no place to put, so only the type is rewritten here - the typedef makes
+    the bare name legal and the object is left uninitialised, exactly as the
+    same declaration in C would be.
+    """
+
+    return _rewrite_types(text, classes)
+
+def _with_typedefs(text: str, typedefs: str) -> str:
+    """Put the typedefs after the last preprocessor line at the top."""
+
+    lines = text.split("\n")
+    at = 0
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            at = index + 1
+    lines.insert(at, typedefs)
+    return "\n".join(lines)
 
 
 def translate_file(path: Path) -> str:
