@@ -1,9 +1,12 @@
 #!/bin/sh
 # Every C++ program in the corpus, put through everything py2bin can do to it.
 #
-#   tools/cpp_sweep.sh            the whole sweep
-#   tools/cpp_sweep.sh meaning    only the comparison against clang++
-#   tools/cpp_sweep.sh targets    only the cross-build over all six targets
+#   tools/cpp_sweep.sh                    the whole sweep, over the corpus
+#   tools/cpp_sweep.sh meaning            only the comparison against clang++
+#   tools/cpp_sweep.sh targets            only the cross-build over all six
+#   tools/cpp_sweep.sh check FILE [DIR]   the same two questions, asked of
+#                                         *your* program rather than the
+#                                         corpus. DIR is an include path.
 #
 # Two different questions, and both have to be asked:
 #
@@ -86,9 +89,59 @@ run_targets() {
   printf "\n  built %d   failed %d\n" "$built" "$unbuilt"
 }
 
+run_check() {
+  entry=$1
+  includes=${2:-}
+  [ -f "$entry" ] || { echo "no such file: $entry"; exit 2; }
+  name=$(basename "$entry" | sed 's/\.[^.]*$//')
+  inc=""
+  [ -n "$includes" ] && inc="--include-dir $includes"
+
+  echo "== $entry: does it build for every machine =="
+  for target in $TARGETS; do
+    suffix=""
+    case "$target" in windows-*) suffix=".exe" ;; esac
+    if PYTHONPATH="$ROOT/src" python3 -m py2bin cc "$entry" $inc \
+         -o "$WORK/${target}_$name$suffix" --target "$target" > "$WORK/log" 2>&1; then
+      printf "  %-18s built\n" "$target"
+      built=$((built + 1))
+    else
+      printf "  %-18s FAILED\n" "$target"
+      sed 's/^/        /' "$WORK/log" | tail -3
+      unbuilt=$((unbuilt + 1))
+    fi
+  done
+
+  if command -v clang++ > /dev/null 2>&1; then
+    echo ""
+    echo "== $entry: does it mean what clang++ says it means =="
+    std=""
+    for s in c++03 c++11 c++17; do
+      clang++ -std=$s -w -o "$WORK/ref_$name" "$entry" 2>/dev/null && { std=$s; break; }
+    done
+    if [ -z "$std" ]; then
+      echo "  clang++ could not build it either, so there is nothing to compare."
+    else
+      want=$("$WORK/ref_$name" 2>&1); wantcode=$?
+      host=$(PYTHONPATH="$ROOT/src" python3 -m py2bin targets 2>/dev/null | head -1)
+      mine=$("$WORK/darwin-arm64_$name" 2>&1 || "$WORK/linux-x86_64_$name" 2>&1)
+      minecode=$?
+      if [ "$mine" = "$want" ]; then
+        echo "  output matches clang++"
+      else
+        printf "  clang++: %s (exit %s)\n" "$(printf '%s' "$want" | tr '\n' '|')" "$wantcode"
+        printf "  py2bin : %s (exit %s)\n" "$(printf '%s' "$mine" | tr '\n' '|')" "$minecode"
+        differ=$((differ + 1))
+      fi
+    fi
+  fi
+  printf "\n  built %d   failed %d\n" "$built" "$unbuilt"
+}
+
 case "$WHICH" in
   meaning) run_meaning ;;
   targets) run_targets ;;
+  check) run_check "${2:-}" "${3:-}" ;;
   *) run_meaning; run_targets ;;
 esac
 

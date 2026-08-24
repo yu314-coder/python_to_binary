@@ -1246,17 +1246,32 @@ class Lambdas(unittest.TestCase):
         )
         self.assertIn("double __py2bin_lambda_1__op_call", out)
 
-    def test_capturing_everything_is_refused_by_name(self) -> None:
-        """`[=]` and `[&]` do not say what they capture, and this writes a
-        member per capture - so there is nothing to write."""
+    def test_a_reference_capture_is_the_address_and_is_followed(self) -> None:
+        """Which is what a reference is, once it is written out."""
 
-        with self.assertRaises(CppTranslationError) as caught:
-            translate(
-                "int main(void){ int n = 1; auto f = [=](int x){ return x+n; };"
-                " return f(1); }",
-                "t.cpp",
-            )
-        self.assertIn("[x, y]", str(caught.exception))
+        out = translate(
+            "class H{public:int n;\n H(){n=0;}\n void put(int v){n+=v;}};\n"
+            "int main(void){ H h; auto f = [&h](int v){ h.put(v); };"
+            " f(2); return h.n; }",
+            "t.cpp",
+        )
+        self.assertIn("H * h;", out)       # the member holds the address
+        self.assertIn("f.h = &h;", out)    # and is given it where it is made
+
+    def test_capturing_everything_takes_what_the_body_uses(self) -> None:
+        """`[&]` and `[=]` capture what C++ says they do: what is mentioned.
+
+        Read from the body rather than guessed at - a name the enclosing
+        scope does not declare is a global or a function and needs nothing.
+        """
+
+        out = translate(
+            "int main(void){ int a = 2, total = 0;"
+            " auto f = [&](int n){ total += a * n; }; f(3); return total; }",
+            "t.cpp",
+        )
+        self.assertIn("f.total = &total;", out)
+        self.assertIn("f.a = &a;", out)
 
     def test_a_member_named_like_a_lambda_head_is_not_one(self) -> None:
         """`operator[](int i) {` reads exactly like `[](int i) {`.
@@ -1335,3 +1350,84 @@ class Corpus(unittest.TestCase):
         root = Path(__file__).resolve().parents[1] / "tools"
         for name in ("cpp_sweep.sh", "cpp_differential.sh"):
             self.assertTrue((root / name).exists(), f"{name} is missing")
+
+
+class MoreOfTheLanguage(unittest.TestCase):
+    """What the sweep found once it stopped waiting to be told."""
+
+    def test_a_multi_declarator_statement_declares_all_of_them(self) -> None:
+        """`int a = 1, b = 2;` puts the type in front of the first only.
+
+        A pattern looking for one type and one name never sees the rest, so
+        `b` had no type at all - which is what stopped `[&]` from finding
+        what to capture.
+        """
+
+        from py2bin.cpp_frontend import _declared_here
+
+        found = _declared_here("int a = 1, b = 2; double *p = 0; char buf[8];")
+        self.assertEqual(found.get("a"), "int")
+        self.assertEqual(found.get("b"), "int")
+        self.assertEqual(found.get("p"), "double *")
+        self.assertEqual(found.get("buf"), "char *")
+
+    def test_a_static_member_function_takes_no_object(self) -> None:
+        out = translate(
+            "class M{public: static int twice(int n){return n*2;} int k; M(){k=1;}};\n"
+            "int main(void){ return M::twice(21); }",
+            "t.cpp",
+        )
+        self.assertIn("M__twice(int n)", out)
+        self.assertNotIn("M__twice(struct M", out)
+        self.assertIn("M__twice(21)", out)
+
+    def test_a_function_pointer_member_keeps_c_s_spelling(self) -> None:
+        """`int (*op)(int)` puts the name inside the parentheses.
+
+        Which is also why it was mistaken for a method declared here and
+        defined elsewhere - both have parentheses, and only where the name
+        sits tells them apart.
+        """
+
+        out = translate(
+            "class H{public: int (*op)(int); H(){op=0;} int use(int n){return op(n);}};\n"
+            "int main(void){ H h; return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("(*op)(int);", out)
+        self.assertIn("this->op(n)", out)
+
+    def test_a_free_function_may_return_a_class(self) -> None:
+        """The same hidden pointer a method gets, for the same reason."""
+
+        out = translate(
+            "class R{public:int a;R(){a=0;}};\n"
+            "R make(int x){ R r; r.a = x; return r; }\n"
+            "int main(void){ R r = make(4); return r.a; }",
+            "t.cpp",
+        )
+        self.assertIn("void make(struct R *__ret,", out)
+        self.assertIn("make(&r, 4)", out)
+
+    def test_a_derived_object_upcasts_at_a_reference_parameter(self) -> None:
+        out = translate(
+            "class S{public: virtual int id(){return 1;} virtual ~S(){}};\n"
+            "class T : public S{public: int id(){return 2;}};\n"
+            "int ask(S &s){ return s.id(); }\n"
+            # Assigned rather than returned: returning an object that has a
+            # destructor is refused, and says so.
+            "int main(void){ T t; int n = ask(t); return n; }",
+            "t.cpp",
+        )
+        self.assertIn("ask((struct S *)&t)", out)
+
+    def test_a_class_pointer_member_is_already_the_address(self) -> None:
+        """Taking one gave `&this->p`, which is a `T **`."""
+
+        out = translate(
+            "class A{public:int n;A(){n=1;} int get(){return n;}};\n"
+            "class B{public: A *inner; B(){inner=0;} int use(){ return inner->get(); }};\n"
+            "int main(void){ B b; return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("A__get(this->inner)", out)

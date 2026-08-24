@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,967 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,974 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -566,7 +566,8 @@ code before it emits anything, which is where they are done here:
 | **Namespaces** | flattened. One translation unit, no linker, so scoping is the whole of what a namespace can mean here |
 | **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer |
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
-| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is the only way to hold one, because the class's name is generated. `[=]` and `[&]` are refused: they do not say what they capture |
+| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is the only way to hold one, because the class's name is generated. `[x]` copies, `[&x]` holds the address and every use follows it, and `[=]`/`[&]` capture what the body uses and the scope declares — the same rule C++ applies |
+| **The rest of it** | enums (plain and scoped), unions, `static` data members and member functions, nested classes, range-`for`, member initialiser lists, default arguments, named casts, `explicit`, function-pointer members, `auto`, `bool`/`true`/`false`/`nullptr`, forward declarations, and free functions that return a class by value |
 | **`operator()`** | a call on an object, so `std::sort(v.begin(), v.end(), cmp)` takes a lambda or a function object alike |
 
 **Standard headers**, each written in py2bin's own C++ subset and put
@@ -633,10 +634,19 @@ py2bin, once by `clang++` — run on this machine, and the outputs compared.
 Reading the generated C tells you it is well formed and nothing about whether
 it means the same thing, and this is the only thing that asks.
 
+Point it at your own program instead of the corpus:
+
+```sh
+tools/cpp_sweep.sh check src/main.cpp include
+```
+
+which asks the same two questions of that file — every target, and the
+comparison — and is the thing to run before shipping.
+
 *Targets*: every program is built for all six targets. A construct can
 translate perfectly and still fail to encode for one machine, and this is the
 only thing that asks that. It does not run them; five of the six are not this
-computer. 120 programs × 6 targets = 720 builds.
+computer. 133 programs × 6 targets = 798 builds.
 
 The corpus is where the coverage lives: enums, static members, nested
 classes, range-`for`, member initialiser lists, default arguments, named
@@ -644,7 +654,7 @@ casts, `operator=`, deep inheritance, and every header above. Each got in
 because something broke on it. `tools/cpp_differential.sh` still works and is
 the meaning half under its old name. The suite additionally translates every
 corpus program on each change, so one that stops working is caught whether or
-not the sweep is run that day. It runs over 120 programs,
+not the sweep is run that day. It runs over 133 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1745,9 +1755,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1867 tests, no dependencies, nothing to install. Five modules want pytest's
+1874 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1967. Two of them compile a program in a *fresh interpreter* and
+too, for 1974. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1762,4 +1772,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1967-test suite.
+    is checked on every change is the 1974-test suite.

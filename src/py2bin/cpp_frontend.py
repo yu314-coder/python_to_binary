@@ -94,6 +94,9 @@ class Method:
     #: `= 0`: declared, deliberately not defined. The slot holds a null and a
     #: class with one is abstract.
     pure: bool = False
+    #: Declared `static`: one function for the class rather than one per
+    #: object, so it takes no `this` and is reached by the class's name.
+    shared: bool = False
 
 
 @dataclass
@@ -242,8 +245,13 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
             break
         declaration = body[index:statement_end].strip()
         if declaration:
-            if "(" in declaration:
-                # A member function declared here and defined outside.
+            if "(" in declaration and not _FUNCTION_POINTER_MEMBER.match(
+                declaration
+            ):
+                # A member function declared here and defined outside. Told
+                # apart from `int (*op)(int);` by where the name sits: a
+                # method's is before the parentheses and a function pointer's
+                # is inside them, and both otherwise look the same.
                 found.methods.append(
                     _method_from(declaration, "", filename, at + index)
                 )
@@ -253,7 +261,24 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
     return found
 
 
+#: `int (*op)(int)` - a member that is a pointer to a function. The name is
+#: inside the parentheses, which is the whole reason this needs its own read.
+_FUNCTION_POINTER_MEMBER = re.compile(
+    r"^(.+?)\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*(\([^()]*\))$"
+)
+
+
 def _member_from(declaration: str, filename: str, at: int) -> Member:
+    pointer = _FUNCTION_POINTER_MEMBER.match(declaration.strip())
+    if pointer is not None:
+        # Carried whole, with the name marked, so the emitter can put it back
+        # where C wants it - `int (*op)(int)` and not `int (*)(int) op`.
+        return Member(
+            name=pointer.group(2),
+            ctype=f"{pointer.group(1).strip()}(*)"
+            f"{pointer.group(3)}\x00fn",
+            array="",
+        )
     words = declaration.replace("*", " * ").split()
     if len(words) < 2:
         raise CppTranslationError(
@@ -279,7 +304,13 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
     # `virtual` is remembered, because it is the one that changes the code.
     virtual = re.match(r"\bvirtual\b", head) is not None
     head = re.sub(r"^\s*virtual\b", "", head).strip()
+    shared = re.match(r"\bstatic\b", head) is not None
+    head = re.sub(r"^\s*static\b", "", head).strip()
     head = re.sub(r"\b(override|final)\b\s*$", "", head).strip()
+    # `explicit` and `inline` constrain how a member may be called and
+    # whether it may be duplicated; neither changes what it is.
+    head = re.sub(r"^\s*(explicit|inline)\b", "", head).strip()
+    head = re.sub(r"^\s*(explicit|inline)\b", "", head).strip()
     pure = False
     if re.search(r"=\s*0\s*$", head):
         pure = True
@@ -288,6 +319,7 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
     def decorated(method: Method) -> Method:
         method.virtual = virtual
         method.pure = pure
+        method.shared = shared
         return method
 
     # `int operator()(int x)` has two parameter lists as far as `find` is
@@ -458,6 +490,61 @@ _LITERAL_TYPES = (
 )
 
 
+#: The head of a declaration statement: the type, then its declarators.
+_DECLARATION_STATEMENT = re.compile(
+    r"^\s*((?:(?:const|unsigned|signed|long|short|static)\s+)*[A-Za-z_]\w*)\s+(.+)$",
+    re.S,
+)
+
+#: What one declarator names: stars, then the name.
+_DECLARATOR = re.compile(r"^\s*(\**)\s*([A-Za-z_]\w*)")
+
+#: Types read out of a text, kept because `_deduced_type` asks repeatedly and
+#: the answer depends only on the text. Capped, because a translation unit
+#: produces a handful of distinct texts and an unbounded cache is a leak.
+_DECLARED_CACHE: "dict[int, dict[str, str]]" = {}
+_DECLARED_CACHE_LIMIT = 64
+
+
+def _declared_here(text: str) -> "dict[str, str]":
+    """Every name this text declares, and what it was declared as.
+
+    Read statement by statement, so `int a = 1, b = 2;` declares both - which
+    a pattern matching one type and one name cannot see, because only the
+    first declarator has the type in front of it.
+    """
+
+    key = hash(text)
+    found = _DECLARED_CACHE.get(key)
+    if found is not None:
+        return found
+    found = {}
+    for statement in _statements(_without_literals(text)):
+        cleaned = statement.strip().rstrip(";").strip()
+        if not cleaned or cleaned.startswith(("{", "}")):
+            continue
+        match = _DECLARATION_STATEMENT.match(cleaned)
+        if match is None:
+            continue
+        spelled = match.group(1).strip()
+        if spelled.split()[-1] in _NOT_A_TYPE:
+            continue
+        for part in _split_arguments(match.group(2)):
+            declarator = _DECLARATOR.match(part)
+            if declarator is None:
+                continue
+            # An array declarator is a pointer to its element for this purpose.
+            stars = declarator.group(1)
+            if "[" in part.split("=")[0]:
+                stars += "*"
+            found.setdefault(
+                declarator.group(2), f"{spelled} {stars}".strip()
+            )
+    if len(_DECLARED_CACHE) >= _DECLARED_CACHE_LIMIT:
+        _DECLARED_CACHE.clear()
+    _DECLARED_CACHE[key] = found
+    return found
+
 def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     """What type an argument has, as far as this can tell without a type system.
 
@@ -492,7 +579,10 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
         and _could_start_a_declaration(code, match.start())
     ]
     if not found:
-        return None
+        # `int a = 1, b = 2;` puts the type in front of the first declarator
+        # only, so a pattern looking for one type and one name never sees the
+        # rest. Read the statement instead.
+        return _declared_here(text).get(spelled)
     # The declaration nearest above the call, which is the one C++ would have
     # in scope; falling back to the first anywhere when the call comes first.
     earlier = [match for match in found if before < 0 or match.start() < before]
@@ -1147,8 +1237,18 @@ def _expand_lambdas(text: str, filename: str) -> str:
             ) from None
         body = text[found.end() - 1: closing]
         result = (declared or "").strip() or _lambda_result(body, parameters, text)
-        held = _lambda_captures(captures, text, found.start(), filename)
-        members = "".join(f"    {spelled} {variable};\n" for variable, spelled in held)
+        held = _lambda_captures(captures, text, found.start(), filename, body)
+        # A reference capture is the address, and every use inside follows it.
+        classes = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+        body = _deref_references(
+            body,
+            {v: s for v, s, by_reference in held if by_reference},
+            {name: None for name in classes},
+        )
+        members = "".join(
+            f"    {spelled} {'*' if by_reference else ''}{variable};\n"
+            for variable, spelled, by_reference in held
+        )
         made.append(
             f"class {name} {{\npublic:\n{members}"
             f"    {name}() {{ }}\n"
@@ -1166,7 +1266,10 @@ def _expand_lambdas(text: str, filename: str) -> str:
             r"auto\s+([A-Za-z_]\w*)\s*=\s*$", text[start:found.start()]
         )
         holder = holding.group(1) if holding else f"{name}__made"
-        setup = "".join(f" {holder}.{v} = {v};" for v, _s in held)
+        setup = "".join(
+            f" {holder}.{v} = {'&' if by_reference else ''}{v};"
+            for v, _s, by_reference in held
+        )
         if holding:
             after = closing + 1 if text[closing:closing + 1] == ";" else closing
             text = text[:start] + f"{name} {holder};{setup}" + text[after:]
@@ -1215,39 +1318,96 @@ def _lambda_result(body: str, parameters: str, text: str) -> str:
 
 
 def _lambda_captures(
-    captures: str, text: str, at: int, filename: str
-) -> "list[tuple[str, str]]":
-    """Each captured name and the type it is held as."""
+    captures: str, text: str, at: int, filename: str, body: str = ""
+) -> "list[tuple[str, str, bool]]":
+    """Each captured name, the type it is held as, and whether by reference.
+
+    A capture by value is a member holding a copy. A capture by reference is
+    a member holding the address, and every use inside the body follows it -
+    which is what a reference is once it is written out. Both are members,
+    which is why `[=]` and `[&]` can be honoured too: what they capture is
+    whatever the body uses that the enclosing scope declared.
+    """
 
     spelled = captures.strip()
     if not spelled:
         return []
     if spelled in ("=", "&"):
-        raise CppTranslationError(
-            filename,
-            _line_of(text, at),
-            "a lambda that captures everything by writing `[=]` or `[&]` does "
-            "not say what it captures, and py2bin writes a member per capture "
-            "- name them, as in `[x, y]`",
-        )
-    held: list[tuple[str, str]] = []
+        return _captures_used(text, at, body, by_reference=spelled == "&")
+    held: list[tuple[str, str, bool]] = []
     for part in _split_arguments(spelled):
         name = part.strip()
-        if name.startswith("&"):
+        by_reference = name.startswith("&")
+        if by_reference:
+            name = name[1:].strip()
+        if name in ("this",):
             raise CppTranslationError(
                 filename,
                 _line_of(text, at),
-                f"a lambda capturing {name[1:].strip()!r} by reference outlives "
-                "nothing here - py2bin copies each capture into a member, so "
-                "write it as a copy",
+                "a lambda capturing `this` is not translated: it would need "
+                "the enclosing class's own type as a member, and the lambda "
+                "is written out before any class is read. Capture the members "
+                "it uses instead",
             )
         if not name.isidentifier():
             raise CppTranslationError(
                 filename, _line_of(text, at), f"cannot read the capture {name!r}"
             )
-        found = _deduced_type(name, text[:at])
-        held.append((name, found or "int"))
+        found = _deduced_type(name, text[:at]) or "int"
+        held.append((name, found, by_reference))
     return held
+
+
+def _captures_used(
+    text: str, at: int, body: str, by_reference: bool
+) -> "list[tuple[str, str, bool]]":
+    """What `[=]` or `[&]` captures: whatever the body uses and the scope has.
+
+    C++ works this out the same way - a capture-default takes what the body
+    mentions - so the list is read from the body rather than guessed at. A
+    name the enclosing scope does not declare is not a capture: it is a
+    global, or a function, and needs nothing.
+    """
+
+    before = text[:at]
+    start = _enclosing_body_start(before)
+    scope = before[start:]
+    held: "list[tuple[str, str, bool]]" = []
+    seen: "set[str]" = set()
+    for match in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)", _without_literals(body)):
+        name = match.group(1)
+        if name in seen or name in _NOT_A_TYPE or name in _LEADS_A_TYPE:
+            continue
+        # A name that is called is a function, not a capture.
+        after = body[match.end():].lstrip()
+        if after.startswith("("):
+            continue
+        if name not in _declared_here(scope):
+            continue
+        found = _deduced_type(name, before)
+        if found is None:
+            continue
+        seen.add(name)
+        held.append((name, found, by_reference))
+    return held
+
+
+def _enclosing_body_start(before: str) -> int:
+    """Where the innermost open block begins, so a scope can be read from it."""
+
+    depth = 0
+    index = len(before)
+    while index > 0:
+        index -= 1
+        piece = before[index]
+        if piece == "}":
+            depth += 1
+        elif piece == "{":
+            if depth == 0:
+                return index + 1
+            depth -= 1
+    return 0
+
 
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
@@ -2800,6 +2960,11 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
         # whatever the object turned out to be.
         lines.append("    void **__vptr;")
     for member in found.members:
+        if member.ctype.endswith("\x00fn"):
+            spelled = member.ctype[: -len("\x00fn")]
+            head, _, tail = spelled.partition("(*)")
+            lines.append(f"    {head}(*{member.name}){tail};")
+            continue
         lines.append(f"    {member.ctype} {member.name}{member.array};")
     if not found.members and not found.base:
         # C has no empty struct; give it something so the type exists.
@@ -2871,7 +3036,7 @@ def _emit_one(
     found: Class, method: Method, classes: "dict[str, Class]", unit: str = ""
 ) -> str:
     name = _c_name(found.name, method.name, _suffix_of(found.name, method, classes))
-    parameters = f"struct {found.name} *this"
+    parameters = "" if method.shared else f"struct {found.name} *this"
     # A value return becomes the hidden pointer a compiler would pass: the
     # caller supplies the space and the callee writes through it. py2bin's C
     # cannot return a struct, and does not have to - this is the same
@@ -2883,7 +3048,11 @@ def _emit_one(
     # which is what "by value" means: the callee may write to it and the
     # caller must not see that.
     copied = _by_value_objects(method.parameters, classes)
-    if method.parameters:
+    if method.parameters and not parameters:
+        parameters = _rewrite_types(
+            _references_to_pointers(method.parameters), classes
+        )
+    elif method.parameters:
         # Types first, then the by-value rewrite: done the other way round the
         # `struct` this adds was added again, giving `struct struct V *`.
         spelled = _rewrite_types(_references_to_pointers(method.parameters), classes)
@@ -2902,6 +3071,7 @@ def _emit_one(
         body = _deref_references(body, references, classes)
     body = _bare_method_calls(body, found, classes)
     known = {"this": found.name}
+    pointers: "set[str]" = {"this"}
     for referenced, held in references.items():
         if held in classes:
             known[referenced] = held
@@ -2913,12 +3083,16 @@ def _emit_one(
         # Already qualified above, so the name in the text is `this->motor`.
         spelled = f"this->{prefix}{holder.name}"
         known[spelled] = held
-        receivers[spelled] = f"&{spelled}"
+        # A member that is a pointer already *is* the address. Taking one of
+        # it gave `&this->p` where a `T *` was wanted, which is a `T **`.
+        receivers[spelled] = spelled if "*" in holder.ctype else f"&{spelled}"
+        if "*" in holder.ctype:
+            pointers.add(spelled)
     body = _rewrite_body(
         body,
         classes,
         known,
-        pointers={"this", *(n for n, h in references.items() if h in classes)},
+        pointers=pointers | {n for n, h in references.items() if h in classes},
         receivers=receivers,
         unit=unit,
     )
@@ -2937,6 +3111,8 @@ def _emit_one(
         body = _open_with_subobjects(body, found, classes)
     elif method.name == "~":
         body = _close_with_subobjects(body, found, classes)
+    if method.shared and not parameters:
+        parameters = "void"
     returns = "void" if (method.name in ("", "~") or returned) else method.returns
     if method.name not in ("", "~") and not returned and _returns_reference(method):
         # A reference is a pointer that the language follows for you. The
@@ -5049,6 +5225,55 @@ def translate(source: str, filename: str = "<c++>") -> str:
     tables = _emit_vtables(order, classes)
     if tables:
         declarations += "\n" + tables
+    # `M::twice(21)` - a static member function is reached by the class's
+    # name, which is a qualifier and not a namespace, so nothing else strips
+    # it. There is no object to pass, which is what makes it static.
+    for name in order:
+        for method in classes[name].methods:
+            if not method.shared or not method.name:
+                continue
+            spelled = _c_name(name, method.name, _suffix_of(name, method, classes))
+            remainder = _map_code(
+                remainder,
+                lambda part, o=name, m=method.name, s=spelled: re.sub(
+                    rf"\b{re.escape(o)}\s*::\s*{re.escape(m)}\b", s, part
+                ),
+            )
+
+    # `R r = make(4);` - a free function returning a class hands it back the
+    # way a method does, through a pointer the caller provides.
+    returning = {
+        match.group(2): match.group(1).split()[-1]
+        for match in _DEFINITION.finditer(remainder)
+        if _depth_at(remainder, match.end() - 1) == 0
+        and match.group(1).split()
+        and "*" not in match.group(1)
+        and match.group(1).split()[-1] in classes
+    }
+    if returning:
+        pattern = re.compile(
+            r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\("
+        )
+
+        def taken(match: "re.Match[str]") -> str:
+            spelled, variable, called = match.groups()
+            if returning.get(called) != spelled or spelled not in classes:
+                return match.group(0)
+            close = _closing_paren(match.string, match.end() - 1)
+            if close < 0:
+                return match.group(0)
+            arguments = match.string[match.end(): close]
+            passed = f", {arguments}" if arguments.strip() else ""
+            return (
+                f"{spelled} {variable}; {called}(&{variable}{passed})"
+                + "\x00drop"
+            )
+
+        remainder = _map_code(remainder, lambda part: pattern.sub(taken, part))
+        # The original argument list is still there; the marker says where it
+        # ends so it can go.
+        remainder = re.sub(r"\x00drop[^;]*;", ";", remainder)
+
     made = _file_scope_objects(remainder, classes)
     remainder = _construct_before_main(remainder, made, classes)
     # What every body may need to look up: the file, plus the shapes of the
@@ -5060,7 +5285,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
         _emit_methods(classes[name], classes, scope) for name in order
     )
     remainder = _address_reference_arguments(
-        remainder, _function_signatures(remainder, classes)
+        remainder, _function_signatures(remainder, classes), classes
     )
     rewritten = _rewrite_functions(remainder, classes, made, scope)
     head = "\n".join(directives)
@@ -5457,7 +5682,9 @@ def _function_signatures(text: str, classes: "dict[str, Class]" = {}) -> "dict[s
 
 
 def _address_reference_arguments(
-    text: str, signatures: "dict[str, list[int]]"
+    text: str,
+    signatures: "dict[str, list[int]]",
+    classes: "dict[str, Class]" = {},
 ) -> str:
     """`bump(a, 9)` becomes `bump(&a, 9)` where the parameter is a reference.
 
@@ -5469,6 +5696,16 @@ def _address_reference_arguments(
 
     if not signatures:
         return text
+    wanted_types: "dict[tuple[str, int], str]" = {}
+    for match in _DEFINITION.finditer(text):
+        if _depth_at(text, match.end() - 1) != 0:
+            continue
+        for index, part in enumerate(_split_arguments(match.group(3))):
+            spelled = part.replace("*", " ").replace("&", " ").split()
+            for word in spelled:
+                if word in classes:
+                    wanted_types[(match.group(2), index)] = word
+                    break
     for name, positions in signatures.items():
         pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
         out: list[str] = []
@@ -5485,7 +5722,22 @@ def _address_reference_arguments(
                 argument = parts[index].strip()
                 if argument.startswith("&") or not _has_an_address(argument):
                     continue
-                parts[index] = f"&{argument}"
+                # C++ converts a derived object to its base wherever one is
+                # wanted; C makes you say so. The address is the same - the
+                # base is the first member - so this is a cast and no more.
+                wanted = wanted_types.get((name, index))
+                held = _deduced_type(argument, text)
+                cast = ""
+                if (
+                    wanted
+                    and held
+                    and held.replace("*", "").strip() != wanted
+                    and _derives_from(
+                        held.replace("*", "").strip(), wanted, classes
+                    )
+                ):
+                    cast = f"(struct {wanted} *)"
+                parts[index] = f"{cast}&{argument}"
             out.append(text[at:found.end()])
             out.append(", ".join(part.strip() for part in parts))
             at = close
@@ -5556,6 +5808,15 @@ def _rewrite_functions(
         # `v)` is not an identifier, so the last parameter was never seen.
         inside = head[opened + 1: head.rfind(")")] if opened >= 0 else ""
         copied = _by_value_objects(inside, classes)
+        # A class returned by value becomes the hidden pointer an ABI would
+        # pass - the same transform a method gets, and for the same reason:
+        # this backend does not return a struct.
+        # `R make(int x)` - the words before the parentheses are the return
+        # type and then the name, so the type is everything but the last.
+        spelled_result = head[:head.rfind("(")].strip() if opened >= 0 else ""
+        words = spelled_result.split()
+        returned = words[-2] if len(words) >= 2 else ""
+        returns_object = "*" not in spelled_result and returned in classes
         for held, variable in copied:
             # Without the `struct`: the declaration rewriter below adds one,
             # and two is not C.
@@ -5564,6 +5825,13 @@ def _rewrite_functions(
                 f"{held} *__by_value_{variable}",
                 head,
                 count=1,
+            )
+        if returns_object:
+            head = (
+                f"\nvoid {words[-1]}"
+                # Without the `struct`: the declaration rewriter adds one.
+                f"({returned} *__ret{',' if inside.strip() else ''}"
+                f"{head[head.rfind('(') + 1:]}"
             )
         known, pointers, indexed = _parameters_of(head, classes)
         # A file-scope object is in scope in every function, and nothing in
@@ -5577,6 +5845,8 @@ def _rewrite_functions(
         for held, variable in copied:
             known[variable] = held
         inner = _deref_references(text[opening:closing], references, classes)
+        if returns_object:
+            inner = _return_through_pointer(inner)
         rewritten = _rewrite_body(
             inner, classes, known, pointers, unit=unit, pointer_arrays=indexed
         )
