@@ -732,6 +732,394 @@ _LAMBDA = re.compile(
 )
 
 
+#: `class B;` - a forward declaration. The typedefs this emits already name
+#: every class before any body, so there is nothing left for one to do.
+_FORWARD_DECLARATION = re.compile(
+    r"(?m)^[ \t]*(?:class|struct|union)\s+[A-Za-z_]\w*\s*;[ \t]*$"
+)
+
+#: `static_cast<int>(x)` and the rest. C has one cast and it is spelled with
+#: parentheses; these say *which* conversion is meant, which C++ checks and C
+#: does not, so the check is what is lost and the conversion is not.
+_NAMED_CAST = re.compile(
+    r"\b(static_cast|const_cast|reinterpret_cast)\s*<([^<>]+)>\s*\("
+)
+
+#: `enum class Mode {` and `enum struct Mode {`, which C spells `enum Mode`.
+_SCOPED_ENUM = re.compile(r"\benum\s+(?:class|struct)\s+([A-Za-z_]\w*)")
+
+#: `enum Name {`, `union Name {` - anything whose bare name C++ takes for a
+#: type and C does not.
+_TAGGED_TYPE = re.compile(r"\b(enum|union)\s+([A-Za-z_]\w*)\s*\{")
+
+
+def _tag_typedef(name: str, text: str) -> str:
+    """`typedef enum Colour Colour;` - whichever tag the name was declared with."""
+
+    kind = "union" if re.search(rf"\bunion\s+{re.escape(name)}\s*\{{", text) else "enum"
+    return f"typedef {kind} {name} {name};"
+
+
+def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
+    """The C++ that is a different spelling of C, spelled the C way.
+
+    Returns the text and the tag names that need a typedef, since C++ lets a
+    bare `Colour` or `U` name a type and C wants `enum Colour` or `union U`.
+    """
+
+    text = _FORWARD_DECLARATION.sub("", text)
+    # Keywords in C++, and in C either a macro from a header the program did
+    # not include or nothing at all. Spelled out here so a program need not
+    # remember which.
+    text = _map_code(
+        text,
+        lambda part: re.sub(r"\bnullptr\b", "0", re.sub(r"\bbool\b", "int", part)),
+    )
+    text = _map_code(
+        text,
+        lambda part: re.sub(r"\btrue\b", "1", re.sub(r"\bfalse\b", "0", part)),
+    )
+
+    # `static_cast<int>(d)` becomes `((int)(d))`. The argument's own
+    # parentheses are consumed so the replacement closes what it opens - a
+    # substitution alone left the outer one hanging.
+    while True:
+        found = _NAMED_CAST.search(text)
+        if found is None:
+            break
+        close = _closing_paren(text, found.end() - 1)
+        if close < 0:
+            break
+        inside = text[found.end(): close]
+        text = (
+            text[:found.start()]
+            + f"(({found.group(2).strip()})({inside}))"
+            + text[close + 1:]
+        )
+
+    scoped = {match.group(1) for match in _SCOPED_ENUM.finditer(text)}
+    text = _map_code(text, lambda part: _SCOPED_ENUM.sub(r"enum \1", part))
+
+    # The typedef goes immediately after the body, not with the class ones at
+    # the top: C has no forward declaration of an enum, so a typedef naming
+    # one before it is defined is not C.
+    out: list[str] = []
+    at = 0
+    for match in _TAGGED_TYPE.finditer(text):
+        if match.start() < at:
+            continue
+        try:
+            closing = _matching(text, match.end() - 1)
+        except ValueError:
+            continue
+        end = closing
+        while end < len(text) and text[end] in " \t":
+            end += 1
+        if end < len(text) and text[end] == ";":
+            end += 1
+        kind, name = match.group(1), match.group(2)
+        out.append(text[at:end])
+        out.append(f"\ntypedef {kind} {name} {name};\n")
+        at = end
+    out.append(text[at:])
+    return "".join(out), scoped
+
+#: `auto n = 5;` - a declaration whose type is whatever the initialiser is.
+_AUTO_DECLARATION = re.compile(
+    r"(?<![.\w>])auto\s+([A-Za-z_]\w*)\s*=\s*([^;]+);"
+)
+
+#: `C(int x, int y) : a(x), b(y) {` - a constructor's initialiser list.
+_INITIALISER_LIST = re.compile(
+    r"\)\s*:\s*((?:[A-Za-z_]\w*\s*\([^()]*\)\s*,?\s*)+)\{"
+)
+
+#: `a(x)` inside one.
+_ONE_INITIALISER = re.compile(r"([A-Za-z_]\w*)\s*\(([^()]*)\)")
+
+
+def _rewrite_auto(text: str) -> str:
+    """`auto n = 5;` becomes `int n = 5;`, and so on.
+
+    A lambda is handled before this and needs no help: it is the one case
+    where the type has no spelling a program could have written. Everything
+    else `auto` stands for is a type the initialiser already says.
+    """
+
+    def one(match: "re.Match[str]") -> str:
+        name, value = match.group(1), match.group(2).strip()
+        held = _deduced_type(value, text, match.start())
+        if held is None:
+            return match.group(0)
+        return f"{held} {name} = {value};"
+
+    return _map_code(text, lambda part: _AUTO_DECLARATION.sub(one, part))
+
+
+def _rewrite_initialiser_lists(text: str) -> str:
+    """`C(int x) : a(x) { }` becomes `C(int x) { a = x; }`.
+
+    C++ initialises a member there rather than assigning to it, which matters
+    for a member that cannot be assigned - a reference, or a const. Nothing
+    in this subset has one, so the two are the same thing written twice, and
+    the assignment is the one C has.
+    """
+
+    def one(match: "re.Match[str]") -> str:
+        assignments = []
+        for found in _ONE_INITIALISER.finditer(match.group(1)):
+            assignments.append(f"{found.group(1)} = {found.group(2).strip()};")
+        return ") { " + " ".join(assignments) + " "
+
+    return _map_code(text, lambda part: _INITIALISER_LIST.sub(one, part))
+
+#: `for (int x : v)` - a range-based for.
+_RANGE_FOR = re.compile(
+    r"\bfor\s*\(\s*([A-Za-z_][\w\s*&]*?)\s+([A-Za-z_]\w*)\s*:\s*([^)]+)\)"
+)
+
+#: `static int count;` written inside a class.
+_STATIC_MEMBER = re.compile(
+    r"(?<![\w>])static\s+([A-Za-z_][\w\s*]*?)\s+([A-Za-z_]\w*)\s*;"
+)
+
+#: `int C::count = 0;` - where a static member is given its storage.
+_STATIC_DEFINITION = re.compile(
+    r"(?m)^[ \t]*([A-Za-z_][\w\s*]*?)\s+([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)\s*(=[^;]*)?;"
+)
+
+
+def _rewrite_range_for(text: str, counter: "list[int]") -> str:
+    """`for (int x : v)` becomes an index loop over the same container.
+
+    Written against `size()` and `[]` rather than iterators: those are what
+    every container in this subset has, and an iterator here is a pointer
+    anyway.
+    """
+
+    def one(match: "re.Match[str]") -> str:
+        held, name, over = match.group(1), match.group(2), match.group(3).strip()
+        counter[0] += 1
+        index = f"__py2bin_each_{counter[0]}"
+        # A bare name is left bare: the rewriters that turn `v.size()` into a
+        # call look for a name on the left, and `(v).size()` is not one.
+        reached = over if over.isidentifier() else f"({over})"
+        return (
+            f"for (unsigned long {index} = 0; {index} < {reached}.size(); "
+            f"{index} = {index} + 1) "
+            f"{{ {held} {name} = {reached}[{index}];"
+        )
+
+    out = _map_code(text, lambda part: _RANGE_FOR.sub(one, part))
+    if out == text:
+        return text
+    # The body gained an opening brace, so it needs a closing one. The loop
+    # body is whatever follows, and its own braces are what say where it ends.
+    return _close_range_bodies(out)
+
+
+def _close_range_bodies(text: str) -> str:
+    """Put back the brace each rewritten range-for opened."""
+
+    while True:
+        found = re.search(r"= \(?([^()\[]*)\)?\[(__py2bin_each_\d+)\];", text)
+        if found is None or "\x00closed" in text[found.end(): found.end() + 8]:
+            break
+        # Find the body that follows and close after it.
+        rest = text[found.end():]
+        stripped = rest.lstrip()
+        offset = found.end() + (len(rest) - len(stripped))
+        if stripped.startswith("{"):
+            closing = _matching(text, offset)
+        else:
+            semicolon = text.index(";", offset)
+            closing = semicolon + 1
+        text = (
+            text[:found.end()]
+            + "\x00closed"
+            + text[found.end():closing]
+            + " }"
+            + text[closing:]
+        )
+    return text.replace("\x00closed", "")
+
+
+def _rewrite_static_members(text: str, filename: str) -> str:
+    """A static member is one object for the class, so it becomes one object.
+
+    C has no such thing inside a struct, and there is nowhere for it to live
+    but file scope. The name carries the class, so two classes may each have
+    a `count` without either being the other's.
+    """
+
+    owners: "dict[str, str]" = {}
+    out: list[str] = []
+    at = 0
+    for head in _CLASS_HEAD.finditer(text):
+        if head.start() < at:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        owner = head.group(2)
+        body = text[head.end() - 1: closing]
+
+        def taken(match: "re.Match[str]", o=owner) -> str:
+            owners[match.group(2)] = o
+            return ""
+
+        out.append(text[at:head.end() - 1])
+        out.append(_STATIC_MEMBER.sub(taken, body))
+        at = closing
+    out.append(text[at:])
+    text = "".join(out)
+    if not owners:
+        return text
+
+    # `int C::count = 0;` becomes the file-scope object itself.
+    def defined(match: "re.Match[str]") -> str:
+        spelled, owner, name, value = match.groups()
+        if owners.get(name) != owner:
+            return match.group(0)
+        return f"{spelled} {_c_name(owner, name)} {value or '= 0'};"
+
+    text = _STATIC_DEFINITION.sub(defined, text)
+    # And every mention of it - `C::count` from outside, `count` from within -
+    # is that object.
+    for name, owner in owners.items():
+        spelled = _c_name(owner, name)
+        text = _map_code(
+            text,
+            lambda part, o=owner, n=name, s=spelled: re.sub(
+                rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", s, part
+            ),
+        )
+        text = _map_code(
+            text,
+            lambda part, n=name, s=spelled: re.sub(
+                rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, part
+            ),
+        )
+    return text
+
+#: `int add(int a, int b = 10)` - a parameter with a default.
+_DEFAULTED = re.compile(r"([A-Za-z_]\w*)\s*=\s*([^,)]+)")
+
+#: `class Inner {` written inside another class body.
+_NESTED_CLASS = re.compile(r"\b(class|struct)\s+([A-Za-z_]\w*)\s*\{")
+
+
+def _rewrite_default_arguments(text: str) -> str:
+    """Fill a call's missing arguments in from the declaration.
+
+    C has no defaults, so the caller supplies what the callee assumed. Read
+    from the definition, which is the only place the values are written.
+    """
+
+    defaults: "dict[str, list[str]]" = {}
+    out: list[str] = []
+    at = 0
+    for match in _ANY_DEFINITION.finditer(text):
+        head = match.group(1).strip()
+        if not head or head.split()[0] in _NOT_A_TYPE:
+            continue
+        parts = _split_arguments(match.group(2))
+        found = [
+            _DEFAULTED.search(part).group(2).strip()
+            if _DEFAULTED.search(part)
+            else ""
+            for part in parts
+        ]
+        if not any(found):
+            continue
+        name = head.replace("*", " * ").replace("&", " & ").split()[-1]
+        name = name.split("::")[-1]
+        defaults[name] = found
+        out.append(text[at:match.start(2)])
+        out.append(", ".join(_DEFAULTED.sub(r"\1", part) for part in parts))
+        at = match.end(2)
+    out.append(text[at:])
+    text = "".join(out)
+    if not defaults:
+        return text
+
+    for name, values in defaults.items():
+        pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
+        rebuilt: list[str] = []
+        at = 0
+        for call in pattern.finditer(text):
+            if call.start() < at:
+                continue
+            close = _closing_paren(text, call.end() - 1)
+            if close < 0 or _is_a_definition(text, close):
+                continue
+            given = _call_arguments(text, call.end() - 1)
+            if len(given) >= len(values):
+                continue
+            filled = given + [v for v in values[len(given):] if v]
+            if len(filled) != len(values):
+                continue
+            rebuilt.append(text[at:call.end()])
+            rebuilt.append(", ".join(filled))
+            at = close
+        rebuilt.append(text[at:])
+        text = "".join(rebuilt)
+    return text
+
+
+def _lift_nested_classes(text: str) -> str:
+    """A class written inside another becomes one of its own.
+
+    C has no nested type, and the inner one is not a member - it is a type
+    that happens to be spelled with the outer one's name in front. So it is
+    moved out under a name that keeps that, and `Outer::Inner` follows it.
+    """
+
+    lifted: list[str] = []
+    while True:
+        moved = False
+        for head in _CLASS_HEAD.finditer(text):
+            try:
+                closing = _matching(text, head.end() - 1)
+            except ValueError:
+                continue
+            body = text[head.end(): closing - 1]
+            inner = _NESTED_CLASS.search(body)
+            if inner is None:
+                continue
+            start = head.end() + inner.start()
+            try:
+                inner_close = _matching(text, head.end() + inner.end() - 1)
+            except ValueError:
+                continue
+            end = inner_close
+            while end < len(text) and text[end] in " \t":
+                end += 1
+            if end < len(text) and text[end] == ";":
+                end += 1
+            outer, name = head.group(2), inner.group(2)
+            spelled = f"{outer}__{name}"
+            taken = text[start:end].replace(name, spelled, 1)
+            lifted.append(taken)
+            text = text[:start] + text[end:]
+            text = _map_code(
+                text,
+                lambda part, o=outer, n=name, s=spelled: re.sub(
+                    rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", s, part
+                ),
+            )
+            text = _map_code(
+                text,
+                lambda part, n=name, s=spelled: re.sub(
+                    rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, part
+                ),
+            )
+            moved = True
+            break
+        if not moved:
+            return "\n".join(lifted) + ("\n" if lifted else "") + text
+
 def _expand_lambdas(text: str, filename: str) -> str:
     """Turn each lambda into a class, and its use into an object of it."""
 
@@ -3075,9 +3463,21 @@ def _hoist_value_returns(
             owner = _find_method(holds, method, classes)
             if owner is None:
                 continue
-            declared = _method_named_returning(owner, method, classes)
-            if declared is None:
+            member = _method_by_name(owner, method, classes)
+            declared = _returns_object(member, classes) if member else None
+            if declared is None and member is not None and _returns_reference(member):
+                # A reference return is a pointer in the C, and `.m()` on one
+                # is not something the rewriters recognise. Held in a
+                # reference of its own, which the pass below turns into the
+                # pointer it already is - so nothing is copied.
+                declared = member.returns.replace("&", "").replace("*", "").strip()
+                if declared not in classes:
+                    continue
+                by_reference = True
+            elif declared is None:
                 continue
+            else:
+                by_reference = False
             close = _closing_paren(body, match.end() - 1)
             if close < 0:
                 continue
@@ -3092,19 +3492,32 @@ def _hoist_value_returns(
                 begins += 1
             if _VALUE_INIT.match(body, begins):
                 continue
-            found = (match, close, declared)
+            # And the form this pass itself emits, which is the same thing
+            # with a `&` in it. Without this the declaration it wrote was
+            # hoisted again, and again, until the round limit stopped it.
+            # The two names have to be separated by something - whitespace
+            # or the `&`. Without that the pattern backtracked inside a single
+            # name, reading `whole = ` as `whol` `e` `=` and skipping a hoist
+            # that was needed.
+            already = re.match(
+                r"[A-Za-z_]\w*(?:\s+|\s*&\s*)[A-Za-z_]\w*\s*=\s*", body[begins:]
+            )
+            if already and begins + already.end() == match.start():
+                continue
+            found = (match, close, declared, by_reference)
             break
         if found is None:
             return body
-        match, close, held = found
+        match, close, held, by_reference = found
         counter[0] += 1
         name = f"__py2bin_value_{counter[0]}"
         known[name] = held
         start = _statement_start(body, match.start())
         call = body[match.start(): close + 1]
+        marker = "&" if by_reference else ""
         body = (
             body[:start]
-            + f"{held} {name} = {call}; "
+            + f"{held} {marker}{name} = {call}; "
             + body[start:match.start()]
             + name
             + body[close + 1:]
@@ -3164,6 +3577,7 @@ def _rewrite_body(
     inherited_arrays: "dict[str, str] | None" = None,
     unit: str = "",
     enclosing: "list[tuple[str, str]]" = (),
+    pointer_arrays: "set[str]" = (),
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -3285,6 +3699,15 @@ def _rewrite_body(
     if local_references:
         body = _deref_references(body, local_references, classes)
         for index, made in enumerate(bindings):
+            # The declaration's own name is the pointer and must stay as it
+            # is, but what it is initialised *from* may name an earlier
+            # reference - one chained call feeding the next - and that side
+            # needs following like any other use.
+            head, _, source = made.partition("=")
+            if source:
+                made = head + "=" + _deref_references(
+                    source, local_references, classes
+                )
             body = body.replace(_BINDING_MARK % index, made)
 
     def declare_from_call(match: "re.Match[str]") -> str:
@@ -3320,7 +3743,9 @@ def _rewrite_body(
         pointers.add(variable)
         return f"struct {type_name} *{variable}"
 
-    pointer_arrays: dict[str, str] = {}
+    pointer_arrays: dict[str, str] = {
+        name: known[name] for name in (pointer_arrays or ()) if name in known
+    }
 
     def declare_pointer_array(match: "re.Match[str]") -> str:
         type_name, variable, count = match.groups()
@@ -3831,6 +4256,28 @@ def _rewrite_operators(
                 return f"{_c_name(o, n)}({a}, {passed})"
 
             body = _map_code(body, lambda part: re.sub(pattern, replace, part))
+    # `b = a;` where the class declared an assignment operator. Only where
+    # both sides are objects of it: a struct copy is what `=` means without
+    # one, and that is still what a class without an `operator=` gets.
+    for variable in sorted(known, key=len, reverse=True):
+        holds = known[variable]
+        owner = _find_method(holds, "op_assign", classes)
+        if owner is None:
+            continue
+        address = variable if variable in pointers else f"&{variable}"
+        pattern = re.compile(
+            rf"(?<![.\w>=!<]){re.escape(variable)}\s*=(?!=)\s*([A-Za-z_]\w*)\s*;"
+        )
+
+        def assigned(match: "re.Match[str]", o=owner, a=address) -> str:
+            source = match.group(1)
+            if known.get(source) != holds:
+                return match.group(0)
+            passed = source if source in pointers else f"&{source}"
+            return f"{_c_name(o, 'op_assign')}({a}, {passed});"
+
+        body = _map_code(body, lambda part: pattern.sub(assigned, part))
+
     # `d(5)` where `d` is an object with a call operator. A name that holds
     # an object is never a function, so a call on it is that operator and
     # nothing else - which is what makes this safe to do by name.
@@ -4406,10 +4853,25 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # functions sharing one, and every later pass assumes a name is a thing.
     # Before names are read: a template has no name until it is written out,
     # and what comes out of this is ordinary classes and functions.
+    # The C++ that is only a different spelling of C: named casts, forward
+    # declarations, scoped enums, and `bool`/`true`/`false`/`nullptr`, which
+    # are keywords there and macros here.
     before_patterns = text
+    text, scoped_enums = _rewrite_cpp_spellings(text)
+    text = _strip_namespace_qualifiers(text, scoped_enums)
+    # Before the lambdas, because a member initialised from one is still an
+    # initialiser list; after the spellings, because a cast may appear in one.
+    text = _rewrite_initialiser_lists(text)
+    text = _rewrite_static_members(text, filename)
+    text = _lift_nested_classes(text)
+    text = _rewrite_default_arguments(text)
+    text = _rewrite_range_for(text, [0])
     # Before the templates: a lambda becomes a class, and a class may be a
     # template argument.
     text = _expand_lambdas(text, filename)
+    # After the lambdas: `auto f = <lambda>` is the one `auto` whose type has
+    # no spelling, and it is already gone by here.
+    text = _rewrite_auto(text)
     text = _expand_templates(text, filename)
     text = _mangle_overloaded_functions(text, filename)
     #: Whether a pass above has already made this text something other than
@@ -4498,7 +4960,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
             return text
         # Nothing to translate, but the bare struct names still need to be
         # types: this file is C++ only in that respect.
-        typedefs = "\n".join(f"typedef struct {name} {name};" for name in plain)
+        typedefs = "\n".join(
+            f"typedef struct {name} {name};" for name in plain
+        )
         return _with_typedefs(text, typedefs)
 
     for name in order:
@@ -5101,7 +5565,7 @@ def _rewrite_functions(
                 head,
                 count=1,
             )
-        known, pointers = _parameters_of(head, classes)
+        known, pointers, indexed = _parameters_of(head, classes)
         # A file-scope object is in scope in every function, and nothing in
         # the head says so.
         for name, held in (outer or {}).items():
@@ -5113,7 +5577,9 @@ def _rewrite_functions(
         for held, variable in copied:
             known[variable] = held
         inner = _deref_references(text[opening:closing], references, classes)
-        rewritten = _rewrite_body(inner, classes, known, pointers, unit=unit)
+        rewritten = _rewrite_body(
+            inner, classes, known, pointers, unit=unit, pointer_arrays=indexed
+        )
         if copied:
             # After the body is rewritten, not before: this text is already C,
             # and a `struct V v;` put in ahead of the declaration pass reads
@@ -5137,7 +5603,7 @@ def _rewrite_functions(
 
 def _parameters_of(
     head: str, classes: "dict[str, Class]"
-) -> "tuple[dict[str, str], set[str]]":
+) -> "tuple[dict[str, str], set[str], set[str]]":
     """The class-typed parameters of a function, which its body can call on.
 
     A parameter is declared in the head and used in the body, and the body is
@@ -5147,9 +5613,10 @@ def _parameters_of(
 
     opening = head.rfind("(")
     if opening < 0:
-        return {}, set()
+        return {}, set(), set()
     known: dict[str, str] = {}
     pointers: set[str] = set()
+    arrays: set[str] = set()
     for part in head[opening + 1:].split(","):
         words = part.replace("*", " * ").split()
         if len(words) < 2:
@@ -5161,7 +5628,11 @@ def _parameters_of(
         known[name] = held
         if "*" in part:
             pointers.add(name)
-    return known, pointers
+        if part.count("*") >= 2:
+            # `Shape **all` is an array of pointers, reached with `all[i]->m()`
+            # exactly as a locally declared `Shape *all[3]` is.
+            arrays.add(name)
+    return known, pointers, arrays
 
 def _depth_at(text: str, index: int) -> int:
     """How many braces are open just before `index`."""
@@ -5305,7 +5776,12 @@ public:
         for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 0; } }
         return 1;
     }
-    int operator!=(string o) { int same; same = 0; return same; }
+    int operator!=(string o) {
+        int i;
+        if (len != o.len) { return 1; }
+        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 1; } }
+        return 0;
+    }
 };
 }
 """

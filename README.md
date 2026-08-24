@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,964 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,967 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -622,10 +622,29 @@ signal here, so the program exits with a status of its own instead. Multiple
 inheritance, `dynamic_cast` and RTTI are not implemented. Two overloads that
 differ only in types py2bin cannot read are refused rather than guessed at.
 
-**How it is checked.** Reading the generated C tells you it is well formed and
-nothing about whether it *means* the same thing — so the corpus in
-`tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it, over 84 programs,
+**How it is checked.** One command, two questions:
+
+```sh
+tools/cpp_sweep.sh
+```
+
+*Meaning*: every program in `tools/cpp_corpus/` is built twice — once by
+py2bin, once by `clang++` — run on this machine, and the outputs compared.
+Reading the generated C tells you it is well formed and nothing about whether
+it means the same thing, and this is the only thing that asks.
+
+*Targets*: every program is built for all six targets. A construct can
+translate perfectly and still fail to encode for one machine, and this is the
+only thing that asks that. It does not run them; five of the six are not this
+computer. 120 programs × 6 targets = 720 builds.
+
+The corpus is where the coverage lives: enums, static members, nested
+classes, range-`for`, member initialiser lists, default arguments, named
+casts, `operator=`, deep inheritance, and every header above. Each got in
+because something broke on it. `tools/cpp_differential.sh` still works and is
+the meaning half under its old name. The suite additionally translates every
+corpus program on each change, so one that stops working is caught whether or
+not the sweep is run that day. It runs over 120 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1726,9 +1745,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1864 tests, no dependencies, nothing to install. Five modules want pytest's
+1867 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1964. Two of them compile a program in a *fresh interpreter* and
+too, for 1967. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1743,4 +1762,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1964-test suite.
+    is checked on every change is the 1967-test suite.

@@ -1,0 +1,95 @@
+#!/bin/sh
+# Every C++ program in the corpus, put through everything py2bin can do to it.
+#
+#   tools/cpp_sweep.sh            the whole sweep
+#   tools/cpp_sweep.sh meaning    only the comparison against clang++
+#   tools/cpp_sweep.sh targets    only the cross-build over all six targets
+#
+# Two different questions, and both have to be asked:
+#
+#   meaning  - build it twice, once with clang++ and once with py2bin, run
+#              both on this machine and compare. This is the only thing that
+#              says the translation *means* the same; reading the generated C
+#              tells you it is well formed and nothing else.
+#   targets  - build it for every target py2bin supports. A construct can
+#              translate perfectly and still fail to encode for one machine,
+#              and this is the only thing that asks. It does not run them:
+#              five of the six are not this computer.
+#
+# clang++ is the yardstick here and never a dependency - py2bin builds with
+# no toolchain at all. Where clang++ is missing, `meaning` is skipped and
+# `targets` still runs.
+set -u
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+CORPUS="$ROOT/tools/cpp_corpus"
+WHICH=${1:-all}
+WORK=${TMPDIR:-/tmp}/py2bin-sweep
+mkdir -p "$WORK"
+
+TARGETS="darwin-arm64 darwin-x86_64 linux-x86_64 linux-arm64 windows-x86_64 windows-arm64"
+
+agree=0; differ=0; refused=0; built=0; unbuilt=0
+
+run_meaning() {
+  command -v clang++ > /dev/null 2>&1 || {
+    echo "  clang++ is not here, so there is nothing to compare against."
+    return
+  }
+  echo "== meaning: py2bin against clang++, run on this machine =="
+  for source in "$CORPUS"/*.cpp; do
+    name=$(basename "$source" .cpp)
+    std=""
+    for s in c++03 c++11 c++17; do
+      clang++ -std=$s -w -o "$WORK/ref_$name" "$source" 2>/dev/null && { std=$s; break; }
+    done
+    [ -z "$std" ] && { printf "  %-28s no reference - skipped\n" "$name"; continue; }
+    want=$("$WORK/ref_$name" 2>&1); wantcode=$?
+    got=$(PYTHONPATH="$ROOT/src" python3 -m py2bin cc "$source" -o "$WORK/p_$name" 2>&1)
+    if [ $? -ne 0 ]; then
+      printf "  %-28s REFUSED\n" "$name"
+      printf '%s\n' "$got" | tail -1 | sed 's/^/        /'
+      refused=$((refused + 1)); continue
+    fi
+    mine=$("$WORK/p_$name" 2>&1); minecode=$?
+    if [ "$mine" = "$want" ] && [ "$minecode" = "$wantcode" ]; then
+      agree=$((agree + 1))
+    else
+      printf "  %-28s DIFFERS\n" "$name"
+      printf "        clang++: %s (exit %s)\n" "$(printf '%s' "$want" | tr '\n' '|')" "$wantcode"
+      printf "        py2bin : %s (exit %s)\n" "$(printf '%s' "$mine" | tr '\n' '|')" "$minecode"
+      differ=$((differ + 1))
+    fi
+  done
+  printf "\n  agreed %d   differed %d   refused %d\n\n" "$agree" "$differ" "$refused"
+}
+
+run_targets() {
+  echo "== targets: does each one encode for every machine =="
+  for target in $TARGETS; do
+    bad=""
+    for source in "$CORPUS"/*.cpp; do
+      name=$(basename "$source" .cpp)
+      if PYTHONPATH="$ROOT/src" python3 -m py2bin cc "$source" \
+           -o "$WORK/${target}_$name" --target "$target" > "$WORK/log" 2>&1; then
+        built=$((built + 1))
+      else
+        unbuilt=$((unbuilt + 1))
+        bad="$bad $name"
+      fi
+    done
+    if [ -z "$bad" ]; then
+      printf "  %-18s all built\n" "$target"
+    else
+      printf "  %-18s FAILED:%s\n" "$target" "$bad"
+    fi
+  done
+  printf "\n  built %d   failed %d\n" "$built" "$unbuilt"
+}
+
+case "$WHICH" in
+  meaning) run_meaning ;;
+  targets) run_targets ;;
+  *) run_meaning; run_targets ;;
+esac
+
+[ "$differ" -eq 0 ] && [ "$refused" -eq 0 ] && [ "$unbuilt" -eq 0 ]

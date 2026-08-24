@@ -1291,3 +1291,47 @@ class OverloadedTemplates(unittest.TestCase):
         )
         self.assertIn("sort__int(", out)
         self.assertIn("__sift_by__int", out)
+
+
+class Corpus(unittest.TestCase):
+    """The corpus is the thing that catches what the unit tests do not.
+
+    Every construct here got in because something broke on it, and a corpus
+    that quietly shrinks stops being that. These do not run the programs -
+    `tools/cpp_sweep.sh` does, against clang++ and across every target - they
+    check that what it runs is still there.
+    """
+
+    def _corpus(self) -> "list[Path]":
+        root = Path(__file__).resolve().parents[1] / "tools" / "cpp_corpus"
+        return sorted(root.glob("*.cpp"))
+
+    def test_every_program_still_translates(self) -> None:
+        """Not what they mean - the sweep asks that - but that none is broken.
+
+        A corpus program that stops translating is a regression whether or
+        not anyone runs the sweep that day, and this runs on every change.
+        """
+
+        for source in self._corpus():
+            with self.subTest(program=source.stem):
+                translate(
+                    inline_local_includes(source, [], set(), set()), str(source)
+                )
+
+    def test_the_corpus_covers_the_ground_it_is_meant_to(self) -> None:
+        names = {source.stem for source in self._corpus()}
+        for wanted in (
+            "virtual_basic", "template_class", "references", "heap_new",
+            "exception_basic", "lambda_captures", "std_vector", "std_string",
+            "iostream_hello", "algorithm_sort", "filesystem_paths",
+            "enum_plain", "static_member", "range_for", "init_list",
+            "nested_class", "default_args", "casts", "operators_all",
+        ):
+            self.assertIn(wanted, names, f"{wanted} has gone from the corpus")
+        self.assertGreater(len(names), 100)
+
+    def test_the_sweep_is_where_the_readme_says(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "tools"
+        for name in ("cpp_sweep.sh", "cpp_differential.sh"):
+            self.assertTrue((root / name).exists(), f"{name} is missing")
