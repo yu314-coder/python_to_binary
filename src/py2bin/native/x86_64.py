@@ -705,10 +705,30 @@ class _Syscalls86:
     exit_number: int
     mmap_number: int
     mmap_flags: int
-    open_number: int = 0
-    read_number: int = 0
-    close_number: int = 0
+    #: None where the kernel has no such call. Not 0: `read` on linux-x86_64
+    #: *is* syscall 0, and a falsy test read that as "not available" - which
+    #: needed a special case for `read` alone, and would have needed another
+    #: for every syscall that happens to be numbered zero somewhere.
+    open_number: "int | None" = None
+    read_number: "int | None" = None
+    close_number: "int | None" = None
     open_takes_dirfd: bool = False
+    #: Everything below is a file operation whose arguments are integers and
+    #: pointers only - no kernel struct is read, because the layout of one
+    #: differs between platforms and between architectures, and py2bin can run
+    #: a binary for exactly one of them here. `stat` is deliberately absent
+    #: for that reason; what needs it is refused instead.
+    lseek_number: "int | None" = None
+    mkdir_number: "int | None" = None
+    rmdir_number: "int | None" = None
+    unlink_number: "int | None" = None
+    rename_number: "int | None" = None
+    access_number: "int | None" = None
+    #: Linux arm64 has no legacy path syscalls at all - only the `*at` forms,
+    #: which take a leading directory descriptor, and which fold rmdir into
+    #: unlinkat with a flag. So the kernels differ in arity and in count, not
+    #: just in numbering.
+    paths_take_dirfd: bool = False
     #: Darwin sets the carry flag and returns a positive errno; Linux returns
     #: -errno. A small positive number is a valid descriptor, so the flag is
     #: what distinguishes them.
@@ -723,16 +743,40 @@ def _file_call_shape(operation, system) -> tuple[int, tuple]:
         "read": system.read_number,
         "write": system.write_number,
         "close": system.close_number,
+        "lseek": system.lseek_number,
+        "mkdir": system.mkdir_number,
+        "rmdir": system.rmdir_number,
+        "unlink": system.unlink_number,
+        "rename": system.rename_number,
+        "access": system.access_number,
     }
-    number = numbers.get(operation.kind, 0)
-    if not number and operation.kind != "read":
+    number = numbers.get(operation.kind)
+    if number is None:
         raise ValueError(
             f"file operation {operation.kind!r} is not available on this target"
         )
     arguments = operation.arguments
     if operation.kind == "open" and system.open_takes_dirfd:
-        arguments = (IntConstant(-100), *arguments)  # AT_FDCWD
+        # AT_FDCWD, so a relative path is resolved against the working
+        # directory exactly as plain open() would resolve it.
+        arguments = (IntConstant(-100), *arguments)
+    elif system.paths_take_dirfd and operation.kind in _AT_FORMS:
+        # The same AT_FDCWD, and for rmdir the flag that makes unlinkat
+        # remove a directory rather than a name.
+        if operation.kind == "rmdir":
+            arguments = (IntConstant(-100), *arguments, IntConstant(0x200))
+        elif operation.kind == "unlink":
+            arguments = (IntConstant(-100), *arguments, IntConstant(0))
+        elif operation.kind == "rename":
+            old, new = arguments
+            arguments = (IntConstant(-100), old, IntConstant(-100), new)
+        else:
+            arguments = (IntConstant(-100), *arguments)
     return number, arguments
+
+
+#: The operations linux-arm64 spells with a leading directory descriptor.
+_AT_FORMS = frozenset({"mkdir", "rmdir", "unlink", "rename", "access"})
 
 
 def _emit_x86_operations(
@@ -957,19 +1001,48 @@ def _encode_x86(
     image_statics: bool = False,
     entered_by_call: bool = False,
 ) -> tuple[bytes, "_X86Refs"]:
+    # Named rather than positional: this record has grown, and a tuple
+    # unpacked in order put `errors_use_carry` in the middle of the file
+    # numbers the moment a field was added between them. Nothing about that
+    # failure would have been visible except a syscall that did the wrong
+    # thing on one platform.
     if platform == "linux":
-        write_number, exit_number = 1, 60
-        mmap_number, mmap_flags = 9, 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
-        files = (2, 0, 3, False, False)  # open, read, close; this kernel has open
+        system = _Syscalls86(
+            write_number=1,
+            exit_number=60,
+            mmap_number=9,
+            mmap_flags=0x22,  # MAP_PRIVATE | MAP_ANONYMOUS
+            open_number=2,
+            read_number=0,
+            close_number=3,
+            # This kernel is old enough to have the plain path syscalls.
+            lseek_number=8,
+            mkdir_number=83,
+            rmdir_number=84,
+            unlink_number=87,
+            rename_number=82,
+            access_number=21,
+        )
     elif platform == "darwin":
-        write_number, exit_number = 0x02000004, 0x02000001
-        mmap_number, mmap_flags = 0x020000C5, 0x1002  # MAP_ANON | MAP_PRIVATE
-        files = (0x02000005, 0x02000003, 0x02000006, False, True)
+        system = _Syscalls86(
+            write_number=0x02000004,
+            exit_number=0x02000001,
+            mmap_number=0x020000C5,
+            mmap_flags=0x1002,  # MAP_ANON | MAP_PRIVATE
+            open_number=0x02000005,
+            read_number=0x02000003,
+            close_number=0x02000006,
+            # The BSD numbers macOS keeps, each in syscall class 2.
+            lseek_number=0x020000C7,   # 199
+            mkdir_number=0x02000088,   # 136
+            rmdir_number=0x02000089,   # 137
+            unlink_number=0x0200000A,  # 10
+            rename_number=0x02000080,  # 128
+            access_number=0x02000021,  # 33
+            errors_use_carry=True,
+        )
     else:
         raise ValueError(f"unsupported x86-64 syscall platform: {platform}")
-    system = _Syscalls86(
-        write_number, exit_number, mmap_number, mmap_flags, *files
-    )
 
     code = bytearray()
     # System V wants rsp 16-byte aligned *at the call instruction*, so that the
@@ -1021,10 +1094,10 @@ def _encode_x86(
         code.extend(b"\x31\xff")  # xor edi, edi
         code.extend(b"\x48\xc7\xc6" + struct.pack("<I", module.static_bytes))
         code.extend(b"\xba\x03\x00\x00\x00")  # mov edx, PROT_READ|PROT_WRITE
-        code.extend(b"\x49\xc7\xc2" + struct.pack("<I", mmap_flags))
+        code.extend(b"\x49\xc7\xc2" + struct.pack("<I", system.mmap_flags))
         code.extend(b"\x49\xc7\xc0\xff\xff\xff\xff")  # mov r8, -1
         code.extend(b"\x45\x31\xc9")  # xor r9d, r9d
-        code.extend(b"\x48\xc7\xc0" + struct.pack("<I", mmap_number))
+        code.extend(b"\x48\xc7\xc0" + struct.pack("<I", system.mmap_number))
         code.extend(b"\x0f\x05")  # syscall
         code.extend(b"\x49\x89\xc7")  # mov r15, rax
 

@@ -364,6 +364,20 @@ _USING_NAME = re.compile(r"\busing\s+[A-Za-z_][\w:]*\s*;")
 _TEMPLATE = re.compile(r"\btemplate\s*<([^<>]*)>\s*")
 
 
+def _is_a_definition(text: str, close: int) -> bool:
+    """Whether the parentheses closing at `close` belong to a definition.
+
+    A call is never followed by a body. `const` may sit between, and so may
+    an inheritance-free `noexcept`; anything else means this was a call.
+    """
+
+    rest = text[close + 1:].lstrip()
+    for word in ("const", "noexcept"):
+        if rest.startswith(word):
+            rest = rest[len(word):].lstrip()
+    return rest.startswith("{")
+
+
 def _template_parameters(spelled: str) -> "list[tuple[str, bool]]":
     """Each parameter as (name, is_a_type)."""
 
@@ -730,6 +744,13 @@ def _expand_templates(text: str, filename: str) -> str:
                 close = _closing_paren(region, call.end() - 1)
                 if close < 0:
                     continue
+                if _is_a_definition(region, close):
+                    # A member or function *named* like the template, not a
+                    # call to it: `<string>` has a `find` method and
+                    # `<algorithm>` has a `find` template, and the method's
+                    # own head reads exactly like a call until you notice
+                    # what follows the parentheses.
+                    continue
                 given = _call_arguments(region, call.end() - 1)
                 deduced = _deduce_arguments(
                     parameters, declared.group(3), given, scope, call.start()
@@ -803,7 +824,7 @@ def _expand_templates(text: str, filename: str) -> str:
                 if call.start() < at:
                     continue
                 close = _closing_paren(region, call.end() - 1)
-                if close < 0:
+                if close < 0 or _is_a_definition(region, close):
                     continue
                 given = _call_arguments(region, call.end() - 1)
                 deduced = _deduce_arguments(
@@ -1700,14 +1721,66 @@ _DECLARES = re.compile(
 
 
 def _declared_names(body: str) -> "set[str]":
-    """The classes and functions a namespace body declares, for clash checks."""
+    """The classes and functions a namespace body declares, for clash checks.
+
+    A class body is taken out first. What is inside one is a member, reached
+    through an object and never by its bare name, so two classes in two
+    namespaces may both have a `c_str` without either hiding the other -
+    which is exactly what <filesystem>'s `path` and <string>'s `string` do.
+    """
 
     found = set()
-    for match in _DECLARES.finditer(_without_literals(body)):
+    for match in _DECLARES.finditer(_without_literals(_without_class_bodies(body))):
         spelled = match.group(1) or match.group(2)
         if spelled and spelled not in _NOT_A_TYPE:
             found.add(spelled)
     return found
+
+
+def _without_class_bodies(text: str) -> str:
+    """The text with every `class`/`struct` body replaced by nothing.
+
+    The head is kept, so the class's own name is still declared here.
+    """
+
+    out: list[str] = []
+    at = 0
+    for head in _CLASS_HEAD.finditer(text):
+        if head.start() < at:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        out.append(text[at:head.end() - 1])
+        out.append(" ")
+        at = closing
+    out.append(text[at:])
+    return "".join(out)
+
+
+#: `namespace fs = std::filesystem;` - another name for a namespace, which is
+#: how nearly all code that uses one with a long name refers to it.
+_NAMESPACE_ALIAS = re.compile(
+    r"\bnamespace\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_][\w:]*)\s*;"
+)
+
+
+def _namespace_aliases(text: str) -> "tuple[str, set[str]]":
+    """Take the aliases out, and report the names they introduce.
+
+    An alias needs no more than that: every namespace qualifier is stripped
+    here anyway, so a name that stands for one is stripped the same way. What
+    it must not do is survive into the C, where `namespace` is not a word.
+    """
+
+    found: set[str] = set()
+
+    def taken(match: "re.Match[str]") -> str:
+        found.add(match.group(1))
+        return ""
+
+    return _map_code(text, lambda part: _NAMESPACE_ALIAS.sub(taken, part)), found
 
 
 def _strip_namespace_qualifiers(text: str, namespaces: "set[str]") -> str:
@@ -2739,6 +2812,138 @@ _ASSIGNED_FROM_NEW = re.compile(
 )
 
 
+
+#: `a.b()` or `p->b()` - a call on something, with what follows left alone.
+_CALL_ON = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*(\.|->)\s*([A-Za-z_]\w*)\s*\(")
+
+
+def _declared_objects(
+    body: str, classes: "dict[str, Class]"
+) -> "dict[str, str]":
+    """Every object this body declares, read without rewriting anything.
+
+    The declaration passes below both read and rewrite, and something has to
+    know the types before they run.
+    """
+
+    found: dict[str, str] = {}
+    for pattern in (_OBJECT, _OBJECT_ARRAY, _OBJECT_POINTER, _VALUE_INIT):
+        for match in pattern.finditer(body):
+            held, name = match.group(1), match.group(2)
+            if held in classes:
+                found[name] = held
+    return found
+
+
+def _hoist_value_returns(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    counter: "list[int]",
+) -> str:
+    """`f.filename().c_str()` becomes a temporary and two calls.
+
+    A method returning an object by value returns nothing in the C - the
+    caller provides the space and the callee writes through a hidden pointer -
+    so its result is not an expression that anything can be called on. C++
+    calls that a temporary, and this writes the temporary out.
+
+    Done here, on the C++, so everything after sees an ordinary object with
+    an ordinary name and needs to know nothing about where it came from.
+    """
+
+    if not known:
+        return body
+    for _round in range(_HOIST_ROUNDS):
+        found = None
+        for match in _CALL_ON.finditer(body):
+            receiver, _reach, method = match.groups()
+            holds = known.get(receiver)
+            if holds is None:
+                continue
+            owner = _find_method(holds, method, classes)
+            if owner is None:
+                continue
+            declared = _method_named_returning(owner, method, classes)
+            if declared is None:
+                continue
+            close = _closing_paren(body, match.end() - 1)
+            if close < 0:
+                continue
+            # Anything except the one form that is already handled: a
+            # declaration whose whole initialiser is this call, where the
+            # caller's own space is the variable being declared. Everywhere
+            # else - assigned to something that exists, called on, passed as
+            # an argument - there is no space to write through until one is
+            # made, so one is.
+            begins = _statement_start(body, match.start())
+            while begins < len(body) and body[begins] in " \t\n":
+                begins += 1
+            if _VALUE_INIT.match(body, begins):
+                continue
+            found = (match, close, declared)
+            break
+        if found is None:
+            return body
+        match, close, held = found
+        counter[0] += 1
+        name = f"__py2bin_value_{counter[0]}"
+        known[name] = held
+        start = _statement_start(body, match.start())
+        call = body[match.start(): close + 1]
+        body = (
+            body[:start]
+            + f"{held} {name} = {call}; "
+            + body[start:match.start()]
+            + name
+            + body[close + 1:]
+        )
+    return body
+
+
+#: How many chained calls one body may hold. Each round writes one temporary
+#: out; a body with more than this many is a body doing something this was
+#: not written for, and looping forever would be the worse answer.
+_HOIST_ROUNDS = 64
+
+
+def _method_named_returning(
+    owner: str, method: str, classes: "dict[str, Class]"
+) -> "str | None":
+    """The class that member returns by value, if it returns one."""
+
+    found = _method_by_name(owner, method, classes)
+    if found is None:
+        return None
+    return _returns_object(found, classes)
+
+
+def _statement_start(body: str, at: int) -> int:
+    """Where the statement holding `at` begins.
+
+    A temporary has to be declared before the statement that uses it, not in
+    the middle of one - `printf("%s", f.filename().c_str())` has no room for
+    a declaration inside the argument list.
+    """
+
+    depth = 0
+    index = at
+    while index > 0:
+        index -= 1
+        piece = body[index]
+        if piece in ")]":
+            depth += 1
+        elif piece in "([":
+            if depth:
+                depth -= 1
+            # At depth zero an opening parenthesis means the call being
+            # hoisted is written inside another one - `printf(..., f.x().y())`
+            # - and the statement starts further back still. Stopping here put
+            # the declaration inside the argument list.
+        elif depth == 0 and piece in ";{}":
+            return index + 1
+    return 0
+
 def _rewrite_body(
     body: str,
     classes: "dict[str, Class]",
@@ -2829,6 +3034,14 @@ def _rewrite_body(
     # Before the declaration passes: `Node *n = new Node(3);` has to become a
     # call first, or the pointer declaration reads `new Node` as the type.
     body = _rewrite_new(body, classes, scope())
+
+    # `f.filename().c_str()`: a call on what a value return handed back. The
+    # declarations have not been read yet - they are rewritten below, and
+    # this has to run before that - so what this body declares is scanned for
+    # first, without touching it.
+    body = _hoist_value_returns(
+        body, classes, {**_declared_objects(body, classes), **known}, [0]
+    )
 
     # `int &r = a.v;` is a pointer whose uses are dereferenced. Done before
     # anything else reads the body, so the rest sees an ordinary pointer.
@@ -3962,7 +4175,8 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # Before anything else reads the text: a class inside a namespace is a
     # class, and every pass below looks for classes at the top level.
     text, namespaces = _flatten_namespaces(text, filename)
-    text = _strip_namespace_qualifiers(text, namespaces)
+    text, aliases = _namespace_aliases(text)
+    text = _strip_namespace_qualifiers(text, namespaces | aliases)
     _refuse_unsupported(text, filename)
     # Before anything reads a function's name: an overload set is several
     # functions sharing one, and every later pass assumes a name is a thing.
@@ -4155,7 +4369,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
         _emit_methods(classes[name], classes, scope) for name in order
     )
     remainder = _address_reference_arguments(
-        remainder, _function_signatures(remainder)
+        remainder, _function_signatures(remainder, classes)
     )
     rewritten = _rewrite_functions(remainder, classes, made, scope)
     head = "\n".join(directives)
@@ -4522,7 +4736,7 @@ def _deref_references(
 _DEFINITION = re.compile(r"\b([A-Za-z_][\w\s*]*?)\b([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*\{")
 
 
-def _function_signatures(text: str) -> "dict[str, list[int]]":
+def _function_signatures(text: str, classes: "dict[str, Class]" = {}) -> "dict[str, list[int]]":
     """For each function defined here, which arguments want an address.
 
     Read from the definitions rather than tracked through the rewriter,
@@ -4537,10 +4751,14 @@ def _function_signatures(text: str) -> "dict[str, list[int]]":
         name = match.group(2)
         if name in _NOT_A_TYPE:
             continue
+        by_value = {
+            variable for _held, variable in _by_value_objects(match.group(3), classes)
+        }
         at = [
             index
             for index, part in enumerate(_split_arguments(match.group(3)))
             if _REFERENCE.search(part)
+            or any(re.search(rf"\b{re.escape(v)}\b", part) for v in by_value)
         ]
         if at:
             found[name] = at
@@ -4638,6 +4856,24 @@ def _rewrite_functions(
         )
         if references:
             head = head[:opened + 1] + _references_to_pointers(head[opened + 1:])
+        # A parameter of class type taken by value is a pointer in the C, with
+        # the copy made on entry - exactly what a method does with one. Free
+        # functions did not, so `int twice(V v)` declared a struct parameter
+        # this backend cannot pass and the call was refused.
+        # Between the parentheses, not merely after the opening one: the
+        # trailing `)` rides along on the last parameter otherwise, and
+        # `v)` is not an identifier, so the last parameter was never seen.
+        inside = head[opened + 1: head.rfind(")")] if opened >= 0 else ""
+        copied = _by_value_objects(inside, classes)
+        for held, variable in copied:
+            # Without the `struct`: the declaration rewriter below adds one,
+            # and two is not C.
+            head = re.sub(
+                rf"\b{re.escape(held)}\s+{re.escape(variable)}\b",
+                f"{held} *__by_value_{variable}",
+                head,
+                count=1,
+            )
         known, pointers = _parameters_of(head, classes)
         # A file-scope object is in scope in every function, and nothing in
         # the head says so.
@@ -4647,9 +4883,25 @@ def _rewrite_functions(
             if held in classes:
                 known[name] = held
                 pointers.add(name)
+        for held, variable in copied:
+            known[variable] = held
         inner = _deref_references(text[opening:closing], references, classes)
+        rewritten = _rewrite_body(inner, classes, known, pointers, unit=unit)
+        if copied:
+            # After the body is rewritten, not before: this text is already C,
+            # and a `struct V v;` put in ahead of the declaration pass reads
+            # as a new object to construct - so the copy ran the constructor
+            # over what it was about to be handed. Declared and then assigned
+            # rather than initialised, because py2bin's C takes `o = *p;` and
+            # not `struct V o = *p;`.
+            entry = " ".join(
+                f"struct {held} {variable}; {variable} = *__by_value_{variable};"
+                for held, variable in copied
+            )
+            spot = rewritten.find("{")
+            rewritten = rewritten[:spot + 1] + " " + entry + rewritten[spot + 1:]
         out.append(_rewrite_declarations(head, classes))
-        out.append(_rewrite_body(inner, classes, known, pointers, unit=unit))
+        out.append(rewritten)
         at = closing
     out.append(_rewrite_declarations(text[at:], classes))
     return "".join(out)
@@ -4792,6 +5044,22 @@ public:
     int empty() { return len == 0; }
     char at(int i) { return buf[i]; }
     const char *c_str() { return buf; }
+    void push_back(char c) {
+        if (len < 255) { buf[len] = c; len = len + 1; buf[len] = 0; }
+    }
+    void clear() { len = 0; buf[0] = 0; }
+    int compare(const char *s) {
+        int i;
+        i = 0;
+        while (buf[i] != 0 && buf[i] == s[i]) { i = i + 1; }
+        return (int)(unsigned char)buf[i] - (int)(unsigned char)s[i];
+    }
+    int find(char c) {
+        int i;
+        i = 0;
+        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
+        return -1;
+    }
     void append(string o) {
         int j; j = 0;
         while (j < o.len && len + j < 255) { buf[len + j] = o.buf[j]; j = j + 1; }
@@ -5067,6 +5335,154 @@ public:
 }
 """
 
+#: py2bin's own <filesystem>. `path` is string work and nothing else, which
+#: is most of what the header is used for; the queries go to the syscalls on
+#: POSIX and to the imports <windows.h> declares on Windows, chosen with the
+#: platform macros the preprocessor now defines.
+#:
+#: What is missing is `directory_iterator`: reading a directory means
+#: getdents on Linux, getdirentries on macOS and FindFirstFile on Windows,
+#: each with a different struct laid out differently per architecture - and
+#: py2bin can run a binary for exactly one of those here. A struct read wrong
+#: gives plausible answers, so it is left out rather than guessed at.
+_FILESYSTEM_HEADER = r"""
+#include <string>
+#include <py2bin_fs.h>
+
+namespace std {
+namespace filesystem {
+
+class path {
+public:
+    std::string text;
+    path() { }
+    path(const char *s) { text.assign(s); }
+    const char *c_str() { return text.c_str(); }
+    int empty() { return text.empty(); }
+    /* Written as a member rather than `out.text.push_back(c)` at each call:
+       reaching through a member of a local to call one of *its* methods is
+       a shape the translator does not rewrite. */
+    void __add(char c) { text.push_back(c); }
+    void __add_text(const char *s) { text.append(s); }
+    int __size() { return text.size(); }
+    char __at(int i) { return text.at(i); }
+
+    /* `p / "sub"`, which is how a path is built. The separator is only added
+       where there is not one already, so joining twice does not double it. */
+    path operator/(const char *piece) {
+        path joined;
+        int i;
+        i = 0;
+        while (i < this->__size()) { joined.__add(this->__at(i)); i = i + 1; }
+        if (joined.__size() > 0) {
+            if (joined.text.at(joined.__size() - 1) != '/') {
+                joined.__add_text("/");
+            }
+        }
+        joined.__add_text(piece);
+        return joined;
+    }
+
+    int __last_separator() {
+        int i;
+        int found;
+        found = -1;
+        i = 0;
+        while (i < this->__size()) {
+            if (this->__at(i) == '/') { found = i; }
+            if (this->__at(i) == '\\') { found = i; }
+            i = i + 1;
+        }
+        return found;
+    }
+
+    path filename() {
+        path out;
+        int i;
+        i = __last_separator() + 1;
+        while (i < this->__size()) { out.__add(this->__at(i)); i = i + 1; }
+        return out;
+    }
+
+    path parent_path() {
+        path out;
+        int cut;
+        int i;
+        cut = __last_separator();
+        i = 0;
+        while (i < cut) { out.__add(this->__at(i)); i = i + 1; }
+        return out;
+    }
+
+    path extension() {
+        path out;
+        int start;
+        int i;
+        int dot;
+        start = __last_separator() + 1;
+        dot = -1;
+        i = start;
+        while (i < this->__size()) {
+            if (this->__at(i) == '.') { if (i > start) { dot = i; } }
+            i = i + 1;
+        }
+        if (dot < 0) { return out; }
+        i = dot;
+        while (i < this->__size()) { out.__add(this->__at(i)); i = i + 1; }
+        return out;
+    }
+
+    path stem() {
+        path whole;
+        path suffix;
+        path out;
+        int keep;
+        int i;
+        whole = this->filename();
+        suffix = this->extension();
+        keep = whole.__size() - suffix.__size();
+        i = 0;
+        while (i < keep) { out.__add(whole.__at(i)); i = i + 1; }
+        return out;
+    }
+};
+
+/* Every question that depends on the platform is asked in <py2bin_fs.h>,
+   which is C and so is read by the preprocessor that knows about #ifdef. */
+int exists(path p) { return __py2bin_fs_exists(p.c_str()); }
+int is_directory(path p) { return __py2bin_fs_is_directory(p.c_str()); }
+int is_regular_file(path p) {
+    if (!__py2bin_fs_exists(p.c_str())) { return 0; }
+    return !__py2bin_fs_is_directory(p.c_str());
+}
+unsigned long file_size(path p) {
+    long held;
+    held = __py2bin_fs_size(p.c_str());
+    if (held < 0) { return 0; }
+    return (unsigned long)held;
+}
+int create_directory(path p) { return __py2bin_fs_mkdir(p.c_str()); }
+int remove(path p) {
+    if (__py2bin_fs_is_directory(p.c_str())) {
+        return __py2bin_fs_rmdir(p.c_str());
+    }
+    return __py2bin_fs_unlink(p.c_str());
+}
+int rename(path from, path to) {
+    return __py2bin_fs_rename(from.c_str(), to.c_str());
+}
+path current_path() {
+    path out;
+    char buffer[260];
+    __py2bin_fs_cwd(buffer, 260);
+    out.text.assign(buffer);
+    return out;
+}
+
+}
+}
+"""
+
 _BUILTIN_CPP_HEADERS = {
     "string": _STRING_HEADER,
     "vector": _VECTOR_HEADER,
@@ -5075,6 +5491,7 @@ _BUILTIN_CPP_HEADERS = {
     "utility": _UTILITY_HEADER,
     "numeric": _NUMERIC_HEADER,
     "stdexcept": _STDEXCEPT_HEADER,
+    "filesystem": _FILESYSTEM_HEADER,
     "cassert": "#include <assert.h>\n",
     "climits": "#include <limits.h>\n",
     "cfloat": "#include <float.h>\n",
@@ -5149,7 +5566,11 @@ def inline_local_includes(
         if named in seen_headers:
             return ""
         seen_headers.add(named)
-        return supplied
+        # One of these may include another - <filesystem> is written on top
+        # of <string> - so what is pasted is pasted again. Without it the
+        # inner include survived into the C, and the compiler reported a
+        # missing header the user never wrote.
+        return re.sub(r'#\s*include\s*<([^>]+)>', paste_builtin, supplied)
 
     return re.sub(r'#\s*include\s*<([^>]+)>', paste_builtin, text)
 

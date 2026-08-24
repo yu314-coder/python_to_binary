@@ -20,8 +20,12 @@ for source in "$(dirname "$0")"/cpp_corpus/*.cpp; do
     # standard that has them.
     if ! clang++ -std=c++03 -w -o "/tmp/ref_$name" "$source" 2>/dev/null; then
         if ! clang++ -std=c++11 -w -o "/tmp/ref_$name" "$source" 2>/dev/null; then
-            printf "  %-28s reference did not build - skipped\n" "$name"
-            continue
+            # <filesystem> is C++17, and its reference has to be asked for in
+            # a standard that has it.
+            if ! clang++ -std=c++17 -w -o "/tmp/ref_$name" "$source" 2>/dev/null; then
+                printf "  %-28s reference did not build - skipped\n" "$name"
+                continue
+            fi
         fi
     fi
     want=$("/tmp/ref_$name" 2>&1); wantcode=$?

@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,951 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,957 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -586,6 +586,15 @@ not special cases in the compiler:
   they work on a `vector` and on a plain array alike.
 * `<stdexcept>` — `exception` and the four that derive from it, each carrying
   a message and answering `what()`.
+* `<filesystem>` — `path` (`filename`, `stem`, `extension`, `parent_path`,
+  `operator/`) plus `exists`, `is_directory`, `is_regular_file`, `file_size`,
+  `create_directory`, `remove`, `rename`. The `path` half is string work; the
+  questions that depend on the platform live in a C header, because `#ifdef`
+  is read by the C preprocessor and the C++ translator runs before it.
+  `directory_iterator` is *not* there: reading a directory means `getdents`
+  on Linux, `getdirentries` on macOS and `FindFirstFile` on Windows, each
+  with a struct laid out differently per architecture - and a struct read
+  wrong gives plausible answers.
 * `<utility>` (`pair`), `<numeric>` (`accumulate`), and `<cassert>`,
   `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
   `<cmath>`, `<cstdint>` as names for the C headers underneath.
@@ -607,7 +616,7 @@ differ only in types py2bin cannot read are refused rather than guessed at.
 **How it is checked.** Reading the generated C tells you it is well formed and
 nothing about whether it *means* the same thing — so the corpus in
 `tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it, over 76 programs,
+the outputs compared. `tools/cpp_differential.sh` runs it, over 79 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1708,9 +1717,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1851 tests, no dependencies, nothing to install. Five modules want pytest's
+1857 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1951. Two of them compile a program in a *fresh interpreter* and
+too, for 1957. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1725,4 +1734,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1951-test suite.
+    is checked on every change is the 1957-test suite.

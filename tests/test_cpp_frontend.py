@@ -1101,3 +1101,99 @@ class StatementOrder(unittest.TestCase):
             body.index("= risky(7)"),
             "the call after the try was hoisted in front of it",
         )
+
+
+class Filesystem(unittest.TestCase):
+    """`path` is string work; the queries go to the platform.
+
+    The split is not cosmetic: `#ifdef` is read by the C preprocessor, and the
+    C++ translator runs before it - so a conditional written in a C++ header
+    is still there when the translator reads the file, and it sees both
+    branches. The platform half lives in a C header for that reason.
+    """
+
+    def test_the_platform_half_is_reached_through_c(self) -> None:
+        out = with_headers(
+            "#include <filesystem>\n"
+            "int main(void){ std::filesystem::path p(\"/tmp\");"
+            " return std::filesystem::exists(p); }"
+        )
+        self.assertIn("__py2bin_fs_exists", out)
+        # And no conditional survives into the C++ the translator reads.
+        self.assertNotIn("#ifdef _WIN32", out.split("int main")[0].split("path")[0])
+
+    def test_a_namespace_alias_is_another_name_for_one(self) -> None:
+        out = translate(
+            "namespace deep { class T { public: int v; T(){v=3;} }; }\n"
+            "namespace d = deep;\n"
+            "int main(void){ d::T t; return t.v; }",
+            "t.cpp",
+        )
+        self.assertIn("struct T t;", out)
+        self.assertNotIn("namespace", out)
+
+
+class ByValueFreeFunctions(unittest.TestCase):
+    def test_a_class_taken_by_value_becomes_a_pointer_and_a_copy(self) -> None:
+        """Methods did this from the start; free functions did not.
+
+        `int twice(V v)` declared a struct parameter this backend cannot
+        pass, and the call was refused with a type error rather than the
+        missing feature it was.
+        """
+
+        out = translate(
+            "class V{public:int n;\n V(){n=5;}\n int get(){return n;}};\n"
+            "int twice(V v){ return v.get() * 2; }\n"
+            "int main(void){ V a; return twice(a); }",
+            "t.cpp",
+        )
+        self.assertIn("int twice(struct V *__by_value_v)", out)
+        self.assertIn("v = *__by_value_v;", out)
+        self.assertIn("twice(&a)", out)
+
+
+class ChainedValueReturns(unittest.TestCase):
+    def test_a_call_on_a_returned_object_gets_a_temporary(self) -> None:
+        """A value return writes through a hidden pointer and yields nothing.
+
+        So its result is not something anything can be called on until there
+        is somewhere for it to live. C++ calls that a temporary; this writes
+        the temporary out, in the C++, before anything else reads the body.
+        """
+
+        out = translate(
+            "class S{public:int n;\n S(){n=1;}\n S twin(){ S o; o.n=n*2; return o; }\n"
+            " int get(){return n;}};\n"
+            "int main(void){ S a; return a.twin().get(); }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_value_1", out)
+        self.assertIn("S__twin(&a, &__py2bin_value_1)", out)
+        self.assertIn("S__get(&__py2bin_value_1)", out)
+
+    def test_the_declaration_form_still_needs_no_temporary(self) -> None:
+        # `S c = a.twin();` already hands the callee the caller's own space.
+        out = translate(
+            "class S{public:int n;\n S(){n=1;}\n S twin(){ S o; return o; }};\n"
+            "int main(void){ S a; S c = a.twin(); return c.n; }",
+            "t.cpp",
+        )
+        self.assertNotIn("__py2bin_value", out)
+        self.assertIn("struct S c; S__twin(&a, &c);", out)
+
+
+class TemplateNamesakes(unittest.TestCase):
+    def test_a_method_named_like_a_template_is_not_a_call_to_it(self) -> None:
+        """<string> has a `find` method and <algorithm> has a `find` template.
+
+        The method's own head reads exactly like a call to the template until
+        you notice what follows the parentheses - a body, which no call has.
+        """
+
+        out = with_headers(
+            "#include <string>\n#include <algorithm>\n"
+            "int main(void){ std::string s; s.assign(\"abc\");"
+            " return s.find('b'); }"
+        )
+        self.assertIn("string__find", out)

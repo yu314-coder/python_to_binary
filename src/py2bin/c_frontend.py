@@ -113,6 +113,7 @@ from .native.ir import (
     Function as IRFunction,
     FunctionAddress,
     GlobalAddress,
+    FileCall,
     HeapInit,
     HeapLoad,
     HeapStore,
@@ -830,6 +831,22 @@ CType = (
 )
 
 VOID = VoidType()
+
+#: The file system calls a C program may make, and how many arguments each
+#: takes. Named with the prefix because they are py2bin's own primitives, not
+#: POSIX's own spelling: `open` is a name a program may use for its own.
+_FILE_BUILTINS: dict[str, tuple[str, int]] = {
+    "__py2bin_open": ("open", 3),
+    "__py2bin_read": ("read", 3),
+    "__py2bin_write": ("write", 3),
+    "__py2bin_close": ("close", 1),
+    "__py2bin_lseek": ("lseek", 3),
+    "__py2bin_mkdir": ("mkdir", 2),
+    "__py2bin_rmdir": ("rmdir", 1),
+    "__py2bin_unlink": ("unlink", 1),
+    "__py2bin_rename": ("rename", 2),
+    "__py2bin_access": ("access", 2),
+}
 
 #: The names that stop the program rather than returning from it.
 _EXIT_BUILTINS = frozenset({"exit", "_Exit", "abort"})
@@ -4063,6 +4080,49 @@ class Lowerer:
         self.emit(HeapInit(slot, ARENA_BYTES))
         return Value(PointerType(VOID), IntLoad(slot))
 
+    def file_builtin(self, node: Call) -> Value:
+        """One file syscall, with the kernel's own answer handed back.
+
+        These are what <stdio.h>'s FILE layer and <filesystem> are written on
+        top of, in C - the same arrangement as the allocator. A failure comes
+        back as a negative errno rather than through anything hidden, because
+        that is what the kernel returns and there is nowhere else to put it.
+
+        POSIX only: the syscalls are the interface. Windows has handles and
+        a different set of calls, and the headers reach those through the
+        imports <windows.h> declares - which is why they are written with
+        `#ifdef _WIN32` rather than pretending one shape fits both.
+        """
+
+        kind, arity = _FILE_BUILTINS[node.name]
+        if self.target.startswith("windows-"):
+            self.error(
+                f"{node.name}() is a POSIX system call, and Windows has no "
+                "such thing to make. py2bin's own headers use the functions "
+                "<windows.h> imports there instead; code calling this "
+                "directly needs the same `#ifdef _WIN32`",
+                node.token,
+            )
+        if len(node.arguments) != arity:
+            self.error(
+                f"{node.name}() takes exactly {arity} argument(s)", node.token
+            )
+        arguments = []
+        for argument in node.arguments:
+            value = self.rvalue(argument)
+            if not is_integer(value.ctype) and not isinstance(
+                value.ctype, PointerType
+            ):
+                self.error(
+                    f"{node.name}() takes integers and pointers, not "
+                    f"{value.ctype}",
+                    argument.token,
+                )
+            arguments.append(value.expr)
+        slot = self.take(8)
+        self.emit(FileCall(kind, slot, tuple(arguments)))
+        return Value(LONG, IntLoad(slot))
+
     def exit_builtin(self, node: Call) -> None:
         """`exit(status)` and `abort()`: stop the process, here and now.
 
@@ -4104,6 +4164,8 @@ class Lowerer:
                 return self.math_builtin(node)
         if node.name == "__py2bin_arena" and node.name not in self.unit.functions:
             return self.arena_builtin(node)
+        if node.name in _FILE_BUILTINS and node.name not in self.unit.functions:
+            return self.file_builtin(node)
         if node.name in _EXIT_BUILTINS and node.name not in self.unit.functions:
             self.exit_builtin(node)
             # `exit` does not come back, and C says its type is void. A caller

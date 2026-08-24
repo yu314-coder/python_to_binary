@@ -1348,6 +1348,111 @@ extern int MessageBoxA(HWND, LPCSTR, LPCSTR, UINT);
 extern int MessageBoxW(HWND, LPCWSTR, LPCWSTR, UINT);
 extern int GetSystemMetrics(int);
 extern BOOL MessageBeep(UINT);
+extern BOOL CreateDirectoryA(LPCSTR, LPVOID);
+extern BOOL RemoveDirectoryA(LPCSTR);
+extern BOOL MoveFileA(LPCSTR, LPCSTR);
+extern DWORD GetFileAttributesA(LPCSTR);
+extern DWORD SetFilePointer(HANDLE, LONG, LPVOID, DWORD);
+extern DWORD GetCurrentDirectoryA(DWORD, LPSTR);
+
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#define FILE_ATTRIBUTE_DIRECTORY 0x00000010
+#define FILE_BEGIN 0
+#define FILE_CURRENT 1
+#define FILE_END 2
+"""
+
+#: The platform half of <filesystem>, in C. It lives here rather than in the
+#: C++ header because `#ifdef` is read by *this* preprocessor, and the C++
+#: translator runs before it - a `#ifdef _WIN32` written in a C++ header is
+#: still there when the translator reads the file, and it sees both branches.
+#: So the C++ side is the `path` class and nothing conditional, and every
+#: question that depends on the platform is asked here.
+_PY2BIN_FS_H = """
+#ifdef _WIN32
+#include <windows.h>
+
+int __py2bin_fs_exists(const char *__p) {
+    return GetFileAttributesA(__p) != INVALID_FILE_ATTRIBUTES;
+}
+
+int __py2bin_fs_is_directory(const char *__p) {
+    unsigned int __held = GetFileAttributesA(__p);
+    if (__held == INVALID_FILE_ATTRIBUTES) { return 0; }
+    return (__held & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+long __py2bin_fs_size(const char *__p) {
+    void *__handle;
+    unsigned int __held;
+    __handle = CreateFileA(__p, GENERIC_READ, FILE_SHARE_READ, 0,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (__handle == INVALID_HANDLE_VALUE) { return -1; }
+    __held = GetFileSize(__handle, 0);
+    CloseHandle(__handle);
+    return (long)__held;
+}
+
+int __py2bin_fs_mkdir(const char *__p) { return CreateDirectoryA(__p, 0) != 0; }
+int __py2bin_fs_rmdir(const char *__p) { return RemoveDirectoryA(__p) != 0; }
+int __py2bin_fs_unlink(const char *__p) { return DeleteFileA(__p) != 0; }
+int __py2bin_fs_rename(const char *__a, const char *__b) {
+    return MoveFileA(__a, __b) != 0;
+}
+int __py2bin_fs_cwd(char *__into, int __room) {
+    return (int)GetCurrentDirectoryA((unsigned int)__room, __into);
+}
+
+#else
+
+int __py2bin_fs_exists(const char *__p) {
+    return __py2bin_access(__p, 0) == 0;
+}
+
+int __py2bin_fs_is_directory(const char *__p) {
+    long __fd;
+    long __back;
+    char __probe[1];
+    __fd = __py2bin_open(__p, 0, 0);
+    if (__fd < 0) { return 0; }
+    /* Reading a directory descriptor fails - EISDIR on Linux, EINVAL on
+       macOS - and reading a file of any kind does not. That is enough to
+       tell them apart without reading a `struct stat`, whose layout differs
+       between the platforms this has to work on and between architectures
+       on one of them. An empty file reads zero bytes, which is not a
+       failure, so the test is on the sign and not on the count. */
+    __back = __py2bin_read(__fd, __probe, 1);
+    __py2bin_close(__fd);
+    return __back < 0;
+}
+
+long __py2bin_fs_size(const char *__p) {
+    long __fd;
+    long __size;
+    __fd = __py2bin_open(__p, 0, 0);
+    if (__fd < 0) { return -1; }
+    __size = __py2bin_lseek(__fd, 0, 2);
+    __py2bin_close(__fd);
+    return __size;
+}
+
+int __py2bin_fs_mkdir(const char *__p) {
+    return __py2bin_mkdir(__p, 0755) == 0;
+}
+int __py2bin_fs_rmdir(const char *__p) { return __py2bin_rmdir(__p) == 0; }
+int __py2bin_fs_unlink(const char *__p) { return __py2bin_unlink(__p) == 0; }
+int __py2bin_fs_rename(const char *__a, const char *__b) {
+    return __py2bin_rename(__a, __b) == 0;
+}
+int __py2bin_fs_cwd(char *__into, int __room) {
+    /* No getcwd syscall is wired, and the one that exists differs enough
+       between the kernels to be worth leaving alone. `.` is what a relative
+       path is resolved against, which is the answer callers use it for. */
+    if (__room > 1) { __into[0] = '.'; __into[1] = 0; return 1; }
+    return 0;
+}
+
+#endif
 """
 
 _CTYPE_H = """
@@ -1671,6 +1776,7 @@ _BUILTIN_HEADERS = {
     "string.h": _STRING_H,
     "ctype.h": _CTYPE_H,
     "windows.h": _WINDOWS_H,
+    "py2bin_fs.h": _PY2BIN_FS_H,
     "assert.h": _ASSERT_H,
     "float.h": _FLOAT_H,
     "stddef.h": "#define NULL ((void *)0)\n",

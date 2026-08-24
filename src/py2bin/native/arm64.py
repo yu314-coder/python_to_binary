@@ -775,21 +775,13 @@ def _darwin_encode(
     return _encode(
         module,
         code_address,
+        _DARWIN_SYSCALLS,
         image_statics=image_statics,
         # Measured rather than assumed: macOS hands the count and the vector
         # to the entry point in X0 and X1, for a static LC_UNIXTHREAD image as
         # well as for a dynamic one dyld calls like a C main. Linux is the
         # kernel that leaves them on the stack.
         entry_gets_registers=True,
-        write_number=4,
-        exit_number=1,
-        mmap_number=197,
-        mmap_flags=0x1002,  # MAP_ANON | MAP_PRIVATE
-        svc=0xD4001001,
-        open_number=5,
-        read_number=3,
-        close_number=6,
-        errors_use_carry=True,
     )
 
 
@@ -812,33 +804,14 @@ def _linux_encode(
     return _encode(
         module,
         code_address,
+        _LINUX_SYSCALLS,
         image_statics=image_statics,
-        write_number=64,
-        exit_number=93,
-        mmap_number=222,
-        mmap_flags=0x22,
-        svc=0xD4000001,
-        open_number=56,
-        read_number=63,
-        close_number=57,
-        open_takes_dirfd=True,
     )
 
 
 def encode_linux(module: Module, code_address: int) -> bytes:
     code, externs, _statics = _encode(
-        module,
-        code_address,
-        write_number=64,
-        exit_number=93,
-        mmap_number=222,
-        mmap_flags=0x22,  # MAP_PRIVATE | MAP_ANONYMOUS
-        svc=0xD4000001,
-        # There is no plain open on this kernel, only openat.
-        open_number=56,
-        read_number=63,
-        close_number=57,
-        open_takes_dirfd=True,
+        module, code_address, _LINUX_SYSCALLS
     )
     if externs:
         raise ValueError("external symbol calls are not supported for linux-arm64")
@@ -1156,10 +1129,30 @@ class _Syscalls:
     #: open/read/close, and whether open takes a leading directory descriptor.
     #: Linux arm64 has no plain open at all, only openat, so the two kernels
     #: differ in arity and not just in numbering.
-    open_number: int = 0
-    read_number: int = 0
-    close_number: int = 0
+    #: None where the kernel has no such call. Not 0: `read` on linux-x86_64
+    #: *is* syscall 0, and a falsy test read that as "not available" - which
+    #: needed a special case for `read` alone, and would have needed another
+    #: for every syscall that happens to be numbered zero somewhere.
+    open_number: "int | None" = None
+    read_number: "int | None" = None
+    close_number: "int | None" = None
     open_takes_dirfd: bool = False
+    #: Everything below is a file operation whose arguments are integers and
+    #: pointers only - no kernel struct is read, because the layout of one
+    #: differs between platforms and between architectures, and py2bin can run
+    #: a binary for exactly one of them here. `stat` is deliberately absent
+    #: for that reason; what needs it is refused instead.
+    lseek_number: "int | None" = None
+    mkdir_number: "int | None" = None
+    rmdir_number: "int | None" = None
+    unlink_number: "int | None" = None
+    rename_number: "int | None" = None
+    access_number: "int | None" = None
+    #: Linux arm64 has no legacy path syscalls at all - only the `*at` forms,
+    #: which take a leading directory descriptor, and which fold rmdir into
+    #: unlinkat with a flag. So the kernels differ in arity and in count, not
+    #: just in numbering.
+    paths_take_dirfd: bool = False
     #: Darwin reports a failed syscall by setting the carry flag and leaving a
     #: positive errno behind; Linux returns -errno. A small positive number is
     #: a perfectly good file descriptor, so the two cannot be told apart by the
@@ -1173,6 +1166,48 @@ class _Syscalls:
         return 8 if self.svc == 0xD4000001 else 16
 
 
+_DARWIN_SYSCALLS = _Syscalls(
+    write_number=4,
+    exit_number=1,
+    mmap_number=197,
+    mmap_flags=0x1002,  # MAP_ANON | MAP_PRIVATE
+    svc=0xD4001001,
+    open_number=5,
+    read_number=3,
+    close_number=6,
+    # BSD numbers, which macOS keeps from its 4.4BSD ancestry.
+    lseek_number=199,
+    mkdir_number=136,
+    rmdir_number=137,
+    unlink_number=10,
+    rename_number=128,
+    access_number=33,
+    errors_use_carry=True,
+)
+
+#: Linux arm64 is a "new" architecture: no legacy path syscalls at all, only
+#: the `*at` forms, and rmdir is unlinkat with a flag. So the two kernels
+#: differ in arity and in count, not just in numbering.
+_LINUX_SYSCALLS = _Syscalls(
+    write_number=64,
+    exit_number=93,
+    mmap_number=222,
+    mmap_flags=0x22,
+    svc=0xD4000001,
+    open_number=56,   # openat
+    read_number=63,
+    close_number=57,
+    open_takes_dirfd=True,
+    lseek_number=62,
+    mkdir_number=34,   # mkdirat
+    rmdir_number=35,   # unlinkat with AT_REMOVEDIR
+    unlink_number=35,  # unlinkat
+    rename_number=38,  # renameat
+    access_number=48,  # faccessat
+    paths_take_dirfd=True,
+)
+
+
 def _file_call_shape(operation, system) -> tuple[int, tuple]:
     """The syscall number and the argument list the kernel expects."""
 
@@ -1181,9 +1216,15 @@ def _file_call_shape(operation, system) -> tuple[int, tuple]:
         "read": system.read_number,
         "write": system.write_number,
         "close": system.close_number,
+        "lseek": system.lseek_number,
+        "mkdir": system.mkdir_number,
+        "rmdir": system.rmdir_number,
+        "unlink": system.unlink_number,
+        "rename": system.rename_number,
+        "access": system.access_number,
     }
-    number = numbers.get(operation.kind, 0)
-    if not number:
+    number = numbers.get(operation.kind)
+    if number is None:
         raise ValueError(
             f"file operation {operation.kind!r} is not available on this target"
         )
@@ -1192,7 +1233,23 @@ def _file_call_shape(operation, system) -> tuple[int, tuple]:
         # AT_FDCWD, so a relative path is resolved against the working
         # directory exactly as plain open() would resolve it.
         arguments = (IntConstant(-100), *arguments)
+    elif system.paths_take_dirfd and operation.kind in _AT_FORMS:
+        # The same AT_FDCWD, and for rmdir the flag that makes unlinkat
+        # remove a directory rather than a name.
+        if operation.kind == "rmdir":
+            arguments = (IntConstant(-100), *arguments, IntConstant(0x200))
+        elif operation.kind == "unlink":
+            arguments = (IntConstant(-100), *arguments, IntConstant(0))
+        elif operation.kind == "rename":
+            old, new = arguments
+            arguments = (IntConstant(-100), old, IntConstant(-100), new)
+        else:
+            arguments = (IntConstant(-100), *arguments)
     return number, arguments
+
+
+#: The operations linux-arm64 spells with a leading directory descriptor.
+_AT_FORMS = frozenset({"mkdir", "rmdir", "unlink", "rename", "access"})
 
 
 def _emit_operations(
@@ -1430,16 +1487,7 @@ def _emit_static_block(words: list[int], size: int, system: _Syscalls) -> None:
 def _encode(
     module: Module,
     code_address: int,
-    write_number: int,
-    exit_number: int,
-    mmap_number: int,
-    mmap_flags: int,
-    svc: int,
-    open_number: int = 0,
-    read_number: int = 0,
-    close_number: int = 0,
-    open_takes_dirfd: bool = False,
-    errors_use_carry: bool = False,
+    system: "_Syscalls",
     entry_gets_registers: bool = False,
     image_statics: bool = False,
 ) -> tuple[bytes, list[tuple[int, str]], list[tuple[int, int]]]:
@@ -1451,18 +1499,6 @@ def _encode(
     the static-address sites as ``(byte_offset_in_text, static offset)`` pairs
     (empty unless ``image_statics`` puts static storage in the image).
     """
-    system = _Syscalls(
-        write_number,
-        exit_number,
-        mmap_number,
-        mmap_flags,
-        svc,
-        open_number,
-        read_number,
-        close_number,
-        open_takes_dirfd,
-        errors_use_carry,
-    )
     entry_frame = _frame_bytes(module.stack_slots)
     words: list[int] = list(_frame_sub(entry_frame))
     words.append(0x910003FD)  # mov x29, sp

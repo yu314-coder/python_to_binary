@@ -274,6 +274,18 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     ),
     "GetSystemMetrics": ("GetSystemMetrics", ("int",), "int", "USER32.dll"),
     "MessageBeep": ("MessageBeep", ("int",), "int", "USER32.dll"),
+    # What <filesystem> and <stdio.h>'s FILE layer reach for on Windows,
+    # where there are no syscalls to make and these are the interface.
+    "CreateDirectoryA": ("CreateDirectoryA", ("ptr", "ptr"), "int", "KERNEL32.dll"),
+    "RemoveDirectoryA": ("RemoveDirectoryA", ("ptr",), "int", "KERNEL32.dll"),
+    "MoveFileA": ("MoveFileA", ("ptr", "ptr"), "int", "KERNEL32.dll"),
+    "GetFileAttributesA": ("GetFileAttributesA", ("ptr",), "int", "KERNEL32.dll"),
+    "SetFilePointer": (
+        "SetFilePointer", ("ptr", "int", "ptr", "int"), "int", "KERNEL32.dll",
+    ),
+    "GetCurrentDirectoryA": (
+        "GetCurrentDirectoryA", ("int", "ptr"), "int", "KERNEL32.dll",
+    ),
 }
 
 _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
