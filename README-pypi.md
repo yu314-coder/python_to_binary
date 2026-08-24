@@ -228,7 +228,7 @@ unwinder, so a call that can throw gets a statement of its own - one behind
 would run at the wrong time.
 
 It is checked by building `tools/cpp_corpus/` twice, once with py2bin and once
-with `clang++`, and comparing the output: 71 programs, all agreeing. clang++ is
+with `clang++`, and comparing the output: 76 programs, all agreeing. clang++ is
 the yardstick there and never a dependency.
 
 ### C, and a project of several files
@@ -247,8 +247,10 @@ the mistake is in. `py2bin make` offers a `.c` program the same way it offers
 a `.py` one.
 
 py2bin's C compiler implements C and ships its own standard headers, with no
-system include path; `<stdlib.h>` brings a real `malloc`, written in C on top
-of one primitive the compiler provides. **C++ is translated to C** rather than
+system include path. The ones with functions in them - `string.h`, `ctype.h`,
+`math.h`, and the allocator in `stdlib.h` - are written in C and compiled like
+any other source. Text is UTF-8, and `L"..."`, `u"..."`, `U"..."` and
+`u8"..."` all work, with `wchar_t` as wide as the target says it is. **C++ is translated to C** rather than
 compiled - see above.
 
 There is an npm wrapper, so a Node project can reach the same thing:
@@ -1261,4 +1263,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 804. What is checked on every change is the 1940-test suite.
+    is 804. What is checked on every change is the 1947-test suite.

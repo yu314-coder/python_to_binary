@@ -173,6 +173,70 @@ class NoExternalToolchainTests(unittest.TestCase):
         self.assertEqual(finished.returncode, 0, finished.stderr)
         self.assertEqual(finished.stdout.strip(), "[]", finished.stdout)
 
+    def test_compiling_cpp_needs_nothing_but_python_either(self):
+        """The same question, asked of the C++ path and the headers it uses.
+
+        C++ is translated to C by py2bin and compiled by py2bin, and the
+        standard headers it includes are C source py2bin compiles like any
+        other - so nothing here should reach for a toolchain either. Asked
+        separately from the check above because it is a different path
+        through the compiler, and "no toolchain" is a claim about all of it.
+        """
+
+        import subprocess
+        import sys
+        import tempfile
+
+        program = (
+            "#include <iostream>\n"
+            "#include <vector>\n"
+            "#include <algorithm>\n"
+            "#include <string>\n"
+            "#include <stdexcept>\n"
+            "#include <string.h>\n"
+            "template<typename T> T twice(T v) { return v + v; }\n"
+            "class Base { public: virtual int tag() { return 1; } "
+            "virtual ~Base() { } };\n"
+            "class Sub : public Base { public: int tag() { return 2; } };\n"
+            "int risky(int n) { if (n < 0) throw std::runtime_error(\"no\"); "
+            "return n; }\n"
+            "int main() {\n"
+            "  std::vector<int> v; v.push_back(3); v.push_back(1);\n"
+            "  std::sort(v.begin(), v.end());\n"
+            "  Base *b = new Sub;\n"
+            "  const wchar_t *w = L\"wide\";\n"
+            "  char buf[8]; strcpy(buf, \"hi\");\n"
+            "  try { risky(-1); } catch (std::exception &e) "
+            "{ std::cout << e.what() << std::endl; }\n"
+            "  std::cout << v[0] << b->tag() << twice(2) << buf << (int)w[0]"
+            " << std::endl;\n"
+            "  delete b; return 0;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            probe = (
+                "import sys, pathlib\n"
+                "from py2bin.c_native import compile_c_native\n"
+                f"root = pathlib.Path({directory!r})\n"
+                f"(root / 'p.cpp').write_text({program!r})\n"
+                "compile_c_native(root / 'p.cpp', root / 'p.bin', "
+                "target='darwin-arm64', clean=True)\n"
+                "print(sorted(name for name in sys.modules "
+                "if name.split('.')[0] in {'ctypes', '_ctypes', 'subprocess'}))\n"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(
+                Path(__file__).resolve().parents[1] / "src"
+            )
+            finished = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(finished.stdout.strip(), "[]", finished.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

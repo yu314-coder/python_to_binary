@@ -474,12 +474,13 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
 
 
 
-#: `v.begin()` or `p->size()` - a call on something, taking nothing.
+#: `v.begin()` or `p->at(3)` - a call on something. The arguments do not
+#: matter: what a member returns is a property of the member.
 _MEMBER_CALL = re.compile(
-    r"^([A-Za-z_]\w*)\s*(?:\.|->)\s*([A-Za-z_]\w*)\s*\(\s*\)$"
+    r"^([A-Za-z_]\w*)\s*(?:\.|->)\s*([A-Za-z_]\w*)\s*\(.*\)$", re.S
 )
-#: `f()` - a plain call, taking nothing.
-_PLAIN_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\(\s*\)$")
+#: `f()` or `f(1, 2)` - a plain call.
+_PLAIN_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\(.*\)$", re.S)
 
 
 def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | None":
@@ -501,6 +502,24 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
         if held is None or "*" not in held:
             return None
         return held[::-1].replace("*", "", 1)[::-1].strip()
+    dispatched = _DISPATCHED.match(spelled)
+    if dispatched is not None:
+        # A virtual call, as this translator writes one: a read from the
+        # object's table, cast to the shape of the function and called. The
+        # cast says what it returns, which is the only part wanted here.
+        return dispatched.group(1).strip()
+    cast = _CAST.match(spelled)
+    if cast is not None and _names_a_type(cast.group(1)):
+        # `(int)x` is an int, whatever x was. This is also the escape hatch
+        # the diagnostics point at: a cast says what something is where
+        # nothing else does.
+        return cast.group(1).strip()
+    indexed = _INDEXED.match(spelled)
+    if indexed is not None:
+        held = _deduced_type(indexed.group(1).strip(), text, before)
+        if held is not None and "*" in held:
+            return held[::-1].replace("*", "", 1)[::-1].strip()
+        return None
     # `raw + 8` is where `raw` points, moved along: the same type.
     walked = re.match(r"^(.+?)\s*[+-]\s*[^+-]+$", spelled)
     if walked is not None:
@@ -508,6 +527,33 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
         if held is not None:
             return held
     return _deduced_from_call(spelled, text, before)
+
+
+#: `((int (*)(struct Base *))(p->__vptr[0]))(p)` - a virtual call, spelled
+#: the way this translator spells one. The cast names the return type.
+_DISPATCHED = re.compile(r"^\(\(\s*(.+?)\s*\(\s*\*\s*\)\s*\(", re.S)
+
+#: `(int)x`, `(const char *)p` - a cast, which says what something is.
+_CAST = re.compile(r"^\(\s*((?:const\s+)?[A-Za-z_]\w*(?:\s*\*)*)\s*\)\s*(.+)$", re.S)
+#: `a[i]`, whatever `a` is.
+_INDEXED = re.compile(r"^(.+)\[[^\]]*\]$", re.S)
+
+#: The words a cast's contents may begin with for it to be a cast rather than
+#: a call through a pointer. A `*` settles it on its own; otherwise the name
+#: has to be one this translator knows is a type.
+_TYPE_WORDS = frozenset(
+    """void char short int long float double signed unsigned _Bool bool
+    wchar_t char16_t char32_t size_t""".split()
+)
+
+
+def _names_a_type(spelled: str) -> bool:
+    if "*" in spelled:
+        return True
+    words = spelled.replace("const", "").split()
+    if not words:
+        return False
+    return words[0] in _TYPE_WORDS or words[0] in _CLASS_NAMES
 
 
 def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
@@ -2090,6 +2136,30 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
     return "\n".join(lines)
 
 
+def _method_declarations(
+    order: "list[str]", classes: "dict[str, Class]"
+) -> str:
+    """Every method's emitted C signature, as text something can read.
+
+    Deduction works by finding where a name was declared, and a method's C
+    name is declared nowhere the file can see - it is made by the emitter.
+    Without this, `cout << v[0]` could not be resolved: `v[0]` is a call to
+    `vector__int__op_index`, and nothing said what that returns.
+
+    The bodies are empty because nothing runs this; it is a table with the
+    shape of code so that the same reader can read it.
+    """
+
+    lines: list[str] = []
+    for name in order:
+        for method in classes[name].methods:
+            if method.name in ("", "~"):
+                continue
+            spelled = _c_name(name, method.name, _suffix_of(name, method, classes))
+            result, parameters = _c_signature(name, method, classes)
+            lines.append(f"{result.replace('&', '*')} {spelled}({parameters}) {{ }}")
+    return "\n".join(lines)
+
 def _emit_methods(found: Class, classes: "dict[str, Class]", unit: str = "") -> str:
     out = []
     for method in found.methods:
@@ -3117,6 +3187,13 @@ def _rewrite_value_operators(
         name = _OPERATOR_NAMES[symbol]
         if symbol in ("[]", "()", "="):
             continue
+        if symbol in ("<<", ">>"):
+            # Streams are chains, and a chain is read whole by
+            # `_rewrite_stream_chains`. This pass matches a *bare name* on the
+            # right, so it turned `cout << a[0]` into a call taking `a` and
+            # left `[0]` hanging - and it ran first, so the chain pass never
+            # saw the statement at all.
+            continue
         pattern = re.compile(
             rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*"
             rf"{re.escape(symbol)}\s*([A-Za-z_]\w*)\s*;"
@@ -3301,6 +3378,13 @@ def _rewrite_operators(
     for symbol in _OPERATOR_SYMBOLS:
         if symbol in ("[]", "()", "="):
             continue  # spelled differently; handled below
+        if symbol in ("<<", ">>"):
+            # Streams are chains, and a chain is read whole by
+            # `_rewrite_stream_chains`. This pass matches a *bare name* on the
+            # right, so it turned `cout << a[0]` into a call taking `a` and
+            # left `[0]` hanging - and it ran first, so the chain pass never
+            # saw the statement at all.
+            continue
         name = _OPERATOR_NAMES[symbol]
         for variable in sorted(known, key=len, reverse=True):
             owner = _find_method(known[variable], name, classes)
@@ -4060,15 +4144,20 @@ def translate(source: str, filename: str = "<c++>") -> str:
     tables = _emit_vtables(order, classes)
     if tables:
         declarations += "\n" + tables
+    made = _file_scope_objects(remainder, classes)
+    remainder = _construct_before_main(remainder, made, classes)
+    # What every body may need to look up: the file, plus the shapes of the
+    # methods the emitter is about to write. A method's C name is declared
+    # nowhere the file can see, so without this `cout << v[0]` had no way to
+    # find out what `v[0]` - a call to `vector__int__op_index` - returns.
+    scope = remainder + "\n" + _method_declarations(order, classes)
     definitions = "\n".join(
-        _emit_methods(classes[name], classes, remainder) for name in order
+        _emit_methods(classes[name], classes, scope) for name in order
     )
     remainder = _address_reference_arguments(
         remainder, _function_signatures(remainder)
     )
-    made = _file_scope_objects(remainder, classes)
-    remainder = _construct_before_main(remainder, made, classes)
-    rewritten = _rewrite_functions(remainder, classes, made, remainder)
+    rewritten = _rewrite_functions(remainder, classes, made, scope)
     head = "\n".join(directives)
     if throws:
         head = f"{_EXCEPTION_STATE}{head}"
@@ -4986,7 +5075,7 @@ _BUILTIN_CPP_HEADERS = {
     "utility": _UTILITY_HEADER,
     "numeric": _NUMERIC_HEADER,
     "stdexcept": _STDEXCEPT_HEADER,
-    "cassert": "#define assert(condition) ((void)0)\n",
+    "cassert": "#include <assert.h>\n",
     "climits": "#include <limits.h>\n",
     "cfloat": "#include <float.h>\n",
     "cctype": "#include <ctype.h>\n",

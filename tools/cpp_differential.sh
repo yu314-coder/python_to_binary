@@ -14,9 +14,15 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PASS=0; FAIL=0; REFUSED=0
 for source in "$(dirname "$0")"/cpp_corpus/*.cpp; do
     name=$(basename "$source" .cpp)
+    # c++03 first, because that is the shape of the subset; c++11 for the
+    # programs whose feature only exists there - `char16_t` and `u"..."` are
+    # not C++03 at all, so a reference for them has to be asked for in a
+    # standard that has them.
     if ! clang++ -std=c++03 -w -o "/tmp/ref_$name" "$source" 2>/dev/null; then
-        printf "  %-28s reference did not build - skipped\n" "$name"
-        continue
+        if ! clang++ -std=c++11 -w -o "/tmp/ref_$name" "$source" 2>/dev/null; then
+            printf "  %-28s reference did not build - skipped\n" "$name"
+            continue
+        fi
     fi
     want=$("/tmp/ref_$name" 2>&1); wantcode=$?
     got=$(PYTHONPATH="$ROOT/src" python3 -m py2bin cc \

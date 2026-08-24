@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,940 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,947 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -454,10 +454,13 @@ real file and line rather than guessed at.
 with it, and an `include/` directory beside it is searched.
 
 **What it is not.** py2bin's C compiler implements C and ships its own copies
-of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `math.h`,
-`stdint.h`, `inttypes.h`, `limits.h`, `stddef.h`, `stdbool.h`). It has no
-system include path - a real system header uses compiler extensions this does
-not implement. **C++ is translated to C** rather than compiled:
+of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `ctype.h`,
+`math.h`, `assert.h`, `wchar.h`, `uchar.h`, `stdint.h`, `inttypes.h`,
+`limits.h`, `float.h`, `stddef.h`, `stdbool.h`). The ones with functions in
+them - `string.h`, `ctype.h`, `math.h`, the allocator in `stdlib.h` - are
+written in C and compiled like any other source, so they can be read rather
+than taken on trust. It has no system include path: a real system header uses
+compiler extensions this does not implement. **C++ is translated to C** rather than compiled:
 classes, inheritance, `virtual`, references, templates, overloading, `new`,
 exceptions, and py2bin's own `<string>`, `<vector>` and `<iostream>` - see
 [C++, translated to C](#c-translated-to-c).
@@ -500,6 +503,15 @@ its own standard headers and has no system include path, so `#include
 had. `<stdlib.h>` brings a real `malloc`, written in C on top of one primitive
 the compiler provides, so it can be read rather than taken on trust; it is an
 arena, and `free` keeps its promise not to touch what you hand it.
+
+**Text is UTF-8, and the wide literals mean what the platform means.** A
+character above 127 written in a source file goes into a plain literal as the
+UTF-8 it already was. `L"..."` becomes `wchar_t`, which is four bytes on
+POSIX and two on Windows - so a character outside the basic plane becomes a
+surrogate pair there, which is what makes Windows' `wchar_t` different rather
+than merely narrower. `u"..."` and `U"..."` are UTF-16 and UTF-32 whatever
+the target, `u8"..."` is UTF-8, and `\xFF` still names the byte while
+`\u00ff` names the character.
 
 ### C++, translated to C
 
@@ -576,7 +588,7 @@ differ only in types py2bin cannot read are refused rather than guessed at.
 **How it is checked.** Reading the generated C tells you it is well formed and
 nothing about whether it *means* the same thing — so the corpus in
 `tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it, over 71 programs,
+the outputs compared. `tools/cpp_differential.sh` runs it, over 76 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1677,9 +1689,12 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1840 tests, no dependencies, nothing to install. Five modules want pytest's
+1847 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1940. The suite fails if any module under `src/` imports
+too, for 1947. Two of them compile a program in a *fresh interpreter* and
+assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
+afterwards - one through the Python path, one through the C++ one. "No
+toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
 `subprocess`, `multiprocessing`, `pty`, `distutils` or `setuptools`, or names
 an external toolchain as a value - which is what keeps the zero-toolchain
 claim honest rather than aspirational.
@@ -1691,4 +1706,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1940-test suite.
+    is checked on every change is the 1947-test suite.

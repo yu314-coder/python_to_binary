@@ -4065,3 +4065,110 @@ class CcCommandTests(unittest.TestCase):
             main(["cc", str(entry), "--os", "linux", "--arch", "aarch64",
                   "-o", str(root / "out")])
             self.assertEqual((root / "out").read_bytes()[:4], b"\x7fELF")
+
+
+class WideAndUnicodeLiterals(unittest.TestCase):
+    """`L"..."`, `u"..."`, `U"..."` and `u8"..."`, and UTF-8 in a plain one.
+
+    What a code unit is depends on the target - `wchar_t` is two bytes on
+    Windows and four everywhere else - so the literal is carried as code
+    points and encoded where the target is known.
+    """
+
+    def _bytes(self, source: str, target: str = "darwin-arm64") -> bytes:
+        from py2bin.native.ir import CStringConstant
+
+        module = compile_c_to_ir(source, "t.c", target)
+        found = []
+
+        def walk(item):
+            if isinstance(item, CStringConstant):
+                found.append(item.data)
+                return
+            for name in getattr(item, "__slots__", ()) or ():
+                walk(getattr(item, name, None))
+            if isinstance(item, (list, tuple)):
+                for part in item:
+                    walk(part)
+
+        for operation in module.operations:
+            walk(operation)
+        for function in module.functions:
+            for operation in function.operations:
+                walk(operation)
+        return b"".join(found)
+
+    def test_a_plain_literal_carries_the_utf8_the_source_held(self) -> None:
+        """A source character above 127 used to be refused outright.
+
+        `escape` returned one byte, so `é` - which is two bytes of UTF-8 in
+        the file - had nowhere to go and the literal was rejected.
+        """
+
+        out = self._bytes(
+            _STDIO + 'int main(void) { const char *s = "hé"; return s[0]; }\n'
+        )
+        self.assertIn("hé".encode("utf-8") + b"\0", out)
+
+    def test_wchar_is_four_bytes_off_windows_and_two_on_it(self) -> None:
+        source = _STDIO + 'int main(void) { const wchar_t *s = L"AB"; return s[0]; }\n'
+        self.assertIn(
+            (0x41).to_bytes(4, "little") + (0x42).to_bytes(4, "little") + b"\0" * 4,
+            self._bytes(source, "linux-x86_64"),
+        )
+        self.assertIn(
+            (0x41).to_bytes(2, "little") + (0x42).to_bytes(2, "little") + b"\0" * 2,
+            self._bytes(source, "windows-x86_64"),
+        )
+
+    def test_a_character_outside_the_basic_plane_becomes_a_surrogate_pair(
+        self,
+    ) -> None:
+        """Which is what makes Windows' wchar_t different, not merely narrow."""
+
+        out = self._bytes(
+            _STDIO + 'int main(void) { const wchar_t *s = L"\\U0001F600"; return 0; }\n',
+            "windows-arm64",
+        )
+        self.assertIn(bytes.fromhex("3dd800de"), out)
+
+    def test_the_prefixes_pick_their_own_widths(self) -> None:
+        for prefix, width in (("u", 2), ("U", 4)):
+            with self.subTest(prefix=prefix):
+                out = self._bytes(
+                    _STDIO
+                    + f'int main(void) {{ const char{width * 8}_t *s = {prefix}"A";'
+                    " return 0; }\n"
+                )
+                self.assertIn((0x41).to_bytes(width, "little") + b"\0" * width, out)
+
+    def test_an_escape_stays_a_byte_and_a_character_does_not(self) -> None:
+        """`\\xFF` names the byte 0xFF; `\\u00ff` names the character.
+
+        Conflating them is what made a source character unrepresentable, and
+        keeping them apart is what lets both mean what C says they mean.
+        """
+
+        out = self._bytes(
+            _STDIO + 'int main(void) { const char *s = "\\xFF\\u00ff"; return 0; }\n'
+        )
+        self.assertIn(b"\xff" + "ÿ".encode("utf-8") + b"\0", out)
+
+
+class ExitBuiltins(unittest.TestCase):
+    def test_exit_stops_the_program_from_anywhere(self) -> None:
+        from py2bin.native.ir import ExitValue
+
+        module = compile_c_to_ir(
+            _STDIO + "void stop(void) { exit(3); }\n"
+            "int main(void) { stop(); return 0; }\n",
+            "t.c",
+            "darwin-arm64",
+        )
+        found = [
+            operation
+            for function in module.functions
+            for operation in function.operations
+            if isinstance(operation, ExitValue)
+        ]
+        self.assertTrue(found, "exit() inside a function emitted nothing")

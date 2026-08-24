@@ -264,12 +264,39 @@ def _scan(source: str, origin: str) -> list[list[PPToken]]:
                 index += 1
             name = text[start:index]
             if name in {"L", "u", "U", "u8"} and index < total and text[index] in "'\"":
-                raise CCompileError(
-                    origin,
-                    line,
-                    column,
-                    "wide and Unicode string/character literals are not supported",
+                # A prefix belongs to the literal, not to an identifier that
+                # happens to sit next to one. Kept in the spelling and handed
+                # on whole: the compiler's own lexer reads the prefix again
+                # and decides what the literal means, which is where knowing
+                # the target - and so how wide a wchar_t is - belongs.
+                quote = text[index]
+                index += 1
+                while index < total and text[index] != quote:
+                    if text[index] == "\n":
+                        break
+                    index += 2 if text[index] == "\\" else 1
+                if index >= total or text[index] != quote:
+                    raise CCompileError(
+                        origin,
+                        line,
+                        column,
+                        "unterminated string literal"
+                        if quote == '"'
+                        else "unterminated character constant",
+                    )
+                index += 1
+                current.append(
+                    PPToken(
+                        "string" if quote == '"' else "character",
+                        text[start:index],
+                        line,
+                        column,
+                        origin,
+                        spaced,
+                    )
                 )
+                spaced = False
+                continue
             current.append(PPToken("identifier", name, line, column, origin, spaced))
             spaced = False
             continue
@@ -1126,6 +1153,243 @@ _MATH_H = (
 )
 
 #: program that has no library behind it: the macros.
+_CTYPE_H = """
+/* The C locale, which is the only one py2bin has: these answer for ASCII and
+   say no to everything above it rather than guessing at an encoding. */
+int isdigit(int __c) { return __c >= 48 && __c <= 57; }
+int isupper(int __c) { return __c >= 65 && __c <= 90; }
+int islower(int __c) { return __c >= 97 && __c <= 122; }
+int isalpha(int __c) { return isupper(__c) || islower(__c); }
+int isalnum(int __c) { return isalpha(__c) || isdigit(__c); }
+int isspace(int __c) {
+    return __c == 32 || (__c >= 9 && __c <= 13);
+}
+int isblank(int __c) { return __c == 32 || __c == 9; }
+int ispunct(int __c) {
+    if (__c <= 32 || __c >= 127) { return 0; }
+    return !isalnum(__c);
+}
+int isprint(int __c) { return __c >= 32 && __c < 127; }
+int isgraph(int __c) { return __c > 32 && __c < 127; }
+int iscntrl(int __c) { return __c < 32 || __c == 127; }
+int isxdigit(int __c) {
+    if (isdigit(__c)) { return 1; }
+    if (__c >= 97 && __c <= 102) { return 1; }
+    return __c >= 65 && __c <= 70;
+}
+int tolower(int __c) { return isupper(__c) ? __c + 32 : __c; }
+int toupper(int __c) { return islower(__c) ? __c - 32 : __c; }
+"""
+
+_ASSERT_H = """
+#include <stdio.h>
+#include <stdlib.h>
+
+/* A real assert, not a no-op: it says which condition failed and stops.
+   py2bin cannot raise a signal, so it exits with the status a shell reports
+   for one instead of aborting. Writing it as a call rather than an `if`
+   keeps `assert(x);` a single statement wherever it is written. */
+void __py2bin_assert(int __ok, const char *__text) {
+    if (__ok) { return; }
+    printf("Assertion failed: %s\\n", __text);
+    abort();
+}
+#define assert(condition) __py2bin_assert((condition) ? 1 : 0, #condition)
+"""
+
+_FLOAT_H = """
+#define FLT_RADIX 2
+#define FLT_MANT_DIG 24
+#define FLT_DIG 6
+#define FLT_MIN_EXP (-125)
+#define FLT_MAX_EXP 128
+#define FLT_EPSILON 1.19209290e-07F
+#define FLT_MIN 1.17549435e-38F
+#define FLT_MAX 3.40282347e+38F
+#define DBL_MANT_DIG 53
+#define DBL_DIG 15
+#define DBL_MIN_EXP (-1021)
+#define DBL_MAX_EXP 1024
+#define DBL_EPSILON 2.2204460492503131e-16
+#define DBL_MIN 2.2250738585072014e-308
+#define DBL_MAX 1.7976931348623157e+308
+#define LDBL_MANT_DIG DBL_MANT_DIG
+#define LDBL_DIG DBL_DIG
+#define LDBL_EPSILON DBL_EPSILON
+#define LDBL_MIN DBL_MIN
+#define LDBL_MAX DBL_MAX
+#define DECIMAL_DIG 17
+"""
+
+_STRING_H = """
+#define NULL ((void *)0)
+
+unsigned long strlen(const char *__s) {
+    unsigned long __n = 0;
+    while (__s[__n] != 0) { __n = __n + 1; }
+    return __n;
+}
+
+int strcmp(const char *__a, const char *__b) {
+    unsigned long __i = 0;
+    while (__a[__i] != 0 && __a[__i] == __b[__i]) { __i = __i + 1; }
+    /* C fixes the sign and leaves the magnitude open; the difference is what
+       every implementation returns, so a program that prints it prints the
+       same thing here as it does anywhere else. Unsigned, because C compares
+       these as unsigned char and a plain char is signed in this dialect. */
+    return (int)(unsigned char)__a[__i] - (int)(unsigned char)__b[__i];
+}
+
+int strncmp(const char *__a, const char *__b, unsigned long __n) {
+    unsigned long __i = 0;
+    while (__i < __n) {
+        if (__a[__i] != __b[__i]) {
+            return (int)(unsigned char)__a[__i] - (int)(unsigned char)__b[__i];
+        }
+        if (__a[__i] == 0) { return 0; }
+        __i = __i + 1;
+    }
+    return 0;
+}
+
+char *strcpy(char *__to, const char *__from) {
+    unsigned long __i = 0;
+    while (__from[__i] != 0) { __to[__i] = __from[__i]; __i = __i + 1; }
+    __to[__i] = 0;
+    return __to;
+}
+
+char *strncpy(char *__to, const char *__from, unsigned long __n) {
+    unsigned long __i = 0;
+    while (__i < __n && __from[__i] != 0) { __to[__i] = __from[__i]; __i = __i + 1; }
+    /* C pads the rest with zeros and does not terminate a full copy. */
+    while (__i < __n) { __to[__i] = 0; __i = __i + 1; }
+    return __to;
+}
+
+char *strcat(char *__to, const char *__from) {
+    unsigned long __at = strlen(__to);
+    unsigned long __i = 0;
+    while (__from[__i] != 0) { __to[__at + __i] = __from[__i]; __i = __i + 1; }
+    __to[__at + __i] = 0;
+    return __to;
+}
+
+char *strncat(char *__to, const char *__from, unsigned long __n) {
+    unsigned long __at = strlen(__to);
+    unsigned long __i = 0;
+    while (__i < __n && __from[__i] != 0) {
+        __to[__at + __i] = __from[__i];
+        __i = __i + 1;
+    }
+    __to[__at + __i] = 0;
+    return __to;
+}
+
+char *strchr(const char *__s, int __c) {
+    unsigned long __i = 0;
+    while (1) {
+        if (__s[__i] == (char)__c) { return (char *)(__s + __i); }
+        if (__s[__i] == 0) { return NULL; }
+        __i = __i + 1;
+    }
+}
+
+char *strrchr(const char *__s, int __c) {
+    char *__found = NULL;
+    unsigned long __i = 0;
+    while (1) {
+        if (__s[__i] == (char)__c) { __found = (char *)(__s + __i); }
+        if (__s[__i] == 0) { return __found; }
+        __i = __i + 1;
+    }
+}
+
+char *strstr(const char *__hay, const char *__needle) {
+    unsigned long __i = 0;
+    unsigned long __j;
+    if (__needle[0] == 0) { return (char *)__hay; }
+    while (__hay[__i] != 0) {
+        __j = 0;
+        while (__needle[__j] != 0 && __hay[__i + __j] == __needle[__j]) {
+            __j = __j + 1;
+        }
+        if (__needle[__j] == 0) { return (char *)(__hay + __i); }
+        __i = __i + 1;
+    }
+    return NULL;
+}
+
+void *memcpy(void *__to, const void *__from, unsigned long __n) {
+    unsigned char *__d = (unsigned char *)__to;
+    const unsigned char *__s = (const unsigned char *)__from;
+    unsigned long __i = 0;
+    while (__i < __n) { __d[__i] = __s[__i]; __i = __i + 1; }
+    return __to;
+}
+
+void *memmove(void *__to, const void *__from, unsigned long __n) {
+    unsigned char *__d = (unsigned char *)__to;
+    const unsigned char *__s = (const unsigned char *)__from;
+    unsigned long __i;
+    /* Backwards when they overlap the wrong way, which is the whole of what
+       memmove promises over memcpy. */
+    if (__d > __s) {
+        __i = __n;
+        while (__i > 0) { __i = __i - 1; __d[__i] = __s[__i]; }
+        return __to;
+    }
+    __i = 0;
+    while (__i < __n) { __d[__i] = __s[__i]; __i = __i + 1; }
+    return __to;
+}
+
+void *memset(void *__to, int __value, unsigned long __n) {
+    unsigned char *__d = (unsigned char *)__to;
+    unsigned long __i = 0;
+    while (__i < __n) { __d[__i] = (unsigned char)__value; __i = __i + 1; }
+    return __to;
+}
+
+int memcmp(const void *__a, const void *__b, unsigned long __n) {
+    const unsigned char *__x = (const unsigned char *)__a;
+    const unsigned char *__y = (const unsigned char *)__b;
+    unsigned long __i = 0;
+    while (__i < __n) {
+        if (__x[__i] != __y[__i]) { return (int)__x[__i] - (int)__y[__i]; }
+        __i = __i + 1;
+    }
+    return 0;
+}
+"""
+
+_WCHAR_H = """
+#define NULL ((void *)0)
+#define WEOF ((wchar_t)-1)
+
+unsigned long wcslen(const wchar_t *__s) {
+    unsigned long __n = 0;
+    while (__s[__n] != 0) { __n = __n + 1; }
+    return __n;
+}
+
+int wcscmp(const wchar_t *__a, const wchar_t *__b) {
+    unsigned long __i = 0;
+    while (__a[__i] != 0 && __a[__i] == __b[__i]) { __i = __i + 1; }
+    /* C fixes the sign and leaves the magnitude open. The difference is what
+       every implementation returns, so a program that prints the result
+       prints the same thing here as it does anywhere else. */
+    return (int)__a[__i] - (int)__b[__i];
+}
+
+wchar_t *wcscpy(wchar_t *__to, const wchar_t *__from) {
+    unsigned long __i = 0;
+    while (__from[__i] != 0) { __to[__i] = __from[__i]; __i = __i + 1; }
+    __to[__i] = 0;
+    return __to;
+}
+"""
+
 _STDLIB_H = f"#define __PY2BIN_ARENA_BYTES {ARENA_BYTES}UL\n" + """
 #define NULL ((void *)0)
 #define EXIT_SUCCESS 0
@@ -1207,8 +1471,16 @@ _BUILTIN_HEADERS = {
     # like any other. It is an arena - free() keeps its promise not to touch
     # what you hand it, and the memory comes back when the process ends.
     "stdlib.h": _STDLIB_H,
-    "string.h": "#define NULL ((void *)0)\n",
+    "string.h": _STRING_H,
+    "ctype.h": _CTYPE_H,
+    "assert.h": _ASSERT_H,
+    "float.h": _FLOAT_H,
     "stddef.h": "#define NULL ((void *)0)\n",
+    # wchar_t, char16_t and char32_t are keywords in py2bin's C, the way they
+    # are in C++, so these headers have no typedefs to give. What they do
+    # bring is the handful of functions that go with them, written in C.
+    "wchar.h": _WCHAR_H,
+    "uchar.h": "#define NULL ((void *)0)\n",
     "stdbool.h": "#define bool _Bool\n#define true 1\n#define false 0\n"
     "#define __bool_true_false_are_defined 1\n",
     # <math.h> supplies its functions as C source that py2bin then

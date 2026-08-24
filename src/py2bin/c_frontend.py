@@ -179,6 +179,10 @@ class Token:
     # The file the token was really written in, which is not the file being
     # compiled once #include has brought another one in.
     origin: str = ""
+    # For a string or character literal, its prefix: "", "u8", "L", "u", "U".
+    # The plain and u8 kinds carry bytes; the rest carry code points, because
+    # what a code unit is depends on the target.
+    encoding: str = ""
 
 
 _OPERATORS = (
@@ -288,23 +292,40 @@ class Lexer:
                 )
             return
 
-    def escape(self, quote: str) -> int:
-        """Consume one character (or escape sequence) and return its byte value."""
+    def escape(self, quote: str) -> "tuple[int, bool]":
+        """Consume one character or escape and say what it is.
+
+        Returns the value and whether it is a *byte*. The distinction is the
+        whole of what C says here: `\\xFF` names the byte 0xFF whatever the
+        literal's kind, while `é` written in the source names a character,
+        and what that becomes depends on the kind - three bytes in a plain
+        literal, one code unit in a wide one. Conflating them made a source
+        character above 127 unrepresentable and refused the literal.
+        """
 
         character = self.advance()
         if character != "\\":
-            value = ord(character)
-            if value > 0xFF:
-                self.error(
-                    "py2bin's C compiler handles single-byte characters only; "
-                    "this literal is not representable in one byte"
-                )
-            return value
+            return ord(character), False
         if self.index >= len(self.source):
             self.error("unterminated escape sequence")
         escaped = self.advance()
         if escaped in _SIMPLE_ESCAPES:
-            return _SIMPLE_ESCAPES[escaped]
+            return _SIMPLE_ESCAPES[escaped], True
+        if escaped in "uU":
+            # A universal character name: `\\u00e9` is the character, not a
+            # byte, so it encodes the same way one written in the source does.
+            width = 4 if escaped == "u" else 8
+            digits = ""
+            while len(digits) < width and self.index < len(self.source) and (
+                self.source[self.index] in "0123456789abcdefABCDEF"
+            ):
+                digits += self.advance()
+            if len(digits) != width:
+                self.error(f"\\{escaped} needs exactly {width} hexadecimal digits")
+            value = int(digits, 16)
+            if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                self.error(f"\\{escaped}{digits} is not a character")
+            return value, False
         if escaped == "x":
             digits = ""
             while self.index < len(self.source) and self.source[self.index] in (
@@ -316,7 +337,7 @@ class Lexer:
             value = int(digits, 16)
             if value > 0xFF:
                 self.error("\\x escape does not fit in one byte")
-            return value
+            return value, True
         if escaped in "01234567":
             digits = escaped
             while len(digits) < 3 and self.index < len(self.source) and (
@@ -326,7 +347,7 @@ class Lexer:
             value = int(digits, 8)
             if value > 0xFF:
                 self.error("octal escape does not fit in one byte")
-            return value
+            return value, True
         self.error(f"unsupported escape sequence \\{escaped} in a {quote} literal")
 
     def digits(self, allowed: str) -> int:
@@ -455,23 +476,53 @@ class Lexer:
             self.error("unsupported integer literal suffix", line, column)
         return Token("integer", value, line, column, suffix, radix)
 
-    def character(self) -> Token:
+    def character(self, kind: str = "") -> Token:
+        # The prefix has already been read - it lexed as an identifier, which
+        # is what a prefix looks like until the quote after it says otherwise.
         line, column = self.line, self.column
         self.advance()  # opening quote
         if self.index < len(self.source) and self.source[self.index] == "'":
             self.error("empty character constant", line, column)
-        value = self.escape("character")
+        value, is_byte = self.escape("character")
         if self.index >= len(self.source) or self.advance() != "'":
             self.error("multi-character constants are not supported", line, column)
+        if kind:
+            # A wide character constant is the code point, not a byte, and it
+            # is not sign-adjusted: `L'\u00e9'` is 233 and not -23.
+            if kind == "u" and value > 0xFFFF:
+                self.error(
+                    "u'...' holds one UTF-16 code unit, and this character "
+                    "does not fit in one; write U'...'",
+                    line,
+                    column,
+                )
+            return Token("integer", value, line, column, "", 10, "", kind)
+        if not is_byte and value > 0x7F:
+            self.error(
+                "a character constant holds one byte; write it as a wide one "
+                "(L'x', u'x' or U'x') or put it in a string, where it is UTF-8",
+                line,
+                column,
+            )
         # A character constant has type int in C, and a plain 'char' is signed
         # in this dialect, so \xFF is -1 exactly as it is on Apple's ABI.
         if value >= 0x80:
             value -= 0x100
         return Token("integer", value, line, column, "")
 
-    def string(self) -> Token:
+    def string(self, kind: str = "") -> Token:
+        """One string literal, of whichever kind its prefix asked for.
+
+        A plain or `u8` literal is bytes; the others are code units, which
+        cannot be encoded until the target is known - `wchar_t` is two bytes
+        on Windows and four elsewhere - so they are carried as code points
+        and encoded where that is known.
+        """
+
+        # As in `character`, the prefix has already been read.
         line, column = self.line, self.column
         self.advance()  # opening quote
+        points: list[int] = []
         data = bytearray()
         while True:
             if self.index >= len(self.source):
@@ -481,8 +532,18 @@ class Lexer:
                 break
             if self.source[self.index] == "\n":
                 self.error("newline in string literal", line, column)
-            data.append(self.escape("string"))
-        return Token("string", bytes(data), line, column)
+            value, is_byte = self.escape("string")
+            if kind in ("", "u8"):
+                # A byte goes in as it is; a character goes in as the UTF-8 it
+                # is written as, which is what the source file already held.
+                data.extend(
+                    bytes([value]) if is_byte else chr(value).encode("utf-8")
+                )
+                continue
+            points.append(value)
+        if kind in ("", "u8"):
+            return Token("string", bytes(data), line, column, "", 10, "", kind)
+        return Token("string", tuple(points), line, column, "", 10, "", kind)
 
     def tokens(self) -> list[Token]:
         result: list[Token] = []
@@ -503,12 +564,18 @@ class Lexer:
                 if name in {"L", "u8", "u", "U"} and self.index < len(self.source) and (
                     self.source[self.index] in "'\""
                 ):
-                    self.error(
-                        "wide and Unicode string/character literals are not "
-                        "supported",
-                        line,
-                        column,
-                    )
+                    if self.source[self.index] == '"':
+                        result.append(self.string(name))
+                    else:
+                        if name == "u8":
+                            self.error(
+                                "u8 character constants are C23; write the "
+                                "character in a u8 string, which is UTF-8",
+                                line,
+                                column,
+                            )
+                        result.append(self.character(name))
+                    continue
                 result.append(Token("identifier", name, line, column))
                 continue
             if character.isdigit():
@@ -759,6 +826,13 @@ CType = (
 
 VOID = VoidType()
 
+#: The names that stop the program rather than returning from it.
+_EXIT_BUILTINS = frozenset({"exit", "_Exit", "abort"})
+
+#: What `abort()` leaves behind. A shell reports 134 for SIGABRT, which is
+#: what a caller looking for an abort will be testing for.
+_ABORT_STATUS = 134
+
 #: Bytes the heap reserves the first time a program asks for memory. One
 #: anonymous mapping, made on demand, never grown and never given back -- see
 #: :class:`py2bin.native.ir.HeapInit`. <stdlib.h> quotes this same number as
@@ -768,6 +842,22 @@ ARENA_BYTES = 64 * 1024 * 1024
 CHAR = IntegerType("char", 1, True, 1)
 SCHAR = IntegerType("signed char", 1, True, 1)
 UCHAR = IntegerType("unsigned char", 1, False, 1)
+#: C says char16_t and char32_t are exactly these widths, and unsigned.
+CHAR16 = IntegerType("char16_t", 2, False, 2)
+CHAR32 = IntegerType("char32_t", 4, False, 3)
+#: `wchar_t` is whatever the platform says it is: two bytes on Windows,
+#: four everywhere else. A wide literal is encoded to match, so a program
+#: that builds for both gets the platform's own answer on each.
+WCHAR_NARROW = IntegerType("wchar_t", 2, False, 2)
+WCHAR_WIDE = IntegerType("wchar_t", 4, True, 3)
+
+
+def wchar_for(target: str) -> IntegerType:
+    return WCHAR_NARROW if target.startswith("windows-") else WCHAR_WIDE
+
+
+#: What each prefix means, except `L`, whose answer the target decides.
+_WIDE_CHAR_TYPES = {"u": CHAR16, "U": CHAR32}
 SHORT = IntegerType("short", 2, True, 2)
 USHORT = IntegerType("unsigned short", 2, False, 2)
 INT = IntegerType("int", 4, True, 3)
@@ -825,6 +915,9 @@ _TYPE_KEYWORDS = frozenset(
         "_Bool",
         "float",
         "double",
+        "wchar_t",
+        "char16_t",
+        "char32_t",
     }
 )
 # Qualifiers py2bin can honour by ignoring them. ``const`` and ``restrict``
@@ -837,6 +930,8 @@ _QUALIFIERS = frozenset({"const", "volatile", "restrict"})
 _SPECIFIER_COMBINATIONS: dict[tuple[str, ...], CType] = {
     ("void",): VOID,
     ("_Bool",): BOOL,
+    ("char16_t",): CHAR16,
+    ("char32_t",): CHAR32,
     ("char",): CHAR,
     ("signed", "char"): SCHAR,
     ("char", "signed"): SCHAR,
@@ -999,7 +1094,57 @@ class FloatLiteral(Node):
 
 @dataclasses.dataclass(slots=True)
 class StringLiteral(Node):
-    data: bytes
+    #: Bytes for a plain or `u8` literal; code points for a wide one, which
+    #: cannot become code units until the target says how wide one is.
+    data: "bytes | tuple[int, ...]"
+    kind: str = ""
+
+    def bytes_for(self, target: str) -> bytes:
+        """The literal's bytes, terminator included, for this target."""
+
+        if isinstance(self.data, bytes):
+            return self.data + b"\0"
+        width = _unit_width(self.kind, target)
+        out = bytearray()
+        for point in self.data:
+            out.extend(_code_units(point, width))
+        out.extend(bytes(width))
+        return bytes(out)
+
+    def element_for(self, target: str) -> "CType":
+        """The type of one element of the array this literal is."""
+
+        if isinstance(self.data, bytes):
+            return CHAR
+        if self.kind == "u":
+            return CHAR16
+        if self.kind == "U":
+            return CHAR32
+        return wchar_for(target)
+
+
+def _unit_width(kind: str, target: str) -> int:
+    if kind == "u":
+        return 2
+    if kind == "U":
+        return 4
+    return wchar_for(target).size
+
+
+def _code_units(point: int, width: int) -> bytes:
+    """One code point as code units of `width` bytes, little-endian.
+
+    Two bytes means UTF-16, and a character outside the basic plane becomes
+    a surrogate pair - which is what makes `L"..."` on Windows different
+    from `L"..."` anywhere else, rather than merely narrower.
+    """
+
+    if width == 2 and point > 0xFFFF:
+        point -= 0x10000
+        high = 0xD800 + (point >> 10)
+        low = 0xDC00 + (point & 0x3FF)
+        return high.to_bytes(2, "little") + low.to_bytes(2, "little")
+    return point.to_bytes(width, "little")
 
 
 @dataclasses.dataclass(slots=True)
@@ -1283,9 +1428,11 @@ _UNSUPPORTED_KEYWORDS = {
 
 
 class Parser:
-    def __init__(self, tokens: list[Token], filename: str):
+    def __init__(self, tokens: list[Token], filename: str, target: str = ""):
         self.tokens = tokens
         self.filename = filename
+        #: Needed here only for `wchar_t`, whose width the platform decides.
+        self.target = target
         self.index = 0
         self.functions: dict[str, Function] = {}
         self.externs: dict[str, CType] = {}
@@ -1552,9 +1699,12 @@ class Parser:
             )
             if rejection is not None:
                 self.error(rejection, start)
-            resolved = _SPECIFIER_COMBINATIONS.get(key)
-            if resolved is None:
-                resolved = _SPECIFIER_COMBINATIONS.get(tuple(sorted(key)))
+            if key == ("wchar_t",):
+                resolved = wchar_for(self.target)
+            else:
+                resolved = _SPECIFIER_COMBINATIONS.get(key)
+                if resolved is None:
+                    resolved = _SPECIFIER_COMBINATIONS.get(tuple(sorted(key)))
             if resolved is None:
                 self.error(f"unsupported type specifier {' '.join(words)!r}", start)
             base = resolved
@@ -1829,6 +1979,14 @@ class Parser:
         token = self.token
         if token.kind == "integer":
             self.take()
+            if token.encoding:
+                # `L'x'` has type wchar_t, `u'x'` char16_t, `U'x'` char32_t -
+                # not int, which is what an unprefixed one has.
+                return IntLiteral(
+                    token, int(token.value), _WIDE_CHAR_TYPES.get(
+                        token.encoding, wchar_for(self.target)
+                    ) if token.encoding != "L" else wchar_for(self.target),
+                )
             return IntLiteral(token, int(token.value), _literal_type(token, self.filename))
         if token.kind == "float":
             self.take()
@@ -1839,10 +1997,30 @@ class Parser:
             )
         if token.kind == "string":
             self.take()
-            data = bytes(token.value)  # type: ignore[arg-type]
-            while self.token.kind == "string":  # adjacent literals concatenate
-                data += bytes(self.take().value)  # type: ignore[arg-type]
-            return StringLiteral(token, data)
+            kind = token.encoding
+            if kind in ("", "u8"):
+                data = bytes(token.value)  # type: ignore[arg-type]
+                while self.token.kind == "string":  # adjacent ones concatenate
+                    if self.token.encoding not in ("", "u8"):
+                        self.error(
+                            "a plain string literal joined to a wide one; C "
+                            "leaves what that means undefined, so py2bin will "
+                            "not choose",
+                            self.token,
+                        )
+                    data += bytes(self.take().value)  # type: ignore[arg-type]
+                return StringLiteral(token, data, kind)
+            points = tuple(token.value)  # type: ignore[arg-type]
+            while self.token.kind == "string":
+                if self.token.encoding != kind:
+                    self.error(
+                        f"a {kind or 'plain'} string literal joined to a "
+                        f"{self.token.encoding or 'plain'} one; C leaves what "
+                        "that means undefined, so py2bin will not choose",
+                        self.token,
+                    )
+                points += tuple(self.take().value)  # type: ignore[arg-type]
+            return StringLiteral(token, points, kind)
         if token.kind == "identifier":
             if token.value in _UNSUPPORTED_KEYWORDS:
                 self.error(_UNSUPPORTED_KEYWORDS[str(token.value)])
@@ -3237,7 +3415,10 @@ class Lowerer:
                     "(printf of a literal is)",
                     node.token,
                 )
-            return Value(PointerType(CHAR), CStringConstant(node.data + b"\0"))
+            return Value(
+                PointerType(node.element_for(self.target)),
+                CStringConstant(node.bytes_for(self.target)),
+            )
         if isinstance(node, Identifier):
             local = self.lookup(node.name)
             if local is None:
@@ -3302,7 +3483,9 @@ class Lowerer:
         """``sizeof e`` does not evaluate ``e``; it needs only its type."""
 
         if isinstance(node, StringLiteral):
-            return len(node.data) + 1
+            # sizeof a literal is its whole array, terminator included - which
+            # for a wide one is code units, not characters.
+            return len(node.bytes_for(self.target))
         if isinstance(node, Identifier):
             local = self.lookup(node.name)
             if local is not None:
@@ -3875,6 +4058,29 @@ class Lowerer:
         self.emit(HeapInit(slot, ARENA_BYTES))
         return Value(PointerType(VOID), IntLoad(slot))
 
+    def exit_builtin(self, node: Call) -> None:
+        """`exit(status)` and `abort()`: stop the process, here and now.
+
+        The IR already ends a program this way - it is what `return` from
+        `main` compiles to - and nothing about it needs to be at the end of
+        `main`, so a call anywhere works.
+        """
+
+        if node.name == "abort":
+            if node.arguments:
+                self.error("abort() takes no arguments", node.token)
+            # 134 is what a shell reports for a process killed by SIGABRT.
+            # py2bin cannot raise a signal, so this is the nearest thing that
+            # a caller testing the status will recognise.
+            self.emit(ExitValue(IntConstant(_ABORT_STATUS)))
+            return
+        if len(node.arguments) != 1:
+            self.error(f"{node.name}() takes exactly one argument", node.token)
+        value = self.rvalue(node.arguments[0])
+        if not is_integer(value.ctype):
+            self.error(f"{node.name}() needs an integer status", node.token)
+        self.emit(ExitValue(self.fit(value.expr, INT)))
+
     def argument_limit(self) -> int:
         """How many arguments this target can pass.
 
@@ -3893,6 +4099,12 @@ class Lowerer:
                 return self.math_builtin(node)
         if node.name == "__py2bin_arena" and node.name not in self.unit.functions:
             return self.arena_builtin(node)
+        if node.name in _EXIT_BUILTINS and node.name not in self.unit.functions:
+            self.exit_builtin(node)
+            # `exit` does not come back, and C says its type is void. A caller
+            # that uses the value of it is a caller that is wrong about what
+            # it does, so there is nothing to hand back.
+            return Value(INT, IntConstant(0))
         if node.name == "printf":
             self.error(
                 "printf's return value is not implemented; call it as a statement",
@@ -4518,8 +4730,13 @@ class Lowerer:
     ) -> ArrayType:
         if isinstance(initializer, tuple):
             return ArrayType(ctype.element, max(1, len(initializer[1])))
-        if isinstance(initializer, StringLiteral) and _is_character(ctype.element):
-            return ArrayType(ctype.element, len(initializer.data) + 1)
+        if isinstance(initializer, StringLiteral) and _string_fits(
+            initializer, ctype.element, self.target
+        ):
+            size = size_of(ctype.element) or 1
+            return ArrayType(
+                ctype.element, len(initializer.bytes_for(self.target)) // size
+            )
         self.error(
             "an array without a length needs a braced initializer (or a string "
             "literal for a character array) to deduce it from",
@@ -4544,21 +4761,24 @@ class Lowerer:
                 token,
             )
         if isinstance(initializer, StringLiteral):
-            if not _is_character(element):
+            if not _string_fits(initializer, element, self.target):
                 self.error(
-                    "a string literal can only initialize a character array", token
+                    f"a {initializer.kind or 'plain'} string literal cannot "
+                    f"initialize an array of {element}",
+                    token,
                 )
-            data = initializer.data + b"\0"
-            if len(data) > ctype.count:
+            data = initializer.bytes_for(self.target)
+            width = size_of(element) or 1
+            if len(data) > ctype.count * width:
                 self.error(
                     f"the initializer is {len(data)} bytes but the array holds "
-                    f"{ctype.count}",
+                    f"{ctype.count * width}",
                     token,
                 )
             self.emit_bytes(
                 base,
                 0,
-                data + b"\0" * (ctype.count - len(data)),
+                data + b"\0" * (ctype.count * width - len(data)),
                 skip_zero=static,
             )
             return
@@ -5941,6 +6161,19 @@ def _is_character(ctype: CType) -> bool:
     return ctype in {CHAR, SCHAR, UCHAR}
 
 
+def _string_fits(literal: "StringLiteral", element: CType, target: str) -> bool:
+    """Whether this literal may initialise an array of that element type.
+
+    A plain literal goes in a character array; a wide one goes in an array of
+    the type its prefix names. Anything else is a mistake C reports and this
+    reports too, rather than filling the array with the wrong width.
+    """
+
+    if isinstance(literal.data, bytes):
+        return _is_character(element)
+    return element == literal.element_for(target)
+
+
 def compile_c_to_ir(
     source: str,
     filename: str,
@@ -5967,5 +6200,5 @@ def compile_c_to_ir(
         include_dirs=include_dirs,
         defines=defines,
     )
-    unit = Parser(tokens, filename).translation_unit()
+    unit = Parser(tokens, filename, target).translation_unit()
     return Lowerer(unit, filename, target).compile()
