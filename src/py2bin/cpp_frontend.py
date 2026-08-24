@@ -51,12 +51,12 @@ class CppTranslationError(ValueError):
 
 #: Spelled out so the refusal can name the construct rather than failing later
 #: as a C syntax error in translated output nobody wrote.
-_REFUSED = (
-
-    ("throw", "exceptions"),
-    ("catch", "exceptions"),
-
-)
+#: C++ py2bin does not translate. Empty, and kept so: the list was how the
+#: subset said what it was not, and every entry on it has since become
+#: something it does. A construct that turns up unhandled now reaches the C
+#: compiler and is reported there, which is a worse message than this gave -
+#: so anything found that way belongs back on this list until it works.
+_REFUSED: "tuple[tuple[str, str], ...]" = ()
 
 _WORD = re.compile(r"\b[A-Za-z_]\w*\b")
 
@@ -325,9 +325,23 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
 
 
 
+#: Whether the file throws at all.
+_THROWS = re.compile(r"\b(throw|try|catch)\b")
+
 #: Whether the file asks for the heap at all. Word-bounded, so `newest` and a
 #: member called `deleted` are not it.
 _WANTS_HEAP = re.compile(r"\b(new|delete)\b")
+
+
+def _wants_heap(text: str) -> bool:
+    """Whether the allocator has to come with this file.
+
+    `new` and `delete` say so. So does a `throw` of an object, which by this
+    point has already become the malloc that copies it - the word `new` was
+    never there.
+    """
+
+    return _WANTS_HEAP.search(text) is not None or "malloc(" in text
 
 #: `namespace N {` - and `namespace {`, which C++ calls anonymous.
 _NAMESPACE = re.compile(r"\bnamespace\s*([A-Za-z_]\w*)?\s*\{")
@@ -689,6 +703,566 @@ def _expand_templates(text: str, filename: str) -> str:
 _TEMPLATE_ROUNDS = 16
 
 
+# --- exceptions ------------------------------------------------------------
+#
+# There is no unwinder, and writing one means saving and restoring a stack
+# frame - which is machine code, not translation. What a translator can do is
+# what C++ did before unwinders: set a flag, return, and have every caller
+# check. That is exact as long as the check happens where the call did, so a
+# statement holding a call that can throw is split into one call per statement
+# with a check after each.
+#
+# What is lost is that the propagation is visible in the C, and that a call
+# whose result feeds a short-circuit cannot be split without changing when the
+# other side runs. Those are refused rather than reordered.
+
+#: `throw expr;` and a bare `throw;`, which rethrows what is in flight.
+_THROW = re.compile(r"\bthrow\b\s*([^;]*);")
+#: `try {`
+_TRY = re.compile(r"\btry\s*\{")
+#: `catch (int e) {` and `catch (...) {`
+_CATCH = re.compile(r"\bcatch\s*\(\s*([^)]*)\s*\)\s*\{")
+
+_THROWN = "__py2bin_thrown"
+_IN_FLIGHT = "__py2bin_in_flight"
+
+#: Declared once, at the top of any file that throws.
+_EXCEPTION_STATE = f"""
+static int {_THROWN} = 0;
+static long {_IN_FLIGHT} = 0;
+"""
+
+
+def _zero_for(returns: str, classes: "dict[str, Class]") -> str:
+    """What a function hands back on the way out with an exception in flight.
+
+    Nothing reads it - every caller looks at the flag first - so the only
+    requirement is that C accepts it as a value of the declared type.
+    """
+
+    spelled = returns.strip()
+    if spelled in ("", "void") or _returns_object_named(spelled, classes):
+        return "return;"
+    return "return 0;"
+
+
+def _returns_object_named(spelled: str, classes: "dict[str, Class]") -> bool:
+    """Whether that spelling names a class held by value.
+
+    Such a function returns nothing in the C - the caller provides the space
+    and the callee writes through a hidden pointer - so the way out with an
+    exception in flight is a bare `return;`.
+    """
+
+    return "*" not in spelled and spelled.replace("&", "").strip() in classes
+
+
+#: Any function-like head followed by a body: `int f(int a) {`, `T::m() {`,
+#: and a constructor's `Guard() {`, which has no return type at all.
+_ANY_DEFINITION = re.compile(
+    r"([A-Za-z_~][\w\s*&:~]*?)\s*\(([^;{}()]*)\)\s*(?:const\s*)?\{"
+)
+
+
+def _every_body(text: str) -> "list[tuple[re.Match[str], int, str, str]]":
+    """Each function in the text as (head match, body end, name, return type).
+
+    At every depth, because a method is written inside its class and can
+    throw exactly as a free function can.
+    """
+
+    found = []
+    for match in _ANY_DEFINITION.finditer(text):
+        head = match.group(1).strip()
+        if not head or head.split()[0] in _NOT_A_TYPE:
+            continue
+        words = head.replace("*", " * ").replace("&", " & ").split()
+        name = words[-1].split("::")[-1]
+        returns = " ".join(words[:-1]) if len(words) > 1 else ""
+        if not re.fullmatch(r"~?[A-Za-z_]\w*", name):
+            continue
+        try:
+            closing = _matching(text, match.end() - 1)
+        except ValueError:
+            continue
+        found.append((match, closing, name, returns))
+    return found
+
+
+def _throwing_names(text: str) -> "set[str]":
+    """Every function that can leave with an exception in flight, by name.
+
+    By name rather than by class: a method is identified here the way a call
+    site writes it, and a call site writes `.check(`. Two classes with a
+    method of the same name make this conservative, which costs a test of a
+    flag that will be zero.
+    """
+
+    bodies = {
+        name: text[match.end() - 1: closing]
+        for match, closing, name, _returns in _every_body(text)
+    }
+    throwing = {
+        name for name, body in bodies.items() if _THROW.search(_without_literals(body))
+    }
+    while True:
+        grown = set(throwing)
+        for name, body in bodies.items():
+            if name in grown:
+                continue
+            code = _without_literals(body)
+            if any(
+                re.search(rf"(?<![\w>]){re.escape(other)}\s*\(", code)
+                for other in throwing
+            ):
+                grown.add(name)
+        if grown == throwing:
+            return throwing
+        throwing = grown
+
+
+def _result_types(text: str) -> "dict[str, str]":
+    """What each function returns, for the temporaries a split call needs."""
+
+    found: dict[str, str] = {}
+    for _match, _closing, name, returns in _every_body(text):
+        spelled = re.sub(r"\b(static|inline|virtual|extern)\b", "", returns).strip()
+        found[name] = (spelled or "long").replace("&", "*")
+    return found
+
+
+def _rewrite_exceptions_early(text: str, filename: str) -> str:
+    """Turn throw, try and catch into flags, checks and labels.
+
+    Done on the C++, before classes are taken apart, so the `return` this
+    leaves behind is one the destructor pass can see - an exception leaving a
+    function has to destroy what that function built, and that pass is what
+    knows which locals those are.
+    """
+
+    throwing = _throwing_names(text)
+    global _CALL_RESULT_TYPES
+    _CALL_RESULT_TYPES = _result_types(text)
+    counter = [0]
+    out: list[str] = []
+    at = 0
+    for match, closing, name, returns in _every_body(text):
+        if match.start() < at:
+            continue
+        opening = match.end() - 1
+        spelled = re.sub(r"\b(static|inline|virtual|extern)\b", "", returns).strip()
+        out.append(text[at:opening])
+        out.append(
+            _rewrite_exceptions(
+                text[opening:closing],
+                spelled,
+                throwing,
+                {},
+                filename,
+                counter,
+                uncaught=name == "main",
+            )
+        )
+        at = closing
+    out.append(text[at:])
+    return "".join(out)
+
+
+class _Landing:
+    """Where a check goes when it finds an exception in flight.
+
+    Inside a `try`, to that try's handler. Otherwise out of the function,
+    with the flag still set so the caller's own check finds it.
+    """
+
+    __slots__ = ("label", "returns", "classes", "uncaught")
+
+    def __init__(
+        self,
+        label: "str | None",
+        returns: str,
+        classes,
+        uncaught: bool = False,
+    ) -> None:
+        self.label = label
+        self.returns = returns
+        self.classes = classes
+        #: Set on `main`, where there is nothing left to propagate to. C++
+        #: calls terminate here, which aborts; py2bin has no way to raise a
+        #: signal, so the program stops with a status of its own instead of
+        #: running on as though nothing had happened.
+        self.uncaught = uncaught
+
+    def leave(self) -> str:
+        if self.label is not None:
+            return f"goto {self.label};"
+        if self.uncaught:
+            return f"return {UNCAUGHT_STATUS};"
+        return _zero_for(self.returns, self.classes)
+
+
+#: What a program exits with when an exception reaches the end of `main`.
+#: C++ aborts there; this is the nearest thing a translation to C can do, and
+#: it is a status a caller can test rather than a silent success.
+UNCAUGHT_STATUS = 3
+
+#: Operators whose right side runs only sometimes. A call split out of one of
+#: these would run when C++ says it must not.
+_SHORT_CIRCUIT = ("&&", "||", "?")
+
+
+def _rewrite_exceptions(
+    body: str,
+    returns: str,
+    throwing: "set[str]",
+    classes: "dict[str, Class]",
+    filename: str,
+    counter: "list[int]",
+    uncaught: bool = False,
+) -> str:
+    """Turn `throw`, `try` and `catch` into flags, checks and labels."""
+
+    if not throwing and not _THROW.search(_without_literals(body)):
+        return body
+    return _guarded(
+        body,
+        _Landing(None, returns, classes, uncaught),
+        throwing,
+        classes,
+        filename,
+        counter,
+    )
+
+
+#: Stands in for a try that has been dealt with, while the rest is.
+_TRY_MARK = "\x00py2bin_try_%d\x00"
+
+
+def _guarded(
+    body: str,
+    landing: "_Landing",
+    throwing: "set[str]",
+    classes: "dict[str, Class]",
+    filename: str,
+    counter: "list[int]",
+) -> str:
+    """Handle every try in this scope, then throws and checks at this landing."""
+
+    finished: list[str] = []
+    body = _extract_tries(
+        body, landing, throwing, classes, filename, counter, finished
+    )
+    # A try's contents have already been walked, with its handler as their
+    # landing. Left in place they would be walked again with this landing, and
+    # the first check to fire would leave the function instead of reaching the
+    # handler - which is why they are held aside while the rest is done.
+    body = _check_after_calls(body, landing, throwing, filename, counter)
+    for index, made in enumerate(finished):
+        body = body.replace(_TRY_MARK % index, made)
+    return body
+
+
+def _extract_tries(
+    body: str,
+    landing: "_Landing",
+    throwing: "set[str]",
+    classes: "dict[str, Class]",
+    filename: str,
+    counter: "list[int]",
+    finished: "list[str]",
+) -> str:
+    """`try { A } catch (T e) { B }` becomes A, a jump past B, and B.
+
+    The handler is reached by a `goto` from wherever inside A the flag was
+    found set, which is what makes it a handler rather than a test after the
+    fact: A stops where it stopped. A try inside A is dealt with first, and a
+    throw inside B goes outward - to whatever encloses this try, or out of
+    the function - because a handler is not inside its own try.
+    """
+
+    while True:
+        found = _TRY.search(body)
+        if found is None:
+            return body
+        opening = found.end() - 1
+        try:
+            closing = _matching(body, opening)
+        except ValueError:
+            raise CppTranslationError(
+                filename, _line_of(body, opening), "a try block is not closed"
+            ) from None
+        rest = body[closing:]
+        catch = _CATCH.match(rest.lstrip())
+        if catch is None:
+            raise CppTranslationError(
+                filename,
+                _line_of(body, closing),
+                "a try block needs a catch after it; py2bin has no unwinder, "
+                "so an exception that nothing catches is one nothing can be "
+                "done about",
+            )
+        offset = closing + (len(rest) - len(rest.lstrip()))
+        handler_open = offset + catch.end() - 1
+        handler_close = _matching(body, handler_open)
+
+        counter[0] += 1
+        number = counter[0]
+        label = f"__py2bin_catch_{number}"
+        after = f"__py2bin_done_{number}"
+
+        guarded = _guarded(
+            body[opening + 1: closing - 1],
+            _Landing(label, landing.returns, landing.classes),
+            throwing,
+            classes,
+            filename,
+            counter,
+        )
+        handled = _guarded(
+            body[handler_open + 1: handler_close - 1],
+            landing,
+            throwing,
+            classes,
+            filename,
+            counter,
+        )
+        caught = _catch_binding(
+            catch.group(1).strip(), filename, body, offset, classes
+        )
+        made = (
+            f"{{ {guarded} }} goto {after}; {label}: ; "
+            f"{{ {_THROWN} = 0; {caught}{handled} }} {after}: ;"
+        )
+        finished.append(made)
+        body = (
+            body[:found.start()]
+            + (_TRY_MARK % (len(finished) - 1))
+            + body[handler_close:]
+        )
+
+
+def _catch_binding(
+    spelled: str,
+    filename: str,
+    body: str,
+    at: int,
+    classes: "dict[str, Class] | set[str]" = (),
+) -> str:
+    """`catch (int e)` names the value; `catch (...)` does not."""
+
+    if spelled in ("...", ""):
+        return ""
+    words = spelled.replace("*", " * ").replace("&", " ").split()
+    if len(words) < 2:
+        raise CppTranslationError(
+            filename, _line_of(body, at),
+            f"cannot read the catch parameter {spelled!r}; py2bin catches by "
+            f"value, so write it as `catch (int e)` or `catch (...)`",
+        )
+    named = words[-1]
+    held = " ".join(words[:-1])
+    if held.strip() in _CLASS_NAMES:
+        # Declared and then assigned, not initialised: py2bin's C takes
+        # `o = *p;` and not `struct V o = *p;`.
+        return (
+            f"{held} {named}; {named} = *({held} *){_IN_FLIGHT}; "
+        )
+    return f"{held} {named} = ({held}){_IN_FLIGHT}; "
+
+
+def _thrown(match: "re.Match[str]", landing: "_Landing", body: str) -> str:
+    """What `throw expr;` becomes.
+
+    A number goes in the flag word as it is. An object cannot - it is wider
+    than a word, and the stack frame holding it is gone by the time a handler
+    runs - so a copy is made on the heap and the address goes in the word
+    instead. That is what an exception object is: a copy that outlives the
+    frame that threw it.
+    """
+
+    spelled = match.group(1).strip()
+    if not spelled:
+        # A bare `throw;` inside a handler: what is in flight stays in flight.
+        return f"{{ {_THROWN} = 1; {landing.leave()} }}"
+    held = _deduced_type(spelled, body, match.start())
+    if held is not None and held.replace("*", "").strip() in _CLASS_NAMES:
+        named = held.replace("*", "").strip()
+        return (
+            f"{{ {_THROWN} = 1; "
+            f"{named} *__py2bin_raised = ({named} *)malloc(sizeof({named})); "
+            f"*__py2bin_raised = {spelled}; "
+            f"{_IN_FLIGHT} = (long)__py2bin_raised; {landing.leave()} }}"
+        )
+    return (
+        f"{{ {_THROWN} = 1; {_IN_FLIGHT} = (long)({spelled}); {landing.leave()} }}"
+    )
+
+
+#: The classes this file declares. Read before the exception pass, which runs
+#: before classes are taken apart and so has nothing else to ask.
+_CLASS_NAMES: "set[str]" = set()
+
+def _check_after_calls(
+    body: str,
+    landing: "_Landing",
+    throwing: "set[str]",
+    filename: str,
+    counter: "list[int]",
+) -> str:
+    """Put a test of the flag immediately after every call that can set it.
+
+    Immediately, not at the end of the statement: everything between the call
+    and the test would run with the exception already in flight, and anything
+    it printed or stored would be output C++ never produces. A statement with
+    more than one such call is split so each gets its own test.
+    """
+
+    body = _THROW.sub(lambda m: _thrown(m, landing, body), body)
+    if not throwing:
+        return body
+    return _split_statements(body, landing, throwing, filename, counter)
+
+
+def _split_statements(
+    body: str,
+    landing: "_Landing",
+    throwing: "set[str]",
+    filename: str,
+    counter: "list[int]",
+) -> str:
+    """Give every call that can throw a statement, and a test, of its own.
+
+    The counter is shared across the whole file: a try block and the code
+    around it are split separately, and two temporaries of the same name in
+    one function is a redeclaration.
+    """
+
+    out: list[str] = []
+    for statement in _statements(body):
+        calls = _throwing_calls(statement, throwing)
+        if not calls:
+            out.append(statement)
+            continue
+        _refuse_where_splitting_would_change_it(statement, calls, body, filename)
+        lifted: list[str] = []
+        for call in calls:
+            counter[0] += 1
+            held = f"__py2bin_call_{counter[0]}"
+            spelled = _call_result_type(call, throwing)
+            statement = statement.replace(call, held, 1)
+            if spelled in ("void", ""):
+                # Nothing to hold; the call is the whole of what it does.
+                lifted.append(f" {call}; if ({_THROWN}) {{ {landing.leave()} }} ")
+                statement = statement.replace(held, "0", 1)
+                continue
+            lifted.append(
+                f" {spelled} {held} = {call}; "
+                f"if ({_THROWN}) {{ {landing.leave()} }} "
+            )
+        out.append("".join(lifted))
+        out.append(statement)
+    return "".join(out)
+
+
+def _refuse_where_splitting_would_change_it(
+    statement: str, calls: "list[str]", body: str, filename: str
+) -> None:
+    """Say so where lifting a call out would run it at a different time."""
+
+    for call in calls:
+        before = statement[: statement.index(call)]
+        if any(mark in _without_literals(before) for mark in _SHORT_CIRCUIT):
+            raise CppTranslationError(
+                filename,
+                _line_of(body, body.find(statement)),
+                "a call that can throw is on the right of `&&`, `||` or `?:` "
+                "here. py2bin gives each such call a statement of its own so "
+                "the exception is seen where it happened, and moving this one "
+                "would run it when C++ says it must not; assign it to a "
+                "variable on a line before this one",
+            )
+    stripped = statement.lstrip()
+    if re.match(r"\b(while|for)\b", stripped):
+        raise CppTranslationError(
+            filename,
+            _line_of(body, body.find(statement)),
+            "a call that can throw is in a loop's header here. py2bin lifts "
+            "such a call to a statement of its own, and a header runs again "
+            "each time round - so lifting this one would run it once; move it "
+            "into the body",
+        )
+
+
+def _statements(body: str) -> "list[str]":
+    """Split a body into statements, keeping every character.
+
+    A statement ends at a `;`, and a brace ends one too: `if (c) { ... }` is
+    a statement whose condition this has to see on its own, because that is
+    where a call inside it would be lifted from.
+    """
+
+    found: list[str] = []
+    depth = 0
+    at = 0
+    index = 0
+    while index < len(body):
+        piece = body[index]
+        if piece in "\"'":
+            quote = piece
+            index += 1
+            while index < len(body) and body[index] != quote:
+                index += 2 if body[index] == "\\" else 1
+            index += 1
+            continue
+        if piece in "([":
+            depth += 1
+        elif piece in ")]":
+            depth -= 1
+        elif depth == 0 and (piece == ";" or piece in "{}"):
+            found.append(body[at:index + 1])
+            at = index + 1
+        index += 1
+    if at < len(body):
+        found.append(body[at:])
+    return found
+
+
+def _throwing_calls(statement: str, throwing: "set[str]") -> "list[str]":
+    """Each call to a function that can throw, outermost first, left to right.
+
+    Outermost only: a call inside another call's arguments is part of that
+    call's text and is lifted with it, which keeps the order they run in.
+    """
+
+    code = _without_literals(statement)
+    found: list[str] = []
+    at = 0
+    # The receiver is part of the call: `g.check(13)` has to be lifted whole,
+    # or the temporary is assigned from a method with nothing to call it on.
+    pattern = re.compile(
+        r"(?<![.\w>])((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*)([A-Za-z_]\w*)\s*\("
+    )
+    for match in pattern.finditer(code):
+        if match.start() < at:
+            continue
+        if match.group(2) not in throwing:
+            continue
+        close = _closing_paren(statement, match.end() - 1)
+        if close < 0:
+            continue
+        found.append(statement[match.start(): close + 1])
+        at = close + 1
+    return found
+
+
+#: What a lifted call's temporary is declared as. The value is never read when
+#: the flag is set, so this only has to be a type the call's result fits.
+_CALL_RESULT_TYPES: "dict[str, str]" = {}
+
+
+def _call_result_type(call: str, throwing: "set[str]") -> str:
+    name = call.split("(", 1)[0].strip().replace("->", ".").split(".")[-1].strip()
+    return _CALL_RESULT_TYPES.get(name, "long")
 def _mangle_overloaded_functions(text: str, filename: str) -> str:
     """Give each free function of a shared name a name of its own.
 
@@ -933,7 +1507,8 @@ _NOT_A_TYPE = frozenset(
     """return if else while for do switch case default break continue goto
     sizeof typedef struct union enum static const volatile extern register
     auto inline restrict public private protected class new delete this
-    true false""".split()
+    true false throw try catch template typename namespace using operator
+    virtual""".split()
 )
 
 
@@ -1884,6 +2459,7 @@ def _rewrite_body(
     receivers: "dict[str, str] | None" = None,
     inherited_arrays: "dict[str, str] | None" = None,
     unit: str = "",
+    enclosing: "list[tuple[str, str]]" = (),
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -2229,10 +2805,11 @@ def _rewrite_body(
             dict(given),
             dict(arrays),
             unit,
+            [*enclosing, *((name, known[name]) for name in destroyed)],
         )
         for inner in blocks
     ]
-    body = _close_with_destructors(body, destroyed, known, classes)
+    body = _close_with_destructors(body, destroyed, known, classes, enclosing)
     return _restore_nested(body, rewritten_blocks)
 
 
@@ -2990,6 +3567,7 @@ def _close_with_destructors(
     destroyed: "list[str]",
     known: "dict[str, str]",
     classes: "dict[str, Class]",
+    enclosing: "list[tuple[str, str]]" = (),
 ) -> str:
     """Run each destructor where the block ends - including at a `return`.
 
@@ -3003,11 +3581,19 @@ def _close_with_destructors(
     honest answer is to say so.
     """
 
-    if not destroyed:
+    if not destroyed and not enclosing:
         return body
     calls = "".join(
         f" {_destructor_call(known[name], name, classes)}"
         for name in reversed(destroyed)
+    )
+    # A `return` inside a block leaves the whole function, so it destroys what
+    # the blocks around it built as well - innermost first, which is the order
+    # they were made in reversed. Only at a `return`: reaching the end of this
+    # block does not end theirs.
+    leaving = calls + "".join(
+        f" {_destructor_call(held, name, classes)}"
+        for name, held in reversed(list(enclosing))
     )
 
     out = []
@@ -3026,7 +3612,7 @@ def _close_with_destructors(
                     f"return that instead",
                 )
         out.append(body[at:found.start()])
-        out.append(calls.strip() + " " + found.group(0))
+        out.append(leaving.strip() + " " + found.group(0))
         at = found.end()
     out.append(body[at:])
     body = "".join(out)
@@ -3076,6 +3662,19 @@ def translate(source: str, filename: str = "<c++>") -> str:
     #: what the author wrote. The shortcut below hands the source straight
     #: back, which threw away every expansion made here.
     patterned = text != before_patterns
+    #: Whether this file throws. Asked before the rewriting below, which is
+    #: what takes the word away.
+    throws = _THROWS.search(text) is not None
+    if throws:
+        # Before the classes are taken apart: what this leaves behind is a
+        # `return`, and only the pass that reads a class body knows which
+        # destructors a return has to run first. The names are read first,
+        # because a thrown object is copied to the heap and the copy needs
+        # its type spelled.
+        global _CLASS_NAMES
+        _CLASS_NAMES = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+        text = _rewrite_exceptions_early(text, filename)
+        patterned = True
 
     classes: dict[str, Class] = {}
     order: list[str] = []
@@ -3114,8 +3713,13 @@ def translate(source: str, filename: str = "<c++>") -> str:
         # References and `new` are C++ without being classes, and a file can
         # use them and declare none. Returning the source untouched here left
         # `void swap(int &a, int &b)` for the C compiler to choke on.
-        allocates = _WANTS_HEAP.search(text) is not None
-        loose = allocates or _REFERENCE.search(text) is not None or patterned
+        allocates = _wants_heap(text)
+        loose = (
+            allocates
+            or _REFERENCE.search(text) is not None
+            or patterned
+            or throws
+        )
         if not plain and not namespaces and not loose:
             # Nothing C++ about this file at all: hand back what was written,
             # comments and all, so a diagnostic points at the real text.
@@ -3123,6 +3727,8 @@ def translate(source: str, filename: str = "<c++>") -> str:
         if loose:
             text = _address_reference_arguments(text, _function_signatures(text))
             text = _rewrite_functions(text, {}, None, text)
+            if throws:
+                text = _EXCEPTION_STATE + text
             if allocates:
                 # Asked before the rewriting, which is what turns `new` into
                 # the call to malloc: afterwards the word is gone.
@@ -3231,7 +3837,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     remainder = _construct_before_main(remainder, made, classes)
     rewritten = _rewrite_functions(remainder, classes, made, remainder)
     head = "\n".join(directives)
-    if _WANTS_HEAP.search(text):
+    if throws:
+        head = f"{_EXCEPTION_STATE}{head}"
+    if _wants_heap(text):
         # Only a file that allocates gets the allocator. `new` compiles to
         # malloc, which lives in <stdlib.h>; including it here rather than
         # asking the author to means `new` works in a file that never heard of

@@ -1375,13 +1375,36 @@ int main(void) {
                     target=target,
                 )
 
-    def test_a_runtime_conversion_is_refused_where_it_cannot_be_emitted(self):
-        with self.assertRaisesRegex(CCompileError, "runtime conversion"):
-            compile_c_to_ir(
-                _STDIO + 'int main(void) { printf("%d\\n", 1); return 0; }\n',
-                "win.c",
-                "windows-x86_64",
-            )
+    def test_a_runtime_conversion_is_emitted_for_windows_too(self):
+        """It was refused there for as long as the C front end has existed.
+
+        The refusal said the write needed a POSIX syscall. It does not: both
+        Windows encoders have lowered ``WriteRuntime`` to WriteFile since
+        before the C front end was written, so the refusal was answering a
+        question nobody had asked the backend. Nothing printed a number on
+        Windows until this went.
+        """
+
+        from py2bin.native.ir import WriteRuntime
+
+        for target in ("windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                module = compile_c_to_ir(
+                    _STDIO + 'int main(void) { printf("%d\\n", 1); return 0; }\n',
+                    "win.c",
+                    target,
+                )
+                written = [
+                    operation
+                    for function in module.functions
+                    for operation in function.operations
+                    if isinstance(operation, WriteRuntime)
+                ] + [
+                    operation
+                    for operation in module.operations
+                    if isinstance(operation, WriteRuntime)
+                ]
+                self.assertTrue(written, "no runtime write was emitted")
 
     def test_unimplemented_conversions_are_named_not_guessed(self):
         self.reject(

@@ -4831,13 +4831,6 @@ class Lowerer:
                 "argument(s)",
                 node.token,
             )
-        if expected and self.target.startswith("windows-"):
-            self.error(
-                "printf with a runtime conversion needs the write syscall py2bin "
-                f"only emits for POSIX targets, not {self.target!r}; a format with "
-                "no conversions works everywhere",
-                node.token,
-            )
         # C11 6.5.2.2p10 puts a sequence point after every argument is
         # evaluated and before the call, so printf may produce no output until
         # all of its arguments have been computed. Evaluating them while

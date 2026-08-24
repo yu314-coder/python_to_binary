@@ -142,12 +142,19 @@ class Refusals(unittest.TestCase):
             translate(source, "t.cpp")
         return str(caught.exception)
 
-    def test_each_is_named_rather_than_mistranslated(self) -> None:
-        for source, expected in (
-            ("int main(void){ throw 1; }", "exceptions"),
-        ):
-            with self.subTest(expected=expected):
-                self.assertIn(expected, self._refused(source))
+    def test_nothing_is_on_the_list_any_more(self) -> None:
+        """The list was how the subset said what it was not.
+
+        Every entry that was on it - templates, virtual functions, the heap,
+        exceptions, the standard library - is something it does now. It is
+        kept empty rather than deleted because a construct found unhandled
+        belongs back on it: a refusal that names the feature is a better
+        message than whatever the C compiler makes of the wreckage.
+        """
+
+        from py2bin.cpp_frontend import _REFUSED
+
+        self.assertEqual(_REFUSED, ())
 
     def test_a_word_containing_one_is_not_one(self) -> None:
         # `newest` is not `new`, and a refusal on it would be nonsense.
@@ -814,3 +821,150 @@ class Streams(unittest.TestCase):
         # hands the stream back as the address its reference became, so the
         # next one takes it directly and nothing is dereferenced in between.
         self.assertIn('S__op_shl__1__int(S__op_shl__1__char_p(&out, "a"), 2)', out)
+
+
+class Exceptions(unittest.TestCase):
+    """No unwinder, so the propagation is written out where it happens.
+
+    A `throw` sets a flag and returns; every caller tests the flag right
+    after the call. That is exact as long as the test lands where the call
+    did, which is why a statement holding one is split.
+    """
+
+    def test_a_throw_sets_the_flag_and_leaves(self) -> None:
+        out = translate(
+            "int risky(int n){ if (n < 0) throw 7; return n; }\n"
+            "int main(void){ try { return risky(-1); } catch (int e) { return e; } }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_thrown = 1", out)
+        self.assertIn("__py2bin_in_flight = (long)(7)", out)
+        # And the caller looks, immediately after the call.
+        self.assertIn("if (__py2bin_thrown)", out)
+
+    def test_the_handler_is_reached_by_a_jump_from_where_it_happened(self) -> None:
+        out = translate(
+            "int risky(int n){ if (n < 0) throw 7; return n; }\n"
+            "int main(void){ try { risky(-1); } catch (int e) { return e; } return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("goto __py2bin_catch_1;", out)
+        self.assertIn("__py2bin_catch_1: ;", out)
+        self.assertIn("int e = (int)__py2bin_in_flight;", out)
+        # The handler is jumped over when nothing was thrown.
+        self.assertIn("goto __py2bin_done_1;", out)
+
+    def test_a_file_that_never_throws_declares_no_state(self) -> None:
+        out = translate("int main(void){ return 0; }", "t.cpp")
+        self.assertNotIn("__py2bin_thrown", out)
+
+    def test_a_call_behind_a_short_circuit_is_refused(self) -> None:
+        """Splitting it would run it when C++ says it must not.
+
+        `a() || b()` runs `b` only if `a` was false. Lifting `b` to its own
+        statement runs it always, which is a different program - so this says
+        so instead of quietly writing one.
+        """
+
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "int risky(int n){ if (n < 0) throw 1; return n; }\n"
+                "int main(void){ if (1 || risky(-1)) { return 0; } return 1; }",
+                "t.cpp",
+            )
+        self.assertIn("&&", str(caught.exception))
+
+
+class Destructors(unittest.TestCase):
+    def test_a_return_inside_a_block_destroys_the_scopes_around_it(self) -> None:
+        """It leaves the function, not just the block it is written in.
+
+        Only the block's own objects were destroyed, so an object made in the
+        function and returned from inside an `if` was never destroyed at all.
+        """
+
+        out = translate(
+            "class R{public:int n;\n R(){n=1;}\n ~R(){n=0;}};\n"
+            "int f(int k){ R r; if (k) { return 1; } return 2; }",
+            "t.cpp",
+        )
+        body = out[out.index("int f("):]
+        first = body[: body.index("return 1;")]
+        self.assertIn("R__dtor(&r);", first)
+
+
+class ThrownObjects(unittest.TestCase):
+    def test_an_object_is_copied_to_the_heap_and_the_flag_carries_its_address(
+        self,
+    ) -> None:
+        """A word cannot hold a struct, and the frame that threw it is gone.
+
+        So a copy outlives the frame, which is what an exception object is.
+        """
+
+        out = translate(
+            "class Err{public:int code;\n Err(){code=5;}};\n"
+            "int f(void){ Err e; throw e; }\n"
+            "int main(void){ try { f(); } catch (Err e) { return e.code; } return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("malloc(sizeof(struct Err))", out)
+        self.assertIn("__py2bin_in_flight = (long)__py2bin_raised", out)
+        # And the handler gets the copy back, declared then assigned because
+        # py2bin's C takes `o = *p;` and not `struct V o = *p;`.
+        self.assertIn("__py2bin_in_flight;", out)
+
+    def test_a_number_still_goes_in_the_word_itself(self) -> None:
+        out = translate(
+            "int f(void){ throw 7; }\n"
+            "int main(void){ try { f(); } catch (int e) { return e; } return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_in_flight = (long)(7)", out)
+        self.assertNotIn("malloc", out)
+
+
+class NestedTry(unittest.TestCase):
+    def test_a_try_inside_a_try_gets_its_own_handler(self) -> None:
+        out = translate(
+            "int f(int n){ if (n < 0) throw 1; return n; }\n"
+            "int main(void){\n"
+            "  try { try { f(-1); } catch (int e) { throw 2; } }\n"
+            "  catch (int e) { return e; }\n"
+            "  return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_catch_1", out)
+        self.assertIn("__py2bin_catch_2", out)
+
+    def test_a_throw_in_a_handler_goes_outward(self) -> None:
+        """A handler is not inside its own try, so it cannot catch itself."""
+
+        out = translate(
+            "int f(int n){ if (n < 0) throw 1; return n; }\n"
+            "int main(void){\n"
+            "  try { try { f(-1); } catch (int a) { throw 2; } }\n"
+            "  catch (int b) { return b; }\n"
+            "  return 0; }",
+            "t.cpp",
+        )
+        inner = out[out.index("int a = "):]
+        # The rethrow jumps to the outer handler, not back to the inner one.
+        self.assertIn("goto __py2bin_catch_1;", inner.split("__py2bin_done_1")[0])
+
+
+class Uncaught(unittest.TestCase):
+    def test_one_that_reaches_the_end_of_main_stops_the_program(self) -> None:
+        """C++ aborts. py2bin cannot raise a signal, so it exits non-zero.
+
+        Running on as though nothing had happened - which is what a plain
+        `return 0;` would do - is the one answer that is definitely wrong.
+        """
+
+        from py2bin.cpp_frontend import UNCAUGHT_STATUS
+
+        out = translate(
+            "int f(void){ throw 9; }\nint main(void){ f(); return 0; }", "t.cpp"
+        )
+        self.assertIn(f"return {UNCAUGHT_STATUS};", out)
+        self.assertNotEqual(UNCAUGHT_STATUS, 0)
