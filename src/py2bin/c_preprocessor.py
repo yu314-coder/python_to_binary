@@ -71,7 +71,7 @@ import collections
 import dataclasses
 from pathlib import Path
 
-from .c_frontend import CCompileError, Lexer, Token
+from .c_frontend import ARENA_BYTES, CCompileError, Lexer, Token
 
 __all__ = ["preprocess"]
 
@@ -388,6 +388,8 @@ class Preprocessor:
     ):
         self.macros: dict[str, Macro] = {}
         self.include_dirs = [Path(item) for item in include_dirs]
+        #: Standard headers already supplied. See the include path below.
+        self._builtins_read: set[str] = set()
         self.output: list[PPToken] = []
         self.depth = 0
         self.once: set[str] = set()
@@ -723,6 +725,14 @@ class Preprocessor:
                 return
         builtin = _BUILTIN_HEADERS.get(name)
         if builtin is not None:
+            if name in self._builtins_read:
+                # C says a standard header may be included more than once, and
+                # programs rely on it: two headers of a project each include
+                # <stdlib.h> and the second is meant to be nothing. The ones
+                # that are only #defines survived that; <math.h> and <stdlib.h>
+                # carry functions, and a second copy is a redefinition.
+                return
+            self._builtins_read.add(name)
             self._enter(builtin, f"<{name}>", None, at)
             return
         searched = ", ".join(str(item) for item in candidates) or "nowhere"
@@ -1116,10 +1126,87 @@ _MATH_H = (
 )
 
 #: program that has no library behind it: the macros.
+_STDLIB_H = f"#define __PY2BIN_ARENA_BYTES {ARENA_BYTES}UL\n" + """
+#define NULL ((void *)0)
+#define EXIT_SUCCESS 0
+#define EXIT_FAILURE 1
+
+/* The bump pointer and the end of the reservation. Both zero until the first
+   allocation, which is what makes the mapping happen on demand: a program
+   that includes this header and never allocates reserves nothing. */
+static unsigned long __py2bin_heap_bump = 0;
+static unsigned long __py2bin_heap_end = 0;
+
+void *malloc(unsigned long __n) {
+    unsigned long __p;
+    if (__py2bin_heap_end == 0) {
+        __py2bin_heap_bump = (unsigned long)__py2bin_arena();
+        __py2bin_heap_end = __py2bin_heap_bump + __PY2BIN_ARENA_BYTES;
+    }
+    /* Round up to 16, which is the alignment any C object may ask for, so
+       every block this returns is aligned for every type. A request of zero
+       still gets a distinct address, as C says it may. */
+    __n = (__n + 15UL) & ~15UL;
+    if (__n == 0UL) __n = 16UL;
+    /* Written as a subtraction so a size near the top of the range cannot
+       wrap the sum past the end and be let through. */
+    if (__n > __py2bin_heap_end - __py2bin_heap_bump) return NULL;
+    __p = __py2bin_heap_bump;
+    __py2bin_heap_bump = __p + __n;
+    return (void *)__p;
+}
+
+void *calloc(unsigned long __count, unsigned long __size) {
+    unsigned long __total;
+    unsigned char *__block;
+    unsigned long __i;
+    if (__count != 0UL && __size > 0xFFFFFFFFFFFFFFFFUL / __count) return NULL;
+    __total = __count * __size;
+    __block = (unsigned char *)malloc(__total);
+    if (__block == NULL) return NULL;
+    /* The arena is zero-filled when it is mapped, but a block reused after a
+       realloc is not, so this clears rather than assuming. */
+    for (__i = 0UL; __i < __total; __i++) __block[__i] = 0;
+    return (void *)__block;
+}
+
+void free(void *__block) {
+    /* An arena does not reclaim. Saying so plainly is better than a free()
+       that appears to work and silently does nothing about fragmentation. */
+    (void)__block;
+}
+
+void *realloc(void *__block, unsigned long __size) {
+    unsigned char *__old;
+    unsigned char *__new;
+    unsigned long __i;
+    if (__block == NULL) return malloc(__size);
+    __new = (unsigned char *)malloc(__size);
+    if (__new == NULL) return NULL;
+    /* Nothing records how big the old block was, so this copies the smaller
+       of the two -- the new size -- and reads no more of the old block than
+       the arena holds. Growing is exact; shrinking copies only what stays. */
+    __old = (unsigned char *)__block;
+    for (__i = 0UL; __i < __size; __i++) {
+        if ((unsigned long)(__old + __i) >= __py2bin_heap_bump) break;
+        __new[__i] = __old[__i];
+    }
+    return (void *)__new;
+}
+
+int abs(int __value) { return __value < 0 ? -__value : __value; }
+long labs(long __value) { return __value < 0 ? -__value : __value; }
+"""
+
 _BUILTIN_HEADERS = {
     "stdio.h": "#define EOF (-1)\n#define NULL ((void *)0)\n",
-    "stdlib.h": "#define NULL ((void *)0)\n"
-    "#define EXIT_SUCCESS 0\n#define EXIT_FAILURE 1\n",
+    # <stdlib.h> brings the heap, and brings it as C source for the same
+    # reason <math.h> does: an allocator you can read is one you can check.
+    # The compiler itself supplies exactly one thing, __py2bin_arena(), which
+    # is a single anonymous mapping; everything below is ordinary C compiled
+    # like any other. It is an arena - free() keeps its promise not to touch
+    # what you hand it, and the memory comes back when the process ends.
+    "stdlib.h": _STDLIB_H,
     "string.h": "#define NULL ((void *)0)\n",
     "stddef.h": "#define NULL ((void *)0)\n",
     "stdbool.h": "#define bool _Bool\n#define true 1\n#define false 0\n"

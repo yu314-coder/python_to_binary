@@ -108,6 +108,7 @@ from .native.ir import (
     Function as IRFunction,
     FunctionAddress,
     GlobalAddress,
+    HeapInit,
     HeapLoad,
     HeapStore,
     IndirectCall,
@@ -757,6 +758,13 @@ CType = (
 )
 
 VOID = VoidType()
+
+#: Bytes the heap reserves the first time a program asks for memory. One
+#: anonymous mapping, made on demand, never grown and never given back -- see
+#: :class:`py2bin.native.ir.HeapInit`. <stdlib.h> quotes this same number as
+#: __PY2BIN_ARENA_BYTES, so the allocator's idea of where the arena ends and
+#: the reservation itself cannot drift apart.
+ARENA_BYTES = 64 * 1024 * 1024
 CHAR = IntegerType("char", 1, True, 1)
 SCHAR = IntegerType("signed char", 1, True, 1)
 UCHAR = IntegerType("unsigned char", 1, False, 1)
@@ -3852,6 +3860,21 @@ class Lowerer:
             )
         return Value(DOUBLE, FloatUnary(_MATH_BUILTINS[node.name], self.widen(value)))
 
+    def arena_builtin(self, node: Call) -> Value:
+        """Reserve the arena and hand back its base.
+
+        This is the only part of the heap the compiler has to provide: one
+        anonymous mapping. `malloc` and its family are ordinary C written on
+        top of it in <stdlib.h>, which is why they can be read rather than
+        taken on trust.
+        """
+
+        if node.arguments:
+            self.error("__py2bin_arena() takes no arguments", node.token)
+        slot = self.take(8)
+        self.emit(HeapInit(slot, ARENA_BYTES))
+        return Value(PointerType(VOID), IntLoad(slot))
+
     def argument_limit(self) -> int:
         """How many arguments this target can pass.
 
@@ -3868,6 +3891,8 @@ class Lowerer:
         if node.name in _MATH_BUILTINS and self.lookup(node.name) is None:
             if node.name not in self.unit.functions:
                 return self.math_builtin(node)
+        if node.name == "__py2bin_arena" and node.name not in self.unit.functions:
+            return self.arena_builtin(node)
         if node.name == "printf":
             self.error(
                 "printf's return value is not implemented; call it as a statement",

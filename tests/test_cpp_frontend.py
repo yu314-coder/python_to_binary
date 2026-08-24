@@ -144,11 +144,8 @@ class Refusals(unittest.TestCase):
 
     def test_each_is_named_rather_than_mistranslated(self) -> None:
         for source, expected in (
-            ("template<class T> T id(T v){return v;}", "templates"),
-            ("class A{public: virtual int f(){return 1;}};", "virtual"),
             ("int main(void){ throw 1; }", "exceptions"),
             ("#include <iostream>\nint main(void){return 0;}", "standard library"),
-            ("class A{public:int x;};\nint main(void){A*a=new A();return 0;}", "new"),
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self._refused(source))
@@ -517,3 +514,211 @@ class Namespaces(unittest.TestCase):
         )
         self.assertIn("static void M__ctor(struct M *this)", out)
         self.assertIn("static int M__get(struct M *this)", out)
+
+
+class Overloads(unittest.TestCase):
+    """C has one function per name, and C++ has as many as the arguments differ.
+
+    They are told apart by how many arguments they take, which is the one
+    thing a call site always shows.
+    """
+
+    def test_two_constructors_get_two_names(self) -> None:
+        out = translate(
+            "class N{public:int v;\n N(){v=0;}\n N(int a){v=a;}\n};\n"
+            "int main(void){ N x; N y(5); return y.v; }",
+            "t.cpp",
+        )
+        self.assertIn("N__ctor__0(struct N *this)", out)
+        self.assertIn("N__ctor__1(struct N *this, int a)", out)
+        # And the call sites pick by count, not by order of declaration.
+        self.assertIn("N__ctor__0(&x)", out)
+        self.assertIn("N__ctor__1(&y, 5)", out)
+
+    def test_a_method_alone_keeps_its_plain_name(self) -> None:
+        # A suffix on every method would make the C unreadable for no gain.
+        out = translate(
+            "class N{public:int v;\n N(){v=0;}\n int get(){return v;}};\n"
+            "int main(void){ N x; return x.get(); }",
+            "t.cpp",
+        )
+        self.assertIn("N__get(struct N *this)", out)
+        self.assertNotIn("N__get__0", out)
+
+
+class Heap(unittest.TestCase):
+    def test_new_becomes_a_function_that_allocates_then_constructs(self) -> None:
+        out = translate(
+            "class N{public:int v;\n N(int a){v=a;}};\n"
+            "int main(void){ N *p = new N(3); delete p; return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("malloc(sizeof(struct N))", out)
+        self.assertIn("N__delete(p);", out)
+        # The allocator comes with it, so `new` works without <stdlib.h>.
+        self.assertIn("#include <stdlib.h>", out)
+
+    def test_a_file_that_never_allocates_gets_no_allocator(self) -> None:
+        out = translate(
+            "class N{public:int v;\n N(){v=1;}};\nint main(void){ N a; return a.v; }",
+            "t.cpp",
+        )
+        self.assertNotIn("stdlib.h", out)
+        self.assertNotIn("N__new", out)
+
+    def test_delete_array_runs_one_destructor_per_element(self) -> None:
+        out = translate(
+            "class N{public:int v;\n N(){v=1;}\n ~N(){v=0;}};\n"
+            "int main(void){ N *p = new N[4]; delete[] p; return 0; }",
+            "t.cpp",
+        )
+        # The count is written in front of the block, because C++ asks for
+        # every element to be destroyed and nothing else records how many.
+        self.assertIn("*(unsigned long *)__block = __n;", out)
+        self.assertIn("N__delete_array(p);", out)
+
+
+class Virtual(unittest.TestCase):
+    def test_a_polymorphic_class_carries_a_table_pointer(self) -> None:
+        out = translate(
+            "class A{public: virtual int f(){return 1;}};\n"
+            "class B : public A{public: int f(){return 2;}};\n"
+            "int main(void){ B b; A *p = &b; return p->f(); }",
+            "t.cpp",
+        )
+        self.assertIn("void **__vptr;", out)
+        self.assertIn("A__vtable", out)
+        self.assertIn("B__vtable", out)
+        # The call reads the slot rather than naming a function.
+        self.assertIn("__vptr[0]", out)
+
+    def test_the_derived_table_keeps_the_base_ordering(self) -> None:
+        """A base pointer reads slot 1 expecting the base's second virtual.
+
+        A derived class may add to the table and may replace what is in it,
+        but may not move anything: the caller holding a base pointer has no
+        way to know it is looking at a derived object.
+        """
+
+        out = translate(
+            "class A{public: virtual int f(){return 1;} virtual int g(){return 2;}};\n"
+            "class B : public A{public: int g(){return 3;} virtual int h(){return 4;}};\n"
+            "int main(void){ B b; return b.g(); }",
+            "t.cpp",
+        )
+        table = [line for line in out.splitlines() if "B__vtable" in line][0]
+        self.assertIn("A__f", table.split("{")[1].split(",")[0])
+        self.assertIn("B__g", table.split(",")[1])
+        self.assertIn("B__h", table.split(",")[2])
+
+    def test_a_non_polymorphic_class_carries_nothing(self) -> None:
+        out = translate(
+            "class A{public:int x;\n A(){x=1;}\n int f(){return x;}};\n"
+            "int main(void){ A a; return a.f(); }",
+            "t.cpp",
+        )
+        self.assertNotIn("__vptr", out)
+        self.assertNotIn("vtable", out)
+
+    def test_only_the_root_stores_the_pointer(self) -> None:
+        # Two pointers in one object would leave the wrong one at the front.
+        out = translate(
+            "class A{public: virtual int f(){return 1;}};\n"
+            "class B : public A{public: int f(){return 2;}};\n"
+            "class C : public B{public: int f(){return 3;}};\n"
+            "int main(void){ C c; return c.f(); }",
+            "t.cpp",
+        )
+        self.assertEqual(out.count("void **__vptr;"), 1)
+
+
+class References(unittest.TestCase):
+    def test_a_reference_parameter_becomes_a_pointer_on_both_sides(self) -> None:
+        out = translate(
+            "class B{public:int v;\n B(){v=1;}};\n"
+            "void bump(B &b){ b.v = b.v + 1; }\n"
+            "int main(void){ B a; bump(a); return a.v; }",
+            "t.cpp",
+        )
+        self.assertIn("void bump(struct B *b)", out)
+        self.assertIn("b->v = b->v + 1", out)
+        self.assertIn("bump(&a)", out)
+
+    def test_a_reference_to_a_number_is_dereferenced_at_each_use(self) -> None:
+        out = translate(
+            "void swap(int &a, int &b){ int t = a; a = b; b = t; }\n"
+            "int main(void){ int x = 1, y = 2; swap(x, y); return x; }",
+            "t.cpp",
+        )
+        self.assertIn("void swap(int *a, int *b)", out)
+        self.assertIn("(*a) = (*b);", out)
+        self.assertIn("swap(&x, &y)", out)
+
+    def test_the_binding_itself_is_not_dereferenced(self) -> None:
+        """`int &r = v;` declares the pointer; every other use follows it."""
+
+        out = translate(
+            "int main(void){ int v = 1; int &r = v; r = r + 1; return v; }",
+            "t.cpp",
+        )
+        self.assertIn("int *r = &(v);", out)
+        self.assertIn("(*r) = (*r) + 1;", out)
+        self.assertNotIn("(*r) = &", out)
+
+
+class Templates(unittest.TestCase):
+    """A template is a pattern, so it becomes one copy per set of arguments.
+
+    The copies are named after what they were made from, which is what makes
+    the C readable: `Box__int` rather than a hash.
+    """
+
+    def test_a_class_template_becomes_one_class_per_argument(self) -> None:
+        out = translate(
+            "template<typename T>\nclass Box{public: T v;\n Box(){v=0;}\n"
+            " T get(){return v;}};\n"
+            "int main(void){ Box<int> a; Box<double> b; return a.get(); }",
+            "t.cpp",
+        )
+        self.assertIn("struct Box__int", out)
+        self.assertIn("struct Box__double", out)
+        self.assertIn("int Box__int__get(struct Box__int *this)", out)
+        self.assertIn("double Box__double__get(struct Box__double *this)", out)
+        # The pattern itself is not code and must not survive into the C.
+        self.assertNotIn("template", out)
+
+    def test_one_copy_however_many_times_it_is_asked_for(self) -> None:
+        out = translate(
+            "template<typename T>\nclass Box{public: T v;\n Box(){v=0;}};\n"
+            "int main(void){ Box<int> a; Box<int> b; Box<int> c; return 0; }",
+            "t.cpp",
+        )
+        self.assertEqual(out.count("struct Box__int {"), 1)
+
+    def test_a_function_template_deduces_from_a_literal(self) -> None:
+        out = translate(
+            "template<typename T>\nT twice(T v){ return v + v; }\n"
+            "int main(void){ return twice(5) + (int)twice(2.5); }",
+            "t.cpp",
+        )
+        self.assertIn("int twice__int(int v)", out)
+        self.assertIn("double twice__double(double v)", out)
+        self.assertIn("twice__int(5)", out)
+
+    def test_a_call_it_cannot_read_is_refused_with_the_spelling_that_works(
+        self,
+    ) -> None:
+        """Guessing here would compile the wrong copy and run.
+
+        Deduction covers literals and variables it can see declared. Anything
+        else is refused, and the message says to write the argument out.
+        """
+
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "template<typename T>\nT twice(T v){ return v + v; }\n"
+                "int pick(void);\n"
+                "int main(void){ return twice(pick()); }",
+                "t.cpp",
+            )
+        self.assertIn("twice<type>", str(caught.exception))
