@@ -269,23 +269,19 @@ that is not a plain function in this module.
 That is the whole decision, and it is the only one `py2bin make` (or
 `build.py` in a clone) asks about.
 
-There is a third, `compile`, which is not a general choice: it accepts a small
-subset of the language and no packages at all, in exchange for an artifact
-with no interpreter anywhere near it. Reach for it when that is the point.
-
-| | `freeze` | `compile-capi` | `compile` |
-|---|---|---|---|
-| **speed** on a 30M-iteration loop | 0.74 s | 0.44 s | **0.05 s** |
-| **artifact** | 24 MB | 50 KB | **32 KB** |
-| **needs Python on the machine?** | no, it carries one | yes, or bundle it | **no** |
-| **how much Python works** | **everything** | most of it: 886 of an 889-program corpus[^corpus] | a small subset |
-| **third-party packages** | **carried inside** | any the interpreter can import | none |
-| what actually runs your logic | CPython, interpreting | machine code | machine code |
+| | `freeze` | `compile-capi` |
+|---|---|---|
+| **speed** on a 30M-iteration loop | 0.74 s | **0.44 s** |
+| **artifact** | 24 MB | **50 KB** |
+| **needs Python on the machine?** | no, it carries one | yes, or bundle it |
+| **how much Python works** | **everything** | most of it: 886 of an 889-program corpus[^corpus] |
+| **third-party packages** | **carried inside** | any the interpreter can import |
+| what actually runs your logic | CPython, interpreting | machine code |
 
 **`freeze` is the most complete.** It ships your program beside an interpreter
 that runs it, so NumPy, Torch and a GUI toolkit all work exactly as they do
-now. Nothing is translated, so nothing is faster; the artifact is the largest
-of the three because an interpreter and every dependency are inside it.
+now. Nothing is translated, so nothing is faster; the artifact is the larger
+of the two because an interpreter and every dependency are inside it.
 
 **`compile-capi` is the one under active work.** It translates
 ordinary Python into C that drives the CPython C API, then compiles that C with
@@ -303,6 +299,20 @@ fast path is off. On a loop it can claim, the same tier is 1.17× faster than
 CPython; a float loop, once the worst row at 0.32×, is 1.06×; and a call to a
 small helper is 2.10×, because the call stops existing and the loop around it
 becomes machine arithmetic.
+
+### The third tier, which is not one of the two
+
+`py2bin compile` is out of the table on purpose: it is not something to choose
+between, because it takes a small subset of the language and no packages at
+all. What it gives back is an artifact with no interpreter in it and none on
+the machine - 14× faster on that loop, in 32 KB. Reach for it when *that* is
+the point. It is also the compiler behind `py2bin cc`, so C goes through it
+whether or not any Python does.
+
+**Its integers are 64 bits wide and they wrap**, which is the one place py2bin
+can be quietly wrong rather than refuse: `v = v * 2` seventy times answers 0
+where Python answers 1180591620717411303424. Constants are folded exactly.
+Both tiers in the table use the interpreter's own arithmetic and are exact.
 
 ## Using it
 

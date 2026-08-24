@@ -41,32 +41,19 @@ py2bin compile-capi app.py --target darwin-universal2 --app --dmg -o App.app
 That is the whole decision, and it is the only one `py2bin make` (or
 `build.py` in a clone) asks about.
 
-There is a third, `compile`, which is not a general choice: it accepts a small
-subset of the language and no packages at all, in exchange for an artifact
-with no interpreter anywhere near it. Reach for it when that is the point.
-
-**Its integers are 64 bits wide and they wrap.** That is the one place in
-py2bin where a program can be quietly wrong rather than refused, so it is
-worth saying plainly: a runtime integer in the native tier is a machine word,
-and `v = v * 2` run seventy times answers 0 where Python answers
-1180591620717411303424. Constants are folded exactly - `2 ** 70` written down
-is right - so it is only values the program computes as it runs. The other
-two tiers use the interpreter's own arithmetic and are exact. If your program
-counts past 2^63 anywhere, this is not the tier for it.
-
-| | `freeze` | `compile-capi` | `compile` |
-|---|---|---|---|
-| **speed** on a 30M-iteration loop | 0.74 s | 0.44 s | **0.05 s** |
-| **artifact** | 24 MB | 50 KB | **32 KB** |
-| **needs Python on the machine?** | no, it carries one | yes, or bundle it | **no** |
-| **how much Python works** | **everything** | most of it: 886 of an 889-program corpus[^corpus] | a small subset |
-| **third-party packages** | **carried inside** | any the interpreter can import | none |
-| what actually runs your logic | CPython, interpreting | machine code | machine code |
+| | `freeze` | `compile-capi` |
+|---|---|---|
+| **speed** on a 30M-iteration loop | 0.74 s | **0.44 s** |
+| **artifact** | 24 MB | **50 KB** |
+| **needs Python on the machine?** | no, it carries one | yes, or bundle it |
+| **how much Python works** | **everything** | most of it: 886 of an 889-program corpus[^corpus] |
+| **third-party packages** | **carried inside** | any the interpreter can import |
+| what actually runs your logic | CPython, interpreting | machine code |
 
 **`freeze` is the most complete.** It ships your program beside an interpreter
 that runs it, so NumPy, Torch and a GUI toolkit all work exactly as they do
-now. Nothing is translated, so nothing is faster; the artifact is the largest
-of the three because an interpreter and every dependency are inside it.
+now. Nothing is translated, so nothing is faster; the artifact is the larger
+of the two because an interpreter and every dependency are inside it.
 
 **`compile-capi` is the one under active work.** It translates
 ordinary Python into C that drives the CPython C API, then compiles that C with
@@ -79,12 +66,25 @@ because each is a real C-API call where the interpreter has a per-site cache
 that reads the object's internals directly. See
 [what it supports](#what-compile-capi-supports) for the per-feature table.
 
-**`compile` is the fastest and the smallest.** Python AST → py2bin IR →
-optimizer → handwritten x86-64/ARM64 → ELF, PE or Mach-O. There is no
-interpreter in the artifact and none on the machine: 14× faster than CPython on
-that loop, in 32 KB that runs on a bare system. You pay for it in what it will
-accept - integers, floats, strings, control flow, your own functions - and it
-will not import a package at all.
+### The third tier, which is not one of the two
+
+`py2bin compile` is deliberately out of the table above, because it is not
+something to choose between: it accepts a small subset of the language and no
+packages at all. Python AST → py2bin IR → optimizer → handwritten
+x86-64/ARM64 → ELF, PE or Mach-O. No interpreter in the artifact and none on
+the machine: 14× faster than CPython on that loop, in 32 KB that runs on a
+bare system. Reach for it when *that* is the point, not when you are deciding
+how to ship a program. It is also the compiler behind `py2bin cc`, so C goes
+through it whether or not any Python does.
+
+**Its integers are 64 bits wide and they wrap.** That is the one place in
+py2bin where a program can be quietly wrong rather than refused, so it is
+worth saying plainly: a runtime integer in this tier is a machine word, and
+`v = v * 2` run seventy times answers 0 where Python answers
+1180591620717411303424. Constants are folded exactly - `2 ** 70` written down
+is right - so it is only values the program computes as it runs. Both tiers in
+the table use the interpreter's own arithmetic and are exact. If your program
+counts past 2^63 anywhere, this is not the tier for it.
 
 The loop above is deliberately unkind to `compile-capi`: its accumulator is
 compared against a parameter, which the register analysis cannot claim, so the

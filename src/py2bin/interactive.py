@@ -64,7 +64,10 @@ METHODS = (
         "Python there is.",
     ),
     (
-        "compile",
+        # Named for the command it runs. It read "compile" for a long time,
+        # which is a different tier - the one with no CPython at all - and
+        # this has never built that.
+        "compile-capi",
         "COMPILE IT - Python translated to C, and that C to machine code by "
         "py2bin's own compiler.\n      Slower to build; no source and no "
         "bytecode in what comes out.",
@@ -330,7 +333,7 @@ def main(where: str | None = None) -> int:
     else:
         method = offered[ask("How should it be built?", offered, 1)][0]
 
-    if method == "compile" and not _COMPILED_CARRIES_PYTHON[system]:
+    if method == "compile-capi" and not _COMPILED_CARRIES_PYTHON[system]:
         # Said before the build rather than after it: everything up to that
         # point takes a while and downloads a good deal, and finding out at
         # the end that the target still needs Python is finding out too late.
