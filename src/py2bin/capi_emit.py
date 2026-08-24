@@ -691,7 +691,13 @@ static void _py2bin_crash_report(void) {
                    the thing that crashed. */
                 "_where = getattr(builtins, '_py2bin_dir', '') or "
                 "os.path.dirname(os.path.abspath(sys.executable))\n"
-                "for _dir in (_where, os.path.expanduser('~')):\n"
+                /* SystemExit is how a program stops on purpose - `sys.exit(0)`,
+                   or the `raise SystemExit(main())` that ends most scripts -
+                   so it is not a crash and CPython prints no traceback for it
+                   either. Reported as one, every successful run of a windowed
+                   app left a crash.txt beside itself saying "SystemExit: 0". */
+                "if not isinstance(_e, SystemExit):\n"
+                "  for _dir in (_where, os.path.expanduser('~')):\n"
                 "    try:\n"
                 "        _p = os.path.join(_dir, 'crash.txt')\n"
                 "        with open(_p, 'w', encoding='utf-8') as _f:\n"

@@ -215,6 +215,17 @@ def _parser() -> argparse.ArgumentParser:
         "web assets, anything it opens rather than imports; repeatable",
     )
     capi_parser.add_argument(
+        "--native",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="compile this C program for the same target and carry it beside "
+        "the executable. PATH is the .c file with the main, or a directory "
+        "holding it; every other .c beside it is compiled in, since there is "
+        "no linker, and an include/ directory beside it is searched. "
+        "Repeatable",
+    )
+    capi_parser.add_argument(
         "--auto-fetch",
         action="store_true",
         help="download whatever is missing over verified HTTPS instead of "
@@ -722,6 +733,56 @@ def _site_paths(values: list[str]) -> tuple[str, ...]:
         for value in values
     )
 
+
+
+def _build_native_helper(where: Path, beside: Path, chosen: str) -> Path:
+    """Compile a C program for `chosen` and put the executable in `beside`.
+
+    `where` is the `.c` holding the `main`, or a directory holding it. Every
+    other `.c` beside it is compiled in - py2bin has no linker, so the whole
+    program is one translation unit - and an `include/` directory beside it is
+    searched for headers.
+
+    The point of doing this at build time rather than accepting an executable
+    someone built earlier is the target. A compiled Python program and the C
+    helper it runs have to be for the same machine, and nothing about a file
+    already built says which machine that was.
+    """
+
+    from .c_native import compile_c_native
+    from .interactive import c_programs, c_sources_beside
+
+    where = where.resolve()
+    if where.is_dir():
+        found = c_programs(where)
+        if not found:
+            raise FileNotFoundError(
+                f"no .c file defining a main in {where}; --native wants the "
+                f"program to compile, and a directory of helpers has nothing "
+                f"to start"
+            )
+        if len(found) > 1:
+            names = ", ".join(path.name for path in found)
+            raise ValueError(
+                f"{where} holds more than one C program ({names}); name the "
+                f"one to build rather than the directory"
+            )
+        entry = found[0]
+    elif where.is_file():
+        entry = where
+    else:
+        raise FileNotFoundError(f"nothing to compile at {where}")
+
+    others, includes = c_sources_beside(entry)
+    result = compile_c_native(
+        entry,
+        beside / (entry.stem + (".exe" if chosen.startswith("windows-") else "")),
+        target=chosen,
+        clean=True,
+        include_dirs=tuple(includes),
+        extra_sources=tuple(others),
+    )
+    return result.artifact
 
 def _embedded_python_path() -> str:
     """Where the carried interpreter sits, relative to the executable."""
@@ -1540,6 +1601,30 @@ def _main(argv: list[str] | None = None) -> int:
                     icon=Path(args.icon),
                 )
                 print(f"put {Path(args.icon).name} inside {output.name}", file=sys.stderr)
+
+            if args.native:
+                # Compiled here rather than carried already built, so the C is
+                # built for the target the Python was built for. A helper
+                # compiled for this machine and dropped into a Windows bundle
+                # is the failure this exists to prevent.
+                beside = (
+                    output / "Contents" / "MacOS"
+                    if args.app and chosen.startswith("darwin")
+                    else output.parent
+                )
+                beside.mkdir(parents=True, exist_ok=True)
+                for named in args.native:
+                    try:
+                        built = _build_native_helper(
+                            Path(named).expanduser(), beside, chosen
+                        )
+                    except (FileNotFoundError, ValueError) as error:
+                        print(f"py2bin: error: {error}", file=sys.stderr)
+                        return 2
+                    print(
+                        f"compiled {built.name} for {chosen} beside the program",
+                        file=sys.stderr,
+                    )
 
             if args.include:
                 import shutil as _shutil

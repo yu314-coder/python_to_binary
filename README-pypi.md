@@ -175,6 +175,24 @@ exec on Apple silicon, whose pages are 16 KB, while `codesign` still calls the
 file valid and the same bytes run fine on their own. Every slice is placed on
 2**14, as Apple's own universal2 builds are.
 
+### A program that is not all one language
+
+Python, C and web assets in one artifact, through the tier that makes real
+machine code:
+
+```sh
+py2bin compile-capi app.py --native native --include web --app --onefile -o App.app
+```
+
+`--native` compiles the C for the same target as the Python and carries the
+executable with it; `--include` carries a directory as it is. `py2bin make`
+needs neither typed - a `native/` with a `.c` holding a `main` is compiled, and
+`web/`, `assets/`, `static/`, `templates/`, `resources/`, `data/` are carried.
+
+The C and the Python do not merge into one image - there is no linker - so the
+C is a separate executable inside the bundle and the Python runs it. What is in
+one file is the delivery, not the linkage.
+
 ### C, and a project of several files
 
 py2bin has its own C compiler, so a C program is a native executable the same

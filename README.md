@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,856 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,868 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -460,6 +460,43 @@ system include path - a real system header uses compiler extensions this does
 not implement - and **no C++**. C++ is not a flag away from C: classes,
 templates, name mangling, exceptions and the standard library are a compiler
 of their own, and py2bin does not have one.
+
+### A program that is not all one language
+
+An application is often Python, some C, and a folder of html/css/js. All three
+go into one artifact through `compile-capi` - the tier that produces real
+machine code, not an interpreter shipped beside your source:
+
+```sh
+py2bin compile-capi app.py --native native --include web \
+       --app --name App --onefile --embed-python -o App.app
+```
+
+- **`--native PATH`** compiles the C *for the same target as the Python* and
+  puts the executable beside it. PATH is the `.c` holding the `main`, or a
+  directory holding it; every other `.c` beside it is compiled in, and an
+  `include/` directory is searched for headers. Compiled here rather than
+  accepted already built, because nothing about a finished executable says
+  which machine it was for - and a helper built for the build machine, dropped
+  into a Windows bundle, is the failure worth preventing.
+- **`--include PATH`** carries a file or directory as it is. Web assets are
+  not "supported" so much as *carried*: they are data, and a bundle is a
+  filesystem.
+
+`build.py` and `py2bin make` need none of that typed. A `native/` directory
+holding a `.c` with a `main` is compiled; `web/`, `assets/`, `static/`,
+`templates/`, `resources/` and `data/` are carried. Answer the three questions
+and the mixture comes out as one file.
+
+**The C and the Python do not merge into one image.** py2bin has no linker, so
+the C is a separate executable inside the bundle and the Python reaches it the
+ordinary way - `subprocess`, or `ctypes` for a shared library. What is in one
+file is the *delivery*, not the linkage.
+
+Two limits of the C compiler are worth knowing before leaning on this: it
+ships its own standard headers and has no system include path, and a `printf`
+with a runtime conversion is POSIX-only, because that is where it emits the
+write syscall. A format with no conversions works on every target.
 
 ### Reaching it from npm
 

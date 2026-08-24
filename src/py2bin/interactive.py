@@ -26,6 +26,9 @@ _ICONS = ("icon.ico", "icon.icns", "icon.png", "app.ico", "app.icns")
 #: icons. They are carried beside it, because that is where it looks.
 _DATA_DIRECTORIES = ("web", "assets", "static", "templates", "resources", "data")
 
+#: Directories holding C to build with the program rather than data to carry.
+_NATIVE_DIRECTORIES = ("native", "c", "csrc", "lib")
+
 #: Directories inside the clone that hold py2bin, not anyone's program. Run
 #: from the clone root, these are all there is, and offering them would be
 #: offering to compile the compiler.
@@ -361,6 +364,22 @@ def main(where: str | None = None) -> int:
     if carried:
         say(f"  carrying {', '.join(path.name + '/' for path in carried)}")
 
+    # C beside the program is compiled for the same machine and carried with
+    # it. Found rather than asked for, like the data directories: a `native/`
+    # holding a `.c` with a `main` is what it is. Building it here rather than
+    # taking one already built is the whole point - a helper compiled for this
+    # machine dropped into a Windows bundle is the failure worth preventing.
+    native = [
+        folder
+        for folder in (here / name for name in _NATIVE_DIRECTORIES)
+        if folder.is_dir() and c_programs(folder)
+    ]
+    if native:
+        say(
+            f"  compiling {', '.join(path.name + '/' for path in native)} "
+            f"for the same machine"
+        )
+
     icon = next((here / name for name in _ICONS if (here / name).is_file()), None)
     if icon is not None:
         say(f"  using {icon.name} as the icon")
@@ -449,6 +468,8 @@ def main(where: str | None = None) -> int:
         arguments += ["--icon", str(icon)]
     for path in carried:
         arguments += ["--include", str(path)]
+    for path in native:
+        arguments += ["--native", str(path)]
     arguments += ["-o", str(output)]
 
     delivered = {
