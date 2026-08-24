@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,932 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,940 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -536,7 +536,7 @@ code before it emits anything, which is where they are done here:
 | **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer |
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
 
-**Three standard headers**, each written in py2bin's own C++ subset and put
+**Standard headers**, each written in py2bin's own C++ subset and put
 through the same translator as your code — so they are readable, and they are
 not special cases in the compiler:
 
@@ -549,6 +549,15 @@ not special cases in the compiler:
 * `<iostream>` — `cout` with one `operator<<` per type it can print, each
   handing the stream back so the next `<<` in the chain has something to be
   called on.
+* `<algorithm>` — `sort` (a heapsort: no recursion, no scratch memory),
+  `find`, `count`, `fill`, `reverse`, `min`/`max`, `min_element`/`max_element`,
+  `swap`. Templates over pointers, which is what a contiguous iterator is, so
+  they work on a `vector` and on a plain array alike.
+* `<stdexcept>` — `exception` and the four that derive from it, each carrying
+  a message and answering `what()`.
+* `<utility>` (`pair`), `<numeric>` (`accumulate`), and `<cassert>`,
+  `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
+  `<cmath>`, `<cstdint>` as names for the C headers underneath.
 
 ```cpp
 #include <iostream>
@@ -567,7 +576,7 @@ differ only in types py2bin cannot read are refused rather than guessed at.
 **How it is checked.** Reading the generated C tells you it is well formed and
 nothing about whether it *means* the same thing — so the corpus in
 `tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it, over 66 programs,
+the outputs compared. `tools/cpp_differential.sh` runs it, over 71 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1668,9 +1677,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1832 tests, no dependencies, nothing to install. Five modules want pytest's
+1840 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1932. The suite fails if any module under `src/` imports
+too, for 1940. The suite fails if any module under `src/` imports
 `subprocess`, `multiprocessing`, `pty`, `distutils` or `setuptools`, or names
 an external toolchain as a value - which is what keeps the zero-toolchain
 claim honest rather than aspirational.
@@ -1682,4 +1691,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1932-test suite.
+    is checked on every change is the 1940-test suite.

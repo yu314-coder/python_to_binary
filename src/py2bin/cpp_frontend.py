@@ -449,11 +449,14 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
         if pattern.match(spelled):
             return named
     if not spelled.isidentifier():
-        return None
+        return _deduced_from_expression(spelled, text, before)
     # Bounded on both sides: without it, `main(void)` reads as a declaration
     # of `d` with type `voi`, and the copy was written out under that name.
+    # The trailing `[` is how an array is declared, and an array used as a
+    # value is a pointer to its first element - which is what `sort(raw, raw
+    # + 8)` passes.
     pattern = re.compile(
-        rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*(\*?)\s*\b{re.escape(spelled)}\b\s*[=;,)]"
+        rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*(\*?)\s*\b{re.escape(spelled)}\b\s*([=;,)\[])"
     )
     found = [
         match
@@ -466,8 +469,96 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # in scope; falling back to the first anywhere when the call comes first.
     earlier = [match for match in found if before < 0 or match.start() < before]
     declared = earlier[-1] if earlier else found[0]
-    return (declared.group(1) + " " + declared.group(2)).strip()
+    stars = declared.group(2) + ("*" if declared.group(3) == "[" else "")
+    return (declared.group(1) + " " + stars).strip()
 
+
+
+#: `v.begin()` or `p->size()` - a call on something, taking nothing.
+_MEMBER_CALL = re.compile(
+    r"^([A-Za-z_]\w*)\s*(?:\.|->)\s*([A-Za-z_]\w*)\s*\(\s*\)$"
+)
+#: `f()` - a plain call, taking nothing.
+_PLAIN_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\(\s*\)$")
+
+
+def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | None":
+    """The type of something that is not a bare name.
+
+    Only the shapes an argument is actually written in: a call, a pointer
+    walked forward, a dereference, an address. Anything else says so rather
+    than being guessed at, because the answer picks which copy of a template
+    is compiled and a wrong one runs.
+    """
+
+    while spelled.startswith("(") and _closing_paren(spelled, 0) == len(spelled) - 1:
+        spelled = spelled[1:-1].strip()
+    if spelled.startswith("&"):
+        held = _deduced_type(spelled[1:].strip(), text, before)
+        return None if held is None else f"{held} *".replace("  ", " ")
+    if spelled.startswith("*"):
+        held = _deduced_type(spelled[1:].strip(), text, before)
+        if held is None or "*" not in held:
+            return None
+        return held[::-1].replace("*", "", 1)[::-1].strip()
+    # `raw + 8` is where `raw` points, moved along: the same type.
+    walked = re.match(r"^(.+?)\s*[+-]\s*[^+-]+$", spelled)
+    if walked is not None:
+        held = _deduced_type(walked.group(1).strip(), text, before)
+        if held is not None:
+            return held
+    return _deduced_from_call(spelled, text, before)
+
+
+def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
+    """The type of a call's result, where the call is simple enough to read.
+
+    `sort(v.begin(), v.end())` is how nearly every use of <algorithm> is
+    written, and none of it can be deduced without knowing what `begin`
+    returns. So a call on a name is followed: the name says which class, and
+    the class says what the member returns.
+    """
+
+    member = _MEMBER_CALL.match(spelled)
+    if member is not None:
+        held = _deduced_type(member.group(1), text, before)
+        if held is None:
+            return None
+        return _declared_return(text, held.replace("*", "").strip(), member.group(2))
+    plain = _PLAIN_CALL.match(spelled)
+    if plain is not None:
+        return _declared_return(text, None, plain.group(1))
+    return None
+
+
+def _declared_return(text: str, owner: "str | None", method: str) -> "str | None":
+    """What `owner::method` is declared to return, read out of the source.
+
+    Read from the text rather than from parsed classes because this runs
+    before the classes are taken apart - a template is expanded first, and
+    the expansion is what a class body is made of.
+    """
+
+    where = text
+    if owner is not None:
+        found = None
+        for head in _CLASS_HEAD.finditer(text):
+            if head.group(2) == owner:
+                found = head
+                break
+        if found is None:
+            return None
+        try:
+            where = text[found.end() - 1: _matching(text, found.end() - 1)]
+        except ValueError:
+            return None
+    for match in _ANY_DEFINITION.finditer(where):
+        head = match.group(1).strip()
+        words = head.replace("*", " * ").replace("&", " & ").split()
+        if not words or words[-1] != method or len(words) < 2:
+            continue
+        return " ".join(words[:-1]).replace("&", "*").strip()
+    return None
 
 def _deduce_arguments(
     parameters: "list[tuple[str, bool]]",
@@ -487,18 +578,30 @@ def _deduce_arguments(
     if len(wanted) != len(given):
         return None
     found: dict[str, str] = {}
+    names = {name for name, is_type in parameters if is_type}
     for part, argument in zip(wanted, given):
+        stars = part.count("*")
         words = part.replace("*", " * ").replace("&", " ").split()
         if len(words) < 2:
             continue
         named = words[0] if words[0] not in ("const",) else (words[1] if len(words) > 2 else "")
-        if named not in {name for name, is_type in parameters if is_type}:
+        if named not in names:
             continue
         if named in found:
             continue
         deduced = _deduced_type(argument, text, before)
         if deduced is None:
             return None
+        if stars:
+            # `T *first` given an `int *` deduces T as `int`, not `int *`.
+            # Without this, `sort(v.begin(), v.end())` asked for a copy of
+            # sort over `int *` and compared the addresses.
+            peeled = deduced
+            for _ in range(stars):
+                if "*" not in peeled:
+                    return None
+                peeled = peeled[::-1].replace("*", "", 1)[::-1].strip()
+            deduced = peeled
         found[named] = deduced
     if len(found) != len([1 for _n, is_type in parameters if is_type]):
         return None
@@ -556,51 +659,136 @@ def _expand_templates(text: str, filename: str) -> str:
     # Repeated, because a copy may itself name a template - `Stack<Pair<int>>`
     # asks for `Pair<int>` too, and the inner one is only visible once the
     # outer has been written out.
-    for _round in range(_TEMPLATE_ROUNDS):
-        wanted: list[tuple[str, list[str]]] = []
+    def uses(region: str, scope: str) -> "tuple[list, list]":
+        """Every template this region asks for, spelled out or deduced.
+
+        The region comes first in what is searched for a declaration, so a
+        copy's own parameters win over an identically named parameter in
+        another copy - `sort__double` calls `__sift` on a `double *`, and
+        searching the file first found `sort__int`'s `int *first`.
+        """
+
+        scope = region + "\n" + scope
+
+        asked: list[tuple[str, list[str]]] = []
+        unread: list[tuple[str, int]] = []
         for name, (parameters, kind, pattern_text) in patterns.items():
             if kind != "function":
                 continue
             # A call that did not spell the arguments out: `twice(5)` rather
             # than `twice<int>(5)`. What it means is read off the arguments.
             declared = _DEFINITION.match(pattern_text)
-            for call in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", text):
-                if declared is None:
-                    continue
-                close = _closing_paren(text, call.end() - 1)
+            if declared is None:
+                continue
+            for call in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", region):
+                close = _closing_paren(region, call.end() - 1)
                 if close < 0:
                     continue
-                inside = text[call.end(): close]
-                given = (
-                    [a.strip() for a in _split_arguments(inside)]
-                    if inside.strip()
-                    else []
-                )
+                given = _call_arguments(region, call.end() - 1)
                 deduced = _deduce_arguments(
-                    parameters, declared.group(3), given, text, call.start()
+                    parameters, declared.group(3), given, scope, call.start()
                 )
                 if deduced is None:
-                    raise CppTranslationError(
-                        filename,
-                        _line_of(text, call.start()),
-                        f"cannot work out what {name}() is being called with "
-                        f"here. py2bin deduces a template argument from a "
-                        f"literal or a variable it can see declared; write "
-                        f"{name}<type>(...) to say which copy is meant",
-                    )
-                wanted.append((name, deduced))
+                    # Not yet, rather than never: `sort(v.begin(), v.end())`
+                    # cannot be read until `vector<int>` has been written out,
+                    # because until then there is no `begin` to ask. Held for
+                    # the next round, and reported once the rounds stop
+                    # producing anything new.
+                    unread.append((name, call.start()))
+                    continue
+                asked.append((name, deduced))
         for name in patterns:
-            for found in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*<", text):
-                close = _closing_angle(text, found.end() - 1)
+            for found in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*<", region):
+                close = _closing_angle(region, found.end() - 1)
                 if close < 0:
                     continue
-                arguments = _split_arguments(text[found.end(): close])
+                arguments = _split_arguments(region[found.end(): close])
                 if any(
-                    re.search(rf"(?<![.\w>]){re.escape(other)}\s*<", ",".join(arguments))
+                    re.search(
+                        rf"(?<![.\w>]){re.escape(other)}\s*<", ",".join(arguments)
+                    )
                     for other in patterns
                 ):
                     continue  # an inner template first; next round
-                wanted.append((name, [a.strip() for a in arguments]))
+                asked.append((name, [a.strip() for a in arguments]))
+        return asked, unread
+
+    def point(region: str, scope: str) -> str:
+        """Send every use in this region to the copy written for it.
+
+        Same reasoning as in :func:`uses` about which text is searched first.
+        """
+
+        scope = region + "\n" + scope
+
+        out: list[str] = []
+        at = 0
+        spelled_out = re.compile(
+            r"(?<![.\w>])(" + "|".join(re.escape(n) for n in patterns) + r")\s*<"
+        )
+        for found in spelled_out.finditer(region):
+            if found.start() < at:
+                continue
+            close = _closing_angle(region, found.end() - 1)
+            if close < 0:
+                continue
+            arguments = [
+                a.strip() for a in _split_arguments(region[found.end(): close])
+            ]
+            named = _instantiated_name(found.group(1), arguments)
+            if named not in made:
+                continue
+            out.append(region[at:found.start()])
+            out.append(named)
+            at = close + 1
+        out.append(region[at:])
+        region = "".join(out)
+
+        # The same for the calls that named no arguments at all.
+        for name, (parameters, kind, pattern_text) in patterns.items():
+            if kind != "function":
+                continue
+            declared = _DEFINITION.match(pattern_text)
+            if declared is None:
+                continue
+            out = []
+            at = 0
+            for call in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", region):
+                if call.start() < at:
+                    continue
+                close = _closing_paren(region, call.end() - 1)
+                if close < 0:
+                    continue
+                given = _call_arguments(region, call.end() - 1)
+                deduced = _deduce_arguments(
+                    parameters, declared.group(3), given, scope, call.start()
+                )
+                if deduced is None:
+                    continue
+                named = _instantiated_name(name, deduced)
+                if named not in made:
+                    continue
+                out.append(region[at:call.start()])
+                out.append(f"{named}(")
+                at = call.end()
+            out.append(region[at:])
+            region = "".join(out)
+        return region
+
+    for _round in range(_TEMPLATE_ROUNDS):
+        # A copy may itself use a template - `sort` calls `__sift`, and
+        # `Stack<Pair<int>>` asks for `Pair<int>` too - so the copies written
+        # so far are scanned and rewritten exactly like the file is.
+        scope = text + "\n" + "\n".join(made.values())
+        wanted: list[tuple[str, list[str]]] = []
+        undeduced: list[tuple[str, int]] = []
+        asked, unread = uses(text, scope)
+        wanted.extend(asked)
+        undeduced.extend(unread)
+        for copy in list(made.values()):
+            asked, _unread = uses(copy, scope)
+            wanted.extend(asked)
+
         fresh = [
             (name, arguments)
             for name, arguments in wanted
@@ -615,7 +803,7 @@ def _expand_templates(text: str, filename: str) -> str:
                     f"{name} is a template taking {len(parameters)} argument(s) "
                     f"and is used here with {len(arguments)}",
                 )
-            spelled = _instantiated_name(name, arguments)
+            named = _instantiated_name(name, arguments)
             copy = _substituted(
                 pattern, [p for p, _is_type in parameters], arguments
             )
@@ -623,69 +811,29 @@ def _expand_templates(text: str, filename: str) -> str:
             # inside it, which are spelled with the class's own name.
             copy = _map_code(
                 copy,
-                lambda part, n=name, s=spelled: re.sub(
+                lambda part, n=name, s=named: re.sub(
                     rf"(?<![.\w>]){re.escape(n)}\b(?!\s*<)", s, part
                 ),
             )
-            made[spelled] = copy
-        # Point every use at the copy that was written for it.
-        replaced: list[str] = []
-        at = 0
-        pattern = re.compile(
-            r"(?<![.\w>])(" + "|".join(re.escape(n) for n in patterns) + r")\s*<"
-        )
-        for found in pattern.finditer(text):
-            if found.start() < at:
-                continue
-            close = _closing_angle(text, found.end() - 1)
-            if close < 0:
-                continue
-            arguments = [a.strip() for a in _split_arguments(text[found.end(): close])]
-            spelled = _instantiated_name(found.group(1), arguments)
-            if spelled not in made:
-                continue
-            replaced.append(text[at:found.start()])
-            replaced.append(spelled)
-            at = close + 1
-        replaced.append(text[at:])
-        text = "".join(replaced)
+            made[named] = copy
 
-        # The same for the calls that named no arguments at all.
-        for name, (parameters, kind, pattern_text) in patterns.items():
-            if kind != "function":
-                continue
-            declared = _DEFINITION.match(pattern_text)
-            if declared is None:
-                continue
-            out: list[str] = []
-            at = 0
-            for call in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", text):
-                if call.start() < at:
-                    continue
-                close = _closing_paren(text, call.end() - 1)
-                if close < 0:
-                    continue
-                inside = text[call.end(): close]
-                given = (
-                    [a.strip() for a in _split_arguments(inside)]
-                    if inside.strip()
-                    else []
-                )
-                deduced = _deduce_arguments(
-                    parameters, declared.group(3), given, text, call.start()
-                )
-                if deduced is None:
-                    continue
-                spelled = _instantiated_name(name, deduced)
-                if spelled not in made:
-                    continue
-                out.append(text[at:call.start()])
-                out.append(f"{spelled}(")
-                at = call.end()
-            out.append(text[at:])
-            text = "".join(out)
+        scope = text + "\n" + "\n".join(made.values())
+        text = point(text, scope)
+        for key in list(made):
+            made[key] = point(made[key], scope)
 
         if not fresh:
+            if undeduced:
+                name, where = undeduced[0]
+                raise CppTranslationError(
+                    filename,
+                    _line_of(text, where),
+                    f"cannot work out what {name}() is being called with "
+                    f"here. py2bin deduces a template argument from a "
+                    f"literal, from a variable it can see declared, or from "
+                    f"a call whose return type it can read; write "
+                    f"{name}<type>(...) to say which copy is meant",
+                )
             break
     else:
         raise CppTranslationError(
@@ -934,8 +1082,11 @@ def _rewrite_exceptions(
     )
 
 
-#: Stands in for a try that has been dealt with, while the rest is.
-_TRY_MARK = "\x00py2bin_try_%d\x00"
+#: Stands in for a try that has been dealt with, while the rest is. The `;`
+#: is load-bearing: statements are split on it, and without one the try and
+#: whatever followed it were one statement - so a call hoisted out of that
+#: next statement was placed *before* the try and ran too early.
+_TRY_MARK = "\x00py2bin_try_%d\x00;"
 
 
 def _guarded(
@@ -1052,6 +1203,7 @@ def _catch_binding(
 
     if spelled in ("...", ""):
         return ""
+    by_reference = "&" in spelled
     words = spelled.replace("*", " * ").replace("&", " ").split()
     if len(words) < 2:
         raise CppTranslationError(
@@ -1062,6 +1214,25 @@ def _catch_binding(
     named = words[-1]
     held = " ".join(words[:-1])
     if held.strip() in _CLASS_NAMES:
+        if by_reference:
+            # A reference to what is in flight, not a copy of it - which is
+            # what `catch (std::exception &e)` is for. Written as a C++
+            # reference so the pass that turns those into pointers does it,
+            # and `e.what()` reaches the object that was actually thrown
+            # rather than the base it was sliced to.
+            return f"{held} &{named} = *({held} *){_IN_FLIGHT}; "
+        if held.strip() in _POLYMORPHIC and held.strip() in _INHERITED_FROM:
+            raise CppTranslationError(
+                filename,
+                _line_of(body, at),
+                f"catching {held.strip()} by value, and something in this "
+                f"file derives from it. C++ slices the object to that class "
+                f"here, so a virtual function called on it answers as the "
+                f"base rather than as what was thrown - py2bin's copy keeps "
+                f"the object it was made from and would answer differently. "
+                f"Write `catch ({held.strip()} &{named})`, which is what the "
+                f"slicing is a reason to write anyway",
+            )
         # Declared and then assigned, not initialised: py2bin's C takes
         # `o = *p;` and not `struct V o = *p;`.
         return (
@@ -1084,6 +1255,17 @@ def _thrown(match: "re.Match[str]", landing: "_Landing", body: str) -> str:
     if not spelled:
         # A bare `throw;` inside a handler: what is in flight stays in flight.
         return f"{{ {_THROWN} = 1; {landing.leave()} }}"
+    made = _CONSTRUCTED.match(spelled)
+    if made is not None and made.group(1) in _CLASS_NAMES:
+        # A temporary built in the throw itself, which is how the standard
+        # exception types are always thrown. `new` allocates and runs the
+        # constructor, which is exactly the copy that has to outlive the
+        # frame - so this is written as `new` and goes through that path.
+        return (
+            f"{{ {_THROWN} = 1; "
+            f"{made.group(1)} *__py2bin_raised = new {spelled}; "
+            f"{_IN_FLIGHT} = (long)__py2bin_raised; {landing.leave()} }}"
+        )
     held = _deduced_type(spelled, body, match.start())
     if held is not None and held.replace("*", "").strip() in _CLASS_NAMES:
         named = held.replace("*", "").strip()
@@ -1098,9 +1280,45 @@ def _thrown(match: "re.Match[str]", landing: "_Landing", body: str) -> str:
     )
 
 
+#: `Err(1, 2)` - a temporary built where it is thrown.
+_CONSTRUCTED = re.compile(r"^([A-Za-z_]\w*)\s*\(")
+
 #: The classes this file declares. Read before the exception pass, which runs
 #: before classes are taken apart and so has nothing else to ask.
 _CLASS_NAMES: "set[str]" = set()
+
+#: Of those, the ones with a virtual function somewhere above them. Catching
+#: one by value slices it, which is the one thing this cannot reproduce.
+_POLYMORPHIC: "set[str]" = set()
+
+#: Classes something else in this file inherits from. Only these can be
+#: sliced by a catch: a class nothing derives from is already what it is.
+_INHERITED_FROM: "set[str]" = set()
+
+
+def _polymorphic_names(text: str) -> "set[str]":
+    """Class names that have a virtual function, their own or inherited."""
+
+    bases: dict[str, str] = {}
+    declares: set[str] = set()
+    for head in _CLASS_HEAD.finditer(text):
+        name, base = head.group(2), head.group(3)
+        bases[name] = base or ""
+        try:
+            body = text[head.end() - 1: _matching(text, head.end() - 1)]
+        except ValueError:
+            continue
+        if re.search(r"\bvirtual\b", _without_literals(body)):
+            declares.add(name)
+    found = set()
+    for name in bases:
+        seen = name
+        while seen:
+            if seen in declares:
+                found.add(name)
+                break
+            seen = bases.get(seen, "")
+    return found
 
 def _check_after_calls(
     body: str,
@@ -3682,8 +3900,12 @@ def translate(source: str, filename: str = "<c++>") -> str:
         # destructors a return has to run first. The names are read first,
         # because a thrown object is copied to the heap and the copy needs
         # its type spelled.
-        global _CLASS_NAMES
+        global _CLASS_NAMES, _POLYMORPHIC, _INHERITED_FROM
         _CLASS_NAMES = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+        _POLYMORPHIC = _polymorphic_names(text)
+        _INHERITED_FROM = {
+            m.group(3) for m in _CLASS_HEAD.finditer(text) if m.group(3)
+        }
         text = _rewrite_exceptions_early(text, filename)
         patterned = True
 
@@ -4580,10 +4802,194 @@ const char *endl = "\n";
 }
 """
 
+#: py2bin's own <algorithm>. Templates over pointers, which is what an
+#: iterator is for a contiguous container - <vector>'s `begin()` and `end()`
+#: hand back `T *`, so these work on a vector and on a plain array alike.
+#: `sort` is a heapsort: O(n log n) with no recursion and no scratch memory,
+#: which matters when the heap underneath is an arena that does not reclaim.
+_ALGORITHM_HEADER = r"""
+namespace std {
+
+template<typename T>
+T max(T a, T b) { return a > b ? a : b; }
+
+template<typename T>
+T min(T a, T b) { return a < b ? a : b; }
+
+template<typename T>
+void swap(T &a, T &b) { T held; held = a; a = b; b = held; }
+
+template<typename T>
+T *find(T *first, T *last, T value) {
+    while (first != last) { if (*first == value) { return first; } first = first + 1; }
+    return last;
+}
+
+template<typename T>
+long count(T *first, T *last, T value) {
+    long seen = 0;
+    while (first != last) { if (*first == value) { seen = seen + 1; } first = first + 1; }
+    return seen;
+}
+
+template<typename T>
+void fill(T *first, T *last, T value) {
+    while (first != last) { *first = value; first = first + 1; }
+}
+
+template<typename T>
+void reverse(T *first, T *last) {
+    T held;
+    last = last - 1;
+    while (first < last) {
+        held = *first; *first = *last; *last = held;
+        first = first + 1; last = last - 1;
+    }
+}
+
+template<typename T>
+T *max_element(T *first, T *last) {
+    T *best = first;
+    while (first != last) { if (*best < *first) { best = first; } first = first + 1; }
+    return best;
+}
+
+template<typename T>
+T *min_element(T *first, T *last) {
+    T *best = first;
+    while (first != last) { if (*first < *best) { best = first; } first = first + 1; }
+    return best;
+}
+
+template<typename T>
+void __sift(T *base, long root, long span) {
+    long child;
+    T held;
+    while (1) {
+        child = root * 2 + 1;
+        if (child >= span) { return; }
+        if (child + 1 < span) { if (base[child] < base[child + 1]) { child = child + 1; } }
+        if (base[child] < base[root]) { return; }
+        if (base[child] == base[root]) { return; }
+        held = base[root]; base[root] = base[child]; base[child] = held;
+        root = child;
+    }
+}
+
+template<typename T>
+void sort(T *first, T *last) {
+    long span;
+    long i;
+    T held;
+    span = last - first;
+    if (span < 2) { return; }
+    i = span / 2 - 1;
+    while (i >= 0) { __sift(first, i, span); i = i - 1; }
+    i = span - 1;
+    while (i > 0) {
+        held = first[0]; first[0] = first[i]; first[i] = held;
+        __sift(first, (long)0, i);
+        i = i - 1;
+    }
+}
+
+template<typename T>
+int equal(T *first, T *last, T *other) {
+    while (first != last) {
+        if (*first == *other) { first = first + 1; other = other + 1; }
+        else { return 0; }
+    }
+    return 1;
+}
+
+}
+"""
+
+#: `std::pair` and the two free functions that go with it. A template, so it
+#: comes out as one concrete struct per pair of types.
+_UTILITY_HEADER = r"""
+namespace std {
+template<typename A, typename B>
+class pair {
+public:
+    A first;
+    B second;
+    pair() { }
+};
+
+template<typename T>
+void swap(T &a, T &b) { T held; held = a; a = b; b = held; }
+}
+"""
+
+#: <numeric>, which is `accumulate` and little else that a program without
+#: iterators of its own can use.
+_NUMERIC_HEADER = r"""
+namespace std {
+template<typename T>
+T accumulate(T *first, T *last, T start) {
+    while (first != last) { start = start + *first; first = first + 1; }
+    return start;
+}
+}
+"""
+
+#: <stdexcept>. The standard ones carry a message and answer `what()`; that
+#: is the whole of what code catching them uses, and it is what these do.
+#: There is no hierarchy - py2bin catches by the type written, and a `catch
+#: (std::exception &)` that means "any of them" would need one.
+_STDEXCEPT_HEADER = r"""
+namespace std {
+class exception {
+public:
+    const char *message;
+    exception() { message = ""; }
+    exception(const char *text) { message = text; }
+    // Virtual, and answering with the class's own name rather than the
+    // message, because that is what the standard one does: an exception
+    // caught by value is sliced to this, and what it says then should not
+    // depend on what it was before it was sliced.
+    virtual const char *what() { return "std::exception"; }
+};
+class runtime_error : public exception {
+public:
+    runtime_error() { message = ""; }
+    runtime_error(const char *text) { message = text; }
+    const char *what() { return message; }
+};
+class logic_error : public exception {
+public:
+    logic_error() { message = ""; }
+    logic_error(const char *text) { message = text; }
+    const char *what() { return message; }
+};
+class out_of_range : public exception {
+public:
+    out_of_range() { message = ""; }
+    out_of_range(const char *text) { message = text; }
+    const char *what() { return message; }
+};
+class invalid_argument : public exception {
+public:
+    invalid_argument() { message = ""; }
+    invalid_argument(const char *text) { message = text; }
+    const char *what() { return message; }
+};
+}
+"""
+
 _BUILTIN_CPP_HEADERS = {
     "string": _STRING_HEADER,
     "vector": _VECTOR_HEADER,
     "iostream": _IOSTREAM_HEADER,
+    "algorithm": _ALGORITHM_HEADER,
+    "utility": _UTILITY_HEADER,
+    "numeric": _NUMERIC_HEADER,
+    "stdexcept": _STDEXCEPT_HEADER,
+    "cassert": "#define assert(condition) ((void)0)\n",
+    "climits": "#include <limits.h>\n",
+    "cfloat": "#include <float.h>\n",
+    "cctype": "#include <ctype.h>\n",
     "cstdio": '#include <stdio.h>\n',
     "cstdlib": '#include <stdlib.h>\n',
     "cstring": '#include <string.h>\n',

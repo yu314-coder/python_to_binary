@@ -17,10 +17,28 @@ from pathlib import Path
 
 from py2bin.cpp_frontend import (
     CppTranslationError,
+    inline_local_includes,
     is_cpp,
     translate,
     translate_unity,
 )
+
+
+def with_headers(source: str) -> str:
+    """Translate source that includes one of py2bin's own C++ headers.
+
+    `translate` is handed text that already has its includes resolved;
+    `inline_local_includes` is what resolves them, and what supplies
+    <vector>, <algorithm> and the rest. A test that calls `translate`
+    directly on a file with `#include <algorithm>` is testing neither.
+    """
+
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / "t.cpp"
+        path.write_text(source, encoding="utf-8")
+        return translate(
+            inline_local_includes(path, [], set(), set()), str(path)
+        )
 
 
 _VEC = """#include <stdio.h>
@@ -968,3 +986,118 @@ class Uncaught(unittest.TestCase):
         )
         self.assertIn(f"return {UNCAUGHT_STATUS};", out)
         self.assertNotEqual(UNCAUGHT_STATUS, 0)
+
+
+class Algorithm(unittest.TestCase):
+    """<algorithm> is templates over pointers, which is what a contiguous
+    iterator is. Its calls are also the hardest deduction in the language:
+    `sort(v.begin(), v.end())` says nothing about the type anywhere."""
+
+    def test_a_call_is_deduced_through_a_member_call(self) -> None:
+        out = with_headers(
+            "#include <vector>\n#include <algorithm>\n"
+            "int main(void){ std::vector<int> v; v.push_back(1);"
+            " std::sort(v.begin(), v.end()); return v[0]; }"
+        )
+        self.assertIn("sort__int(", out)
+        self.assertNotIn("sort__int_p", out)
+
+    def test_an_array_deduces_as_a_pointer_to_its_element(self) -> None:
+        """`sort(raw, raw + 8)` is how half of all uses are written."""
+
+        out = with_headers(
+            "#include <algorithm>\n"
+            "int main(void){ int raw[4]; std::sort(raw, raw + 4); return raw[0]; }",
+        )
+        self.assertIn("sort__int(", out)
+
+    def test_a_template_calling_another_gets_both_copies(self) -> None:
+        """`sort` calls `__sift`, from inside a copy the file never wrote.
+
+        The expansion used to scan only the file, so a call inside a copy was
+        left naming the pattern - which is not a function.
+        """
+
+        out = with_headers(
+            "#include <algorithm>\n"
+            "int main(void){ double d[4]; std::sort(d, d + 4); return 0; }",
+        )
+        self.assertIn("__sift__double(", out)
+        self.assertNotIn("__sift__int", out)
+
+
+class ThrownTemporaries(unittest.TestCase):
+    def test_a_temporary_built_in_the_throw_is_allocated_and_constructed(
+        self,
+    ) -> None:
+        """`throw std::runtime_error("x")` is how exceptions are thrown.
+
+        `new` is exactly allocate-then-construct, which is what an exception
+        object has to be: a copy that outlives the frame that threw it.
+        """
+
+        out = with_headers(
+            "#include <stdexcept>\n"
+            "int f(void){ throw std::runtime_error(\"bad\"); }\n"
+            "int main(void){ try { f(); } catch (std::exception &e) "
+            "{ return e.what()[0]; } return 0; }",
+        )
+        self.assertIn("runtime_error__new", out)
+        self.assertIn("__py2bin_in_flight = (long)__py2bin_raised", out)
+
+    def test_catching_by_reference_binds_rather_than_copies(self) -> None:
+        out = with_headers(
+            "#include <stdexcept>\n"
+            "int f(void){ throw std::runtime_error(\"bad\"); }\n"
+            "int main(void){ try { f(); } catch (std::exception &e) "
+            "{ return e.what()[0]; } return 0; }",
+        )
+        # A pointer to what is in flight, and the virtual call through it.
+        self.assertIn("struct exception *e = &(*(exception *)__py2bin_in_flight)", out)
+
+    def test_catching_a_base_by_value_is_refused(self) -> None:
+        """C++ slices it; py2bin's copy would not. Say so rather than differ."""
+
+        with self.assertRaises(CppTranslationError) as caught:
+            with_headers(
+                "#include <stdexcept>\n"
+                "int f(void){ throw std::runtime_error(\"bad\"); }\n"
+                "int main(void){ try { f(); } catch (std::exception e) "
+                "{ return 1; } return 0; }",
+            )
+        self.assertIn("&e", str(caught.exception))
+
+    def test_a_class_nothing_derives_from_may_be_caught_by_value(self) -> None:
+        # Slicing a T to a T loses nothing, so the refusal above must not
+        # fire on every catch of a class that happens to have a base.
+        out = with_headers(
+            "#include <stdexcept>\n"
+            "int f(void){ throw std::out_of_range(\"z\"); }\n"
+            "int main(void){ try { f(); } catch (std::out_of_range e) "
+            "{ return 1; } return 0; }",
+        )
+        self.assertIn("out_of_range e;", out)
+
+
+class StatementOrder(unittest.TestCase):
+    def test_a_hoisted_call_stays_after_the_try_it_follows(self) -> None:
+        """The try's placeholder needed a `;` to be a statement of its own.
+
+        Without it the try and the statement after it were one statement, so
+        the call hoisted out of that statement was placed before the try and
+        ran too early - visibly, in the order things printed.
+        """
+
+        out = translate(
+            "int risky(int n){ if (n < 0) throw 1; return n; }\n"
+            "int main(void){\n"
+            "  try { risky(-1); } catch (int e) { return 1; }\n"
+            "  return risky(7); }",
+            "t.cpp",
+        )
+        body = out[out.index("int main"):]
+        self.assertLess(
+            body.index("__py2bin_catch_1"),
+            body.index("= risky(7)"),
+            "the call after the try was hoisted in front of it",
+        )
