@@ -1,0 +1,46 @@
+#!/bin/sh
+# Differential test: the same C++ built two ways, and the outputs compared.
+#
+#   reference : clang++ - ground truth for what the C++ means
+#   py2bin    : translated to C, then compiled by py2bin's own C compiler
+#
+# clang++ is the yardstick, not a dependency: py2bin builds with no toolchain.
+# This asks whether the translation preserves meaning, which is the only thing
+# reading the generated C cannot tell you.
+
+PASS=0; FAIL=0; REFUSED=0
+for source in "$(dirname "$0")"/cpp_corpus/*.cpp; do
+    name=$(basename "$source" .cpp)
+    if ! clang++ -std=c++03 -w -o "/tmp/ref_$name" "$source" 2>/dev/null; then
+        printf "  %-28s reference did not build - skipped\n" "$name"
+        continue
+    fi
+    want=$("/tmp/ref_$name" 2>&1); wantcode=$?
+    got=$(PYTHONPATH=/Volumes/D/github/python_to_binary/src python3 -m py2bin cc \
+          "$source" -o "/tmp/p2b_$name" 2>&1)
+    if [ $? -ne 0 ]; then
+        case "$got" in
+            *"does not do"*|*"standard library"*|*"initialiser list"*|*"destructor"*)
+                printf "  %-28s refused (says why)\n" "$name"
+                REFUSED=$((REFUSED + 1)) ;;
+            *)
+                printf "  %-28s BUILD FAILED\n" "$name"
+                printf "        %s\n" "$(printf '%s' "$got" | head -1 | cut -c1-96)"
+                FAIL=$((FAIL + 1)) ;;
+        esac
+        continue
+    fi
+    mine=$("/tmp/p2b_$name" 2>&1); minecode=$?
+    if [ "$mine" = "$want" ] && [ "$minecode" = "$wantcode" ]; then
+        printf "  %-28s ok\n" "$name"
+        PASS=$((PASS + 1))
+    else
+        printf "  %-28s DIFFERS\n" "$name"
+        printf "        clang++: %s (exit %s)\n" "$(printf '%s' "$want" | tr '\n' '|' | cut -c1-70)" "$wantcode"
+        printf "        py2bin : %s (exit %s)\n" "$(printf '%s' "$mine" | tr '\n' '|' | cut -c1-70)" "$minecode"
+        FAIL=$((FAIL + 1))
+    fi
+done
+echo
+echo "  agreed $PASS   differed $FAIL   refused $REFUSED"
+[ $FAIL -eq 0 ]

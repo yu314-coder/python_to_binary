@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,887 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,895 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -530,6 +530,17 @@ because C++ mistranslated into C fails somewhere nobody wrote.
 `new` is refused for a reason worth stating plainly: py2bin's C compiler has
 no `malloc`. There is no heap to put an object on, so this is not a corner cut
 here - it is the shape of what is underneath.
+
+**How it is checked.** Reading the generated C tells you it is well formed
+and nothing about whether it *means* the same thing - so the corpus in
+`tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
+the outputs compared. `tools/cpp_differential.sh` runs it. Ten programs found
+three bugs on the first run and eight in total, every one of which produced C
+that compiled cleanly and meant something else: a member called `n` rewrote
+`printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
+member answered 200 where the answer is 105; a destructor in a nested block was
+emitted at the end of the function. clang++ is the yardstick there and never a
+dependency - py2bin still builds with no toolchain at all.
 
 **Be clear about what this is.** It is a useful subset, not a C++ compiler,
 and it will not build code that uses the standard library - which is most real

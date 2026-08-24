@@ -133,6 +133,46 @@ def _strip_comments(text: str) -> str:
     return "".join(out)
 
 
+
+def _map_code(text: str, change) -> str:
+    """Apply `change` to the code, and to nothing inside a literal.
+
+    Rewriting ran over the whole text, string literals included, and a class
+    with a member called `n` turned `printf("outer\\n")` into
+    `printf("outer\\this->n")`. The program still built and printed the wrong
+    thing, which is the failure mode worth the most care: a literal is data,
+    and no name in it is a name.
+    """
+
+    out = []
+    chunk = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in "\"'":
+            out.append(change("".join(chunk)))
+            chunk = []
+            quote = char
+            literal = [char]
+            index += 1
+            while index < length:
+                if text[index] == "\\" and index + 1 < length:
+                    literal.append(text[index:index + 2])
+                    index += 2
+                    continue
+                literal.append(text[index])
+                if text[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            out.append("".join(literal))
+            continue
+        chunk.append(char)
+        index += 1
+    out.append(change("".join(chunk)))
+    return "".join(out)
+
 def _matching(text: str, opening: int) -> int:
     """The index just past the brace that closes the one at `opening`."""
 
@@ -270,7 +310,96 @@ def _refuse_unsupported(text: str, filename: str) -> None:
             )
 
 
-def _this_qualified(body: str, owner: Class, classes: "dict[str, Class]") -> str:
+#: `int x;`, `int x = 1;`, `Vec v(1, 2);` - something declared in this body.
+_DECLARED_HERE = re.compile(r"\b([A-Za-z_]\w*)\s*\**\s*([A-Za-z_]\w*)\s*[=;(\[]")
+
+#: Words that are not a type, however much `return v;` looks like `int v;`.
+#: Without this, `return v` hid the member `v` from its own method and the
+#: compiler reported a name that is not declared anywhere.
+_NOT_A_TYPE = frozenset(
+    """return if else while for do switch case default break continue goto
+    sizeof typedef struct union enum static const volatile extern register
+    auto inline restrict public private protected class new delete this
+    true false""".split()
+)
+
+
+
+def _without_literals(text: str) -> str:
+    """The text with every literal blanked, for scanning rather than editing.
+
+    Kept the same length so an offset still means something, and emptied so
+    nothing inside a literal can be read as code.
+    """
+
+    return "".join(
+        part if kind == "code" else " " * len(part)
+        for kind, part in _split_literals(text)
+    )
+
+
+def _split_literals(text: str) -> "list[tuple[str, str]]":
+    """The text as alternating ("code", ...) and ("literal", ...) pieces."""
+
+    pieces: list[tuple[str, str]] = []
+    chunk: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in "\"'":
+            pieces.append(("code", "".join(chunk)))
+            chunk = []
+            quote = char
+            literal = [char]
+            index += 1
+            while index < length:
+                if text[index] == "\\" and index + 1 < length:
+                    literal.append(text[index:index + 2])
+                    index += 2
+                    continue
+                literal.append(text[index])
+                if text[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            pieces.append(("literal", "".join(literal)))
+            continue
+        chunk.append(char)
+        index += 1
+    pieces.append(("code", "".join(chunk)))
+    return pieces
+
+def _shadowing(body: str, parameters: str) -> "set[str]":
+    """Names in this body that hide a member of the same name.
+
+    C++ resolves `n` to the parameter when a parameter is called `n`, and to
+    the member only otherwise. Qualifying every occurrence made
+    `this->n + n` into `this->n + this->n` - 200 where the answer is 105, and
+    a program that runs and is wrong rather than one that fails.
+    """
+
+    hidden = set()
+    for part in parameters.split(","):
+        words = part.replace("*", " * ").split()
+        if len(words) >= 2 and words[-1].isidentifier():
+            hidden.add(words[-1])
+    # Over the code only. `printf("n=%d a=%d")` contains `d a=`, which reads
+    # exactly like a declaration of `a` - so the member `a` was hidden from
+    # its own method by a format string that merely mentions the letter.
+    for found in _DECLARED_HERE.finditer(_without_literals(body)):
+        if found.group(1) in _NOT_A_TYPE:
+            continue
+        hidden.add(found.group(2))
+    return hidden
+
+
+def _this_qualified(
+    body: str,
+    owner: Class,
+    classes: "dict[str, Class]",
+    hidden: "set[str]" = frozenset(),
+) -> str:
     """Point bare member names at `this`, the way C++ resolves them.
 
     Inherited names count: the base is embedded as the first member, so a
@@ -291,7 +420,7 @@ def _this_qualified(body: str, owner: Class, classes: "dict[str, Class]") -> str
 
     def replace(match: "re.Match[str]") -> str:
         word = match.group(0)
-        if word not in names:
+        if word not in names or word in hidden:
             return word
         start = match.start()
         # Not after `.` or `->`, which already name an object, and not a
@@ -301,7 +430,7 @@ def _this_qualified(body: str, owner: Class, classes: "dict[str, Class]") -> str
             return word
         return f"this->{names[word]}{word}"
 
-    return _WORD.sub(replace, body)
+    return _map_code(body, lambda part: _WORD.sub(replace, part))
 
 
 def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
@@ -334,7 +463,9 @@ def _emit_one(found: Class, method: Method, classes: "dict[str, Class]") -> str:
     parameters = f"struct {found.name} *this"
     if method.parameters:
         parameters += ", " + _rewrite_types(method.parameters, classes)
-    body = _this_qualified(method.body, found, classes)
+    body = _this_qualified(
+        method.body, found, classes, _shadowing(method.body, method.parameters)
+    )
     body = _bare_method_calls(body, found, classes)
     known = {"this": found.name}
     receivers: dict[str, str] = {}
@@ -480,7 +611,7 @@ def _rewrite_types(text: str, classes: "dict[str, Class]") -> str:
             return f"struct {word}"
         return word
 
-    return _WORD.sub(replace, text)
+    return _map_code(text, lambda part: _WORD.sub(replace, part))
 
 
 #: `Vec v(1, 2);` and `Vec v;` - an object with automatic storage.
@@ -497,6 +628,7 @@ def _rewrite_body(
     known: "dict[str, str]",
     pointers: "set[str]" = frozenset(),
     receivers: "dict[str, str] | None" = None,
+    inherited_arrays: "dict[str, str] | None" = None,
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -530,7 +662,7 @@ def _rewrite_body(
             destroyed.append(variable)
         return constructed
 
-    arrays: dict[str, str] = {}
+    arrays: dict[str, str] = dict(inherited_arrays or {})
 
     def declare_array(match: "re.Match[str]") -> str:
         type_name, variable, count = match.groups()
@@ -550,6 +682,12 @@ def _rewrite_body(
             f" {_c_name(owner, '')}(&{variable}[{index}]); }}"
         )
         return kept
+
+    # A nested block is its own scope. Handled first, and on its own, because
+    # C++ destroys what a block declared at the end of *that* block - and a
+    # name declared there is not in scope after it either, so a destructor
+    # placed at the end of the function named a variable C says is not there.
+    body, blocks = _lift_nested(body)
 
     body = _OBJECT_ARRAY.sub(declare_array, body)
     body = _OBJECT.sub(declare, body)
@@ -578,6 +716,50 @@ def _rewrite_body(
             )
             body = _rewrite_indexed(body, pattern, _c_name(owner, method), variable)
 
+    # An inherited *member* reached from outside the class: `d.v` where `v`
+    # lives in the base is `d.__base.v` in C. Methods were followed up the
+    # chain from the start; fields were not, and the compiler reported a
+    # struct with no such member on a line that is correct C++.
+    for variable in sorted(known, key=len, reverse=True):
+        holds = known[variable]
+        access = "->" if variable in pointers else "."
+        for member, prefix in _reachable_members(classes[holds], classes):
+            if not prefix:
+                continue  # its own field; the name is already right
+            body = re.sub(
+                rf"\b{re.escape(variable)}{re.escape(access)}{re.escape(member.name)}\b",
+                f"{variable}{access}{prefix}{member.name}",
+                body,
+            )
+
+    # A member that is a pointer to a class is a receiver in its own right:
+    # `a.next->get()` is a call on whatever `next` points at. Without this the
+    # chain stopped at the first hop and the compiler reported a struct with
+    # no member called `get`.
+    for variable in sorted(known, key=len, reverse=True):
+        access = "->" if variable in pointers else "."
+        for member, prefix in _reachable_members(classes[known[variable]], classes):
+            held = member.ctype.replace("*", "").strip()
+            if "*" not in member.ctype or held not in classes:
+                continue
+            reached = f"{variable}{access}{prefix}{member.name}"
+            known.setdefault(reached, held)
+            pointers.add(reached)
+
+    # `b.inner.get()` - a member that is a class, reached from outside. The
+    # address is `&b.inner`, and without it the call looked for a field named
+    # after the method.
+    for variable in sorted(known, key=len, reverse=True):
+        access = "->" if variable in pointers else "."
+        for member, prefix in _reachable_members(classes[known[variable]], classes):
+            held = member.ctype.replace("*", "").strip()
+            if "*" in member.ctype or held not in classes:
+                continue
+            reached = f"{variable}{access}{prefix}{member.name}"
+            if reached not in known:
+                known[reached] = held
+                (receivers := dict(receivers or {}))[reached] = f"&{reached}"
+
     given = dict(receivers or {})
     for variable in sorted(known, key=len, reverse=True):
         holds = known[variable]
@@ -599,10 +781,59 @@ def _rewrite_body(
                 reached = f"&{inner}{path}"
             pattern = rf"\b{re.escape(variable)}{arrow}{re.escape(method)}\s*\("
             body = _rewrite_calls(body, pattern, _c_name(owner, method), reached)
+    # Now that this scope is known, each block is rewritten inside it.
+    rewritten_blocks = [
+        _rewrite_body(
+            inner, classes, dict(known), set(pointers), dict(given), dict(arrays)
+        )
+        for inner in blocks
+    ]
     body = _close_with_destructors(body, destroyed, known, classes)
+    return _restore_nested(body, rewritten_blocks)
+
+
+
+
+#: Stands in for a nested block while the enclosing scope is rewritten, so a
+#: declaration inside one is not mistaken for a declaration in this one.
+_BLOCK_MARK = "\x00py2bin_block_%d\x00"
+
+
+def _lift_nested(body: str) -> "tuple[str, list[str]]":
+    """Take each nested block out, leaving a marker.
+
+    Only taken out here, not rewritten: a block has to be rewritten knowing
+    what this scope declared *before* it, and this scope has not been read
+    yet. Rewritten too early, a `for` body did not know that the array it
+    indexes was an array at all.
+    """
+
+    blocks: list[str] = []
+    out = []
+    index = 0
+    depth = 0
+    while index < len(body):
+        char = body[index]
+        if char == "{":
+            depth += 1
+            if depth == 2:
+                closing = _matching(body, index)
+                out.append(_BLOCK_MARK % len(blocks))
+                blocks.append(body[index:closing])
+                depth -= 1
+                index = closing
+                continue
+        elif char == "}":
+            depth -= 1
+        out.append(char)
+        index += 1
+    return "".join(out), blocks
+
+
+def _restore_nested(body: str, blocks: "list[str]") -> str:
+    for number, inner in enumerate(blocks):
+        body = body.replace(_BLOCK_MARK % number, inner)
     return body
-
-
 
 def _rewrite_indexed(body: str, pattern: str, function: str, variable: str) -> str:
     """`bank[i].rate(` becomes `function(&bank[i]`, keeping the index."""

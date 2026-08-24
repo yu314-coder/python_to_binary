@@ -328,3 +328,106 @@ int main(void) { Plain p; p.f = 9; K k; return p.f + k.n; }
         out = translate(source, "s.cpp")
         self.assertIn("typedef struct Plain Plain;", out)
         self.assertIn("struct Plain { int f; };", out)
+
+
+class AgainstARealCompiler(unittest.TestCase):
+    """Each of these was found by building the same C++ with clang++ too.
+
+    Reading the generated C says whether it is well formed. It cannot say
+    whether it means the same thing, and every one of these compiled cleanly
+    while meaning something else. `tools/cpp_differential.sh` is the harness;
+    clang++ is the yardstick there, never a dependency of py2bin.
+    """
+
+    def test_a_literal_is_data_and_no_name_in_it_is_a_name(self) -> None:
+        """`printf("outer\\n")` became `printf("outer\\this->n")`.
+
+        The class has a member `n`, and `\\n` contains the letter. The program
+        built and printed the wrong thing.
+        """
+
+        out = translate(
+            'class O { public: int n; O() { n = 2; printf("outer\\n"); } };\n'
+            "int main(void) { O o; return o.n; }\n",
+            "o.cpp",
+        )
+        self.assertIn(r'printf("outer\n")', out)
+        self.assertNotIn("this->n\"", out)
+
+    def test_a_parameter_hides_the_member_it_is_named_after(self) -> None:
+        """`int mix(int n) { return this->n + n; }` answered 200, not 105."""
+
+        out = translate(
+            "class C { public: int n; C() { n = 100; }\n"
+            " int mix(int n) { return this->n + n; } };\n"
+            "int main(void) { C c; return c.mix(5); }\n",
+            "c.cpp",
+        )
+        self.assertIn("return this->n + n;", out)
+
+    def test_a_format_string_does_not_hide_a_member(self) -> None:
+        # `printf("n=%d a=%d")` contains `d a=`, which reads like a
+        # declaration of `a` - hiding the member from its own method.
+        out = translate(
+            'class T { public: int a; T() { a = 2; }\n'
+            ' void show() { printf("n=%d a=%d\\n", a, a); } };\n'
+            "int main(void) { T t; t.show(); return 0; }\n",
+            "t.cpp",
+        )
+        self.assertIn("this->a, this->a", out)
+
+    def test_an_inherited_field_resolves_from_outside_the_class(self) -> None:
+        # Methods followed the base chain from the start; fields did not.
+        out = translate(
+            "class B { public: int v; B() { v = 1; } };\n"
+            "class D : public B { public: int w; D() { w = 2; } };\n"
+            "int main(void) { D d; return d.v + d.w; }\n",
+            "d.cpp",
+        )
+        self.assertIn("d.__base.v", out)
+
+    def test_a_nested_block_is_its_own_scope(self) -> None:
+        """The destructor landed at the end of the function, not the block.
+
+        Which is both the wrong moment and, in C, a name that is not in scope
+        there at all.
+        """
+
+        out = translate(
+            "class R { public: int id; R() { id = 1; } ~R() { id = 0; } };\n"
+            "int main(void) { { R r; int x = r.id; } return 0; }\n",
+            "r.cpp",
+        )
+        inner = out[out.index("{ struct R r;"):out.index("return 0;")]
+        self.assertIn("R__dtor(&r);", inner)
+
+    def test_a_pointer_member_is_a_receiver(self) -> None:
+        # `a.next->get()` stopped at the first hop.
+        out = translate(
+            "class N { public: int v; N *next; N() { v = 0; next = 0; }\n"
+            " int get() { return v; } };\n"
+            "int main(void) { N a; N b; a.next = &b; return a.next->get(); }\n",
+            "n.cpp",
+        )
+        self.assertIn("N__get(a.next)", out)
+
+    def test_a_member_object_is_a_receiver_from_outside(self) -> None:
+        out = translate(
+            "class A { public: int v; A() { v = 3; } int get() { return v; } };\n"
+            "class B { public: A inner; B() { } };\n"
+            "int main(void) { B b; return b.inner.get(); }\n",
+            "b.cpp",
+        )
+        self.assertIn("A__get(&b.inner)", out)
+
+    def test_an_array_inside_a_nested_block_is_still_an_array(self) -> None:
+        # Blocks were rewritten before the enclosing scope was read, so a
+        # `for` body did not know the array it indexes was one.
+        out = translate(
+            "class E { public: int n; E() { n = 2; } int get() { return n; } };\n"
+            "int main(void) { E e[3]; int i; int t = 0;\n"
+            " for (i = 0; i < 3; i++) { t = t + e[i].get(); }\n"
+            " return t; }\n",
+            "e.cpp",
+        )
+        self.assertIn("E__get(&e[i])", out)
