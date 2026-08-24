@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,957 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,964 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -566,6 +566,8 @@ code before it emits anything, which is where they are done here:
 | **Namespaces** | flattened. One translation unit, no linker, so scoping is the whole of what a namespace can mean here |
 | **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer |
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
+| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is the only way to hold one, because the class's name is generated. `[=]` and `[&]` are refused: they do not say what they capture |
+| **`operator()`** | a call on an object, so `std::sort(v.begin(), v.end(), cmp)` takes a lambda or a function object alike |
 
 **Standard headers**, each written in py2bin's own C++ subset and put
 through the same translator as your code — so they are readable, and they are
@@ -595,6 +597,13 @@ not special cases in the compiler:
   on Linux, `getdirentries` on macOS and `FindFirstFile` on Windows, each
   with a struct laid out differently per architecture - and a struct read
   wrong gives plausible answers.
+* `<functional>` — `less`, `greater`, `plus`, `equal_to` and the rest of the
+  comparison and arithmetic objects, which are small classes with a call
+  operator. `std::function` is **not** there: it holds *any* callable, which
+  means erasing the type of what is in it, and every callable py2bin makes is
+  a class of its own with nothing common to erase to. What it is used for
+  works without it — `auto` holds a lambda, a function pointer holds a
+  function — and a program that names it is told so.
 * `<utility>` (`pair`), `<numeric>` (`accumulate`), and `<cassert>`,
   `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
   `<cmath>`, `<cstdint>` as names for the C headers underneath.
@@ -616,7 +625,7 @@ differ only in types py2bin cannot read are refused rather than guessed at.
 **How it is checked.** Reading the generated C tells you it is well formed and
 nothing about whether it *means* the same thing — so the corpus in
 `tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it, over 79 programs,
+the outputs compared. `tools/cpp_differential.sh` runs it, over 84 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1717,9 +1726,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1857 tests, no dependencies, nothing to install. Five modules want pytest's
+1864 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1957. Two of them compile a program in a *fresh interpreter* and
+too, for 1964. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1734,4 +1743,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1957-test suite.
+    is checked on every change is the 1964-test suite.

@@ -1197,3 +1197,97 @@ class TemplateNamesakes(unittest.TestCase):
             " return s.find('b'); }"
         )
         self.assertIn("string__find", out)
+
+
+class CallOperator(unittest.TestCase):
+    def test_operator_call_is_parsed_and_reached(self) -> None:
+        """`int operator()(int x)` has two parameter lists as far as `find`
+        is concerned, and the first one is the operator's own name."""
+
+        out = translate(
+            "class D{public: int operator()(int x){ return x*2; }};\n"
+            "int main(void){ D d; return d(5); }",
+            "t.cpp",
+        )
+        self.assertIn("D__op_call(struct D *this, int x)", out)
+        self.assertIn("D__op_call(&d, 5)", out)
+
+
+class Lambdas(unittest.TestCase):
+    """A lambda is a class with a call operator and a member per capture.
+
+    That is not an analogy - it is what the standard says one is, and writing
+    it out is all this does.
+    """
+
+    def test_one_becomes_a_class_and_an_object_of_it(self) -> None:
+        out = translate(
+            "int main(void){ auto f = [](int x){ return x + 1; };"
+            " return f(2); }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_lambda_1__op_call", out)
+        # `auto f = <lambda>` names the object itself; nothing is copied.
+        self.assertIn("struct __py2bin_lambda_1 f;", out)
+
+    def test_a_capture_becomes_a_member_set_where_it_is_made(self) -> None:
+        out = translate(
+            "int main(void){ int base = 10;"
+            " auto f = [base](int x){ return x + base; }; return f(1); }",
+            "t.cpp",
+        )
+        self.assertIn("f.base = base;", out)
+
+    def test_the_return_type_is_read_from_the_return(self) -> None:
+        out = translate(
+            "int main(void){ auto f = [](double x){ return x * 2.0; };"
+            " return (int)f(1.5); }",
+            "t.cpp",
+        )
+        self.assertIn("double __py2bin_lambda_1__op_call", out)
+
+    def test_capturing_everything_is_refused_by_name(self) -> None:
+        """`[=]` and `[&]` do not say what they capture, and this writes a
+        member per capture - so there is nothing to write."""
+
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "int main(void){ int n = 1; auto f = [=](int x){ return x+n; };"
+                " return f(1); }",
+                "t.cpp",
+            )
+        self.assertIn("[x, y]", str(caught.exception))
+
+    def test_a_member_named_like_a_lambda_head_is_not_one(self) -> None:
+        """`operator[](int i) {` reads exactly like `[](int i) {`.
+
+        Stopping at the first one meant a member in a supplied header hid
+        every real lambda after it in the file.
+        """
+
+        out = with_headers(
+            "#include <string>\n"
+            "int main(void){ std::string s; s.assign(\"ab\");"
+            " auto f = [](int x){ return x; }; return f(s.size()); }"
+        )
+        self.assertIn("__py2bin_lambda_1", out)
+
+
+class OverloadedTemplates(unittest.TestCase):
+    def test_two_templates_of_one_name_both_survive(self) -> None:
+        """`sort(first, last)` and `sort(first, last, less_than)`.
+
+        Keyed by the name alone, the second replaced the first and every call
+        to the two-argument form became unreadable.
+        """
+
+        out = with_headers(
+            "#include <algorithm>\n"
+            "int main(void){ int a[3]; a[0]=2; a[1]=1; a[2]=3;\n"
+            "  std::sort(a, a + 3);\n"
+            "  auto down = [](int x, int y){ return x > y; };\n"
+            "  std::sort(a, a + 3, down);\n"
+            "  return a[0]; }"
+        )
+        self.assertIn("sort__int(", out)
+        self.assertIn("__sift_by__int", out)

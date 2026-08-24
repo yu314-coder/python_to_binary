@@ -290,7 +290,14 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
         method.pure = pure
         return method
 
-    open_paren = head.find("(")
+    # `int operator()(int x)` has two parameter lists as far as `find` is
+    # concerned, and the first is the operator's own name. Where the name is
+    # spelled with brackets, the parameter list is the pair after it.
+    named_with_brackets = re.search(r"\boperator\s*(\(\s*\)|\[\s*\])", head)
+    if named_with_brackets:
+        open_paren = head.find("(", named_with_brackets.end())
+    else:
+        open_paren = head.find("(")
     close_paren = head.rfind(")")
     if open_paren < 0 or close_paren < 0:
         raise CppTranslationError(filename, at, f"cannot read the member {head!r}")
@@ -304,7 +311,9 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
         # `Vec operator+(Vec o)` - the name is the symbol, which no identifier
         # can hold, so it is carried as a word and spelled back at the call.
         at = before.index("operator")
-        symbol = before[at + len("operator"):].strip()
+        # `()` and `[]` come through with their own spacing, and the name is
+        # the symbol with none of it.
+        symbol = re.sub(r"\s+", "", before[at + len("operator"):])
         returns = before[:at].strip()
         if symbol not in _OPERATOR_NAMES:
             raise CppTranslationError(
@@ -472,10 +481,15 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     pattern = re.compile(
         rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*(\*?)\s*\b{re.escape(spelled)}\b\s*([=;,)\[])"
     )
+    code = _without_literals(text)
     found = [
         match
-        for match in pattern.finditer(_without_literals(text))
+        for match in pattern.finditer(code)
+        # A declaration starts a statement. `return x * x;` reads exactly like
+        # one declaring a pointer `x` of type `x`, and taking it for one gave
+        # a lambda the return type `x *`.
         if match.group(1) not in _NOT_A_TYPE
+        and _could_start_a_declaration(code, match.start())
     ]
     if not found:
         return None
@@ -534,13 +548,43 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
         if held is not None and "*" in held:
             return held[::-1].replace("*", "", 1)[::-1].strip()
         return None
-    # `raw + 8` is where `raw` points, moved along: the same type.
-    walked = re.match(r"^(.+?)\s*[+-]\s*[^+-]+$", spelled)
-    if walked is not None:
-        held = _deduced_type(walked.group(1).strip(), text, before)
+    # Arithmetic: `raw + 8` is where `raw` points moved along, and `x * 2.0`
+    # is whichever of the two is wider - which is what C++ does with them.
+    binary = re.match(r"^(.+?)\s*[-+*/%]\s*([^-+*/%]+)$", spelled)
+    if binary is not None:
+        left = _deduced_type(binary.group(1).strip(), text, before)
+        right = _deduced_type(binary.group(2).strip(), text, before)
+        held = _wider(left, right)
         if held is not None:
             return held
     return _deduced_from_call(spelled, text, before)
+
+
+#: Widest last. What C++ calls the usual arithmetic conversions, as far as
+#: picking one type out of two goes.
+_WIDTH_ORDER = (
+    "char", "short", "int", "unsigned int", "long", "unsigned long",
+    "long long", "float", "double",
+)
+
+
+def _wider(left: "str | None", right: "str | None") -> "str | None":
+    """Which of two types an expression mixing them has."""
+
+    if left is None:
+        return right
+    if right is None:
+        return left
+    # Pointer arithmetic answers with the pointer, whichever side it is on.
+    if "*" in left:
+        return left
+    if "*" in right:
+        return right
+    order = {name: index for index, name in enumerate(_WIDTH_ORDER)}
+    here, there = order.get(left.strip()), order.get(right.strip())
+    if here is None or there is None:
+        return left
+    return left if here >= there else right
 
 
 #: `((int (*)(struct Base *))(p->__vptr[0]))(p)` - a virtual call, spelled
@@ -668,6 +712,155 @@ def _deduce_arguments(
     return [found[name] for name, _is_type in parameters]
 
 
+# --- lambdas ---------------------------------------------------------------
+#
+# A lambda is a class with a call operator and a member per capture. That is
+# not an analogy: it is what the standard says one is, and writing it out is
+# all this does. The name is generated, which is the only part a program
+# cannot say for itself - which is why `auto` is the only way to hold one.
+
+#: `auto f = __py2bin_lambda_1__made;` once the lambda itself is written out.
+#: `auto` is the only way a program can hold one, because the class's name is
+#: generated and there is nothing else to write.
+_AUTO_FROM_LAMBDA = re.compile(
+    r"\bauto\s+([A-Za-z_]\w*)\s*=\s*(__py2bin_lambda_\d+)__made"
+)
+
+#: `[captures](params) -> result {` - the head of a lambda.
+_LAMBDA = re.compile(
+    r"\[([^\]\[]*)\]\s*\(([^()]*)\)\s*(?:mutable\s*)?(?:->\s*([^{;]+?))?\s*\{"
+)
+
+
+def _expand_lambdas(text: str, filename: str) -> str:
+    """Turn each lambda into a class, and its use into an object of it."""
+
+    made: list[str] = []
+    count = 0
+    at = 0
+    while True:
+        found = _LAMBDA.search(text, at)
+        if found is None:
+            break
+        if _looks_like_an_index(text, found):
+            # `operator[](int i) {` reads exactly like a lambda head. Skipped
+            # rather than stopped at: stopping meant the first such member in
+            # a supplied header hid every real lambda after it.
+            at = found.end()
+            continue
+        count += 1
+        name = f"__py2bin_lambda_{count}"
+        captures, parameters, declared = found.groups()
+        try:
+            closing = _matching(text, found.end() - 1)
+        except ValueError:
+            raise CppTranslationError(
+                filename, _line_of(text, found.start()), "a lambda is not closed"
+            ) from None
+        body = text[found.end() - 1: closing]
+        result = (declared or "").strip() or _lambda_result(body, parameters, text)
+        held = _lambda_captures(captures, text, found.start(), filename)
+        members = "".join(f"    {spelled} {variable};\n" for variable, spelled in held)
+        made.append(
+            f"class {name} {{\npublic:\n{members}"
+            f"    {name}() {{ }}\n"
+            f"    {result} operator()({parameters}) {body}\n}};\n"
+        )
+        # Where it is used: a declaration of one, and a member per capture.
+        start = _statement_start(text, found.start())
+        while start < len(text) and text[start] in " \t\n":
+            start += 1
+        # `auto f = <lambda>;` names the object itself. Anything else needs a
+        # temporary, because there is nowhere else for the object to live -
+        # and a copy from one to the other is a struct assignment in a
+        # declaration, which this backend does not take.
+        holding = re.match(
+            r"auto\s+([A-Za-z_]\w*)\s*=\s*$", text[start:found.start()]
+        )
+        holder = holding.group(1) if holding else f"{name}__made"
+        setup = "".join(f" {holder}.{v} = {v};" for v, _s in held)
+        if holding:
+            after = closing + 1 if text[closing:closing + 1] == ";" else closing
+            text = text[:start] + f"{name} {holder};{setup}" + text[after:]
+            at = 0
+            continue
+        text = (
+            text[:start]
+            + f"{name} {holder};{setup} "
+            + text[start:found.start()]
+            + holder
+            + text[closing:]
+        )
+        at = 0
+    if not made:
+        return text
+    return "".join(made) + text
+
+
+def _looks_like_an_index(text: str, found: "re.Match[str]") -> bool:
+    """Whether `[...](...)  {` is really a subscript rather than a lambda.
+
+    `a[i](x) { ... }` is not C++, so the only way to be fooled is a subscript
+    on something callable followed by a block - which does not happen. What
+    does happen is a name immediately before the bracket, which a lambda
+    never has.
+    """
+
+    before = text[:found.start()].rstrip()
+    return bool(before) and (before[-1].isalnum() or before[-1] in "_)]")
+
+
+def _lambda_result(body: str, parameters: str, text: str) -> str:
+    """What the lambda returns, where it did not say.
+
+    Read from the `return` it holds. A lambda with no return, or one whose
+    value cannot be read, is void - which is right for the first and reported
+    by the C compiler for the second, on the line the lambda is on.
+    """
+
+    match = re.search(r"\breturn\b([^;]*);", _without_literals(body))
+    if match is None or not match.group(1).strip():
+        return "void"
+    scope = parameters + ";\n" + body + "\n" + text
+    held = _deduced_type(match.group(1).strip(), scope)
+    return held or "int"
+
+
+def _lambda_captures(
+    captures: str, text: str, at: int, filename: str
+) -> "list[tuple[str, str]]":
+    """Each captured name and the type it is held as."""
+
+    spelled = captures.strip()
+    if not spelled:
+        return []
+    if spelled in ("=", "&"):
+        raise CppTranslationError(
+            filename,
+            _line_of(text, at),
+            "a lambda that captures everything by writing `[=]` or `[&]` does "
+            "not say what it captures, and py2bin writes a member per capture "
+            "- name them, as in `[x, y]`",
+        )
+    held: list[tuple[str, str]] = []
+    for part in _split_arguments(spelled):
+        name = part.strip()
+        if name.startswith("&"):
+            raise CppTranslationError(
+                filename,
+                _line_of(text, at),
+                f"a lambda capturing {name[1:].strip()!r} by reference outlives "
+                "nothing here - py2bin copies each capture into a member, so "
+                "write it as a copy",
+            )
+        if not name.isidentifier():
+            raise CppTranslationError(
+                filename, _line_of(text, at), f"cannot read the capture {name!r}"
+            )
+        found = _deduced_type(name, text[:at])
+        held.append((name, found or "int"))
+    return held
+
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
 
@@ -686,7 +879,9 @@ def _expand_templates(text: str, filename: str) -> str:
                 end += 1
             if end < len(rest) and rest[end] == ";":
                 end += 1
-            patterns[head.group(2)] = (parameters, "class", rest[:end])
+            patterns.setdefault(head.group(2), []).append(
+                (parameters, "class", rest[:end])
+            )
             cut.append((match.start(), match.end() + end))
             continue
         definition = _DEFINITION.match(rest)
@@ -699,7 +894,12 @@ def _expand_templates(text: str, filename: str) -> str:
                 "is neither",
             )
         closing = _matching(rest, definition.end() - 1)
-        patterns[definition.group(2)] = (parameters, "function", rest[:closing])
+        # A list rather than one entry: `sort(first, last)` and
+        # `sort(first, last, less_than)` are two templates of one name, and
+        # keying by the name alone let the second replace the first.
+        patterns.setdefault(definition.group(2), []).append(
+            (parameters, "function", rest[:closing])
+        )
         cut.append((match.start(), match.end() + closing))
 
     if not patterns:
@@ -732,7 +932,8 @@ def _expand_templates(text: str, filename: str) -> str:
 
         asked: list[tuple[str, list[str]]] = []
         unread: list[tuple[str, int]] = []
-        for name, (parameters, kind, pattern_text) in patterns.items():
+        for name, entries in patterns.items():
+          for parameters, kind, pattern_text in entries:
             if kind != "function":
                 continue
             # A call that did not spell the arguments out: `twice(5)` rather
@@ -763,7 +964,7 @@ def _expand_templates(text: str, filename: str) -> str:
                     # producing anything new.
                     unread.append((name, call.start()))
                     continue
-                asked.append((name, deduced))
+                asked.append((name, deduced, (parameters, kind, pattern_text)))
         for name in patterns:
             for found in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*<", region):
                 close = _closing_angle(region, found.end() - 1)
@@ -777,7 +978,16 @@ def _expand_templates(text: str, filename: str) -> str:
                     for other in patterns
                 ):
                     continue  # an inner template first; next round
-                asked.append((name, [a.strip() for a in arguments]))
+                # Spelled out, so the entry is whichever takes that many
+                # template parameters.
+                for entry in patterns[name]:
+                    # `entry[0]` is the parameter list already read, not the
+                    # text it was read from.
+                    if len(entry[0]) == len(arguments):
+                        asked.append(
+                            (name, [a.strip() for a in arguments], entry)
+                        )
+                        break
         return asked, unread
 
     def point(region: str, scope: str) -> str:
@@ -812,7 +1022,8 @@ def _expand_templates(text: str, filename: str) -> str:
         region = "".join(out)
 
         # The same for the calls that named no arguments at all.
-        for name, (parameters, kind, pattern_text) in patterns.items():
+        for name, entries in patterns.items():
+          for parameters, kind, pattern_text in entries:
             if kind != "function":
                 continue
             declared = _DEFINITION.match(pattern_text)
@@ -857,12 +1068,12 @@ def _expand_templates(text: str, filename: str) -> str:
             wanted.extend(asked)
 
         fresh = [
-            (name, arguments)
-            for name, arguments in wanted
+            (name, arguments, entry)
+            for name, arguments, entry in wanted
             if _instantiated_name(name, arguments) not in made
         ]
-        for name, arguments in fresh:
-            parameters, kind, pattern = patterns[name]
+        for name, arguments, entry in fresh:
+            parameters, kind, pattern = entry
             if len(arguments) != len(parameters):
                 raise CppTranslationError(
                     filename,
@@ -3620,6 +3831,19 @@ def _rewrite_operators(
                 return f"{_c_name(o, n)}({a}, {passed})"
 
             body = _map_code(body, lambda part: re.sub(pattern, replace, part))
+    # `d(5)` where `d` is an object with a call operator. A name that holds
+    # an object is never a function, so a call on it is that operator and
+    # nothing else - which is what makes this safe to do by name.
+    for variable in sorted(known, key=len, reverse=True):
+        owner = _find_method(known[variable], "op_call", classes)
+        if owner is None:
+            continue
+        address = variable if variable in pointers else f"&{variable}"
+        pattern = rf"(?<![.\w>])\b{re.escape(variable)}\s*\("
+        body = _rewrite_calls(
+            body, pattern, _name_for(owner, "op_call", classes), address
+        )
+
     # `a[i]` where a is an object with an index operator. Written out rather
     # than routed through the array rewriter: that one turns `bank[i].m()`
     # into a call on an element, and this turns the subscript itself into the
@@ -4183,6 +4407,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # Before names are read: a template has no name until it is written out,
     # and what comes out of this is ordinary classes and functions.
     before_patterns = text
+    # Before the templates: a lambda becomes a class, and a class may be a
+    # template argument.
+    text = _expand_lambdas(text, filename)
     text = _expand_templates(text, filename)
     text = _mangle_overloaded_functions(text, filename)
     #: Whether a pass above has already made this text something other than
@@ -5233,6 +5460,40 @@ void __sift(T *base, long root, long span) {
     }
 }
 
+template<typename T, typename C>
+void __sift_by(T *base, long root, long span, C less_than) {
+    long child;
+    T held;
+    while (1) {
+        child = root * 2 + 1;
+        if (child >= span) { return; }
+        if (child + 1 < span) {
+            if (less_than(base[child], base[child + 1])) { child = child + 1; }
+        }
+        if (less_than(base[child], base[root])) { return; }
+        if (!less_than(base[root], base[child])) { return; }
+        held = base[root]; base[root] = base[child]; base[child] = held;
+        root = child;
+    }
+}
+
+template<typename T, typename C>
+void sort(T *first, T *last, C less_than) {
+    long span;
+    long i;
+    T held;
+    span = last - first;
+    if (span < 2) { return; }
+    i = span / 2 - 1;
+    while (i >= 0) { __sift_by(first, i, span, less_than); i = i - 1; }
+    i = span - 1;
+    while (i > 0) {
+        held = first[0]; first[0] = first[i]; first[i] = held;
+        __sift_by(first, (long)0, i, less_than);
+        i = i - 1;
+    }
+}
+
 template<typename T>
 void sort(T *first, T *last) {
     long span;
@@ -5483,6 +5744,90 @@ path current_path() {
 }
 """
 
+#: py2bin's own <functional>. The comparison and arithmetic objects, which
+#: are small classes with a call operator - the same thing a lambda becomes.
+#:
+#: `std::function` is not here. It is a box that holds *any* callable, which
+#: means erasing the type of what is in it; every callable py2bin makes is a
+#: class of its own, and nothing common to them exists to erase to. What it
+#: is used for works without it: `auto` holds a lambda, and a plain function
+#: pointer holds a function. A program that names it is told that.
+_FUNCTIONAL_HEADER = r"""
+namespace std {
+
+template<typename T>
+class less {
+public:
+    less() { }
+    int operator()(T a, T b) { return a < b; }
+};
+
+template<typename T>
+class greater {
+public:
+    greater() { }
+    int operator()(T a, T b) { return a > b; }
+};
+
+template<typename T>
+class less_equal {
+public:
+    less_equal() { }
+    int operator()(T a, T b) { return a <= b; }
+};
+
+template<typename T>
+class greater_equal {
+public:
+    greater_equal() { }
+    int operator()(T a, T b) { return a >= b; }
+};
+
+template<typename T>
+class equal_to {
+public:
+    equal_to() { }
+    int operator()(T a, T b) { return a == b; }
+};
+
+template<typename T>
+class not_equal_to {
+public:
+    not_equal_to() { }
+    int operator()(T a, T b) { return a != b; }
+};
+
+template<typename T>
+class plus {
+public:
+    plus() { }
+    T operator()(T a, T b) { return a + b; }
+};
+
+template<typename T>
+class minus {
+public:
+    minus() { }
+    T operator()(T a, T b) { return a - b; }
+};
+
+template<typename T>
+class multiplies {
+public:
+    multiplies() { }
+    T operator()(T a, T b) { return a * b; }
+};
+
+template<typename T>
+class negate {
+public:
+    negate() { }
+    T operator()(T a) { return -a; }
+};
+
+}
+"""
+
 _BUILTIN_CPP_HEADERS = {
     "string": _STRING_HEADER,
     "vector": _VECTOR_HEADER,
@@ -5492,6 +5837,7 @@ _BUILTIN_CPP_HEADERS = {
     "numeric": _NUMERIC_HEADER,
     "stdexcept": _STDEXCEPT_HEADER,
     "filesystem": _FILESYSTEM_HEADER,
+    "functional": _FUNCTIONAL_HEADER,
     "cassert": "#include <assert.h>\n",
     "climits": "#include <limits.h>\n",
     "cfloat": "#include <float.h>\n",

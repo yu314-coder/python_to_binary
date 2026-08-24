@@ -214,8 +214,12 @@ label.
 Standard headers come with it, each written in py2bin's own C++ subset and
 put through the same translator as your code: `<string>`, `<vector>`,
 `<iostream>`, `<algorithm>` (`sort`, `find`, `count`, `reverse`,
-`min_element`, ...), `<stdexcept>`, `<utility>`, `<numeric>` and
-`<filesystem>` (`path` and the queries, but not `directory_iterator`). So this
+`min_element`, ...), `<stdexcept>`, `<utility>`, `<numeric>`, `<filesystem>` (`path` and the
+queries, but not `directory_iterator`) and `<functional>` (the comparison and
+arithmetic objects; not `std::function`). Lambdas work - a lambda is a class
+with a call operator and a member per capture, which is what the standard
+says one is - so `std::sort(v.begin(), v.end(), [](int a, int b){ return a > b; })`
+compiles. So this
 builds, and prints what clang++ prints:
 
 ```cpp
@@ -229,7 +233,7 @@ unwinder, so a call that can throw gets a statement of its own - one behind
 would run at the wrong time.
 
 It is checked by building `tools/cpp_corpus/` twice, once with py2bin and once
-with `clang++`, and comparing the output: 79 programs, all agreeing. clang++ is
+with `clang++`, and comparing the output: 84 programs, all agreeing. clang++ is
 the yardstick there and never a dependency.
 
 ### C, and a project of several files
@@ -1268,4 +1272,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 804. What is checked on every change is the 1957-test suite.
+    is 804. What is checked on every change is the 1964-test suite.
