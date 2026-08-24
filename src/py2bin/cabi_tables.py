@@ -201,6 +201,12 @@ _CPYTHON_SYMBOLS = frozenset(
 def symbol_library(symbol: str) -> str | None:
     """Return the library that provides ``symbol``, or None for the default."""
 
+    if symbol in _windows_api():
+        raise ValueError(
+            f"{symbol!r} is a Windows API function, and there is no import "
+            "for it on this target. Guard the call with `#ifdef _WIN32`, "
+            "which py2bin defines only when it is building for Windows"
+        )
     if symbol in _CPYTHON_SYMBOLS:
         return _cpython_library()
     if symbol in _OBJC_SYMBOLS:
@@ -234,6 +240,21 @@ def windows_symbol_library(symbol: str, python_dll: str) -> str:
             f"{symbol!r} is part of the Objective-C runtime, which exists on "
             "darwin only; there is no Windows import for it"
         )
+    api = _windows_api()
+    if symbol in api:
+        return api[symbol]
     if symbol in _LIBC_SYMBOLS:
         return WINDOWS_C_RUNTIME
     return python_dll
+
+
+def _windows_api() -> "dict[str, str]":
+    """Each Windows API name and the DLL it is imported from.
+
+    Imported lazily: this module is what the native front end reads its
+    tables from, and reaching back into it at import time would be a cycle.
+    """
+
+    from .native.frontend import WINDOWS_API
+
+    return {name: entry[3] for name, entry in WINDOWS_API.items()}

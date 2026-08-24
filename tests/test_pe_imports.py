@@ -160,3 +160,122 @@ class ShellLauncherProcessCreation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsApiImports(unittest.TestCase):
+    """A C program calling a Windows API becomes an import the loader binds.
+
+    Same reading as everything above: nothing here starts the binary, it
+    reads the image the way the loader does. What is new is that the symbols
+    come from the *program* rather than from the encoder, and that they may
+    live in more than one DLL - so the descriptor per DLL, and every RVA
+    inside it, is what there is to get wrong.
+    """
+
+    SOURCE = (
+        "#include <windows.h>\n"
+        "int main(void) {\n"
+        "    Sleep(1);\n"
+        "    MessageBeep(MB_OK);\n"
+        "    return GetSystemMetrics(SM_CXSCREEN) > 0;\n"
+        "}\n"
+    )
+
+    def _image(self, target: str) -> bytes:
+        import tempfile
+        from pathlib import Path
+
+        from py2bin.c_native import compile_c_native
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "w.c").write_text(self.SOURCE, encoding="utf-8")
+            compile_c_native(
+                root / "w.c", root / "w.exe", target=target, clean=True
+            )
+            return (root / "w.exe").read_bytes()
+
+    def test_every_symbol_the_program_calls_is_imported(self) -> None:
+        for target in ("windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                found = _walk_imports(self._image(target))
+                for symbol in ("Sleep", "MessageBeep", "GetSystemMetrics"):
+                    self.assertIn(symbol, found)
+
+    def test_a_second_dll_gets_a_descriptor_of_its_own(self) -> None:
+        """`MessageBeep` is user32's; `Sleep` is the kernel's.
+
+        A PE symbol belongs to the DLL its descriptor names - unlike ELF,
+        where the loader searches everything listed - so putting one in the
+        wrong descriptor is a name that never resolves.
+        """
+
+        image = self._image("windows-x86_64")
+        libraries = _import_libraries(image)
+        self.assertIn("Sleep", libraries["KERNEL32.dll"])
+        self.assertIn("MessageBeep", libraries["USER32.dll"])
+        self.assertIn("GetSystemMetrics", libraries["USER32.dll"])
+
+    def test_the_kernel_is_named_once(self) -> None:
+        """The encoder imports from KERNEL32 and so does the program.
+
+        Two descriptors for one DLL is legal and every loader handles it, but
+        one is what every other linker writes.
+        """
+
+        image = self._image("windows-x86_64")
+        names = _import_library_order(image)
+        self.assertEqual(
+            names.count("KERNEL32.dll"), 1, f"KERNEL32 named {names.count('KERNEL32.dll')} times"
+        )
+
+    def test_calling_one_off_windows_says_so(self) -> None:
+        from py2bin.cabi_tables import symbol_library
+
+        with self.assertRaisesRegex(ValueError, "Windows API"):
+            symbol_library("Sleep")
+
+
+def _import_libraries(image: bytes) -> "dict[str, list[str]]":
+    """Each DLL the image imports from, and the names it takes from it."""
+
+    header = struct.unpack_from("<I", image, 0x3C)[0]
+    optional = header + 24
+    sections = _sections(image)
+    directory = struct.unpack_from("<I", image, optional + 112 + 8)[0]
+    _where, cursor = _locate(sections, directory)
+    found: "dict[str, list[str]]" = {}
+    while True:
+        lookup, _a, _b, name_rva, _iat = struct.unpack_from("<IIIII", image, cursor)
+        if not (lookup or name_rva or _iat):
+            return found
+        _s, offset = _locate(sections, name_rva)
+        library = image[offset: image.index(b"\0", offset)].decode("ascii")
+        _s, position = _locate(sections, lookup)
+        names: list[str] = []
+        while True:
+            entry = struct.unpack_from("<Q", image, position + len(names) * 8)[0]
+            if not entry:
+                break
+            _s, at = _locate(sections, entry)
+            names.append(image[at + 2: image.index(b"\0", at + 2)].decode("ascii"))
+        found.setdefault(library, []).extend(names)
+        cursor += 20
+
+
+def _import_library_order(image: bytes) -> list[str]:
+    """The DLL names in descriptor order, duplicates included."""
+
+    header = struct.unpack_from("<I", image, 0x3C)[0]
+    optional = header + 24
+    sections = _sections(image)
+    directory = struct.unpack_from("<I", image, optional + 112 + 8)[0]
+    _where, cursor = _locate(sections, directory)
+    names: list[str] = []
+    while True:
+        lookup, _a, _b, name_rva, _iat = struct.unpack_from("<IIIII", image, cursor)
+        if not (lookup or name_rva or _iat):
+            return names
+        _s, offset = _locate(sections, name_rva)
+        names.append(image[offset: image.index(b"\0", offset)].decode("ascii"))
+        cursor += 20

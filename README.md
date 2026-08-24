@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,947 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,951 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -460,7 +460,26 @@ of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `ctype.h`,
 them - `string.h`, `ctype.h`, `math.h`, the allocator in `stdlib.h` - are
 written in C and compiled like any other source, so they can be read rather
 than taken on trust. It has no system include path: a real system header uses
-compiler extensions this does not implement. **C++ is translated to C** rather than compiled:
+compiler extensions this does not implement.
+
+**Which is why `<windows.h>` is py2bin's own too.** Microsoft's is tens of
+thousands of declarations written in extensions this compiler does not have.
+py2bin ships the part a program usually wants - the types (`DWORD`, `HANDLE`,
+`LPCSTR`, ...), the constants, and prototypes for about thirty functions from
+`KERNEL32` and `USER32`: `Sleep`, `GetTickCount`, `GetStdHandle`, `WriteFile`,
+`CreateFileA`, `SetConsoleOutputCP`, `MessageBoxA`, `MultiByteToWideChar` and
+so on. Each is an ordinary import the loader binds, the same mechanism a
+program driving CPython already uses, so calling one still needs no toolchain.
+A name it does not declare is a name the compiler reports, rather than one
+that compiles and fails to resolve; and on a target that is not Windows the
+header says so instead of letting the program build against declarations that
+cannot bind.
+
+**The platform macros are defined**, which they were not before: `_WIN32`,
+`_WIN64`, `__APPLE__`, `__linux__`, `__unix__`, `__x86_64__`, `__aarch64__`,
+`_M_X64`, `_M_ARM64`. A file that picks its headers with `#ifdef _WIN32` took
+the wrong branch on every target until these existed, and the failure was a
+missing header rather than anything that pointed at the cause. **C++ is translated to C** rather than compiled:
 classes, inheritance, `virtual`, references, templates, overloading, `new`,
 exceptions, and py2bin's own `<string>`, `<vector>` and `<iostream>` - see
 [C++, translated to C](#c-translated-to-c).
@@ -1689,9 +1708,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1847 tests, no dependencies, nothing to install. Five modules want pytest's
+1851 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1947. Two of them compile a program in a *fresh interpreter* and
+too, for 1951. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1706,4 +1725,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1947-test suite.
+    is checked on every change is the 1951-test suite.

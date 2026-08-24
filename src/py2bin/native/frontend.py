@@ -206,6 +206,76 @@ def exception_ancestry(name: str) -> tuple[str, ...]:
     return tuple(chain)
 
 
+#: The Windows API functions <windows.h> declares. Each is an ordinary import
+#: from a DLL the loader resolves - the same mechanism a program driving
+#: CPython already uses - so calling one needs no toolchain either. Every
+#: argument is an integer or a pointer, which is what the vetted ABI can
+#: describe; nothing here passes or returns a struct by value.
+WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
+    # name: (symbol, argument kinds, result kind, DLL)
+    "Sleep": ("Sleep", ("int",), "void", "KERNEL32.dll"),
+    "GetTickCount": ("GetTickCount", (), "int", "KERNEL32.dll"),
+    "GetTickCount64": ("GetTickCount64", (), "int", "KERNEL32.dll"),
+    "GetLastError": ("GetLastError", (), "int", "KERNEL32.dll"),
+    "SetLastError": ("SetLastError", ("int",), "void", "KERNEL32.dll"),
+    "GetCurrentProcessId": ("GetCurrentProcessId", (), "int", "KERNEL32.dll"),
+    "GetCurrentThreadId": ("GetCurrentThreadId", (), "int", "KERNEL32.dll"),
+    "GetStdHandle": ("GetStdHandle", ("int",), "ptr", "KERNEL32.dll"),
+    "CloseHandle": ("CloseHandle", ("ptr",), "int", "KERNEL32.dll"),
+    "WriteFile": (
+        "WriteFile", ("ptr", "ptr", "int", "ptr", "ptr"), "int", "KERNEL32.dll",
+    ),
+    "ReadFile": (
+        "ReadFile", ("ptr", "ptr", "int", "ptr", "ptr"), "int", "KERNEL32.dll",
+    ),
+    "CreateFileA": (
+        "CreateFileA",
+        ("ptr", "int", "int", "ptr", "int", "int", "ptr"),
+        "ptr",
+        "KERNEL32.dll",
+    ),
+    "DeleteFileA": ("DeleteFileA", ("ptr",), "int", "KERNEL32.dll"),
+    "GetFileSize": ("GetFileSize", ("ptr", "ptr"), "int", "KERNEL32.dll"),
+    "SetConsoleOutputCP": ("SetConsoleOutputCP", ("int",), "int", "KERNEL32.dll"),
+    "SetConsoleCP": ("SetConsoleCP", ("int",), "int", "KERNEL32.dll"),
+    "SetConsoleTextAttribute": (
+        "SetConsoleTextAttribute", ("ptr", "int"), "int", "KERNEL32.dll",
+    ),
+    "SetConsoleTitleA": ("SetConsoleTitleA", ("ptr",), "int", "KERNEL32.dll"),
+    "GetModuleFileNameA": (
+        "GetModuleFileNameA", ("ptr", "ptr", "int"), "int", "KERNEL32.dll",
+    ),
+    "GetEnvironmentVariableA": (
+        "GetEnvironmentVariableA", ("ptr", "ptr", "int"), "int", "KERNEL32.dll",
+    ),
+    "MultiByteToWideChar": (
+        "MultiByteToWideChar",
+        ("int", "int", "ptr", "int", "ptr", "int"),
+        "int",
+        "KERNEL32.dll",
+    ),
+    "WideCharToMultiByte": (
+        "WideCharToMultiByte",
+        ("int", "int", "ptr", "int", "ptr", "int", "ptr", "ptr"),
+        "int",
+        "KERNEL32.dll",
+    ),
+    "QueryPerformanceCounter": (
+        "QueryPerformanceCounter", ("ptr",), "int", "KERNEL32.dll",
+    ),
+    "QueryPerformanceFrequency": (
+        "QueryPerformanceFrequency", ("ptr",), "int", "KERNEL32.dll",
+    ),
+    "MessageBoxA": (
+        "MessageBoxA", ("ptr", "ptr", "ptr", "int"), "int", "USER32.dll",
+    ),
+    "MessageBoxW": (
+        "MessageBoxW", ("ptr", "ptr", "ptr", "int"), "int", "USER32.dll",
+    ),
+    "GetSystemMetrics": ("GetSystemMetrics", ("int",), "int", "USER32.dll"),
+    "MessageBeep": ("MessageBeep", ("int",), "int", "USER32.dll"),
+}
+
 _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "getpid": ("getpid", ()),
     "getppid": ("getppid", ()),
@@ -521,6 +591,21 @@ _CABI_RESULTS: dict[str, str] = {
     "PyErr_Occurred": "ptr",
     "PyErr_Print": "void",
     "PyErr_Clear": "void",
+}
+
+# The Windows API entries stay *out* of the two tables above, which describe
+# the symbols a py2bin **Python** program may call - and every one of those
+# has a ctypes shim in `py2bin.cabi`, so that running the source and running
+# the compiled binary do the same thing. A Windows API function has no such
+# shim and could not have one off Windows; it is reachable from C only. The
+# C front end reads the merged view below, and nothing else does.
+C_EXTERN_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
+    **_CABI_SYMBOLS,
+    **{name: (entry[0], entry[1]) for name, entry in WINDOWS_API.items()},
+}
+C_EXTERN_RESULTS: dict[str, str] = {
+    **_CABI_RESULTS,
+    **{name: entry[2] for name, entry in WINDOWS_API.items()},
 }
 
 assert set(_CABI_RESULTS) == set(_CABI_SYMBOLS), "cabi result kinds are out of sync"

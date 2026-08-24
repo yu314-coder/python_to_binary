@@ -86,7 +86,12 @@ from __future__ import annotations
 import dataclasses
 import struct
 
-from .native.frontend import _CABI_RESULT_WIDTH, _CABI_RESULTS, _CABI_SYMBOLS
+from .native.frontend import _CABI_RESULT_WIDTH
+# The C front end may call more than a Python program may: a Windows API
+# function is an import the loader binds, and has no CPython shim because it
+# could not have one anywhere else. See `C_EXTERN_SYMBOLS`.
+from .native.frontend import C_EXTERN_RESULTS as _CABI_RESULTS
+from .native.frontend import C_EXTERN_SYMBOLS as _CABI_SYMBOLS
 from .native.compiler import CALL_CAPABLE_TARGETS
 from .native.ir import (
     MAXIMUM_STACK_SLOTS,

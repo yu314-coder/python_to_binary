@@ -310,6 +310,26 @@ def _write_pe(module: Module, machine: int, arm64: bool) -> bytes:
     )
 
 
+def _descriptors(
+    ordered: "dict[str, list[str]]",
+) -> "list[tuple[str, tuple[str, ...]]]":
+    """One import descriptor per DLL, with the kernel's own names folded in.
+
+    A program that calls a Windows API from C imports from the same KERNEL32
+    the encoder does. Two descriptors naming it is legal - the loader resolves
+    each thunk array in turn - but one is what every other linker writes, and
+    a single list is one fewer thing for a loader to disagree about.
+    """
+
+    merged: "dict[str, set[str]]" = {_PE_KERNEL_LIBRARY: set(_PE_KERNEL_IMPORTS)}
+    for name, symbols in ordered.items():
+        merged.setdefault(name, set()).update(symbols)
+    return [
+        (_PE_KERNEL_LIBRARY, tuple(sorted(merged.pop(_PE_KERNEL_LIBRARY)))),
+        *((name, tuple(sorted(symbols))) for name, symbols in sorted(merged.items())),
+    ]
+
+
 def write_pe_x86_64_dynamic(
     module: Module,
     symbol_libraries: "dict[str, str]",
@@ -334,10 +354,7 @@ def write_pe_x86_64_dynamic(
     ordered: "dict[str, list[str]]" = {}
     for symbol, library in symbol_libraries.items():
         ordered.setdefault(library, []).append(symbol)
-    libraries = [
-        (_PE_KERNEL_LIBRARY, _PE_KERNEL_IMPORTS),
-        *((name, tuple(sorted(symbols))) for name, symbols in sorted(ordered.items())),
-    ]
+    libraries = _descriptors(ordered)
     # Where the data section lands depends on how long the code is, and how
     # long the code is does not depend on where the data lands: every reference
     # is a fixed-size displacement. So encode once to measure, place the
@@ -398,10 +415,7 @@ def write_pe_arm64_dynamic(
     ordered: "dict[str, list[str]]" = {}
     for symbol, library in symbol_libraries.items():
         ordered.setdefault(library, []).append(symbol)
-    libraries = [
-        (_PE_KERNEL_LIBRARY, _PE_KERNEL_IMPORTS),
-        *((name, tuple(sorted(symbols))) for name, symbols in sorted(ordered.items())),
-    ]
+    libraries = _descriptors(ordered)
 
     def build(rdata_rva: int):
         blob, imports, iat_offset, iat_size = _imports_from_libraries(

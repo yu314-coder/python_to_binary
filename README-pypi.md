@@ -250,7 +250,11 @@ py2bin's C compiler implements C and ships its own standard headers, with no
 system include path. The ones with functions in them - `string.h`, `ctype.h`,
 `math.h`, and the allocator in `stdlib.h` - are written in C and compiled like
 any other source. Text is UTF-8, and `L"..."`, `u"..."`, `U"..."` and
-`u8"..."` all work, with `wchar_t` as wide as the target says it is. **C++ is translated to C** rather than
+`u8"..."` all work, with `wchar_t` as wide as the target says it is. The
+platform macros - `_WIN32`, `__APPLE__`, `__linux__`, `__x86_64__` and the
+rest - are defined, so `#ifdef` picks the branch it should. `<windows.h>` is
+py2bin's own: the types, the constants, and about thirty KERNEL32/USER32
+functions, each an ordinary import the loader binds. **C++ is translated to C** rather than
 compiled - see above.
 
 There is an npm wrapper, so a Node project can reach the same thing:
@@ -1263,4 +1267,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 804. What is checked on every change is the 1947-test suite.
+    is 804. What is checked on every change is the 1951-test suite.

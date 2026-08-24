@@ -50,8 +50,8 @@ from .native.optimizer import optimize
 
 # Symbols the generated C may declare via an extern prototype. Kept in sync
 # with py2bin.native.frontend._CABI_SYMBOLS, the compiler-side whitelist.
-from .native.frontend import _CABI_RESULTS as _EXTERN_RESULTS
-from .native.frontend import _CABI_SYMBOLS as _EXTERN_SYMBOLS
+from .native.frontend import C_EXTERN_RESULTS as _EXTERN_RESULTS
+from .native.frontend import C_EXTERN_SYMBOLS as _EXTERN_SYMBOLS
 
 # How an adapter-ABI argument/result kind must be spelled in a C prototype.
 # ``cstr``/``cfmt`` arguments are ``char *`` in C but compile-time constants

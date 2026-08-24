@@ -236,6 +236,65 @@ def _clean(source: str, origin: str) -> tuple[str, list[tuple[int, int]]]:
     return "".join(text), where
 
 
+#: What a compiler on each platform defines, as far as a program that only
+#: wants to know where it is being built needs. Deliberately not the whole set
+#: - `__GNUC__` would promise extensions this compiler does not have.
+_PLATFORM_MACROS = {
+    "windows": (
+        # _WIN32 is defined on 64-bit Windows too - it means "Windows", not
+        # "32-bit" - and _WIN64 alongside it says which.
+        "#define _WIN32 1",
+        "#define _WIN64 1",
+        "#define __WIN32__ 1",
+        "#define WIN32 1",
+    ),
+    "darwin": (
+        "#define __APPLE__ 1",
+        "#define __MACH__ 1",
+        "#define __unix__ 1",
+        "#define __unix 1",
+    ),
+    "linux": (
+        "#define __linux__ 1",
+        "#define __linux 1",
+        "#define __unix__ 1",
+        "#define __unix 1",
+    ),
+}
+
+#: And which machine. `_M_X64`/`_M_ARM64` are Microsoft's spellings, which
+#: Windows code uses as often as the GNU ones.
+_MACHINE_MACROS = {
+    "x86_64": (
+        "#define __x86_64__ 1",
+        "#define __x86_64 1",
+        "#define __amd64__ 1",
+        "#define _M_X64 100",
+        "#define _LP64 1",
+    ),
+    "arm64": (
+        "#define __aarch64__ 1",
+        "#define _M_ARM64 1",
+        "#define _LP64 1",
+    ),
+}
+
+
+def _respaced(tokens: "list[PPToken]") -> str:
+    """Put a run of preprocessing tokens back together as it was written.
+
+    Each token remembers whether whitespace came before it, which is what
+    makes this possible - the alternative is one space between everything.
+    """
+
+    out: list[str] = []
+    for index, token in enumerate(tokens):
+        if index and token.spaced:
+            out.append(" ")
+        out.append(token.spelling)
+    return "".join(out)
+
+
 def _scan(source: str, origin: str) -> list[list[PPToken]]:
     """Split cleaned source into logical lines of preprocessing tokens."""
 
@@ -457,6 +516,14 @@ class Preprocessor:
                 text.append(f"#define __py2bin_{machine}__ 1")
             if system in ("darwin", "linux", "windows"):
                 text.append(f"#define __py2bin_{system}__ 1")
+            # The names real code actually guards on. py2bin's own
+            # `__py2bin_windows__` says the same thing, but no program in the
+            # world is written against it - a file that picks its headers with
+            # `#ifdef _WIN32` took the wrong branch on every target until
+            # these were defined, and the failure was a missing header rather
+            # than anything that pointed at the cause.
+            text.extend(_PLATFORM_MACROS.get(system, ()))
+            text.extend(_MACHINE_MACROS.get(machine, ()))
         self._file("\n".join(text) + "\n", origin, None)
 
     # --- running over a file ---
@@ -568,7 +635,11 @@ class Preprocessor:
             self._include(rest, name_token, directory)
             return
         if name == "error":
-            message = " ".join(item.spelling for item in rest)
+            # Rebuilt with the spacing the author wrote, not one space per
+            # token: `#error <windows.h> is for Windows` came back as
+            # `< windows . h > is for Windows`, which is a worse message than
+            # the one the author took the trouble to write.
+            message = _respaced(rest)
             self.error(f"#error {message}" if message else "#error", name_token)
         if name == "pragma":
             if [item.spelling for item in rest] == ["once"]:
@@ -1153,6 +1224,132 @@ _MATH_H = (
 )
 
 #: program that has no library behind it: the macros.
+#: py2bin's own <windows.h>. Not Microsoft's - that one is tens of thousands
+#: of declarations written in extensions this compiler does not have
+#: (`__declspec`, `__stdcall`, SAL annotations, packed unions). This is the
+#: part a program usually wants: the types, the constants, and prototypes for
+#: functions py2bin can import from a DLL. Each prototype is an extern the
+#: loader binds, so calling one still needs no toolchain.
+#:
+#: It is only meaningful on a Windows target, and says so on any other rather
+#: than letting a program compile against declarations that cannot resolve.
+_WINDOWS_H = """
+#ifndef __py2bin_windows__
+#error <windows.h> is for Windows targets; build with --target windows-x86_64 \
+or windows-arm64, or guard the include with #ifdef _WIN32
+#endif
+
+#define NULL ((void *)0)
+#define WINAPI
+#define APIENTRY
+#define CALLBACK
+#define CONST const
+#define FALSE 0
+#define TRUE 1
+#define MAX_PATH 260
+
+typedef int BOOL;
+typedef unsigned char BYTE;
+typedef unsigned short WORD;
+typedef unsigned int DWORD;
+typedef unsigned int UINT;
+typedef int INT;
+typedef long LONG;
+typedef unsigned long ULONG;
+typedef long long LONGLONG;
+typedef unsigned long long ULONGLONG;
+typedef unsigned long SIZE_T;
+typedef void *HANDLE;
+typedef void *HWND;
+typedef void *HINSTANCE;
+typedef void *HMODULE;
+typedef void *LPVOID;
+typedef const void *LPCVOID;
+typedef char CHAR;
+typedef char *LPSTR;
+typedef const char *LPCSTR;
+typedef wchar_t WCHAR;
+typedef wchar_t *LPWSTR;
+typedef const wchar_t *LPCWSTR;
+typedef DWORD *LPDWORD;
+typedef WORD *LPWORD;
+typedef BOOL *LPBOOL;
+
+#define INVALID_HANDLE_VALUE ((HANDLE)-1)
+#define STD_INPUT_HANDLE ((DWORD)-10)
+#define STD_OUTPUT_HANDLE ((DWORD)-11)
+#define STD_ERROR_HANDLE ((DWORD)-12)
+
+#define GENERIC_READ 0x80000000
+#define GENERIC_WRITE 0x40000000
+#define FILE_SHARE_READ 0x00000001
+#define FILE_SHARE_WRITE 0x00000002
+#define CREATE_ALWAYS 2
+#define CREATE_NEW 1
+#define OPEN_EXISTING 3
+#define OPEN_ALWAYS 4
+#define TRUNCATE_EXISTING 5
+#define FILE_ATTRIBUTE_NORMAL 0x00000080
+
+#define CP_ACP 0
+#define CP_UTF8 65001
+
+#define MB_OK 0x00000000
+#define MB_OKCANCEL 0x00000001
+#define MB_YESNO 0x00000004
+#define MB_ICONERROR 0x00000010
+#define MB_ICONWARNING 0x00000030
+#define MB_ICONINFORMATION 0x00000040
+#define IDOK 1
+#define IDCANCEL 2
+#define IDYES 6
+#define IDNO 7
+
+#define SM_CXSCREEN 0
+#define SM_CYSCREEN 1
+
+#define FOREGROUND_BLUE 0x0001
+#define FOREGROUND_GREEN 0x0002
+#define FOREGROUND_RED 0x0004
+#define FOREGROUND_INTENSITY 0x0008
+#define BACKGROUND_BLUE 0x0010
+#define BACKGROUND_GREEN 0x0020
+#define BACKGROUND_RED 0x0040
+#define BACKGROUND_INTENSITY 0x0080
+
+/* Everything below is imported from a DLL by the loader. The set is what
+   py2bin has vetted signatures for; anything else is a name this header does
+   not declare, and the compiler says so rather than pretending. */
+extern void Sleep(DWORD);
+extern DWORD GetTickCount(void);
+extern DWORD GetTickCount64(void);
+extern DWORD GetLastError(void);
+extern void SetLastError(DWORD);
+extern DWORD GetCurrentProcessId(void);
+extern DWORD GetCurrentThreadId(void);
+extern HANDLE GetStdHandle(DWORD);
+extern BOOL CloseHandle(HANDLE);
+extern BOOL WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPVOID);
+extern BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
+extern HANDLE CreateFileA(LPCSTR, DWORD, DWORD, LPVOID, DWORD, DWORD, HANDLE);
+extern BOOL DeleteFileA(LPCSTR);
+extern DWORD GetFileSize(HANDLE, LPDWORD);
+extern BOOL SetConsoleOutputCP(UINT);
+extern BOOL SetConsoleCP(UINT);
+extern BOOL SetConsoleTextAttribute(HANDLE, WORD);
+extern BOOL SetConsoleTitleA(LPCSTR);
+extern DWORD GetModuleFileNameA(HMODULE, LPSTR, DWORD);
+extern DWORD GetEnvironmentVariableA(LPCSTR, LPSTR, DWORD);
+extern int MultiByteToWideChar(UINT, DWORD, LPCSTR, int, LPWSTR, int);
+extern int WideCharToMultiByte(UINT, DWORD, LPCWSTR, int, LPSTR, int, LPCSTR, LPBOOL);
+extern BOOL QueryPerformanceCounter(LPVOID);
+extern BOOL QueryPerformanceFrequency(LPVOID);
+extern int MessageBoxA(HWND, LPCSTR, LPCSTR, UINT);
+extern int MessageBoxW(HWND, LPCWSTR, LPCWSTR, UINT);
+extern int GetSystemMetrics(int);
+extern BOOL MessageBeep(UINT);
+"""
+
 _CTYPE_H = """
 /* The C locale, which is the only one py2bin has: these answer for ASCII and
    say no to everything above it rather than guessing at an encoding. */
@@ -1473,6 +1670,7 @@ _BUILTIN_HEADERS = {
     "stdlib.h": _STDLIB_H,
     "string.h": _STRING_H,
     "ctype.h": _CTYPE_H,
+    "windows.h": _WINDOWS_H,
     "assert.h": _ASSERT_H,
     "float.h": _FLOAT_H,
     "stddef.h": "#define NULL ((void *)0)\n",
