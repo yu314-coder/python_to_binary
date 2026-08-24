@@ -67,6 +67,7 @@ _OPERATOR_NAMES = {
     "==": "op_eq", "!=": "op_ne", "<": "op_lt", ">": "op_gt",
     "<=": "op_le", ">=": "op_ge", "[]": "op_index", "()": "op_call",
     "+=": "op_add_assign", "-=": "op_sub_assign", "=": "op_assign",
+    "<<": "op_shl", ">>": "op_shr",
 }
 #: Longest first, so `<=` is not read as `<`.
 _OPERATOR_SYMBOLS = sorted(_OPERATOR_NAMES, key=len, reverse=True)
@@ -314,7 +315,9 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
         return decorated(Method(
             _OPERATOR_NAMES[symbol], returns or "void", parameters, body, at_line
         ))
-    words = before.replace("*", " * ").split()
+    # `&` is spaced out with `*`: `int &at` names `at` and returns `int &`,
+    # and taken whole the name read as `&at`.
+    words = before.replace("*", " * ").replace("&", " & ").split()
     if len(words) == 1:
         # A constructor: the name is the class's own, with no return type.
         return decorated(Method("", "void", parameters, body, at))
@@ -689,54 +692,91 @@ _TEMPLATE_ROUNDS = 16
 def _mangle_overloaded_functions(text: str, filename: str) -> str:
     """Give each free function of a shared name a name of its own.
 
-    Same reasoning as for methods: C has one function per name. Two that take
-    different numbers of arguments are told apart by the count at the call
-    site. Two that take the same number and differ only in the types are not -
-    that needs to know the type of every expression, which this translator
-    does not - so they are refused here rather than resolved by guesswork.
+    Same reasoning as for methods: C has one function per name. Which one a
+    call means is read from what it passes - the count where that settles it,
+    and the types where two take the same number.
     """
 
-    definitions: dict[str, list[int]] = {}
+    definitions: dict[str, list[str]] = {}
     for match in _DEFINITION.finditer(text):
         if _depth_at(text, match.end() - 1) != 0:
             continue
         name = match.group(2)
         if name in _NOT_A_TYPE or name == "main":
             continue
-        arity = len(
-            [part for part in _split_arguments(match.group(3)) if part.strip()]
-        ) if match.group(3).strip() not in ("", "void") else 0
-        definitions.setdefault(name, []).append(arity)
+        definitions.setdefault(name, []).append(match.group(3))
 
     overloaded = {
-        name: arities for name, arities in definitions.items() if len(arities) > 1
+        name: spelled for name, spelled in definitions.items() if len(spelled) > 1
     }
     if not overloaded:
         return text
-    for name, arities in overloaded.items():
-        if len(set(arities)) != len(arities):
-            clash = next(n for n in arities if arities.count(n) > 1)
+
+    def suffix_of(name: str, parameters: str) -> str:
+        arity = _arity(parameters)
+        same = [p for p in overloaded[name] if _arity(p) == arity]
+        if len(same) == 1:
+            return str(arity)
+        return f"{arity}__" + "_".join(_parameter_types(parameters))
+
+    for name, spelled in overloaded.items():
+        seen = [suffix_of(name, parameters) for parameters in spelled]
+        if len(set(seen)) != len(seen):
             raise CppTranslationError(
                 filename,
                 _line_of(text, text.index(name)),
-                f"two definitions of {name}() take {clash} argument(s) "
-                f"each. py2bin tells overloads apart by how many arguments "
-                f"they take, which is what a call site shows; two that differ "
-                f"only in the types would need every expression's type to "
-                f"choose between them, so give them different names",
+                f"two definitions of {name}() take the same arguments; C++ "
+                f"would not accept that either",
             )
+
+    # The definitions first, so a call is rewritten against names that exist.
+    out: list[str] = []
+    at = 0
+    for match in _DEFINITION.finditer(text):
+        if _depth_at(text, match.end() - 1) != 0 or match.start() < at:
+            continue
+        name = match.group(2)
+        if name not in overloaded:
+            continue
+        out.append(text[at:match.start(2)])
+        out.append(f"{name}__{suffix_of(name, match.group(3))}")
+        at = match.end(2)
+    out.append(text[at:])
+    text = "".join(out)
 
     def rename(match: "re.Match[str]") -> str:
         name = match.group(1)
         if name not in overloaded:
             return match.group(0)
-        arity = _call_arity(match.string, match.end() - 1)
-        if arity not in overloaded[name]:
+        given = _call_arguments(match.string, match.end() - 1)
+        arity = len(given)
+        same = [p for p in overloaded[name] if _arity(p) == arity]
+        if not same:
             return match.group(0)
-        return f"{name}__{arity}("
+        if len(same) == 1:
+            return f"{name}__{arity}("
+        wanted = [_deduced_type(value, match.string, match.start()) for value in given]
+        if any(item is None for item in wanted):
+            raise CppTranslationError(
+                filename,
+                _line_of(match.string, match.start()),
+                f"more than one {name}() takes {arity} argument(s), and "
+                f"py2bin cannot tell which is meant here. It reads the type "
+                f"of a literal and of a variable it can see declared; cast "
+                f"the argument to the type of the one you want",
+            )
+        codes = [_type_code(item) for item in wanted]
+        for parameters in same:
+            if _parameter_types(parameters) == codes:
+                return f"{name}__{suffix_of(name, parameters)}("
+        for parameters in same:
+            if all(
+                declared == code or declared in _PROMOTIONS.get(code, ())
+                for declared, code in zip(_parameter_types(parameters), codes)
+            ):
+                return f"{name}__{suffix_of(name, parameters)}("
+        return match.group(0)
 
-    # Definitions and calls alike: both are `name(`, and a definition's own
-    # head is just the call shape with a body after it.
     return _map_code(
         text, lambda part: re.sub(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(", rename, part)
     )
@@ -1203,11 +1243,7 @@ def _emit_vtables(order: "list[str]", classes: "dict[str, Class]") -> str:
             method = _slot_method(provider, key, classes)
             if method is None:
                 continue
-            symbol = _c_name(
-                provider,
-                key[0],
-                key[1] if _overloaded(provider, key[0], classes) else None,
-            )
+            symbol = _c_name(provider, key[0], _suffix_of(provider, method, classes))
             if symbol in seen:
                 continue
             seen.add(symbol)
@@ -1224,12 +1260,13 @@ def _emit_vtables(order: "list[str]", classes: "dict[str, Class]") -> str:
                 # path reaches it anyway.
                 entries.append("0")
                 continue
+            declared = _slot_method(provider, key, classes)
             entries.append(
                 "(void *)"
                 + _c_name(
                     provider,
                     key[0],
-                    key[1] if _overloaded(provider, key[0], classes) else None,
+                    _suffix_of(provider, declared, classes) if declared else None,
                 )
             )
         held = ", ".join(entries) or "0"
@@ -1260,12 +1297,12 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
     return "\n".join(lines)
 
 
-def _emit_methods(found: Class, classes: "dict[str, Class]") -> str:
+def _emit_methods(found: Class, classes: "dict[str, Class]", unit: str = "") -> str:
     out = []
     for method in found.methods:
         if not method.body:
             continue  # declared here, defined outside; emitted with that body
-        out.append(_emit_one(found, method, classes))
+        out.append(_emit_one(found, method, classes, unit))
     return "\n".join(out)
 
 
@@ -1295,14 +1332,10 @@ def _by_value_objects(
     return taken
 
 
-def _emit_one(found: Class, method: Method, classes: "dict[str, Class]") -> str:
-    name = _c_name(
-        found.name,
-        method.name,
-        _arity(method.parameters)
-        if _overloaded(found.name, method.name, classes)
-        else None,
-    )
+def _emit_one(
+    found: Class, method: Method, classes: "dict[str, Class]", unit: str = ""
+) -> str:
+    name = _c_name(found.name, method.name, _suffix_of(found.name, method, classes))
     parameters = f"struct {found.name} *this"
     # A value return becomes the hidden pointer a compiler would pass: the
     # caller supplies the space and the callee writes through it. py2bin's C
@@ -1352,6 +1385,7 @@ def _emit_one(found: Class, method: Method, classes: "dict[str, Class]") -> str:
         known,
         pointers={"this", *(n for n, h in references.items() if h in classes)},
         receivers=receivers,
+        unit=unit,
     )
     if copied:
         # Declared and then assigned, not initialised: py2bin's C takes
@@ -1369,7 +1403,22 @@ def _emit_one(found: Class, method: Method, classes: "dict[str, Class]") -> str:
     elif method.name == "~":
         body = _close_with_subobjects(body, found, classes)
     returns = "void" if (method.name in ("", "~") or returned) else method.returns
+    if method.name not in ("", "~") and not returned and _returns_reference(method):
+        # A reference is a pointer that the language follows for you. The
+        # callee hands back the address; every call site follows it.
+        returns = returns.replace("&", "*")
+        body = _return_the_address(body)
     return f"static {returns} {name}({parameters}) {body}"
+
+
+def _return_the_address(body: str) -> str:
+    """`return items[i];` becomes `return &(items[i]);` for a reference."""
+
+    return re.sub(
+        r"\breturn\s+([^;]+);",
+        lambda m: f"return &({m.group(1).strip()});",
+        body,
+    )
 
 
 def _return_through_pointer(body: str) -> str:
@@ -1424,7 +1473,7 @@ def _open_with_subobjects(body: str, found: Class, classes: "dict[str, Class]") 
                 f"nothing, or hold a pointer",
             )
         calls.append(
-            f"{_c_name(owner, '', _named_arity(owner, '', classes, 0))}({address});"
+            f"{_c_name(owner, '', _call_suffix(owner, '', classes, []))}({address});"
         )
     if _is_polymorphic(found.name, classes):
         # After the base constructor, which set the pointer to *its* table.
@@ -1490,14 +1539,19 @@ def _bare_method_calls(body: str, owner: Class, classes: "dict[str, Class]") -> 
         pattern = rf"(?<![.>\w]){re.escape(method)}\s*\("
         body = _rewrite_calls(
             body, pattern,
-            _dispatched_here(owner.name, method, classes, provider, reached),
+            _dispatched_here(owner.name, method, classes, provider, reached, body),
             reached,
         )
     return body
 
 
 def _dispatched_here(
-    static: str, method: str, classes: "dict[str, Class]", provider: str, reached: str
+    static: str,
+    method: str,
+    classes: "dict[str, Class]",
+    provider: str,
+    reached: str,
+    text: str = "",
 ):
     """A call written bare inside a member: `sum()`, meaning `this->sum()`.
 
@@ -1507,17 +1561,17 @@ def _dispatched_here(
     """
 
     virtual = _dispatch(static, method, classes, "this")
-    direct = _name_for(provider, method, classes)
+    direct = _name_for(provider, method, classes, text)
 
-    def chosen(arity: int):
-        through = virtual(arity) if virtual is not None else ""
+    def chosen(given: "list[str]"):
+        through = virtual(given) if virtual is not None else ""
         if through:
             return through, "this"
-        return (direct if isinstance(direct, str) else direct(arity)), reached
+        return (direct if isinstance(direct, str) else direct(given)), reached
 
     return chosen
 
-def _c_name(class_name: str, method: str, arity: int | None = None) -> str:
+def _c_name(class_name: str, method: str, suffix: "str | int | None" = None) -> str:
     """The C name for a member. Overloads are told apart by how many they take.
 
     C has one name per function, and C++ has as many as the argument lists
@@ -1533,7 +1587,7 @@ def _c_name(class_name: str, method: str, arity: int | None = None) -> str:
         base = f"{class_name}__dtor"
     else:
         base = f"{class_name}__{method}"
-    return base if arity is None else f"{base}__{arity}"
+    return base if suffix is None else f"{base}__{suffix}"
 
 
 def _arity(parameters: str) -> int:
@@ -1549,14 +1603,144 @@ def _overloaded(owner: str, method: str, classes: "dict[str, Class]") -> bool:
     return len([m for m in found.methods if m.name == method]) > 1
 
 
-def _named_arity(
-    owner: str, method: str, classes: "dict[str, Class]", arity: int
-) -> int | None:
-    """The suffix to use for a call taking `arity` arguments, or None."""
+def _type_code(spelled: str) -> str:
+    """A parameter's type as something that can go in a C identifier.
 
-    if not _overloaded(owner, method, classes):
+    `const char *` becomes `char_p`. Readable on purpose: an overload set
+    written out as `print__1__int` and `print__1__char_p` can be followed in
+    the generated C, where a hash could not.
+    """
+
+    cleaned = re.sub(r"\b(const|volatile)\b", " ", spelled)
+    cleaned = cleaned.replace("*", " p ").replace("&", " ")
+    words = [word for word in cleaned.split() if word]
+    return "_".join(words) or "void"
+
+
+def _parameter_types(parameters: str) -> "list[str]":
+    """The declared types of a parameter list, without the names."""
+
+    found = []
+    for part in _split_arguments(parameters):
+        if not part.strip():
+            continue
+        spelled = re.sub(r"\[\s*\d*\s*\]\s*$", " p", part.strip())
+        words = spelled.replace("*", " * ").replace("&", " & ").split()
+        # The last word is the parameter's own name unless it is all type.
+        if len(words) > 1 and re.fullmatch(r"[A-Za-z_]\w*", words[-1]):
+            words = words[:-1]
+        found.append(_type_code(" ".join(words)))
+    return found
+
+
+def _method_by_name(
+    owner: str, method: str, classes: "dict[str, Class]"
+) -> "Method | None":
+    """The first member of that class with this name."""
+
+    found = classes.get(owner)
+    if found is None:
         return None
-    return arity
+    for candidate in found.methods:
+        if candidate.name == method:
+            return candidate
+    return None
+
+
+def _overload_set(owner: str, method: str, classes: "dict[str, Class]") -> "list[Method]":
+    """Every member of that class with this name, most derived first."""
+
+    found = classes.get(owner)
+    if found is None:
+        return []
+    return [m for m in found.methods if m.name == method]
+
+
+def _suffix_of(owner: str, method: "Method", classes: "dict[str, Class]") -> "str | None":
+    """What to add to a member's C name so it is its own.
+
+    Nothing where the name is used once. The count where that settles it,
+    which is the common case and keeps the C readable. The types as well
+    where two take the same number - `cout << 1` and `cout << "s"` both pass
+    one argument, and only the types tell them apart.
+    """
+
+    set_of = _overload_set(owner, method.name, classes)
+    if len(set_of) < 2:
+        return None
+    arity = _arity(method.parameters)
+    if len([m for m in set_of if _arity(m.parameters) == arity]) == 1:
+        return str(arity)
+    return f"{arity}__" + "_".join(_parameter_types(method.parameters))
+
+
+#: Conversions a call may rely on when no overload matches exactly. Narrow on
+#: purpose: these are the ones C++ makes silently and C makes too.
+_PROMOTIONS = {
+    "int": ("long", "unsigned_long", "double", "float", "unsigned_int", "char", "short"),
+    "char": ("int", "long", "unsigned_long", "double"),
+    "double": ("float",),
+    "char_p": ("void_p",),
+}
+
+
+def _chosen_overload(
+    set_of: "list[Method]", given: "list[str]", text: str, before: int
+) -> "Method | None":
+    """Which member of an overload set a call with these arguments means."""
+
+    candidates = [m for m in set_of if _arity(m.parameters) == len(given)]
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    wanted = [_deduced_type(value, text, before) for value in given]
+    if any(item is None for item in wanted):
+        return None
+    codes = [_type_code(item) for item in wanted]
+    exact = [
+        m for m in candidates if _parameter_types(m.parameters) == codes
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    near = [
+        m
+        for m in candidates
+        if all(
+            declared == code or declared in _PROMOTIONS.get(code, ())
+            for declared, code in zip(_parameter_types(m.parameters), codes)
+        )
+    ]
+    return near[0] if len(near) == 1 else None
+
+
+def _call_suffix(
+    owner: str,
+    method: str,
+    classes: "dict[str, Class]",
+    given: "list[str]",
+    text: str = "",
+    before: int = -1,
+) -> "str | None":
+    """The suffix a call site should use, read from what it passes."""
+
+    set_of = _overload_set(owner, method, classes)
+    if len(set_of) < 2:
+        return None
+    picked = _chosen_overload(set_of, given, text, before)
+    if picked is not None:
+        return _suffix_of(owner, picked, classes)
+    if len([m for m in set_of if _arity(m.parameters) == len(given)]) < 2:
+        # No overload takes this many. Naming the count leaves the C compiler
+        # to report a call to a function that is not there, which is the same
+        # mistake said in the same place.
+        return str(len(given))
+    spelled = ", ".join(given)
+    raise CppTranslationError(
+        "<c++>", 0,
+        f"more than one {method or owner}() takes {len(given)} argument(s), "
+        f"and py2bin cannot tell which is meant by `{spelled}`. It reads the "
+        f"type of a literal and of a variable it can see declared; cast the "
+        f"argument to the type of the one you want",
+    )
 
 
 def _find_method(name: str, method: str, classes: "dict[str, Class]") -> str | None:
@@ -1699,6 +1883,7 @@ def _rewrite_body(
     pointers: "set[str]" = frozenset(),
     receivers: "dict[str, str] | None" = None,
     inherited_arrays: "dict[str, str] | None" = None,
+    unit: str = "",
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -1726,8 +1911,12 @@ def _rewrite_body(
                 "<c++>", 0, f"{type_name} has no constructor to take arguments"
             )
         if owner is not None:
-            count = _arity(arguments or "")
-            suffix = _named_arity(owner, "", classes, count)
+            given = (
+                [a.strip() for a in _split_arguments(arguments)]
+                if (arguments or "").strip()
+                else []
+            )
+            suffix = _call_suffix(owner, "", classes, given, scope())
             passed = f", {arguments}" if arguments else ""
             constructed += f" {_c_name(owner, '', suffix)}(&{variable}{passed});"
         if _find_method(type_name, "~", classes):
@@ -1751,7 +1940,7 @@ def _rewrite_body(
         index = f"__py2bin_i_{variable}"
         kept += (
             f" {{ int {index}; for ({index} = 0; {index} < {count}; {index}++)"
-            f" {_c_name(owner, '', _named_arity(owner, '', classes, 0))}"
+            f" {_c_name(owner, '', _call_suffix(owner, '', classes, []))}"
             f"(&{variable}[{index}]); }}"
         )
         return kept
@@ -1762,9 +1951,20 @@ def _rewrite_body(
     # placed at the end of the function named a variable C says is not there.
     body, blocks = _lift_nested(body)
 
+    def scope() -> str:
+        """This body, and then whatever the file declares outside it.
+
+        Working out an argument's type means finding where it was declared,
+        and `std::endl` is declared at file scope - so a body on its own is
+        not enough to tell `cout << endl` from `cout << 1`. This scope comes
+        first, because a local of the same name is the one in view.
+        """
+
+        return body if not unit else f"{body}\n{unit}"
+
     # Before the declaration passes: `Node *n = new Node(3);` has to become a
     # call first, or the pointer declaration reads `new Node` as the type.
-    body = _rewrite_new(body, classes)
+    body = _rewrite_new(body, classes, scope())
 
     # `int &r = a.v;` is a pointer whose uses are dereferenced. Done before
     # anything else reads the body, so the rest sees an ordinary pointer.
@@ -1817,7 +2017,7 @@ def _rewrite_body(
         # what a by-value return is once the ABI is written out.
         return (
             f"struct {type_name} {variable}; "
-            f"{_c_name(owner, method, _named_arity(owner, method, classes, _arity(fixed)))}"
+            f"{_c_name(owner, method, _call_suffix(owner, method, classes, [a.strip() for a in _split_arguments(fixed)] if fixed.strip() else [], scope()))}"
             f"({address}, &{variable}{passed});"
         )
 
@@ -1859,6 +2059,37 @@ def _rewrite_body(
     # `V c = a.plus(b);` into an assignment from a function that returns void.
     body, from_operators = _rewrite_value_operators(body, classes, known, pointers)
     known.update(from_operators)
+    # `v[i].get()` where `v[i]` is what an index operator returns. Before the
+    # operator pass, which turns the subscript itself into a call and leaves
+    # the method on an expression no later pass recognises as a receiver.
+    for variable in sorted(known, key=len, reverse=True):
+        owner = _find_method(known[variable], "op_index", classes)
+        if owner is None:
+            continue
+        element = _method_by_name(owner, "op_index", classes)
+        held = (element.returns if element else "").replace("&", "").replace("*", "").strip()
+        if held not in classes:
+            continue
+        address = variable if variable in pointers else f"&{variable}"
+        for method in _reachable_methods(held, classes):
+            provider = _find_method(held, method, classes)
+            if provider is None:
+                continue
+            pattern = (
+                rf"\b{re.escape(variable)}\s*\[([^\]]*)\]\s*\.\s*"
+                rf"{re.escape(method)}\s*\("
+            )
+            # `&` in front, because the dereference pass will follow the
+            # reference the index operator returns and the receiver wants the
+            # address again - the two cancel, which is what C++ was doing.
+            body = _rewrite_pointer_indexed(
+                body,
+                pattern,
+                _name_for(provider, method, classes, scope()),
+                variable,
+                f"&{_c_name(owner, 'op_index')}({address}, __I__)",
+            )
+
     body = _rewrite_operators(body, classes, known, pointers)
     body = _VALUE_INIT.sub(declare_from_call, body)
 
@@ -1888,7 +2119,7 @@ def _rewrite_body(
             body = _rewrite_pointer_indexed(
                 body, pattern,
                 _dispatched(
-                    holds, method, classes, f"{variable}[__I__]", owner
+                    holds, method, classes, f"{variable}[__I__]", owner, scope()
                 ),
                 variable,
             )
@@ -1906,7 +2137,7 @@ def _rewrite_body(
             body = _rewrite_indexed(
                 body, pattern,
                 _dispatched(
-                    holds, method, classes, f"&{variable}[__I__]", owner
+                    holds, method, classes, f"&{variable}[__I__]", owner, scope()
                 ),
                 variable,
             )
@@ -1976,15 +2207,28 @@ def _rewrite_body(
                 reached = f"&{inner}{path}"
             pattern = rf"\b{re.escape(variable)}{arrow}{re.escape(method)}\s*\("
             body = _rewrite_calls(
-                body, pattern, _dispatched(holds, method, classes, reached, owner),
+                body, pattern,
+                _dispatched(holds, method, classes, reached, owner, scope()),
                 reached,
             )
     body = _fix_call_arguments(body, classes, known, pointers)
 
+    # After the dereference pass, not before it: each call in a chain hands
+    # back the stream as an address and the next call takes it as its
+    # receiver, so following the reference in between would leave a struct
+    # where a pointer is wanted.
+    body = _rewrite_stream_chains(body, classes, known, pointers, scope())
+
     # Now that this scope is known, each block is rewritten inside it.
     rewritten_blocks = [
         _rewrite_body(
-            inner, classes, dict(known), set(pointers), dict(given), dict(arrays)
+            inner,
+            classes,
+            dict(known),
+            set(pointers),
+            dict(given),
+            dict(arrays),
+            unit,
         )
         for inner in blocks
     ]
@@ -2090,6 +2334,144 @@ def _rewrite_value_operators(
         body = _map_code(body, lambda part: pattern.sub(replace, part))
     return body, added
 
+#: `out << a << b;` - a chain, which is what streams are always written as.
+_STREAM_CHAIN = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*(<<|>>)")
+
+
+def _rewrite_stream_chains(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    scope: str = "",
+) -> str:
+    """`out << a << b` becomes one call wrapped around another.
+
+    The generic operator rewriter matches a *name* on the left, and after the
+    first `<<` the left side is no longer a name but the call that replaced
+    it. Streams are written in chains and nothing else is, so the chain is
+    read whole here: each `<<` is a call taking what the one before it
+    returned, which is the address the reference became.
+    """
+
+    if not known:
+        return body
+    out: list[str] = []
+    at = 0
+    for found in _STREAM_CHAIN.finditer(body):
+        if found.start() < at:
+            continue
+        variable, symbol = found.group(1), found.group(2)
+        holds = known.get(variable)
+        if holds is None:
+            continue
+        name = _OPERATOR_NAMES[symbol]
+        if _find_method(holds, name, classes) is None:
+            continue
+        end = _statement_end(body, found.end())
+        if end < 0:
+            continue
+        pieces = _split_on_operator(body[found.end(): end], symbol)
+        if not pieces:
+            continue
+        reached = variable if variable in pointers else f"&{variable}"
+        for piece in pieces:
+            operand = piece.strip()
+            owner = _find_method(holds, name, classes)
+            if owner is None:
+                break
+            picked = _chosen_overload(
+                _overload_set(owner, name, classes),
+                [operand],
+                scope or body,
+                found.start(),
+            )
+            chosen = _c_name(
+                owner,
+                name,
+                _call_suffix(
+                    owner, name, classes, [operand], scope or body, found.start()
+                ),
+            )
+            if picked is not None and not operand.startswith("&"):
+                declared = picked.parameters
+                words = declared.replace("*", " * ").split()
+                by_value = (
+                    "*" not in declared
+                    and "&" not in declared
+                    and len(words) == 2
+                    and words[0] in classes
+                )
+                if (by_value or _REFERENCE.search(declared)) and _has_an_address(
+                    operand
+                ):
+                    operand = f"&{operand}"
+            # Each call hands back the stream, as the address its reference
+            # became, so the next one takes it as the receiver directly.
+            reached = f"{chosen}({reached}, {operand})"
+        out.append(body[at:found.start()])
+        out.append(reached)
+        at = end
+    out.append(body[at:])
+    return "".join(out)
+
+
+def _statement_end(text: str, at: int) -> int:
+    """The `;` that ends the statement starting at `at`, at this depth."""
+
+    depth = 0
+    index = at
+    while index < len(text):
+        piece = text[index]
+        if piece in "\"'":
+            quote = piece
+            index += 1
+            while index < len(text) and text[index] != quote:
+                index += 2 if text[index] == "\\" else 1
+            index += 1
+            continue
+        if piece in "([{":
+            depth += 1
+        elif piece in ")]}":
+            if depth == 0:
+                return index
+            depth -= 1
+        elif piece == ";" and depth == 0:
+            return index
+        index += 1
+    return -1
+
+
+def _split_on_operator(text: str, symbol: str) -> "list[str]":
+    """Split `a << b << c` on the operators between its operands."""
+
+    pieces: list[str] = []
+    depth = 0
+    at = 0
+    index = 0
+    while index < len(text):
+        piece = text[index]
+        if piece in "\"'":
+            quote = piece
+            index += 1
+            while index < len(text) and text[index] != quote:
+                index += 2 if text[index] == "\\" else 1
+            index += 1
+            continue
+        if piece in "([{":
+            depth += 1
+        elif piece in ")]}":
+            depth -= 1
+        elif depth == 0 and text.startswith(symbol, index):
+            pieces.append(text[at:index])
+            index += len(symbol)
+            at = index
+            continue
+        index += 1
+    pieces.append(text[at:])
+    return [piece for piece in pieces if piece.strip()]
+
+
 def _rewrite_operators(
     body: str,
     classes: "dict[str, Class]",
@@ -2135,18 +2517,24 @@ def _rewrite_operators(
                 return f"{_c_name(o, n)}({a}, {passed})"
 
             body = _map_code(body, lambda part: re.sub(pattern, replace, part))
-    # `a[i]` where a is an object with an index operator.
+    # `a[i]` where a is an object with an index operator. Written out rather
+    # than routed through the array rewriter: that one turns `bank[i].m()`
+    # into a call on an element, and this turns the subscript itself into the
+    # call - the index is an argument, not part of the receiver.
     for variable in sorted(known, key=len, reverse=True):
         owner = _find_method(known[variable], "op_index", classes)
         if owner is None:
             continue
         address = variable if variable in pointers else f"&{variable}"
-        body = _rewrite_indexed(
+        pattern = rf"\b{re.escape(variable)}\s*\[([^\]]*)\]"
+        body = _map_code(
             body,
-            rf"\b{re.escape(variable)}\s*\[([^\]]*)\]",
-            _c_name(owner, "op_index"),
-            "",
-        ).replace(f"{_c_name(owner, 'op_index')}(&[", f"{_c_name(owner, 'op_index')}({address}, ")
+            lambda part, o=owner, a=address, p=pattern: re.sub(
+                p,
+                lambda m: f"{_c_name(o, 'op_index')}({a}, {m.group(1)})",
+                part,
+            ),
+        )
     return body
 
 def _call_signatures(
@@ -2159,8 +2547,7 @@ def _call_signatures(
         for method in held.methods:
             if method.name == "~":
                 continue
-            arity = _arity(method.parameters)
-            suffix = arity if _overloaded(owner, method.name, classes) else None
+            suffix = _suffix_of(owner, method, classes)
             found[_c_name(owner, method.name, suffix)] = (owner, method)
             if method.name == "":
                 # `T__new` takes the constructor's own arguments and no
@@ -2168,10 +2555,16 @@ def _call_signatures(
                 made = _c_name(
                     owner,
                     "new",
-                    arity if _has_several_constructors(owner, classes) else None,
+                    suffix if _has_several_constructors(owner, classes) else None,
                 )
                 found[made] = (owner, method)
     return found
+
+
+def _returns_reference(method: "Method") -> bool:
+    """Whether the method hands back a reference rather than a value."""
+
+    return "&" in method.returns
 
 
 def _fix_call_arguments(
@@ -2179,16 +2572,18 @@ def _fix_call_arguments(
     classes: "dict[str, Class]",
     known: "dict[str, str]",
     pointers: "set[str]",
+    signatures: "dict[str, tuple[str, Method]] | None" = None,
 ) -> str:
-    """Hand each call the addresses its parameters turned out to want.
+    """Hand each call the addresses its parameters want, and follow references.
 
     Run once the calls have been rewritten, so a call written inside another
-    one's argument list is already a call and is fixed with the rest. Doing it
-    while the outer call was being rewritten meant skipping over the inner
-    one, which was then left as C++.
+    one's argument list is one too. Arguments are fixed by recursion rather
+    than by scanning past them, because an inner call is inside the outer
+    call's own text and a single left-to-right sweep steps over it.
     """
 
-    signatures = _call_signatures(classes)
+    if signatures is None:
+        signatures = _call_signatures(classes)
     if not signatures:
         return body
     pattern = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
@@ -2197,18 +2592,24 @@ def _fix_call_arguments(
     for found in pattern.finditer(body):
         if found.start() < at:
             continue
-        entry = signatures.get(found.group(1))
-        if entry is None:
-            continue
-        owner, method = entry
         close = _closing_paren(body, found.end() - 1)
         if close < 0:
             continue
-        inside = body[found.end(): close]
+        inside = _fix_call_arguments(
+            body[found.end(): close], classes, known, pointers, signatures
+        )
+        entry = signatures.get(found.group(1))
+        if entry is None:
+            out.append(body[at:found.end()])
+            out.append(inside)
+            at = close
+            continue
+        owner, method = entry
         given = _split_arguments(inside) if inside.strip() else []
         # `T__new` passes no receiver; everything else passes `this` first,
         # and a value return puts the caller's space after it.
-        skip = 0 if found.group(1).endswith("new") or "__new__" in found.group(1) else 1
+        made = found.group(1)
+        skip = 0 if made.endswith("new") or "__new__" in made else 1
         if skip and _returns_object(method, classes):
             skip += 1
         wanted = [
@@ -2216,6 +2617,9 @@ def _fix_call_arguments(
             if part.strip()
         ]
         if len(given) - skip != len(wanted):
+            out.append(body[at:found.end()])
+            out.append(inside)
+            at = close
             continue
         for index, declared in enumerate(wanted):
             value = given[skip + index].strip()
@@ -2232,8 +2636,17 @@ def _fix_call_arguments(
                 continue
             if by_value or _REFERENCE.search(declared):
                 given[skip + index] = f"&{value}"
+        spelled = ", ".join(part.strip() for part in given)
+        if _returns_reference(method):
+            # The callee hands back an address, because C cannot return a
+            # reference; following it here is what the language was doing
+            # silently, and leaves `v[i] = 3;` an assignment to the element.
+            out.append(body[at:found.start()])
+            out.append(f"(*{made}({spelled}))")
+            at = close + 1
+            continue
         out.append(body[at:found.end()])
-        out.append(", ".join(part.strip() for part in given))
+        out.append(spelled)
         at = close
     out.append(body[at:])
     return "".join(out)
@@ -2326,9 +2739,13 @@ def _split_arguments(arguments: str) -> "list[str]":
     return parts
 
 def _rewrite_pointer_indexed(
-    body: str, pattern: str, function, variable: str
+    body: str, pattern: str, function, variable: str, receiver: str = ""
 ) -> str:
-    """`all[i]->m(` becomes `function(all[i]`: the element is the address."""
+    """`all[i]->m(` becomes `function(all[i]`: the element is the address.
+
+    `receiver` overrides how the element is reached, for a container whose
+    elements come out of a call rather than out of an array.
+    """
 
     out = []
     at = 0
@@ -2338,11 +2755,16 @@ def _rewrite_pointer_indexed(
         chosen = (
             function
             if isinstance(function, str)
-            else function(_call_arity(body, found.end() - 1))
+            else function(_call_arguments(body, found.end() - 1))
         )
         chosen = chosen.replace("__I__", found.group(1))
+        reached = (
+            receiver.replace("__I__", found.group(1))
+            if receiver
+            else f"{variable}[{found.group(1)}]"
+        )
         out.append(body[at:found.start()])
-        out.append(f"{chosen}({variable}[{found.group(1)}]{separator}")
+        out.append(f"{chosen}({reached}{separator}")
         at = found.end()
     out.append(body[at:])
     return "".join(out)
@@ -2362,7 +2784,7 @@ def _rewrite_indexed(body: str, pattern: str, function, variable: str) -> str:
         chosen = (
             function
             if isinstance(function, str)
-            else function(_call_arity(body, found.end() - 1))
+            else function(_call_arguments(body, found.end() - 1))
         )
         # A virtual call reads the table out of the element, so it needs the
         # index too - which is only known here, one match at a time.
@@ -2404,11 +2826,19 @@ def _closing_paren(text: str, opening: int) -> int:
 def _call_arity(body: str, opening: int) -> int:
     """How many arguments the call whose `(` is at `opening` passes."""
 
+    return len(_call_arguments(body, opening))
+
+
+def _call_arguments(body: str, opening: int) -> "list[str]":
+    """The arguments of the call whose `(` is at `opening`, as written."""
+
     close = _closing_paren(body, opening)
     if close < 0:
-        return 0
+        return []
     inside = body[opening + 1: close]
-    return 0 if not inside.strip() else len(_split_arguments(inside))
+    if not inside.strip():
+        return []
+    return [part.strip() for part in _split_arguments(inside)]
 
 
 def _rewrite_calls(body: str, pattern: str, function, receiver: str) -> str:
@@ -2433,7 +2863,7 @@ def _rewrite_calls(body: str, pattern: str, function, receiver: str) -> str:
         chosen = (
             function
             if isinstance(function, str)
-            else function(_call_arity(body, found.end() - 1))
+            else function(_call_arguments(body, found.end() - 1))
         )
         # A virtual call may need a different receiver from the direct one: it
         # dispatches on the whole object, where a direct call to an inherited
@@ -2448,12 +2878,20 @@ def _rewrite_calls(body: str, pattern: str, function, receiver: str) -> str:
     return "".join(out)
 
 
-def _name_for(owner: str, method: str, classes: "dict[str, Class]"):
-    """A name if that member is alone, otherwise a chooser keyed on arity."""
+def _name_for(
+    owner: str,
+    method: str,
+    classes: "dict[str, Class]",
+    text: str = "",
+    before: int = -1,
+):
+    """A name if that member is alone, otherwise a chooser reading the call."""
 
     if not _overloaded(owner, method, classes):
         return _c_name(owner, method)
-    return lambda arity: _c_name(owner, method, arity)
+    return lambda given: _c_name(
+        owner, method, _call_suffix(owner, method, classes, given, text, before)
+    )
 
 
 def _dispatch(
@@ -2471,8 +2909,8 @@ def _dispatch(
     slots = _virtual_slots(holds, classes)
     path = _vptr_path(holds, classes)
 
-    def chosen(arity: int) -> str:
-        key = (method, arity)
+    def chosen(given: "list[str]") -> str:
+        key = (method, len(given))
         if key not in slots:
             return ""
         declared = _slot_method(holds, key, classes)
@@ -2492,19 +2930,20 @@ def _dispatched(
     classes: "dict[str, Class]",
     receiver: str,
     static: str,
+    text: str = "",
 ):
     """`_dispatch` where it applies, otherwise the direct name."""
 
     virtual = _dispatch(holds, method, classes, receiver)
     if virtual is None:
-        return _name_for(static, method, classes)
-    direct = _name_for(static, method, classes)
+        return _name_for(static, method, classes, text)
+    direct = _name_for(static, method, classes, text)
 
-    def chosen(arity: int) -> str:
-        through = virtual(arity)
+    def chosen(given: "list[str]") -> str:
+        through = virtual(given)
         if through:
             return through
-        return direct if isinstance(direct, str) else direct(arity)
+        return direct if isinstance(direct, str) else direct(given)
 
     return chosen
 
@@ -2683,7 +3122,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
             return source
         if loose:
             text = _address_reference_arguments(text, _function_signatures(text))
-            text = _rewrite_functions(text, {})
+            text = _rewrite_functions(text, {}, None, text)
             if allocates:
                 # Asked before the rewriting, which is what turns `new` into
                 # the call to malloc: afterwards the word is gone.
@@ -2782,11 +3221,15 @@ def translate(source: str, filename: str = "<c++>") -> str:
     tables = _emit_vtables(order, classes)
     if tables:
         declarations += "\n" + tables
-    definitions = "\n".join(_emit_methods(classes[name], classes) for name in order)
+    definitions = "\n".join(
+        _emit_methods(classes[name], classes, remainder) for name in order
+    )
     remainder = _address_reference_arguments(
         remainder, _function_signatures(remainder)
     )
-    rewritten = _rewrite_functions(remainder, classes)
+    made = _file_scope_objects(remainder, classes)
+    remainder = _construct_before_main(remainder, made, classes)
+    rewritten = _rewrite_functions(remainder, classes, made, remainder)
     head = "\n".join(directives)
     if _WANTS_HEAP.search(text):
         # Only a file that allocates gets the allocator. `new` compiles to
@@ -2843,7 +3286,7 @@ def _emit_heap_helpers(found: "Class", classes: "dict[str, Class]") -> str:
             _parameter_name(part) for part in _split_arguments(constructor.parameters)
             if part.strip()
         )
-        ctor = _c_name(name, "", _named_arity(name, "", classes, arity))
+        ctor = _c_name(name, "", _suffix_of(name, constructor, classes))
         made.append(
             f"static struct {name} *{_c_name(name, 'new', suffix)}({parameters}) {{\n"
             f"    struct {name} *__p = (struct {name} *)malloc({size});\n"
@@ -2854,7 +3297,7 @@ def _emit_heap_helpers(found: "Class", classes: "dict[str, Class]") -> str:
         )
 
     # `new T[n]` needs the default constructor, which is what C++ says too.
-    default = _named_arity(name, "", classes, 0)
+    default = _call_suffix(name, "", classes, [])
     runs_ctor = any(_arity(m.parameters) == 0 for m in found.methods if m.name == "")
     construct = (
         f"    for (__i = 0; __i < __n; __i++) {_c_name(name, '', default)}(&__a[__i]);\n"
@@ -2931,7 +3374,7 @@ def _parameter_name(declaration: str) -> str:
     return found[-1] if found else ""
 
 
-def _rewrite_new(body: str, classes: "dict[str, Class]") -> str:
+def _rewrite_new(body: str, classes: "dict[str, Class]", scope: str = "") -> str:
     """`new T(a)` becomes `T__new(a)`; `new int[n]` becomes a malloc."""
 
     out: list[str] = []
@@ -2975,12 +3418,24 @@ def _rewrite_new(body: str, classes: "dict[str, Class]") -> str:
         if opener == "(":
             close = _closing_paren(body, found.end() - 1)
             arguments = body[found.end(): close]
-            arity = 0 if not arguments.strip() else len(_split_arguments(arguments))
-            chosen = arity if _has_several_constructors(type_name, classes) else None
+            given = (
+                [a.strip() for a in _split_arguments(arguments)]
+                if arguments.strip()
+                else []
+            )
+            chosen = (
+                _call_suffix(type_name, "", classes, given, scope)
+                if _has_several_constructors(type_name, classes)
+                else None
+            )
             out.append(f"{_c_name(type_name, 'new', chosen)}({arguments})")
             at = close + 1
         else:
-            chosen = 0 if _has_several_constructors(type_name, classes) else None
+            chosen = (
+                _call_suffix(type_name, "", classes, [])
+                if _has_several_constructors(type_name, classes)
+                else None
+            )
             out.append(f"{_c_name(type_name, 'new', chosen)}()")
             at = found.end() - (1 if opener else 0)
     out.append(body[at:])
@@ -3214,7 +3669,12 @@ _LOCAL_REFERENCE = re.compile(
 )
 
 
-def _rewrite_functions(text: str, classes: "dict[str, Class]") -> str:
+def _rewrite_functions(
+    text: str,
+    classes: "dict[str, Class]",
+    outer: "dict[str, str] | None" = None,
+    unit: str = "",
+) -> str:
     """Rewrite each function on its own, because a scope is not the file.
 
     Done to the whole remainder at once, a variable declared in one function
@@ -3246,13 +3706,17 @@ def _rewrite_functions(text: str, classes: "dict[str, Class]") -> str:
         if references:
             head = head[:opened + 1] + _references_to_pointers(head[opened + 1:])
         known, pointers = _parameters_of(head, classes)
+        # A file-scope object is in scope in every function, and nothing in
+        # the head says so.
+        for name, held in (outer or {}).items():
+            known.setdefault(name, held)
         for name, held in references.items():
             if held in classes:
                 known[name] = held
                 pointers.add(name)
         inner = _deref_references(text[opening:closing], references, classes)
         out.append(_rewrite_declarations(head, classes))
-        out.append(_rewrite_body(inner, classes, known, pointers))
+        out.append(_rewrite_body(inner, classes, known, pointers, unit=unit))
         at = closing
     out.append(_rewrite_declarations(text[at:], classes))
     return "".join(out)
@@ -3294,15 +3758,60 @@ def _depth_at(text: str, index: int) -> int:
 
 
 def _rewrite_declarations(text: str, classes: "dict[str, Class]") -> str:
-    """Outside any function: a class named as a type is all there is to do.
-
-    A file-scope object would want its constructor run before `main`, which C
-    has no place to put, so only the type is rewritten here - the typedef makes
-    the bare name legal and the object is left uninitialised, exactly as the
-    same declaration in C would be.
-    """
+    """Outside any function: a class named as a type is all there is to do."""
 
     return _rewrite_types(text, classes)
+
+
+#: `Counter shared;` written outside every function.
+_FILE_SCOPE_OBJECT = re.compile(
+    r"(?m)^[ \t]*([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*;"
+)
+
+
+def _file_scope_objects(
+    text: str, classes: "dict[str, Class]"
+) -> "dict[str, str]":
+    """Objects declared outside any function, and what class each holds.
+
+    Their methods are reachable from every function in the file, so every body
+    has to be rewritten knowing about them - without this, `shared.bump()` was
+    left as C++ and the compiler reported a struct with no such member.
+    """
+
+    found: dict[str, str] = {}
+    for match in _FILE_SCOPE_OBJECT.finditer(text):
+        if _depth_at(text, match.start()) != 0:
+            continue
+        if match.group(1) in classes:
+            found[match.group(2)] = match.group(1)
+    return found
+
+
+def _construct_before_main(text: str, made: "dict[str, str]", classes) -> str:
+    """Run each file-scope object's constructor at the top of `main`.
+
+    C++ builds them before `main` runs and C has no place to put that, so the
+    first thing `main` does is what C++ had already done. A program that
+    reaches one of them from another static initialiser would see the
+    difference; there is no such thing here, because C has no static
+    initialiser that can call anything.
+    """
+
+    calls = []
+    for variable, held in made.items():
+        owner = _find_method(held, "", classes)
+        if owner is None:
+            continue
+        calls.append(
+            f"{_c_name(owner, '', _call_suffix(owner, '', classes, []))}(&{variable});"
+        )
+    if not calls:
+        return text
+    entry = re.search(r"\bmain\s*\([^)]*\)\s*\{", text)
+    if entry is None:
+        return text
+    return text[:entry.end()] + " " + " ".join(calls) + text[entry.end():]
 
 def _with_typedefs(text: str, typedefs: str) -> str:
     """Put the typedefs after the last preprocessor line at the top."""
@@ -3375,8 +3884,84 @@ public:
 
 #: Angled includes py2bin answers itself. Anything else angled is left for the
 #: C preprocessor, which has py2bin's own C headers behind it.
+#: py2bin's own <vector>. A template, so it goes through the same expansion
+#: any other does and comes out as one concrete class per element type. It
+#: grows by doubling and copying; the old block is left where it is, because
+#: the heap under it is an arena that does not reclaim (see <stdlib.h>) and
+#: pretending otherwise would be the dishonest part, not the leak.
+_VECTOR_HEADER = r"""
+namespace std {
+template<typename T>
+class vector {
+public:
+    T *items;
+    unsigned long count;
+    unsigned long room;
+    vector() { items = 0; count = 0; room = 0; }
+    unsigned long size() { return count; }
+    int empty() { return count == 0; }
+    void clear() { count = 0; }
+    void reserve(unsigned long want) {
+        unsigned long i;
+        T *fresh;
+        if (want <= room) { return; }
+        fresh = new T[want];
+        i = 0;
+        while (i < count) { fresh[i] = items[i]; i = i + 1; }
+        items = fresh;
+        room = want;
+    }
+    void push_back(T value) {
+        if (count == room) {
+            if (room == 0) { reserve(8); } else { reserve(room * 2); }
+        }
+        items[count] = value;
+        count = count + 1;
+    }
+    void pop_back() { if (count > 0) { count = count - 1; } }
+    void resize(unsigned long want) {
+        reserve(want);
+        count = want;
+    }
+    T &at(unsigned long i) { return items[i]; }
+    T &operator[](unsigned long i) { return items[i]; }
+    T &back() { return items[count - 1]; }
+    T &front() { return items[0]; }
+    T *begin() { return items; }
+    T *end() { return items + count; }
+};
+}
+"""
+
+#: py2bin's own <iostream>. `cout` is an object with one `operator<<` per
+#: type it can print, which is how the real one is put together too; each
+#: hands the stream back so the next `<<` in the chain has something to be
+#: called on. The output goes through printf, which py2bin implements itself.
+_IOSTREAM_HEADER = r"""
+#include <stdio.h>
+namespace std {
+class ostream {
+public:
+    int __stream;
+    ostream() { __stream = 1; }
+    ostream &operator<<(int v) { printf("%d", v); return *this; }
+    ostream &operator<<(long v) { printf("%ld", v); return *this; }
+    ostream &operator<<(unsigned int v) { printf("%u", v); return *this; }
+    ostream &operator<<(unsigned long v) { printf("%lu", v); return *this; }
+    ostream &operator<<(double v) { printf("%g", v); return *this; }
+    ostream &operator<<(char v) { printf("%c", v); return *this; }
+    ostream &operator<<(const char *v) { printf("%s", v); return *this; }
+};
+ostream cout;
+ostream cerr;
+const char *endl = "\n";
+}
+"""
+
 _BUILTIN_CPP_HEADERS = {
     "string": _STRING_HEADER,
+    "vector": _VECTOR_HEADER,
+    "iostream": _IOSTREAM_HEADER,
     "cstdio": '#include <stdio.h>\n',
     "cstdlib": '#include <stdlib.h>\n',
     "cstring": '#include <string.h>\n',

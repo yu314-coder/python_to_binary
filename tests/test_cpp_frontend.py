@@ -145,7 +145,6 @@ class Refusals(unittest.TestCase):
     def test_each_is_named_rather_than_mistranslated(self) -> None:
         for source, expected in (
             ("int main(void){ throw 1; }", "exceptions"),
-            ("#include <iostream>\nint main(void){return 0;}", "standard library"),
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self._refused(source))
@@ -722,3 +721,96 @@ class Templates(unittest.TestCase):
                 "t.cpp",
             )
         self.assertIn("twice<type>", str(caught.exception))
+
+
+class OverloadsByType(unittest.TestCase):
+    """Where two overloads take the same number, the types decide.
+
+    The type of a literal is what it is written as; the type of a name is
+    read from where it was declared. Anything else is refused, because the
+    alternative is compiling the wrong one and running.
+    """
+
+    def test_the_same_count_is_told_apart_by_the_types(self) -> None:
+        out = translate(
+            "class L{public:int n;\n L(){n=0;}\n"
+            " int show(int v){return v;}\n"
+            " int show(const char *s){return s[0];}};\n"
+            'int main(void){ L l; return l.show(1) + l.show("a"); }',
+            "t.cpp",
+        )
+        self.assertIn("L__show__1__int(struct L *this, int v)", out)
+        self.assertIn("L__show__1__char_p(struct L *this, const char *s)", out)
+        self.assertIn("L__show__1__int(&l, 1)", out)
+        self.assertIn('L__show__1__char_p(&l, "a")', out)
+
+    def test_a_name_is_looked_up_where_it_was_declared(self) -> None:
+        out = translate(
+            "class L{public:int n;\n L(){n=0;}\n"
+            " int show(int v){return v;}\n"
+            " int show(double v){return (int)v;}};\n"
+            "int main(void){ L l; double d = 1.5; return l.show(d); }",
+            "t.cpp",
+        )
+        self.assertIn("L__show__1__double(&l, d)", out)
+
+    def test_one_it_cannot_choose_between_is_refused(self) -> None:
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "int pick(void);\n"
+                "class L{public:int n;\n L(){n=0;}\n"
+                " int show(int v){return v;}\n"
+                " int show(double v){return (int)v;}};\n"
+                "int main(void){ L l; return l.show(pick()); }",
+                "t.cpp",
+            )
+        self.assertIn("cannot tell which is meant", str(caught.exception))
+
+
+class FileScopeObjects(unittest.TestCase):
+    def test_a_global_object_is_in_scope_in_every_function(self) -> None:
+        out = translate(
+            "class C{public:int n;\n C(){n=0;}\n int bump(){n=n+1;return n;}};\n"
+            "C shared;\n"
+            "int use(void){ return shared.bump(); }\n"
+            "int main(void){ return use(); }",
+            "t.cpp",
+        )
+        self.assertIn("C__bump(&shared)", out)
+
+    def test_its_constructor_runs_before_anything_else(self) -> None:
+        """C++ builds them before `main`, and C has no place to put that.
+
+        The first thing `main` does is what C++ had already done, which is the
+        closest a translation to C can get without inventing a startup hook.
+        """
+
+        out = translate(
+            "class C{public:int n;\n C(){n=7;}};\nC shared;\n"
+            "int main(void){ return shared.n; }",
+            "t.cpp",
+        )
+        entry = out[out.index("int main"):]
+        self.assertIn("C__ctor(&shared);", entry.split("\n")[0])
+
+
+class Streams(unittest.TestCase):
+    def test_a_chain_becomes_one_call_around_another(self) -> None:
+        """`cout << a << b` is two calls, and the second is called on the first.
+
+        The generic operator rewriter wants a name on the left, and after the
+        first `<<` there is a call there instead - so the chain is read whole.
+        """
+
+        out = translate(
+            'class S{public:int f;\n S(){f=1;}\n S &operator<<(int v){return *this;}\n'
+            ' S &operator<<(const char *v){return *this;}};\n'
+            'S out;\nint main(void){ out << "a" << 2; return 0; }',
+            "t.cpp",
+        )
+        self.assertIn("S__op_shl__1__char_p(&out,", out)
+        self.assertIn("S__op_shl__1__int(", out)
+        # The inner call's result is the outer call's receiver: each `<<`
+        # hands the stream back as the address its reference became, so the
+        # next one takes it directly and nothing is dereferenced in between.
+        self.assertIn('S__op_shl__1__int(S__op_shl__1__char_p(&out, "a"), 2)', out)
