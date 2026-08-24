@@ -57,7 +57,7 @@ _REFUSED = (
     ("operator", "operator overloading"),
     ("throw", "exceptions"),
     ("catch", "exceptions"),
-    ("namespace", "namespaces"),
+
     ("new", "`new` - py2bin's C compiler has no malloc, so there is no heap"),
     ("delete", "`delete` - there is no heap to return an object to"),
 )
@@ -274,6 +274,119 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
         return Method("", "void", parameters, body, at)
     return Method(words[-1], " ".join(words[:-1]), parameters, body, at)
 
+
+
+#: `namespace N {` - and `namespace {`, which C++ calls anonymous.
+_NAMESPACE = re.compile(r"\bnamespace\s*([A-Za-z_]\w*)?\s*\{")
+#: `using namespace N;` - after flattening there is nothing left to bring in.
+_USING_NAMESPACE = re.compile(r"\busing\s+namespace\s+[A-Za-z_][\w:]*\s*;")
+#: `using N::thing;`, same reasoning.
+_USING_NAME = re.compile(r"\busing\s+[A-Za-z_][\w:]*\s*;")
+
+
+def _flatten_namespaces(text: str, filename: str) -> "tuple[str, set[str]]":
+    """Remove the namespace wrappers, and answer which names they were.
+
+    A namespace is scoping and nothing else, and py2bin compiles one
+    translation unit with no linker behind it - so flattening is the whole of
+    what a namespace means here. `N::thing` becomes `thing`, and
+    `using namespace N;` becomes nothing, because there is no longer anywhere
+    else for the name to be.
+
+    What flattening cannot survive is a collision: two namespaces that each
+    declare `helper` are two different functions in C++ and one name in C. So
+    the names each one declares are collected, and a clash is refused by name
+    rather than resolved by whichever came last.
+    """
+
+    known: set[str] = set()
+    declared: dict[str, str] = {}
+
+    while True:
+        found = _NAMESPACE.search(text)
+        if found is None:
+            break
+        name = found.group(1) or ""
+        opening = found.end() - 1
+        try:
+            closing = _matching(text, opening)
+        except ValueError:
+            raise CppTranslationError(
+                filename, _line_of(text, opening),
+                f"namespace {name or '<anonymous>'} is not closed",
+            ) from None
+        inner = text[opening + 1: closing - 1]
+        if name:
+            known.add(name)
+            # Not what a namespace nested inside this one declares: those
+            # names belong to that one, and counting them here made
+            # `namespace outer { namespace inner { class Deep ... } }` look
+            # like two namespaces declaring the same class.
+            for spelled in _declared_names(_without_nested(inner)):
+                if spelled in declared and declared[spelled] != name:
+                    raise CppTranslationError(
+                        filename, _line_of(text, opening),
+                        f"namespace {name} and namespace {declared[spelled]} "
+                        f"both declare {spelled!r}. py2bin compiles one "
+                        f"translation unit and has no linker, so a namespace "
+                        f"is flattened away - and two of the same name cannot "
+                        f"both survive that. Rename one",
+                    )
+                declared[spelled] = name
+        # The body takes the wrapper's place, keeping the newlines the braces
+        # sat on so nothing below shifts.
+        text = text[:found.start()] + inner + text[closing:]
+
+    text = _USING_NAMESPACE.sub("", text)
+    return text, known
+
+
+
+def _without_nested(body: str) -> str:
+    """The body with any namespace nested inside it blanked out."""
+
+    while True:
+        found = _NAMESPACE.search(body)
+        if found is None:
+            return body
+        opening = found.end() - 1
+        try:
+            closing = _matching(body, opening)
+        except ValueError:
+            return body
+        body = body[:found.start()] + " " * (closing - found.start()) + body[closing:]
+
+#: What counts as declaring a name at the top of a namespace body.
+_DECLARES = re.compile(
+    r"\b(?:class|struct)\s+([A-Za-z_]\w*)"
+    r"|\b[A-Za-z_][\w \t*]*?\b([A-Za-z_]\w*)\s*\([^)]*\)\s*[{;]"
+)
+
+
+def _declared_names(body: str) -> "set[str]":
+    """The classes and functions a namespace body declares, for clash checks."""
+
+    found = set()
+    for match in _DECLARES.finditer(_without_literals(body)):
+        spelled = match.group(1) or match.group(2)
+        if spelled and spelled not in _NOT_A_TYPE:
+            found.add(spelled)
+    return found
+
+
+def _strip_namespace_qualifiers(text: str, namespaces: "set[str]") -> str:
+    """`N::thing` becomes `thing`, and `Class::method` is left alone.
+
+    Only the names collected while flattening are stripped, because `::` also
+    spells an out-of-line member definition, and removing that would turn a
+    method into a free function of the same name.
+    """
+
+    for name in sorted(namespaces, key=len, reverse=True):
+        text = _map_code(
+            text, lambda part, n=name: re.sub(rf"\b{re.escape(n)}\s*::\s*", "", part)
+        )
+    return text
 
 def _refuse_unsupported(text: str, filename: str) -> None:
     """Name the C++ this does not do, before it becomes broken C.
@@ -963,6 +1076,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
     """
 
     text = _strip_comments(source)
+    # Before anything else reads the text: a class inside a namespace is a
+    # class, and every pass below looks for classes at the top level.
+    text, namespaces = _flatten_namespaces(text, filename)
+    text = _strip_namespace_qualifiers(text, namespaces)
     _refuse_unsupported(text, filename)
 
     classes: dict[str, Class] = {}
@@ -999,8 +1116,15 @@ def translate(source: str, filename: str = "<c++>") -> str:
         pieces.append((head.start(), end, ""))
 
     if not classes:
-        if not plain:
+        if not plain and not namespaces:
+            # Nothing C++ about this file at all: hand back what was written,
+            # comments and all, so a diagnostic points at the real text.
             return source
+        if not plain:
+            # Namespaces but no classes - flattened above, and that is the
+            # whole of the work. Returning `source` here threw it away, and
+            # the C compiler was handed `namespace u { ... }`.
+            return text
         # Nothing to translate, but the bare struct names still need to be
         # types: this file is C++ only in that respect.
         typedefs = "\n".join(f"typedef struct {name} {name};" for name in plain)

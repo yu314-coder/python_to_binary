@@ -205,9 +205,10 @@ py2bin cc main.cpp stack.cpp -o app
 
 Through: classes with members and methods, in the class or out of it,
 constructors and destructors, `this`, single non-virtual inheritance, and
-classes declared in a `.hpp`. Refused **by name**: templates, exceptions,
-`virtual`, operator overloading, `new`/`delete`, namespaces, references and the
-standard library. `new` is refused because the C compiler has no `malloc` -
+classes declared in a `.hpp`. Namespaces go through, flattened away - `N::thing` is `thing` - with two
+namespaces declaring the same name refused rather than silently merged.
+Refused **by name**: templates, exceptions, `virtual`, operator overloading,
+`new`/`delete`, references and the standard library. `new` is refused because the C compiler has no `malloc` -
 there is no heap to put an object on.
 
 It is a useful subset, not a C++ compiler. Code that uses `<vector>` will not

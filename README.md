@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,895 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,902 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -522,8 +522,15 @@ pointer to the derived object is a pointer to the base one and inherited
 members and methods resolve; classes declared in a `.hpp` and used from a
 `.cpp`.
 
+**Namespaces go through**, flattened away. py2bin compiles one translation
+unit and has no linker, so scoping is the whole of what a namespace can mean
+here: `N::thing` becomes `thing`, `using namespace N;` becomes nothing, and
+nested, anonymous and re-opened namespaces all work. What flattening cannot
+survive is two namespaces declaring the same name - that is refused by name
+rather than resolved by whichever came last.
+
 **What is refused, by name:** templates, exceptions, `virtual`, operator
-overloading, `new`/`delete`, multiple inheritance, namespaces, references, and
+overloading, `new`/`delete`, multiple inheritance, references, and
 the standard library. Each says which construct it was and on which line,
 because C++ mistranslated into C fails somewhere nobody wrote.
 
@@ -534,9 +541,9 @@ here - it is the shape of what is underneath.
 **How it is checked.** Reading the generated C tells you it is well formed
 and nothing about whether it *means* the same thing - so the corpus in
 `tools/cpp_corpus/` is built twice, once by py2bin and once by `clang++`, and
-the outputs compared. `tools/cpp_differential.sh` runs it. Ten programs found
-three bugs on the first run and eight in total, every one of which produced C
-that compiled cleanly and meant something else: a member called `n` rewrote
+the outputs compared. `tools/cpp_differential.sh` runs it, over 33 programs. Ten
+found three bugs on the first run and nine in total, every one of which
+produced C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
 member answered 200 where the answer is 105; a destructor in a nested block was
 emitted at the end of the function. clang++ is the yardstick there and never a

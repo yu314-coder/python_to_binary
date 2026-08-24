@@ -431,3 +431,89 @@ class AgainstARealCompiler(unittest.TestCase):
             "e.cpp",
         )
         self.assertIn("E__get(&e[i])", out)
+
+
+class Namespaces(unittest.TestCase):
+    """A namespace is scoping, and scoping is all it can be here.
+
+    py2bin compiles one translation unit and has no linker, so there is
+    nowhere for a second `helper` to live. Flattening is therefore the whole
+    of what a namespace means - `N::thing` is `thing`, and
+    `using namespace N;` is nothing at all - and the one thing flattening
+    cannot survive is two of the same name, which is refused rather than
+    resolved by whichever came last.
+    """
+
+    def test_a_namespace_is_removed_and_its_qualifier_with_it(self) -> None:
+        out = translate(
+            "namespace geom {\n"
+            " class Point { public: int x; Point(int a) { x = a; } int get() { return x; } };\n"
+            " int twice(int n) { return n * 2; }\n"
+            "}\n"
+            "int main(void) { geom::Point p(3); return p.get() + geom::twice(1); }\n",
+            "g.cpp",
+        )
+        self.assertNotIn("namespace", out)
+        self.assertNotIn("geom::", out)
+        self.assertIn("Point__get(&p)", out)
+
+    def test_a_class_inside_one_is_still_a_class(self) -> None:
+        # Every pass looks for classes at the top level, so the wrapper has to
+        # be gone before any of them runs.
+        out = translate(
+            "namespace n { class K { public: int v; K() { v = 1; } }; }\n"
+            "int main(void) { n::K k; return k.v; }\n",
+            "k.cpp",
+        )
+        self.assertIn("struct K {", out)
+        self.assertIn("K__ctor", out)
+
+    def test_using_namespace_becomes_nothing(self) -> None:
+        out = translate(
+            "namespace u { int f(void) { return 1; } }\n"
+            "using namespace u;\n"
+            "int main(void) { return f(); }\n",
+            "u.cpp",
+        )
+        self.assertNotIn("using", out)
+
+    def test_a_nested_namespace_owns_its_own_names(self) -> None:
+        """Counting them twice looked like two namespaces declaring one class."""
+
+        out = translate(
+            "namespace outer { namespace inner {\n"
+            " class D { public: int v; D() { v = 1; } };\n"
+            "} }\n"
+            "int main(void) { outer::inner::D d; return d.v; }\n",
+            "d.cpp",
+        )
+        self.assertIn("struct D {", out)
+
+    def test_an_anonymous_one_needs_no_name_to_flatten(self) -> None:
+        out = translate(
+            "namespace { class H { public: int v; H() { v = 5; } }; }\n"
+            "int main(void) { H h; return h.v; }\n",
+            "h.cpp",
+        )
+        self.assertIn("struct H {", out)
+
+    def test_two_namespaces_declaring_the_same_name_are_refused(self) -> None:
+        with self.assertRaisesRegex(CppTranslationError, "both declare"):
+            translate(
+                "namespace a { int helper(void) { return 1; } }\n"
+                "namespace b { int helper(void) { return 2; } }\n"
+                "int main(void) { return a::helper(); }\n",
+                "c.cpp",
+            )
+
+    def test_an_out_of_line_member_is_not_a_namespace_qualifier(self) -> None:
+        """`::` spells both, and stripping the wrong one loses the method."""
+
+        out = translate(
+            "namespace lib { class M { public: int v; M(); int get(); };\n"
+            " M::M() { v = 11; }\n int M::get() { return v; }\n}\n"
+            "int main(void) { lib::M m; return m.get(); }\n",
+            "m.cpp",
+        )
+        self.assertIn("static void M__ctor(struct M *this)", out)
+        self.assertIn("static int M__get(struct M *this)", out)
