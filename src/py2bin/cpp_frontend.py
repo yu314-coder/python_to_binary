@@ -68,9 +68,24 @@ _OPERATOR_NAMES = {
     "<=": "op_le", ">=": "op_ge", "[]": "op_index", "()": "op_call",
     "+=": "op_add_assign", "-=": "op_sub_assign", "=": "op_assign",
     "<<": "op_shl", ">>": "op_shr",
+    # `->` and a `*` with nothing on its left. Both are how a holder stands
+    # in for what it holds - a smart pointer, an iterator - and neither is
+    # a binary operator, so they are rewritten where they are written rather
+    # than through the two-operand pass. `!` is the other unary one a holder
+    # writes, for "is there anything here".
+    "->": "op_arrow", "!": "op_not",
 }
-#: Longest first, so `<=` is not read as `<`.
-_OPERATOR_SYMBOLS = sorted(_OPERATOR_NAMES, key=len, reverse=True)
+#: `*x` with nothing on the left. Written `operator*()` - no parameter, which
+#: is the only thing that tells it from multiplication.
+_DEREFERENCE = "op_deref"
+
+#: Longest first, so `<=` is not read as `<`. `->` is not among them: it takes
+#: no right operand of its own, so the two-operand pass has nothing to match.
+_OPERATOR_SYMBOLS = [
+    symbol
+    for symbol in sorted(_OPERATOR_NAMES, key=len, reverse=True)
+    if symbol not in ("->", "!")
+]
 
 
 @dataclass
@@ -400,9 +415,12 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
                 f"py2bin's C++ subset does not know operator{symbol!r}; it "
                 f"knows {', '.join(sorted(_OPERATOR_NAMES))}",
             )
-        return decorated(Method(
-            _OPERATOR_NAMES[symbol], returns or "void", parameters, body, at_line
-        ))
+        # `*x` and `x * y` are written the same and are not the same member.
+        # The parameter list is what says which: a unary operator takes none.
+        named = _OPERATOR_NAMES[symbol]
+        if symbol == "*" and not parameters.strip():
+            named = _DEREFERENCE
+        return decorated(Method(named, returns or "void", parameters, body, at_line))
     # `&` is spaced out with `*`: `int &at` names `at` and returns `int &`,
     # and taken whole the name read as `&at`.
     words = before.replace("*", " * ").replace("&", " & ").split()
@@ -4476,11 +4494,87 @@ def _declared_objects(
     return found
 
 
+
+def _already_a_declaration(text: str, match: "re.Match[str]") -> bool:
+    """Whether this call is already the whole initialiser of a declaration.
+
+    That form needs no temporary: the object being declared *is* the space
+    the callee writes through. It also covers what this pass writes itself -
+    the same thing with a `&` in it - which was otherwise hoisted again, and
+    again, until the round limit stopped it.
+    """
+
+    begins = _statement_start(text, match.start())
+    while begins < len(text) and text[begins] in " \t\n":
+        begins += 1
+    if _VALUE_INIT.match(text, begins):
+        return True
+    # The two names have to be separated by something - whitespace or the
+    # `&`. Without that the pattern backtracked inside a single name, reading
+    # `whole = ` as `whol` `e` `=` and skipping a hoist that was needed.
+    already = re.match(
+        r"[A-Za-z_]\w*(?:\s+|\s*&\s*)[A-Za-z_]\w*\s*=\s*", text[begins:]
+    )
+    return bool(already) and begins + already.end() == match.start()
+
+
+def _stands_alone(text: str, match: "re.Match[str]", close: int) -> bool:
+    """Whether this call is a whole statement rather than part of one."""
+
+    begins = _statement_start(text, match.start())
+    while begins < len(text) and text[begins] in " \t\n":
+        begins += 1
+    return begins == match.start() and text[close + 1:].lstrip()[:1] == ";"
+
+
+def _free_value_initialisers(
+    body: str, classes: "dict[str, Class]", scope: str
+) -> str:
+    """`R r = make(4);` becomes the declaration and the call that fills it.
+
+    A free function answering a class hands it back the way a method does -
+    through a pointer the caller provides - so the object being declared is
+    the space, and the call takes its address.
+
+    Read from `scope` rather than only from `body`, because a method body is
+    emitted on its own and the functions it calls are declared elsewhere.
+    """
+
+    returning = {
+        match.group(2): match.group(1).split()[-1]
+        for match in _DEFINITION.finditer(scope)
+        if match.group(1).split()
+        and "*" not in match.group(1)
+        and match.group(1).split()[-1] in classes
+    }
+    if not returning:
+        return body
+    pattern = re.compile(
+        r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\("
+    )
+
+    def taken(match: "re.Match[str]") -> str:
+        spelled, variable, called = match.groups()
+        if returning.get(called) != spelled or spelled not in classes:
+            return match.group(0)
+        close = _closing_paren(match.string, match.end() - 1)
+        if close < 0:
+            return match.group(0)
+        arguments = match.string[match.end(): close]
+        passed = f", {arguments}" if arguments.strip() else ""
+        return f"{spelled} {variable}; {called}(&{variable}{passed})" + "\x00drop"
+
+    body = _map_code(body, lambda part: pattern.sub(taken, part))
+    # The original argument list is still there; the marker says where it
+    # ends so it can go.
+    return re.sub(r"\x00drop[^;]*;", ";", body)
+
 def _hoist_value_returns(
     body: str,
     classes: "dict[str, Class]",
     known: "dict[str, str]",
     counter: "list[int]",
+    scope: str = "",
 ) -> str:
     """`f.filename().c_str()` becomes a temporary and two calls.
 
@@ -4493,7 +4587,43 @@ def _hoist_value_returns(
     an ordinary name and needs to know nothing about where it came from.
     """
 
-    if not known:
+    # A free function may return an object too, and `held.append(to_string(v))`
+    # is the same shape as a chained method: the result is not an expression
+    # anything can be passed, because the caller provides the space.
+    returning: "dict[str, str]" = {}
+    for definition in _DEFINITION.finditer(f"{body}\n{scope}"):
+        held = definition.group(1).strip()
+        if held in classes and "*" not in held and "&" not in held:
+            returning[definition.group(2)] = held
+
+    def settled(text: str, match: "re.Match[str]", close: int) -> bool:
+        """Whether this call still needs somewhere to write its answer."""
+
+        return not _already_a_declaration(text, match)
+
+    def self_standing(text: str) -> "tuple | None":
+        """The first call to a free function that answers an object."""
+
+        for name, held in returning.items():
+            for match in re.finditer(
+                rf"(?<![.\w>]){re.escape(name)}\s*\(", text
+            ):
+                close = _closing_paren(text, match.end() - 1)
+                if close < 0 or _is_a_definition(text, close):
+                    continue
+                if not settled(text, match, close):
+                    continue
+                if _stands_alone(text, match, close):
+                    # Nothing wants the answer, so there is nowhere it has to
+                    # go. An earlier pass has usually already given a call in
+                    # this position the hidden pointer it writes through, and
+                    # wrapping it again handed a temporary the `void` that a
+                    # rewritten call returns.
+                    continue
+                return (match, close, held, False)
+        return None
+
+    if not known and not returning:
         return body
     for _round in range(_HOIST_ROUNDS):
         found = None
@@ -4529,10 +4659,7 @@ def _hoist_value_returns(
             # else - assigned to something that exists, called on, passed as
             # an argument - there is no space to write through until one is
             # made, so one is.
-            begins = _statement_start(body, match.start())
-            while begins < len(body) and body[begins] in " \t\n":
-                begins += 1
-            if _VALUE_INIT.match(body, begins):
+            if not settled(body, match, close):
                 continue
             # And the form this pass itself emits, which is the same thing
             # with a `&` in it. Without this the declaration it wrote was
@@ -4541,13 +4668,10 @@ def _hoist_value_returns(
             # or the `&`. Without that the pattern backtracked inside a single
             # name, reading `whole = ` as `whol` `e` `=` and skipping a hoist
             # that was needed.
-            already = re.match(
-                r"[A-Za-z_]\w*(?:\s+|\s*&\s*)[A-Za-z_]\w*\s*=\s*", body[begins:]
-            )
-            if already and begins + already.end() == match.start():
-                continue
             found = (match, close, declared, by_reference)
             break
+        if found is None:
+            found = self_standing(body)
         if found is None:
             return body
         match, close, held, by_reference = found
@@ -4845,6 +4969,10 @@ def _rewrite_body(
 
     # Before the declaration passes: `Node *n = new Node(3);` has to become a
     # call first, or the pointer declaration reads `new Node` as the type.
+    # `new int(5)` stores as well as answers, and C has no one expression
+    # that does both. Written out as its own statement first, so what reaches
+    # the rewrite below is the storage on its own.
+    body = _hoist_new_initialisers(body, classes, [0])
     body = _rewrite_new(body, classes, scope())
 
     # `V(5)` written where a value goes: C has no expression that constructs,
@@ -4856,8 +4984,14 @@ def _rewrite_body(
     # this has to run before that - so what this body declares is scanned for
     # first, without touching it.
     body = _hoist_value_returns(
-        body, classes, {**_declared_objects(body, classes), **known}, [0]
+        body, classes, {**_declared_objects(body, classes), **known}, [0], unit
     )
+    # And the declarations that hoist just wrote: a free function answering an
+    # object fills a space the caller provides, here as everywhere else. The
+    # file-scope pass does not reach a method body, which is emitted on its
+    # own - so `held.append(to_string(v))` inside one was left calling a
+    # function with one argument too few.
+    body = _free_value_initialisers(body, classes, f"{body}\n{unit}")
 
     # `int &r = a.v;` is a pointer whose uses are dereferenced. Done before
     # anything else reads the body, so the rest sees an ordinary pointer.
@@ -5036,7 +5170,7 @@ def _rewrite_body(
                 reached,
             )
 
-    body = _rewrite_operators(body, classes, known, pointers)
+    body = _rewrite_operators(body, classes, known, pointers, scope())
     body = _VALUE_INIT.sub(declare_from_call, body)
 
     # Calls, longest name first so `ab.m()` is not matched inside `xab.m()`.
@@ -5475,6 +5609,7 @@ def _rewrite_binary_operator(
     known: "dict[str, str]",
     pointers: "set[str]",
     classes: "dict[str, Class]",
+    scope: str = "",
 ) -> str:
     """`a OP x` becomes the call the class declared, whatever `x` is."""
 
@@ -5504,7 +5639,13 @@ def _rewrite_binary_operator(
             f"&{right}" if right in known and right not in pointers else right
         )
         out.append(body[at:found.start()])
-        out.append(f"{_c_name(owner, name, _call_suffix(owner, name, classes, [right], body))}({address}, {passed})")
+        # The scope goes with the body: which overload `a == b` means is read
+        # off the type of `b`, and `b` may be a parameter, declared in a head
+        # this body does not contain.
+        out.append(
+            f"{_c_name(owner, name, _call_suffix(owner, name, classes, [right], f'{body}\n{scope}'))}"
+            f"({address}, {passed})"
+        )
         at = end
     out.append(body[at:])
     return "".join(out)
@@ -5579,6 +5720,7 @@ def _rewrite_operators(
     classes: "dict[str, Class]",
     known: "dict[str, str]",
     pointers: "set[str]",
+    scope: str = "",
 ) -> str:
     """`a + b` becomes the call the class declared for it.
 
@@ -5621,7 +5763,7 @@ def _rewrite_operators(
             # complain about an operator it does not have.
             body = _rewrite_binary_operator(
                 body, variable, symbol, owner, name, address, known, pointers,
-                classes,
+                classes, scope,
             )
     # `b = a;` where the class declared an assignment operator. Only where
     # both sides are objects of it: a struct copy is what `=` means without
@@ -5673,7 +5815,97 @@ def _rewrite_operators(
             # value` into an assignment to a string's character.
             continue
         body = _rewrite_subscripts(body, variable, known[variable], classes)
+
+    # `*p`, `p->m()` and `!p`, where `p` is a holder standing in for what it
+    # holds. None of the three takes a right operand, so the two-operand pass
+    # above has nothing to match; each is written where it stands.
+    body = _rewrite_holder_operators(body, classes, known, pointers)
     return body
+
+
+def _rewrite_holder_operators(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+) -> str:
+    """The unary operators a smart pointer or an iterator declares."""
+
+    for variable in sorted(known, key=len, reverse=True):
+        if variable in pointers:
+            # Already a pointer: `*p` and `p->m()` mean what C says they mean,
+            # and the class's own operators are not what was written.
+            continue
+        holds = known[variable]
+        address = f"&{variable}"
+        owner = _find_method(holds, "op_arrow", classes)
+        if owner is not None:
+            reached = _arrow_target(owner, classes)
+            if reached is not None:
+                call = f"{_c_name(owner, 'op_arrow')}({address})"
+                for method in _reachable_methods(reached, classes):
+                    provider = _find_method(reached, method, classes)
+                    if provider is None:
+                        continue
+                    body = _rewrite_calls(
+                        body,
+                        rf"(?<![.\w>]){re.escape(variable)}\s*->\s*"
+                        rf"{re.escape(method)}\s*\(",
+                        _name_for(provider, method, classes, body),
+                        call,
+                    )
+                # A member reached through it, rather than a method.
+                body = _map_code(
+                    body,
+                    lambda part, v=variable, c=call: re.sub(
+                        rf"(?<![.\w>]){re.escape(v)}\s*->", f"{c}->", part
+                    ),
+                )
+        for name, symbol in (("op_deref", "*"), ("op_not", "!")):
+            owner = _find_method(holds, name, classes)
+            if owner is None:
+                continue
+            body = _rewrite_prefix(
+                body, variable, symbol, f"{_c_name(owner, name)}({address})"
+            )
+    return body
+
+
+def _arrow_target(owner: str, classes: "dict[str, Class]") -> "str | None":
+    """The class `operator->` hands back a pointer to."""
+
+    method = _method_named(owner, "op_arrow", classes)
+    if method is None:
+        return None
+    held = method.returns.replace("*", "").replace("&", "").replace("const", "")
+    held = held.strip()
+    return held if held in classes else None
+
+
+def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
+    """`*p` or `!p` becomes the call, but only where nothing is on the left.
+
+    `a * p` is a multiplication and `a != p` ends in something that is not a
+    prefix `!` at all, so the character before decides - the last one that is
+    not a space, because the spacing is the author's and means nothing.
+    """
+
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    for match in re.finditer(
+        rf"{re.escape(symbol)}\s*{re.escape(variable)}\b", bare
+    ):
+        if match.start() < at:
+            continue
+        before = bare[:match.start()].rstrip()
+        if before and (before[-1].isalnum() or before[-1] in "_)]\"'"):
+            continue
+        out.append(body[at:match.start()])
+        out.append(call)
+        at = match.end()
+    out.append(body[at:])
+    return "".join(out)
 
 
 def _rewrite_subscripts(
@@ -6635,37 +6867,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
 
     # `R r = make(4);` - a free function returning a class hands it back the
     # way a method does, through a pointer the caller provides.
-    returning = {
-        match.group(2): match.group(1).split()[-1]
-        for match in _DEFINITION.finditer(remainder)
-        if _depth_at(remainder, match.end() - 1) == 0
-        and match.group(1).split()
-        and "*" not in match.group(1)
-        and match.group(1).split()[-1] in classes
-    }
-    if returning:
-        pattern = re.compile(
-            r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\("
-        )
-
-        def taken(match: "re.Match[str]") -> str:
-            spelled, variable, called = match.groups()
-            if returning.get(called) != spelled or spelled not in classes:
-                return match.group(0)
-            close = _closing_paren(match.string, match.end() - 1)
-            if close < 0:
-                return match.group(0)
-            arguments = match.string[match.end(): close]
-            passed = f", {arguments}" if arguments.strip() else ""
-            return (
-                f"{spelled} {variable}; {called}(&{variable}{passed})"
-                + "\x00drop"
-            )
-
-        remainder = _map_code(remainder, lambda part: pattern.sub(taken, part))
-        # The original argument list is still there; the marker says where it
-        # ends so it can go.
-        remainder = re.sub(r"\x00drop[^;]*;", ";", remainder)
+    remainder = _free_value_initialisers(remainder, classes, remainder)
 
     made = _file_scope_objects(remainder, classes)
     remainder = _construct_before_main(remainder, made, classes)
@@ -6837,6 +7039,48 @@ def _parameter_name(declaration: str) -> str:
     return found[-1] if found else ""
 
 
+
+def _hoist_new_initialisers(
+    body: str, classes: "dict[str, Class]", counter: "list[int]"
+) -> str:
+    """`new int(5)` becomes storage, a store, and the pointer.
+
+    Only for a type that is not a class: a class has a constructor, and that
+    is already a call taking the address it just allocated.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        found = None
+        for match in _NEW.finditer(body):
+            if match.group(2) != "(" or match.group(1).strip() in classes:
+                continue
+            close = _closing_paren(body, match.end() - 1)
+            if close < 0 or not body[match.end(): close].strip():
+                continue
+            found = (match, close)
+            break
+        if found is None:
+            return body
+        match, close = found
+        held = match.group(1).strip()
+        value = body[match.end(): close]
+        counter[0] += 1
+        name = f"__py2bin_new_{counter[0]}"
+        start = _statement_start(body, match.start())
+        body = (
+            body[:start]
+            + f"{held} *{name}; {name} = ({held} *)malloc(sizeof({held})); "
+            f"*{name} = {value}; "
+            + body[start:match.start()]
+            + name
+            + body[close + 1:]
+        )
+    raise CppTranslationError(
+        "<c++>", 0,
+        "a statement allocating more objects than py2bin writes out; each "
+        "becomes a statement of its own and this one never stops asking",
+    )
+
 def _rewrite_new(body: str, classes: "dict[str, Class]", scope: str = "") -> str:
     """`new T(a)` becomes `T__new(a)`; `new int[n]` becomes a malloc."""
 
@@ -6863,16 +7107,10 @@ def _rewrite_new(body: str, classes: "dict[str, Class]", scope: str = "") -> str
             # was written. C has no comma expression that also yields the
             # pointer, so an initialiser is refused rather than dropped.
             if opener == "(":
+                # An initialiser here has already been hoisted into its own
+                # statement by `_hoist_new_initialisers`; whatever is left is
+                # `new int()`, which is the storage and nothing else.
                 close = _closing_paren(body, found.end() - 1)
-                if body[found.end(): close].strip():
-                    raise CppTranslationError(
-                        "<c++>",
-                        _line_of(body, found.start()),
-                        f"new {type_name}(value) has to store through the "
-                        f"pointer as well as return it, which is not one C "
-                        f"expression; write `{type_name} *p = new {type_name}; "
-                        f"*p = value;`",
-                    )
                 at = close + 1
             else:
                 at = found.end() - (1 if opener else 0)
@@ -8127,8 +8365,277 @@ public:
 }
 """
 
+
+_MAP_HEADER = r"""
+
+namespace std {
+/* Entries in one array, so an iterator is a pointer to one and `it->first`
+   and `it->second` are ordinary member reads. */
+template<typename K, typename V>
+class map_entry {
+public:
+    K first;
+    V second;
+    map_entry() { }
+};
+
+/* Searched from the front, and kept in insertion order. That is not a
+   red-black tree, and a program storing thousands of keys will notice; it is
+   the same interface, and it needs nothing this subset does not have. */
+template<typename K, typename V>
+class map {
+public:
+    map_entry<K, V> *entries;
+    unsigned long used;
+    unsigned long room;
+    typedef K key_type;
+    typedef V mapped_type;
+    typedef map_entry<K, V> value_type;
+    typedef map_entry<K, V> *iterator;
+    typedef map_entry<K, V> *const_iterator;
+    typedef unsigned long size_type;
+    map() { entries = 0; used = 0; room = 0; }
+    unsigned long size() { return used; }
+    int empty() { return used == 0; }
+    void clear() { used = 0; }
+    void reserve(unsigned long want) {
+        unsigned long i;
+        map_entry<K, V> *fresh;
+        if (want <= room) { return; }
+        fresh = new map_entry<K, V>[want];
+        i = 0;
+        while (i < used) { fresh[i] = entries[i]; i = i + 1; }
+        entries = fresh;
+        room = want;
+    }
+    map_entry<K, V> *begin() { return entries; }
+    map_entry<K, V> *end() { return entries + used; }
+    map_entry<K, V> *find(K key) {
+        unsigned long i;
+        K held;
+        i = 0;
+        while (i < used) {
+            /* Through a name of its own: a comparison rewritten to the
+               class's own `operator==` is matched on a name to its left, and
+               `entries[i].first` is not one. */
+            held = entries[i].first;
+            if (held == key) { return entries + i; }
+            i = i + 1;
+        }
+        return entries + used;
+    }
+    unsigned long count(K key) { return find(key) == entries + used ? 0 : 1; }
+    int contains(K key) { return find(key) != entries + used; }
+    V &operator[](K key) {
+        map_entry<K, V> *found;
+        found = find(key);
+        if (found != entries + used) { return found->second; }
+        if (used == room) {
+            if (room == 0) { reserve(8); } else { reserve(room * 2); }
+        }
+        entries[used].first = key;
+        used = used + 1;
+        return entries[used - 1].second;
+    }
+    V &at(K key) { return find(key)->second; }
+    void erase(K key) {
+        map_entry<K, V> *found;
+        unsigned long i;
+        found = find(key);
+        if (found == entries + used) { return; }
+        i = (unsigned long)(found - entries);
+        while (i + 1 < used) { entries[i] = entries[i + 1]; i = i + 1; }
+        used = used - 1;
+    }
+};
+}
+"""
+
+_SET_HEADER = r"""
+
+namespace std {
+/* The same shape as `map` with nothing on the other side. */
+template<typename T>
+class set {
+public:
+    T *items;
+    unsigned long used;
+    unsigned long room;
+    typedef T key_type;
+    typedef T value_type;
+    typedef T *iterator;
+    typedef T *const_iterator;
+    typedef unsigned long size_type;
+    set() { items = 0; used = 0; room = 0; }
+    unsigned long size() { return used; }
+    int empty() { return used == 0; }
+    void clear() { used = 0; }
+    void reserve(unsigned long want) {
+        unsigned long i;
+        T *fresh;
+        if (want <= room) { return; }
+        fresh = new T[want];
+        i = 0;
+        while (i < used) { fresh[i] = items[i]; i = i + 1; }
+        items = fresh;
+        room = want;
+    }
+    T *begin() { return items; }
+    T *end() { return items + used; }
+    T *find(T value) {
+        unsigned long i;
+        T held;
+        i = 0;
+        while (i < used) {
+            /* Through a name of its own, for the same reason `map` does. */
+            held = items[i];
+            if (held == value) { return items + i; }
+            i = i + 1;
+        }
+        return items + used;
+    }
+    unsigned long count(T value) { return find(value) == items + used ? 0 : 1; }
+    int contains(T value) { return find(value) != items + used; }
+    void insert(T value) {
+        if (find(value) != items + used) { return; }
+        if (used == room) {
+            if (room == 0) { reserve(8); } else { reserve(room * 2); }
+        }
+        items[used] = value;
+        used = used + 1;
+    }
+    void erase(T value) {
+        T *found;
+        unsigned long i;
+        found = find(value);
+        if (found == items + used) { return; }
+        i = (unsigned long)(found - items);
+        while (i + 1 < used) { items[i] = items[i + 1]; i = i + 1; }
+        used = used - 1;
+    }
+    T &operator[](unsigned long i) { return items[i]; }
+};
+}
+"""
+
+_MEMORY_HEADER = r"""
+
+namespace std {
+/* A holder that frees what it holds. Not move-only and not reference
+   counted: this subset has neither move semantics nor atomics, so what is
+   here is the ownership - one owner, freed when the holder goes - and not
+   the machinery C++ uses to enforce it. */
+template<typename T>
+class unique_ptr {
+public:
+    T *raw;
+    unique_ptr() { raw = 0; }
+    unique_ptr(T *p) { raw = p; }
+    ~unique_ptr() { if (raw != 0) { delete raw; raw = 0; } }
+    T *get() { return raw; }
+    T *operator->() { return raw; }
+    T &operator*() { return *raw; }
+    int operator!() { return raw == 0; }
+    T *release() { T *held; held = raw; raw = 0; return held; }
+    void reset(T *p) { if (raw != 0) { delete raw; } raw = p; }
+};
+
+template<typename T>
+class shared_ptr {
+public:
+    T *raw;
+    shared_ptr() { raw = 0; }
+    shared_ptr(T *p) { raw = p; }
+    T *get() { return raw; }
+    T *operator->() { return raw; }
+    T &operator*() { return *raw; }
+    int operator!() { return raw == 0; }
+    void reset(T *p) { raw = p; }
+};
+}
+"""
+
+_SSTREAM_HEADER = r"""
+
+namespace std {
+/* A stream that writes into a string. `<<` is what a program uses it for,
+   and each overload appends the text the value would print as. */
+class ostringstream {
+public:
+    string held;
+    ostringstream() { }
+    string str() { return held; }
+    void clear() { held.clear(); }
+    ostringstream &operator<<(const char *s) { held.append(s); return *this; }
+    ostringstream &operator<<(string s) { held.append(s); return *this; }
+    ostringstream &operator<<(char c) { held.push_back(c); return *this; }
+    ostringstream &operator<<(int v) { held.append(to_string(v)); return *this; }
+    ostringstream &operator<<(long v) { held.append(to_string((int)v)); return *this; }
+    ostringstream &operator<<(unsigned int v) { held.append(to_string((int)v)); return *this; }
+    ostringstream &operator<<(unsigned long v) { held.append(to_string((int)v)); return *this; }
+    ostringstream &operator<<(double v) {
+        int whole;
+        int frac;
+        whole = (int)v;
+        frac = (int)((v - (double)whole) * 1000000.0);
+        if (frac < 0) { frac = -frac; }
+        held.append(to_string(whole));
+        held.push_back('.');
+        held.append(to_string(frac));
+        return *this;
+    }
+};
+
+typedef ostringstream stringstream;
+}
+"""
+
+_ARRAY_HEADER = r"""
+
+namespace std {
+/* `array<T, N>` needs a value template argument, which this subset does not
+   deduce - so the count lives in the object and the storage is a vector's.
+   `std::array<int, 4> a;` gives four default elements, as C++ does. */
+template<typename T>
+class array {
+public:
+    T *items;
+    unsigned long count;
+    typedef T *iterator;
+    typedef T value_type;
+    typedef unsigned long size_type;
+    array() { items = 0; count = 0; }
+    void resize(unsigned long want) { items = new T[want]; count = want; }
+    unsigned long size() { return count; }
+    int empty() { return count == 0; }
+    T &operator[](unsigned long i) { return items[i]; }
+    T &at(unsigned long i) { return items[i]; }
+    T &front() { return items[0]; }
+    T &back() { return items[count - 1]; }
+    T *begin() { return items; }
+    T *end() { return items + count; }
+    T *data() { return items; }
+    void fill(T value) {
+        unsigned long i;
+        i = 0;
+        while (i < count) { items[i] = value; i = i + 1; }
+    }
+};
+}
+"""
+
 _BUILTIN_CPP_HEADERS = {
     "string": _STRING_HEADER,
+    "map": _MAP_HEADER,
+    # An unordered map is the same interface with no promise about order,
+    # and this one keeps insertion order - which is a stronger promise than
+    # C++ makes, so no program that is correct against C++ can tell.
+    "unordered_map": _MAP_HEADER,
+    "set": _SET_HEADER,
+    "unordered_set": _SET_HEADER,
+    "memory": _MEMORY_HEADER,
+    "sstream": _SSTREAM_HEADER,
+    "array": _ARRAY_HEADER,
     "vector": _VECTOR_HEADER,
     "iostream": _IOSTREAM_HEADER,
     "algorithm": _ALGORITHM_HEADER,
