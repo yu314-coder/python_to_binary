@@ -462,6 +462,16 @@ every inlining of that body names the same one — and the initial value is
 written with the file-scope objects, because a store where the declaration
 stands would run again on every call.
 
+**`printf` is compiled, not called.** The format is read at compile time and
+the formatting code is emitted for it, which is why there is no C library
+underneath. It writes `%d %i %u %x %X %o %c %s %f %F %e %E %g %G` with the
+`h`/`hh`/`l`/`ll`/`z` length modifiers, a precision on the floating ones, and
+the `-`, `+`, space and `0` flags with a field width — `%5d`, `%-8s`,
+`%08.2f`, `%+d` all pad exactly as C says, including putting the zeros of a
+zero-padded field after the sign rather than before it. A width given as `*`
+is refused with the reason: it comes from an argument, and the format is read
+before there are any.
+
 **Bitfields** are laid out, read and written: `unsigned int flags : 3;` packs
 into a storage unit of its declared type and the next field continues in the
 same unit while it fits, which is what every ABI py2bin targets does. A read

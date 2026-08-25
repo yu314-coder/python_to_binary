@@ -1154,10 +1154,25 @@ int main(void) {
             stdout="1.500000 1.500000\n2\n",
         )
 
+    def test_a_field_width_pads_a_floating_conversion(self):
+        self.run_c(
+            'int main(void) { printf("[%8.2f][%-8.2f][%08.2f][%+.1f]",'
+            ' 3.14159, 3.14159, 3.14159, 2.5); return 0; }\n',
+            stdout="[    3.14][3.14    ][00003.14][+2.5]",
+        )
+
     def test_what_printf_still_refuses(self):
         self.reject(
-            'int main(void) { printf("%5.2f", 1.0); return 0; }\n',
-            "flags and field widths",
+            'int main(void) { printf("%*d", 5, 1); return 0; }\n',
+            "given as '*'",
+        )
+        self.reject(
+            'int main(void) { printf("%#x", 255u); return 0; }\n',
+            "'#' flag",
+        )
+        self.reject(
+            'int main(void) { printf("%300d", 1); return 0; }\n',
+            "beyond the 120",
         )
         self.reject(
             'int main(void) { printf("%.200f", 1.0); return 0; }\n',
@@ -1406,14 +1421,41 @@ int main(void) {
                 ]
                 self.assertTrue(written, "no runtime write was emitted")
 
+    def test_a_field_width_pads_an_integer_conversion(self):
+        self.run_c(
+            _STDIO + 'int main(void) { printf("[%5d][%-5d][%05d][%+d][% d]",'
+            ' 42, 42, 42, 42, 42); return 0; }\n',
+            stdout="[   42][42   ][00042][+42][ 42]",
+        )
+
+    def test_a_field_width_pads_a_negative_number_after_its_sign(self):
+        self.run_c(
+            _STDIO + 'int main(void) { printf("[%5d][%-5d][%05d]",'
+            ' -42, -42, -42); return 0; }\n',
+            stdout="[  -42][-42  ][-0042]",
+        )
+
+    def test_a_field_width_pads_strings_and_characters(self):
+        self.run_c(
+            _STDIO + 'int main(void) { printf("[%8s][%-8s][%3c][%08x]",'
+            ' "hi", "hi", \'x\', 255u); return 0; }\n',
+            stdout="[      hi][hi      ][  x][000000ff]",
+        )
+
+    def test_a_field_narrower_than_the_number_does_not_truncate_it(self):
+        self.run_c(
+            _STDIO + 'int main(void) { printf("[%3d]", 12345); return 0; }\n',
+            stdout="[12345]",
+        )
+
     def test_unimplemented_conversions_are_named_not_guessed(self):
         self.reject(
             _STDIO + 'int main(void) { printf("%a\\n", 1.0); return 0; }\n',
             "is not implemented",
         )
         self.reject(
-            _STDIO + 'int main(void) { printf("%5d\\n", 1); return 0; }\n',
-            "field widths are not implemented",
+            _STDIO + 'int main(void) { printf("%#o\\n", 1); return 0; }\n',
+            "is not implemented",
         )
         self.reject(
             _STDIO + 'int main(void) { printf("%d %d\\n", 1); return 0; }\n',

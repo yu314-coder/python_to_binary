@@ -3050,6 +3050,10 @@ _FLOAT_CONVERSIONS = frozenset({"f", "F", "e", "E", "g", "G"})
 #: needs in %f, with the sign and the point, inside _TEXT_BYTES.
 _MAXIMUM_PRECISION = 120
 
+#: The widest field printf will pad to. The formatter builds its answer in a
+#: fixed frame buffer, and a width past that would write off the end of it.
+_MAXIMUM_FIELD = 120
+
 #: Bytes of frame the floating formatter needs. The digit array holds the EXACT
 #: decimal expansion of a double: 767 digits for the smallest subnormal (its
 #: mantissa times 5**1074), plus one the final rounding carry can add.
@@ -5540,9 +5544,14 @@ class Lowerer:
 
     # --- printf ---
 
+    #: Where a conversion is built. Wide enough for the longest number plus
+    #: the widest field a program may pad it to, because the padding is
+    #: written into the same buffer, in front of what it pads.
+    _BUFFER_BYTES = 32 + _MAXIMUM_FIELD
+
     def print_buffer(self) -> int:
         if self.buffer_slot is None:
-            self.buffer_slot = self.allocate(32)
+            self.buffer_slot = self.allocate(self._BUFFER_BYTES)
         return self.buffer_slot
 
     def printf(self, node: Call) -> None:
@@ -5569,15 +5578,15 @@ class Lowerer:
         # each result in a slot, then emit the output.
         prepared: list[object] = []
         for position, argument in enumerate(arguments):
-            style, ctype, precision = segments[
+            style, ctype, precision, flags, width = segments[
                 [i for i, (kind, _) in enumerate(segments) if kind != "text"][position]
             ][1]
             value = self.rvalue(argument)
-            prepared.append((style, ctype, precision, value, argument))
+            prepared.append((style, ctype, precision, value, argument, flags, width))
         held: list[object] = []
-        for style, ctype, precision, value, argument in prepared:
+        for style, ctype, precision, value, argument, flags, width in prepared:
             if style == "string":
-                held.append((style, precision, value, argument))
+                held.append((style, precision, value, argument, flags, width))
                 continue
             if style in _FLOAT_CONVERSIONS:
                 if not is_floating(value.ctype):
@@ -5592,7 +5601,14 @@ class Lowerer:
                 # reason the integer path pins its value: a later argument must
                 # not be able to change what this one formats.
                 held.append(
-                    (style, precision, self.materialize_float(value.expr), argument)
+                    (
+                        style,
+                        precision,
+                        self.materialize_float(value.expr),
+                        argument,
+                        flags,
+                        width,
+                    )
                 )
                 continue
             if not is_integer(value.ctype):
@@ -5603,7 +5619,14 @@ class Lowerer:
             # materialize() pins the value in a slot, so evaluating a later
             # argument cannot change what this one reads.
             held.append(
-                (style, precision, self.materialize(self.fit(value.expr, ctype)), argument)
+                (
+                    style,
+                    precision,
+                    self.materialize(self.fit(value.expr, ctype)),
+                    argument,
+                    flags,
+                    width,
+                )
             )
 
         index = 0
@@ -5611,10 +5634,10 @@ class Lowerer:
             if kind == "text":
                 self.emit(Write(payload))
                 continue
-            style, precision, value, argument = held[index]
+            style, precision, value, argument, flags, width = held[index]
             index += 1
             if style in _FLOAT_CONVERSIONS:
-                self.emit_floating(value, style, precision)
+                self.emit_floating(value, style, precision, flags, width)
                 continue
             if style == "string":
                 if value.null or not isinstance(value.ctype, PointerType):
@@ -5627,18 +5650,25 @@ class Lowerer:
                         f"{value.ctype}",
                         argument.token,
                     )
-                self.emit_string(value.expr)
+                self.emit_string(value.expr, flags, width)
                 continue
             expression = value
             if style == "char":
-                self.emit_character(expression)
+                self.emit_character(expression, flags, width)
             elif style == "signed":
-                self.emit_number(expression, signed=True, base=10, upper=False)
+                self.emit_number(
+                    expression, signed=True, base=10, upper=False,
+                    flags=flags, width=width,
+                )
             elif style == "unsigned":
-                self.emit_number(expression, signed=False, base=10, upper=False)
+                self.emit_number(
+                    expression, signed=False, base=10, upper=False,
+                    flags=flags, width=width,
+                )
             else:
                 self.emit_number(
-                    expression, signed=False, base=16, upper=style == "HEX"
+                    expression, signed=False, base=16, upper=style == "HEX",
+                    flags=flags, width=width,
                 )
 
     def parse_format(self, literal: StringLiteral) -> list[tuple[str, object]]:
@@ -5657,12 +5687,32 @@ class Lowerer:
                 text.append(0x25)
                 position += 1
                 continue
-            if position < len(data) and (
-                chr(data[position]) in "-+ #" or chr(data[position]).isdigit()
-            ):
+            flags = ""
+            while position < len(data) and chr(data[position]) in "-+ #0":
+                flags += chr(data[position])
+                position += 1
+            width = 0
+            if position < len(data) and chr(data[position]) == "*":
                 self.error(
-                    "printf flags and field widths are not implemented; py2bin "
-                    "emits the formatting itself and pads nothing",
+                    "a field width given as '*' is not implemented; py2bin "
+                    "reads the format at compile time, and a width taken from "
+                    "an argument is not known then. Write the number",
+                    literal.token,
+                )
+            while position < len(data) and chr(data[position]).isdigit():
+                width = width * 10 + (data[position] - 48)
+                position += 1
+            if width > _MAXIMUM_FIELD:
+                self.error(
+                    f"a field width of {width} is beyond the {_MAXIMUM_FIELD} "
+                    f"py2bin implements; the formatter pads inside a fixed "
+                    f"frame buffer",
+                    literal.token,
+                )
+            if "#" in flags:
+                self.error(
+                    "the '#' flag is not implemented; py2bin emits the "
+                    "formatting itself and writes no 0x or 0 prefix",
                     literal.token,
                 )
             precision: int | None = None
@@ -5708,7 +5758,9 @@ class Lowerer:
                 if text:
                     segments.append(("text", bytes(text)))
                     text.clear()
-                segments.append(("conversion", (specifier, DOUBLE, precision)))
+                segments.append(
+                    ("conversion", (specifier, DOUBLE, precision, flags, width))
+                )
                 continue
             if specifier not in _CONVERSIONS:
                 self.error(
@@ -5745,7 +5797,7 @@ class Lowerer:
             if text:
                 segments.append(("text", bytes(text)))
                 text.clear()
-            segments.append(("conversion", (style, ctype, None)))
+            segments.append(("conversion", (style, ctype, None, flags, width)))
         if text:
             segments.append(("text", bytes(text)))
         return segments
@@ -5757,6 +5809,13 @@ class Lowerer:
     _FLOAT_SCRATCH = (
         "argument",
         "mode",
+        # The field a conversion is padded to, and how: 0 pads with spaces on
+        # the left, 1 with spaces on the right, 2 with zeros after the sign.
+        # `positive` is the character a `+` or a space flag asks for in front
+        # of a number that has no sign of its own, or 0 for neither.
+        "field",
+        "align",
+        "positive",
         "given",
         "figures_asked",
         "upper",
@@ -5806,7 +5865,12 @@ class Lowerer:
         return self.digit_slot, self.text_slot, self.float_scratch
 
     def emit_floating(
-        self, value: FloatExpression, style: str, precision: int
+        self,
+        value: FloatExpression,
+        style: str,
+        precision: int,
+        flags: str = "",
+        width: int = 0,
     ) -> None:
         """Format one double for %f/%e/%g and write it.
 
@@ -5828,6 +5892,19 @@ class Lowerer:
             Store(scratch["mode"], IntConstant({"f": 0, "e": 1, "g": 2}[kind]))
         )
         self.emit(Store(scratch["given"], IntConstant(precision)))
+        self.emit(Store(scratch["field"], IntConstant(width)))
+        self.emit(
+            Store(
+                scratch["align"],
+                IntConstant(1 if "-" in flags else (2 if "0" in flags else 0)),
+            )
+        )
+        self.emit(
+            Store(
+                scratch["positive"],
+                IntConstant(43 if "+" in flags else (32 if " " in flags else 0)),
+            )
+        )
         # C reads a %g precision of zero as one significant digit.
         self.emit(
             Store(scratch["figures_asked"], IntConstant(max(1, precision)))
@@ -6502,14 +6579,131 @@ class Lowerer:
         self.emit(Label(plain))
 
         self.emit(Label(emit_text))
-        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.emit_float_field(text, written)
 
-    def emit_character(self, expression: IntExpression) -> None:
+    def emit_float_field(self, text: IntExpression, written: int) -> None:
+        """Write the formatted number, with the sign and padding it was given.
+
+        Three shapes of padding, and the zero-padded one is why this is not
+        simply a run of spaces: `%08.2f` of -3.14 is `-0003.14`, so the sign
+        goes first and the zeros between it and the digits. A `+` or a space
+        flag puts a character in front of a number the formatter wrote none
+        for, which is one more column the field has to hold.
+        """
+
+        scratch = self.float_scratch
+        field, align = scratch["field"], scratch["align"]
+        positive = scratch["positive"]
+
+        # Whether the text already begins with a sign, and whether a flag
+        # asks for one it does not have.
+        negative = self.new_temp()
+        self.emit(
+            Store(negative, IntCompare("eq", HeapLoad(text, 1), IntConstant(45)))
+        )
+        extra = self.new_temp()
+        self.emit(
+            Store(
+                extra,
+                _binary(
+                    "and",
+                    IntCompare("ne", IntLoad(positive), IntConstant(0)),
+                    IntCompare("eq", IntLoad(negative), IntConstant(0)),
+                ),
+            )
+        )
+        total = self.new_temp()
+        self.emit(Store(total, _binary("add", IntLoad(written), IntLoad(extra))))
+        wanted = _binary("sub", IntLoad(field), IntLoad(total))
+
+        def write_flag() -> None:
+            """The `+` or space, where the number carries no sign of its own."""
+
+            skip = self.new_label("fp_no_flag")
+            self.emit(JumpIfFalse(IntLoad(extra), skip))
+            self.pad_runtime(IntConstant(1), IntLoad(positive))
+            self.emit(Label(skip))
+
+        plain = self.new_label("fp_no_field")
+        left = self.new_label("fp_left")
+        zeros = self.new_label("fp_zeros")
+        done = self.new_label("fp_field_done")
+        self.emit(
+            JumpIfFalse(IntCompare("gt", IntLoad(field), IntLoad(total)), plain)
+        )
+        onward = self.new_label("fp_not_left")
+        self.emit(JumpIfFalse(IntCompare("eq", IntLoad(align), IntConstant(1)), onward))
+        self.emit(Jump(left))
+        self.emit(Label(onward))
+        after = self.new_label("fp_not_zero")
+        self.emit(JumpIfFalse(IntCompare("eq", IntLoad(align), IntConstant(2)), after))
+        self.emit(Jump(zeros))
+        self.emit(Label(after))
+        # Right-aligned with spaces, which is what a bare width means.
+        self.pad_runtime(wanted, IntConstant(32))
+        write_flag()
+        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.emit(Jump(done))
+
+        self.emit(Label(left))
+        write_flag()
+        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.pad_runtime(wanted, IntConstant(32))
+        self.emit(Jump(done))
+
+        self.emit(Label(zeros))
+        write_flag()
+        bare = self.new_label("fp_zero_bare")
+        self.emit(JumpIfFalse(IntLoad(negative), bare))
+        self.emit(WriteRuntime(text, IntConstant(1)))
+        self.pad_runtime(wanted, IntConstant(48))
+        self.emit(
+            WriteRuntime(
+                _binary("add", text, IntConstant(1)),
+                _binary("sub", IntLoad(written), IntConstant(1)),
+            )
+        )
+        self.emit(Jump(done))
+        self.emit(Label(bare))
+        self.pad_runtime(wanted, IntConstant(48))
+        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.emit(Jump(done))
+
+        self.emit(Label(plain))
+        write_flag()
+        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.emit(Label(done))
+
+    def pad_runtime(self, count: IntExpression, character: IntExpression) -> None:
+        """Write `count` copies of a character, where the count is not known."""
+
+        base = SlotAddress(self.print_buffer())
+        left = self.new_temp()
+        self.emit(Store(left, count))
+        self.emit(HeapStore(base, character, 1))
+        top = self.new_label("pad_run")
+        end = self.new_label("pad_run_end")
+        self.emit(Label(top))
+        self.emit(JumpIfFalse(IntCompare("gt", IntLoad(left), IntConstant(0)), end))
+        self.emit(WriteRuntime(base, IntConstant(1)))
+        self.emit(Store(left, _binary("sub", IntLoad(left), IntConstant(1))))
+        self.emit(Jump(top))
+        self.emit(Label(end))
+
+    def emit_character(
+        self, expression: IntExpression, flags: str = "", width: int = 0
+    ) -> None:
         base = SlotAddress(self.print_buffer())
         self.emit(HeapStore(base, expression, 1))
+        if width > 1 and "-" not in flags:
+            self.emit(Write(b" " * (width - 1)))
         self.emit(WriteRuntime(base, IntConstant(1)))
+        if width > 1 and "-" in flags:
+            self.emit(Write(b" " * (width - 1)))
 
-    def emit_string(self, pointer: IntExpression) -> None:
+    def emit_string(
+        self, pointer: IntExpression, flags: str = "", width: int = 0
+    ) -> None:
         pointer_slot = self.new_temp()
         length_slot = self.new_temp()
         self.emit(Store(pointer_slot, pointer))
@@ -6530,10 +6724,136 @@ class Lowerer:
         )
         self.emit(Jump(top))
         self.emit(Label(end))
+        if width and "-" not in flags:
+            self.pad_forward(width, IntLoad(length_slot))
         self.emit(WriteRuntime(IntLoad(pointer_slot), IntLoad(length_slot)))
+        if width and "-" in flags:
+            self.pad_forward(width, IntLoad(length_slot))
+
+    def emit_sign(
+        self,
+        buffer: IntExpression,
+        index_slot: int,
+        negative_slot: int,
+        flags: str,
+    ) -> None:
+        """Put `-`, or the `+`/space a flag asked for, in front of the digits."""
+
+        done = self.new_label("no_sign")
+        if "+" in flags or " " in flags:
+            # Always one character, so there is no branch about whether to
+            # write one - only about which.
+            self.emit(
+                Store(index_slot, _binary("sub", IntLoad(index_slot), IntConstant(1)))
+            )
+            positive = 43 if "+" in flags else 32
+            self.emit(
+                HeapStore(
+                    _binary("add", buffer, IntLoad(index_slot)),
+                    _binary(
+                        "add",
+                        IntConstant(positive),
+                        _binary(
+                            "mul", IntLoad(negative_slot), IntConstant(45 - positive)
+                        ),
+                    ),
+                    1,
+                )
+            )
+            return
+        self.emit(JumpIfFalse(IntLoad(negative_slot), done))
+        self.emit(
+            Store(index_slot, _binary("sub", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", buffer, IntLoad(index_slot)), IntConstant(45), 1
+            )
+        )
+        self.emit(Label(done))
+
+    def pad_back(
+        self,
+        buffer: IntExpression,
+        index_slot: int,
+        width: int,
+        character: int,
+        signed: bool,
+        negative_slot: "int | None",
+    ) -> None:
+        """Fill backwards from the digits until the field is `width` wide.
+
+        Backwards because that is where the buffer has room: the number was
+        built from the end, so what goes in front of it goes in front of the
+        index, which is exactly where padding belongs.
+        """
+
+        room = width
+        if signed and negative_slot is not None:
+            # A `-` still to be written takes one of the field's columns.
+            room_slot = self.new_temp()
+            self.emit(
+                Store(
+                    room_slot,
+                    _binary("sub", IntConstant(width), IntLoad(negative_slot)),
+                )
+            )
+            wanted: IntExpression = IntLoad(room_slot)
+        else:
+            wanted = IntConstant(room)
+        top = self.new_label("pad")
+        end = self.new_label("pad_end")
+        self.emit(Label(top))
+        self.emit(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    _binary(
+                        "sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)
+                    ),
+                    wanted,
+                ),
+                end,
+            )
+        )
+        self.emit(
+            Store(index_slot, _binary("sub", IntLoad(index_slot), IntConstant(1)))
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", buffer, IntLoad(index_slot)),
+                IntConstant(character),
+                1,
+            )
+        )
+        self.emit(Jump(top))
+        self.emit(Label(end))
+
+    def pad_forward(self, width: int, written: IntExpression) -> None:
+        """Write spaces after what was emitted, for a left-aligned field."""
+
+        left = self.new_temp()
+        self.emit(Store(left, _binary("sub", IntConstant(width), written)))
+        top = self.new_label("pad_right")
+        end = self.new_label("pad_right_end")
+        self.emit(Label(top))
+        self.emit(
+            JumpIfFalse(IntCompare("gt", IntLoad(left), IntConstant(0)), end)
+        )
+        self.emit(Write(b" "))
+        self.emit(Store(left, _binary("sub", IntLoad(left), IntConstant(1))))
+        self.emit(Jump(top))
+        self.emit(Label(end))
 
     def emit_number(
-        self, expression: IntExpression, *, signed: bool, base: int, upper: bool
+        self,
+        expression: IntExpression,
+        *,
+        signed: bool,
+        base: int,
+        upper: bool,
+        flags: str = "",
+        width: int = 0,
     ) -> None:
         """Format one integer into the scratch buffer and write it to stdout.
 
@@ -6565,7 +6885,7 @@ class Lowerer:
                     IntBinary("sub", IntBinary("xor", IntLoad(value_slot), sign), sign),
                 )
             )
-        self.emit(Store(index_slot, IntConstant(32)))
+        self.emit(Store(index_slot, IntConstant(self._BUFFER_BYTES)))
         digit_slot = self.new_temp()
         top = self.new_label("digits")
         self.emit(Label(top))
@@ -6606,24 +6926,27 @@ class Lowerer:
                 IntCompare("eq", IntLoad(value_slot), IntConstant(0)), top
             )
         )
+        # Zero padding goes between the sign and the digits, which is why it
+        # is written before the sign and space padding after it.
+        if width and "0" in flags and "-" not in flags:
+            room = width - (1 if signed and ("+" in flags or " " in flags) else 0)
+            self.pad_back(buffer, index_slot, room, 48, signed, negative_slot)
         if signed:
-            done = self.new_label("no_sign")
-            self.emit(JumpIfFalse(IntLoad(negative_slot), done))
-            self.emit(
-                Store(index_slot, _binary("sub", IntLoad(index_slot), IntConstant(1)))
-            )
-            self.emit(
-                HeapStore(
-                    _binary("add", buffer, IntLoad(index_slot)), IntConstant(45), 1
-                )
-            )
-            self.emit(Label(done))
+            self.emit_sign(buffer, index_slot, negative_slot, flags)
+        if width and ("0" not in flags or "-" in flags):
+            if "-" not in flags:
+                self.pad_back(buffer, index_slot, width, 32, False, None)
         self.emit(
             WriteRuntime(
                 _binary("add", buffer, IntLoad(index_slot)),
-                _binary("sub", IntConstant(32), IntLoad(index_slot)),
+                _binary("sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)),
             )
         )
+        if width and "-" in flags:
+            self.pad_forward(
+                width,
+                _binary("sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)),
+            )
 
     # --- entry point ---
 
