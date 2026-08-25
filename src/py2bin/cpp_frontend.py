@@ -1618,6 +1618,51 @@ def _settled_parameters(
         out.append(re.sub(r"(?<![.\w>])auto\b", wanted, spelled, count=1))
     return ", ".join(out)
 
+
+#: `std::function<int(int)> f = ...` - by the time this runs the `std::` is
+#: gone. The signature is not a type this subset can name, so what is kept is
+#: the thing on the right.
+_STD_FUNCTION = re.compile(
+    r"(?<![.\w>])function\s*<([^;{}]*?)>\s*(?=[A-Za-z_*&])"
+)
+
+
+def _rewrite_std_function(text: str, filename: str) -> str:
+    """`std::function<int(int)> f = g;` becomes `auto f = g;`.
+
+    What `std::function` adds over the thing it holds is type erasure - two
+    different callables of the same signature stored in one variable - and
+    that needs a table this subset does not build for a closure. What it is
+    almost always used for is holding one callable under a name, which `auto`
+    does exactly: a lambda keeps its own class, a functor keeps its own, and
+    a function's name keeps the type this translator gives it.
+
+    Anywhere `auto` will not do - a parameter, a member - it says so, because
+    silently holding the first callable assigned would run and be wrong.
+    """
+
+    out: list[str] = []
+    at = 0
+    for found in _STD_FUNCTION.finditer(_without_literals(text)):
+        if found.start() < at:
+            continue
+        rest = text[found.end():]
+        held = re.match(r"([A-Za-z_]\w*)\s*=", rest)
+        if held is None:
+            raise CppTranslationError(
+                filename,
+                _line_of(text, found.start()),
+                "std::function here is not initialised where it is declared, "
+                "so there is nothing to say which callable it holds. py2bin "
+                "keeps the callable's own type; write the parameter as a "
+                "template parameter, or take a pointer to a function",
+            )
+        out.append(text[at:found.start()])
+        out.append("auto ")
+        at = found.end()
+    out.append(text[at:])
+    return "".join(out)
+
 def _expand_lambdas(text: str, filename: str) -> str:
     """Turn each lambda into a class, and its use into an object of it."""
 
@@ -2009,6 +2054,103 @@ _TEMPLATE_MEMBER = re.compile(
 #: A backstop on the folding below, not a budget.
 _OUT_OF_LINE_ROUNDS = 512
 
+
+
+def _expand_member_templates(text: str, filename: str) -> str:
+    """`template<typename T> T twice(T v)` written inside a class.
+
+    C++ makes one copy per set of argument types, and so does this - read
+    from the calls, because a member template has no other use. Each copy is
+    an ordinary member of the class, named the way a free template's copy is,
+    and every call that asked for it is pointed at the one it meant.
+    """
+
+    for _round in range(_OUT_OF_LINE_ROUNDS):
+        found = None
+        for match in _TEMPLATE.finditer(text):
+            if _depth_at(text, match.start()) > 0:
+                found = match
+                break
+        if found is None:
+            return text
+        rest = text[found.end():]
+        definition = _DEFINITION.match(rest)
+        if definition is None:
+            raise CppTranslationError(
+                filename,
+                _line_of(text, found.start()),
+                "a template written inside a class has to be a member "
+                "function; py2bin reads the pattern and writes out one copy "
+                "per use, and this is neither",
+            )
+        try:
+            closing = _matching(rest, definition.end() - 1)
+        except ValueError:
+            return text
+        parameters = _template_parameters(found.group(1))
+        pattern = rest[:closing + 1]
+        name = definition.group(2)
+        without = text[:found.start()] + text[found.end() + closing + 1:]
+        copies, without = _member_copies(
+            without, name, parameters, definition.group(3), pattern
+        )
+        if not copies:
+            # Nothing calls it, so there is nothing to write. The pattern is
+            # gone either way: it is not C.
+            text = without
+            continue
+        text = (
+            without[:found.start()]
+            + "\n".join(copies)
+            + "\n"
+            + without[found.start():]
+        )
+    raise CppTranslationError(
+        "<c++>", 0,
+        "member templates that never stop asking for another copy",
+    )
+
+
+def _member_copies(
+    text: str,
+    name: str,
+    parameters: "list[tuple[str, bool]]",
+    declared: str,
+    pattern: str,
+) -> "tuple[list[str], str]":
+    """One copy per set of argument types the calls to `name` ask for."""
+
+    made: "dict[str, str]" = {}
+    out: list[str] = []
+    at = 0
+    for call in re.finditer(
+        rf"(\.|->)\s*{re.escape(name)}\s*\(", _without_literals(text)
+    ):
+        if call.start() < at:
+            continue
+        close = _closing_paren(text, call.end() - 1)
+        if close < 0:
+            continue
+        given = _call_arguments(text, call.end() - 1)
+        deduced = _deduce_arguments(parameters, declared, given, text, call.start())
+        if deduced is None:
+            continue
+        named = _instantiated_name(name, deduced)
+        if named not in made:
+            copy = _substituted(
+                pattern, [held for held, _is_type in parameters], deduced
+            )
+            made[named] = _map_code(
+                copy,
+                lambda part, n=name, s=named: re.sub(
+                    rf"(?<![.\w>]){re.escape(n)}\b(?!\s*<)", s, part
+                ),
+            )
+        out.append(text[at:call.start()])
+        out.append(f"{call.group(1)}{named}(")
+        at = call.end()
+    out.append(text[at:])
+    return list(made.values()), "".join(out)
 
 def _fold_out_of_line_templates(text: str) -> str:
     """Put a class template's members back inside it.
@@ -6782,6 +6924,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     text = _lift_nested_classes(text)
     text = _rewrite_default_arguments(text)
     text = _rewrite_range_for(text, [0])
+    # Before the lambdas, because that pass reads `auto f = <lambda>` to find
+    # out what the closure is held under.
+    text = _rewrite_std_function(text, filename)
     # Before the templates: a lambda becomes a class, and a class may be a
     # template argument.
     text = _expand_lambdas(text, filename)
@@ -6791,6 +6936,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # Before the templates are read: a member defined outside its class
     # template belongs to the pattern the reader is about to copy.
     text = _fold_out_of_line_templates(text)
+    # Before the file's own templates: a member template is expanded from its
+    # call sites, and the copies it leaves are ordinary members.
+    text = _expand_member_templates(text, filename)
     text = _expand_templates(text, filename)
     # After them: a function's name passed as a value needs a type that can
     # be written where a template argument goes, and the deduction above has
