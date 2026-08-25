@@ -171,14 +171,29 @@ class BuildScriptAnswers(unittest.TestCase):
             self.assertTrue((program.parent / "dist" / "hello.exe").is_file())
 
     def test_a_machine_it_does_not_build_for_is_named(self) -> None:
+        """A real file, because a missing one sends it down another path.
+
+        Named with a path that exists: given one that does not, `build.py`
+        searches for something to build starting from the *working
+        directory*, so what this asserted depended on where the suite
+        happened to be - which made it pass alone and fail in company.
+        """
+
         import subprocess
         import sys
+        import tempfile
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        done = subprocess.run(
-            [sys.executable, str(root / "build.py"), "x.cpp", "--target", "vax"],
-            capture_output=True, text=True, timeout=300,
-        )
+        with tempfile.TemporaryDirectory() as scratch:
+            program = Path(scratch) / "hello.cpp"
+            program.write_text("int main(void){ return 0; }\n", encoding="utf-8")
+            done = subprocess.run(
+                [
+                    sys.executable, str(root / "build.py"), str(program),
+                    "--target", "vax",
+                ],
+                capture_output=True, text=True, timeout=300,
+            )
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("darwin-arm64", done.stdout)
