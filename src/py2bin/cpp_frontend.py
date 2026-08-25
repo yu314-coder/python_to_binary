@@ -1567,6 +1567,57 @@ def _lift_nested_classes(text: str) -> str:
         if not moved:
             return "\n".join(lifted) + ("\n" if lifted else "") + text
 
+
+def _settled_parameters(
+    parameters: str,
+    holder: str,
+    text: str,
+    closing: int,
+    filename: str,
+    at: int,
+) -> str:
+    """Give a generic lambda's `auto` parameters the types it is called with.
+
+    `[](auto a, auto b)` is a member template in C++ - one copy per set of
+    argument types. py2bin writes a lambda out as one class, so the types are
+    read from the calls instead. Where the calls disagree, that is a template
+    and this says so rather than compiling the first one and running it for
+    both.
+    """
+
+    given: "list[list[str]]" = []
+    rest = text[closing:]
+    for call in re.finditer(rf"(?<![.\w>]){re.escape(holder)}\s*\(", rest):
+        close = _closing_paren(rest, call.end() - 1)
+        if close < 0:
+            continue
+        inside = rest[call.end(): close].strip()
+        arguments = _split_arguments(inside) if inside else []
+        held = [_deduced_type(one.strip(), text) for one in arguments]
+        if any(one is None for one in held):
+            continue
+        given.append([str(one) for one in held])
+    settled = [one for one in given if len(one) == len(_split_arguments(parameters))]
+    if not settled:
+        raise CppTranslationError(
+            filename, _line_of(text, at),
+            "a lambda whose parameters are `auto` is a template, and py2bin "
+            "writes one copy of a lambda. Nothing here says what it is called "
+            "with, so give the parameters their types",
+        )
+    if any(one != settled[0] for one in settled[1:]):
+        raise CppTranslationError(
+            filename, _line_of(text, at),
+            "a lambda whose parameters are `auto` is called here with more "
+            "than one set of types, which is a template; py2bin writes one "
+            "copy of a lambda, so write one for each set",
+        )
+    out = []
+    for spelled, wanted in zip(_split_arguments(parameters), settled[0]):
+        spelled = spelled.strip()
+        out.append(re.sub(r"(?<![.\w>])auto\b", wanted, spelled, count=1))
+    return ", ".join(out)
+
 def _expand_lambdas(text: str, filename: str) -> str:
     """Turn each lambda into a class, and its use into an object of it."""
 
@@ -1593,31 +1644,9 @@ def _expand_lambdas(text: str, filename: str) -> str:
                 filename, _line_of(text, found.start()), "a lambda is not closed"
             ) from None
         body = text[found.end() - 1: closing]
-        result = (declared or "").strip() or _lambda_result(body, parameters, text)
-        held = _lambda_captures(captures, text, found.start(), filename, body)
-        # A reference capture is the address, and every use inside follows it.
-        classes = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
-        owner = next((s.strip() for v, s, _r in held if v == _SELF), None)
-        if owner is not None:
-            body = _through_self(body, owner, text)
-        body = _deref_references(
-            body,
-            {
-                v: s for v, s, by_reference in held
-                if by_reference and v != _SELF
-            },
-            {name: None for name in classes},
-        )
-        members = "".join(
-            f"    {spelled} {'*' if by_reference else ''}{variable};\n"
-            for variable, spelled, by_reference in held
-        )
-        made.append(
-            f"class {name} {{\npublic:\n{members}"
-            f"    {name}() {{ }}\n"
-            f"    {result} operator()({parameters}) {body}\n}};\n"
-        )
-        # Where it is used: a declaration of one, and a member per capture.
+        # Where it is used, read before the class is written: a generic
+        # lambda's parameter types are whatever it is called with, and the
+        # name it is held under is how those calls are found.
         start = _statement_start(text, found.start())
         while start < len(text) and text[start] in " \t\n":
             start += 1
@@ -1629,10 +1658,37 @@ def _expand_lambdas(text: str, filename: str) -> str:
             r"auto\s+([A-Za-z_]\w*)\s*=\s*$", text[start:found.start()]
         )
         holder = holding.group(1) if holding else f"{name}__made"
+        if re.search(r"(?<![.\w>])auto\b", parameters):
+            parameters = _settled_parameters(
+                parameters, holder, text, closing, filename, found.start()
+            )
+        result = (declared or "").strip() or _lambda_result(body, parameters, text)
+        held = _lambda_captures(captures, text, found.start(), filename, body)
+        # A reference capture is the address, and every use inside follows it.
+        classes = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+        owner = next((s.strip() for v, s, _r, _f in held if v == _SELF), None)
+        if owner is not None:
+            body = _through_self(body, owner, text)
+        body = _deref_references(
+            body,
+            {
+                v: s for v, s, by_reference, _f in held
+                if by_reference and v != _SELF
+            },
+            {name: None for name in classes},
+        )
+        members = "".join(
+            f"    {spelled} {'*' if by_reference else ''}{variable};\n"
+            for variable, spelled, by_reference, _from in held
+        )
+        made.append(
+            f"class {name} {{\npublic:\n{members}"
+            f"    {name}() {{ }}\n"
+            f"    {result} operator()({parameters}) {body}\n}};\n"
+        )
+        # Where it is used: a declaration of one, and a member per capture.
         setup = "".join(
-            f" {holder}.{v} = "
-            + ("this;" if v == _SELF else f"{'&' if by_reference else ''}{v};")
-            for v, _s, by_reference in held
+            f" {holder}.{v} = {source};" for v, _s, _r, source in held
         )
         if holding:
             after = closing + 1 if text[closing:closing + 1] == ";" else closing
@@ -1807,9 +1863,9 @@ def _lambda_captures(
         # the body named a method that exists on no class the closure knows.
         owner = _enclosing_class(text, at)
         if owner is not None and _uses_the_object(body, text, owner):
-            held.append((_SELF, f"{owner} ", True))
+            held.append((_SELF, f"{owner} ", True, "this"))
         return held
-    held: list[tuple[str, str, bool]] = []
+    held: list[tuple[str, str, bool, str]] = []
     for part in _split_arguments(spelled):
         name = part.strip()
         by_reference = name.startswith("&")
@@ -1824,14 +1880,28 @@ def _lambda_captures(
                     "a lambda captures `this` outside any class, so there is "
                     "nothing for it to capture",
                 )
-            held.append((_SELF, f"{owner} ", True))
+            held.append((_SELF, f"{owner} ", True, "this"))
+            continue
+        # `[v = n * 2]` - the member is initialised from an expression rather
+        # than from a variable of the same name. C++ calls it an init-capture
+        # and it is the only way a lambda holds something the scope has no
+        # name for.
+        given = re.match(r"^([A-Za-z_]\w*)\s*=(?!=)\s*(.+)$", name, re.S)
+        if given is not None:
+            name, source = given.group(1), given.group(2).strip()
+            found = _deduced_type(source, text[:at]) or "int"
+            held.append(
+                (name, found, by_reference, f"&({source})" if by_reference else source)
+            )
             continue
         if not name.isidentifier():
             raise CppTranslationError(
                 filename, _line_of(text, at), f"cannot read the capture {name!r}"
             )
         found = _deduced_type(name, text[:at]) or "int"
-        held.append((name, found, by_reference))
+        held.append(
+            (name, found, by_reference, f"&{name}" if by_reference else name)
+        )
     return held
 
 
@@ -1849,7 +1919,7 @@ def _captures_used(
     before = text[:at]
     start = _enclosing_body_start(before)
     scope = before[start:]
-    held: "list[tuple[str, str, bool]]" = []
+    held: "list[tuple[str, str, bool, str]]" = []
     seen: "set[str]" = set()
     for match in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)", _without_literals(body)):
         name = match.group(1)
@@ -1865,7 +1935,9 @@ def _captures_used(
         if found is None:
             continue
         seen.add(name)
-        held.append((name, found, by_reference))
+        held.append(
+            (name, found, by_reference, f"&{name}" if by_reference else name)
+        )
     return held
 
 
