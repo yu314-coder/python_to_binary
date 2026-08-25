@@ -666,9 +666,41 @@ def _parser() -> argparse.ArgumentParser:
     source_compile_parser.add_argument("--app", action="store_true")
     source_compile_parser.add_argument("--clean", action="store_true")
     kernel_options(source_compile_parser)
+    header_parser = commands.add_parser(
+        "fetch-header",
+        help="download a header py2bin cannot find on this machine",
+    )
+    header_parser.add_argument(
+        "name",
+        help="the header as a program includes it, e.g. WebView2.h or "
+             "nlohmann/json.hpp",
+    )
+    header_parser.add_argument(
+        "--into", type=Path, default=Path("."),
+        help="where to write it (default: here). Name this directory with "
+             "--include-dir when you compile",
+    )
+    header_parser.add_argument(
+        "--from", dest="url", default=None, metavar="URL",
+        help="an HTTPS URL for the header itself, for one that is in no index",
+    )
     commands.add_parser("targets", help="list native code-generation targets")
     return parser
 
+
+
+def _include_root(kept: Path, name: str) -> Path:
+    """The directory an `#include` of `name` is written against.
+
+    `nlohmann/json.hpp` was written into `<root>/nlohmann/json.hpp`, so the
+    directory to put on the search path is two levels up from the file - not
+    the file's own parent, or the two get spliced together.
+    """
+
+    root = kept
+    for _piece in range(name.replace("\\", "/").count("/") + 1):
+        root = root.parent
+    return root
 
 def _analysis_dict(result) -> dict[str, object]:
     return {
@@ -1136,6 +1168,20 @@ def _main(argv: list[str] | None = None) -> int:
             )
             if bridge.c_artifact is not None:
                 print(f"retained parsed C source at {bridge.c_artifact}")
+            return 0
+        if args.command == "fetch-header":
+            from .header_fetch import fetch_header, fetch_header_from
+
+            into = args.into.expanduser().resolve()
+            if args.url:
+                kept = fetch_header_from(args.url, args.name, into)
+            else:
+                kept = fetch_header(args.name, into, say=print)
+            print(f"wrote {kept}")
+            print(
+                f"compile with --include-dir "
+                f"{_include_root(kept, args.name)}"
+            )
             return 0
         if args.command == "cc":
             # Defaults chosen so the common case needs no flags at all:

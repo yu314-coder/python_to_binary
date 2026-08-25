@@ -453,6 +453,13 @@ real file and line rather than guessed at.
 `.py` one: any `.c` beside it that does not define its own `main` is compiled
 with it, and an `include/` directory beside it is searched.
 
+**Braced initialisers** work for whatever they nest: `struct P a = {1, 2}`, a
+struct inside a struct, an array of structs, a two-dimensional array, a string
+member, a union, a partly-filled list (C zero-fills the rest, and so does
+this), and any of them at file scope. One entry point initialises whatever is
+at an address, of whatever shape it is, because a member may be an array or a
+struct or a scalar and C nests them freely.
+
 **What it is not.** py2bin's C compiler implements C and ships its own copies
 of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `ctype.h`,
 `math.h`, `assert.h`, `wchar.h`, `uchar.h`, `stdint.h`, `inttypes.h`,
@@ -471,6 +478,27 @@ vendor SDK: `WebView2.h` and its like are COM — `MIDL_INTERFACE`,
 half the Windows SDK behind them. Finding the file does not help, because the
 file is written in a language this compiler does not implement. That is a real
 ceiling and not a missing flag.
+
+**A header that is not on this machine can be fetched.** `--auto-fetch`
+(`build.py`) says that a header py2bin cannot find here may be looked up and
+downloaded; without it nothing reaches the network, which is what keeps a
+build the same on a machine that has none. Two places are searched, and which
+one first is decided by the name: an include with a directory in it, or one
+spelled `.hpp`, belongs to a library published as source, and a bare `.h` is
+what a vendor ships in a package.
+
+```
+python3 build.py app.cpp --auto-fetch
+py2bin fetch-header nlohmann/json.hpp --into vendor
+py2bin fetch-header thing.h --from https://example.com/thing.h --into vendor
+```
+
+Every header near the one asked for comes with it, because a header includes
+its neighbours and one at a time would ask again immediately; each build says
+which package or repository a header came from, so you can judge it. What
+arrives is a header and not a toolchain: whether py2bin's C understands what
+is inside it is a separate question, answered by the compiler in the usual
+way — `WebView2.h` downloads and then stops on the COM above.
 
 **Which is why `<windows.h>` is py2bin's own too.** Microsoft's is tens of
 thousands of declarations written in extensions this compiler does not have.
@@ -572,12 +600,13 @@ code before it emits anything, which is where they are done here:
 | **`virtual`** | a pointer to a table of the object's own functions, installed by its constructor. Derived tables keep the base's slot order |
 | **References** | a pointer with the dereference written out; call sites take the address |
 | **`new` / `delete`** | malloc from `<stdlib.h>`, then the constructor. `new T[n]` records the count in front of the block so `delete[]` can destroy every element |
-| **Templates** | one copy per set of arguments used, named after them — `Box__int`, not a hash. Arguments a call does not spell out are deduced from literals and from declarations in view |
+| **Templates** | one copy per set of arguments used, named after them — `Box__int`, not a hash. Arguments a call does not spell out are deduced from literals and from declarations in view. A member written outside its class (`template<typename T> T Box<T>::get()`) is folded back into it; `template<>` is one copy written by hand and goes straight in under the name the expander would have used; a member template is expanded from its call sites |
 | **Namespaces** | flattened. One translation unit, no linker, so scoping is the whole of what a namespace can mean here |
-| **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer |
+| **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer. The right side is an operand, not just a name: `a += " x"` and `a + f(1)` work too. Unary ones as well — `*p`, `!p`, `-v`, `p->m()`, `++c` and `c++` — each told from the two-operand spelling by taking no parameter, which is the only thing that says |
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
-| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is the only way to hold one, because the class's name is generated. `[x]` copies, `[&x]` holds the address and every use follows it, `[this]` holds the enclosing object and bare member names go through it, and `[=]`/`[&]` capture what the body uses — including the object, the same rule C++ applies |
-| **The rest of it** | enums (plain and scoped), unions, `static` data members and member functions, nested classes, range-`for`, member initialiser lists, default arguments, named casts, `explicit`, function-pointer members, `auto`, `bool`/`true`/`false`/`nullptr`, forward declarations, and free functions that return a class by value |
+| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is how one is held, because the class's name is generated — and `std::function<int(int)> f = ...` becomes exactly that. `[x]` copies, `[&x]` holds the address and every use follows it, `[this]` holds the enclosing object and bare member names go through it, `[=]`/`[&]` capture what the body uses — including the object, the same rule C++ applies — and `[v = n * 2]` is a member initialised from an expression the scope has no name for. `[](auto a, auto b)` is a member template in C++; here the types are read from the calls, and calls that disagree are refused rather than compiled once and run for both |
+| **`dynamic_cast`** | answered from the table the object carries. py2bin has no linker, so a translation unit is the whole program and there is no class it has not seen: an object is a `D` if its table is D's own or belongs to something derived from D. A cast that fails answers null |
+| **The rest of it** | enums (plain and scoped), unions, `static` data members and member functions, nested classes, member typedefs (`vector<int>::iterator`), range-`for` (over a container, over a plain array, and by reference), member initialiser lists, default arguments, named casts, `explicit`, function-pointer members, `auto`, `using X = Y`, aggregate and braced initialisers, `bool`/`true`/`false`/`nullptr`, forward declarations, members defined outside their class, prototypes in headers, and free functions that return a class by value |
 | **`operator()`** | a call on an object, so `std::sort(v.begin(), v.end(), cmp)` takes a lambda or a function object alike |
 
 **Standard headers**, each written in py2bin's own C++ subset and put
@@ -585,11 +614,31 @@ through the same translator as your code — so they are readable, and they are
 not special cases in the compiler:
 
 * `<string>` — a fixed-capacity string with `assign`, `size`, `c_str`,
-  `append`, `operator+` and comparison.
-* `<vector>` — a template, so one concrete class per element type. It grows
-  by doubling and the old block stays where it is, because the heap under it
-  is an arena that does not reclaim; pretending otherwise would be the
-  dishonest part, not the leak.
+  `append`, `substr`, `find`, `npos`, `push_back`, `operator+`, `operator+=`,
+  `operator[]`, comparison, and the free `to_string` and `stoi`.
+* `<vector>` — a template, so one concrete class per element type, with
+  `push_back`, `pop_back`, `erase`, `insert`, `assign`, `resize`, `reserve`,
+  `at`, `front`, `back`, `data`, `begin`/`end` and `iterator`. It grows by
+  doubling and the old block stays where it is, because the heap under it is
+  an arena that does not reclaim; pretending otherwise would be the dishonest
+  part, not the leak. A `vector<vector<int>>` works, and so does `g[0][1]`.
+* `<map>` and `<unordered_map>` — entries in one array, so an iterator is a
+  pointer to one and `it->first` is an ordinary member read. `find`, `count`,
+  `contains`, `at`, `erase`, `operator[]`, `begin`/`end`. It searches from the
+  front, which a red-black tree would not: a program holding thousands of keys
+  will notice, and one holding dozens will not.
+* `<set>` and `<unordered_set>` — the same shape with nothing on the other
+  side. Insertion order is kept, which is a stronger promise than the
+  unordered ones make and a weaker one than the ordered ones do.
+* `<memory>` — `unique_ptr` (which frees what it holds when it goes) and
+  `shared_ptr`, with `get`, `release`, `reset`, `operator->` and `operator*`.
+  Not move-only and not reference counted: this subset has neither move
+  semantics nor atomics, so what is here is the ownership and not the
+  machinery C++ uses to enforce it.
+* `<sstream>` — `ostringstream` with one `operator<<` per type it can write,
+  and `str()`.
+* `<array>` — the count lives in the object rather than in the type, because
+  a value template argument is not something this subset deduces.
 * `<iostream>` — `cout` with one `operator<<` per type it can print, each
   handing the stream back so the next `<<` in the chain has something to be
   called on.
@@ -610,11 +659,13 @@ not special cases in the compiler:
   wrong gives plausible answers.
 * `<functional>` — `less`, `greater`, `plus`, `equal_to` and the rest of the
   comparison and arithmetic objects, which are small classes with a call
-  operator. `std::function` is **not** there: it holds *any* callable, which
-  means erasing the type of what is in it, and every callable py2bin makes is
-  a class of its own with nothing common to erase to. What it is used for
-  works without it — `auto` holds a lambda, a function pointer holds a
-  function — and a program that names it is told so.
+  operator. `std::function` erases the type of what it holds, and every
+  callable py2bin makes is a class of its own with nothing common to erase
+  to — so what it is nearly always written for is written out instead.
+  `std::function<int(int)> f = g;` becomes `auto f = g;`: a lambda keeps its own class, a functor
+  keeps its own, and a function's name keeps the type py2bin gives it. Where
+  `auto` will not do — a parameter, a member — it says so, because silently
+  keeping the first callable assigned would run and be wrong.
 * `<utility>` (`pair`), `<numeric>` (`accumulate`), and `<cassert>`,
   `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
   `<cmath>`, `<cstdint>` as names for the C headers underneath.
@@ -630,10 +681,11 @@ means one behind `&&`, `||` or `?:`, or in a loop's header, is refused with
 the reason rather than moved to where it would run at the wrong time. An
 exception reaching the end of `main` aborts in C++; there is no way to raise a
 signal here, so the program exits with a status of its own instead. Multiple
-inheritance, `dynamic_cast` and RTTI are not implemented. Two overloads that
+inheritance and the rest of RTTI (`typeid`, `type_info`) are not implemented;
+`dynamic_cast` is, because the table the object already carries answers it. Two overloads that
 differ only in types py2bin cannot read are refused rather than guessed at.
 
-**How it is checked.** One command, two questions:
+**How it is checked.** One command, three questions:
 
 ```sh
 tools/cpp_sweep.sh
@@ -642,7 +694,19 @@ tools/cpp_sweep.sh
 *Meaning*: every program in `tools/cpp_corpus/` is built twice — once by
 py2bin, once by `clang++` — run on this machine, and the outputs compared.
 Reading the generated C tells you it is well formed and nothing about whether
-it means the same thing, and this is the only thing that asks.
+it means the same thing, and this is the only thing that asks. C programs are
+in there beside the C++ ones: the translator writes C, so a gap in the C front
+end shows up as a C++ program that will not build, and a C program says which
+of the two is at fault.
+
+*Projects*: each directory under `tools/cpp_projects/` is a program in several
+files with headers of its own, built from its `main.cpp` the way `build.py` is
+handed one — which is how a project reaches py2bin, and not how a single file
+does.
+
+*Targets*: every program built for all six machines. A construct can
+translate perfectly and still fail to encode for one of them, and nothing else
+asks.
 
 Point it at your own program instead of the corpus:
 
@@ -658,40 +722,38 @@ added, so a program built the documented way came out unrunnable and no test
 noticed. `build.py` now takes the three answers on the command line
 (`--target`, `--how`), which is what lets anything check it.
 
-There is also a Claude Code workflow, `.claude/workflows/cpp-hunt.js`: ten
-agents, one per area of the language, each writing programs and building
-them through `build.py`, then a verify pass that tries to *refute* each
-reported failure before it is believed. It finds what the corpus does not
-cover yet, which is the only kind of bug left. Its first run probed 206
-candidates across ten areas and confirmed 97, of which two were programs that
-*ran and were wrong* rather than programs that were refused — a class holding
-another was never constructed, and a copy never called the copy constructor.
-Neither would have been found by waiting to be told.
+The corpus is where each of those answers ends up: a program goes in when
+something about it was broken, so the thing that broke cannot come back
+quietly. It is over two hundred programs now, and every one of them agrees
+with `clang++`.
 
-which asks the same two questions of that file — every target, and the
-comparison — and is the thing to run before shipping.
+`tools/cpp_sweep.sh check src/main.cpp include` asks the same questions of
+your own file — every target, and the comparison — and is the thing to run
+before shipping.
 
-*Targets*: every program is built for all six targets. A construct can
-translate perfectly and still fail to encode for one machine, and this is the
-only thing that asks that. It does not run them; five of the six are not this
-computer. 157 programs × 6 targets = 942 builds.
+It does not run the cross-builds; five of the six machines are not this
+computer. 204 programs × 6 targets is 1224 builds, and the two projects are
+built for this machine and run.
 
-The corpus is where the coverage lives: enums, static members, nested
-classes, range-`for`, member initialiser lists, default arguments, named
-casts, `operator=`, deep inheritance, and every header above. Each got in
-because something broke on it. `tools/cpp_differential.sh` still works and is
-the meaning half under its old name. The suite additionally translates every
-corpus program on each change, so one that stops working is caught whether or
-not the sweep is run that day. It runs over 157 programs,
-all agreeing. The first run of it found nine bugs, every one of which produced
-C that compiled cleanly and meant something else: a member called `n` rewrote
+What is in the corpus is what broke at some point: enums, static members,
+nested classes, range-`for`, member initialiser lists, default arguments,
+named casts, `operator=`, deep inheritance, every header above, and a program
+for each container and each operator. `tools/cpp_differential.sh` still works
+and is the meaning half under its old name. The test suite additionally
+translates every corpus program on each change, so one that stops working is
+caught whether or not the sweep is run that day.
+
+The first run of the sweep found nine bugs, every one of which produced C that
+compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
 member answered 200 where the answer is 105; a destructor in a nested block
 was emitted at the end of the function. It has gone on finding them —
-`return size * size;` read as a declaration of a pointer named `size`, and a
-`return` inside a block destroying only that block's objects. clang++ is the
-yardstick there and never a dependency; py2bin still builds with no toolchain
-at all.
+`return size * size;` read as a declaration of a pointer named `size`; a
+`return` inside a block destroying only that block's objects; a rewrite that
+looks around itself reading its own position against the wrong text, so a
+class deriving from one in a header assigned to the base's *name*, and did so
+only when a header was included. clang++ is the yardstick there and never a
+dependency; py2bin still builds with no toolchain at all.
 
 ### Reaching it from npm
 

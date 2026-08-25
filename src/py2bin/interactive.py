@@ -8,6 +8,7 @@ found or downloaded rather than typed.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -268,6 +269,7 @@ def main(
     target: str | None = None,
     method: str | None = None,
     include_dirs: "tuple[str, ...]" = (),
+    auto_fetch: bool = False,
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -275,6 +277,12 @@ def main(
     either, that question is not asked - which is what lets a script, a test
     or a sweep use this same entry point rather than a different one. A build
     that is only reachable by typing at it is a build nothing can check.
+
+    `auto_fetch` allows a header py2bin cannot find on this machine to be
+    looked up in a package index and downloaded. It is off unless asked for:
+    a build that reaches the network on its own is a build that stops working
+    on a machine without one, and says something different each time the
+    index changes.
     """
 
     # Everything is said on stdout. Some editors show only that, and an
@@ -335,7 +343,7 @@ def main(
         say(f"\n  building for {target}")
 
     if program.suffix in _SOURCE_SUFFIXES:
-        return _build_c(program, target, include_dirs)
+        return _build_c(program, target, include_dirs, auto_fetch)
 
     system = target.split("-")[0]
     offered = methods_for(target)
@@ -558,8 +566,61 @@ def main(
 
 
 
+
+#: How many headers one build may fetch. A backstop, not a budget: each round
+#: brings one down and asks the compiler again.
+_FETCH_ROUNDS = 24
+
+#: What the preprocessor says when it cannot find one. Read back rather than
+#: raised as a type of its own, so this stays out of the compiler's way.
+_MISSING_HEADER = re.compile(r"cannot find the header '([^']+)'")
+
+
+def _header_that_is_missing(message: str) -> "str | None":
+    """The header name out of the preprocessor's own refusal, if that is it."""
+
+    found = _MISSING_HEADER.search(message)
+    return found.group(1) if found is not None else None
+
+
+def _fetch_one_header(program: Path, wanted: str) -> "Path | None":
+    """Look `wanted` up, keep it beside the program, and say where to search.
+
+    Answers the directory the `#include` is written against - not the file's
+    own, since a program says `#include "nlohmann/json.hpp"` and the search
+    path has to be the directory holding `nlohmann`.
+    """
+
+    from .header_fetch import CACHE_DIRECTORY, HeaderFetchError, fetch_header
+
+    into = program.parent / CACHE_DIRECTORY
+    say(f"\n  {wanted} is not here. Looking for a package that holds it.")
+    try:
+        kept = fetch_header(wanted, into, say=say)
+    except HeaderFetchError as error:
+        say(f"  {error}")
+        return None
+    except Exception as error:  # a network that is not there, or is refusing
+        say(f"  could not fetch {wanted}: {error}")
+        if "429" in str(error) or "rate limit" in str(error).lower():
+            say(
+                "  The source host allows a small number of anonymous "
+                "requests an hour.\n"
+                "  Wait, or download the header yourself and name its "
+                "directory with --include."
+            )
+        return None
+    from .cli import _include_root
+
+    root = _include_root(kept, wanted)
+    say(f"  fetched {wanted} into {root}")
+    return root
+
 def _build_c(
-    program: Path, target: str, include_dirs: "tuple[str, ...]" = ()
+    program: Path,
+    target: str,
+    include_dirs: "tuple[str, ...]" = (),
+    auto_fetch: bool = False,
 ) -> int:
     """Compile a C or C++ program, and everything beside it, into one binary.
 
@@ -596,14 +657,36 @@ def _build_c(
     else:
         say(f"\n  Compiling {program.name} for {target}.")
     try:
-        result = compile_c_native(
-            program,
-            output,
-            target=target,
-            clean=True,
-            include_dirs=tuple(includes),
-            extra_sources=tuple(others),
-        )
+        # A header py2bin cannot find here can be fetched, if the author said
+        # so. Each round brings one down and asks again: a header includes its
+        # neighbours, and the next name is only known once this one is here.
+        for _round in range(_FETCH_ROUNDS if auto_fetch else 1):
+            try:
+                result = compile_c_native(
+                    program,
+                    output,
+                    target=target,
+                    clean=True,
+                    include_dirs=tuple(includes),
+                    extra_sources=tuple(others),
+                )
+                break
+            except Exception as refused:
+                wanted = (
+                    _header_that_is_missing(str(refused)) if auto_fetch else None
+                )
+                if wanted is None:
+                    raise
+                kept = _fetch_one_header(program, wanted)
+                if kept is None:
+                    raise
+                if str(kept) not in includes:
+                    includes = [str(kept), *includes]
+        else:
+            raise RuntimeError(
+                f"still asking for headers after {_FETCH_ROUNDS} were "
+                f"fetched; something here includes more than a program has"
+            )
     except Exception as error:  # the C compiler's own located rejection
         say(f"\n  {error}")
         say(
