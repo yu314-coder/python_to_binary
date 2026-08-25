@@ -472,6 +472,23 @@ zero-padded field after the sign rather than before it. A width given as `*`
 is refused with the reason: it comes from an argument, and the format is read
 before there are any.
 
+`sprintf` and `snprintf` are the same formatter pointed at a buffer instead of
+at stdout. `snprintf` keeps what fits and answers the length it *would* have
+written — which is what lets a caller ask how much room to make — and puts the
+terminator where the copy stopped. A size of zero writes nothing at all, as C
+says. A program that defines its own `printf`, `sprintf` or `snprintf` gets
+that one; these are only what a program calls without having written.
+
+**Variadic functions** work, and `<stdarg.h>` is the typedef that goes with
+them. The arguments past the named ones are promoted the way C promotes them —
+narrow integers to `int`, `float` to `double` — and written into a run of
+eight-byte cells whose address travels as one more argument; so a `va_list` is
+a pointer into those cells, `va_arg` is a load and a step forward, and `va_end`
+has nothing to undo. Passing it as an argument rather than finding it in the
+frame is what makes it work the same whether the callee was inlined or really
+called, and it means a `va_list` can be handed on to another function, which is
+how every logging helper in C is written.
+
 **Bitfields** are laid out, read and written: `unsigned int flags : 3;` packs
 into a storage unit of its declared type and the next field continues in the
 same unit while it fits, which is what every ABI py2bin targets does. A read

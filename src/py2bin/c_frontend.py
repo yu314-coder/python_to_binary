@@ -71,12 +71,11 @@ What is implemented
 
 What is rejected
 ----------------
-``long double``, variadic user functions and variadic function types, a
+``long double``, a variadic function *type* (a pointer to one), a
 function type with an unspecified ``()`` parameter list, a function whose own
 declarator is not the plain ``TYPE *... name(params)`` (write a typedef for the
-result type), ``static`` inside a block, ``extern`` objects (py2bin compiles one
-translation unit and has no linker), a braced initializer for a file-scope
-struct or union, more than eight arguments to a function (py2bin passes
+result type), ``extern`` objects (py2bin compiles one translation unit and has
+no linker), more than eight arguments to a function (py2bin passes
 arguments only in registers), and recursion, function pointers or file-scope
 objects on the targets that have no call ABI or static block yet.
 """
@@ -1305,6 +1304,13 @@ class Cast(Node):
 
 
 @dataclasses.dataclass(slots=True)
+class TypeArgument(Node):
+    """A type written where an argument goes, which only `va_arg` does."""
+
+    ctype: "CType"
+
+
+@dataclasses.dataclass(slots=True)
 class SizeofType(Node):
     ctype: CType
 
@@ -1405,6 +1411,10 @@ class Function:
     #: one is still the ordinary way to write mutual recursion in C.
     body: Compound | None
     token: Token
+    #: Whether the parameter list ended with `...`. The extra arguments are
+    #: promoted and written into a run of 8-byte cells, whose address is what
+    #: `va_start` hands back - so `va_arg` is a load and a step forward.
+    variadic: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -1482,11 +1492,10 @@ _RESERVED = frozenset(
 )
 
 _UNSUPPORTED_KEYWORDS = {
-    "static": "'static' is accepted on a file-scope declaration, where all it "
-    "limits is a linkage py2bin's single translation unit has no way to escape. "
-    "A static object inside a block is not implemented, because a body that is "
-    "inlined rather than called would get one object per inlining instead of "
-    "the single object C promises",
+    "static": "'static' is accepted on a declaration - at file scope, where all "
+    "it limits is a linkage py2bin's single translation unit has no way to "
+    "escape, and inside a block, where it gives the object static storage. It "
+    "is not accepted here, which is not a place C puts it either",
     "register": "the 'register' storage class is not accepted",
     "auto": "the 'auto' storage class is not accepted",
     "_Complex": "complex types are not implemented",
@@ -2177,7 +2186,15 @@ class Parser:
                 arguments: list[Node] = []
                 if not self.accept(")"):
                     while True:
-                        arguments.append(self.assignment_expression())
+                        if name == "va_arg" and len(arguments) == 1:
+                            # The second argument names a type, which is where
+                            # `va_arg` differs from every other call in C. Read
+                            # the way `sizeof(int)` is read.
+                            arguments.append(
+                                TypeArgument(self.token, self.type_name())
+                            )
+                        else:
+                            arguments.append(self.assignment_expression())
                         if self.accept(")"):
                             break
                         self.take(",")
@@ -2503,6 +2520,7 @@ class Parser:
         name = str(name_token.value)
         self.take("(")
         parameters: list[tuple[CType, str]] = []
+        variadic = False
         if not self.accept(")"):
             if self.at("void") and self.peek().value == ")":
                 self.take("void")
@@ -2510,7 +2528,18 @@ class Parser:
             else:
                 while True:
                     if self.at("..."):
-                        self.error("variadic user functions are not implemented")
+                        # `int f(int n, ...)`. The extra arguments are promoted
+                        # and written into a run of cells at the call, and the
+                        # address of that run is the `va_list`.
+                        self.take("...")
+                        if not parameters:
+                            self.error(
+                                "a variadic function needs a named parameter "
+                                "before the '...', because `va_start` names it"
+                            )
+                        variadic = True
+                        self.take(")")
+                        break
                     parameter_type, parameter_name = self.declarator(
                         self.type_specifier(), optional=True
                     )
@@ -2531,7 +2560,7 @@ class Parser:
             # long as the signature agrees, which check_redeclaration enforced.
             if previous is None:
                 self.functions[name] = Function(
-                    name, result, parameters, None, name_token
+                    name, result, parameters, None, name_token, variadic
                 )
             return
         if previous is not None and previous.body is not None:
@@ -2548,9 +2577,13 @@ class Parser:
         # The signature is registered before the body is parsed so that the
         # function's own name -- and any name a prototype introduced -- resolves
         # inside it. That is what makes direct and mutual recursion parseable.
-        self.functions[name] = Function(name, result, parameters, None, name_token)
+        self.functions[name] = Function(
+            name, result, parameters, None, name_token, variadic
+        )
         body = self.compound_statement()
-        self.functions[name] = Function(name, result, parameters, body, name_token)
+        self.functions[name] = Function(
+            name, result, parameters, body, name_token, variadic
+        )
 
     def check_redeclaration(
         self,
@@ -3054,6 +3087,20 @@ _MAXIMUM_PRECISION = 120
 #: fixed frame buffer, and a width past that would write off the end of it.
 _MAXIMUM_FIELD = 120
 
+#: The two that format into a buffer rather than onto stdout. Compiled like
+#: `printf` is - the format is read here, and the code that writes it out is
+#: emitted - so there is no C library underneath these either.
+_INTO_A_BUFFER = frozenset({"sprintf", "snprintf"})
+
+#: What `<stdarg.h>` gives a program. Each is compiled rather than called:
+#: a `va_list` is a pointer into the cells the call wrote, `va_arg` reads one
+#: and steps past it, and `va_end` has nothing to undo.
+_VARIADIC_BUILTINS = frozenset({"va_start", "va_arg", "va_end", "va_copy"})
+
+#: The hidden parameter a variadic function is given: where its extra
+#: arguments were written. Named so no program can collide with it.
+_VARIADIC_PARAMETER = "__py2bin_va_area"
+
 #: Bytes of frame the floating formatter needs. The digit array holds the EXACT
 #: decimal expansion of a double: 767 digits for the smallest subnormal (its
 #: mantissa times 5**1074), plus one the final rounding carry can add.
@@ -3142,6 +3189,9 @@ class Lowerer:
         self.functions: list[FunctionContext] = []
         self.active: list[str] = []
         self.buffer_slot: int | None = None
+        #: Where formatted output goes when it is not going to stdout:
+        #: (buffer slot, limit slot, count slot) for `snprintf`.
+        self.sink: "tuple[int, int, int] | None" = None
         self.digit_slot: int | None = None
         self.text_slot: int | None = None
         self.float_scratch: dict[str, int] = {}
@@ -4395,9 +4445,14 @@ class Lowerer:
             # that uses the value of it is a caller that is wrong about what
             # it does, so there is nothing to hand back.
             return Value(INT, IntConstant(0))
-        if node.name == "printf":
+        if node.name in _VARIADIC_BUILTINS and node.name not in self.unit.functions:
+            return self.variadic_builtin(node)
+        if node.name in _INTO_A_BUFFER and node.name not in self.unit.functions:
+            return self.formatted_into(node, bounded=node.name == "snprintf")
+        if node.name == "printf" and "printf" not in self.unit.functions:
             self.error(
-                "printf's return value is not implemented; call it as a statement",
+                "printf's return value is not implemented; call it as a "
+                "statement, or use snprintf if the count is what is wanted",
                 node.token,
             )
         if self.lookup(node.name) is not None:
@@ -4578,6 +4633,108 @@ class Lowerer:
         declared = self.unit.externs[name]
         return Value(declared, self.fit(IntLoad(slot), declared))
 
+    def variadic_builtin(self, node: Call) -> Value:
+        """`va_start`, `va_arg`, `va_end` and `va_copy`, written out here.
+
+        A `va_list` is a pointer to the cells the call wrote its extra
+        arguments into, so starting one is an assignment, reading one is a
+        load and a step, and ending one is nothing at all.
+        """
+
+        if node.name == "va_end":
+            return Value(VOID, IntConstant(0))
+        if node.name in ("va_start", "va_copy"):
+            if len(node.arguments) != 2:
+                self.error(f"{node.name} takes two arguments", node.token)
+            ctype, address = self.lvalue(node.arguments[0])
+            if node.name == "va_copy":
+                source = self.rvalue(node.arguments[1])
+                self.emit(HeapStore(address, source.expr, 8))
+                return Value(VOID, IntConstant(0))
+            held = self.lookup(_VARIADIC_PARAMETER)
+            if held is None:
+                self.error(
+                    "va_start is only meaningful inside a function whose "
+                    "parameter list ends with '...'",
+                    node.token,
+                )
+            self.emit(
+                HeapStore(address, HeapLoad(self.address_of(held), 8), 8)
+            )
+            return Value(VOID, IntConstant(0))
+        # `va_arg(ap, T)`: read the cell, then move past it.
+        if len(node.arguments) != 2:
+            self.error("va_arg takes a va_list and a type", node.token)
+        wanted = node.arguments[1]
+        if not isinstance(wanted, TypeArgument):
+            self.error(
+                "the second argument of va_arg has to be a type", node.token
+            )
+        ctype, address = self.lvalue(node.arguments[0])
+        cell = self.new_temp()
+        self.emit(Store(cell, HeapLoad(address, 8)))
+        self.emit(
+            HeapStore(address, _binary("add", IntLoad(cell), IntConstant(8)), 8)
+        )
+        held = wanted.ctype
+        if is_floating(held):
+            # Promoted to a double where it was passed, and rounded here if
+            # the program asked for a float.
+            return Value(
+                held,
+                self.assign_convert(
+                    Value(DOUBLE, BitsFloat(HeapLoad(IntLoad(cell), 8), 8)),
+                    held,
+                    node.token,
+                    "va_arg",
+                ),
+            )
+        return Value(held, self.fit(HeapLoad(IntLoad(cell), 8), held))
+
+    def gather_variadic(self, function: Function, node: Call) -> IntExpression:
+        """Write the arguments past the named ones into a run of cells.
+
+        C promotes what it passes to `...`: an integer narrower than `int`
+        arrives as an `int`, and a `float` as a `double`. Each promoted value
+        takes one eight-byte cell, so `va_arg` is a load and a step forward -
+        which is the whole of what a `va_list` has to be here.
+        """
+
+        extra = node.arguments[len(function.parameters):]
+        area = self.allocate(8 * max(1, len(extra)))
+        for index, argument in enumerate(extra):
+            value = self.rvalue(argument)
+            if is_floating(value.ctype):
+                self.emit(
+                    HeapStore(
+                        _binary("add", SlotAddress(area), IntConstant(index * 8)),
+                        FloatBits(self.promote_float(value), 8),
+                        8,
+                    )
+                )
+                continue
+            if not is_integer(value.ctype) and not isinstance(
+                value.ctype, PointerType
+            ):
+                self.error(
+                    f"a variadic argument has to be a number or a pointer, "
+                    f"not {value.ctype}",
+                    argument.token,
+                )
+            self.emit(
+                HeapStore(
+                    _binary("add", SlotAddress(area), IntConstant(index * 8)),
+                    value.expr,
+                    8,
+                )
+            )
+        return SlotAddress(area)
+
+    def promote_float(self, value: Value) -> FloatExpression:
+        """A `float` argument arrives as a `double`, which C says it must."""
+
+        return value.expr
+
     def prepare_arguments(
         self, function: Function, node: Call
     ) -> list[IntExpression]:
@@ -4593,13 +4750,24 @@ class Lowerer:
         four bytes its object holds.
         """
 
-        if len(node.arguments) != len(function.parameters):
+        if function.variadic:
+            if len(node.arguments) < len(function.parameters):
+                self.error(
+                    f"{function.name}() takes at least "
+                    f"{len(function.parameters)} argument(s), got "
+                    f"{len(node.arguments)}",
+                    node.token,
+                )
+        elif len(node.arguments) != len(function.parameters):
             self.error(
                 f"{function.name}() takes {len(function.parameters)} argument(s), "
                 f"got {len(node.arguments)}",
                 node.token,
             )
         prepared: list[IntExpression] = []
+        area: "IntExpression | None" = (
+            self.gather_variadic(function, node) if function.variadic else None
+        )
         for position, (argument, (parameter_type, _name)) in enumerate(
             zip(node.arguments, function.parameters), 1
         ):
@@ -4610,6 +4778,11 @@ class Lowerer:
                 f"argument {position} of {function.name}()",
             )
             prepared.append(self.stored_bits(converted, parameter_type))
+        if area is not None:
+            # One more argument than the program wrote: where the extras are.
+            # It travels like any other, so the callee finds them whether it
+            # was inlined into this frame or called into one of its own.
+            prepared.append(area)
         return prepared
 
     # --- real calls --------------------------------------------------------
@@ -4696,7 +4869,10 @@ class Lowerer:
                     raise AssertionError(
                         "a parameter must occupy exactly one stack slot"
                     )
-            if self.stack_slots != len(function.parameters):
+            if function.variadic:
+                self.declare(_VARIADIC_PARAMETER, PointerType(CHAR), function.token)
+            wanted = len(function.parameters) + (1 if function.variadic else 0)
+            if self.stack_slots != wanted:
                 raise AssertionError("parameter slots must be slots 0..n-1")
             context = FunctionContext(
                 function,
@@ -4721,7 +4897,7 @@ class Lowerer:
             self.emit_float_dispatch()
             body = IRFunction(
                 function.name,
-                len(function.parameters),
+                len(function.parameters) + (1 if function.variadic else 0),
                 self.peak_slots,
                 self.operations,
             )
@@ -4758,7 +4934,10 @@ class Lowerer:
             )
         prepared = self.prepare_arguments(function, node)
         self.scopes.append({})
-        for (parameter_type, name), expression in zip(function.parameters, prepared):
+        wanted = [*function.parameters]
+        if function.variadic:
+            wanted.append((PointerType(CHAR), _VARIADIC_PARAMETER))
+        for (parameter_type, name), expression in zip(wanted, prepared):
             local = self.declare(name, parameter_type, node.token)
             self.emit(
                 HeapStore(
@@ -4885,8 +5064,14 @@ class Lowerer:
         """A full expression evaluated for its effect, with its value discarded."""
 
         if isinstance(node, Call):
-            if node.name == "printf":
+            if node.name == "printf" and "printf" not in self.unit.functions:
                 self.printf(node)
+                return
+            if node.name in _INTO_A_BUFFER and node.name not in self.unit.functions:
+                self.formatted_into(node, bounded=node.name == "snprintf")
+                return
+            if node.name in _VARIADIC_BUILTINS and node.name not in self.unit.functions:
+                self.variadic_builtin(node)
                 return
             if node.name in self.unit.externs:
                 self.extern_call(node, discarded=True)
@@ -5554,11 +5739,167 @@ class Lowerer:
             self.buffer_slot = self.allocate(self._BUFFER_BYTES)
         return self.buffer_slot
 
+    def put(self, payload: bytes) -> None:
+        """Write literal bytes: to stdout, or into the buffer a sink names.
+
+        Into a buffer they go one at a time. The text between conversions in
+        a format is short, and so is the widest field, so a store apiece is
+        smaller than the loop and the address it would need.
+        """
+
+        if self.sink is None:
+            self.emit(Write(payload))
+            return
+        for byte in payload:
+            self.put_byte(IntConstant(byte))
+
+    def put_byte(self, character: IntExpression) -> None:
+        """One byte into the sink, kept if it fits and counted either way."""
+
+        buffer, limit, count = self.sink
+        past = self.new_label("sink_byte_past")
+        self.emit(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    _binary("add", IntLoad(count), IntConstant(1)),
+                    IntLoad(limit),
+                ),
+                past,
+            )
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", IntLoad(buffer), IntLoad(count)), character, 1
+            )
+        )
+        self.emit(Label(past))
+        self.emit(Store(count, _binary("add", IntLoad(count), IntConstant(1))))
+
+    def put_runtime(self, address: IntExpression, length: IntExpression) -> None:
+        """Write `length` bytes from `address`, wherever the output is going.
+
+        Into a buffer, the copy stops at what the caller said it holds and the
+        count keeps rising past it: `snprintf` answers the length it would
+        have written, which is what lets a caller ask how much room to make.
+        """
+
+        if self.sink is None:
+            self.emit(WriteRuntime(address, length))
+            return
+        buffer, limit, count = self.sink
+        source = self.new_temp()
+        left = self.new_temp()
+        self.emit(Store(source, address))
+        self.emit(Store(left, length))
+        top = self.new_label("sink")
+        end = self.new_label("sink_end")
+        past = self.new_label("sink_past")
+        self.emit(Label(top))
+        self.emit(JumpIfFalse(IntCompare("gt", IntLoad(left), IntConstant(0)), end))
+        # One short of the limit: the last byte of the buffer is the NUL.
+        self.emit(
+            JumpIfFalse(
+                IntCompare(
+                    "lt",
+                    _binary("add", IntLoad(count), IntConstant(1)),
+                    IntLoad(limit),
+                ),
+                past,
+            )
+        )
+        self.emit(
+            HeapStore(
+                _binary("add", IntLoad(buffer), IntLoad(count)),
+                HeapLoad(IntLoad(source), 1),
+                1,
+            )
+        )
+        self.emit(Label(past))
+        self.emit(Store(count, _binary("add", IntLoad(count), IntConstant(1))))
+        self.emit(Store(source, _binary("add", IntLoad(source), IntConstant(1))))
+        # The loop below repeats from here.
+        self.emit(Store(left, _binary("sub", IntLoad(left), IntConstant(1))))
+        self.emit(Jump(top))
+        self.emit(Label(end))
+
+    def formatted_into(self, node: Call, bounded: bool) -> Value:
+        """`sprintf` and `snprintf`: the same formatting, into a buffer.
+
+        C answers the length that *would* have been written, so a caller can
+        ask how much room to make; the copy stops at the room there is, and
+        the terminator goes at the end of what was kept.
+        """
+
+        wanted = 3 if bounded else 2
+        if len(node.arguments) < wanted:
+            self.error(
+                f"{node.name} needs a buffer{', a size' if bounded else ''} "
+                f"and a format",
+                node.token,
+            )
+        target = self.rvalue(node.arguments[0])
+        if not isinstance(target.ctype, PointerType):
+            self.error(
+                f"{node.name} writes through a pointer, not {target.ctype}",
+                node.token,
+            )
+        buffer = self.new_temp()
+        self.emit(Store(buffer, target.expr))
+        limit = self.new_temp()
+        if bounded:
+            room = self.rvalue(node.arguments[1])
+            if not is_integer(room.ctype):
+                self.error(
+                    f"{node.name} needs a size, not {room.ctype}", node.token
+                )
+            self.emit(Store(limit, room.expr))
+        else:
+            # `sprintf` has no limit. Said as a number rather than as a
+            # special case, so the copy is the same code either way.
+            self.emit(Store(limit, IntConstant(_MAXIMUM_STATIC_BYTES)))
+        count = self.new_temp()
+        self.emit(Store(count, IntConstant(0)))
+        held, self.sink = self.sink, (buffer, limit, count)
+        try:
+            self.printf(
+                Call(node.token, node.name, list(node.arguments[wanted - 1:]))
+            )
+        finally:
+            self.sink = held
+        # The terminator goes where the copy stopped, which is the shorter of
+        # what was written and one less than the room. `snprintf(b, 0, ...)`
+        # writes nothing at all, which is what C says a size of zero means.
+        past = self.new_label("no_terminator")
+        self.emit(JumpIfFalse(IntCompare("gt", IntLoad(limit), IntConstant(0)), past))
+        stop = self.new_temp()
+        self.emit(Store(stop, IntLoad(count)))
+        fits = self.new_label("terminator_fits")
+        self.emit(
+            JumpIfFalse(
+                IntCompare(
+                    "gt",
+                    IntLoad(count),
+                    _binary("sub", IntLoad(limit), IntConstant(1)),
+                ),
+                fits,
+            )
+        )
+        self.emit(Store(stop, _binary("sub", IntLoad(limit), IntConstant(1))))
+        self.emit(Label(fits))
+        self.emit(
+            HeapStore(
+                _binary("add", IntLoad(buffer), IntLoad(stop)), IntConstant(0), 1
+            )
+        )
+        self.emit(Label(past))
+        return Value(INT, IntLoad(count))
+
     def printf(self, node: Call) -> None:
         if not node.arguments or not isinstance(node.arguments[0], StringLiteral):
             self.error(
-                "printf needs a literal format string; py2bin reads the format at "
-                "compile time and emits the formatting code itself",
+                f"{node.name} needs a literal format string; py2bin reads the "
+                "format at compile time and emits the formatting code itself",
                 node.token,
             )
         segments = self.parse_format(node.arguments[0])
@@ -5632,7 +5973,7 @@ class Lowerer:
         index = 0
         for kind, payload in segments:
             if kind == "text":
-                self.emit(Write(payload))
+                self.put(payload)
                 continue
             style, precision, value, argument, flags, width = held[index]
             index += 1
@@ -6642,12 +6983,12 @@ class Lowerer:
         # Right-aligned with spaces, which is what a bare width means.
         self.pad_runtime(wanted, IntConstant(32))
         write_flag()
-        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.put_runtime(text, IntLoad(written))
         self.emit(Jump(done))
 
         self.emit(Label(left))
         write_flag()
-        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.put_runtime(text, IntLoad(written))
         self.pad_runtime(wanted, IntConstant(32))
         self.emit(Jump(done))
 
@@ -6655,23 +6996,21 @@ class Lowerer:
         write_flag()
         bare = self.new_label("fp_zero_bare")
         self.emit(JumpIfFalse(IntLoad(negative), bare))
-        self.emit(WriteRuntime(text, IntConstant(1)))
+        self.put_runtime(text, IntConstant(1))
         self.pad_runtime(wanted, IntConstant(48))
-        self.emit(
-            WriteRuntime(
-                _binary("add", text, IntConstant(1)),
-                _binary("sub", IntLoad(written), IntConstant(1)),
-            )
+        self.put_runtime(
+            _binary("add", text, IntConstant(1)),
+            _binary("sub", IntLoad(written), IntConstant(1)),
         )
         self.emit(Jump(done))
         self.emit(Label(bare))
         self.pad_runtime(wanted, IntConstant(48))
-        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.put_runtime(text, IntLoad(written))
         self.emit(Jump(done))
 
         self.emit(Label(plain))
         write_flag()
-        self.emit(WriteRuntime(text, IntLoad(written)))
+        self.put_runtime(text, IntLoad(written))
         self.emit(Label(done))
 
     def pad_runtime(self, count: IntExpression, character: IntExpression) -> None:
@@ -6685,7 +7024,7 @@ class Lowerer:
         end = self.new_label("pad_run_end")
         self.emit(Label(top))
         self.emit(JumpIfFalse(IntCompare("gt", IntLoad(left), IntConstant(0)), end))
-        self.emit(WriteRuntime(base, IntConstant(1)))
+        self.put_runtime(base, IntConstant(1))
         self.emit(Store(left, _binary("sub", IntLoad(left), IntConstant(1))))
         self.emit(Jump(top))
         self.emit(Label(end))
@@ -6696,10 +7035,10 @@ class Lowerer:
         base = SlotAddress(self.print_buffer())
         self.emit(HeapStore(base, expression, 1))
         if width > 1 and "-" not in flags:
-            self.emit(Write(b" " * (width - 1)))
-        self.emit(WriteRuntime(base, IntConstant(1)))
+            self.put(b" " * (width - 1))
+        self.put_runtime(base, IntConstant(1))
         if width > 1 and "-" in flags:
-            self.emit(Write(b" " * (width - 1)))
+            self.put(b" " * (width - 1))
 
     def emit_string(
         self, pointer: IntExpression, flags: str = "", width: int = 0
@@ -6726,7 +7065,7 @@ class Lowerer:
         self.emit(Label(end))
         if width and "-" not in flags:
             self.pad_forward(width, IntLoad(length_slot))
-        self.emit(WriteRuntime(IntLoad(pointer_slot), IntLoad(length_slot)))
+        self.put_runtime(IntLoad(pointer_slot), IntLoad(length_slot))
         if width and "-" in flags:
             self.pad_forward(width, IntLoad(length_slot))
 
@@ -6840,7 +7179,7 @@ class Lowerer:
         self.emit(
             JumpIfFalse(IntCompare("gt", IntLoad(left), IntConstant(0)), end)
         )
-        self.emit(Write(b" "))
+        self.put(b" ")
         self.emit(Store(left, _binary("sub", IntLoad(left), IntConstant(1))))
         self.emit(Jump(top))
         self.emit(Label(end))
@@ -6936,11 +7275,9 @@ class Lowerer:
         if width and ("0" not in flags or "-" in flags):
             if "-" not in flags:
                 self.pad_back(buffer, index_slot, width, 32, False, None)
-        self.emit(
-            WriteRuntime(
-                _binary("add", buffer, IntLoad(index_slot)),
-                _binary("sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)),
-            )
+        self.put_runtime(
+            _binary("add", buffer, IntLoad(index_slot)),
+            _binary("sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)),
         )
         if width and "-" in flags:
             self.pad_forward(

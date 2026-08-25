@@ -1791,6 +1791,10 @@ _BUILTIN_HEADERS = {
     "assert.h": _ASSERT_H,
     "float.h": _FLOAT_H,
     "stddef.h": "#define NULL ((void *)0)\n",
+    # A `va_list` is a pointer to the cells the call wrote its extra arguments
+    # into, and the four names that walk one are compiled rather than called -
+    # so this header is the typedef and nothing else.
+    "stdarg.h": "typedef char *va_list;\n",
     # wchar_t, char16_t and char32_t are keywords in py2bin's C, the way they
     # are in C++, so these headers have no typedefs to give. What they do
     # bring is the handful of functions that go with them, written in C.

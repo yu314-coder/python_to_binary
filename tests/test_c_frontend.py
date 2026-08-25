@@ -1757,11 +1757,53 @@ class RejectionTests(CProgramTestCase):
         self.reject("int f(void) { return 1; }\n", "no int main")
         self.reject("void main(void) { }\n", "int main\\(void\\)")
 
-    def test_variadic_definitions_are_refused(self):
-        self.reject(
-            "int f(int a, ...) { return a; }\nint main(void) { return f(1); }\n",
-            "variadic",
+    def test_a_variadic_function_reads_what_it_was_passed(self):
+        self.run_c(
+            "typedef char *va_list;\n"
+            "static int total(int n, ...) { va_list a; int t = 0; int i;"
+            " va_start(a, n); for (i = 0; i < n; i++) { t += va_arg(a, int); }"
+            " va_end(a); return t; }\n"
+            "int main(void) { return total(3, 1, 2, 4); }\n",
+            status=7,
         )
+
+    def test_a_variadic_argument_narrower_than_int_arrives_promoted(self):
+        # C promotes what it passes to `...`, and a `float` arrives as a
+        # `double` - so `va_arg(a, double)` is what reads one back.
+        self.run_c(
+            "typedef char *va_list;\n"
+            "static int first(int n, ...) { va_list a; double v;"
+            " va_start(a, n); v = va_arg(a, double); va_end(a);"
+            " return (int)(v * 2.0); }\n"
+            "int main(void) { return first(1, 2.5f); }\n",
+            status=5,
+        )
+
+    def test_a_va_list_may_be_handed_to_another_function(self):
+        self.run_c(
+            "typedef char *va_list;\n"
+            "static int inner(int n, va_list a) { int t = 0; int i;"
+            " for (i = 0; i < n; i++) t += va_arg(a, int); return t; }\n"
+            "static int outer(int n, ...) { va_list a; int t; va_start(a, n);"
+            " t = inner(n, a); va_end(a); return t; }\n"
+            "int main(void) { return outer(3, 4, 5, 6); }\n",
+            status=15,
+        )
+
+    def test_va_start_outside_a_variadic_function_is_refused(self):
+        self.reject(
+            "typedef char *va_list;\n"
+            "int main(void) { va_list a; va_start(a, a); return 0; }\n",
+            "parameter list ends with",
+        )
+
+    def test_a_variadic_function_still_needs_a_named_parameter(self):
+        self.reject(
+            "int f(...) { return 0; }\nint main(void) { return f(); }\n",
+            "named parameter before",
+        )
+
+    def test_a_variadic_function_type_is_still_refused(self):
         self.reject(
             "int main(void) { int (*f)(int, ...); return 0; }\n", "variadic"
         )
