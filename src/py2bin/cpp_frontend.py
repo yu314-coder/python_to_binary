@@ -4605,8 +4605,12 @@ def _upcast_assignments(
     )
 
     def assigned(match: "re.Match[str]") -> str:
-        variable, made = match.group(1), match.group(2)
-        wanted = known.get(variable) if variable in pointers else None
+        variable, index, made = match.groups()
+        wanted = (
+            pointer_arrays.get(variable)
+            if index
+            else (known.get(variable) if variable in pointers else None)
+        )
         if wanted is None or wanted == made or not _derives_from(made, wanted, classes):
             return match.group(0)
         head, call = match.group(0).split("=", 1)
@@ -4620,9 +4624,12 @@ _DECLARED_FROM_NEW = re.compile(
     r"\bstruct\s+([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*"
     r"([A-Za-z_]\w*)__new(?:__\d+|_array)?\s*\("
 )
-#: The same, assigning to a pointer declared earlier.
+#: The same, assigning to a pointer declared earlier - or to an element of an
+#: array of them, which is how a program keeps a mixture of things that share
+#: a base: `all[0] = new Sub();`.
 _ASSIGNED_FROM_NEW = re.compile(
-    r"\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)__new(?:__\d+|_array)?\s*\("
+    r"\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*=\s*"
+    r"([A-Za-z_]\w*)__new(?:__\d+|_array)?\s*\("
 )
 
 
@@ -7062,6 +7069,16 @@ def translate(source: str, filename: str = "<c++>") -> str:
         remainder, _function_signatures(remainder, classes), classes
     )
     rewritten = _rewrite_functions(remainder, classes, made, scope)
+    # `dynamic_cast<D *>(p)` asks at run time what an object really is. This
+    # unit is the whole program, so the answer is in the table the object
+    # carries: it is a D if that table is D's own or belongs to a class
+    # derived from D. Written after the bodies, because the calls it answers
+    # are in them.
+    rewritten, asked = _rewrite_dynamic_casts(rewritten, classes, filename)
+    if asked:
+        definitions += "\n" + "\n".join(
+            _emit_dynamic_cast(name, order, classes) for name in asked
+        )
     head = "\n".join(directives)
     if throws:
         head = f"{_EXCEPTION_STATE}{head}"
@@ -7099,6 +7116,90 @@ _DELETE = re.compile(r"\bdelete\b\s*(\[\s*\])?\s*([^;]+);")
 #: hands back 16-byte-aligned memory and the array has to stay that way.
 _ARRAY_COOKIE = 16
 
+
+
+#: `dynamic_cast<D *>(p)`. Only to a pointer: a cast to a reference throws on
+#: failure, and this subset answers with a null instead.
+_DYNAMIC_CAST = re.compile(r"\bdynamic_cast\s*<([^<>]+)>\s*\(")
+
+
+def _dynamic_cast_name(name: str) -> str:
+    return f"__py2bin_as_{name}"
+
+
+def _rewrite_dynamic_casts(
+    body: str, classes: "dict[str, Class]", filename: str
+) -> "tuple[str, list[str]]":
+    """`dynamic_cast<D *>(p)` becomes a call that checks and then casts."""
+
+    asked: "list[str]" = []
+    out: list[str] = []
+    at = 0
+    for found in _DYNAMIC_CAST.finditer(body):
+        if found.start() < at:
+            continue
+        wanted = found.group(1).replace("*", "").replace("struct", "").strip()
+        close = _closing_paren(body, found.end() - 1)
+        if close < 0:
+            continue
+        if wanted not in classes or not _is_polymorphic(wanted, classes):
+            raise CppTranslationError(
+                filename,
+                _line_of(body, found.start()),
+                f"dynamic_cast to {wanted}, which has no virtual functions - "
+                f"there is nothing in the object that says what it is. Give "
+                f"the base a virtual destructor, or use a plain cast",
+            )
+        if "*" not in found.group(1):
+            raise CppTranslationError(
+                filename,
+                _line_of(body, found.start()),
+                "dynamic_cast to a reference throws when it fails, and this "
+                "subset has no way to say so; cast to a pointer and test it",
+            )
+        if wanted not in asked:
+            asked.append(wanted)
+        out.append(body[at:found.start()])
+        out.append(
+            f"{_dynamic_cast_name(wanted)}((void *)({body[found.end(): close]}))"
+        )
+        at = close + 1
+    out.append(body[at:])
+    return "".join(out), asked
+
+
+def _emit_dynamic_cast(
+    wanted: str, order: "list[str]", classes: "dict[str, Class]"
+) -> str:
+    """The function that answers whether an object really is a `wanted`.
+
+    Every table in the unit that belongs to `wanted` or to something derived
+    from it. That is the whole answer: py2bin has no linker, so this
+    translation unit is the program and there is no class it has not seen.
+    """
+
+    root = wanted
+    while classes[root].base and _carries_vptr(classes[root].base, classes):
+        root = classes[root].base
+    path = _vptr_path(root, classes)
+    tables = [
+        _vtable_name(name)
+        for name in order
+        if _is_polymorphic(name, classes)
+        and (name == wanted or _derives_from(name, wanted, classes))
+    ]
+    if not tables:
+        return ""
+    test = " || ".join(f"held == {one}" for one in tables)
+    return (
+        f"static struct {wanted} *{_dynamic_cast_name(wanted)}(void *__p) {{\n"
+        f"    void **held;\n"
+        f"    if (__p == 0) {{ return 0; }}\n"
+        f"    held = ((struct {root} *)__p)->{path};\n"
+        f"    if ({test}) {{ return (struct {wanted} *)__p; }}\n"
+        f"    return 0;\n"
+        f"}}"
+    )
 
 def _emit_heap_helpers(found: "Class", classes: "dict[str, Class]") -> str:
     """`T__new` and friends: allocate, then construct, in that order.
