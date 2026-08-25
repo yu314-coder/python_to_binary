@@ -453,6 +453,25 @@ real file and line rather than guessed at.
 `.py` one: any `.c` beside it that does not define its own `main` is compiled
 with it, and an `include/` directory beside it is searched.
 
+**A `static` object inside a block** is one object with the scope of the name
+that declares it, and it keeps its value between calls. That used to be
+refused, and for a reason: py2bin inlines a body rather than calling it, so a
+function compiled into three call sites would have got three objects instead
+of the one C promises. The slot is keyed by the declaration itself now, so
+every inlining of that body names the same one — and the initial value is
+written with the file-scope objects, because a store where the declaration
+stands would run again on every call.
+
+**Bitfields** are laid out, read and written: `unsigned int flags : 3;` packs
+into a storage unit of its declared type and the next field continues in the
+same unit while it fits, which is what every ABI py2bin targets does. A read
+shifts down and masks, and a signed field gets back the sign its own width
+carries — three bits holding -1 read as -1 and not as 7. A write is a
+read-modify-write, so the fields beside it keep their values. `: 0` closes the
+unit without taking any of it, an unnamed field pads without being reachable,
+and `&f.a` is refused with the reason, because a bitfield has no address of
+its own.
+
 **Braced initialisers** work for whatever they nest: `struct P a = {1, 2}`, a
 struct inside a struct, an array of structs, a two-dimensional array, a string
 member, a union, a partly-filled list (C zero-fills the rest, and so does
@@ -606,7 +625,7 @@ code before it emits anything, which is where they are done here:
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
 | **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is how one is held, because the class's name is generated — and `std::function<int(int)> f = ...` becomes exactly that. `[x]` copies, `[&x]` holds the address and every use follows it, `[this]` holds the enclosing object and bare member names go through it, `[=]`/`[&]` capture what the body uses — including the object, the same rule C++ applies — and `[v = n * 2]` is a member initialised from an expression the scope has no name for. `[](auto a, auto b)` is a member template in C++; here the types are read from the calls, and calls that disagree are refused rather than compiled once and run for both |
 | **`dynamic_cast`** | answered from the table the object carries. py2bin has no linker, so a translation unit is the whole program and there is no class it has not seen: an object is a `D` if its table is D's own or belongs to something derived from D. A cast that fails answers null |
-| **The rest of it** | enums (plain and scoped), unions, `static` data members and member functions, nested classes, member typedefs (`vector<int>::iterator`), range-`for` (over a container, over a plain array, and by reference), member initialiser lists, default arguments, named casts, `explicit`, function-pointer members, `auto`, `using X = Y`, aggregate and braced initialisers, `bool`/`true`/`false`/`nullptr`, forward declarations, members defined outside their class, prototypes in headers, and free functions that return a class by value |
+| **The rest of it** | enums (plain, scoped, and with an underlying type named), unions, bitfields, `static` data members, member functions and block-scope statics, objects at file scope with or without constructor arguments, nested classes, nested namespaces (`namespace a::b`), member typedefs (`vector<int>::iterator`), range-`for` (over a container, over a plain array, and by reference), member initialiser lists (including a member of class type, built with what the list gave it), default member initialisers (`int n = 7;`), `= default` and `= delete`, `final` and `override`, default arguments, named casts, `explicit`, function-pointer members, `auto`, `using X = Y`, aggregate and braced initialisers, arrays of objects built from a brace list, `bool`/`true`/`false`/`nullptr`, forward declarations, members defined outside their class, prototypes in headers, and free functions that return a class by value |
 | **`operator()`** | a call on an object, so `std::sort(v.begin(), v.end(), cmp)` takes a lambda or a function object alike |
 
 **Standard headers**, each written in py2bin's own C++ subset and put
@@ -680,7 +699,9 @@ in the C and a call that can throw is given a statement of its own — which
 means one behind `&&`, `||` or `?:`, or in a loop's header, is refused with
 the reason rather than moved to where it would run at the wrong time. An
 exception reaching the end of `main` aborts in C++; there is no way to raise a
-signal here, so the program exits with a status of its own instead. Multiple
+signal here, so the program exits with a status of its own instead. A bare
+`throw;` inside a `catch` rethrows what is in flight, and a `try` inside a
+`try` nests the way C++ says. Multiple
 inheritance and the rest of RTTI (`typeid`, `type_info`) are not implemented;
 `dynamic_cast` is, because the table the object already carries answers it. Two overloads that
 differ only in types py2bin cannot read are refused rather than guessed at.

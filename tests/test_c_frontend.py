@@ -1557,6 +1557,53 @@ class RejectionTests(CProgramTestCase):
             "must be a constant expression",
         )
 
+    def test_a_bitfield_reads_back_what_was_written_to_it(self):
+        self.run_c(
+            "struct F { unsigned int a : 3; unsigned int b : 5; };\n"
+            "int main(void) { struct F f; f.a = 5; f.b = 20;"
+            " return f.a * 10 + f.b; }\n",
+            status=70,
+        )
+
+    def test_a_signed_bitfield_keeps_the_sign_its_width_carries(self):
+        # Three bits holding -1 read back as 7 without the sign extension the
+        # field's own width calls for.
+        self.run_c(
+            "struct S { signed int a : 4; };\n"
+            "int main(void) { struct S s; s.a = -3; return s.a + 10; }\n",
+            status=7,
+        )
+
+    def test_a_bitfield_leaves_the_rest_of_its_unit_alone(self):
+        self.run_c(
+            "struct F { unsigned int a : 4; unsigned int b : 4; };\n"
+            "int main(void) { struct F f; f.a = 9; f.b = 5; f.a = 2;"
+            " return f.a * 10 + f.b; }\n",
+            status=25,
+        )
+
+    def test_a_zero_width_bitfield_only_closes_the_unit(self):
+        self.run_c(
+            "struct W { unsigned char a : 2; unsigned char : 0;"
+            " unsigned char b : 2; };\n"
+            "int main(void) { return (int)sizeof(struct W); }\n",
+            status=2,
+        )
+
+    def test_a_bitfield_has_no_address_of_its_own(self):
+        self.reject(
+            "struct F { unsigned int a : 3; };\n"
+            "int main(void) { struct F f; unsigned int *p = &f.a; return *p; }\n",
+            "no address of its own",
+        )
+
+    def test_a_bitfield_wider_than_its_type_is_refused(self):
+        self.reject(
+            "struct F { unsigned char a : 9; };\n"
+            "int main(void) { struct F f; f.a = 1; return f.a; }\n",
+            "holds between 0 and 8 bits",
+        )
+
     def test_a_block_scope_static_keeps_its_value_between_calls(self):
         # It used to be refused, because a body compiled into several call
         # sites would get one object per inlining rather than the single

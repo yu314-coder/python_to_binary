@@ -700,11 +700,21 @@ class FunctionType:
         return f"{self.result} ({inside})"
 
 
+#: What an unnamed bitfield is called, so the passes that walk members can
+#: tell padding from something a program can write to.
+_UNNAMED_BITFIELD = "__py2bin_pad_"
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class Member:
     name: str
     ctype: "CType"
     offset: int
+    #: For a bitfield: how wide it is, and where in the storage unit at
+    #: `offset` its low bit sits. `width` is None for an ordinary member,
+    #: which is the whole of what tells the two apart.
+    width: "int | None" = None
+    bit: int = 0
 
 
 @dataclasses.dataclass(slots=True)
@@ -779,18 +789,53 @@ def align_of(ctype: "CType") -> int:
     return 1
 
 
-def lay_out(struct: StructType, members: list[tuple[str, "CType"]]) -> None:
-    """Assign member offsets and set the struct's size and alignment."""
+def lay_out(
+    struct: StructType,
+    members: "list[tuple[str, CType] | tuple[str, CType, int]]",
+) -> None:
+    """Assign member offsets and set the struct's size and alignment.
+
+    A member given a width is a bitfield: it is packed into a storage unit of
+    its own declared type, and the next one continues in the same unit while
+    it fits. That is what every ABI py2bin targets does, and it is the only
+    part of a bitfield's layout C says anything about beyond "it fits".
+    """
 
     placed: list[Member] = []
     offset = 0
     alignment = 1
-    for name, ctype in members:
+    #: Where the bitfield being filled starts, and how much of it is used.
+    unit_at = -1
+    unit_bits = 0
+    unit_size = 0
+    for entry in members:
+        name, ctype = entry[0], entry[1]
+        width = entry[2] if len(entry) > 2 else None
         member_alignment = align_of(ctype)
         member_size = size_of(ctype) or 0
         alignment = max(alignment, member_alignment)
+        if width is not None and not struct.is_union:
+            if width == 0:
+                # Closes whatever unit is being filled and takes no bits of
+                # its own, which is the only thing C gives a zero width to
+                # mean. It does not reserve a unit: the next field starts one.
+                offset = (offset + member_alignment - 1) & ~(member_alignment - 1)
+                unit_at, unit_bits, unit_size = -1, 0, 0
+                continue
+            if unit_at < 0 or unit_size != member_size or (
+                unit_bits + width > member_size * 8
+            ):
+                # A new storage unit: this one is full, or the first, or of a
+                # different width.
+                offset = (offset + member_alignment - 1) & ~(member_alignment - 1)
+                unit_at, unit_bits, unit_size = offset, 0, member_size
+                offset += member_size
+            placed.append(Member(name, ctype, unit_at, width, unit_bits))
+            unit_bits += width
+            continue
+        unit_at, unit_bits, unit_size = -1, 0, 0
         if struct.is_union:
-            placed.append(Member(name, ctype, 0))
+            placed.append(Member(name, ctype, 0, width, 0))
             offset = max(offset, member_size)
             continue
         # Pad forward to this member's own alignment.
@@ -1665,7 +1710,7 @@ class Parser:
         if struct.members is not None:
             self.error(f"{struct} is defined twice", keyword)
         self.take("{")
-        members: list[tuple[str, CType]] = []
+        members: "list[tuple[str, CType] | tuple[str, CType, int]]" = []
         seen: set[str] = set()
         while not self.accept("}"):
             if self.token.kind == "eof":
@@ -1674,7 +1719,28 @@ class Parser:
             base = self.type_specifier()
             while True:
                 name_token = self.token
+                if self.at(":"):
+                    # `unsigned int : 3;` - an unnamed bitfield, which pads and
+                    # is not reachable. It still takes its bits.
+                    self.take(":")
+                    width = self.bitfield_width(base, "", member_start)
+                    members.append(
+                        (f"{_UNNAMED_BITFIELD}{len(members)}", base, width)
+                    )
+                    if not self.accept(","):
+                        break
+                    continue
                 ctype, member_name = self.declarator(base)
+                if self.at(":"):
+                    self.take(":")
+                    width = self.bitfield_width(ctype, member_name, name_token)
+                    if member_name in seen:
+                        self.error(f"duplicate member {member_name!r}", name_token)
+                    seen.add(member_name)
+                    members.append((member_name, ctype, width))
+                    if not self.accept(","):
+                        break
+                    continue
                 if member_name in seen:
                     self.error(
                         f"duplicate member {member_name!r}", name_token
@@ -1710,6 +1776,33 @@ class Parser:
             self.error("an empty struct has no size in C", keyword)
         lay_out(struct, members)
         return struct
+
+    def bitfield_width(self, ctype: CType, name: str, token: Token) -> int:
+        """The `: 3` on a member: how many bits of its storage unit it takes."""
+
+        spelled = ConstantEvaluator(self.filename).value(
+            self.assignment_expression()
+        )
+        held = size_of(ctype)
+        if not isinstance(ctype, IntegerType) or held is None:
+            self.error(
+                f"a bitfield has to have an integer type, and {name or 'this one'} "
+                f"is declared {ctype}",
+                token,
+            )
+        if spelled < 0 or spelled > held * 8:
+            self.error(
+                f"a bitfield of {ctype} holds between 0 and {held * 8} bits, "
+                f"and {name or 'this one'} asks for {spelled}",
+                token,
+            )
+        if spelled == 0 and name:
+            self.error(
+                "only an unnamed bitfield may be zero bits wide; that is what "
+                "says the next one starts a new storage unit",
+                token,
+            )
+        return spelled
 
     def type_specifier(self) -> CType:
         """Parse a declaration specifier list into one type."""
@@ -3069,6 +3162,9 @@ class Lowerer:
         #: Keyed that way so a body inlined into several call sites still
         #: names one object, which is what C says a static local is.
         self.stored_locals: "dict[tuple[int, str], Local]" = {}
+        #: The bitfield the last `lvalue` answered about, if it was one. A
+        #: bitfield has no address, so the caller gets its unit's and this.
+        self.packed: "Member | None" = None
         self.static_bytes = 0
 
     # --- bookkeeping ---
@@ -3411,6 +3507,11 @@ class Lowerer:
                 self.error(
                     f"{owner} has no member named {node.name!r}", node.token
                 )
+            # A bitfield is some of the bits of the unit it shares, so what
+            # is answered here is that unit's address and the member is left
+            # where the caller can find it. Everything that reads or writes
+            # one looks; `&` refuses.
+            self.packed = member if member.width is not None else None
             if member.offset == 0:
                 return member.ctype, address
             return member.ctype, IntBinary(
@@ -3498,7 +3599,10 @@ class Lowerer:
                 )
             return self.load(local.ctype, self.address_of(local))
         if isinstance(node, (Index, MemberAccess)):
+            self.packed = None
             ctype, address = self.lvalue(node)
+            if self.packed is not None:
+                return self.load_bitfield(self.packed, address)
             return self.load(ctype, address)
         if isinstance(node, Unary):
             return self.unary(node)
@@ -3588,7 +3692,15 @@ class Lowerer:
 
     def unary(self, node: Unary) -> Value:
         if node.operator == "&":
+            self.packed = None
             ctype, address = self.lvalue(node.operand)
+            if self.packed is not None:
+                self.error(
+                    f"{self.packed.name!r} is a bitfield, which has no address "
+                    f"of its own: it is some of the bits of the unit it shares. "
+                    f"Copy it into an object of its own first",
+                    node.token,
+                )
             return Value(PointerType(ctype), address)
         if node.operator == "*":
             ctype, address = self.lvalue(node)
@@ -3999,8 +4111,73 @@ class Lowerer:
             remaining -= unit
         return Value(ctype, destination)
 
+    def load_bitfield(self, member: Member, address: IntExpression) -> Value:
+        """Read the bits this member owns out of the unit it shares.
+
+        Shifted down, masked to its width, and - for a signed one - given
+        back the sign C says those bits carry. Without that last step a
+        `signed int f : 3` holding -1 would read as 7.
+        """
+
+        held = member.ctype
+        size = size_of(held) or 1
+        unit = self.load(held, address).expr
+        shifted = (
+            _binary("urshift", unit, IntConstant(member.bit))
+            if member.bit
+            else unit
+        )
+        mask = (1 << member.width) - 1
+        value = _binary("and", shifted, IntConstant(mask))
+        if held.signed and member.width < size * 8:
+            # The field's own sign bit, brought back: `(v ^ s) - s` where `s`
+            # is that bit. Written this way because it is two instructions
+            # and needs no branch.
+            sign = 1 << (member.width - 1)
+            value = _binary(
+                "sub", _binary("xor", value, IntConstant(sign)), IntConstant(sign)
+            )
+        return Value(held, self.from_bits(value, held))
+
+    def assign_bitfield(
+        self, node: Assignment, member: Member, address: IntExpression
+    ) -> Value:
+        """Write this member's bits, leaving the rest of the unit alone.
+
+        Read, clear, or in, store. C says the value is truncated to the
+        field's width, and the result of the assignment is what was stored -
+        so the answer is read back out rather than being what was written.
+        """
+
+        held = member.ctype
+        address = self.stabilize(address)
+        if node.operator == "=":
+            value = self.rvalue(node.value)
+            stored = self.assign_convert(value, held, node.token, "this assignment")
+        else:
+            current = self.load_bitfield(member, address)
+            operand = self.rvalue(node.value)
+            combined = self.apply(node.operator[:-1], current, operand, node.token)
+            stored = self.assign_convert(
+                combined, held, node.token, "this compound assignment"
+            )
+        mask = (1 << member.width) - 1
+        bits = self.materialize(self.stored_bits(stored, held))
+        unit = self.load(held, address).expr
+        kept = _binary("and", unit, IntConstant(~(mask << member.bit)))
+        put = _binary(
+            "lshift", _binary("and", bits, IntConstant(mask)), IntConstant(member.bit)
+        )
+        self.emit(
+            HeapStore(address, _binary("or", kept, put), size_of(held))
+        )
+        return self.load_bitfield(member, address)
+
     def assignment(self, node: Assignment) -> Value:
+        self.packed = None
         ctype, address = self.lvalue(node.target)
+        if self.packed is not None:
+            return self.assign_bitfield(node, self.packed, address)
         if isinstance(ctype, ArrayType):
             self.error("an array is not assignable", node.token)
         address = self.stabilize(address)
@@ -4967,6 +5144,42 @@ class Lowerer:
             return
         self.emit(HeapStore(base, bits, size_of(ctype)))
 
+    def packed_unit(
+        self,
+        members: "list[Member]",
+        position: int,
+        items: "list[object]",
+        index: int,
+        token: Token,
+    ) -> "tuple[IntExpression, int]":
+        """One store's worth of bitfields, and how many values it used."""
+
+        offset = members[position].offset
+        combined: IntExpression = IntConstant(0)
+        while position < len(members) and index < len(items):
+            member = members[position]
+            if member.width is None or member.offset != offset:
+                break
+            if member.name.startswith(_UNNAMED_BITFIELD):
+                position += 1
+                continue
+            value = self.static_value(
+                items[index], member.ctype, token, f"the value for {member.name!r}"
+            )
+            mask = (1 << member.width) - 1
+            combined = _binary(
+                "or",
+                combined,
+                _binary(
+                    "lshift",
+                    _binary("and", value, IntConstant(mask)),
+                    IntConstant(member.bit),
+                ),
+            )
+            position += 1
+            index += 1
+        return combined, index
+
     def struct_initializer(
         self,
         base: "IntExpression",
@@ -4991,19 +5204,39 @@ class Lowerer:
         members = list(ctype.members)
         if ctype.is_union:
             members = members[:1]
-        if len(items) > len(members):
+        named = [
+            one for one in members if not one.name.startswith(_UNNAMED_BITFIELD)
+        ]
+        if len(items) > len(named):
             self.error(
                 f"the initializer has {len(items)} values but {ctype} holds "
-                f"{len(members)}",
+                f"{len(named)}",
                 token,
             )
-        for member, item in zip(members, items):
+        index = 0
+        for position, member in enumerate(members):
+            if member.name.startswith(_UNNAMED_BITFIELD):
+                # Padding: C gives it no value, so it takes none of the list.
+                continue
+            if index >= len(items):
+                break
             where = (
                 base
                 if member.offset == 0
                 else _binary("add", base, IntConstant(member.offset))
             )
-            self.aggregate_initializer(where, member.ctype, item, token, static=static)
+            if member.width is not None:
+                # Every bitfield sharing this unit is written by one store:
+                # storing them one at a time would each write the whole unit
+                # and the last would be the only one left.
+                taken = self.packed_unit(members, position, items, index, token)
+                self.emit(HeapStore(where, taken[0], size_of(member.ctype)))
+                index = taken[1]
+                continue
+            self.aggregate_initializer(
+                where, member.ctype, items[index], token, static=static
+            )
+            index += 1
         # C zero-fills what the braces leave out; a static object already is.
         if static or len(items) == len(members):
             return

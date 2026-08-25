@@ -717,7 +717,7 @@ def _function_definitions(text: str) -> "dict[str, tuple[str, str]]":
 
 
 #: Words that say where a function lives rather than what it answers.
-_STORAGE = frozenset({"static", "inline", "extern", "__inline"})
+_STORAGE = frozenset({"static", "inline", "extern", "__inline", "constexpr"})
 
 
 def _function_type_name(spelled: str, text: str) -> "str | None":
@@ -2820,6 +2820,12 @@ def _every_body(text: str) -> "list[tuple[re.Match[str], int, str, str]]":
     found = []
     for match in _ANY_DEFINITION.finditer(text):
         head = match.group(1).strip()
+        # How a function is stored is not part of what it is. Read as the
+        # first word of the return type, `static` put the whole body outside
+        # what this reads - so a `throw` inside a `static` function was never
+        # rewritten, while the same function without the word was.
+        while head.split() and head.split()[0] in _STORAGE:
+            head = head.split(None, 1)[1] if " " in head else ""
         if not head or head.split()[0] in _NOT_A_TYPE:
             continue
         words = head.replace("*", " * ").replace("&", " & ").split()
@@ -4816,7 +4822,12 @@ _VALUE_INIT = re.compile(
 )
 
 #: `Vec bank[3];` - an array of objects, each of which C++ default-constructs.
-_OBJECT_ARRAY = re.compile(r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*;")
+#: Not one already written as C: `struct A xs[3];` is what the pass that
+#: builds an array from a brace list leaves behind, and every element of that
+#: one has been constructed already.
+_OBJECT_ARRAY = re.compile(
+    r"(?<!struct )\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*;"
+)
 #: `Shape *all[3];` - an array of pointers, which is how a program holds a
 #: mixture of things that share a base.
 _POINTER_ARRAY = re.compile(
@@ -5326,6 +5337,77 @@ def _statement_start(body: str, at: int) -> int:
 _TEMPORARY = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(")
 
 
+
+#: `A xs[3] = {A(1), A(2)};` - an array of objects, each given its arguments.
+_OBJECT_ARRAY_VALUES = re.compile(
+    r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\[\s*(\d*)\s*\]\s*=\s*\{"
+)
+
+
+def _rewrite_object_array_values(
+    body: str, classes: "dict[str, Class]", known: "dict[str, str]"
+) -> str:
+    """Construct each element of an array of objects where it stands.
+
+    C has no expression that constructs, and an array's brace list is not a
+    place a statement can go - so each element becomes a call after the
+    declaration, in the order C++ builds them.
+    """
+
+    if not classes:
+        return body
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    for match in _OBJECT_ARRAY_VALUES.finditer(bare):
+        if match.start() < at:
+            continue
+        held, variable, count = match.groups()
+        if held not in classes:
+            continue
+        owner = _find_method(held, "", classes)
+        if owner is None:
+            continue
+        closing = _matching(bare, match.end() - 1)
+        pieces = _split_arguments(body[match.end(): closing - 1])
+        values = [piece.strip() for piece in pieces if piece.strip()]
+        if count and int(count) < len(values):
+            continue
+        known[variable] = held
+        # Written as C already, so the pass that default-constructs an array
+        # of objects leaves it alone: every element here is built below.
+        made = [f"struct {held} {variable}[{count or len(values)}];"]
+        for index, value in enumerate(values):
+            built = re.match(rf"^{re.escape(held)}\s*\((.*)\)$", value, re.S)
+            spot = f"&{variable}[{index}]"
+            if built is not None:
+                given = (
+                    [one.strip() for one in _split_arguments(built.group(1))]
+                    if built.group(1).strip()
+                    else []
+                )
+                passed = f", {built.group(1)}" if built.group(1).strip() else ""
+                made.append(
+                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
+                    f"({spot}{passed});"
+                )
+                continue
+            # Anything else is an object already built, and C++ copies it.
+            made.append(_copied_in(held, f"{variable}[{index}]", f"&{value}", classes))
+        # Whatever the braces did not fill, C++ default-constructs.
+        for index in range(len(values), int(count) if count else len(values)):
+            made.append(
+                f"{_c_name(owner, '', _call_suffix(owner, '', classes, []))}"
+                f"(&{variable}[{index}]);"
+            )
+        out.append(body[at:match.start()])
+        out.append(" ".join(made))
+        at = closing
+        while at < len(body) and body[at] in " ;":
+            at += 1
+    out.append(body[at:])
+    return "".join(out)
+
 def _rewrite_temporaries(
     body: str, classes: "dict[str, Class]", counter: "list[int]"
 ) -> str:
@@ -5577,6 +5659,12 @@ def _rewrite_body(
     # the rewrite below is the storage on its own.
     body = _hoist_new_initialisers(body, classes, [0])
     body = _rewrite_new(body, classes, scope())
+
+    # `A xs[3] = {A(1), A(2), A(3)};` - each element is constructed where it
+    # stands. Before the temporaries pass, which would otherwise hoist each
+    # `A(1)` to the start of the statement and leave the braces holding
+    # declarations.
+    body = _rewrite_object_array_values(body, classes, known)
 
     # `V(5)` written where a value goes: C has no expression that constructs,
     # so each temporary becomes an object with a name ahead of the statement.
@@ -5941,6 +6029,13 @@ def _rewrite_body(
 _BLOCK_MARK = "\x00py2bin_block_%d\x00"
 
 
+
+def _initialiser_brace(body: str, index: int) -> bool:
+    """Whether the `{` at `index` opens a list of values rather than a scope."""
+
+    before = body[:index].rstrip()
+    return before.endswith("=") or before.endswith(",")
+
 def _lift_nested(body: str) -> "tuple[str, list[str]]":
     """Take each nested block out, leaving a marker.
 
@@ -5958,11 +6053,21 @@ def _lift_nested(body: str) -> "tuple[str, list[str]]":
         char = body[index]
         if char == "{":
             depth += 1
-            if depth == 2:
+            if depth == 2 and not _initialiser_brace(body, index):
                 closing = _matching(body, index)
                 out.append(_BLOCK_MARK % len(blocks))
                 blocks.append(body[index:closing])
                 depth -= 1
+                index = closing
+                continue
+            if depth == 2:
+                # `A xs[3] = { ... };` is a list of values, not a scope. Taken
+                # out as a block, the pass that constructs each element never
+                # saw it, and a declaration written inside one would have been
+                # scoped to a block that does not exist.
+                depth -= 1
+                closing = _matching(body, index)
+                out.append(body[index:closing])
                 index = closing
                 continue
         elif char == "}":
@@ -7576,6 +7681,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # Before the arguments are given their addresses: a temporary is an
     # object, and an object passed by value is passed by address - but only
     # if it exists by the time that pass runs.
+    # Before the temporaries: `A xs[3] = {A(1), A(2)};` builds each element
+    # where it stands, and a temporary hoisted out of the braces would be
+    # hoisted to the start of the statement - which is inside them.
+    remainder = _rewrite_object_array_values(remainder, classes, {})
     remainder = _rewrite_temporaries(remainder, classes, [0])
     remainder = _address_reference_arguments(
         remainder, _function_signatures(remainder, classes), classes
