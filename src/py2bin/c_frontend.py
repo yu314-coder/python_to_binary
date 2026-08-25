@@ -4688,6 +4688,11 @@ class Lowerer:
                     self.address_of(local), ctype, initializer, node.token
                 )
                 continue
+            if isinstance(ctype, StructType) and isinstance(initializer, tuple):
+                self.struct_initializer(
+                    self.address_of(local), ctype, initializer, node.token
+                )
+                continue
             if isinstance(initializer, tuple):
                 token, items = initializer
                 if len(items) != 1 or isinstance(items[0], tuple):
@@ -4749,11 +4754,10 @@ class Lowerer:
             self.array_initializer(base, ctype, initializer, entry.token, static=True)
             return
         if isinstance(ctype, StructType):
-            self.error(
-                "initializing a file-scope struct or union is not implemented; "
-                "declare it and assign its members in main()",
-                entry.token,
+            self.struct_initializer(
+                base, ctype, initializer, entry.token, static=True
             )
+            return
         if isinstance(initializer, tuple):
             token, items = initializer
             if len(items) != 1 or isinstance(items[0], tuple):
@@ -4810,6 +4814,95 @@ class Lowerer:
             token,
         )
 
+    def aggregate_initializer(
+        self,
+        base: "IntExpression",
+        ctype: "CType",
+        initializer: object,
+        token: Token,
+        *,
+        static: bool = False,
+    ) -> None:
+        """Initialize whatever is at ``base``, of whatever shape it is.
+
+        An array, a struct, or a scalar. Written as one entry point because a
+        member may be any of the three and C nests them freely.
+        """
+
+        if isinstance(ctype, ArrayType):
+            self.array_initializer(base, ctype, initializer, token, static=static)
+            return
+        if isinstance(ctype, StructType):
+            if not isinstance(initializer, tuple):
+                self.error(
+                    f"{ctype} needs a braced initializer, not a single value",
+                    token,
+                )
+            self.struct_initializer(base, ctype, initializer, token, static=static)
+            return
+        if isinstance(initializer, tuple):
+            _brace, items = initializer
+            if len(items) != 1 or isinstance(items[0], tuple):
+                self.error(
+                    "a braced initializer for a scalar needs exactly one value",
+                    token,
+                )
+            initializer = items[0]
+        if static:
+            stored = self.static_value(initializer, ctype, token, "the initializer")
+        else:
+            stored = self.assign_convert(
+                self.rvalue(initializer), ctype, token, "the initializer"
+            )
+        bits = self.stored_bits(stored, ctype)
+        if static and bits == IntConstant(0):
+            return
+        self.emit(HeapStore(base, bits, size_of(ctype)))
+
+    def struct_initializer(
+        self,
+        base: "IntExpression",
+        ctype: StructType,
+        initializer: object,
+        token: Token,
+        *,
+        static: bool = False,
+    ) -> None:
+        """`struct P a = {1, 2};` - each value goes to the member it lines up with.
+
+        In declaration order, which is what C says the braces mean without
+        designators. A union takes one value, for its first member, because
+        every member of one starts at the same place.
+        """
+
+        if ctype.members is None:
+            self.error(f"{ctype} is not complete here", token)
+        if isinstance(initializer, StringLiteral) or not isinstance(initializer, tuple):
+            self.error(f"{ctype} needs a braced initializer", token)
+        _brace, items = initializer
+        members = list(ctype.members)
+        if ctype.is_union:
+            members = members[:1]
+        if len(items) > len(members):
+            self.error(
+                f"the initializer has {len(items)} values but {ctype} holds "
+                f"{len(members)}",
+                token,
+            )
+        for member, item in zip(members, items):
+            where = (
+                base
+                if member.offset == 0
+                else _binary("add", base, IntConstant(member.offset))
+            )
+            self.aggregate_initializer(where, member.ctype, item, token, static=static)
+        # C zero-fills what the braces leave out; a static object already is.
+        if static or len(items) == len(members):
+            return
+        filled = members[len(items)].offset if items else 0
+        if ctype.size > filled:
+            self.emit_bytes(base, filled, b"\0" * (ctype.size - filled))
+
     def array_initializer(
         self,
         base: IntExpression,
@@ -4821,9 +4914,9 @@ class Lowerer:
     ) -> None:
         element = ctype.element
         size = size_of(element)
-        if size is None or isinstance(element, ArrayType):
+        if size is None:
             self.error(
-                "only a one-dimensional array of scalars can be initialized; "
+                "an array of something with no size cannot be initialized; "
                 "assign the elements instead",
                 token,
             )
@@ -4861,8 +4954,17 @@ class Lowerer:
                 token,
             )
         for position, item in enumerate(items):
-            if isinstance(item, tuple):
-                self.error("nested braced initializers are not implemented", token)
+            if isinstance(item, tuple) or isinstance(element, (StructType, ArrayType)):
+                # An array of structs, or of arrays: each element is itself an
+                # aggregate and is initialized the same way this one is.
+                self.aggregate_initializer(
+                    _binary("add", base, IntConstant(position * size)),
+                    element,
+                    item,
+                    token,
+                    static=static,
+                )
+                continue
             what = f"initializer element {position}"
             if static:
                 stored = self.static_value(item, element, token, what)

@@ -1,5 +1,8 @@
 #!/bin/sh
-# Every C++ program in the corpus, put through everything py2bin can do to it.
+# Every program in the corpus, put through everything py2bin can do to it.
+# C++ and C both: the C++ translator writes C, so a gap in the C front end
+# shows up as a C++ program that cannot be built, and the C ones say which
+# of the two is at fault.
 #
 #   tools/cpp_sweep.sh                    the whole sweep, over the corpus
 #   tools/cpp_sweep.sh meaning            only the comparison against clang++
@@ -51,12 +54,17 @@ run_meaning() {
     return
   }
   echo "== meaning: py2bin against clang++, run on this machine =="
-  for source in "$CORPUS"/*.cpp; do
-    name=$(basename "$source" .cpp)
+  for source in "$CORPUS"/*.cpp "$CORPUS"/*.c; do
+    [ -f "$source" ] || continue
+    name=$(basename "${source%.*}")
     std=""
-    for s in c++03 c++11 c++17; do
-      clang++ -std=$s -w -o "$WORK/ref_$name" "$source" 2>/dev/null && { std=$s; break; }
-    done
+    case "$source" in
+      *.c) clang -w -o "$WORK/ref_$name" "$source" 2>/dev/null && std=c ;;
+      *) for s in c++03 c++11 c++17; do
+           clang++ -std=$s -w -o "$WORK/ref_$name" "$source" 2>/dev/null \
+             && { std=$s; break; }
+         done ;;
+    esac
     [ -z "$std" ] && { printf "  %-28s no reference - skipped\n" "$name"; continue; }
     want=$("$WORK/ref_$name" 2>&1); wantcode=$?
     rm -rf "$CORPUS/dist"
@@ -83,8 +91,9 @@ run_targets() {
   echo "== targets: does each one encode for every machine =="
   for target in $TARGETS; do
     bad=""
-    for source in "$CORPUS"/*.cpp; do
-      name=$(basename "$source" .cpp)
+    for source in "$CORPUS"/*.cpp "$CORPUS"/*.c; do
+      [ -f "$source" ] || continue
+      name=$(basename "${source%.*}")
       if python3 "$ROOT/build.py" "$source" --target "$target" \
            > "$WORK/log" 2>&1; then
         built=$((built + 1))

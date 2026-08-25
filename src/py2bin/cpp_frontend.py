@@ -1100,6 +1100,26 @@ _STATIC_DEFINITION = re.compile(
 )
 
 
+
+def _array_extent(text: str, name: str) -> "int | None":
+    """How many elements an array has, read from where it was declared."""
+
+    code = _without_literals(text)
+    counted = re.search(
+        rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\[\s*(\d+)\s*\]", code
+    )
+    if counted is not None:
+        return int(counted.group(1))
+    # `int a[] = {1, 2, 3}` says how many by listing them.
+    listed = re.search(
+        rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\[\s*\]\s*=\s*\{{([^}}]*)\}}",
+        code,
+    )
+    if listed is None:
+        return None
+    inside = listed.group(1).strip()
+    return len(_split_arguments(inside)) if inside else 0
+
 def _rewrite_range_for(text: str, counter: "list[int]") -> str:
     """`for (int x : v)` becomes an index loop over the same container.
 
@@ -1115,8 +1135,13 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
         # A bare name is left bare: the rewriters that turn `v.size()` into a
         # call look for a name on the left, and `(v).size()` is not one.
         reached = over if over.isidentifier() else f"({over})"
+        # A plain array has no `size()`; C++ reads its extent from the
+        # declaration, and so does this. `int a[5]` and `int a[] = {1,2,3}`
+        # both say how many there are, in different places.
+        extent = _array_extent(text, over) if over.isidentifier() else None
+        bound = str(extent) if extent is not None else f"{reached}.size()"
         return (
-            f"for (unsigned long {index} = 0; {index} < {reached}.size(); "
+            f"for (unsigned long {index} = 0; {index} < {bound}; "
             f"{index} = {index} + 1) "
             f"{{ {held} {name} = {reached}[{index}];"
         )
@@ -1154,6 +1179,50 @@ def _close_range_bodies(text: str) -> str:
         )
     return text.replace("\x00closed", "")
 
+
+
+#: `P a{1, 2};` or `int n{5};` - a declaration initialised with braces. No
+#: nested braces and a `;` right after, which is what tells it from a class
+#: body or a function.
+_BRACE_INIT = re.compile(
+    r"(?<![.\w>])([A-Za-z_]\w*)\s+(\*?)\s*([A-Za-z_]\w*)\s*\{([^{}]*)\}\s*;"
+)
+
+
+def _rewrite_brace_initialisers(text: str) -> str:
+    """`P a{1, 2};` becomes what C spells the same thing.
+
+    A class with a constructor gets the call - `V a{2}` is `V a(2)`. Anything
+    else is an aggregate, and C has written those with `=` all along.
+    """
+
+    constructed = {
+        head.group(2)
+        for head in _CLASS_HEAD.finditer(text)
+        if _has_a_constructor(text, head)
+    }
+
+    def one(match: "re.Match[str]") -> str:
+        held, star, name, inside = match.groups()
+        if held in _NOT_A_TYPE or star:
+            return match.group(0)
+        inside = inside.strip()
+        if held in constructed:
+            return f"{held} {name}({inside});"
+        return f"{held} {name} = {{{inside}}};" if inside else f"{held} {name};"
+
+    return _map_code(text, lambda part: _BRACE_INIT.sub(one, part))
+
+
+def _has_a_constructor(text: str, head: "re.Match[str]") -> bool:
+    """Whether a class body declares a constructor of its own."""
+
+    try:
+        closing = _matching(text, head.end() - 1)
+    except ValueError:
+        return False
+    body = text[head.end() - 1: closing]
+    return re.search(rf"(?<![.\w>~]){re.escape(head.group(2))}\s*\(", body) is not None
 
 def _rewrite_static_members(text: str, filename: str) -> str:
     """A static member is one object for the class, so it becomes one object.
@@ -3467,7 +3536,10 @@ def _emit_one(
     # apart by the type of what it passes, and that is declared in the head.
     # In the C++ spelling, not the rewritten one: a by-value object is renamed
     # `__by_value_o` there, and the body still calls it `o`.
-    scope = f"{method.parameters};\n{unit}" if method.parameters else unit
+    # Last, because the reader takes the declaration nearest above the use:
+    # put in front of the unit, a parameter named `o` lost to any other `o`
+    # declared anywhere in the file.
+    scope = f"{unit}\n{method.parameters};" if method.parameters else unit
     body = _bare_method_calls(body, found, classes, scope)
     known = {"this": found.name}
     pointers: "set[str]" = {"this"}
@@ -3498,11 +3570,12 @@ def _emit_one(
         known,
         pointers=pointers | {n for n, h in references.items() if h in classes},
         receivers=receivers,
-        # The parameters come first: which overload a bare call means is
-        # decided by the type of what it passes, and a parameter is declared
-        # in the head rather than in the body being read. Both spellings, so
-        # that whichever name the body has reached by now is found.
-        unit=f"{parameters};\n{scope}",
+        # The parameters go last: which overload a bare call means is decided
+        # by the type of what it passes, a parameter is declared in the head
+        # rather than in the body being read, and the reader takes the
+        # declaration nearest above the use. Both spellings, so that whichever
+        # name the body has reached by now is found.
+        unit=f"{scope}\n{parameters};",
         returns=method.returns,
     )
     if copied:
@@ -4170,6 +4243,31 @@ def _upcast_assignments(
 
     body = _map_code(body, lambda part: _DECLARED_FROM_NEW.sub(allocated, part))
 
+    # `Base *p = &derived;` - a declaration, which the assignment pattern
+    # above does not see because the type is in front of the name. This is
+    # where a reference to a base comes out: `A &r = b;` is a pointer here.
+    def declared(match: "re.Match[str]") -> str:
+        wanted, variable, value = match.groups()
+        spelled = value.strip()
+        if wanted not in classes or spelled.startswith("(struct"):
+            return match.group(0)
+        source = spelled.lstrip("&").strip()
+        while source.startswith("(") and source.endswith(")"):
+            source = source[1:-1].strip()
+        held = known.get(source)
+        if held is None or held == wanted or not _derives_from(held, wanted, classes):
+            return match.group(0)
+        return f"struct {wanted} *{variable} = (struct {wanted} *){spelled};"
+
+    body = _map_code(
+        body,
+        lambda part: re.sub(
+            r"\bstruct\s+([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*([^;]+);",
+            declared,
+            part,
+        ),
+    )
+
     def assigned(match: "re.Match[str]") -> str:
         variable, made = match.group(1), match.group(2)
         wanted = known.get(variable) if variable in pointers else None
@@ -4431,6 +4529,68 @@ def _rewrite_temporaries(
 #: How many temporaries one body may hold. A backstop, not a budget.
 _TEMPORARY_ROUNDS = 128
 
+
+def _split_object_declarators(body: str, classes: "dict[str, Class]") -> str:
+    """`V a(2), b(3);` becomes two declarations, which is what it means.
+
+    C++ writes the type once and then as many declarators as it likes. Every
+    rewriter below reads one type and one name, so the second declarator was
+    left where it stood - `V a(2), b(3);` constructed `a` and then handed the
+    C compiler `, b(3);`, which is a call to something that is not a function.
+    """
+
+    if not classes:
+        return body
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    start = 0
+    depth = 0
+    for index, char in enumerate(bare):
+        # Braces are counted as boundaries, not as depth: a body starts with
+        # one, and counting it left every statement inside looking nested.
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char in ";{}" and depth == 0:
+            statement = body[start:index]
+            replaced = _one_declaration(statement, bare[start:index], classes)
+            if replaced is not None:
+                out.append(body[at:start])
+                out.append(replaced)
+                at = index + 1
+                # The `;` goes with the last declarator, which the rewrite
+                # already wrote out.
+            start = index + 1
+    out.append(body[at:])
+    return "".join(out)
+
+
+def _one_declaration(
+    statement: str, bare: str, classes: "dict[str, Class]"
+) -> "str | None":
+    """One `T a, b;` written out as `T a; T b;`, or None if it is not one."""
+
+    head = re.match(r"(\s*)([A-Za-z_]\w*)(\s+)", bare)
+    if head is None or head.group(2) not in classes:
+        return None
+    # Split what follows on commas that are not inside anything.
+    rest = statement[head.end():]
+    pieces = _split_arguments(bare[head.end():])
+    if len(pieces) < 2:
+        return None
+    spelled: list[str] = []
+    at = 0
+    for piece in pieces:
+        spelled.append(rest[at: at + len(piece)].strip())
+        at += len(piece) + 1
+    if not all(re.match(r"^\*?[A-Za-z_]\w*\b", one) for one in spelled):
+        return None
+    return head.group(1) + " ".join(
+        f"{head.group(2)} {one};" for one in spelled
+    )
+
 def _rewrite_body(
     body: str,
     classes: "dict[str, Class]",
@@ -4600,6 +4760,7 @@ def _rewrite_body(
             f"({address}, &{variable}{passed});"
         )
 
+    body = _split_object_declarators(body, classes)
     body = _OBJECT_ARRAY.sub(declare_array, body)
     body = _OBJECT.sub(declare, body)
     def copy_initialise(match: "re.Match[str]") -> str:
@@ -5987,6 +6148,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # Before the lambdas, because a member initialised from one is still an
     # initialiser list; after the spellings, because a cast may appear in one.
     text = _rewrite_initialiser_lists(text)
+    text = _rewrite_brace_initialisers(text)
     text = _rewrite_static_members(text, filename)
     text = _lift_nested_classes(text)
     text = _rewrite_default_arguments(text)
@@ -6858,7 +7020,7 @@ def _rewrite_functions(
             inner = _return_through_pointer(inner)
         rewritten = _rewrite_body(
             inner, classes, known, pointers,
-            unit=f"{head[head.rfind('(') + 1: head.rfind(')')]};\n{unit}"
+            unit=f"{unit}\n{head[head.rfind('(') + 1: head.rfind(')')]};"
             if opened >= 0 else unit,
             pointer_arrays=indexed,
             # `S *pick` splits into the type `S *` and the name `pick`;
