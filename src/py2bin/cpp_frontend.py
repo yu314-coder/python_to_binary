@@ -6304,7 +6304,13 @@ def translate(source: str, filename: str = "<c++>") -> str:
         found = classes[name]
         if not (_is_polymorphic(name, classes) or _subobjects(found, classes)):
             continue
-        if not any(m.name == "" and not m.parameters for m in found.methods):
+        # Only where the author wrote no constructor at all, which is when
+        # C++ writes one. A class that declares one taking arguments has no
+        # implicit default constructor, and adding one here gave it a second
+        # constructor with no initialiser list - which then tried to build a
+        # base that has nothing to build it with, and said so as a refusal of
+        # the program the author actually wrote.
+        if not any(m.name == "" for m in found.methods):
             found.methods.append(Method("", "void", "", "{ }", 0))
 
     # Everything the classes did not claim is ordinary code, rewritten so its
