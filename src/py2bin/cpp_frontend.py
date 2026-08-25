@@ -1906,6 +1906,58 @@ def _into_class_body(
         return text[:head.end()] + inside + text[closing:]
     return None
 
+
+#: `typedef T *iterator;` written inside a class. C has no such scope, so the
+#: name is resolved where it is used and the typedef itself goes.
+_NESTED_TYPEDEF = re.compile(
+    r"\btypedef\s+([A-Za-z_][\w\s]*?)\s*(\**)\s*([A-Za-z_]\w*)\s*;"
+)
+
+
+def _resolve_nested_typedefs(text: str) -> str:
+    """`vector<int>::iterator` becomes the type the class said it is.
+
+    A member typedef is how a container names the things it is made of, and
+    every one of them - `iterator`, `value_type`, `size_type` - is written
+    this way. C has no scope to put them in, so each use is replaced by what
+    it stands for and the typedef itself is dropped.
+    """
+
+    names: "dict[tuple[str, str], str]" = {}
+    out: list[str] = []
+    at = 0
+    for head in _CLASS_HEAD.finditer(text):
+        if head.start() < at:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        owner = head.group(2)
+        inside = text[head.end() - 1: closing]
+
+        def taken(match: "re.Match[str]", o=owner) -> str:
+            names[(o, match.group(3))] = (
+                f"{match.group(1).strip()} {match.group(2)}".strip()
+            )
+            return ""
+
+        out.append(text[at: head.end() - 1])
+        out.append(_NESTED_TYPEDEF.sub(taken, inside))
+        at = closing
+    out.append(text[at:])
+    text = "".join(out)
+    if not names:
+        return text
+    for (owner, name), held in names.items():
+        text = _map_code(
+            text,
+            lambda part, o=owner, n=name, h=held: re.sub(
+                rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", h, part
+            ),
+        )
+    return text
+
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
 
@@ -5620,17 +5672,89 @@ def _rewrite_operators(
             # it as the class's own subscript turned a vector's `items[i] =
             # value` into an assignment to a string's character.
             continue
-        address = f"&{variable}"
-        pattern = rf"\b{re.escape(variable)}\s*\[([^\]]*)\]"
-        body = _map_code(
-            body,
-            lambda part, o=owner, a=address, p=pattern: re.sub(
-                p,
-                lambda m: f"{_c_name(o, 'op_index')}({a}, {m.group(1)})",
-                part,
-            ),
-        )
+        body = _rewrite_subscripts(body, variable, known[variable], classes)
     return body
+
+
+def _rewrite_subscripts(
+    body: str, variable: str, holds: str, classes: "dict[str, Class]"
+) -> str:
+    """`g[0][1]` becomes one index call wrapped around another.
+
+    A subscript that answers an object may be subscripted again, and after
+    the first rewrite the receiver is no longer a name - so a pattern looking
+    for one saw `g[0]` and left `[1]` for the C compiler, which read it as
+    pointer arithmetic on a struct and said so.
+
+    The receiver is written with a `&` at every level, including in front of
+    the inner call. That reads oddly until you know what happens next: the
+    pass that follows a reference return puts a `*` on every one of these
+    calls, and `&(*p)` is `p`. Written any other way, that pass - which runs
+    once per method name and so sees each call fresh - dereferenced a
+    receiver that was already the address the outer call wanted.
+    """
+
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    for match in re.finditer(rf"(?<![.\w>]){re.escape(variable)}\s*\[", bare):
+        if match.start() < at:
+            continue
+        receiver = variable
+        held = holds
+        end = match.end() - 1
+        reached = False
+        while True:
+            owner = _find_method(held, "op_index", classes)
+            if owner is None:
+                break
+            close = _bracket_end(bare, end)
+            if close < 0:
+                break
+            receiver = (
+                f"{_c_name(owner, 'op_index')}(&{receiver}, {body[end + 1: close]})"
+            )
+            reached = True
+            end = close + 1
+            held = _element_of(owner, classes)
+            while end < len(bare) and bare[end] in " \t":
+                end += 1
+            if held is None or end >= len(bare) or bare[end] != "[":
+                break
+        if not reached:
+            continue
+        out.append(body[at:match.start()])
+        out.append(receiver)
+        at = end
+    out.append(body[at:])
+    return "".join(out)
+
+
+def _element_of(owner: str, classes: "dict[str, Class]") -> "str | None":
+    """The class a subscript on `owner` answers, if it answers one at all."""
+
+    method = _method_named(owner, "op_index", classes)
+    if method is None:
+        return None
+    held = method.returns.replace("&", "").replace("*", "").replace("const", "")
+    held = held.strip()
+    return held if held in classes else None
+
+
+def _bracket_end(text: str, at: int) -> int:
+    """Where the `[` at `at` is closed, counting the ones inside it."""
+
+    depth = 0
+    index = at
+    while index < len(text):
+        if text[index] == "[":
+            depth += 1
+        elif text[index] == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
 
 def _call_signatures(
     classes: "dict[str, Class]"
@@ -6274,6 +6398,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # template belongs to the pattern the reader is about to copy.
     text = _fold_out_of_line_templates(text)
     text = _expand_templates(text, filename)
+    # After the copies exist, so `vector<int>::iterator` has become
+    # `vector__int::iterator` and there is a class of that name to ask.
+    text = _resolve_nested_typedefs(text)
     text = _mangle_overloaded_functions(text, filename)
     #: Whether a pass above has already made this text something other than
     #: what the author wrote. The shortcut below hands the source straight
@@ -7492,8 +7619,43 @@ public:
     T &operator[](unsigned long i) { return items[i]; }
     T &back() { return items[count - 1]; }
     T &front() { return items[0]; }
+    typedef T *iterator;
+    typedef T *const_iterator;
+    typedef T value_type;
+    typedef unsigned long size_type;
     T *begin() { return items; }
     T *end() { return items + count; }
+    T *data() { return items; }
+    unsigned long capacity() { return room; }
+    /* `erase` is written against the pointer an iterator is here: everything
+       after the hole moves down one, which is what a vector does. */
+    T *erase(T *where) {
+        unsigned long at;
+        at = (unsigned long)(where - items);
+        while (at + 1 < count) { items[at] = items[at + 1]; at = at + 1; }
+        if (count > 0) { count = count - 1; }
+        return where;
+    }
+    T *insert(T *where, T value) {
+        unsigned long at;
+        unsigned long j;
+        at = (unsigned long)(where - items);
+        if (count == room) {
+            if (room == 0) { reserve(8); } else { reserve(room * 2); }
+        }
+        j = count;
+        while (j > at) { items[j] = items[j - 1]; j = j - 1; }
+        items[at] = value;
+        count = count + 1;
+        return items + at;
+    }
+    void assign(unsigned long many, T value) {
+        unsigned long i;
+        reserve(many);
+        i = 0;
+        while (i < many) { items[i] = value; i = i + 1; }
+        count = many;
+    }
 };
 }
 """
