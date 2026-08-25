@@ -1624,3 +1624,119 @@ class CapturingThis(unittest.TestCase):
                 "t.cpp",
             )
         self.assertIn("outside any class", str(caught.exception))
+
+
+class SecondHuntPass(unittest.TestCase):
+    """Seven more of the fan-out's findings."""
+
+    def test_delete_is_a_word_and_not_a_prefix(self) -> None:
+        """`deleteAll()` became a call to `free`.
+
+        The word boundary is the whole fix, and the failure it caused was an
+        ordinary method silently turning into a deallocation.
+        """
+
+        out = translate(
+            "class W{public:int deleted;int deleteLater;\n W(){deleted=0;deleteLater=3;}\n"
+            " int deleteAll(){ deleted=1; return deleteLater; }};\n"
+            "int main(){ W w; return w.deleteAll(); }",
+            "t.cpp",
+        )
+        self.assertIn("W__deleteAll", out)
+        self.assertNotIn("free(", out)
+
+    def test_friend_asks_for_what_is_already_given(self) -> None:
+        out = translate(
+            "class P;\nclass O{ friend class P; public: int secret; O(){secret=42;} };\n"
+            "class P{public: int read(O &o){ return o.secret; }};\n"
+            "int main(){ O o; P p; return p.read(o); }",
+            "t.cpp",
+        )
+        self.assertNotIn("friend", out)
+
+    def test_the_address_of_a_reference_is_the_object(self) -> None:
+        """`this == &other` in an assignment operator.
+
+        A reference is a pointer here, so taking its address gave a `T **`.
+        """
+
+        out = translate(
+            "class C{public:int n;C(){n=1;}\n"
+            " C &operator=(const C &o){ if (this == &o) return *this; n=o.n; return *this; }};\n"
+            "int main(){ C a; C b; a.n=7; b=a; return b.n; }",
+            "t.cpp",
+        )
+        self.assertIn("this == o", out)
+
+    def test_a_base_named_in_the_initialiser_list_is_constructed_with_it(
+        self,
+    ) -> None:
+        """And *before* the derived class installs its own table.
+
+        C++ builds an object base-first and its type changes as it goes;
+        installing the table first let the base's constructor set it back, so
+        every virtual call answered as the base.
+        """
+
+        out = translate(
+            "class B{public:int n;B(int v){n=v;}virtual int show(){return n;}virtual ~B(){}};\n"
+            "class S : public B{public:S(int v) : B(v*2) {} int show(){return B__NONE;}};\n".replace(
+                "B__NONE", "B::show() + 1"
+            )
+            # Assigned first: returning an object with a destructor is refused.
+            + "int main(){ S s(5); int n = s.show(); return n; }",
+            "t.cpp",
+        )
+        body = out[out.index("S__ctor"):]
+        first = body[: body.index("}")]
+        self.assertLess(
+            first.index("B__ctor"), first.index("__vptr"),
+            "the table was installed before the base was constructed",
+        )
+
+    def test_a_base_implementation_can_be_named(self) -> None:
+        """`Base::show()` is the one call a virtual does *not* dispatch."""
+
+        out = translate(
+            "class B{public:int n;B(){n=1;}virtual int show(){return n;}virtual ~B(){}};\n"
+            "class S : public B{public: int show(){ return B::show() + 1; }};\n"
+            "int main(){ S s; int n = s.show(); return n; }",
+            "t.cpp",
+        )
+        self.assertIn("B__show(&this->__base)", out)
+
+    def test_an_enum_declared_in_a_class_becomes_a_type_of_its_own(self) -> None:
+        out = translate(
+            "class M{public: enum Mode { Off, On }; Mode m; M(){m=On;}\n"
+            " int get(){return (int)m;}};\n"
+            "int main(){ M x; return x.get() + (int)M::Off; }",
+            "t.cpp",
+        )
+        self.assertIn("enum Mode { Off, On };", out)
+        # And above the struct that holds one, since C reads top to bottom.
+        self.assertLess(out.index("enum Mode"), out.index("struct M {"))
+
+    def test_a_static_const_given_its_value_in_the_class(self) -> None:
+        out = translate(
+            "class L{public: static const int limit = 10; int n; L(){n=0;}\n"
+            " int room(){ return limit - n; }};\n"
+            "int main(){ L l; return l.room() + L::limit; }",
+            "t.cpp",
+        )
+        self.assertIn("L__limit = 10;", out)
+
+    def test_a_grandparent_virtual_through_the_middle_class(self) -> None:
+        """The table is read from the object, not from a base subobject.
+
+        Applying the base adjustment to the receiver *and* to the path that
+        finds the table counted it twice, and `A` has no `__base`.
+        """
+
+        out = translate(
+            "class A{public: virtual int id(){return 1;} virtual ~A(){}};\n"
+            "class B : public A{public:};\n"
+            "class C : public B{public: int id(){return 3;}};\n"
+            "int main(){ C c; B *p = (B *)&c; return p->id(); }",
+            "t.cpp",
+        )
+        self.assertNotIn("__base.__base.__vptr", out.split("int main")[1])

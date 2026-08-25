@@ -233,7 +233,7 @@ unwinder, so a call that can throw gets a statement of its own - one behind
 would run at the wrong time.
 
 It is checked by building `tools/cpp_corpus/` twice, once with py2bin and once
-with `clang++`, and comparing the output: 147 programs, all agreeing - and
+with `clang++`, and comparing the output: 154 programs, all agreeing - and
 building every one of them for all six targets. `tools/cpp_sweep.sh` does
 both. clang++ is
 the yardstick there and never a dependency.
@@ -1274,4 +1274,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 804. What is checked on every change is the 1991-test suite.
+    is 804. What is checked on every change is the 1999-test suite.

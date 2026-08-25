@@ -855,6 +855,9 @@ _LAMBDA = re.compile(
 )
 
 
+#: `friend class X;` or `friend int peek(X &);` - an access grant.
+_FRIEND = re.compile(r"\bfriend\b[^;{}]*;")
+
 #: `class B;` - a forward declaration. The typedefs this emits already name
 #: every class before any body, so there is nothing left for one to do.
 _FORWARD_DECLARATION = re.compile(
@@ -876,6 +879,42 @@ _SCOPED_ENUM = re.compile(r"\benum\s+(?:class|struct)\s+([A-Za-z_]\w*)")
 _TAGGED_TYPE = re.compile(r"\b(enum|union)\s+([A-Za-z_]\w*)\s*\{")
 
 
+def _hoist_tagged_types(text: str) -> "tuple[str, str]":
+    """Take every top-level `enum`/`union` definition out, with its typedef.
+
+    Returns what is left and what was taken. They are put back above the
+    struct definitions, because a struct holding one needs the complete type
+    and C reads a file top to bottom.
+    """
+
+    taken: list[str] = []
+    out: list[str] = []
+    at = 0
+    for match in _TAGGED_TYPE.finditer(text):
+        if match.start() < at or _depth_at(text, match.start()) != 0:
+            continue
+        try:
+            closing = _matching(text, match.end() - 1)
+        except ValueError:
+            continue
+        end = closing
+        while end < len(text) and text[end] in " \t":
+            end += 1
+        if end < len(text) and text[end] == ";":
+            end += 1
+        # The typedef this file's own spelling pass wrote just after it.
+        following = re.match(
+            r"\s*typedef\s+(?:enum|union)\s+\w+\s+\w+\s*;", text[end:]
+        )
+        if following:
+            end += following.end()
+        taken.append(text[match.start():end])
+        out.append(text[at:match.start()])
+        at = end
+    out.append(text[at:])
+    return "".join(out), "\n".join(taken)
+
+
 def _tag_typedef(name: str, text: str) -> str:
     """`typedef enum Colour Colour;` - whichever tag the name was declared with."""
 
@@ -891,6 +930,10 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     """
 
     text = _FORWARD_DECLARATION.sub("", text)
+    # `friend class X;` and `friend int f();` grant access to what is private.
+    # py2bin emits a plain struct and enforces no access at all, so a friend
+    # declaration asks for something already given and has nothing to become.
+    text = _map_code(text, lambda part: _FRIEND.sub("", part))
     # Keywords in C++, and in C either a macro from a header the program did
     # not include or nothing at all. Spelled out here so a program need not
     # remember which.
@@ -988,13 +1031,41 @@ def _rewrite_initialiser_lists(text: str) -> str:
     the assignment is the one C has.
     """
 
+    bases = {
+        head.group(2): head.group(3)
+        for head in _CLASS_HEAD.finditer(text)
+        if head.group(3)
+    }
+
     def one(match: "re.Match[str]") -> str:
+        # Which class this constructor belongs to, so its base can be told
+        # from its members: `Sub(int v) : Base(v * 2)` constructs the base,
+        # and turning that into `Base = v * 2;` assigns to a type.
+        before = text[:match.start()]
+        owner = None
+        for head in _CLASS_HEAD.finditer(before):
+            try:
+                closing = _matching(text, head.end() - 1)
+            except ValueError:
+                continue
+            if head.end() <= match.start() < closing:
+                owner = head.group(2)
+        base = bases.get(owner or "")
         assignments = []
         for found in _ONE_INITIALISER.finditer(match.group(1)):
-            assignments.append(f"{found.group(1)} = {found.group(2).strip()};")
+            name, value = found.group(1), found.group(2).strip()
+            if name == base:
+                assignments.append(f"{_BASE_INIT}({value});")
+                continue
+            assignments.append(f"{name} = {value};")
         return ") { " + " ".join(assignments) + " "
 
     return _map_code(text, lambda part: _INITIALISER_LIST.sub(one, part))
+
+
+#: Stands in for "construct the base with these arguments" until the class
+#: table exists and the base's constructor has a name.
+_BASE_INIT = "__py2bin_base_init"
 
 #: `for (int x : v)` - a range-based for.
 _RANGE_FOR = re.compile(
@@ -1003,7 +1074,10 @@ _RANGE_FOR = re.compile(
 
 #: `static int count;` written inside a class.
 _STATIC_MEMBER = re.compile(
-    r"(?<![\w>])static\s+([A-Za-z_][\w\s*]*?)\s+([A-Za-z_]\w*)\s*;"
+    # The initialiser is optional: C++ lets an integral one be written in the
+    # class, which is where a limit or a count usually is.
+    r"(?<![\w>])static\s+([A-Za-z_][\w\s*]*?)\s+([A-Za-z_]\w*)\s*"
+    r"(=\s*[^;]+)?;"
 )
 
 #: `int C::count = 0;` - where a static member is given its storage.
@@ -1076,6 +1150,7 @@ def _rewrite_static_members(text: str, filename: str) -> str:
     """
 
     owners: "dict[str, str]" = {}
+    given: "dict[str, str]" = {}
     out: list[str] = []
     at = 0
     for head in _CLASS_HEAD.finditer(text):
@@ -1090,6 +1165,13 @@ def _rewrite_static_members(text: str, filename: str) -> str:
 
         def taken(match: "re.Match[str]", o=owner) -> str:
             owners[match.group(2)] = o
+            if match.group(3):
+                # Given its value here, so this is where it is defined; there
+                # is no `int C::limit = 10;` anywhere else to find.
+                given[_c_name(o, match.group(2))] = (
+                    f"{match.group(1).strip()} {_c_name(o, match.group(2))} "
+                    f"{match.group(3).strip()};"
+                )
             return ""
 
         out.append(text[at:head.end() - 1])
@@ -1108,6 +1190,9 @@ def _rewrite_static_members(text: str, filename: str) -> str:
         return f"{spelled} {_c_name(owner, name)} {value or '= 0'};"
 
     text = _STATIC_DEFINITION.sub(defined, text)
+    # Those that were given a value in the class need their storage written.
+    if given:
+        text = "\n".join(given.values()) + "\n" + text
     # And every mention of it - `C::count` from outside, `count` from within -
     # is that object.
     for name, owner in owners.items():
@@ -1195,6 +1280,55 @@ def _rewrite_default_arguments(text: str) -> str:
         rebuilt.append(text[at:])
         text = "".join(rebuilt)
     return text
+
+
+#: `enum Mode { Off, On };` written inside a class body.
+_NESTED_ENUM = re.compile(r"\benum\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)\s*\{")
+
+
+def _lift_nested_enums(text: str) -> str:
+    """An enum written inside a class is a type, and C has no nested type.
+
+    Moved out under its own name rather than the class's: an enumerator is
+    reached bare from inside the class and as `Class::Name` from outside, and
+    both spellings are kept working by stripping the qualifier.
+    """
+
+    lifted: list[str] = []
+    while True:
+        moved = False
+        for head in _CLASS_HEAD.finditer(text):
+            try:
+                closing = _matching(text, head.end() - 1)
+            except ValueError:
+                continue
+            body = text[head.end(): closing - 1]
+            inner = _NESTED_ENUM.search(body)
+            if inner is None:
+                continue
+            start = head.end() + inner.start()
+            try:
+                inner_close = _matching(text, head.end() + inner.end() - 1)
+            except ValueError:
+                continue
+            end = inner_close
+            while end < len(text) and text[end] in " \t":
+                end += 1
+            if end < len(text) and text[end] == ";":
+                end += 1
+            lifted.append(text[start:end])
+            text = text[:start] + text[end:]
+            owner = head.group(2)
+            text = _map_code(
+                text,
+                lambda part, o=owner: re.sub(
+                    rf"\b{re.escape(o)}\s*::\s*", "", part
+                ),
+            )
+            moved = True
+            break
+        if not moved:
+            return "\n".join(lifted) + ("\n" if lifted else "") + text
 
 
 def _lift_nested_classes(text: str) -> str:
@@ -3255,6 +3389,7 @@ def _emit_one(
     )
     if references:
         body = _deref_references(body, references, classes)
+    body = _qualified_base_calls(body, found, classes)
     body = _bare_method_calls(body, found, classes)
     known = {"this": found.name}
     pointers: "set[str]" = {"this"}
@@ -3296,7 +3431,8 @@ def _emit_one(
     if returned:
         body = _return_through_pointer(body)
     if method.name == "":
-        body = _open_with_subobjects(body, found, classes)
+        body, base_arguments = _base_initialiser(body, found)
+        body = _open_with_subobjects(body, found, classes, base_arguments)
     elif method.name == "~":
         body = _close_with_subobjects(body, found, classes)
     if method.shared and not parameters:
@@ -3355,9 +3491,45 @@ def _subobjects(found: Class, classes: "dict[str, Class]") -> "list[tuple[str, s
     return parts
 
 
-def _open_with_subobjects(body: str, found: Class, classes: "dict[str, Class]") -> str:
+def _base_initialiser(body: str, found: Class) -> "tuple[str, str | None]":
+    """Take `: Base(v * 2)` out of the body and report what it passed.
+
+    It is not expanded here. The base has to be constructed *before* the
+    derived class installs its own table - C++ builds an object base-first,
+    and its type changes as it goes - and where that happens is
+    `_open_with_subobjects`. Expanding it in place put the base's
+    constructor after the table install, so the base's constructor set the
+    table back to the base's and every virtual call answered as the base.
+    """
+
+    match = re.search(rf"{_BASE_INIT}\s*\(([^;]*)\);", body)
+    if match is None or not found.base:
+        return body, None
+    return body[:match.start()] + body[match.end():], match.group(1).strip()
+
+
+def _open_with_subobjects(
+    body: str,
+    found: Class,
+    classes: "dict[str, Class]",
+    base_arguments: "str | None" = None,
+) -> str:
     calls = []
     for held, address in _subobjects(found, classes):
+        if base_arguments is not None and address == "&this->__base":
+            # Named in the initialiser list, so it is built with what was
+            # written there rather than with nothing.
+            owner = _find_method(held, "", classes)
+            given = (
+                [a.strip() for a in _split_arguments(base_arguments)]
+                if base_arguments else []
+            )
+            if owner is not None:
+                calls.append(
+                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
+                    f"({address}{', ' + base_arguments if base_arguments else ''});"
+                )
+            continue
         owner = _find_method(held, "", classes)
         if owner is None:
             continue
@@ -3417,6 +3589,37 @@ def _reachable_members(
         base = classes[base].base
         depth += 1
     return found
+
+def _qualified_base_calls(
+    body: str, owner: Class, classes: "dict[str, Class]"
+) -> str:
+    """`Base::show()` - the base's own version, named rather than dispatched.
+
+    This is the one call a virtual function does *not* go through the table:
+    naming the class is how C++ says "that one, not whatever this object
+    turned out to be", and it is how an override reaches what it overrode.
+    """
+
+    for named in sorted(classes, key=len, reverse=True):
+        if named == owner.name or not _derives_from(owner.name, named, classes):
+            continue
+        for method in _reachable_methods(named, classes):
+            provider = _find_method(named, method, classes)
+            if provider is None:
+                continue
+            depth = _base_depth(owner.name, provider, classes)
+            reached = "this" if depth == 0 else (
+                "&this->" + "__base." * (depth - 1) + "__base"
+            )
+            pattern = (
+                rf"(?<![.\w>]){re.escape(named)}\s*::\s*"
+                rf"{re.escape(method)}\s*\("
+            )
+            body = _rewrite_calls(
+                body, pattern, _name_for(provider, method, classes), reached
+            )
+    return body
+
 
 def _bare_method_calls(body: str, owner: Class, classes: "dict[str, Class]") -> str:
     """`sum()` inside a member is a call on `this`, and C has no such thing.
@@ -4528,7 +4731,11 @@ def _rewrite_body(
             pattern = rf"\b{re.escape(variable)}{arrow}{re.escape(method)}\s*\("
             body = _rewrite_calls(
                 body, pattern,
-                _dispatched(holds, method, classes, reached, owner, scope()),
+                # The object's own address for a virtual call, the base
+                # subobject's for a direct one.
+                _dispatched(
+                    holds, method, classes, address, owner, scope(), reached
+                ),
                 reached,
             )
     body = _fill_member_defaults(body, classes)
@@ -5183,10 +5390,15 @@ def _rewrite_pointer_indexed(
             if isinstance(function, str)
             else function(_call_arguments(body, found.end() - 1))
         )
+        # The chooser may answer with a receiver of its own, where a virtual
+        # call needs the whole object and a direct one needs a subobject.
+        passed = receiver
+        if isinstance(chosen, tuple):
+            chosen, passed = chosen
         chosen = chosen.replace("__I__", found.group(1))
         reached = (
-            receiver.replace("__I__", found.group(1))
-            if receiver
+            passed.replace("__I__", found.group(1))
+            if passed
             else f"{variable}[{found.group(1)}]"
         )
         out.append(body[at:found.start()])
@@ -5214,9 +5426,17 @@ def _rewrite_indexed(body: str, pattern: str, function, variable: str) -> str:
         )
         # A virtual call reads the table out of the element, so it needs the
         # index too - which is only known here, one match at a time.
+        passed = None
+        if isinstance(chosen, tuple):
+            chosen, passed = chosen
         chosen = chosen.replace("__I__", found.group(1))
+        reached = (
+            passed.replace("__I__", found.group(1))
+            if passed
+            else f"&{variable}[{found.group(1)}]"
+        )
         out.append(body[at:found.start()])
-        out.append(f"{chosen}(&{variable}[{found.group(1)}]{separator}")
+        out.append(f"{chosen}({reached}{separator}")
         at = found.end()
     out.append(body[at:])
     return "".join(out)
@@ -5357,19 +5577,26 @@ def _dispatched(
     receiver: str,
     static: str,
     text: str = "",
+    direct: "str | None" = None,
 ):
     """`_dispatch` where it applies, otherwise the direct name."""
 
     virtual = _dispatch(holds, method, classes, receiver)
+    named = _name_for(static, method, classes, text)
     if virtual is None:
-        return _name_for(static, method, classes, text)
-    direct = _name_for(static, method, classes, text)
+        return named
 
-    def chosen(given: "list[str]") -> str:
+    def chosen(given: "list[str]"):
         through = virtual(given)
         if through:
-            return through
-        return direct if isinstance(direct, str) else direct(given)
+            # A virtual call reads the table out of the whole object, and
+            # passes the whole object. A direct call to an inherited method
+            # is handed the base subobject instead - so where the two differ,
+            # the receiver differs too, and applying the base adjustment to
+            # both counted it twice.
+            return through, receiver
+        spelled = named if isinstance(named, str) else named(given)
+        return (spelled, direct) if direct is not None else spelled
 
     return chosen
 
@@ -5514,6 +5741,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # declarations, scoped enums, and `bool`/`true`/`false`/`nullptr`, which
     # are keywords there and macros here.
     before_patterns = text
+    # Before the spellings: that pass writes `typedef enum Mode Mode;` right
+    # after the enum body, and a typedef written inside a class body is not C.
+    text = _lift_nested_enums(text)
     text, scoped_enums = _rewrite_cpp_spellings(text)
     text = _strip_namespace_qualifiers(text, scoped_enums)
     # Before the lambdas, because a member initialised from one is still an
@@ -5702,8 +5932,13 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # C++ and a syntax error in C, which wants `struct Vec v;` - and a class
     # held *inside* another names its type before its own definition is
     # reached, so the name has to exist before any struct body does.
+    # An enum or a union defined at the top level goes ahead of the structs:
+    # a struct may hold one, and C needs the complete type to lay the field
+    # out. A nested enum lifted out of a class is exactly that case.
+    remainder, tagged = _hoist_tagged_types(remainder)
     typedefs = "\n".join(
-        f"typedef struct {name} {name};" for name in [*order, *plain]
+        [tagged] * bool(tagged)
+        + [f"typedef struct {name} {name};" for name in [*order, *plain]]
     )
     # A class holding another must be defined after it: C needs the complete
     # type to lay out the field. Emitting in source order put `Car` before
@@ -5830,7 +6065,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
 #: the `*[n]` was left behind for the C compiler to choke on.
 _NEW = re.compile(r"\bnew\s+([A-Za-z_]\w*(?:\s*\*)*)\s*(\[|\()?")
 #: `delete p;` and `delete[] p;`, to the end of the statement.
-_DELETE = re.compile(r"\bdelete\s*(\[\s*\])?\s*([^;]+);")
+#: The word boundary after `delete` is load-bearing: without it `deleteAll()`
+#: and `deleteLater` were read as a `delete` of whatever followed, and a
+#: perfectly ordinary method became a call to `free`.
+_DELETE = re.compile(r"\bdelete\b\s*(\[\s*\])?\s*([^;]+);")
 
 #: The header on a `new[]` block: the element count, so `delete[]` knows how
 #: many destructors to run. Sixteen bytes rather than eight, because malloc
@@ -6147,6 +6385,15 @@ def _deref_references(
 
     for name, held in references.items():
         if held in classes:
+            # `&r` on a reference is the address of what it names, which is
+            # what the pointer already holds. Taking one of the pointer gave
+            # a `T **` - which is what `this == &other` compared against.
+            body = _map_code(
+                body,
+                lambda part, n=name: re.sub(
+                    rf"&\s*(?<![.\w>])\b{re.escape(n)}\b(?!\s*[\w(])", n, part
+                ),
+            )
             body = _map_code(
                 body,
                 lambda part, n=name: re.sub(
