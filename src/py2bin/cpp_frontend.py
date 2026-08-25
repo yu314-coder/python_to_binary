@@ -824,6 +824,12 @@ _PLAIN_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\(.*\)$", re.S)
 def _subscript_result(text: str, owner: str) -> "str | None":
     """What `operator[]` on that class is declared to answer."""
 
+    return _member_result(text, owner, r"operator\s*\[\s*\]")
+
+
+def _member_result(text: str, owner: str, spelled: str) -> "str | None":
+    """What the member matching `spelled` on that class is declared to answer."""
+
     for head in _CLASS_HEAD.finditer(text):
         if head.group(2) != owner:
             continue
@@ -833,7 +839,7 @@ def _subscript_result(text: str, owner: str) -> "str | None":
             return None
         inside = text[head.end() - 1: closing]
         found = re.search(
-            r"(?<![.\w>])([A-Za-z_][\w\s]*?)\s*([*&]*)\s*operator\s*\[\s*\]", inside
+            rf"(?<![.\w>])([A-Za-z_][\w\s]*?)\s*([*&]*)\s*{spelled}", inside
         )
         if found is None:
             return None
@@ -971,6 +977,15 @@ def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
         # temporary it makes has its type.
         if _names_a_class(text, plain.group(1)):
             return plain.group(1)
+        # `f(5)` where `f` is an object: a name that holds one is never a
+        # function, so the call is that class's own call operator and what it
+        # answers is what this is. That is how a lambda returning a lambda is
+        # held - `auto add5 = outer(5)` has no other way to be read.
+        holder = _deduced_type(plain.group(1), text, before)
+        if holder is not None and "*" not in holder:
+            answered = _member_result(text, holder.strip(), r"operator\s*\(\s*\)")
+            if answered is not None:
+                return answered
         return _declared_return(text, None, plain.group(1))
     return None
 
@@ -1842,11 +1857,13 @@ def _rewrite_std_function(text: str, filename: str) -> str:
     out.append(text[at:])
     return "".join(out)
 
-def _expand_lambdas(text: str, filename: str) -> str:
+def _expand_lambdas(
+    text: str, filename: str, counter: "list[int] | None" = None
+) -> str:
     """Turn each lambda into a class, and its use into an object of it."""
 
     made: list[str] = []
-    count = 0
+    numbered = counter if counter is not None else [0]
     at = 0
     while True:
         found = _LAMBDA.search(text, at)
@@ -1858,8 +1875,8 @@ def _expand_lambdas(text: str, filename: str) -> str:
             # a supplied header hid every real lambda after it.
             at = found.end()
             continue
-        count += 1
-        name = f"__py2bin_lambda_{count}"
+        numbered[0] += 1
+        name = f"__py2bin_lambda_{numbered[0]}"
         captures, parameters, declared = found.groups()
         try:
             closing = _matching(text, found.end() - 1)
@@ -1868,6 +1885,13 @@ def _expand_lambdas(text: str, filename: str) -> str:
                 filename, _line_of(text, found.start()), "a lambda is not closed"
             ) from None
         body = text[found.end() - 1: closing]
+        if _LAMBDA.search(body) is not None:
+            # A lambda inside this one. That one goes first: what this one
+            # returns is read off its own `return`, and until the inner is a
+            # class with a name there is nothing there to read.
+            at = found.start() + 1
+            numbered[0] -= 1
+            continue
         # Where it is used, read before the class is written: a generic
         # lambda's parameter types are whatever it is called with, and the
         # name it is held under is how those calls are found.
@@ -1929,7 +1953,11 @@ def _expand_lambdas(text: str, filename: str) -> str:
         at = 0
     if not made:
         return text
-    return "".join(made) + text
+    # Again over everything, the classes included: a lambda written inside
+    # another is in the body that just became one of these, and nothing
+    # rescans what has been emitted. Each round takes one lambda away, so
+    # this ends.
+    return _expand_lambdas("".join(made) + text, filename, numbered)
 
 
 def _looks_like_an_index(text: str, found: "re.Match[str]") -> bool:
@@ -1939,10 +1967,28 @@ def _looks_like_an_index(text: str, found: "re.Match[str]") -> bool:
     on something callable followed by a block - which does not happen. What
     does happen is a name immediately before the bracket, which a lambda
     never has.
+
+    Some keywords may come before one: `return [a](int b){ ... };` ends in
+    the letters of `return`, and reading those as a name meant a lambda
+    written inside another was never expanded. Named one by one rather than
+    taken as "any keyword", because `operator[](int i)` also ends in one and
+    is the very thing this exists to tell apart.
     """
 
     before = text[:found.start()].rstrip()
-    return bool(before) and (before[-1].isalnum() or before[-1] in "_)]")
+    if not before:
+        return False
+    word = re.search(r"[A-Za-z_]\w*$", before)
+    if word is not None:
+        return word.group(0) not in _BEFORE_A_LAMBDA
+    return before[-1] in "_)]"
+
+
+#: Words a lambda may be written straight after. Everything else that ends in
+#: a letter is a name, and a name before `[` is a subscript.
+_BEFORE_A_LAMBDA = frozenset(
+    {"return", "case", "else", "do", "throw", "co_return", "co_yield"}
+)
 
 
 def _lambda_result(body: str, parameters: str, text: str) -> str:
@@ -6500,11 +6546,29 @@ def _rewrite_operators(
     # `d(5)` where `d` is an object with a call operator. A name that holds
     # an object is never a function, so a call on it is that operator and
     # nothing else - which is what makes this safe to do by name.
-    for variable in sorted(known, key=len, reverse=True):
+    # Repeated while it keeps finding names: a call that answers an object
+    # declares one, and that object may have a call operator of its own -
+    # which is exactly what a lambda returning a lambda is.
+    seen: "set[str]" = set()
+    while True:
+      fresh = [name for name in known if name not in seen]
+      if not fresh:
+        break
+      seen.update(fresh)
+      for variable in sorted(fresh, key=len, reverse=True):
         owner = _find_method(known[variable], "op_call", classes)
         if owner is None:
             continue
         address = variable if variable in pointers else f"&{variable}"
+        if _method_named(owner, "op_call", classes, returns_object=True):
+            # It answers an object, so the caller provides the space and the
+            # call cannot stand in an expression - the same as an operator
+            # that does. `auto f = outer(5);` is how a lambda returning a
+            # lambda is held, and this is the only form it comes in.
+            body = _rewrite_value_call(
+                body, variable, owner, address, classes, known
+            )
+            continue
         pattern = rf"(?<![.\w>])\b{re.escape(variable)}\s*\("
         body = _rewrite_calls(
             body, pattern, _name_for(owner, "op_call", classes), address
@@ -6617,6 +6681,46 @@ def _arrow_target(owner: str, classes: "dict[str, Class]") -> "str | None":
     return held if held in classes else None
 
 
+
+
+def _rewrite_value_call(
+    body: str,
+    variable: str,
+    owner: str,
+    address: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str] | None" = None,
+) -> str:
+    """`T v = f(args);` where `f` is an object whose call answers an object."""
+
+    pattern = re.compile(
+        rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
+        rf"(?<![.\w>]){re.escape(variable)}\s*\("
+    )
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    for match in pattern.finditer(bare):
+        if match.start() < at:
+            continue
+        held, target = match.group(1), match.group(2)
+        if held not in classes:
+            continue
+        close = _closing_paren(body, match.end() - 1)
+        if close < 0 or body[close + 1:].lstrip()[:1] != ";":
+            continue
+        arguments = body[match.end(): close]
+        passed = f", {arguments}" if arguments.strip() else ""
+        if known is not None:
+            known[target] = held
+        out.append(body[at:match.start()])
+        out.append(
+            f"struct {held} {target}; "
+            f"{_c_name(owner, 'op_call')}({address}, &{target}{passed})"
+        )
+        at = close + 1
+    out.append(body[at:])
+    return "".join(out)
 
 def _rewrite_value_prefix(
     body: str,
