@@ -4291,9 +4291,31 @@ def _emit_one(
         unit=f"{scope}\n{parameters};",
         returns=method.returns,
     )
+    if returned:
+        body = _return_through_pointer(body)
+    if method.name == "":
+        body, base_arguments = _base_initialiser(body, found)
+        body, member_arguments = _member_initialisers(body)
+        # `int n = 7;` written on the member, put in before the subobjects so
+        # that it ends up after them: a member of class type has to be built
+        # before anything assigns to it. An initialiser list naming the same
+        # member is applied by the pass below and overwrites this, which is
+        # the order C++ gives the two.
+        body = _open_with_member_values(
+            body, found, classes, member_arguments
+        )
+        body = _open_with_subobjects(
+            body, found, classes, base_arguments, member_arguments, scope
+        )
+    elif method.name == "~":
+        body = _close_with_subobjects(body, found, classes)
     if copied:
         # Declared and then assigned, not initialised: py2bin's C takes
         # `o = *p;` and not `struct V o = *p;`.
+        # Last of the things put at the top, so it ends up first: a member
+        # initialiser list may name a parameter, and `Person(string n) :
+        # name(n)` has to see the copy of `n` rather than the pointer it
+        # arrived as.
         entry = " ".join(
             f"struct {held} {variable}; "
             + _copied_in(held, variable, f"__by_value_{variable}", classes)
@@ -4301,20 +4323,6 @@ def _emit_one(
         )
         opening = body.find("{")
         body = body[:opening + 1] + " " + entry + body[opening + 1:]
-    if returned:
-        body = _return_through_pointer(body)
-    if method.name == "":
-        body, base_arguments = _base_initialiser(body, found)
-        body, member_arguments = _member_initialisers(body)
-        body = _open_with_subobjects(
-            body, found, classes, base_arguments, member_arguments
-        )
-        # `int n = 7;` written on the member. Applied in every constructor,
-        # and first, so an initialiser list naming the same member overwrites
-        # it - which is the order C++ gives the two.
-        body = _open_with_member_values(body, found, classes)
-    elif method.name == "~":
-        body = _close_with_subobjects(body, found, classes)
     if method.shared and not parameters:
         parameters = "void"
     returns = "void" if (method.name in ("", "~") or returned) else method.returns
@@ -4425,7 +4433,10 @@ def _base_initialiser(body: str, found: Class) -> "tuple[str, str | None]":
 
 
 def _open_with_member_values(
-    body: str, found: Class, classes: "dict[str, Class]"
+    body: str,
+    found: Class,
+    classes: "dict[str, Class]",
+    named: "dict[str, str] | None" = None,
 ) -> str:
     """Assign what each member was given where it was declared.
 
@@ -4434,31 +4445,32 @@ def _open_with_member_values(
     it can be assigned to, and what the author wrote has to win.
     """
 
-    values = list(found.member_values)
-    seen = found
-    while seen.base and seen.base in classes:
-        # A base's own are applied by the base's constructor, which has
-        # already run by here, so only this class's are wanted.
-        break
+    # Only the members the initialiser list did not name: C++ applies a
+    # default member initialiser where the list is silent, and the list where
+    # it is not. Skipping them here is what keeps the two from both running.
+    values = [
+        (name, value)
+        for name, value in found.member_values
+        if name not in (named or {})
+    ]
     if not values:
         return body
     spelled = " ".join(f"this->{name} = {value};" for name, value in values)
-    opening = _opening_of(body)
+    opening = body.find("{")
     return body[:opening + 1] + " " + spelled + body[opening + 1:]
 
 
-def _opening_of(body: str) -> int:
-    """Where a constructor's own statements begin.
+def _same_class(
+    value: str, held: str, scope: str, classes: "dict[str, Class]"
+) -> bool:
+    """Whether `value` names an object of exactly the class `held`."""
 
-    After whatever `_open_with_subobjects` put in, which is written as one
-    run of calls right after the brace - a member assigned before the object
-    it names is constructed would be overwritten by that construction.
-    """
-
-    opening = body.find("{")
-    rest = body[opening + 1:]
-    built = re.match(r"(?:\s*[A-Za-z_]\w*__ctor[^;]*;)*", rest)
-    return opening + (built.end() if built else 0)
+    if held not in classes:
+        return False
+    spelled = _deduced_type(value, scope)
+    if spelled is None or "*" in spelled:
+        return False
+    return spelled.replace("const", "").strip() == held
 
 def _open_with_subobjects(
     body: str,
@@ -4466,8 +4478,13 @@ def _open_with_subobjects(
     classes: "dict[str, Class]",
     base_arguments: "str | None" = None,
     member_arguments: "dict[str, str] | None" = None,
+    scope: str = "",
 ) -> str:
     named = dict(member_arguments or {})
+    # Which overload builds a member is read off what the list passed, and
+    # that is usually a parameter - declared in a head this body does not
+    # hold. `Person(string n) : name(n)` picked the `const char *` one.
+    reading = f"{body}\n{scope}"
     calls = []
     for held, address in _subobjects(found, classes):
         if base_arguments is not None and address == "&this->__base":
@@ -4480,7 +4497,7 @@ def _open_with_subobjects(
             )
             if owner is not None:
                 calls.append(
-                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
+                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, reading))}"
                     f"({address}{', ' + base_arguments if base_arguments else ''});"
                 )
             continue
@@ -4497,8 +4514,16 @@ def _open_with_subobjects(
                 if arguments.strip()
                 else []
             )
+            if len(given) == 1 and _same_class(given[0], held, reading, classes):
+                # `Person(string n) : name(n)` names the copy constructor,
+                # and a class that wrote none has the memberwise copy py2bin
+                # already does everywhere else. Nothing to construct.
+                calls.append(
+                    _copied_in(held, address.lstrip("&"), f"&{given[0]}", classes)
+                )
+                continue
             calls.append(
-                f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
+                f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, reading))}"
                 f"({address}{', ' + arguments if arguments.strip() else ''});"
             )
             continue
@@ -4856,8 +4881,12 @@ _OBJECT_POINTER = re.compile(
     r"(?<!struct )\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)"
 )
 #: `Vec b = a;` - a declaration copied from another object of the same class.
+#: The right side is an object, not only a name: `T held = *first;` and
+#: `T held = base[root];` are how a container's own code takes a copy, and
+#: neither is a bare identifier.
 _COPY_INIT = re.compile(
-    r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;"
+    r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
+    r"(\*?\s*(?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*\[[^\]]*\])?)\s*;"
 )
 
 #: `Vec c = a.add(b);` - a declaration whose value comes from a method that
@@ -5390,6 +5419,45 @@ _OBJECT_ARRAY_VALUES = re.compile(
 )
 
 
+
+def _name_returned_objects(
+    body: str, classes: "dict[str, Class]", returns: str, counter: "list[int]"
+) -> str:
+    """`return a + b;` becomes a declaration and a `return` of its name.
+
+    Everything that fills an object here fills one that has a name: `T v =
+    ...` is the form the operator, the call and the temporary passes all
+    know. A `return` is the one other place an object is made, so it is
+    written as that form and they take it from there.
+    """
+
+    held = returns.replace("const", "").strip()
+    if "*" in held or "&" in held or held not in classes:
+        return body
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    for match in re.finditer(r"\breturn\b([^;]*);", bare):
+        if match.start() < at:
+            continue
+        value = body[match.start(1): match.end(1)].strip()
+        # Nothing, a name, or a path to one: the hidden pointer can be
+        # written from any of those as they stand.
+        if not value or re.fullmatch(r"[A-Za-z_]\w*(?:\s*(?:\.|->)\s*\w+)*", value):
+            continue
+        # A call, which the passes that fill a declaration from one already
+        # handle - including the ones this translator has already rewritten,
+        # where a second name would be a second object nobody fills.
+        if _MEMBER_CALL.match(value) or _PLAIN_CALL.match(value):
+            continue
+        counter[0] += 1
+        name = f"__py2bin_answer_{counter[0]}"
+        out.append(body[at:match.start()])
+        out.append(f"{held} {name} = {value}; return {name};")
+        at = match.end()
+    out.append(body[at:])
+    return "".join(out)
+
 def _rewrite_object_array_values(
     body: str, classes: "dict[str, Class]", known: "dict[str, str]"
 ) -> str:
@@ -5706,6 +5774,12 @@ def _rewrite_body(
     body = _hoist_new_initialisers(body, classes, [0])
     body = _rewrite_new(body, classes, scope())
 
+    # `return a + b;` where the function answers an object: given a name of
+    # its own first, so that every pass which knows how to fill a declaration
+    # - an operator, a call, a temporary - handles this too rather than each
+    # having to learn about `return`.
+    body = _name_returned_objects(body, classes, returns, [0])
+
     # `A xs[3] = {A(1), A(2), A(3)};` - each element is constructed where it
     # stands. Before the temporaries pass, which would otherwise hoist each
     # `A(1)` to the start of the statement and leave the braces holding
@@ -5810,13 +5884,24 @@ def _rewrite_body(
         source = source.strip()
         if type_name not in classes:
             return match.group(0)
-        held = known.get(source) or _declared_objects(body, classes).get(source)
+        held = (
+            known.get(source)
+            or _declared_objects(body, classes).get(source)
+            or (_deduced_type(source, scope()) or "").replace("*", "").strip()
+        )
         if held != type_name:
             return match.group(0)
         known[variable] = type_name
         if _find_method(type_name, "~", classes):
             destroyed.append(variable)
-        address = source if source in pointers else f"&{source}"
+        # `*p` is already an address once the star is gone; anything else has
+        # to have one taken, unless it is a pointer and so is one.
+        if source.startswith("*"):
+            address = source[1:].strip()
+        elif source in pointers:
+            address = source
+        else:
+            address = f"&{source}"
         return (
             f"struct {type_name} {variable}; "
             + _copied_in(type_name, variable, address, classes)
@@ -6171,9 +6256,12 @@ def _rewrite_value_operators(
         # as ordinary as `a + b`, and the literal cannot be matched by a
         # pattern that ends at an identifier. Scanned by hand rather than
         # through `_map_code`, which hides literals from what it is given.
+        # The left operand may be a member reached through `this`, which is
+        # how a method writes one of its own: `return name + other;` inside
+        # a class is `this->name + other` by the time this runs.
         pattern = re.compile(
-            rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*"
-            rf"{re.escape(symbol)}"
+            rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
+            rf"((?:this\s*->\s*)?[A-Za-z_]\w*)\s*{re.escape(symbol)}"
         )
         bare = _without_literals(body)
         out: list[str] = []
@@ -6355,6 +6443,58 @@ def _split_on_operator(text: str, symbol: str) -> "list[str]":
 
 
 
+
+def _rewrite_indexed_operator(
+    body: str,
+    variable: str,
+    symbol: str,
+    owner: str,
+    name: str,
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    classes: "dict[str, Class]",
+    scope: str,
+) -> str:
+    """`p[i] OP x` becomes the call, where `p` points at objects."""
+
+    bare = _without_literals(body)
+    pattern = re.compile(
+        rf"(?<![.\w>]){re.escape(variable)}\s*\[([^\]]*)\]\s*{re.escape(symbol)}"
+    )
+    out: list[str] = []
+    at = 0
+    for found in pattern.finditer(bare):
+        if found.start() < at:
+            continue
+        after = body[found.end():]
+        if symbol in ("+", "-", "<", ">", "*", "/", "%") and after[:1] == "=":
+            continue
+        if symbol in ("<", ">") and after[:1] == symbol:
+            continue
+        end = _one_operand(body, found.end())
+        if end < 0:
+            continue
+        right = body[found.end(): end].strip()
+        if not right:
+            continue
+        passed = right
+        held = (_deduced_type(right, f"{body}\n{scope}") or "").strip()
+        if right in known and right not in pointers:
+            passed = f"&{right}"
+        elif held.replace("const", "").strip() in classes and "*" not in held:
+            # An element of an array of objects, or any other object: the
+            # call takes its address, the way every receiver here does.
+            passed = f"&{right}"
+        suffix = _call_suffix(owner, name, classes, [right], f"{body}\n{scope}")
+        out.append(body[at:found.start()])
+        out.append(
+            f"{_c_name(owner, name, suffix)}"
+            f"(&{variable}[{body[found.start(1): found.end(1)]}], {passed})"
+        )
+        at = end
+    out.append(body[at:])
+    return "".join(out)
+
 def _rewrite_binary_operator(
     body: str,
     variable: str,
@@ -6521,6 +6661,15 @@ def _rewrite_operators(
                 body, variable, symbol, owner, name, address, known, pointers,
                 classes, scope,
             )
+            if variable in pointers:
+                # `base[child] < base[root]` - an element of an array of
+                # objects is an object, and comparing two of them is the
+                # class's own operator. This is how a container's own code
+                # is written, and a pattern matching a name never saw it.
+                body = _rewrite_indexed_operator(
+                    body, variable, symbol, owner, name, known, pointers,
+                    classes, scope,
+                )
     # `b = a;` where the class declared an assignment operator. Only where
     # both sides are objects of it: a struct copy is what `=` means without
     # one, and that is still what a class without an `operator=` gets.
@@ -8953,7 +9102,11 @@ public:
         unsigned long i;
         T *fresh;
         if (want <= room) { return; }
-        fresh = new T[want];
+        /* Storage, not objects: `new T[want]` would run a constructor for
+           every element, which a vector holding fewer than that does not
+           want - and which a class with no default constructor cannot do.
+           This is what a real vector's allocator hands back too. */
+        fresh = (T *)malloc(sizeof(T) * want);
         i = 0;
         while (i < count) { fresh[i] = items[i]; i = i + 1; }
         items = fresh;
@@ -9056,7 +9209,7 @@ template<typename T>
 T min(T a, T b) { return a < b ? a : b; }
 
 template<typename T>
-void swap(T &a, T &b) { T held; held = a; a = b; b = held; }
+void swap(T &a, T &b) { T held = a; a = b; b = held; }
 
 template<typename T>
 T *find(T *first, T *last, T value) {
@@ -9078,7 +9231,11 @@ void fill(T *first, T *last, T value) {
 
 template<typename T>
 void reverse(T *first, T *last) {
-    T held;
+    if (first >= last) { return; }
+    /* Copy-initialised, not default-constructed: an element of a container
+       need not have a constructor taking nothing, and there is always a
+       first element to copy by here. */
+    T held = *first;
     last = last - 1;
     while (first < last) {
         held = *first; *first = *last; *last = held;
@@ -9103,13 +9260,18 @@ T *min_element(T *first, T *last) {
 template<typename T>
 void __sift(T *base, long root, long span) {
     long child;
-    T held;
+    /* Copy-initialised, for the reason `sort` gives: `base[root]` is always
+       there, because a heap being sifted has a root. */
+    T held = base[root];
     while (1) {
         child = root * 2 + 1;
         if (child >= span) { return; }
         if (child + 1 < span) { if (base[child] < base[child + 1]) { child = child + 1; } }
         if (base[child] < base[root]) { return; }
-        if (base[child] == base[root]) { return; }
+        /* No `==` here: `std::sort` asks an element for `<` and nothing
+           else, and this used to ask for equality as well - which a class
+           that only ordered itself could not answer. Swapping two equal
+           elements is harmless; the loop moves down the heap either way. */
         held = base[root]; base[root] = base[child]; base[child] = held;
         root = child;
     }
@@ -9118,7 +9280,7 @@ void __sift(T *base, long root, long span) {
 template<typename T, typename C>
 void __sift_by(T *base, long root, long span, C less_than) {
     long child;
-    T held;
+    T held = base[root];
     while (1) {
         child = root * 2 + 1;
         if (child >= span) { return; }
@@ -9136,9 +9298,9 @@ template<typename T, typename C>
 void sort(T *first, T *last, C less_than) {
     long span;
     long i;
-    T held;
     span = last - first;
     if (span < 2) { return; }
+    T held = *first;
     i = span / 2 - 1;
     while (i >= 0) { __sift_by(first, i, span, less_than); i = i - 1; }
     i = span - 1;
@@ -9153,9 +9315,9 @@ template<typename T>
 void sort(T *first, T *last) {
     long span;
     long i;
-    T held;
     span = last - first;
     if (span < 2) { return; }
+    T held = *first;
     i = span / 2 - 1;
     while (i >= 0) { __sift(first, i, span); i = i - 1; }
     i = span - 1;
@@ -9520,7 +9682,8 @@ public:
         unsigned long i;
         map_entry<K, V> *fresh;
         if (want <= room) { return; }
-        fresh = new map_entry<K, V>[want];
+        /* Storage, not objects, for the reason `vector` gives. */
+        fresh = (map_entry<K, V> *)malloc(sizeof(map_entry<K, V>) * want);
         i = 0;
         while (i < used) { fresh[i] = entries[i]; i = i + 1; }
         entries = fresh;
@@ -9592,7 +9755,8 @@ public:
         unsigned long i;
         T *fresh;
         if (want <= room) { return; }
-        fresh = new T[want];
+        /* Storage, not objects, for the reason `vector` gives. */
+        fresh = (T *)malloc(sizeof(T) * want);
         i = 0;
         while (i < used) { fresh[i] = items[i]; i = i + 1; }
         items = fresh;
@@ -9723,7 +9887,10 @@ public:
     typedef T value_type;
     typedef unsigned long size_type;
     array() { items = 0; count = 0; }
-    void resize(unsigned long want) { items = new T[want]; count = want; }
+    void resize(unsigned long want) {
+        items = (T *)malloc(sizeof(T) * want);
+        count = want;
+    }
     unsigned long size() { return count; }
     int empty() { return count == 0; }
     T &operator[](unsigned long i) { return items[i]; }
