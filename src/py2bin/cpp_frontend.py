@@ -133,6 +133,11 @@ class Class:
     #: Kept here because a call site has to fill them in and the parameter
     #: list has had them stripped by then.
     defaults: "dict[str, list[str]]" = field(default_factory=dict)
+    #: `int n = 7;` written on the member itself. C++ applies it in every
+    #: constructor that does not name the member in its initialiser list, so
+    #: it becomes an assignment at the top of each - before the list's own,
+    #: which then overwrite where they name the same member.
+    member_values: "list[tuple[str, str]]" = field(default_factory=list)
 
     def field_names(self) -> set[str]:
         return {member.name for member in self.members}
@@ -284,11 +289,34 @@ def _line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
+#: `final` after the name says nothing may derive from it, which C++ checks
+#: and C has no way to state - so it is read and dropped, the way `override`
+#: is on a member.
 _CLASS_HEAD = re.compile(
-    r"\b(class|struct)\s+([A-Za-z_]\w*)\s*(?::\s*(?:public|private|protected)?\s*"
+    r"\b(class|struct)\s+([A-Za-z_]\w*)\s*(?:final\s*)?"
+    r"(?::\s*(?:public|private|protected)?\s*(?:virtual\s+)?"
     r"([A-Za-z_]\w*)\s*)?\{"
 )
 
+
+
+#: `int n = 7;` written on the member itself. Only the `=` form: `Point p{1,
+#: 2};` means the member's own constructor with those arguments, which is a
+#: different thing from an assignment and is left to be reported rather than
+#: turned into one.
+_MEMBER_VALUE = re.compile(r"^(.*?[\s*&])([A-Za-z_]\w*)\s*=\s*(.+)$", re.S)
+
+
+def _member_value(declaration: str) -> "tuple[str, tuple[str, str] | None]":
+    """Split `int n = 7` into the declaration and what to assign, if anything."""
+
+    found = _MEMBER_VALUE.match(declaration.strip())
+    if found is None:
+        return declaration, None
+    spelled = found.group(3).strip()
+    if not spelled:
+        return declaration, None
+    return f"{found.group(1)}{found.group(2)}", (found.group(2), spelled)
 
 def _split_members(body: str, name: str, filename: str, at: int) -> Class:
     """Read a class body into its data members and its member functions."""
@@ -329,6 +357,12 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
                     _method_from(declaration, "", filename, at + index)
                 )
             else:
+                # `int n = 7;` on the member itself. C has no such thing, so
+                # the value is taken off the declaration and put into every
+                # constructor, which is where C++ says it happens.
+                declaration, given = _member_value(declaration)
+                if given is not None:
+                    found.member_values.append(given)
                 # `int x, y;` declares both. Split on the commas and read the
                 # type off the first: only the last declarator was registered
                 # before, so a class could not reach its own `x` from its own
@@ -495,7 +529,10 @@ def _wants_heap(text: str) -> bool:
     return _WANTS_HEAP.search(text) is not None or "malloc(" in text
 
 #: `namespace N {` - and `namespace {`, which C++ calls anonymous.
-_NAMESPACE = re.compile(r"\bnamespace\s*([A-Za-z_]\w*)?\s*\{")
+#: `namespace a { ` and, since C++17, `namespace a::b { ` - which means the
+#: same as the two written one inside the other. Every piece is a namespace
+#: whose qualifier has to be stripped, so the whole spelling is captured.
+_NAMESPACE = re.compile(r"\bnamespace\s*((?:[A-Za-z_]\w*)(?:\s*::\s*[A-Za-z_]\w*)*)?\s*\{")
 #: `using namespace N;` - after flattening there is nothing left to bring in.
 _USING_NAMESPACE = re.compile(r"\busing\s+namespace\s+[A-Za-z_][\w:]*\s*;")
 #: `using N::thing;`, same reasoning.
@@ -1058,7 +1095,18 @@ _NAMED_CAST = re.compile(
 )
 
 #: `enum class Mode {` and `enum struct Mode {`, which C spells `enum Mode`.
-_SCOPED_ENUM = re.compile(r"\benum\s+(?:class|struct)\s+([A-Za-z_]\w*)")
+#: `enum class Level` and `enum class Level : int`. C++ lets the type the
+#: enumerators are stored in be named; C has one and does not, and py2bin's
+#: enumerators are ints either way - so the name is read and dropped rather
+#: than left for the C compiler to trip over.
+_SCOPED_ENUM = re.compile(
+    r"\benum\s+(?:class|struct)\s+([A-Za-z_]\w*)(\s*:\s*[A-Za-z_][\w\s]*?)?(?=\s*[{;])"
+)
+
+#: `enum Level : unsigned char {` without the `class`, which C++11 also allows.
+_ENUM_BASE = re.compile(
+    r"\benum\s+([A-Za-z_]\w*)\s*:\s*[A-Za-z_][\w\s]*?(?=\s*\{)"
+)
 
 #: `enum Name {`, `union Name {` - anything whose bare name C++ takes for a
 #: type and C does not.
@@ -1160,6 +1208,8 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
 
     scoped = {match.group(1) for match in _SCOPED_ENUM.finditer(text)}
     text = _map_code(text, lambda part: _SCOPED_ENUM.sub(r"enum \1", part))
+    # And a plain `enum Level : unsigned char {` for the same reason.
+    text = _map_code(text, lambda part: _ENUM_BASE.sub(r"enum \1", part))
 
     # The typedef goes immediately after the body, not with the class ones at
     # the top: C has no forward declaration of an enum, so a typedef naming
@@ -1219,6 +1269,40 @@ def _rewrite_auto(text: str) -> str:
     return _sub_code(_AUTO_DECLARATION, text, lambda match, whole: one(match))
 
 
+
+#: `C() = default;` and `C(const C &) = delete;` - a member the compiler is
+#: told to write, or told never to write.
+_DEFAULTED_MEMBER = re.compile(
+    r"(?<![.\w>])(~?[A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*"
+    r"(?:const\s*)?(?:noexcept\s*)?=\s*(default|delete)\s*;"
+)
+
+
+def _rewrite_defaulted_members(text: str) -> str:
+    """`= default` becomes a body; `= delete` takes the declaration away.
+
+    An empty body is what a defaulted constructor or destructor *is* here:
+    the subobject construction and destruction are put in by the pass that
+    does that for every one of them, written or not.
+
+    A copy constructor is the exception. Defaulted, it means the memberwise
+    copy py2bin already does when a class declares none - so writing it an
+    empty body would give it one that copies nothing. Both spellings drop it
+    instead. `= delete` is a promise C++ enforces and this does not: a
+    program that uses a deleted member compiles here rather than being
+    refused, which is permissive and never wrong for a program that is right.
+    """
+
+    def one(match: "re.Match[str]") -> str:
+        name, parameters, kind = match.groups()
+        held = parameters.replace("&", " ").replace("const", " ").strip()
+        if held.split() and held.split()[0] == name:
+            # `C(const C &)` - the copy constructor.
+            return ""
+        return "" if kind == "delete" else f"{name}({parameters}) {{ }}"
+
+    return _map_code(text, lambda part: _DEFAULTED_MEMBER.sub(one, part))
+
 def _rewrite_initialiser_lists(text: str) -> str:
     """`C(int x) : a(x) { }` becomes `C(int x) { a = x; }`.
 
@@ -1256,7 +1340,11 @@ def _rewrite_initialiser_lists(text: str) -> str:
             if name == base:
                 assignments.append(f"{_BASE_INIT}({value});")
                 continue
-            assignments.append(f"{name} = {value};")
+            # Kept as a marker rather than written out as an assignment:
+            # whether `b(3)` assigns to a member or constructs one depends on
+            # whether `b` is of class type, and the classes have not been
+            # read yet.
+            assignments.append(f"{_MEMBER_INIT}({name}, {value});")
         return ") { " + " ".join(assignments) + " "
 
     return _sub_code(_INITIALISER_LIST, text, lambda match, whole: one(match))
@@ -1265,6 +1353,9 @@ def _rewrite_initialiser_lists(text: str) -> str:
 #: Stands in for "construct the base with these arguments" until the class
 #: table exists and the base's constructor has a name.
 _BASE_INIT = "__py2bin_base_init"
+#: `C(int x) : n(x)` - a member named in the initialiser list, with whatever
+#: it was given. The first argument is the member; the rest are its own.
+_MEMBER_INIT = "__py2bin_member_init"
 
 #: `for (int x : v)` - a range-based for.
 #: The `&` or `*` goes with the type, and it is written against the name -
@@ -3414,7 +3505,11 @@ def _flatten_namespaces(text: str, filename: str) -> "tuple[str, set[str]]":
             ) from None
         inner = text[opening + 1: closing - 1]
         if name:
-            known.add(name)
+            # `namespace a::b {` names two of them, and each is a qualifier
+            # that has to be stripped from every use below.
+            known.update(
+                piece.strip() for piece in name.split("::") if piece.strip()
+            )
             # Not what a namespace nested inside this one declares: those
             # names belong to that one, and counting them here made
             # `namespace outer { namespace inner { class Deep ... } }` look
@@ -4158,7 +4253,14 @@ def _emit_one(
         body = _return_through_pointer(body)
     if method.name == "":
         body, base_arguments = _base_initialiser(body, found)
-        body = _open_with_subobjects(body, found, classes, base_arguments)
+        body, member_arguments = _member_initialisers(body)
+        body = _open_with_subobjects(
+            body, found, classes, base_arguments, member_arguments
+        )
+        # `int n = 7;` written on the member. Applied in every constructor,
+        # and first, so an initialiser list naming the same member overwrites
+        # it - which is the order C++ gives the two.
+        body = _open_with_member_values(body, found, classes)
     elif method.name == "~":
         body = _close_with_subobjects(body, found, classes)
     if method.shared and not parameters:
@@ -4217,6 +4319,41 @@ def _subobjects(found: Class, classes: "dict[str, Class]") -> "list[tuple[str, s
     return parts
 
 
+def _member_initialisers(body: str) -> "tuple[str, dict[str, str]]":
+    """Take `: n(x), b(3)` out of the body and report what each was given.
+
+    Not expanded here for the same reason the base is not: a member of class
+    type has to be *constructed*, and that happens with the other subobjects,
+    in the order C++ builds them.
+    """
+
+    given: "dict[str, str]" = {}
+    out: list[str] = []
+    at = 0
+    for match in re.finditer(rf"{_MEMBER_INIT}\s*\(", body):
+        if match.start() < at:
+            continue
+        close = _closing_paren(body, match.end() - 1)
+        if close < 0:
+            continue
+        pieces = _split_arguments(body[match.end(): close])
+        if not pieces:
+            continue
+        # The name arrives already qualified - every member mention in the
+        # body has been by the time this runs - and what is wanted here is
+        # the member, which is what the subobject list is keyed by.
+        spelled = pieces[0].strip()
+        if spelled.startswith("this->"):
+            spelled = spelled[len("this->"):]
+        given[spelled] = ", ".join(piece.strip() for piece in pieces[1:])
+        out.append(body[at:match.start()])
+        at = close + 1
+        while at < len(body) and body[at] in " ;":
+            at += 1
+    out.append(body[at:])
+    return "".join(out), given
+
+
 def _base_initialiser(body: str, found: Class) -> "tuple[str, str | None]":
     """Take `: Base(v * 2)` out of the body and report what it passed.
 
@@ -4234,12 +4371,51 @@ def _base_initialiser(body: str, found: Class) -> "tuple[str, str | None]":
     return body[:match.start()] + body[match.end():], match.group(1).strip()
 
 
+
+def _open_with_member_values(
+    body: str, found: Class, classes: "dict[str, Class]"
+) -> str:
+    """Assign what each member was given where it was declared.
+
+    Put in after the subobjects are constructed and before anything the
+    constructor's own body does: a member of class type has to exist before
+    it can be assigned to, and what the author wrote has to win.
+    """
+
+    values = list(found.member_values)
+    seen = found
+    while seen.base and seen.base in classes:
+        # A base's own are applied by the base's constructor, which has
+        # already run by here, so only this class's are wanted.
+        break
+    if not values:
+        return body
+    spelled = " ".join(f"this->{name} = {value};" for name, value in values)
+    opening = _opening_of(body)
+    return body[:opening + 1] + " " + spelled + body[opening + 1:]
+
+
+def _opening_of(body: str) -> int:
+    """Where a constructor's own statements begin.
+
+    After whatever `_open_with_subobjects` put in, which is written as one
+    run of calls right after the brace - a member assigned before the object
+    it names is constructed would be overwritten by that construction.
+    """
+
+    opening = body.find("{")
+    rest = body[opening + 1:]
+    built = re.match(r"(?:\s*[A-Za-z_]\w*__ctor[^;]*;)*", rest)
+    return opening + (built.end() if built else 0)
+
 def _open_with_subobjects(
     body: str,
     found: Class,
     classes: "dict[str, Class]",
     base_arguments: "str | None" = None,
+    member_arguments: "dict[str, str] | None" = None,
 ) -> str:
+    named = dict(member_arguments or {})
     calls = []
     for held, address in _subobjects(found, classes):
         if base_arguments is not None and address == "&this->__base":
@@ -4259,15 +4435,30 @@ def _open_with_subobjects(
         owner = _find_method(held, "", classes)
         if owner is None:
             continue
+        # `Holder() : b(3) {}` - the member was named in the initialiser
+        # list, so it is built with what was written there.
+        spelled = address.lstrip("&").replace("this->", "")
+        arguments = named.pop(spelled, None)
+        if arguments is not None:
+            given = (
+                [one.strip() for one in _split_arguments(arguments)]
+                if arguments.strip()
+                else []
+            )
+            calls.append(
+                f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
+                f"({address}{', ' + arguments if arguments.strip() else ''});"
+            )
+            continue
         if any(m.name == "" and m.parameters for m in classes[held].methods) and not any(
             m.name == "" and not m.parameters for m in classes[held].methods
         ):
             raise CppTranslationError(
                 "<c++>", 0,
                 f"{found.name} holds a {held}, whose only constructor takes "
-                f"arguments. C++ would name it in an initialiser list, which "
-                f"this subset does not read - give {held} a constructor taking "
-                f"nothing, or hold a pointer",
+                f"arguments, and no initialiser list here names it. Name it - "
+                f"`{found.name}() : {spelled}(...)` - give {held} a "
+                f"constructor taking nothing, or hold a pointer",
             )
         calls.append(
             f"{_c_name(owner, '', _call_suffix(owner, '', classes, []))}({address});"
@@ -4281,6 +4472,10 @@ def _open_with_subobjects(
             f"this->{_vptr_path(found.name, classes)} = "
             f"{_vtable_name(found.name)};"
         )
+    # Whatever the list named that is not a subobject is an ordinary member,
+    # and an ordinary member is assigned to. After the constructions, because
+    # one of them may be what it is assigned from.
+    calls.extend(f"this->{name} = {value};" for name, value in named.items())
     if not calls:
         return body
     opening = body.find("{")
@@ -7082,6 +7277,7 @@ def translate(source: str, filename: str = "<c++>") -> str:
     text = _strip_namespace_qualifiers(text, scoped_enums)
     # Before the lambdas, because a member initialised from one is still an
     # initialiser list; after the spellings, because a cast may appear in one.
+    text = _rewrite_defaulted_members(text)
     text = _rewrite_initialiser_lists(text)
     text = _rewrite_brace_initialisers(text)
     text = _rewrite_static_members(text, filename)
@@ -7389,7 +7585,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # (string s);` and the definition below became `void shout(struct string
     # *__ret, struct string *__by_value_s)`, so the two disagreed.
     remainder = _rewrite_prototypes(remainder, classes)
-    rewritten = _rewrite_functions(remainder, classes, made, scope)
+    rewritten = _rewrite_functions(
+        remainder, classes, {name: held for name, (held, _a) in made.items()}, scope
+    )
     # `dynamic_cast<D *>(p)` asks at run time what an object really is. This
     # unit is the whole program, so the answer is in the table the object
     # carries: it is a D if that table is D's own or belongs to a class
@@ -8239,28 +8437,62 @@ def _rewrite_declarations(text: str, classes: "dict[str, Class]") -> str:
 
 
 #: `Counter shared;` written outside every function.
+#: `static G global;` counts: how an object is stored is not part of what it
+#: is, and a constructor still has to run for it. `extern` is deliberately
+#: not among them - that names an object defined somewhere else, and
+#: constructing it here would build it twice.
 _FILE_SCOPE_OBJECT = re.compile(
-    r"(?m)^[ \t]*([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*;"
+    r"(?m)^[ \t]*(?:(?:static|const|volatile|inline)[ \t]+)*"
+    r"([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*(?:\(([^;{}()]*)\))?[ \t]*;"
 )
 
 
 def _file_scope_objects(
     text: str, classes: "dict[str, Class]"
-) -> "dict[str, str]":
-    """Objects declared outside any function, and what class each holds.
+) -> "dict[str, tuple[str, str]]":
+    """Objects declared outside any function, with the class and the arguments.
 
     Their methods are reachable from every function in the file, so every body
     has to be rewritten knowing about them - without this, `shared.bump()` was
     left as C++ and the compiler reported a struct with no such member.
     """
 
-    found: dict[str, str] = {}
+    found: "dict[str, tuple[str, str]]" = {}
     for match in _FILE_SCOPE_OBJECT.finditer(text):
         if _depth_at(text, match.start()) != 0:
             continue
+        arguments = (match.group(3) or "").strip()
+        if _looks_like_parameters(arguments, classes):
+            # `string shout(string s);` is a function this file declares, not
+            # an object it builds. C++ has the same ambiguity and resolves it
+            # the same way: what can be read as a declaration is one.
+            continue
         if match.group(1) in classes:
-            found[match.group(2)] = match.group(1)
+            found[match.group(2)] = (match.group(1), arguments)
     return found
+
+
+def _looks_like_parameters(arguments: str, classes: "dict[str, Class]") -> bool:
+    """Whether `(...)` reads as a parameter list rather than as arguments."""
+
+    if arguments.strip() == "void":
+        # Only a declaration spells it that way.
+        return True
+    if not arguments.strip():
+        # `G g();` declares a function taking nothing in C++ too. But a
+        # file-scope object written that way is far commoner than a
+        # prototype for a function answering a class by value, and the
+        # prototype pass rewrites that one anyway.
+        return False
+    for part in _split_arguments(arguments):
+        spelled = part.replace("*", " ").replace("&", " ").replace("const", " ")
+        words = spelled.split()
+        if len(words) >= 2 and all(word.isidentifier() for word in words):
+            continue
+        if len(words) == 1 and (words[0] in classes or words[0] in _LEADS_A_TYPE):
+            continue
+        return False
+    return True
 
 
 def _construct_before_main(text: str, made: "dict[str, str]", classes) -> str:
@@ -8273,13 +8505,32 @@ def _construct_before_main(text: str, made: "dict[str, str]", classes) -> str:
     initialiser that can call anything.
     """
 
+    # `G withArgs(7);` is a declaration with a constructor call in it, and C
+    # reads that as a function taking a 7. The arguments move to the call
+    # below and the declaration is left as the object it declares.
+    text = _sub_code(
+        _FILE_SCOPE_OBJECT,
+        text,
+        lambda match, whole: (
+            None
+            if not match.group(3) or match.group(2) not in made
+            else f"{whole[match.start(): match.start(3) - 1].rstrip()};"
+        ),
+    )
     calls = []
-    for variable, held in made.items():
+    for variable, (held, arguments) in made.items():
         owner = _find_method(held, "", classes)
         if owner is None:
             continue
+        given = (
+            [one.strip() for one in _split_arguments(arguments)]
+            if arguments
+            else []
+        )
+        passed = f", {arguments}" if arguments else ""
         calls.append(
-            f"{_c_name(owner, '', _call_suffix(owner, '', classes, []))}(&{variable});"
+            f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, text))}"
+            f"(&{variable}{passed});"
         )
     if not calls:
         return text

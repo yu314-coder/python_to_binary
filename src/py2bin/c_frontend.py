@@ -1275,6 +1275,9 @@ class SizeofExpression(Node):
 @dataclasses.dataclass(slots=True)
 class Declaration(Node):
     entries: list[tuple[CType, str, object]]  # (type, name, initializer)
+    #: `static int n = 0;` inside a block. One object for the whole program,
+    #: named only where it was written.
+    stored: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -1448,6 +1451,34 @@ _UNSUPPORTED_KEYWORDS = {
     "whether a call is a real call or an inlined body",
 }
 
+
+
+def _stored_declarations(node: object) -> "list[Declaration]":
+    """Every `static` declaration inside a body, at any depth.
+
+    Walked over the dataclass fields rather than through a visitor per node
+    type: what is wanted is one kind of node, and every other kind only has
+    to be looked through.
+    """
+
+    found: "list[Declaration]" = []
+    seen: "set[int]" = set()
+    pending: "list[object]" = [node]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, (list, tuple)):
+            pending.extend(current)
+            continue
+        if not isinstance(current, Node) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, Declaration) and current.stored:
+            found.append(current)
+        for field in dataclasses.fields(current):
+            if field.name == "token":
+                continue
+            pending.append(getattr(current, field.name))
+    return found
 
 class Parser:
     def __init__(self, tokens: list[Token], filename: str, target: str = ""):
@@ -2174,6 +2205,13 @@ class Parser:
 
     def declaration_statement(self) -> Declaration:
         token = self.token
+        # `static int n = 0;` - one object, initialised once, named only
+        # here. Read off before the type, which is where C++ and C both put
+        # it and where the type reader would otherwise refuse it.
+        stored = False
+        while self.token.kind == "identifier" and self.token.value == "static":
+            self.index += 1
+            stored = True
         base = self.type_specifier()
         entries: list[tuple[CType, str, object]] = []
         while True:
@@ -2185,7 +2223,7 @@ class Parser:
             if self.accept(";"):
                 break
             self.take(",")
-        return Declaration(token, entries)
+        return Declaration(token, entries, stored)
 
     def initializer(self) -> object:
         if self.at("{"):
@@ -3027,6 +3065,10 @@ class Lowerer:
         # rather than any frame, which is what lets one object be the same
         # object in the entry point and in every function body.
         self.statics: dict[str, Local] = {}
+        #: `static int n;` inside a block, by the declaration that wrote it.
+        #: Keyed that way so a body inlined into several call sites still
+        #: names one object, which is what C says a static local is.
+        self.stored_locals: "dict[tuple[int, str], Local]" = {}
         self.static_bytes = 0
 
     # --- bookkeeping ---
@@ -4674,7 +4716,40 @@ class Lowerer:
             return
         self.rvalue(node)
 
+    def stored_declaration(self, node: Declaration) -> None:
+        """`static int n = 0;` inside a block: one object, named only here.
+
+        The slot is keyed by the declaration itself rather than by the call,
+        which is what makes this survive inlining: a body compiled into three
+        call sites is the same `Declaration` node three times, so all three
+        name the one object C promises - and not one object per inlining,
+        which is why this used to be refused outright.
+
+        The initial value has to be a constant, as C requires: it is written
+        into the static block rather than stored on the way past, so a
+        declaration reached twice does not initialise twice.
+        """
+
+        for ctype, name, initializer in node.entries:
+            if isinstance(ctype, VoidType):
+                self.error(f"{name!r} cannot have type void", node.token)
+            if isinstance(ctype, ArrayType) and ctype.count is None:
+                ctype = self.deduce_array(ctype, initializer, node.token)
+            local = self.stored_locals.get((id(node), name))
+            if local is None:
+                # Reached without having been seen by the pass that gives
+                # these their storage, which walks every function's body.
+                self.error(
+                    f"{name!r} is a static object in a body py2bin did not "
+                    f"read before it started compiling",
+                    node.token,
+                )
+            self.scopes[-1][name] = local
+
     def declaration(self, node: Declaration) -> None:
+        if node.stored:
+            self.stored_declaration(node)
+            return
         for ctype, name, initializer in node.entries:
             if isinstance(ctype, VoidType):
                 self.error(f"{name!r} cannot have type void", node.token)
@@ -4740,6 +4815,39 @@ class Lowerer:
         # object's initializer may take the address of another.
         for entry in entries:
             self.initialize_global(entry)
+        self.declare_stored_locals()
+
+    def declare_stored_locals(self) -> None:
+        """Give every `static` inside a block its storage and its first value.
+
+        Here, with the file-scope objects, rather than where the declaration
+        stands: C11 6.2.4p3 gives a static local its initial value before the
+        program starts, and a store written where the declaration is would run
+        it again on every call - which is what a static local exists not to do.
+        """
+
+        for function in self.unit.functions.values():
+            if function.body is None:
+                continue
+            for node in _stored_declarations(function.body):
+                for ctype, name, initializer in node.entries:
+                    if isinstance(ctype, ArrayType) and ctype.count is None:
+                        ctype = self.deduce_array(ctype, initializer, node.token)
+                    key = (id(node), name)
+                    if key in self.stored_locals:
+                        continue
+                    local = Local(
+                        ctype, self.allocate_static(ctype, node.token), static=True
+                    )
+                    self.stored_locals[key] = local
+                    if initializer is not None:
+                        self.aggregate_initializer(
+                            GlobalAddress(local.slot),
+                            ctype,
+                            initializer,
+                            node.token,
+                            static=True,
+                        )
 
     def initialize_global(self, entry: GlobalObject) -> None:
         local = self.statics[entry.name]

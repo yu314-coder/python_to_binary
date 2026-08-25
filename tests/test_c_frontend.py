@@ -1557,10 +1557,34 @@ class RejectionTests(CProgramTestCase):
             "must be a constant expression",
         )
 
-    def test_a_block_scope_static_is_refused(self):
-        self.reject(
-            "int main(void) { static int n = 1; return n; }\n",
-            "static object inside a block",
+    def test_a_block_scope_static_keeps_its_value_between_calls(self):
+        # It used to be refused, because a body compiled into several call
+        # sites would get one object per inlining rather than the single
+        # object C promises. The slot is keyed by the declaration itself now,
+        # so every inlining of that body names the same one.
+        self.run_c(
+            "static int tick(void) { static int n = 10; n++; return n; }\n"
+            "int main(void) { tick(); tick(); return tick(); }\n",
+            status=13,
+        )
+
+    def test_a_block_scope_static_is_initialized_once_and_not_per_call(self):
+        # The initial value goes into the static block with the file-scope
+        # objects. Written where the declaration stands, it would run again
+        # on every call - which is what a static local exists not to do.
+        self.run_c(
+            "static int seen(void) { static int n = 5; n = n + 1; return n; }\n"
+            "int main(void) { seen(); seen(); return seen(); }\n",
+            status=8,
+        )
+
+    def test_a_block_scope_static_may_be_an_aggregate(self):
+        self.run_c(
+            "struct P { int x; int y; };\n"
+            "static int used(void) { static struct P p = {3, 4};"
+            " p.x = p.x + 1; return p.x + p.y; }\n"
+            "int main(void) { used(); return used(); }\n",
+            status=9,
         )
 
     def test_a_file_scope_object_cannot_be_redeclared_incompatibly(self):
