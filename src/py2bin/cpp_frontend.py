@@ -196,14 +196,28 @@ def _map_code(text: str, change) -> str:
     return "".join(out)
 
 def _matching(text: str, opening: int) -> int:
-    """The index just past the brace that closes the one at `opening`."""
+    """The index just past the brace that closes the one at `opening`.
+
+    Literals are skipped. A file that embeds HTML or JavaScript is full of
+    braces inside strings - `"function(){}"` - and counting those puts every
+    class body's end in the wrong place, which is a hard thing to see
+    afterwards because the text looks fine.
+    """
 
     depth = 0
     index = opening
     while index < len(text):
-        if text[index] == "{":
+        piece = text[index]
+        if piece in "\"'":
+            quote = piece
+            index += 1
+            while index < len(text) and text[index] != quote:
+                index += 2 if text[index] == "\\" else 1
+            index += 1
+            continue
+        if piece == "{":
             depth += 1
-        elif text[index] == "}":
+        elif piece == "}":
             depth -= 1
             if depth == 0:
                 return index + 1
@@ -1498,6 +1512,12 @@ def _lambda_result(body: str, parameters: str, text: str) -> str:
 
 
 
+#: `int Bridge::run() {` - a method defined outside the class it belongs to.
+_OUT_OF_LINE_HEAD = re.compile(
+    r"(?<![#\w])(?:[A-Za-z_][\w \t*&]*?\s+)?\b([A-Za-z_]\w*)::~?[A-Za-z_]\w*\s*"
+    r"\([^;{}]*\)\s*(?:const\s*)?\{"
+)
+
 #: What a captured `this` is called inside the closure. Not `this`: the
 #: emitted method already has a parameter of that name, and a member called
 #: `this` reached through it would read `this->this`.
@@ -1534,6 +1554,20 @@ def _enclosing_class(text: str, at: int) -> "str | None":
             continue
         if head.end() <= at < closing:
             found = head.group(2)
+    if found is not None:
+        return found
+    # A method defined outside its class is still a method of it, and its
+    # body sits at the top level with no class braces around it. The name
+    # says which class - which is the only thing this needs.
+    for head in _OUT_OF_LINE_HEAD.finditer(text):
+        if head.start() > at:
+            break
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        if head.end() <= at < closing:
+            found = head.group(1)
     return found
 
 

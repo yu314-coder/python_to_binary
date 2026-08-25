@@ -1740,3 +1740,49 @@ class SecondHuntPass(unittest.TestCase):
             "t.cpp",
         )
         self.assertNotIn("__base.__base.__vptr", out.split("int main")[1])
+
+
+class OutOfLineAndLiterals(unittest.TestCase):
+    """What a file that embeds a web page runs into."""
+
+    def test_a_lambda_in_an_out_of_line_method_finds_its_class(self) -> None:
+        """`int Bridge::run() { ... }` has no class braces around it.
+
+        The name says which class, which is the only thing the capture
+        needed - and a method defined outside its class is where a callback
+        is usually written.
+        """
+
+        out = translate(
+            "class B{public:int n;B();void note();int run();};\n"
+            "B::B(){n=0;}\n"
+            "void B::note(){n=n+1;}\n"
+            "int B::run(){ auto f = [this](){ note(); }; f(); return n; }\n"
+            "int main(){ B b; return b.run(); }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_self = this;", out)
+        self.assertIn("B__note(", out)
+
+    def test_a_brace_inside_a_literal_is_not_a_brace(self) -> None:
+        """A file embedding HTML or JavaScript is full of them.
+
+        Counting braces inside strings puts every class body's end in the
+        wrong place, and the text looks perfectly fine afterwards.
+        """
+
+        from py2bin.cpp_frontend import _matching
+
+        text = 'class V { const char *p() { return "a{b"; } int n; };'
+        # Without literal handling the stray `{` makes this run off the end.
+        self.assertEqual(text[_matching(text, text.index("{")) - 1], "}")
+
+    def test_a_class_holding_a_braced_literal_still_translates(self) -> None:
+        out = translate(
+            'class V{public:int n;V(){n=0;}\n'
+            ' const char *page(){ return "<b style=\\"a{b}\\">{}</b>"; }\n'
+            ' int go(){ auto f = [this](){ n = n + 1; }; f(); return n; }};\n'
+            "int main(){ V v; return v.go(); }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_self", out)
