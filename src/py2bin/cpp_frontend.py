@@ -610,6 +610,71 @@ def _declared_here(text: str) -> "dict[str, str]":
     _DECLARED_CACHE[key] = found
     return found
 
+
+#: What a function's own type is called, once it has one.
+_FUNCTION_TYPE = "__py2bin_fn_"
+
+
+def _function_definitions(text: str) -> "dict[str, tuple[str, str]]":
+    """Each function defined at the top level, as name -> (returns, parameters)."""
+
+    found: "dict[str, tuple[str, str]]" = {}
+    for match in _DEFINITION.finditer(text):
+        if _depth_at(text, match.end() - 1) != 0:
+            continue
+        returns = match.group(1).strip()
+        # `static int bigger(...)` - how it is stored is not part of its
+        # type, and a typedef for a pointer to it cannot carry the word.
+        while returns.split() and returns.split()[0] in _STORAGE:
+            returns = returns.split(None, 1)[1] if " " in returns else ""
+        words = returns.split()
+        if not words or words[0] in _NOT_A_TYPE or match.group(2) in _NOT_A_TYPE:
+            continue
+        found[match.group(2)] = (returns, match.group(3).strip())
+    return found
+
+
+#: Words that say where a function lives rather than what it answers.
+_STORAGE = frozenset({"static", "inline", "extern", "__inline"})
+
+
+def _function_type_name(spelled: str, text: str) -> "str | None":
+    """The name of the type a function's own name has, if it is one."""
+
+    if not spelled.isidentifier() or spelled in _NOT_A_TYPE:
+        return None
+    if spelled not in _function_definitions(text):
+        return None
+    return _FUNCTION_TYPE + spelled
+
+
+def _name_function_types(text: str) -> str:
+    """Give a name to the type of every function whose name is used as a value.
+
+    C can declare a pointer to a function only by wrapping the declarator
+    around it, so `C less_than` cannot become one by substituting for `C`.
+    A typedef can, and this writes one wherever a function's name is passed
+    somewhere rather than called.
+    """
+
+    defined = _function_definitions(text)
+    if not defined:
+        return text
+    code = _without_literals(text)
+    typedefs = []
+    for name, (returns, parameters) in defined.items():
+        # Used as a value: the name with no `(` after it. Where it is only
+        # ever called, nothing needs its type and the typedef would be noise.
+        if not re.search(rf"(?<![.\w>]){re.escape(name)}\b\s*(?![\w(])", code):
+            continue
+        typedefs.append(
+            f"typedef {returns} (*{_FUNCTION_TYPE}{name})"
+            f"({parameters or 'void'});"
+        )
+    if not typedefs:
+        return text
+    return "\n".join(typedefs) + "\n" + text
+
 def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     """What type an argument has, as far as this can tell without a type system.
 
@@ -625,6 +690,13 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
             return named
     if not spelled.isidentifier():
         return _deduced_from_expression(spelled, text, before)
+    # A function's own name, passed as a value: `sort(first, last, bigger)`.
+    # It has a type - a pointer to a function - and C cannot spell one in the
+    # place a template argument goes, so it is given a name of its own and
+    # `_name_function_types` writes the typedef that says what it means.
+    named = _function_type_name(spelled, text)
+    if named is not None:
+        return named
     # Bounded on both sides: without it, `main(void)` reads as a declaration
     # of `d` with type `voi`, and the copy was written out under that name.
     # The trailing `[` is how an array is declared, and an array used as a
@@ -786,8 +858,19 @@ def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
         return _declared_return(text, held.replace("*", "").strip(), member.group(2))
     plain = _PLAIN_CALL.match(spelled)
     if plain is not None:
+        # `greater<int>()` is not a call to a function - it builds one of
+        # those. A name that a class body carries is that class, and the
+        # temporary it makes has its type.
+        if _names_a_class(text, plain.group(1)):
+            return plain.group(1)
         return _declared_return(text, None, plain.group(1))
     return None
+
+
+def _names_a_class(text: str, name: str) -> bool:
+    """Whether the text defines a class or struct by that name."""
+
+    return any(head.group(2) == name for head in _CLASS_HEAD.finditer(text))
 
 
 def _declared_return(text: str, owner: "str | None", method: str) -> "str | None":
@@ -6630,6 +6713,12 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # template belongs to the pattern the reader is about to copy.
     text = _fold_out_of_line_templates(text)
     text = _expand_templates(text, filename)
+    # After them: a function's name passed as a value needs a type that can
+    # be written where a template argument goes, and the deduction above has
+    # already used the name this writes the typedef for. Not before, or the
+    # patterns themselves - whose parameters are still spelled `T` - would
+    # each get a typedef naming a type that does not exist.
+    text = _name_function_types(text)
     # After the copies exist, so `vector<int>::iterator` has become
     # `vector__int::iterator` and there is a class of that name to ask.
     text = _resolve_nested_typedefs(text)
@@ -6815,9 +6904,23 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # a struct may hold one, and C needs the complete type to lay the field
     # out. A nested enum lifted out of a class is exactly that case.
     remainder, tagged = _hoist_tagged_types(remainder)
+    # The name a function's own type was given goes up with the rest of them:
+    # a template copy taking one is emitted above whatever is left of the
+    # file, and the typedef was still down where the function was defined.
+    function_types = re.findall(
+        rf"^typedef .*\(\*{_FUNCTION_TYPE}\w+\)\(.*\);$",
+        remainder,
+        re.M,
+    )
+    if function_types:
+        remainder = re.sub(
+            rf"^typedef .*\(\*{_FUNCTION_TYPE}\w+\)\(.*\);$", "", remainder, flags=re.M
+        )
     typedefs = "\n".join(
         [tagged] * bool(tagged)
         + [f"typedef struct {name} {name};" for name in [*order, *plain]]
+        # After the structs: one of these may name a struct in its parameters.
+        + function_types
     )
     # A class holding another must be defined after it: C needs the complete
     # type to lay out the field. Emitting in source order put `Car` before
