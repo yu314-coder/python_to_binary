@@ -7,6 +7,9 @@
 #   tools/cpp_sweep.sh                    the whole sweep, over the corpus
 #   tools/cpp_sweep.sh meaning            only the comparison against clang++
 #   tools/cpp_sweep.sh targets            only the cross-build over all six
+#   tools/cpp_sweep.sh projects           the several-file programs, each of
+#                                         which is a directory with its own
+#                                         headers
 #   tools/cpp_sweep.sh check FILE [DIR]   the same two questions, asked of
 #                                         *your* program rather than the
 #                                         corpus. DIR is an include path.
@@ -35,6 +38,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CORPUS="$ROOT/tools/cpp_corpus"
+PROJECTS="$ROOT/tools/cpp_projects"
 WHICH=${1:-all}
 WORK=${TMPDIR:-/tmp}/py2bin-sweep
 mkdir -p "$WORK"
@@ -81,6 +85,51 @@ run_meaning() {
       printf "  %-28s DIFFERS\n" "$name"
       printf "        clang++: %s (exit %s)\n" "$(printf '%s' "$want" | tr '\n' '|')" "$wantcode"
       printf "        py2bin : %s (exit %s)\n" "$(printf '%s' "$mine" | tr '\n' '|')" "$minecode"
+      differ=$((differ + 1))
+    fi
+  done
+  printf "\n  agreed %d   differed %d   refused %d\n\n" "$agree" "$differ" "$refused"
+}
+
+run_projects() {
+  # A program in several files, with headers of its own. One directory each,
+  # built from its `main.cpp` - which is what `build.py` is handed, and it
+  # finds everything beside it the same way a person would expect.
+  echo "== projects: several files and their own headers =="
+  for dir in "$PROJECTS"/*/; do
+    [ -d "$dir" ] || continue
+    name=$(basename "$dir")
+    entry="$dir/main.cpp"
+    [ -f "$entry" ] || continue
+    want=""
+    if command -v clang++ > /dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      set -- $(find "$dir" -name '*.cpp')
+      includes=""
+      for header in $(find "$dir" -name '*.h' -o -name '*.hpp'); do
+        includes="$includes -I$(dirname "$header")"
+      done
+      # shellcheck disable=SC2086
+      clang++ -std=c++17 -w $includes -o "$WORK/ref_$name" "$@" 2>/dev/null \
+        && want=$("$WORK/ref_$name" 2>&1)
+    fi
+    rm -rf "$dir/dist"
+    if ! python3 "$ROOT/build.py" "$entry" --target "$(host_target)" \
+         > "$WORK/log" 2>&1 || [ ! -x "$dir/dist/main" ]; then
+      printf "  %-28s REFUSED\n" "$name"
+      tail -1 "$WORK/log" | sed 's/^/        /'
+      refused=$((refused + 1)); continue
+    fi
+    mine=$("$dir/dist/main" 2>&1)
+    if [ -z "$want" ]; then
+      printf "  %-28s built (no reference to compare)\n" "$name"
+      agree=$((agree + 1))
+    elif [ "$mine" = "$want" ]; then
+      agree=$((agree + 1))
+    else
+      printf "  %-28s DIFFERS\n" "$name"
+      printf "        clang++: %s\n" "$want"
+      printf "        py2bin : %s\n" "$mine"
       differ=$((differ + 1))
     fi
   done
@@ -162,8 +211,9 @@ run_check() {
 case "$WHICH" in
   meaning) run_meaning ;;
   targets) run_targets ;;
+  projects) run_projects ;;
   check) run_check "${2:-}" "${3:-}" ;;
-  *) run_meaning; run_targets ;;
+  *) run_meaning; run_projects; run_targets ;;
 esac
 
 [ "$differ" -eq 0 ] && [ "$refused" -eq 0 ] && [ "$unbuilt" -eq 0 ]

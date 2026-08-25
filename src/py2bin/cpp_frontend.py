@@ -190,7 +190,10 @@ def _sub_code(pattern: "re.Pattern[str]", text: str, change) -> str:
     was declared above it - was reading the wrong place as soon as anything
     earlier in the file held a string literal. `change` is called with the
     match against a copy whose literals are blanked, and with the real text,
-    so it can slice either.
+    so it can slice either. It answers with the replacement, or with None to
+    leave the match alone - which is not the same as answering
+    `match.group(0)`, since that group comes from the blanked copy and
+    writing it back would erase every literal inside the match.
     """
 
     bare = _without_literals(text)
@@ -199,8 +202,11 @@ def _sub_code(pattern: "re.Pattern[str]", text: str, change) -> str:
     for match in pattern.finditer(bare):
         if match.start() < at:
             continue
+        replacement = change(match, text)
         out.append(text[at:match.start()])
-        out.append(change(match, text))
+        out.append(
+            text[match.start(): match.end()] if replacement is None else replacement
+        )
         at = match.end()
     out.append(text[at:])
     return "".join(out)
@@ -1202,12 +1208,12 @@ def _rewrite_auto(text: str) -> str:
     else `auto` stands for is a type the initialiser already says.
     """
 
-    def one(match: "re.Match[str]") -> str:
+    def one(match: "re.Match[str]") -> "str | None":
         stars, name = match.group(1), match.group(2)
         value = text[match.start(3): match.end(3)].strip()
         held = _deduced_type(value, text, match.start())
         if held is None:
-            return match.group(0)
+            return None
         return f"{held} {stars}{name} = {value};"
 
     return _sub_code(_AUTO_DECLARATION, text, lambda match, whole: one(match))
@@ -1867,7 +1873,7 @@ def _lambda_result(body: str, parameters: str, text: str) -> str:
 
 #: `int Bridge::run() {` - a method defined outside the class it belongs to.
 _OUT_OF_LINE_HEAD = re.compile(
-    r"(?<![#\w])(?:[A-Za-z_][\w \t*&]*?\s+)?\b([A-Za-z_]\w*)::~?[A-Za-z_]\w*\s*"
+    r"(?<![#\w])(?:[A-Za-z_][\w \t]*?\s*[*&]*\s*)?\b([A-Za-z_]\w*)::~?[A-Za-z_]\w*\s*"
     r"\([^;{}]*\)\s*(?:const\s*)?\{"
 )
 
@@ -7037,7 +7043,12 @@ _OUT_OF_LINE = re.compile(
     # for it here, `int Box::width() const {` matched nothing and was emitted
     # verbatim as `int struct Box::width() const` - while the call site was
     # rewritten to the mangled name, so the two halves disagreed.
-    r"(?<![#\w])(?:([A-Za-z_][\w \t*]*?)\s+)?\b([A-Za-z_]\w*)::(~?[A-Za-z_]\w*)\s*"
+    # The stars go in a piece of their own: `const char *Square::name()` has
+    # no space between the `*` and the class, so a pattern ending the return
+    # type with whitespace matched from `Square` onwards and left `const char
+    # *` standing in the output as something C cannot read.
+    r"(?<![#\w])(?:([A-Za-z_][\w \t]*?)\s*([*&]*)\s*)?"
+    r"\b([A-Za-z_]\w*)::(~?[A-Za-z_]\w*)\s*"
     r"\(([^)]*)\)\s*(?:const\s*)?\{"
 )
 
@@ -7210,8 +7221,8 @@ def translate(source: str, filename: str = "<c++>") -> str:
 
     # Members defined outside their class, folded back into it.
     for out in _OUT_OF_LINE.finditer(text):
-        returns, owner, method, parameters = out.groups()
-        returns = (returns or "").strip()
+        spelled, stars, owner, method, parameters = out.groups()
+        returns = f"{(spelled or '').strip()} {stars or ''}".strip()
         if owner not in classes:
             continue
         closing = _matching(text, out.end() - 1)
@@ -7373,6 +7384,11 @@ def translate(source: str, filename: str = "<c++>") -> str:
     remainder = _address_reference_arguments(
         remainder, _function_signatures(remainder, classes), classes
     )
+    # A prototype says the same thing about a function that its definition
+    # does, and has to say it the same way: a header declares `string shout
+    # (string s);` and the definition below became `void shout(struct string
+    # *__ret, struct string *__by_value_s)`, so the two disagreed.
+    remainder = _rewrite_prototypes(remainder, classes)
     rewritten = _rewrite_functions(remainder, classes, made, scope)
     # `dynamic_cast<D *>(p)` asks at run time what an object really is. This
     # unit is the whole program, so the answer is in the table the object
@@ -7990,6 +8006,63 @@ _LOCAL_REFERENCE = re.compile(
     r"\b((?:const\s+)?[A-Za-z_]\w*)\s*&\s*([A-Za-z_]\w*)\s*=\s*([^;]+);"
 )
 
+
+
+#: `string shout(string s);` at the top level - a declaration with no body.
+#: The type and the name have to be separated by something - whitespace, or
+#: the stars of a pointer return. Without that, `printf("...", t);` read as a
+#: declaration of `rintf` with return type `p`.
+_PROTOTYPE = re.compile(
+    r"(?m)^[ \t]*([A-Za-z_][\w\s]*?)(?:\s+|\s*([*&]+)\s*)([A-Za-z_]\w*)\s*"
+    r"\(([^;{}()]*)\)\s*;"
+)
+
+
+def _rewrite_prototypes(text: str, classes: "dict[str, Class]") -> str:
+    """Say about a declared function exactly what its definition says.
+
+    Two things a definition gets and a prototype was not: a class answered by
+    value becomes the hidden pointer the caller provides, and a class taken by
+    value is passed as a pointer and copied on entry. A header that declares
+    the function and a source that defines it then disagreed about both.
+    """
+
+    if not classes:
+        return text
+
+    def one(match: "re.Match[str]") -> "str | None":
+        spelled, stars, name, parameters = match.groups()
+        stars = stars or ""
+        held = spelled.strip()
+        if _depth_at(match.string, match.start()) != 0:
+            # A prototype is at file scope. Inside a body, `string t("a");`
+            # is a temporary being built - and with the literal blanked for
+            # scanning it reads exactly like a declaration taking nothing.
+            return None
+        # Every word of it has to be able to be part of a type. `return f(x);`
+        # and `else g(y);` are statements that read like declarations.
+        if name in _NOT_A_TYPE or any(
+            word in _NOT_A_TYPE for word in held.split()
+        ):
+            return None
+        # Without the `struct`, here and below: the declaration rewriter adds
+        # one further down, and two is not C.
+        inside = _references_to_pointers(parameters)
+        for owner, variable in _by_value_objects(parameters, classes):
+            inside = re.sub(
+                rf"\b{re.escape(owner)}\s+{re.escape(variable)}\b",
+                f"{owner} *__by_value_{variable}",
+                inside,
+                count=1,
+            )
+        if not stars and held in classes:
+            comma = ", " if inside.strip() else ""
+            return f"void {name}({held} *__ret{comma}{inside});"
+        if inside.strip() == parameters.strip():
+            return None
+        return f"{held} {stars}{name}({inside});"
+
+    return _sub_code(_PROTOTYPE, text, lambda m, whole: one(m))
 
 def _rewrite_functions(
     text: str,
