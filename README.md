@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,977 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,986 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -652,7 +652,11 @@ There is also a Claude Code workflow, `.claude/workflows/cpp-hunt.js`: ten
 agents, one per area of the language, each writing programs and building
 them through `build.py`, then a verify pass that tries to *refute* each
 reported failure before it is believed. It finds what the corpus does not
-cover yet, which is the only kind of bug left.
+cover yet, which is the only kind of bug left. Its first run probed 206
+candidates across ten areas and confirmed 97, of which two were programs that
+*ran and were wrong* rather than programs that were refused — a class holding
+another was never constructed, and a copy never called the copy constructor.
+Neither would have been found by waiting to be told.
 
 which asks the same two questions of that file — every target, and the
 comparison — and is the thing to run before shipping.
@@ -660,7 +664,7 @@ comparison — and is the thing to run before shipping.
 *Targets*: every program is built for all six targets. A construct can
 translate perfectly and still fail to encode for one machine, and this is the
 only thing that asks that. It does not run them; five of the six are not this
-computer. 133 programs × 6 targets = 798 builds.
+computer. 144 programs × 6 targets = 864 builds.
 
 The corpus is where the coverage lives: enums, static members, nested
 classes, range-`for`, member initialiser lists, default arguments, named
@@ -668,7 +672,7 @@ casts, `operator=`, deep inheritance, and every header above. Each got in
 because something broke on it. `tools/cpp_differential.sh` still works and is
 the meaning half under its old name. The suite additionally translates every
 corpus program on each change, so one that stops working is caught whether or
-not the sweep is run that day. It runs over 133 programs,
+not the sweep is run that day. It runs over 144 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1769,9 +1773,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1877 tests, no dependencies, nothing to install. Five modules want pytest's
+1886 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1977. Two of them compile a program in a *fresh interpreter* and
+too, for 1986. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1786,4 +1790,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1977-test suite.
+    is checked on every change is the 1986-test suite.

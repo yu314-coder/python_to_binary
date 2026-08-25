@@ -105,6 +105,10 @@ class Class:
     base: str | None = None
     members: list[Member] = field(default_factory=list)
     methods: list[Method] = field(default_factory=list)
+    #: Method name -> the default written for each parameter, "" where none.
+    #: Kept here because a call site has to fill them in and the parameter
+    #: list has had them stripped by then.
+    defaults: "dict[str, list[str]]" = field(default_factory=dict)
 
     def field_names(self) -> set[str]:
         return {member.name for member in self.members}
@@ -256,7 +260,14 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
                     _method_from(declaration, "", filename, at + index)
                 )
             else:
-                found.members.append(_member_from(declaration, filename, at + index))
+                # `int x, y;` declares both. Split on the commas and read the
+                # type off the first: only the last declarator was registered
+                # before, so a class could not reach its own `x` from its own
+                # methods - the struct was laid out right and the name was
+                # simply not in the set that drives implicit `this`.
+                found.members.extend(
+                    _members_from(declaration, filename, at + index)
+                )
         index = statement_end + 1
     return found
 
@@ -266,6 +277,28 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
 _FUNCTION_POINTER_MEMBER = re.compile(
     r"^(.+?)\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*(\([^()]*\))$"
 )
+
+
+def _members_from(
+    declaration: str, filename: str, at: int
+) -> "list[Member]":
+    """Every data member one declaration declares.
+
+    `int x, y;` is two of them, and the type is written in front of the first
+    only - so the rest have to borrow it.
+    """
+
+    parts = _split_arguments(declaration)
+    if len(parts) < 2:
+        return [_member_from(declaration, filename, at)]
+    first = _member_from(parts[0], filename, at)
+    found = [first]
+    for part in parts[1:]:
+        if not part.strip():
+            continue
+        # Each later declarator carries only its own stars and brackets.
+        found.append(_member_from(f"{first.ctype} {part.strip()}", filename, at))
+    return found
 
 
 def _member_from(declaration: str, filename: str, at: int) -> Member:
@@ -1113,6 +1146,12 @@ def _rewrite_default_arguments(text: str) -> str:
     for match in _ANY_DEFINITION.finditer(text):
         head = match.group(1).strip()
         if not head or head.split()[0] in _NOT_A_TYPE:
+            continue
+        if _depth_at(text, match.start()) != 0:
+            # Inside a class body, so it is a member's default and belongs to
+            # the pass that knows how a member is called. This one stripped it
+            # anyway and could not fill the call in, which left the callee
+            # without the default and the caller without the argument.
             continue
         parts = _split_arguments(match.group(2))
         found = [
@@ -3032,6 +3071,53 @@ def _by_value_objects(
     return taken
 
 
+
+def _copy_constructor(held: str, classes: "dict[str, Class]") -> "str | None":
+    """The class that provides a copy constructor for this one, if any.
+
+    A copy constructor is the one-argument constructor whose argument is the
+    class itself. C++ writes one for every class; what matters here is
+    whether the *author* wrote one, because a bitwise copy is what the
+    implicit one does and is already what happens.
+    """
+
+    seen = held
+    while seen and seen in classes:
+        for method in classes[seen].methods:
+            if method.name != "" or _arity(method.parameters) != 1:
+                continue
+            spelled = method.parameters.replace("&", " ").replace("*", " ")
+            words = [w for w in spelled.replace("const", " ").split()]
+            if words and words[0] == seen:
+                return seen
+        seen = classes[seen].base
+    return None
+
+
+def _copied_in(held: str, into: str, source: str, classes) -> str:
+    """The statement that makes a copy: the author's constructor, or a copy.
+
+    C++ calls the copy constructor wherever a copy is made, and an object
+    that owns something - a buffer, a handle - is written on the assumption
+    that it will be. A bitwise copy of one is two objects believing they own
+    the same thing.
+    """
+
+    owner = _copy_constructor(held, classes)
+    if owner is None:
+        return f"{into} = *{source};"
+    return f"{_c_name(owner, '', _copy_suffix(owner, classes))}(&{into}, {source});"
+
+
+def _copy_suffix(owner: str, classes: "dict[str, Class]") -> "str | None":
+    for method in classes[owner].methods:
+        if method.name == "" and _arity(method.parameters) == 1:
+            spelled = method.parameters.replace("&", " ").replace("*", " ")
+            words = spelled.replace("const", " ").split()
+            if words and words[0] == owner:
+                return _suffix_of(owner, method, classes)
+    return None
+
 def _emit_one(
     found: Class, method: Method, classes: "dict[str, Class]", unit: str = ""
 ) -> str:
@@ -3095,12 +3181,14 @@ def _emit_one(
         pointers=pointers | {n for n, h in references.items() if h in classes},
         receivers=receivers,
         unit=unit,
+        returns=method.returns,
     )
     if copied:
         # Declared and then assigned, not initialised: py2bin's C takes
         # `o = *p;` and not `struct V o = *p;`.
         entry = " ".join(
-            f"struct {held} {variable}; {variable} = *__by_value_{variable};"
+            f"struct {held} {variable}; "
+            + _copied_in(held, variable, f"__by_value_{variable}", classes)
             for held, variable in copied
         )
         opening = body.find("{")
@@ -3486,6 +3574,11 @@ _OBJECT = re.compile(r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(\(([^;{}]*)\))?\s*;"
 _OBJECT_POINTER = re.compile(
     r"(?<!struct )\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)"
 )
+#: `Vec b = a;` - a declaration copied from another object of the same class.
+_COPY_INIT = re.compile(
+    r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;"
+)
+
 #: `Vec c = a.add(b);` - a declaration whose value comes from a method that
 #: returns an object. The space is the caller's to provide.
 _VALUE_INIT = re.compile(
@@ -3521,6 +3614,123 @@ def _derives_from(derived: str, base: str, classes: "dict[str, Class]") -> bool:
         seen = found.base
     return False
 
+
+
+def _upcast_pointers(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    returns: str,
+    scope: str,
+) -> str:
+    """Insert the cast C wants wherever a derived pointer stands for a base.
+
+    C++ converts a pointer-to-derived into a pointer-to-base in every position
+    that wants one - an argument, a return, an initialiser - and C makes you
+    say so. The address is the same, so this is a cast and nothing more; what
+    matters is that it is written everywhere and not only where an assignment
+    happened to be.
+    """
+
+    if not classes:
+        return body
+
+    # `return derived;` where the function returns a base pointer.
+    wanted = returns.replace("*", "").strip()
+    if "*" in returns and wanted in classes:
+        def returned(match: "re.Match[str]") -> str:
+            value = match.group(1).strip()
+            held = (_deduced_type(value, scope) or "").replace("*", "").strip()
+            if not held or held == wanted or not _derives_from(held, wanted, classes):
+                return match.group(0)
+            return f"return (struct {wanted} *){value};"
+
+        body = _map_code(
+            body, lambda part: re.sub(r"\breturn\s+([^;]+);", returned, part)
+        )
+
+    # `f(derived)` where a free function's parameter is a base pointer. Read
+    # from the definitions, because a free function has no entry in the class
+    # table and its parameters are written nowhere else.
+    for match in _DEFINITION.finditer(scope):
+        if _depth_at(scope, match.end() - 1) != 0 or match.group(2) in _NOT_A_TYPE:
+            continue
+        wanted_at = [
+            (index, part.replace("*", " ").replace("const", " ").strip())
+            for index, part in enumerate(_split_arguments(match.group(3)))
+            if "*" in part
+            and part.replace("*", " ").replace("const", " ").split()
+            and part.replace("*", " ").replace("const", " ").split()[0] in classes
+        ]
+        if wanted_at:
+            body = _cast_at_positions(
+                body, match.group(2), wanted_at, classes, scope, None
+            )
+
+    # And the same for a method, whose parameters the class table has.
+    signatures = _call_signatures(classes)
+    for name, (owner, method) in signatures.items():
+        wanted_at = [
+            (index, part.replace("*", "").strip())
+            for index, part in enumerate(_split_arguments(method.parameters))
+            if "*" in part
+            and part.replace("*", "").replace("const", "").strip().split()
+            and part.replace("*", "").replace("const", "").strip().split()[0] in classes
+        ]
+        if not wanted_at:
+            continue
+        body = _cast_at_positions(body, name, wanted_at, classes, scope, method)
+    return body
+
+
+def _cast_at_positions(
+    body: str,
+    name: str,
+    wanted_at: "list[tuple[int, str]]",
+    classes: "dict[str, Class]",
+    scope: str,
+    method: "Method | None",
+) -> str:
+    """Cast the arguments at those positions where they name a derived class."""
+
+    pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
+    out: list[str] = []
+    at = 0
+    # A free function has no receiver; a method's is the first argument and
+    # is not one of its declared parameters.
+    if method is None:
+        skip = 0
+    else:
+        skip = 0 if name.endswith("new") or "__new__" in name else 1
+    for call in pattern.finditer(body):
+        if call.start() < at:
+            continue
+        close = _closing_paren(body, call.end() - 1)
+        if close < 0:
+            continue
+        given = _call_arguments(body, call.end() - 1)
+        changed = False
+        for index, spelled in wanted_at:
+            wanted = spelled.replace("const", "").strip().split()[0]
+            where = index + skip
+            if where >= len(given):
+                continue
+            value = given[where].strip()
+            if value.startswith("(struct"):
+                continue
+            held = (_deduced_type(value, scope) or "").replace("*", "").strip()
+            if not held or held == wanted or not _derives_from(held, wanted, classes):
+                continue
+            given[where] = f"(struct {wanted} *){value}"
+            changed = True
+        if not changed:
+            continue
+        out.append(body[at:call.end()])
+        out.append(", ".join(given))
+        at = close
+    out.append(body[at:])
+    return "".join(out)
 
 def _upcast_assignments(
     body: str,
@@ -3744,6 +3954,81 @@ def _statement_start(body: str, at: int) -> int:
             return index + 1
     return 0
 
+
+#: `V(3)` - an object built where it is used rather than named first.
+_TEMPORARY = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(")
+
+
+def _rewrite_temporaries(
+    body: str, classes: "dict[str, Class]", counter: "list[int]"
+) -> str:
+    """`V(5)` becomes an object with a name, because C has nowhere else.
+
+    C++ builds a temporary wherever one is written - as an initialiser, as an
+    argument, in a `return`. C has no expression that constructs anything, so
+    each becomes a declaration ahead of the statement that used it. Where the
+    statement *is* a declaration of the same class, the object being declared
+    is the temporary and no second one is needed.
+    """
+
+    if not classes:
+        return body
+    for _round in range(_TEMPORARY_ROUNDS):
+        found = None
+        for match in _TEMPORARY.finditer(body):
+            name = match.group(1)
+            if name not in classes:
+                continue
+            if _find_method(name, "", classes) is None:
+                continue
+            close = _closing_paren(body, match.end() - 1)
+            if close < 0:
+                continue
+            # `new T(args)` already allocates and constructs; the class name
+            # there is not a temporary being built on the stack.
+            before = body[:match.start()].rstrip()
+            if re.search(r"\bnew$", before):
+                continue
+            # `V t = V(5);` - the declaration's own object is the temporary.
+            start = _statement_start(body, match.start())
+            while start < len(body) and body[start] in " \t\n":
+                start += 1
+            direct = re.match(
+                rf"{re.escape(name)}\s+([A-Za-z_]\w*)\s*=\s*$",
+                body[start:match.start()],
+            )
+            found = (match, close, direct, start)
+            break
+        if found is None:
+            return body
+        match, close, direct, start = found
+        arguments = body[match.end(): close]
+        if direct is not None:
+            body = (
+                body[:start]
+                + f"{match.group(1)} {direct.group(1)}({arguments})"
+                + body[close + 1:]
+            )
+            continue
+        counter[0] += 1
+        held = f"__py2bin_temp_{counter[0]}"
+        body = (
+            body[:start]
+            + f"{match.group(1)} {held}({arguments}); "
+            + body[start:match.start()]
+            + held
+            + body[close + 1:]
+        )
+    raise CppTranslationError(
+        "<c++>", 0,
+        "a statement building more temporaries than py2bin writes out; each "
+        "becomes a declaration of its own and this one never stops asking",
+    )
+
+
+#: How many temporaries one body may hold. A backstop, not a budget.
+_TEMPORARY_ROUNDS = 128
+
 def _rewrite_body(
     body: str,
     classes: "dict[str, Class]",
@@ -3753,7 +4038,8 @@ def _rewrite_body(
     inherited_arrays: "dict[str, str] | None" = None,
     unit: str = "",
     enclosing: "list[tuple[str, str]]" = (),
-    pointer_arrays: "set[str]" = (),
+    pointer_arrays: "dict[str, str] | set[str]" = (),
+    returns: str = "",
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -3836,6 +4122,10 @@ def _rewrite_body(
     # call first, or the pointer declaration reads `new Node` as the type.
     body = _rewrite_new(body, classes, scope())
 
+    # `V(5)` written where a value goes: C has no expression that constructs,
+    # so each temporary becomes an object with a name ahead of the statement.
+    body = _rewrite_temporaries(body, classes, [0])
+
     # `f.filename().c_str()`: a call on what a value return handed back. The
     # declarations have not been read yet - they are rewritten below, and
     # this has to run before that - so what this body declares is scanned for
@@ -3910,6 +4200,32 @@ def _rewrite_body(
 
     body = _OBJECT_ARRAY.sub(declare_array, body)
     body = _OBJECT.sub(declare, body)
+    def copy_initialise(match: "re.Match[str]") -> str:
+        """`T b = a;` - a declaration whose value is another object.
+
+        C++ makes a copy here, which means the copy constructor if the class
+        wrote one. py2bin's C does not take `struct T b = a;` as an
+        initialiser, so it is written as the declaration and the copy that it
+        is - which is also the only way the constructor gets called.
+        """
+
+        type_name, variable, source = match.groups()
+        source = source.strip()
+        if type_name not in classes:
+            return match.group(0)
+        held = known.get(source) or _declared_objects(body, classes).get(source)
+        if held != type_name:
+            return match.group(0)
+        known[variable] = type_name
+        if _find_method(type_name, "~", classes):
+            destroyed.append(variable)
+        address = source if source in pointers else f"&{source}"
+        return (
+            f"struct {type_name} {variable}; "
+            + _copied_in(type_name, variable, address, classes)
+        )
+
+    body = _map_code(body, lambda part: _COPY_INIT.sub(copy_initialise, part))
 
     def declare_pointer(match: "re.Match[str]") -> str:
         type_name, variable = match.groups()
@@ -3919,9 +4235,13 @@ def _rewrite_body(
         pointers.add(variable)
         return f"struct {type_name} *{variable}"
 
-    pointer_arrays: dict[str, str] = {
-        name: known[name] for name in (pointer_arrays or ()) if name in known
-    }
+    # Either a mapping handed down from an enclosing scope, or the bare names
+    # of double-pointer parameters, whose class `known` has.
+    pointer_arrays: dict[str, str] = (
+        dict(pointer_arrays)
+        if isinstance(pointer_arrays, dict)
+        else {name: known[name] for name in (pointer_arrays or ()) if name in known}
+    )
 
     def declare_pointer_array(match: "re.Match[str]") -> str:
         type_name, variable, count = match.groups()
@@ -4111,6 +4431,8 @@ def _rewrite_body(
                 _dispatched(holds, method, classes, reached, owner, scope()),
                 reached,
             )
+    body = _fill_member_defaults(body, classes)
+    body = _upcast_pointers(body, classes, known, pointers, returns, scope())
     body = _fix_call_arguments(body, classes, known, pointers)
 
     # After the dereference pass, not before it: each call in a chain hands
@@ -4130,6 +4452,12 @@ def _rewrite_body(
             dict(arrays),
             unit,
             [*enclosing, *((name, known[name]) for name in destroyed)],
+            # An array of pointers declared in an enclosing scope is still an
+            # array of pointers inside a block. Without this `all[i]->get()`
+            # in a `for` body was left as C++, while the identical statement
+            # written without the braces translated - which is the sort of
+            # difference nobody would think to test for.
+            dict(pointer_arrays),
         )
         for inner in blocks
     ]
@@ -4515,6 +4843,54 @@ def _returns_reference(method: "Method") -> bool:
     """Whether the method hands back a reference rather than a value."""
 
     return "&" in method.returns
+
+
+def _fill_member_defaults(body: str, classes: "dict[str, Class]") -> str:
+    """Give each call the arguments the declaration said it could leave out.
+
+    Run once the calls carry their C names, so a member call and a
+    constructor call are both an ordinary `Name(...)` by the time this looks
+    - which is what makes one pass enough for both.
+    """
+
+    filled: "dict[str, list[str]]" = {}
+    for owner, held in classes.items():
+        for method in held.methods:
+            values = held.defaults.get(method.name)
+            if not values:
+                continue
+            spelled = _c_name(owner, method.name, _suffix_of(owner, method, classes))
+            filled[spelled] = values
+            if method.name == "":
+                filled[_c_name(owner, "new", None)] = values
+    if not filled:
+        return body
+    for name, values in filled.items():
+        pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
+        out: list[str] = []
+        at = 0
+        for call in pattern.finditer(body):
+            if call.start() < at:
+                continue
+            close = _closing_paren(body, call.end() - 1)
+            if close < 0:
+                continue
+            given = _call_arguments(body, call.end() - 1)
+            # The receiver is the first argument of a member call and is not
+            # one of the declared parameters.
+            receiver = given[:1] if not name.endswith("__new") else []
+            rest = given[len(receiver):]
+            if len(rest) >= len(values) or not values[len(rest):]:
+                continue
+            extra = [value for value in values[len(rest):] if value]
+            if len(rest) + len(extra) != len(values):
+                continue
+            out.append(body[at:call.end()])
+            out.append(", ".join(receiver + rest + extra))
+            at = close
+        out.append(body[at:])
+        body = "".join(out)
+    return body
 
 
 def _fix_call_arguments(
@@ -5006,8 +5382,13 @@ _OUT_OF_LINE = re.compile(
     # The return type is optional, because a constructor and a destructor have
     # none: `Stack::Stack()` matched nothing while `void Stack::push()` did, so
     # the constructor was left in the output as C++ nobody could compile.
+    # `const` after the parameters says the method does not change the object,
+    # which is a promise C++ checks and C has no way to make. Without a slot
+    # for it here, `int Box::width() const {` matched nothing and was emitted
+    # verbatim as `int struct Box::width() const` - while the call site was
+    # rewritten to the mangled name, so the two halves disagreed.
     r"(?<![#\w])(?:([A-Za-z_][\w \t*]*?)\s+)?\b([A-Za-z_]\w*)::(~?[A-Za-z_]\w*)\s*"
-    r"\(([^)]*)\)\s*\{"
+    r"\(([^)]*)\)\s*(?:const\s*)?\{"
 )
 
 
@@ -5177,13 +5558,21 @@ def translate(source: str, filename: str = "<c++>") -> str:
             )
         pieces.append((out.start(), closing, ""))
 
-    # A polymorphic class always gets a constructor, even one that does
-    # nothing visible: something has to install the table, and a derived class
-    # that borrowed its base's constructor would be left pointing at the
-    # base's - so its objects would answer as the base.
+    # A class gets a constructor it did not write wherever one has work to do.
+    # Two reasons, and both are silent when they are missed:
+    #
+    #  * a polymorphic class has to install its table, and a derived class
+    #    that borrowed its base's constructor would point at the base's - so
+    #    its objects would answer as the base;
+    #  * a class holding another, or deriving from one, has to construct what
+    #    it holds. `class Outer { Inner in; };` has no constructor of its own
+    #    and py2bin only put subobject construction into one the author wrote,
+    #    so `Outer o;` left `in` as whatever was on the stack. That is C++'s
+    #    implicit default constructor, and leaving it out is not a refusal -
+    #    it is a program that runs and is wrong.
     for name in order:
         found = classes[name]
-        if not _is_polymorphic(name, classes):
+        if not (_is_polymorphic(name, classes) or _subobjects(found, classes)):
             continue
         if not any(m.name == "" and not m.parameters for m in found.methods):
             found.methods.append(Method("", "void", "", "{ }", 0))
@@ -5225,6 +5614,28 @@ def translate(source: str, filename: str = "<c++>") -> str:
     tables = _emit_vtables(order, classes)
     if tables:
         declarations += "\n" + tables
+    # A default argument on a member. The free-function pass above cannot see
+    # these - it reads definitions at the top level, and a member's is inside
+    # a class - and its call pattern excludes `c.bump()` and `Box b(4);`
+    # anyway. So the callee kept losing its default while the call kept its
+    # short list, and the arity check refused a call C++ accepts.
+    for name in order:
+        for method in classes[name].methods:
+            values = [
+                (_DEFAULTED.search(part).group(2).strip()
+                 if _DEFAULTED.search(part) else "")
+                for part in _split_arguments(method.parameters)
+                if part.strip()
+            ]
+            if not any(values):
+                continue
+            method.parameters = ", ".join(
+                _DEFAULTED.sub(r"\1", part).strip()
+                for part in _split_arguments(method.parameters)
+                if part.strip()
+            )
+            classes[name].defaults[method.name] = values
+
     # `M::twice(21)` - a static member function is reached by the class's
     # name, which is a qualifier and not a namespace, so nothing else strips
     # it. There is no object to pass, which is what makes it static.
@@ -5284,6 +5695,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
     definitions = "\n".join(
         _emit_methods(classes[name], classes, scope) for name in order
     )
+    # Before the arguments are given their addresses: a temporary is an
+    # object, and an object passed by value is passed by address - but only
+    # if it exists by the time that pass runs.
+    remainder = _rewrite_temporaries(remainder, classes, [0])
     remainder = _address_reference_arguments(
         remainder, _function_signatures(remainder, classes), classes
     )
@@ -5848,7 +6263,14 @@ def _rewrite_functions(
         if returns_object:
             inner = _return_through_pointer(inner)
         rewritten = _rewrite_body(
-            inner, classes, known, pointers, unit=unit, pointer_arrays=indexed
+            inner, classes, known, pointers, unit=unit, pointer_arrays=indexed,
+            # `S *pick` splits into the type `S *` and the name `pick`;
+            # splitting on whitespace put the star with the name and lost it.
+            returns=(
+                re.match(r"^(.*?)([A-Za-z_]\w*)$", spelled_result).group(1).strip()
+                if re.match(r"^(.*?)([A-Za-z_]\w*)$", spelled_result)
+                else ""
+            ),
         )
         if copied:
             # After the body is rewritten, not before: this text is already C,
@@ -5858,7 +6280,8 @@ def _rewrite_functions(
             # rather than initialised, because py2bin's C takes `o = *p;` and
             # not `struct V o = *p;`.
             entry = " ".join(
-                f"struct {held} {variable}; {variable} = *__by_value_{variable};"
+                f"struct {held} {variable}; "
+                + _copied_in(held, variable, f"__by_value_{variable}", classes)
                 for held, variable in copied
             )
             spot = rewritten.find("{")

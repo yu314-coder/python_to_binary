@@ -1431,3 +1431,126 @@ class MoreOfTheLanguage(unittest.TestCase):
             "t.cpp",
         )
         self.assertIn("A__get(this->inner)", out)
+
+
+class WhatTheHuntFound(unittest.TestCase):
+    """Bugs a fan-out of agents found by probing, not by being told.
+
+    Every one of these was reachable from ordinary C++ and none was in the
+    corpus, which is the point: a corpus catches what it already knows.
+    """
+
+    def test_a_class_holding_another_constructs_it(self) -> None:
+        """C++ writes the default constructor a class did not.
+
+        Subobject construction was only put into a constructor the author
+        wrote, so `class Outer { Inner in; };` left `in` as whatever was on
+        the stack - a program that runs and is wrong, which is worse than one
+        that is refused.
+        """
+
+        out = translate(
+            "class Inner{public:int v;Inner(){v=5;}};\n"
+            "class Outer{public: Inner in;};\n"
+            "int main(){ Outer o; return o.in.v; }",
+            "t.cpp",
+        )
+        self.assertIn("Inner__ctor(&this->in);", out)
+        self.assertIn("Outer__ctor(&o);", out)
+
+    def test_a_copy_runs_the_copy_constructor(self) -> None:
+        """A bitwise copy of an object that owns something makes two owners."""
+
+        source = (
+            "class H{public:int n;H(int v){n=v;}H(const H &o){n=o.n+100;}};\n"
+            "int use(H h){ return h.n; }\n"
+            "int main(){ H a(3); return use(a); }"
+        )
+        out = translate(source, "t.cpp")
+        self.assertIn("(&h, __by_value_h);", out)   # the copy constructor
+
+    def test_two_members_in_one_declaration_are_both_members(self) -> None:
+        """`int x, y;` - the type is in front of the first only.
+
+        The struct was laid out correctly; the names simply were not in the
+        set that drives implicit `this`, so a class could not reach its own
+        `x` from its own methods.
+        """
+
+        out = translate(
+            "struct P{ int x, y; void set(){ x = 1; y = 2; } };\n"
+            "int main(){ P p; p.set(); return p.x; }",
+            "t.cpp",
+        )
+        self.assertIn("this->x = 1", out)
+        self.assertIn("this->y = 2", out)
+
+    def test_an_array_of_pointers_is_still_one_inside_a_block(self) -> None:
+        """The identical statement translated without the braces."""
+
+        out = translate(
+            "class I{public:int n;I(){n=5;}int get(){return n;}};\n"
+            "int main(){ I a; I *all[1]; all[0]=&a;\n"
+            "  for (int i=0;i<1;i++) { return all[i]->get(); } return 0; }",
+            "t.cpp",
+        )
+        self.assertIn("I__get(all[i])", out)
+
+    def test_a_default_argument_on_a_member_reaches_the_call(self) -> None:
+        out = translate(
+            "class C{public:int n;C(){n=0;}void bump(int by = 1){n+=by;}};\n"
+            "int main(){ C c; c.bump(); c.bump(5); return c.n; }",
+            "t.cpp",
+        )
+        self.assertIn("C__bump(&c, 1)", out)
+        self.assertIn("C__bump(&c, 5)", out)
+
+    def test_an_out_of_line_const_method_is_translated(self) -> None:
+        """`const` after the parameters had no slot in the pattern, so the
+        definition stayed as C++ while the call site was rewritten."""
+
+        out = translate(
+            "class B{public:B(int w){w_=w;} int width() const; private: int w_;};\n"
+            "int B::width() const { return w_; }\n"
+            "int main(){ B b(7); return b.width(); }",
+            "t.cpp",
+        )
+        self.assertIn("B__width(struct B *this)", out)
+        self.assertNotIn("B::width", out)
+
+    def test_a_derived_pointer_upcasts_where_a_base_is_wanted(self) -> None:
+        out = translate(
+            "class S{public: virtual int id(){return 1;} virtual ~S(){}};\n"
+            "class T : public S{public: int id(){return 2;}};\n"
+            "int ask(S *s){ return s->id(); }\n"
+            "S *pick(T *t){ return t; }\n"
+            # Assigned rather than returned: returning an object with a
+            # destructor is refused, and says so.
+            "int main(){ T t; int n = ask(&t); return n; }",
+            "t.cpp",
+        )
+        self.assertIn("return (struct S *)t;", out)
+        self.assertIn("ask((struct S *)&t)", out)
+
+    def test_copy_initialising_from_another_object(self) -> None:
+        out = translate(
+            "class B{public:int n;B(int v){n=v;}};\n"
+            "int main(){ B a(3); B b = a; return b.n; }",
+            "t.cpp",
+        )
+        self.assertIn("struct B b;", out)
+        self.assertNotIn("struct B b = a", out)
+
+    def test_a_temporary_becomes_an_object_with_a_name(self) -> None:
+        """C has no expression that constructs anything."""
+
+        out = translate(
+            "class V{public:int n;V(int x){n=x;}};\n"
+            "int take(V v){ return v.n; }\n"
+            "int main(){ V t = V(5); return take(V(6)) + t.n; }",
+            "t.cpp",
+        )
+        # The declaration's own object is the temporary; the argument needs
+        # one of its own.
+        self.assertIn("V__ctor(&t, 5)", out)
+        self.assertIn("__py2bin_temp_", out)
