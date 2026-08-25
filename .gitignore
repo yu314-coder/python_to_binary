@@ -11,5 +11,7 @@ dist/
 .py2bin-work/
 dist_release/
 
-# Worktrees a background workflow makes: each is a copy of this repo.
-.claude/worktrees/
+# Everything the assistant keeps here: workflows, agent definitions, and the
+# worktrees a background workflow makes (each is a copy of this repo). None of
+# it is part of what py2bin is, and it does not belong to anyone who clones.
+.claude/
