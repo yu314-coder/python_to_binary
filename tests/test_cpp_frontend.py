@@ -1554,3 +1554,73 @@ class WhatTheHuntFound(unittest.TestCase):
         # one of its own.
         self.assertIn("V__ctor(&t, 5)", out)
         self.assertIn("__py2bin_temp_", out)
+
+
+class CapturingThis(unittest.TestCase):
+    """`[this]` is how a callback inside a class is written.
+
+    It was refused on the grounds that the enclosing class's type was not
+    known - the lambda is written out before any class is read. The name was
+    all that was missing, and the text has it.
+    """
+
+    def test_the_object_becomes_a_member_of_the_closure(self) -> None:
+        out = translate(
+            "class V{public:int n;\n V(){n=0;}\n void bump(){n=n+1;}\n"
+            " int go(){ auto f = [this](){ bump(); }; f(); return n; }};\n"
+            "int main(){ V v; return v.go(); }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_self", out)
+        # Given the object where the closure is made...
+        self.assertIn("__py2bin_self = this;", out)
+        # ...and the body reaches the class through it.
+        self.assertIn("V__bump(", out)
+
+    def test_a_bare_member_name_goes_through_it_too(self) -> None:
+        """Which is the whole of what capturing `this` buys."""
+
+        out = translate(
+            "class V{public:int n;\n V(){n=0;}\n"
+            " int go(){ auto f = [this](){ n = n + 1; }; f(); return n; }};\n"
+            "int main(){ V v; return v.go(); }",
+            "t.cpp",
+        )
+        self.assertIn("__py2bin_self->n", out)
+
+    def test_capture_defaults_take_the_object_as_well(self) -> None:
+        """`[=]` and `[&]` inside a member function capture `this` in C++.
+
+        Without it the body named a method that exists on no class the
+        closure knows about.
+        """
+
+        for spelled in ("=", "&"):
+            with self.subTest(capture=spelled):
+                out = translate(
+                    "class V{public:int n;\n V(){n=0;}\n void bump(){n=n+1;}\n"
+                    f" int go(){{ auto f = [{spelled}](){{ bump(); }}; f();"
+                    " return n; }};\n"
+                    "int main(){ V v; return v.go(); }",
+                    "t.cpp",
+                )
+                self.assertIn("__py2bin_self = this;", out)
+
+    def test_a_capture_default_that_needs_nothing_takes_nothing(self) -> None:
+        # A closure that never reaches the object should not hold one.
+        out = translate(
+            "class V{public:int n;\n V(){n=0;}\n"
+            " int go(){ int k = 2; auto f = [=](int x){ return x * k; };"
+            " return f(3); }};\n"
+            "int main(){ V v; return v.go(); }",
+            "t.cpp",
+        )
+        self.assertNotIn("__py2bin_self", out)
+
+    def test_capturing_this_outside_a_class_says_so(self) -> None:
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "int main(){ auto f = [this](){ return 1; }; return f(); }",
+                "t.cpp",
+            )
+        self.assertIn("outside any class", str(caught.exception))

@@ -1279,9 +1279,15 @@ def _expand_lambdas(text: str, filename: str) -> str:
         held = _lambda_captures(captures, text, found.start(), filename, body)
         # A reference capture is the address, and every use inside follows it.
         classes = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+        owner = next((s.strip() for v, s, _r in held if v == _SELF), None)
+        if owner is not None:
+            body = _through_self(body, owner, text)
         body = _deref_references(
             body,
-            {v: s for v, s, by_reference in held if by_reference},
+            {
+                v: s for v, s, by_reference in held
+                if by_reference and v != _SELF
+            },
             {name: None for name in classes},
         )
         members = "".join(
@@ -1306,7 +1312,8 @@ def _expand_lambdas(text: str, filename: str) -> str:
         )
         holder = holding.group(1) if holding else f"{name}__made"
         setup = "".join(
-            f" {holder}.{v} = {'&' if by_reference else ''}{v};"
+            f" {holder}.{v} = "
+            + ("this;" if v == _SELF else f"{'&' if by_reference else ''}{v};")
             for v, _s, by_reference in held
         )
         if holding:
@@ -1356,6 +1363,90 @@ def _lambda_result(body: str, parameters: str, text: str) -> str:
     return held or "int"
 
 
+
+#: What a captured `this` is called inside the closure. Not `this`: the
+#: emitted method already has a parameter of that name, and a member called
+#: `this` reached through it would read `this->this`.
+_SELF = "__py2bin_self"
+
+
+def _uses_the_object(body: str, text: str, owner: str) -> bool:
+    """Whether the body reaches the enclosing object at all."""
+
+    code = _without_literals(body)
+    if re.search(r"(?<![.\w>])this\b", code):
+        return True
+    return any(
+        re.search(rf"(?<![.\w>]){re.escape(name)}\b", code)
+        for name in _names_of_class(text, owner)
+    )
+
+
+def _enclosing_class(text: str, at: int) -> "str | None":
+    """The class whose body contains `at`, if any.
+
+    Read from the text because this runs before any class is parsed - which
+    is also why a lambda capturing `this` used to be refused rather than
+    translated. The name is all that was missing.
+    """
+
+    found = None
+    for head in _CLASS_HEAD.finditer(text):
+        if head.start() > at:
+            break
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        if head.end() <= at < closing:
+            found = head.group(2)
+    return found
+
+
+def _through_self(body: str, owner: str, text: str) -> str:
+    """Point what the lambda body says at the object it captured.
+
+    `this` becomes the member holding it. A bare member or method name means
+    the same object in C++ and means nothing here, so it is spelled out -
+    which is the whole of what capturing `this` buys.
+    """
+
+    body = _map_code(
+        body, lambda part: re.sub(r"(?<![.\w>])this\b(?!\s*->)", _SELF, part)
+    )
+    body = _map_code(
+        body, lambda part: re.sub(r"(?<![.\w>])this\s*->", f"{_SELF}->", part)
+    )
+    names = _names_of_class(text, owner)
+    for name in sorted(names, key=len, reverse=True):
+        body = _map_code(
+            body,
+            lambda part, n=name: re.sub(
+                rf"(?<![.\w>]){re.escape(n)}\b", f"{_SELF}->{n}", part
+            ),
+        )
+    return body
+
+
+def _names_of_class(text: str, owner: str) -> "set[str]":
+    """The members and methods that class declares, read from the text."""
+
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) != owner:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            return set()
+        try:
+            found = _split_members(
+                text[head.end(): closing - 1], owner, "<c++>", 0
+            )
+        except CppTranslationError:
+            return set()
+        return found.field_names() | found.method_names()
+    return set()
+
 def _lambda_captures(
     captures: str, text: str, at: int, filename: str, body: str = ""
 ) -> "list[tuple[str, str, bool]]":
@@ -1372,22 +1463,31 @@ def _lambda_captures(
     if not spelled:
         return []
     if spelled in ("=", "&"):
-        return _captures_used(text, at, body, by_reference=spelled == "&")
+        held = _captures_used(text, at, body, by_reference=spelled == "&")
+        # `[=]` and `[&]` written inside a member function capture `this` as
+        # well, and C++ resolves a bare member name through it. Without this
+        # the body named a method that exists on no class the closure knows.
+        owner = _enclosing_class(text, at)
+        if owner is not None and _uses_the_object(body, text, owner):
+            held.append((_SELF, f"{owner} ", True))
+        return held
     held: list[tuple[str, str, bool]] = []
     for part in _split_arguments(spelled):
         name = part.strip()
         by_reference = name.startswith("&")
         if by_reference:
             name = name[1:].strip()
-        if name in ("this",):
-            raise CppTranslationError(
-                filename,
-                _line_of(text, at),
-                "a lambda capturing `this` is not translated: it would need "
-                "the enclosing class's own type as a member, and the lambda "
-                "is written out before any class is read. Capture the members "
-                "it uses instead",
-            )
+        if name == "this":
+            owner = _enclosing_class(text, at)
+            if owner is None:
+                raise CppTranslationError(
+                    filename,
+                    _line_of(text, at),
+                    "a lambda captures `this` outside any class, so there is "
+                    "nothing for it to capture",
+                )
+            held.append((_SELF, f"{owner} ", True))
+            continue
         if not name.isidentifier():
             raise CppTranslationError(
                 filename, _line_of(text, at), f"cannot read the capture {name!r}"

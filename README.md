@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,986 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,991 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -566,7 +566,7 @@ code before it emits anything, which is where they are done here:
 | **Namespaces** | flattened. One translation unit, no linker, so scoping is the whole of what a namespace can mean here |
 | **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer |
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
-| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is the only way to hold one, because the class's name is generated. `[x]` copies, `[&x]` holds the address and every use follows it, and `[=]`/`[&]` capture what the body uses and the scope declares — the same rule C++ applies |
+| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is the only way to hold one, because the class's name is generated. `[x]` copies, `[&x]` holds the address and every use follows it, `[this]` holds the enclosing object and bare member names go through it, and `[=]`/`[&]` capture what the body uses — including the object, the same rule C++ applies |
 | **The rest of it** | enums (plain and scoped), unions, `static` data members and member functions, nested classes, range-`for`, member initialiser lists, default arguments, named casts, `explicit`, function-pointer members, `auto`, `bool`/`true`/`false`/`nullptr`, forward declarations, and free functions that return a class by value |
 | **`operator()`** | a call on an object, so `std::sort(v.begin(), v.end(), cmp)` takes a lambda or a function object alike |
 
@@ -664,7 +664,7 @@ comparison — and is the thing to run before shipping.
 *Targets*: every program is built for all six targets. A construct can
 translate perfectly and still fail to encode for one machine, and this is the
 only thing that asks that. It does not run them; five of the six are not this
-computer. 144 programs × 6 targets = 864 builds.
+computer. 147 programs × 6 targets = 882 builds.
 
 The corpus is where the coverage lives: enums, static members, nested
 classes, range-`for`, member initialiser lists, default arguments, named
@@ -672,7 +672,7 @@ casts, `operator=`, deep inheritance, and every header above. Each got in
 because something broke on it. `tools/cpp_differential.sh` still works and is
 the meaning half under its old name. The suite additionally translates every
 corpus program on each change, so one that stops working is caught whether or
-not the sweep is run that day. It runs over 144 programs,
+not the sweep is run that day. It runs over 147 programs,
 all agreeing. The first run of it found nine bugs, every one of which produced
 C that compiled cleanly and meant something else: a member called `n` rewrote
 `printf("outer\n")` into `printf("outer\this->n")`; a parameter named after a
@@ -1773,9 +1773,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1886 tests, no dependencies, nothing to install. Five modules want pytest's
+1891 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1986. Two of them compile a program in a *fresh interpreter* and
+too, for 1991. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1790,4 +1790,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1986-test suite.
+    is checked on every change is the 1991-test suite.
