@@ -730,7 +730,7 @@ def _function_type_name(spelled: str, text: str) -> "str | None":
     return _FUNCTION_TYPE + spelled
 
 
-def _name_function_types(text: str) -> str:
+def _name_function_types(text: str, classes: "dict[str, Class] | None" = None) -> str:
     """Give a name to the type of every function whose name is used as a value.
 
     C can declare a pointer to a function only by wrapping the declarator
@@ -742,16 +742,24 @@ def _name_function_types(text: str) -> str:
     defined = _function_definitions(text)
     if not defined:
         return text
+    classes = classes or {}
     code = _without_literals(text)
     typedefs = []
     for name, (returns, parameters) in defined.items():
-        # Used as a value: the name with no `(` after it. Where it is only
-        # ever called, nothing needs its type and the typedef would be noise.
-        if not re.search(rf"(?<![.\w>]){re.escape(name)}\b\s*(?![\w(])", code):
+        # Passed somewhere rather than called: after a `(`, a `,`, an `=` or
+        # a `return`, and with no `(` of its own. Asking only for "no paren
+        # after it" also matched a *declaration* of a local with the same
+        # name - `unsigned long at;` inside a container gave the function
+        # `at` a typedef nothing had asked for.
+        if not re.search(
+            rf"(?:[(,=]|\breturn)\s*{re.escape(name)}\b\s*(?![\w(])", code
+        ):
             continue
         typedefs.append(
             f"typedef {returns} (*{_FUNCTION_TYPE}{name})"
-            f"({parameters or 'void'});"
+            # As C, not as C++: a parameter may be a reference, and the
+            # typedef is read by the C compiler.
+            f"({_rewrite_types(_references_to_pointers(parameters), classes) if parameters else 'void'});"
         )
     if not typedefs:
         return text
@@ -4290,6 +4298,7 @@ def _emit_one(
         # name the body has reached by now is found.
         unit=f"{scope}\n{parameters};",
         returns=method.returns,
+        referenced=set(references),
     )
     if returned:
         body = _return_through_pointer(body)
@@ -4867,15 +4876,23 @@ def _rewrite_types(text: str, classes: "dict[str, Class]") -> str:
 
     def replace(match: "re.Match[str]") -> str:
         word = match.group(0)
-        if word in classes:
-            return f"struct {word}"
-        return word
+        if word not in classes:
+            return word
+        # Not where it already says so: `struct P { ... }` is a definition,
+        # and `struct struct P` is not C.
+        before = match.string[:match.start()].rstrip()
+        if before.endswith("struct") or before.endswith("union"):
+            return word
+        return f"struct {word}"
 
     return _map_code(text, lambda part: _WORD.sub(replace, part))
 
 
-#: `Vec v(1, 2);` and `Vec v;` - an object with automatic storage.
-_OBJECT = re.compile(r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(\(([^;{}]*)\))?\s*;")
+#: `Vec v(1, 2);` and `Vec v;` - an object with automatic storage. Not one
+#: that already says `struct`, which is a declaration already written as C.
+_OBJECT = re.compile(
+    r"(?<!struct )\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(\(([^;{}]*)\))?\s*;"
+)
 #: `Vec *p = ...;`
 _OBJECT_POINTER = re.compile(
     r"(?<!struct )\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)"
@@ -5673,6 +5690,7 @@ def _rewrite_body(
     pointer_arrays: "dict[str, str] | set[str]" = (),
     returns: str = "",
     inherited_references: "dict[str, str] | None" = None,
+    referenced: "set[str] | None" = None,
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -5992,7 +6010,9 @@ def _rewrite_body(
                 reached,
             )
 
-    body = _rewrite_operators(body, classes, known, pointers, scope())
+    body = _rewrite_operators(
+        body, classes, known, pointers, scope(), referenced or set()
+    )
     body = _VALUE_INIT.sub(declare_from_call, body)
 
     # Calls, longest name first so `ab.m()` is not matched inside `xab.m()`.
@@ -6617,6 +6637,7 @@ def _rewrite_operators(
     known: "dict[str, str]",
     pointers: "set[str]",
     scope: str = "",
+    referenced: "set[str] | None" = None,
 ) -> str:
     """`a + b` becomes the call the class declared for it.
 
@@ -6731,13 +6752,19 @@ def _rewrite_operators(
         owner = _find_method(known[variable], "op_index", classes)
         if owner is None:
             continue
-        if variable in pointers:
+        if variable in pointers and variable not in (referenced or set()):
             # A pointer indexed is an element of what it points at, which is
             # what the rest of this translator takes `p[i]` to mean. Reading
             # it as the class's own subscript turned a vector's `items[i] =
             # value` into an assignment to a string's character.
+            #
+            # A *reference* is not that: `const vector<int> &v` is a pointer
+            # here only because C has no reference, and `v[i]` in the source
+            # asked the container for its element.
             continue
-        body = _rewrite_subscripts(body, variable, known[variable], classes)
+        body = _rewrite_subscripts(
+            body, variable, known[variable], classes, variable in pointers
+        )
 
     # `*p`, `p->m()` and `!p`, where `p` is a holder standing in for what it
     # holds. None of the three takes a right operand, so the two-operand pass
@@ -6925,7 +6952,11 @@ def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
 
 
 def _rewrite_subscripts(
-    body: str, variable: str, holds: str, classes: "dict[str, Class]"
+    body: str,
+    variable: str,
+    holds: str,
+    classes: "dict[str, Class]",
+    already: bool = False,
 ) -> str:
     """`g[0][1]` becomes one index call wrapped around another.
 
@@ -6948,10 +6979,12 @@ def _rewrite_subscripts(
     for match in re.finditer(rf"(?<![.\w>]){re.escape(variable)}\s*\[", bare):
         if match.start() < at:
             continue
-        receiver = variable
+        # A reference is already the address the call wants; an object is not.
+        receiver = variable if already else f"&{variable}"
         held = holds
         end = match.end() - 1
         reached = False
+        first = True
         while True:
             owner = _find_method(held, "op_index", classes)
             if owner is None:
@@ -6960,8 +6993,11 @@ def _rewrite_subscripts(
             if close < 0:
                 break
             receiver = (
-                f"{_c_name(owner, 'op_index')}(&{receiver}, {body[end + 1: close]})"
+                f"{_c_name(owner, 'op_index')}"
+                f"({receiver if first else '&' + receiver}, "
+                f"{body[end + 1: close]})"
             )
+            first = False
             reached = True
             end = close + 1
             held = _element_of(owner, classes)
@@ -7715,6 +7751,14 @@ def translate(source: str, filename: str = "<c++>") -> str:
             # is - but C++ lets the bare name be a type and C does not, so it
             # still needs the typedef emitted below.
             plain.append(name)
+            # It is still an object as far as *passing* goes: py2bin's C can
+            # neither pass nor answer a struct by value, and `Point add(Point
+            # a, Point b)` is as ordinary in C++ as it is impossible here. So
+            # it is registered with nothing in it - which is all these passes
+            # need to know - and is kept out of `order`, so the body it was
+            # written with is emitted rather than one rebuilt from a reading
+            # that a bitfield or an array would not survive.
+            classes[name] = Class(name)
             continue
         found = _split_members(inner, name, filename, _line_of(text, opening))
         found.base = base
@@ -7946,9 +7990,21 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # does, and has to say it the same way: a header declares `string shout
     # (string s);` and the definition below became `void shout(struct string
     # *__ret, struct string *__by_value_s)`, so the two disagreed.
-    remainder = _rewrite_prototypes(remainder, classes)
+    # A plain struct is C already and is emitted as it was written - but
+    # py2bin's C can neither pass nor answer one by value, and `Point add
+    # (Point a, Point b)` is as ordinary in C++ as it is impossible here. So
+    # the passes that turn a value into a pointer are given a wider view: the
+    # classes, and every plain struct as a shape with nothing in it. Nothing
+    # else sees them, because nothing else should read a body that is already
+    # exactly what it will be emitted as.
+    shapes: "dict[str, Class]" = {**classes, **{name: Class(name) for name in plain}}
+    remainder = _rewrite_prototypes(remainder, shapes)
     rewritten = _rewrite_functions(
-        remainder, classes, {name: held for name, (held, _a) in made.items()}, scope
+        remainder,
+        classes,
+        {name: held for name, (held, _a) in made.items()},
+        scope,
+        shapes,
     )
     # `dynamic_cast<D *>(p)` asks at run time what an object really is. This
     # unit is the whole program, so the answer is in the table the object
@@ -8501,10 +8557,20 @@ def _address_reference_arguments(
     if not signatures:
         return text
     wanted_types: "dict[tuple[str, int], str]" = {}
+    #: How many parameters each function was written with. A call carrying one
+    #: more than that has already been given the caller's space at the front,
+    #: and every position the author wrote has moved along by one. Which calls
+    #: those are is not decidable here - two passes insert it, at different
+    #: times - so it is read off the call itself.
+    arity: "dict[str, int]" = {}
     for match in _DEFINITION.finditer(text):
         if _depth_at(text, match.end() - 1) != 0:
             continue
-        for index, part in enumerate(_split_arguments(match.group(3))):
+        spelled_parts = _split_arguments(match.group(3))
+        arity[match.group(2)] = len(
+            [one for one in spelled_parts if one.strip()]
+        )
+        for index, part in enumerate(spelled_parts):
             spelled = part.replace("*", " ").replace("&", " ").split()
             for word in spelled:
                 if word in classes:
@@ -8520,9 +8586,11 @@ def _address_reference_arguments(
                 continue
             inside = text[found.end(): close]
             parts = _split_arguments(inside) if inside.strip() else []
+            shift = 1 if len(parts) == arity.get(name, -2) + 1 else 0
             for index in positions:
-                if index >= len(parts):
+                if index + shift >= len(parts):
                     continue
+                index = index + shift
                 argument = parts[index].strip()
                 if argument.startswith("&") or not _has_an_address(argument):
                     continue
@@ -8629,6 +8697,7 @@ def _rewrite_functions(
     classes: "dict[str, Class]",
     outer: "dict[str, str] | None" = None,
     unit: str = "",
+    shapes: "dict[str, Class] | None" = None,
 ) -> str:
     """Rewrite each function on its own, because a scope is not the file.
 
@@ -8639,6 +8708,9 @@ def _rewrite_functions(
     somebody else's function.
     """
 
+    # What may be passed by value: the classes, and the plain structs, which
+    # are C already but still cannot travel in a register.
+    shapes = classes if shapes is None else shapes
     out = []
     at = 0
     while True:
@@ -8677,7 +8749,7 @@ def _rewrite_functions(
         # trailing `)` rides along on the last parameter otherwise, and
         # `v)` is not an identifier, so the last parameter was never seen.
         inside = head[opened + 1: head.rfind(")")] if opened >= 0 else ""
-        copied = _by_value_objects(inside, classes)
+        copied = _by_value_objects(inside, shapes)
         # A class returned by value becomes the hidden pointer an ABI would
         # pass - the same transform a method gets, and for the same reason:
         # this backend does not return a struct.
@@ -8686,7 +8758,7 @@ def _rewrite_functions(
         spelled_result = head[:head.rfind("(")].strip() if opened >= 0 else ""
         words = spelled_result.split()
         returned = words[-2] if len(words) >= 2 else ""
-        returns_object = "*" not in spelled_result and returned in classes
+        returns_object = "*" not in spelled_result and returned in shapes
         for held, variable in copied:
             # Without the `struct`: the declaration rewriter below adds one,
             # and two is not C.
@@ -8729,6 +8801,7 @@ def _rewrite_functions(
                 if re.match(r"^(.*?)([A-Za-z_]\w*)$", spelled_result)
                 else ""
             ),
+            referenced=set(references),
         )
         if copied:
             # After the body is rewritten, not before: this text is already C,
