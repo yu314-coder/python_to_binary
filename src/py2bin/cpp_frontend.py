@@ -74,17 +74,26 @@ _OPERATOR_NAMES = {
     # than through the two-operand pass. `!` is the other unary one a holder
     # writes, for "is there anything here".
     "->": "op_arrow", "!": "op_not",
+    # `++c` and `c++` are different members, told apart by a parameter that
+    # exists only to say which - C++ writes the postfix one as `operator++(int)`
+    # and never passes anything for it.
+    "++": "op_inc", "--": "op_dec",
 }
-#: `*x` with nothing on the left. Written `operator*()` - no parameter, which
-#: is the only thing that tells it from multiplication.
+#: `*x` and `-x` with nothing on the left. Written `operator*()` and
+#: `operator-()` - no parameter, which is the only thing that tells either
+#: from the two-operand one written the same way.
 _DEREFERENCE = "op_deref"
+_NEGATE = "op_neg"
+#: `c++` rather than `++c`. Spelled `operator++(int)`, whose parameter is
+#: never given a value and exists only to be different.
+_POSTFIX = {"op_inc": "op_inc_post", "op_dec": "op_dec_post"}
 
 #: Longest first, so `<=` is not read as `<`. `->` is not among them: it takes
 #: no right operand of its own, so the two-operand pass has nothing to match.
 _OPERATOR_SYMBOLS = [
     symbol
     for symbol in sorted(_OPERATOR_NAMES, key=len, reverse=True)
-    if symbol not in ("->", "!")
+    if symbol not in ("->", "!", "++", "--")
 ]
 
 
@@ -170,6 +179,31 @@ def _strip_comments(text: str) -> str:
     return "".join(out)
 
 
+
+
+def _sub_code(pattern: "re.Pattern[str]", text: str, change) -> str:
+    """Like `_map_code`, but the match keeps its place in the whole text.
+
+    `_map_code` hands each stretch of code to the replacement on its own, so
+    a match's offset is into that stretch and not into the file. A
+    replacement that looks around itself - which class encloses this, what
+    was declared above it - was reading the wrong place as soon as anything
+    earlier in the file held a string literal. `change` is called with the
+    match against a copy whose literals are blanked, and with the real text,
+    so it can slice either.
+    """
+
+    bare = _without_literals(text)
+    out: list[str] = []
+    at = 0
+    for match in pattern.finditer(bare):
+        if match.start() < at:
+            continue
+        out.append(text[at:match.start()])
+        out.append(change(match, text))
+        at = match.end()
+    out.append(text[at:])
+    return "".join(out)
 
 def _map_code(text: str, change) -> str:
     """Apply `change` to the code, and to nothing inside a literal.
@@ -418,8 +452,13 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
         # `*x` and `x * y` are written the same and are not the same member.
         # The parameter list is what says which: a unary operator takes none.
         named = _OPERATOR_NAMES[symbol]
-        if symbol == "*" and not parameters.strip():
-            named = _DEREFERENCE
+        if not parameters.strip():
+            named = {"*": _DEREFERENCE, "-": _NEGATE}.get(symbol, named)
+        elif named in _POSTFIX:
+            # The parameter of `operator++(int)` is never given a value; it is
+            # there so the two spellings can be told apart.
+            named = _POSTFIX[named]
+            parameters = ""
         return decorated(Method(named, returns or "void", parameters, body, at_line))
     # `&` is spaced out with `*`: `int &at` names `at` and returns `int &`,
     # and taken whole the name read as `&at`.
@@ -738,6 +777,27 @@ _MEMBER_CALL = re.compile(
 _PLAIN_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\(.*\)$", re.S)
 
 
+
+def _subscript_result(text: str, owner: str) -> "str | None":
+    """What `operator[]` on that class is declared to answer."""
+
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) != owner:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            return None
+        inside = text[head.end() - 1: closing]
+        found = re.search(
+            r"(?<![.\w>])([A-Za-z_][\w\s]*?)\s*([*&]*)\s*operator\s*\[\s*\]", inside
+        )
+        if found is None:
+            return None
+        # A reference is a name for what is there; the type is what it names.
+        return (found.group(1).strip() + " " + found.group(2).replace("&", "")).strip()
+    return None
+
 def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | None":
     """The type of something that is not a bare name.
 
@@ -774,6 +834,11 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
         held = _deduced_type(indexed.group(1).strip(), text, before)
         if held is not None and "*" in held:
             return held[::-1].replace("*", "", 1)[::-1].strip()
+        if held is not None:
+            # A container indexed answers whatever its subscript operator
+            # declares. That is where `for (auto &x : v)` gets the type of
+            # what it walks over.
+            return _subscript_result(text, held.strip())
         return None
     # Arithmetic: `raw + 8` is where `raw` points moved along, and `x * 2.0`
     # is whichever of the two is wider - which is what C++ does with them.
@@ -1037,6 +1102,12 @@ def _tag_typedef(name: str, text: str) -> str:
     return f"typedef {kind} {name} {name};"
 
 
+
+#: `using Number = int;` and `using Fn = int (*)(int);` - a typedef with the
+#: name in front. `using namespace x;` and `using B::f;` have no `=` and are
+#: not this.
+_ALIAS = re.compile(r"(?<![.\w>])using\s+([A-Za-z_]\w*)\s*=\s*([^;]+);")
+
 def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     """The C++ that is a different spelling of C, spelled the C way.
 
@@ -1044,6 +1115,9 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     bare `Colour` or `U` name a type and C wants `enum Colour` or `union U`.
     """
 
+    # `using Number = int;` is a typedef written the other way round, which
+    # is the only way C++11 and later spell one in new code.
+    text = _map_code(text, lambda part: _ALIAS.sub(r"typedef \2 \1;", part))
     text = _FORWARD_DECLARATION.sub("", text)
     # `friend class X;` and `friend int f();` grant access to what is private.
     # py2bin emits a plain struct and enforces no access at all, so a friend
@@ -1106,8 +1180,9 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     return "".join(out), scoped
 
 #: `auto n = 5;` - a declaration whose type is whatever the initialiser is.
+#: The `&` goes with the type and is written against the name: `auto &x = ...`.
 _AUTO_DECLARATION = re.compile(
-    r"(?<![.\w>])auto\s+([A-Za-z_]\w*)\s*=\s*([^;]+);"
+    r"(?<![.\w>])auto\s*([*&]*)\s*([A-Za-z_]\w*)\s*=\s*([^;]+);"
 )
 
 #: `C(int x, int y) : a(x), b(y) {` - a constructor's initialiser list.
@@ -1128,13 +1203,14 @@ def _rewrite_auto(text: str) -> str:
     """
 
     def one(match: "re.Match[str]") -> str:
-        name, value = match.group(1), match.group(2).strip()
+        stars, name = match.group(1), match.group(2)
+        value = text[match.start(3): match.end(3)].strip()
         held = _deduced_type(value, text, match.start())
         if held is None:
             return match.group(0)
-        return f"{held} {name} = {value};"
+        return f"{held} {stars}{name} = {value};"
 
-    return _map_code(text, lambda part: _AUTO_DECLARATION.sub(one, part))
+    return _sub_code(_AUTO_DECLARATION, text, lambda match, whole: one(match))
 
 
 def _rewrite_initialiser_lists(text: str) -> str:
@@ -1167,7 +1243,9 @@ def _rewrite_initialiser_lists(text: str) -> str:
                 owner = head.group(2)
         base = bases.get(owner or "")
         assignments = []
-        for found in _ONE_INITIALISER.finditer(match.group(1)):
+        for found in _ONE_INITIALISER.finditer(
+            text[match.start(1): match.end(1)]
+        ):
             name, value = found.group(1), found.group(2).strip()
             if name == base:
                 assignments.append(f"{_BASE_INIT}({value});")
@@ -1175,7 +1253,7 @@ def _rewrite_initialiser_lists(text: str) -> str:
             assignments.append(f"{name} = {value};")
         return ") { " + " ".join(assignments) + " "
 
-    return _map_code(text, lambda part: _INITIALISER_LIST.sub(one, part))
+    return _sub_code(_INITIALISER_LIST, text, lambda match, whole: one(match))
 
 
 #: Stands in for "construct the base with these arguments" until the class
@@ -1183,8 +1261,11 @@ def _rewrite_initialiser_lists(text: str) -> str:
 _BASE_INIT = "__py2bin_base_init"
 
 #: `for (int x : v)` - a range-based for.
+#: The `&` or `*` goes with the type, and it is written against the name -
+#: `auto &x`, not `auto & x`. Read as its own piece, or the pattern needed
+#: whitespace that nobody writes and matched nothing.
 _RANGE_FOR = re.compile(
-    r"\bfor\s*\(\s*([A-Za-z_][\w\s*&]*?)\s+([A-Za-z_]\w*)\s*:\s*([^)]+)\)"
+    r"\bfor\s*\(\s*([A-Za-z_][\w\s]*?)\s*([*&]*)\s*([A-Za-z_]\w*)\s*:\s*([^)]+)\)"
 )
 
 #: `static int count;` written inside a class.
@@ -1230,7 +1311,8 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
     """
 
     def one(match: "re.Match[str]") -> str:
-        held, name, over = match.group(1), match.group(2), match.group(3).strip()
+        held = (match.group(1) + " " + match.group(2)).strip()
+        name, over = match.group(3), match.group(4).strip()
         counter[0] += 1
         index = f"__py2bin_each_{counter[0]}"
         # A bare name is left bare: the rewriters that turn `v.size()` into a
@@ -5193,6 +5275,7 @@ def _rewrite_body(
     enclosing: "list[tuple[str, str]]" = (),
     pointer_arrays: "dict[str, str] | set[str]" = (),
     returns: str = "",
+    inherited_references: "dict[str, str] | None" = None,
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -5259,6 +5342,21 @@ def _rewrite_body(
     # name declared there is not in scope after it either, so a destructor
     # placed at the end of the function named a variable C says is not there.
     body, blocks = _lift_nested(body)
+
+    # A reference declared in an enclosing scope is still a reference here.
+    # `for (auto &x : v) { x = x * 10; }` puts the binding in the loop's own
+    # block and the author's braces make another inside it, so the uses were
+    # rewritten in a scope that had never heard the name was a reference -
+    # and `x = x * 10` multiplied the pointer.
+    held_references = dict(inherited_references or {})
+    shadowed = _declared_here(body)
+    outer_references = {
+        name: spelled
+        for name, spelled in held_references.items()
+        if name not in shadowed
+    }
+    if outer_references:
+        body = _deref_references(body, outer_references, classes)
 
     def scope() -> str:
         """This body, and then whatever the file declares outside it.
@@ -5626,6 +5724,8 @@ def _rewrite_body(
             # written without the braces translated - which is the sort of
             # difference nobody would think to test for.
             dict(pointer_arrays),
+            returns,
+            {**outer_references, **local_references},
         )
         for inner in blocks
     ]
@@ -6165,12 +6265,37 @@ def _rewrite_holder_operators(
                         rf"(?<![.\w>]){re.escape(v)}\s*->", f"{c}->", part
                     ),
                 )
-        for name, symbol in (("op_deref", "*"), ("op_not", "!")):
+        for name, symbol in (
+            (_DEREFERENCE, "*"), ("op_not", "!"), (_NEGATE, "-"),
+            ("op_inc", "++"), ("op_dec", "--"),
+        ):
             owner = _find_method(holds, name, classes)
             if owner is None:
                 continue
+            if _method_named(owner, name, classes, returns_object=True):
+                # It answers an object, so the caller has to provide the space
+                # and the call cannot stand in an expression - the same as a
+                # two-operand operator that does.
+                body = _rewrite_value_prefix(
+                    body, variable, symbol, owner, name, address, classes
+                )
+                continue
             body = _rewrite_prefix(
                 body, variable, symbol, f"{_c_name(owner, name)}({address})"
+            )
+        # `c++` is the same call written after the name. Done second, so that
+        # `++c` has already gone and cannot be read as `+` `+c`.
+        for name, symbol in (("op_inc_post", "++"), ("op_dec_post", "--")):
+            owner = _find_method(holds, name, classes)
+            if owner is None:
+                continue
+            body = _map_code(
+                body,
+                lambda part, v=variable, s=symbol, o=owner, n=name, a=address: re.sub(
+                    rf"(?<![.\w>]){re.escape(v)}\s*{re.escape(s)}",
+                    f"{_c_name(o, n)}({a})",
+                    part,
+                ),
             )
     return body
 
@@ -6185,6 +6310,34 @@ def _arrow_target(owner: str, classes: "dict[str, Class]") -> "str | None":
     held = held.strip()
     return held if held in classes else None
 
+
+
+def _rewrite_value_prefix(
+    body: str,
+    variable: str,
+    symbol: str,
+    owner: str,
+    name: str,
+    address: str,
+    classes: "dict[str, Class]",
+) -> str:
+    """`V b = -a;` - a prefix operator answering an object, given somewhere to put it."""
+
+    pattern = re.compile(
+        rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*{re.escape(symbol)}\s*"
+        rf"{re.escape(variable)}\s*;"
+    )
+
+    def one(match: "re.Match[str]") -> str:
+        held, target = match.groups()
+        if held not in classes:
+            return match.group(0)
+        return (
+            f"struct {held} {target}; "
+            f"{_c_name(owner, name)}({address}, &{target});"
+        )
+
+    return _map_code(body, lambda part: pattern.sub(one, part))
 
 def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
     """`*p` or `!p` becomes the call, but only where nothing is on the left.
@@ -6949,6 +7102,10 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # After the copies exist, so `vector<int>::iterator` has become
     # `vector__int::iterator` and there is a class of that name to ask.
     text = _resolve_nested_typedefs(text)
+    # Again, for the `auto` whose type only exists once the copies do: the
+    # element of a `vector<int>` is named by `vector__int`'s own subscript
+    # operator, and until the copy is written there is no such class to ask.
+    text = _rewrite_auto(text)
     text = _mangle_overloaded_functions(text, filename)
     #: Whether a pass above has already made this text something other than
     #: what the author wrote. The shortcut below hands the source straight
