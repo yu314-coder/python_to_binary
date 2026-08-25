@@ -1716,6 +1716,36 @@ def _enclosing_body_start(before: str) -> int:
     return 0
 
 
+
+def _member_spans(text: str) -> "list[tuple[int, int, set[str]]]":
+    """Each class body in the text, with the names it declares members under.
+
+    A member hides anything of the same name declared outside the class, so
+    a bare call inside one is answered by the class before the file is asked.
+    """
+
+    spans: "list[tuple[int, int, set[str]]]" = []
+    for head in _CLASS_HEAD.finditer(text):
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        body = text[head.end() - 1: closing]
+        spans.append((
+            head.end() - 1,
+            closing,
+            set(re.findall(r"(?<![.\w>])([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?\{", body)),
+        ))
+    return spans
+
+
+def _hidden_by_a_member(
+    spans: "list[tuple[int, int, set[str]]]", name: str, where: int
+) -> bool:
+    """Whether a call to `name` at `where` is inside a class that declares one."""
+
+    return any(start < where < end and name in names for start, end, names in spans)
+
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
 
@@ -1784,6 +1814,7 @@ def _expand_templates(text: str, filename: str) -> str:
         """
 
         scope = region + "\n" + scope
+        hidden = _member_spans(region)
 
         asked: list[tuple[str, list[str]]] = []
         unread: list[tuple[str, int]] = []
@@ -1806,6 +1837,12 @@ def _expand_templates(text: str, filename: str) -> str:
                     # `<algorithm>` has a `find` template, and the method's
                     # own head reads exactly like a call until you notice
                     # what follows the parentheses.
+                    continue
+                if _hidden_by_a_member(hidden, name, call.start()):
+                    # And a bare call inside that class is to its own member.
+                    # A member hides a name declared outside the class, so
+                    # `find(s)` written in `string` is `string::find` and
+                    # never `std::find`, whatever the template would deduce.
                     continue
                 given = _call_arguments(region, call.end() - 1)
                 deduced = _deduce_arguments(
@@ -1891,6 +1928,8 @@ def _expand_templates(text: str, filename: str) -> str:
                     continue
                 close = _closing_paren(region, call.end() - 1)
                 if close < 0 or _is_a_definition(region, close):
+                    continue
+                if _hidden_by_a_member(_member_spans(region), name, call.start()):
                     continue
                 given = _call_arguments(region, call.end() - 1)
                 deduced = _deduce_arguments(
@@ -3424,12 +3463,22 @@ def _emit_one(
     if references:
         body = _deref_references(body, references, classes)
     body = _qualified_base_calls(body, found, classes)
-    body = _bare_method_calls(body, found, classes)
+    # The parameters go with it: a bare call to an overloaded member is told
+    # apart by the type of what it passes, and that is declared in the head.
+    # In the C++ spelling, not the rewritten one: a by-value object is renamed
+    # `__by_value_o` there, and the body still calls it `o`.
+    scope = f"{method.parameters};\n{unit}" if method.parameters else unit
+    body = _bare_method_calls(body, found, classes, scope)
     known = {"this": found.name}
     pointers: "set[str]" = {"this"}
     for referenced, held in references.items():
         if held in classes:
             known[referenced] = held
+    # A parameter taken by value is an object too. Its copy is spliced in
+    # below, after the body has been rewritten, so nothing else would say
+    # that `o` in `o.c_str()` names one - and the call stayed a field read.
+    for held, variable in copied:
+        known[variable] = held
     receivers: dict[str, str] = {}
     for holder, prefix in _reachable_members(found, classes):
         held = holder.ctype.replace("*", "").strip()
@@ -3449,7 +3498,11 @@ def _emit_one(
         known,
         pointers=pointers | {n for n, h in references.items() if h in classes},
         receivers=receivers,
-        unit=unit,
+        # The parameters come first: which overload a bare call means is
+        # decided by the type of what it passes, and a parameter is declared
+        # in the head rather than in the body being read. Both spellings, so
+        # that whichever name the body has reached by now is found.
+        unit=f"{parameters};\n{scope}",
         returns=method.returns,
     )
     if copied:
@@ -3655,7 +3708,9 @@ def _qualified_base_calls(
     return body
 
 
-def _bare_method_calls(body: str, owner: Class, classes: "dict[str, Class]") -> str:
+def _bare_method_calls(
+    body: str, owner: Class, classes: "dict[str, Class]", scope: str = ""
+) -> str:
     """`sum()` inside a member is a call on `this`, and C has no such thing.
 
     Written out here rather than left to the `this->` pass above, which points
@@ -3675,7 +3730,10 @@ def _bare_method_calls(body: str, owner: Class, classes: "dict[str, Class]") -> 
         pattern = rf"(?<![.>\w]){re.escape(method)}\s*\("
         body = _rewrite_calls(
             body, pattern,
-            _dispatched_here(owner.name, method, classes, provider, reached, body),
+            _dispatched_here(
+                owner.name, method, classes, provider, reached,
+                f"{body}\n{scope}",
+            ),
             reached,
         )
     return body
@@ -4330,9 +4388,16 @@ def _rewrite_temporaries(
             start = _statement_start(body, match.start())
             while start < len(body) and body[start] in " \t\n":
                 start += 1
-            direct = re.match(
-                rf"{re.escape(name)}\s+([A-Za-z_]\w*)\s*=\s*$",
-                body[start:match.start()],
+            # Only when the temporary *is* the whole initialiser. `V t =
+            # V(5) + w;` reads the same up to here, and treating it as a
+            # direct initialisation dropped everything after the `)`.
+            direct = (
+                re.match(
+                    rf"{re.escape(name)}\s+([A-Za-z_]\w*)\s*=\s*$",
+                    body[start:match.start()],
+                )
+                if body[close + 1:].lstrip().startswith(";")
+                else None
             )
             found = (match, close, direct, start)
             break
@@ -4888,27 +4953,53 @@ def _rewrite_value_operators(
             # left `[0]` hanging - and it ran first, so the chain pass never
             # saw the statement at all.
             continue
+        # The right side is an operand, not a name: `string c = a + "x";` is
+        # as ordinary as `a + b`, and the literal cannot be matched by a
+        # pattern that ends at an identifier. Scanned by hand rather than
+        # through `_map_code`, which hides literals from what it is given.
         pattern = re.compile(
             rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*"
-            rf"{re.escape(symbol)}\s*([A-Za-z_]\w*)\s*;"
+            rf"{re.escape(symbol)}"
         )
-
-        def replace(match: "re.Match[str]", n=name) -> str:
-            type_name, variable, left, right = match.groups()
+        bare = _without_literals(body)
+        out: list[str] = []
+        at = 0
+        for match in pattern.finditer(bare):
+            if match.start() < at:
+                continue
+            type_name, variable, left = match.groups()
+            # Not a longer operator that starts with this one, the way `+` is
+            # the front of `+=` and `<` of `<=`.
+            after = body[match.end():]
+            if symbol in ("+", "-", "<", ">", "*", "/", "%") and after[:1] == "=":
+                continue
+            if symbol in ("<", ">") and after[:1] == symbol:
+                continue
             if type_name not in classes or left not in known:
-                return match.group(0)
-            owner = _find_method(known[left], n, classes)
-            if owner is None or not _method_named(owner, n, classes, True):
-                return match.group(0)
+                continue
+            owner = _find_method(known[left], name, classes)
+            if owner is None or not _method_named(owner, name, classes, True):
+                continue
+            end = _one_operand(body, match.end())
+            if end < 0 or body[end:].lstrip()[:1] != ";":
+                continue
+            right = body[match.end(): end].strip()
+            if not right:
+                continue
             added[variable] = type_name
             address = left if left in pointers else f"&{left}"
-            passed = f"&{right}" if right in known and right not in pointers else right
-            return (
-                f"struct {type_name} {variable}; "
-                f"{_c_name(owner, n)}({address}, &{variable}, {passed});"
+            passed = (
+                f"&{right}" if right in known and right not in pointers else right
             )
-
-        body = _map_code(body, lambda part: pattern.sub(replace, part))
+            suffix = _call_suffix(owner, name, classes, [right], body, match.start())
+            out.append(body[at:match.start()])
+            out.append(
+                f"struct {type_name} {variable}; "
+                f"{_c_name(owner, name, suffix)}({address}, &{variable}, {passed})"
+            )
+            at = end
+        out.append(body[at:])
+        body = "".join(out)
     return body, added
 
 #: `out << a << b;` - a chain, which is what streams are always written as.
@@ -5049,6 +5140,116 @@ def _split_on_operator(text: str, symbol: str) -> "list[str]":
     return [piece for piece in pieces if piece.strip()]
 
 
+
+def _rewrite_binary_operator(
+    body: str,
+    variable: str,
+    symbol: str,
+    owner: str,
+    name: str,
+    address: str,
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    classes: "dict[str, Class]",
+) -> str:
+    """`a OP x` becomes the call the class declared, whatever `x` is."""
+
+    pattern = re.compile(
+        rf"(?<![.\w>]){re.escape(variable)}\s*{re.escape(re.sub(r'(.)', r'\\\\\1', ''))}"
+        rf"{re.escape(symbol)}"
+    )
+    out: list[str] = []
+    at = 0
+    for found in pattern.finditer(body):
+        if found.start() < at:
+            continue
+        # Not a longer operator that starts with this one: `a + b` and
+        # `a += b` are different members, and `<` is the front of `<=`.
+        after = body[found.end():]
+        if symbol in ("+", "-", "<", ">", "*", "/", "%") and after[:1] == "=":
+            continue
+        if symbol in ("<", ">") and after[:1] == symbol:
+            continue
+        end = _one_operand(body, found.end())
+        if end < 0:
+            continue
+        right = body[found.end(): end].strip()
+        if not right:
+            continue
+        passed = (
+            f"&{right}" if right in known and right not in pointers else right
+        )
+        out.append(body[at:found.start()])
+        out.append(f"{_c_name(owner, name, _call_suffix(owner, name, classes, [right], body))}({address}, {passed})")
+        at = end
+    out.append(body[at:])
+    return "".join(out)
+
+
+def _one_operand(text: str, at: int) -> int:
+    """The end of the single operand starting at `at`, or -1.
+
+    One operand and not the rest of the expression: `a + b + c` is two calls
+    and not one, and taking everything to the semicolon would make it one.
+    """
+
+    index = at
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index >= len(text):
+        return -1
+    if text[index] in "\"'":
+        quote = text[index]
+        index += 1
+        while index < len(text) and text[index] != quote:
+            index += 2 if text[index] == "\\" else 1
+        index += 1
+    elif text[index] == "(":
+        closing = _closing_paren(text, index)
+        if closing < 0:
+            return -1
+        index = closing + 1
+    elif text[index].isdigit() or (
+        text[index] in "+-" and index + 1 < len(text) and text[index + 1].isdigit()
+    ):
+        index += 1
+        while index < len(text) and (text[index].isalnum() or text[index] == "."):
+            index += 1
+    elif text[index].isalpha() or text[index] == "_":
+        while index < len(text) and (text[index].isalnum() or text[index] == "_"):
+            index += 1
+    else:
+        return -1
+    # Whatever trails it and belongs to it: a call, a subscript, a member.
+    while index < len(text):
+        if text[index] == "(":
+            closing = _closing_paren(text, index)
+            if closing < 0:
+                return index
+            index = closing + 1
+            continue
+        if text[index] == "[":
+            depth = 0
+            scan = index
+            while scan < len(text):
+                if text[scan] == "[":
+                    depth += 1
+                elif text[scan] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                scan += 1
+            if scan >= len(text):
+                return index
+            index = scan + 1
+            continue
+        following = re.match(r"(\.|->)\s*[A-Za-z_]\w*", text[index:])
+        if following:
+            index += following.end()
+            continue
+        break
+    return index
+
 def _rewrite_operators(
     body: str,
     classes: "dict[str, Class]",
@@ -5090,17 +5291,14 @@ def _rewrite_operators(
                 # form below turns `V c = a + b;` into that.
                 continue
             address = variable if variable in pointers else f"&{variable}"
-            pattern = (
-                rf"\b{re.escape(variable)}\s*{re.escape(symbol)}\s*"
-                rf"([A-Za-z_]\w*)\b"
+            # The right side is an operand, not necessarily a name: `a += " x"`
+            # and `a + f(1)` are as ordinary as `a + b`, and a pattern that
+            # only matched an identifier left them for the C compiler to
+            # complain about an operator it does not have.
+            body = _rewrite_binary_operator(
+                body, variable, symbol, owner, name, address, known, pointers,
+                classes,
             )
-
-            def replace(match: "re.Match[str]", o=owner, n=name, a=address) -> str:
-                right = match.group(1)
-                passed = f"&{right}" if right in known and right not in pointers else right
-                return f"{_c_name(o, n)}({a}, {passed})"
-
-            body = _map_code(body, lambda part: re.sub(pattern, replace, part))
     # `b = a;` where the class declared an assignment operator. Only where
     # both sides are objects of it: a struct copy is what `=` means without
     # one, and that is still what a class without an `operator=` gets.
@@ -5144,7 +5342,13 @@ def _rewrite_operators(
         owner = _find_method(known[variable], "op_index", classes)
         if owner is None:
             continue
-        address = variable if variable in pointers else f"&{variable}"
+        if variable in pointers:
+            # A pointer indexed is an element of what it points at, which is
+            # what the rest of this translator takes `p[i]` to mean. Reading
+            # it as the class's own subscript turned a vector's `items[i] =
+            # value` into an assignment to a string's character.
+            continue
+        address = f"&{variable}"
         pattern = rf"\b{re.escape(variable)}\s*\[([^\]]*)\]"
         body = _map_code(
             body,
@@ -6589,6 +6793,15 @@ def _rewrite_functions(
         except ValueError:
             break
         head = text[at:opening]
+        # What sits between the previous function and this one - a file-scope
+        # object, a struct, an include - is not part of the declaration, and
+        # the rebuild below writes a fresh head from the return type and the
+        # name. Read together, that rebuild dropped everything in front of it:
+        # a static member's storage, written at file scope, vanished if the
+        # first function after it returned an object by value.
+        bare = _without_literals(head)
+        cut = max(bare.rfind(";"), bare.rfind("}")) + 1
+        lead, head = head[:cut], head[cut:]
         opened = head.rfind("(")
         references = (
             _reference_parameters(head[opened + 1:], classes) if opened >= 0 else {}
@@ -6644,7 +6857,10 @@ def _rewrite_functions(
         if returns_object:
             inner = _return_through_pointer(inner)
         rewritten = _rewrite_body(
-            inner, classes, known, pointers, unit=unit, pointer_arrays=indexed,
+            inner, classes, known, pointers,
+            unit=f"{head[head.rfind('(') + 1: head.rfind(')')]};\n{unit}"
+            if opened >= 0 else unit,
+            pointer_arrays=indexed,
             # `S *pick` splits into the type `S *` and the name `pick`;
             # splitting on whitespace put the star with the name and lost it.
             returns=(
@@ -6667,6 +6883,7 @@ def _rewrite_functions(
             )
             spot = rewritten.find("{")
             rewritten = rewritten[:spot + 1] + " " + entry + rewritten[spot + 1:]
+        out.append(_rewrite_declarations(lead, classes))
         out.append(_rewrite_declarations(head, classes))
         out.append(rewritten)
         at = closing
@@ -6832,10 +7049,60 @@ public:
         while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
         return -1;
     }
+    static const int npos = -1;
+
+    void operator+=(string o) { append(o); }
+    void operator+=(const char *s) { append(s); }
+    void operator+=(char c) { push_back(c); }
+
+    char &operator[](int i) { return buf[i]; }
+
+    int operator<(string o) { return compare(o.c_str()) < 0; }
+    int operator>(string o) { return compare(o.c_str()) > 0; }
+    int operator<=(string o) { return compare(o.c_str()) <= 0; }
+    int operator>=(string o) { return compare(o.c_str()) >= 0; }
+
+    int find(const char *needle) {
+        int i; int j;
+        if (needle[0] == 0) { return 0; }
+        i = 0;
+        while (i < len) {
+            j = 0;
+            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
+                j = j + 1;
+            }
+            if (needle[j] == 0) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /* The cast is what says which overload: two `find`s take one argument,
+       and the type of a call's result is what tells them apart. */
+    int find(string needle) { return find((const char *)needle.c_str()); }
+
+    string substr(int from, int count) {
+        string out;
+        int i;
+        i = 0;
+        while (i < count && from + i < len) {
+            out.push_back(buf[from + i]);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    string substr(int from) { return substr(from, len - from); }
+
     void append(string o) {
         int j; j = 0;
         while (j < o.len && len + j < 255) { buf[len + j] = o.buf[j]; j = j + 1; }
         len = len + j; buf[len] = 0;
+    }
+    void append(const char *s) {
+        int j; j = 0;
+        while (s[j] != 0 && len < 255) { buf[len] = s[j]; len = len + 1; j = j + 1; }
+        buf[len] = 0;
     }
     string operator+(string o) {
         string r; int i; int j;
@@ -6844,11 +7111,20 @@ public:
         r.len = len + j; r.buf[r.len] = 0;
         return r;
     }
+    int operator==(const char *s) { return compare(s) == 0; }
     int operator==(string o) {
         int i;
         if (len != o.len) { return 0; }
         for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 0; } }
         return 1;
+    }
+    string operator+(const char *s) {
+        string r;
+        int i;
+        i = 0;
+        while (i < len) { r.push_back(buf[i]); i = i + 1; }
+        r.append(s);
+        return r;
     }
     int operator!=(string o) {
         int i;
@@ -6857,6 +7133,35 @@ public:
         return 0;
     }
 };
+
+string to_string(int value) {
+    string out;
+    char digits[24];
+    int at;
+    int negative;
+    unsigned int left;
+    at = 0;
+    negative = value < 0;
+    left = negative ? (unsigned int)(-value) : (unsigned int)value;
+    if (left == 0) { digits[at] = '0'; at = at + 1; }
+    while (left > 0) { digits[at] = (char)('0' + (left % 10)); left = left / 10; at = at + 1; }
+    if (negative) { out.push_back('-'); }
+    while (at > 0) { at = at - 1; out.push_back(digits[at]); }
+    return out;
+}
+
+int stoi(string text) {
+    int i; int sign; int value;
+    i = 0; sign = 1; value = 0;
+    if (text.at(0) == '-') { sign = -1; i = 1; }
+    while (i < text.size()) {
+        if (text.at(i) < '0') { return value * sign; }
+        if (text.at(i) > '9') { return value * sign; }
+        value = value * 10 + (int)(text.at(i) - '0');
+        i = i + 1;
+    }
+    return value * sign;
+}
 }
 """
 
