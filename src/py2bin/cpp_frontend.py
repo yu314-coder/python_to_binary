@@ -1815,10 +1815,104 @@ def _hidden_by_a_member(
 
     return any(start < where < end and name in names for start, end, names in spans)
 
+
+
+#: `int kind<double>(double v) {` - what follows `template<>`, an explicit
+#: specialisation. The arguments are spelled out, so nothing is deduced.
+_SPECIALISATION = re.compile(
+    r"(?:([A-Za-z_][\w\s*&]*?)\s+)?\b([A-Za-z_]\w*)\s*<([^<>]*)>\s*"
+    r"\(([^()]*)\)\s*(?:const\s*)?\{"
+)
+
+#: `template<typename T> T Box<T>::get() { ... }` - a member of a class
+#: template, defined outside it. Which is how a header usually writes one.
+_TEMPLATE_MEMBER = re.compile(
+    r"\btemplate\s*<([^<>]*)>\s*"
+    r"(?:([A-Za-z_][\w\s*&]*?)\s+)?"
+    r"\b([A-Za-z_]\w*)\s*<([^<>]*)>\s*::\s*(~?[A-Za-z_]\w*)\s*"
+    r"\(([^()]*)\)\s*(?:const\s*)?\{"
+)
+
+#: A backstop on the folding below, not a budget.
+_OUT_OF_LINE_ROUNDS = 512
+
+
+def _fold_out_of_line_templates(text: str) -> str:
+    """Put a class template's members back inside it.
+
+    py2bin expands a template by copying its pattern, and the pattern is the
+    class body. A member written as `template<typename T> T Box<T>::get()`
+    is part of that pattern and was sitting outside it, where the reader saw
+    a template that is neither a class nor a function and said so.
+    """
+
+    for _round in range(_OUT_OF_LINE_ROUNDS):
+        found = None
+        for match in _TEMPLATE_MEMBER.finditer(text):
+            if _depth_at(text, match.start()) == 0:
+                found = match
+                break
+        if found is None:
+            return text
+        try:
+            closing = _matching(text, found.end() - 1)
+        except ValueError:
+            return text
+        body = text[found.end() - 1: closing + 1]
+        returns = (found.group(2) or "").strip()
+        owner, name, parameters = found.group(3), found.group(5), found.group(6)
+        spelled = f"{returns + ' ' if returns else ''}{name}({parameters}) {body}"
+        # Cut the definition first. The class is somewhere else in the text
+        # and taking this out does not move anything inside it.
+        without = text[:found.start()] + text[closing + 1:]
+        placed = _into_class_body(without, owner, name, spelled)
+        if placed is None:
+            # No such class template here. Left alone, so whatever reads it
+            # next says so about the text the author wrote.
+            return text
+        text = placed
+    raise CppTranslationError(
+        "<c++>", 0,
+        "members defined outside their class template that never stop being "
+        "folded back into it",
+    )
+
+
+def _into_class_body(
+    text: str, owner: str, name: str, spelled: str
+) -> "str | None":
+    """Put `spelled` into `owner`'s body, over the declaration it defines."""
+
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) != owner:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        inside = text[head.end(): closing]
+        # The declaration this defines: the same name, and a `;` where the
+        # body would be. Replaced rather than added beside, so the class does
+        # not end up with the member twice.
+        declared = re.search(
+            rf"(?<![.\w>])(?:[A-Za-z_][\w\s*&]*?\s+)?{re.escape(name)}\s*"
+            rf"\([^;{{}}]*\)\s*(?:const\s*)?;",
+            inside,
+        )
+        if declared is not None:
+            inside = inside[:declared.start()] + spelled + inside[declared.end():]
+        else:
+            inside = inside + "\n" + spelled + "\n"
+        return text[:head.end()] + inside + text[closing:]
+    return None
+
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
 
     patterns: dict[str, tuple[list[tuple[str, bool]], str, str]] = {}
+    #: Copies the author wrote out by hand, under the name the expander would
+    #: have used. They seed `made`, so the pattern is never copied over them.
+    written: "dict[str, str]" = {}
     cut: list[tuple[int, int]] = []
     for match in _TEMPLATE.finditer(text):
         if _depth_at(text, match.start()) != 0:
@@ -1838,6 +1932,23 @@ def _expand_templates(text: str, filename: str) -> str:
             )
             cut.append((match.start(), match.end() + end))
             continue
+        # `template<> int kind<double>(double v) { ... }` - the copy for one
+        # set of arguments, written by hand. It is not a pattern to expand:
+        # it *is* the expansion, so it goes straight in under the name the
+        # expander would have given it, and the generic one is never copied
+        # for those arguments.
+        special = _SPECIALISATION.match(rest) if not parameters else None
+        if special is not None:
+            closing = _matching(rest, special.end() - 1)
+            arguments = [a.strip() for a in special.group(3).split(",")]
+            named = _instantiated_name(special.group(2), arguments)
+            returns = (special.group(1) or "void").strip()
+            written[named] = (
+                f"{returns} {named}({special.group(4)}) "
+                f"{rest[special.end() - 1: closing + 1]}"
+            )
+            cut.append((match.start(), match.end() + closing + 1))
+            continue
         definition = _DEFINITION.match(rest)
         if definition is None:
             raise CppTranslationError(
@@ -1856,7 +1967,7 @@ def _expand_templates(text: str, filename: str) -> str:
         )
         cut.append((match.start(), match.end() + closing))
 
-    if not patterns:
+    if not patterns and not written:
         return text
 
     # The patterns themselves are not code, so they go; what replaces them is
@@ -1869,7 +1980,7 @@ def _expand_templates(text: str, filename: str) -> str:
     kept.append(text[at:])
     text = "".join(kept)
 
-    made: "dict[str, str]" = {}
+    made: "dict[str, str]" = dict(written)
     # Repeated, because a copy may itself name a template - `Stack<Pair<int>>`
     # asks for `Pair<int>` too, and the inner one is only visible once the
     # outer has been written out.
@@ -6159,6 +6270,9 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # After the lambdas: `auto f = <lambda>` is the one `auto` whose type has
     # no spelling, and it is already gone by here.
     text = _rewrite_auto(text)
+    # Before the templates are read: a member defined outside its class
+    # template belongs to the pattern the reader is about to copy.
+    text = _fold_out_of_line_templates(text)
     text = _expand_templates(text, filename)
     text = _mangle_overloaded_functions(text, filename)
     #: Whether a pass above has already made this text something other than
