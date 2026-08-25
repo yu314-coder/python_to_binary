@@ -833,13 +833,24 @@ class Preprocessor:
             self._builtins_read.add(name)
             self._enter(builtin, f"<{name}>", None, at)
             return
-        searched = ", ".join(str(item) for item in candidates) or "nowhere"
+        # Deduped and one per line: the list repeated itself where two search
+        # roots coincided, and a wall of comma-separated paths is hard to read
+        # at the moment someone most needs to read it.
+        seen: list[str] = []
+        for item in candidates:
+            spelled = str(item)
+            if spelled not in seen:
+                seen.append(spelled)
+        where = "\n    ".join(seen) or "nowhere"
         self.error(
-            f"cannot find the header {name!r}; py2bin looked in {searched}. It has "
-            "built-in copies of the standard headers "
-            f"({', '.join(sorted(_BUILTIN_HEADERS))}) and no system include path, "
-            "because a real system header uses compiler extensions py2bin's C "
-            "compiler does not implement",
+            f"cannot find the header {name!r}. py2bin looked in:\n    {where}\n"
+            "  Add a directory with --include DIR (build.py) or --include-dir "
+            "(py2bin cc); a folder called include, inc, headers or src beside "
+            "the program is searched anyway.\n"
+            "  py2bin ships the standard headers "
+            f"({', '.join(sorted(_BUILTIN_HEADERS))}) and has no system include "
+            "path: a platform SDK header is written in compiler extensions this "
+            "C compiler does not implement, so finding one would not help",
             at,
         )
 

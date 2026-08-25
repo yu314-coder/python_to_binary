@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,002 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,005 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -461,6 +461,16 @@ them - `string.h`, `ctype.h`, `math.h`, the allocator in `stdlib.h` - are
 written in C and compiled like any other source, so they can be read rather
 than taken on trust. It has no system include path: a real system header uses
 compiler extensions this does not implement.
+
+**Your own headers are found; a platform SDK's are not.** A folder called
+`include`, `inc`, `headers` or `src` beside the program is searched without
+being asked, and anywhere else is `--include DIR` (`build.py`) or
+`--include-dir` (`py2bin cc`), repeatable. What that will *not* get you is a
+vendor SDK: `WebView2.h` and its like are COM — `MIDL_INTERFACE`,
+`STDMETHODCALLTYPE`, `__declspec(uuid)`, pure-virtual vtables — and pull in
+half the Windows SDK behind them. Finding the file does not help, because the
+file is written in a language this compiler does not implement. That is a real
+ceiling and not a missing flag.
 
 **Which is why `<windows.h>` is py2bin's own too.** Microsoft's is tens of
 thousands of declarations written in extensions this compiler does not have.
@@ -1773,9 +1783,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1902 tests, no dependencies, nothing to install. Five modules want pytest's
+1905 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 2002. Two of them compile a program in a *fresh interpreter* and
+too, for 2005. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1790,4 +1800,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 2002-test suite.
+    is checked on every change is the 2005-test suite.

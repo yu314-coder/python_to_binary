@@ -267,6 +267,7 @@ def main(
     where: str | None = None,
     target: str | None = None,
     method: str | None = None,
+    include_dirs: "tuple[str, ...]" = (),
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -334,7 +335,7 @@ def main(
         say(f"\n  building for {target}")
 
     if program.suffix in _SOURCE_SUFFIXES:
-        return _build_c(program, target)
+        return _build_c(program, target, include_dirs)
 
     system = target.split("-")[0]
     offered = methods_for(target)
@@ -557,7 +558,9 @@ def main(
 
 
 
-def _build_c(program: Path, target: str) -> int:
+def _build_c(
+    program: Path, target: str, include_dirs: "tuple[str, ...]" = ()
+) -> int:
     """Compile a C or C++ program, and everything beside it, into one binary.
 
     There is no second question here: py2bin has one C compiler and no
@@ -568,6 +571,10 @@ def _build_c(program: Path, target: str) -> int:
     from .c_native import compile_c_native
 
     others, includes = c_sources_beside(program)
+    # Anything named on the command line is searched before the conventional
+    # places, so a vendored header somewhere else can be reached without
+    # moving it.
+    includes = [*include_dirs, *includes]
     # Windows decides what is executable by the extension, so a build for it
     # that leaves the extension off produces a file that will not run. The
     # `cc` command has always added it; this path had not, so a program built

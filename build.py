@@ -94,10 +94,10 @@ def main() -> int:
     sys.path.insert(0, str(SOURCE))
     from py2bin.interactive import main as ask
 
-    where, target, method = _read_arguments(sys.argv[1:])
+    where, target, method, includes = _read_arguments(sys.argv[1:])
     if where is _BAD:
         return 2
-    return ask(where, target, method)
+    return ask(where, target, method, includes)
 
 
 #: What `_read_arguments` returns when it could not read them.
@@ -106,43 +106,52 @@ _BAD = object()
 
 def _read_arguments(
     given: "list[str]",
-) -> "tuple[str | None, str | None, str | None]":
+) -> "tuple[str | None, str | None, str | None, tuple[str, ...]]":
     """The path, and any of the three questions answered in advance.
 
         python3 build.py app.py
         python3 build.py app.cpp --target windows-arm64
+        python3 build.py app.cpp --include vendor/include
         python3 build.py app.py --target linux-x86_64 --how freeze
 
     Answering them on the command line is what lets a script use this same
     entry point rather than a different one - a build that is only reachable
     by typing at it is a build nothing can check.
+
+    `--include` may be given more than once. Directories called `include`,
+    `inc`, `headers` or `src` beside the program are searched anyway; this is
+    for headers that live somewhere else.
     """
 
     where = target = method = None
+    includes: "list[str]" = []
     index = 0
     while index < len(given):
         piece = given[index]
-        if piece in ("--target", "--how"):
+        if piece in ("--target", "--how", "--include", "-I"):
             if index + 1 >= len(given):
                 print(f"{piece} needs a value after it.")
-                return _BAD, None, None
+                return _BAD, None, None, ()
             if piece == "--target":
                 target = given[index + 1]
-            else:
+            elif piece == "--how":
                 method = given[index + 1]
+            else:
+                includes.append(given[index + 1])
             index += 2
             continue
         if piece in ("-h", "--help"):
             print(__doc__.strip().split("\n\n")[0])
-            print("\n  --target NAME   which machine, without being asked")
-            print("  --how NAME      compile-capi, freeze, or compile")
-            return _BAD, None, None
+            print("\n  --target NAME    which machine, without being asked")
+            print("  --how NAME       compile-capi, freeze, or compile")
+            print("  --include DIR    where to look for headers (repeatable)")
+            return _BAD, None, None, ()
         if piece.startswith("-"):
             print(f"{piece} is not an option this understands.")
-            return _BAD, None, None
+            return _BAD, None, None, ()
         where = piece
         index += 1
-    return where, target, method
+    return where, target, method, tuple(includes)
 
 
 if __name__ == "__main__":

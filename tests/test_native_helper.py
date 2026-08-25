@@ -197,3 +197,83 @@ class BuildScriptAnswers(unittest.TestCase):
             )
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("darwin-arm64", done.stdout)
+
+
+class IncludeDirectories(unittest.TestCase):
+    """A project's own headers, and where py2bin agrees to look for them."""
+
+    def _project(self, scratch: "Path") -> "Path":
+        (scratch / "include").mkdir()
+        (scratch / "vendor").mkdir()
+        (scratch / "include" / "near.h").write_text(
+            "#ifndef N\n#define N\nint near_by(void);\n#endif\n", encoding="utf-8"
+        )
+        (scratch / "vendor" / "far.h").write_text(
+            "#ifndef F\n#define F\nint far_away(void);\n#endif\n", encoding="utf-8"
+        )
+        program = scratch / "app.cpp"
+        program.write_text(
+            '#include <stdio.h>\n#include "near.h"\n#include "far.h"\n'
+            "int near_by(void){ return 1; }\nint far_away(void){ return 2; }\n"
+            "int main(){ printf(\"%d\\n\", near_by() + far_away()); return 0; }\n",
+            encoding="utf-8",
+        )
+        return program
+
+    def test_a_folder_beside_the_program_needs_no_saying(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from py2bin.interactive import _build_c
+
+        with tempfile.TemporaryDirectory() as scratch:
+            program = self._project(Path(scratch))
+            # `far.h` is not beside it, so this one should not build yet.
+            self.assertNotEqual(_build_c(program, "linux-x86_64"), 0)
+
+    def test_a_folder_named_on_the_command_line_is_searched_first(self) -> None:
+        """A vendored header that lives somewhere else can be reached.
+
+        `py2bin cc` has always taken `--include-dir`; `build.py`, which is
+        the entry point the readme gives people, had no way to say it.
+        """
+
+        import tempfile
+        from pathlib import Path
+
+        from py2bin.interactive import _build_c
+
+        with tempfile.TemporaryDirectory() as scratch:
+            program = self._project(Path(scratch))
+            self.assertEqual(
+                _build_c(program, "linux-x86_64", (str(Path(scratch) / "vendor"),)),
+                0,
+            )
+            self.assertTrue((program.parent / "dist" / "app").is_file())
+
+    def test_the_missing_header_message_says_what_to_do(self) -> None:
+        """It is read at the moment someone most needs to read it."""
+
+        import tempfile
+        from pathlib import Path
+
+        from py2bin.c_frontend import CCompileError
+        from py2bin.c_native import compile_c_native
+
+        with tempfile.TemporaryDirectory() as scratch:
+            program = Path(scratch) / "a.cpp"
+            program.write_text('#include "nowhere.h"\nint main(){return 0;}\n',
+                               encoding="utf-8")
+            with self.assertRaises(CCompileError) as caught:
+                compile_c_native(
+                    program, Path(scratch) / "a.bin",
+                    target="linux-x86_64", clean=True,
+                )
+        message = str(caught.exception)
+        self.assertIn("--include", message)
+        # And no path is listed twice.
+        listed = [
+            line.strip() for line in message.splitlines()
+            if line.strip().endswith("nowhere.h")
+        ]
+        self.assertEqual(len(listed), len(set(listed)))
