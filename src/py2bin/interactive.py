@@ -263,7 +263,19 @@ def where_to_build(here: Path) -> Path | None:
         say(f"  no Python files to build in {candidate}")
 
 
-def main(where: str | None = None) -> int:
+def main(
+    where: str | None = None,
+    target: str | None = None,
+    method: str | None = None,
+) -> int:
+    """The three questions, with any of them answered in advance.
+
+    `target` and `method` are what the second and third questions ask. Given
+    either, that question is not asked - which is what lets a script, a test
+    or a sweep use this same entry point rather than a different one. A build
+    that is only reachable by typing at it is a build nothing can check.
+    """
+
     # Everything is said on stdout. Some editors show only that, and an
     # explanation nobody sees is the same as no explanation: this exact
     # script reported "nothing to build" to a console that dropped stderr,
@@ -305,20 +317,28 @@ def main(where: str | None = None) -> int:
         program = candidates[chosen]
 
     ordered = sorted(TARGETS, key=lambda entry: entry[0] != host_target())
-    target = ordered[
-        ask(
-            "Which machine is it for?",
-            [(name, f"{label}  ({name})") for name, label in ordered],
-            1,
-        )
-    ][0]
+    if target is None:
+        target = ordered[
+            ask(
+                "Which machine is it for?",
+                [(name, f"{label}  ({name})") for name, label in ordered],
+                1,
+            )
+        ][0]
+    elif target not in {name for name, _label in TARGETS}:
+        say(f"\n  {target!r} is not a machine py2bin builds for. It builds for:")
+        for name, _label in TARGETS:
+            say(f"    {name}")
+        return 1
+    else:
+        say(f"\n  building for {target}")
 
     if program.suffix in _SOURCE_SUFFIXES:
         return _build_c(program, target)
 
     system = target.split("-")[0]
     offered = methods_for(target)
-    if len(offered) == 1:
+    if len(offered) == 1 and method is None:
         if target == "darwin-universal2":
             # The general explanation below is wrong for this one, and was
             # being printed anyway: it said a runtime "can only be taken from
@@ -342,6 +362,13 @@ def main(where: str | None = None) -> int:
                 f"itself for the other way."
             )
         method = offered[0][0]
+    elif method is not None:
+        if method not in {name for name, _label in offered}:
+            say(f"\n  {method!r} is not a way to build for {target}. It offers:")
+            for name, label in offered:
+                say(f"    {name:14} {label}")
+            return 1
+        say(f"\n  building it with {method}")
     else:
         method = offered[ask("How should it be built?", offered, 1)][0]
 
@@ -541,7 +568,12 @@ def _build_c(program: Path, target: str) -> int:
     from .c_native import compile_c_native
 
     others, includes = c_sources_beside(program)
-    output = program.parent / "dist" / program.stem
+    # Windows decides what is executable by the extension, so a build for it
+    # that leaves the extension off produces a file that will not run. The
+    # `cc` command has always added it; this path had not, so a program built
+    # the way the readme tells people to build one came out unrunnable.
+    suffix = ".exe" if target.startswith("windows-") else ""
+    output = program.parent / "dist" / (program.stem + suffix)
     output.parent.mkdir(parents=True, exist_ok=True)
     if others:
         say(

@@ -19,6 +19,13 @@
 #              and this is the only thing that asks. It does not run them:
 #              five of the six are not this computer.
 #
+# Everything is built through `build.py`, which is the entry point the readme
+# gives people and the one `py2bin make` asks the same questions as. A sweep
+# that used some other route would be checking a path nobody takes - and it
+# was: `build.py` left the `.exe` off a Windows build, which the `cc` command
+# has always added, so a program built the documented way came out unrunnable
+# and no test noticed.
+#
 # clang++ is the yardstick here and never a dependency - py2bin builds with
 # no toolchain at all. Where clang++ is missing, `meaning` is skipped and
 # `targets` still runs.
@@ -30,6 +37,11 @@ WORK=${TMPDIR:-/tmp}/py2bin-sweep
 mkdir -p "$WORK"
 
 TARGETS="darwin-arm64 darwin-x86_64 linux-x86_64 linux-arm64 windows-x86_64 windows-arm64"
+
+host_target() {
+  PYTHONPATH="$ROOT/src" python3 -c \
+    "from py2bin.interactive import host_target; print(host_target())"
+}
 
 agree=0; differ=0; refused=0; built=0; unbuilt=0
 
@@ -47,13 +59,14 @@ run_meaning() {
     done
     [ -z "$std" ] && { printf "  %-28s no reference - skipped\n" "$name"; continue; }
     want=$("$WORK/ref_$name" 2>&1); wantcode=$?
-    got=$(PYTHONPATH="$ROOT/src" python3 -m py2bin cc "$source" -o "$WORK/p_$name" 2>&1)
-    if [ $? -ne 0 ]; then
+    rm -rf "$CORPUS/dist"
+    got=$(python3 "$ROOT/build.py" "$source" --target "$(host_target)" 2>&1)
+    if [ $? -ne 0 ] || [ ! -x "$CORPUS/dist/$name" ]; then
       printf "  %-28s REFUSED\n" "$name"
       printf '%s\n' "$got" | tail -1 | sed 's/^/        /'
       refused=$((refused + 1)); continue
     fi
-    mine=$("$WORK/p_$name" 2>&1); minecode=$?
+    mine=$("$CORPUS/dist/$name" 2>&1); minecode=$?
     if [ "$mine" = "$want" ] && [ "$minecode" = "$wantcode" ]; then
       agree=$((agree + 1))
     else
@@ -72,8 +85,8 @@ run_targets() {
     bad=""
     for source in "$CORPUS"/*.cpp; do
       name=$(basename "$source" .cpp)
-      if PYTHONPATH="$ROOT/src" python3 -m py2bin cc "$source" \
-           -o "$WORK/${target}_$name" --target "$target" > "$WORK/log" 2>&1; then
+      if python3 "$ROOT/build.py" "$source" --target "$target" \
+           > "$WORK/log" 2>&1; then
         built=$((built + 1))
       else
         unbuilt=$((unbuilt + 1))
@@ -101,8 +114,8 @@ run_check() {
   for target in $TARGETS; do
     suffix=""
     case "$target" in windows-*) suffix=".exe" ;; esac
-    if PYTHONPATH="$ROOT/src" python3 -m py2bin cc "$entry" $inc \
-         -o "$WORK/${target}_$name$suffix" --target "$target" > "$WORK/log" 2>&1; then
+    if python3 "$ROOT/build.py" "$entry" --target "$target" \
+         > "$WORK/log" 2>&1; then
       printf "  %-18s built\n" "$target"
       built=$((built + 1))
     else
@@ -124,8 +137,7 @@ run_check() {
     else
       want=$("$WORK/ref_$name" 2>&1); wantcode=$?
       host=$(PYTHONPATH="$ROOT/src" python3 -m py2bin targets 2>/dev/null | head -1)
-      mine=$("$WORK/darwin-arm64_$name" 2>&1 || "$WORK/linux-x86_64_$name" 2>&1)
-      minecode=$?
+      mine=$("$(dirname "$entry")/dist/$name" 2>&1); minecode=$?
       if [ "$mine" = "$want" ]; then
         echo "  output matches clang++"
       else

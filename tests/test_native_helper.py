@@ -113,3 +113,72 @@ class FindingIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuildScriptAnswers(unittest.TestCase):
+    """`build.py` is the entry point the readme gives people.
+
+    It asked three questions and had no way to be told the answers, so
+    nothing could check it - and it had a bug the `cc` command did not.
+    """
+
+    def test_a_windows_build_gets_the_extension_that_makes_it_run(self) -> None:
+        """Windows decides what is executable by the extension.
+
+        `py2bin cc` has always added it. This path had not, so a program
+        built the documented way came out unrunnable and nothing noticed.
+        """
+
+        import tempfile
+        from pathlib import Path
+
+        from py2bin.interactive import _build_c
+
+        with tempfile.TemporaryDirectory() as scratch:
+            program = Path(scratch) / "hello.cpp"
+            program.write_text(
+                '#include <stdio.h>\nint main(void){ printf("hi\\n"); return 0; }\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(_build_c(program, "windows-x86_64"), 0)
+            self.assertTrue((program.parent / "dist" / "hello.exe").is_file())
+            self.assertEqual(_build_c(program, "linux-x86_64"), 0)
+            self.assertTrue((program.parent / "dist" / "hello").is_file())
+
+    def test_the_three_questions_can_be_answered_in_advance(self) -> None:
+        """Which is what lets a script, a test or the sweep use this path."""
+
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as scratch:
+            program = Path(scratch) / "hello.cpp"
+            program.write_text(
+                '#include <stdio.h>\nint main(void){ printf("hi\\n"); return 0; }\n',
+                encoding="utf-8",
+            )
+            done = subprocess.run(
+                [
+                    sys.executable, str(root / "build.py"), str(program),
+                    "--target", "windows-arm64",
+                ],
+                capture_output=True, text=True, timeout=600,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertTrue((program.parent / "dist" / "hello.exe").is_file())
+
+    def test_a_machine_it_does_not_build_for_is_named(self) -> None:
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        done = subprocess.run(
+            [sys.executable, str(root / "build.py"), "x.cpp", "--target", "vax"],
+            capture_output=True, text=True, timeout=300,
+        )
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("darwin-arm64", done.stdout)

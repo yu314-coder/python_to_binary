@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 1,974 tests; a 110-program corpus whose output matches
+**Where it stands.** 1,977 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; eight of twenty-seven benchmark rows faster than the interpreter.
@@ -639,6 +639,20 @@ Point it at your own program instead of the corpus:
 ```sh
 tools/cpp_sweep.sh check src/main.cpp include
 ```
+
+Everything is built through `build.py` — the entry point this readme gives
+people, and the one `py2bin make` asks the same questions as. A sweep that
+used some other route would be checking a path nobody takes, and it was:
+`build.py` left the `.exe` off a Windows build, which `py2bin cc` has always
+added, so a program built the documented way came out unrunnable and no test
+noticed. `build.py` now takes the three answers on the command line
+(`--target`, `--how`), which is what lets anything check it.
+
+There is also a Claude Code workflow, `.claude/workflows/cpp-hunt.js`: ten
+agents, one per area of the language, each writing programs and building
+them through `build.py`, then a verify pass that tries to *refute* each
+reported failure before it is believed. It finds what the corpus does not
+cover yet, which is the only kind of bug left.
 
 which asks the same two questions of that file — every target, and the
 comparison — and is the thing to run before shipping.
@@ -1755,9 +1769,9 @@ cd python_to_binary
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-1874 tests, no dependencies, nothing to install. Five modules want pytest's
+1877 tests, no dependencies, nothing to install. Five modules want pytest's
 fixtures and skip themselves without it; `python -m pytest tests` runs those
-too, for 1974. Two of them compile a program in a *fresh interpreter* and
+too, for 1977. Two of them compile a program in a *fresh interpreter* and
 assert that `ctypes`, `_ctypes` and `subprocess` are absent from `sys.modules`
 afterwards - one through the Python path, one through the C++ one. "No
 toolchain" is not a promise here; it is a thing the suite checks. The suite fails if any module under `src/` imports
@@ -1772,4 +1786,4 @@ claim honest rather than aspirational.
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
     is 804; see *It behaves as CPython does* for what the other 82 are. What
-    is checked on every change is the 1974-test suite.
+    is checked on every change is the 1977-test suite.

@@ -1274,4 +1274,4 @@ MIT. Full documentation, source and issues:
     harness is scratch rather than committed, which is why the method is
     written out here rather than pointed at. Comparing stderr as well - which
     means comparing tracebacks a compiled program cannot produce - the figure
-    is 804. What is checked on every change is the 1974-test suite.
+    is 804. What is checked on every change is the 1977-test suite.
