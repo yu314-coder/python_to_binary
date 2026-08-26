@@ -630,6 +630,42 @@ message loop - and so is COM: `CoInitializeEx`, `CoCreateInstance`,
 something py2bin could always express; those are how a program comes by the
 pointer to call it on, which is what it had no way to do.
 
+**A generated COM header compiles.** The vendor's own `WebView2.h` - 68,921
+lines of MIDL output, straight out of the NuGet package - builds for both
+Windows targets, and a program that calls through it lands on the slots the
+vendor's own tables put its methods at.
+
+MIDL output declares every interface twice and chooses between them:
+
+```c
+#if defined(__cplusplus) && !defined(CINTERFACE)
+    /* C++ classes */
+#else
+    /* a table of function pointers */
+#endif
+```
+
+py2bin defines no `__cplusplus`, so the second is the branch taken - and the
+second is the branch it wants, because a COM object *is* that table. What was
+needed to read it was small and ordinary once the shape was clear: `sal.h` and
+the annotations, `CONST_VTBL`, `STDAPI`, `DEFINE_ENUM_FLAG_OPERATORS`, the
+fixed-width `UINT32` family, `IUnknown` and `IStream` in their C shape,
+`VARIANT`, `EventRegistrationToken`, and `__declspec` read and dropped -
+except `align`, which decides layout and is refused rather than dropped.
+
+Two things in the C front end, both of which every real header needs: an
+enumeration constant may now stand in a constant expression, which is how a
+generated enum is written (each entry is the one before it plus one), and an
+enumerator may be `0xffffffff`, which is how a flag enum spells all its bits.
+
+**A header that chooses a branch is not the translator's to read.** The C++
+translator runs before the preprocessor and has no `#if`, so pasting one in
+meant translating both branches - and the branch meant for C is written in
+shapes that mean something else in C++: `interface X { ... }` came out as
+`interface X = { ... };`, and the macro bodies beside it lost the calls they
+were made of. A header with an `#else` in it is now left for the preprocessor,
+which is the pass that knows which half is real.
+
 A DLL somebody else wrote is reached with `LoadLibraryW`, `GetProcAddress` and
 `FreeLibrary` rather than by naming it here. That is the general answer to a
 vendor component - WebView2Loader.dll is one, and so is every other SDK that

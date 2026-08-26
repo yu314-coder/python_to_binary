@@ -1,17 +1,41 @@
 # WebView2, with nothing but py2bin
 
-The vendor's `WebView2.h` cannot be compiled here, and no amount of fetching
-changes that. It is MIDL output: it includes `objbase.h`, `oaidl.h`,
-`unknwn.h` and the rest, and **every** open implementation of those generates
-them from `.idl` with a tool that runs at build time. Checked against three of
-them — none publishes one as a file. The vendor's own set ships inside a
-toolchain.
+**The vendor's `WebView2.h` compiles now.** All 68,921 lines of it, straight
+out of the NuGet package, for both Windows targets:
 
-What a caller needs from a COM interface is smaller than the header: an
-interface is a table of function pointers, and a call is a load from a fixed
-slot. So the answer is to read the slots out of the vendor's header — which
-fetches fine, it just cannot be compiled — and write them as a class py2bin
-does compile.
+```sh
+py2bin fetch-header WebView2.h --into vendor
+py2bin cc app.c -o app.exe --target windows-x86_64 --include-dir vendor
+```
+
+It reads because MIDL declares every interface twice — C++ classes in one
+branch, a table of function pointers in the other — and py2bin defines no
+`__cplusplus`, so the table is the branch it gets. Which is the branch it
+wants: a COM object *is* that table, and py2bin's C compiles one. The headers
+that branch reaches for — `unknwn.h`, `objidl.h`, `oaidl.h`, `EventToken.h`,
+`sal.h`, `rpc.h` — are py2bin's own, for the same reason as always: nobody
+publishes them as files.
+
+So a program written against the vendor's header calls the vendor's own
+slots. `Navigate` is slot 5 in `ICoreWebView2Vtbl`, and what comes out loads
+offset 0x28.
+
+`vendor_header.c` here is written that way: it calls
+`ICoreWebView2Controller::get_CoreWebView2` and `ICoreWebView2::Navigate`
+through the vendor's own tables. It needs the header, which is a download
+rather than a file in this repository:
+
+```sh
+py2bin fetch-header WebView2.h --into vendor
+py2bin cc vendor_header.c -o app.exe --target windows-x86_64 --include-dir vendor
+```
+
+The rest of this file describes the route taken before that worked, which is
+still the smaller one and still builds. What a caller needs from a COM
+interface is less than the whole header: an interface is a table of function
+pointers, and a call is a load from a fixed slot. So the slots can be read out
+of the vendor's header and written as a class py2bin compiles — which is what
+`webview2_min.h` here is.
 
 ```sh
 py2bin fetch-header WebView2.h --into vendor

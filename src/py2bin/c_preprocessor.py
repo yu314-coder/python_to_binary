@@ -1421,6 +1421,35 @@ typedef unsigned long long UINT_PTR;
 typedef unsigned long long DWORD_PTR;
 typedef BYTE *PBYTE;
 typedef BYTE *LPBYTE;
+/* The fixed-width spellings. A generated COM header uses these throughout,
+   because an .idl says how wide a field is rather than what a C compiler
+   happens to make of `int`. */
+typedef signed char INT8;
+typedef short INT16;
+typedef int INT32;
+typedef long long INT64;
+typedef unsigned char UINT8;
+typedef unsigned short UINT16;
+typedef unsigned int UINT32;
+typedef unsigned long long UINT64;
+typedef int LONG32;
+typedef long long LONG64;
+typedef unsigned int ULONG32;
+typedef unsigned long long ULONG64;
+typedef unsigned int DWORD32;
+typedef unsigned long long DWORD64;
+typedef float FLOAT;
+typedef double DOUBLE;
+typedef void *HGLOBAL;
+typedef void *HLOCAL;
+typedef void *HDC;
+typedef void *HRGN;
+typedef void *HBITMAP;
+typedef void *HKEY;
+typedef char *PSTR;
+typedef wchar_t *PWSTR;
+typedef const wchar_t *PCWSTR;
+typedef const char *PCSTR;
 /* Written as the struct alone rather than the union the SDK spells, because
    the two anonymous members of that union are one name for the halves and
    another for the whole, and `QuadPart` is what a program reaches for. */
@@ -1534,32 +1563,31 @@ extern HMODULE GetModuleHandleA(LPCSTR);
 
 /* COM. Calling through a vtable is something py2bin has always been able to
    express; these are how a program comes by the pointer to call it on. */
-typedef LONG HRESULT;
-#define S_OK 0
-#define S_FALSE 1
-#define E_NOINTERFACE ((HRESULT)0x80004002L)
-#define E_POINTER ((HRESULT)0x80004003L)
-#define E_FAIL ((HRESULT)0x80004005L)
-#define E_OUTOFMEMORY ((HRESULT)0x8007000EL)
-#define SUCCEEDED(hr) (((HRESULT)(hr)) >= 0)
-#define FAILED(hr) (((HRESULT)(hr)) < 0)
+/* HRESULT, GUID, BSTR and the S_/E_ codes come from <wtypes.h>, which is
+   py2bin's own too. Written out again here they were the same types under
+   the same names twice, and a program that included both was told its GUID
+   was defined twice - which it was, by us. */
+#include <wtypes.h>
+/* The SDK defines these to nothing when the reader is not a C++ compiler,
+   which py2bin is not: it defines no __cplusplus, so a generated header
+   takes its C branch throughout. */
+#ifndef DEFINE_ENUM_FLAG_OPERATORS
+#define DEFINE_ENUM_FLAG_OPERATORS(T)
+#endif
+#ifndef DECLSPEC_XFGVIRT
+#define DECLSPEC_XFGVIRT(base, func)
+#endif
+#ifndef EXTERN_C
+#define EXTERN_C
+#endif
+#ifndef DECLSPEC_IMPORT
+#define DECLSPEC_IMPORT
+#endif
 #define COINIT_APARTMENTTHREADED 2
 #define COINIT_MULTITHREADED 0
 #define CLSCTX_INPROC_SERVER 1
 #define CLSCTX_LOCAL_SERVER 4
 #define CLSCTX_ALL 23
-
-typedef struct _GUID {
-    DWORD Data1;
-    WORD Data2;
-    WORD Data3;
-    BYTE Data4[8];
-} GUID;
-typedef GUID IID;
-typedef GUID CLSID;
-typedef const GUID *REFIID;
-typedef const GUID *REFCLSID;
-typedef wchar_t *BSTR;
 
 extern HRESULT CoInitialize(LPVOID);
 extern HRESULT CoInitializeEx(LPVOID, DWORD);
@@ -2238,6 +2266,25 @@ _RPCNDR_H = """
 #define __RPCNDR_H_VERSION__ 500
 #define __MIDL_user_allocate_free_DEFINED__
 
+#include <sal.h>
+
+/* The types a generated header names in its proxy and stub prototypes, at
+   the end of the file. A proxy marshals a call to an object in another
+   process; a program calling one in its own never reaches any of this, and
+   the prototypes only ever take a pointer to them - so an opaque struct is
+   the whole of what is needed, and is honest about the rest. */
+typedef struct IRpcStubBuffer IRpcStubBuffer;
+typedef struct IRpcChannelBuffer IRpcChannelBuffer;
+typedef struct __py2bin_RPC_MESSAGE RPC_MESSAGE;
+typedef RPC_MESSAGE *PRPC_MESSAGE;
+typedef long RPC_STATUS;
+typedef void *RPC_BINDING_HANDLE;
+typedef void *handle_t;
+
+/* What a generated header puts before a vtable pointer. `const` in the SDK,
+   because the table is never written; the spelling is all that differs. */
+#define CONST_VTBL const
+
 #define __RPC_STUB
 #define __RPC_FAR
 #define RPC_ENTRY
@@ -2259,6 +2306,12 @@ _RPCNDR_H = """
 #define STDMETHOD_(type, name) virtual type name
 #define STDMETHODIMP HRESULT
 #define STDMETHODIMP_(type) type
+#define STDAPI HRESULT
+#define STDAPI_(type) type
+#define STDAPIV HRESULT
+#define STDAPIV_(type) type
+#define WINOLEAUTAPI HRESULT
+#define WINOLEAUTAPI_(type) type
 #endif
 """
 
@@ -2296,6 +2349,217 @@ void *CoTaskMemAlloc(SIZE_T bytes);
 #: everything in it.
 _PART_OF_WINDOWS_H = "#include <windows.h>\n"
 
+_EVENTTOKEN_H = """
+#ifndef __py2bin_eventtoken_h
+#define __py2bin_eventtoken_h
+/* One struct, which a generated COM header then names two thousand times:
+   the handle registering for an event hands back, so the registration can
+   be taken off again. */
+typedef struct EventRegistrationToken {
+    long long value;
+} EventRegistrationToken;
+#endif
+"""
+
+_OAIDL_H = """
+#ifndef __py2bin_oaidl_h
+#define __py2bin_oaidl_h
+#include <wtypes.h>
+/* What Automation passes a value in. Sixteen bytes on both Windows
+   machines: a two-byte tag, six the SDK reserves, and eight of value -
+   which is what every member of that union is, or fits in. Written as the
+   layout rather than as the union, because the union's members are a
+   hundred names for the same eight bytes and the layout is the part that
+   has to be right. */
+typedef unsigned short VARTYPE;
+typedef struct __py2bin_VARIANT {
+    VARTYPE vt;
+    unsigned short wReserved1;
+    unsigned short wReserved2;
+    unsigned short wReserved3;
+    long long value;
+} VARIANT;
+typedef VARIANT VARIANTARG;
+typedef VARIANT *LPVARIANT;
+#define VT_EMPTY 0
+#define VT_NULL 1
+#define VT_I2 2
+#define VT_I4 3
+#define VT_R4 4
+#define VT_R8 5
+#define VT_BSTR 8
+#define VT_DISPATCH 9
+#define VT_BOOL 11
+#define VT_UNKNOWN 13
+#define VT_I8 20
+#define VT_UI8 21
+#endif
+"""
+
+_UNKNWN_H = """
+#ifndef __py2bin_unknwn_h_c
+#define __py2bin_unknwn_h_c
+#include <wtypes.h>
+/* COM's root interface in the shape C sees one: a pointer to a table of
+   function pointers, each taking the interface as its first argument. That
+   is what the object is - the C++ spelling of it is the same bytes - and it
+   is the branch a generated header takes here, py2bin defining no
+   __cplusplus. Three slots, which is what IUnknown has. */
+typedef struct IUnknown IUnknown;
+typedef struct IUnknownVtbl {
+    HRESULT (*QueryInterface)(IUnknown *, REFIID, void **);
+    unsigned long (*AddRef)(IUnknown *);
+    unsigned long (*Release)(IUnknown *);
+} IUnknownVtbl;
+struct IUnknown { const IUnknownVtbl *lpVtbl; };
+typedef IUnknown *LPUNKNOWN;
+#endif
+"""
+
+_OBJIDL_H = """
+#ifndef __py2bin_objidl_h
+#define __py2bin_objidl_h
+#include <wtypes.h>
+#include <unknwn.h>
+/* IStream, in the shape C sees a COM interface in: a pointer to a table of
+   function pointers, each taking the interface as its first argument. That
+   is what the object actually is - the C++ spelling of it is the same
+   bytes - and it is the shape a generated header uses, because py2bin
+   defines no __cplusplus and so the C branch of one is the branch taken.
+
+   Slot order is the .idl's: IUnknown's three, ISequentialStream's two, then
+   IStream's nine. A slot out of place is a call to the wrong function, and
+   nothing reports it.
+
+   The eight-byte value the SDK spells as a one-member union is written as
+   the integer it is. A struct passed BY VALUE through a foreign vtable is
+   the one thing py2bin cannot spell, and Seek takes one; on both Windows
+   machines an eight-byte struct travels in the register an eight-byte
+   integer travels in, so this is the same ABI and can be called. */
+typedef struct IStream IStream;
+typedef struct ISequentialStream ISequentialStream;
+
+typedef struct __py2bin_STATSTG {
+    LPOLESTR pwcsName;
+    unsigned long type;
+    unsigned long long cbSize;
+    unsigned long mtime_low, mtime_high;
+    unsigned long ctime_low, ctime_high;
+    unsigned long atime_low, atime_high;
+    unsigned long grfMode;
+    unsigned long grfLocksSupported;
+    CLSID clsid;
+    unsigned long grfStateBits;
+    unsigned long reserved;
+} STATSTG;
+
+typedef struct ISequentialStreamVtbl {
+    HRESULT (*QueryInterface)(ISequentialStream *, REFIID, void **);
+    unsigned long (*AddRef)(ISequentialStream *);
+    unsigned long (*Release)(ISequentialStream *);
+    HRESULT (*Read)(ISequentialStream *, void *, unsigned long, unsigned long *);
+    HRESULT (*Write)(ISequentialStream *, const void *, unsigned long, unsigned long *);
+} ISequentialStreamVtbl;
+struct ISequentialStream { const ISequentialStreamVtbl *lpVtbl; };
+
+typedef struct IStreamVtbl {
+    HRESULT (*QueryInterface)(IStream *, REFIID, void **);
+    unsigned long (*AddRef)(IStream *);
+    unsigned long (*Release)(IStream *);
+    HRESULT (*Read)(IStream *, void *, unsigned long, unsigned long *);
+    HRESULT (*Write)(IStream *, const void *, unsigned long, unsigned long *);
+    HRESULT (*Seek)(IStream *, long long, unsigned long, unsigned long long *);
+    HRESULT (*SetSize)(IStream *, unsigned long long);
+    HRESULT (*CopyTo)(IStream *, IStream *, unsigned long long,
+                      unsigned long long *, unsigned long long *);
+    HRESULT (*Commit)(IStream *, unsigned long);
+    HRESULT (*Revert)(IStream *);
+    HRESULT (*LockRegion)(IStream *, unsigned long long, unsigned long long,
+                          unsigned long);
+    HRESULT (*UnlockRegion)(IStream *, unsigned long long, unsigned long long,
+                            unsigned long);
+    HRESULT (*Stat)(IStream *, STATSTG *, unsigned long);
+    HRESULT (*Clone)(IStream *, IStream **);
+} IStreamVtbl;
+struct IStream { const IStreamVtbl *lpVtbl; };
+
+#define STREAM_SEEK_SET 0
+#define STREAM_SEEK_CUR 1
+#define STREAM_SEEK_END 2
+
+/* Named in signatures and passed along, never called: WebView2 hands one to
+   a drag-and-drop handler and takes it back. Left incomplete rather than
+   written out, because its table is nine methods over structs whose layout
+   would be being guessed at here - and a program that does want to call one
+   is told the type is incomplete, which is true, instead of being handed a
+   table that might be wrong. */
+typedef struct IDataObject IDataObject;
+#endif
+"""
+
+
+_SAL_H = """
+#ifndef __py2bin_sal_h
+#define __py2bin_sal_h
+/* The annotations a platform header writes on its parameters. They say what
+   a function does with a pointer - reads it, writes it, may be handed null -
+   for a static analyser to check against. They are not types and they emit
+   nothing, which is what they expand to under every compiler that is not
+   that analyser, and what they expand to here. */
+#define _In_
+#define _In_opt_
+#define _In_z_
+#define _In_opt_z_
+#define _Out_
+#define _Out_opt_
+#define _Out_writes_bytes_(n)
+#define _Inout_
+#define _Inout_opt_
+#define _Outptr_
+#define _Outptr_opt_
+#define _Outptr_result_maybenull_
+#define _COM_Outptr_
+#define _COM_Outptr_opt_
+#define _COM_Outptr_result_maybenull_
+#define _Ret_maybenull_
+#define _Ret_notnull_
+#define _Result_nullonfailure_
+#define _Field_size_(n)
+#define _Field_size_opt_(n)
+#define _In_reads_(n)
+#define _In_reads_opt_(n)
+#define _In_reads_bytes_(n)
+#define _In_reads_bytes_opt_(n)
+#define _Out_writes_(n)
+#define _Out_writes_opt_(n)
+#define _Out_writes_to_(n, c)
+#define _Inout_updates_(n)
+#define _Inout_updates_bytes_(n)
+#define _Success_(expr)
+#define _Check_return_
+#define _Must_inspect_result_
+#define _Reserved_
+#define _Null_terminated_
+#define _Notnull_
+#define _Maybenull_
+#define _Deref_out_
+#define _Deref_opt_out_
+#define _Analysis_noreturn_
+#define _When_(c, a)
+#define _Post_
+#define _Pre_
+#define __in
+#define __out
+#define __inout
+#define __in_opt
+#define __out_opt
+#define __reserved
+#define __deref_out
+#define SAL_H
+#endif
+"""
+
+
 #: Where `--auto-fetch` keeps what it downloaded. Named here rather than
 #: imported, because the fetcher imports this module for the list of headers
 #: py2bin ships and the two would chase each other.
@@ -2312,6 +2576,18 @@ _BUILTIN_HEADERS = {
     # is for a program that serves an interface over a wire, which is not
     # what a program calling a COM object in its own process is doing.
     "rpc.h": "#include <rpcndr.h>\n",
+    # The three a generated COM header names in its signatures. Written for
+    # the C branch of one, which is the branch taken here: py2bin defines no
+    # __cplusplus, so `#if defined(__cplusplus) && !defined(CINTERFACE)` is
+    # false and the interface arrives as a table of function pointers - which
+    # is what the object is, and what py2bin's C compiles.
+    "sal.h": _SAL_H,
+    "unknwn.h": _UNKNWN_H,
+    "specstrings.h": _SAL_H,
+    "objidl.h": _OBJIDL_H,
+    "oaidl.h": _OAIDL_H,
+    "EventToken.h": _EVENTTOKEN_H,
+    "eventtoken.h": _EVENTTOKEN_H,
     "objbase.h": _OBJBASE_H,
     "combaseapi.h": _OBJBASE_H,
     "ole2.h": _OBJBASE_H,

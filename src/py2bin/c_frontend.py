@@ -1677,11 +1677,22 @@ class Parser:
                 self.error(f"duplicate enumerator {name!r}", name_token)
             if self.accept("="):
                 value_token = self.token
-                next_value = ConstantEvaluator(self.filename).value(
+                next_value = ConstantEvaluator(self.filename, self.enumerators).value(
                     self.assignment_expression()
                 )
-                if not -(1 << 31) <= next_value < (1 << 31):
-                    self.error("an enumerator must fit in an int", value_token)
+                # A flag enum's "all bits" entry is written 0xffffffff, which
+                # is past the signed range and which every real compiler
+                # takes - C23 says so outright, and the ones before it took
+                # it anyway. Kept as the int of the same bits, because what a
+                # value like this is for is masking, and the bits are what
+                # masking reads.
+                if not -(1 << 31) <= next_value < (1 << 32):
+                    self.error(
+                        "an enumerator must fit in an int, signed or unsigned",
+                        value_token,
+                    )
+                if next_value >= (1 << 31):
+                    next_value -= 1 << 32
             self.enumerators[name] = next_value
             next_value += 1
             if not self.accept(","):
@@ -1812,7 +1823,7 @@ class Parser:
     def bitfield_width(self, ctype: CType, name: str, token: Token) -> int:
         """The `: 3` on a member: how many bits of its storage unit it takes."""
 
-        spelled = ConstantEvaluator(self.filename).value(
+        spelled = ConstantEvaluator(self.filename, self.enumerators).value(
             self.assignment_expression()
         )
         held = size_of(ctype)
@@ -1853,6 +1864,9 @@ class Parser:
             if name in _IGNORED_SPECIFIERS:
                 self.index += 1
                 continue
+            if name == "__declspec":
+                self.skip_declspec()
+                continue
             if name in _UNSUPPORTED_KEYWORDS:
                 self.error(_UNSUPPORTED_KEYWORDS[name])
             if name in _QUALIFIERS:
@@ -1892,6 +1906,44 @@ class Parser:
         if base is None:
             self.error(f"expected a type name, found {self.describe(start)}", start)
         return base
+
+    def skip_declspec(self) -> None:
+        """Read `__declspec(...)` and drop it - except where it decides layout.
+
+        What a generated COM header puts in one is `selectany`, `novtable`,
+        `uuid` and `xfg_virtual`: a linkage hint for a definition repeated
+        across translation units, two optimisation hints, and a GUID that the
+        same header also writes out as an ordinary constant. None of them
+        changes a byte of what is emitted here, and a single translation unit
+        has no linkage to choose anyway.
+
+        `align` does change layout, so it is refused rather than dropped.
+        Quietly ignoring it would move every member after it and the program
+        would run and be wrong, which is the failure worth the most care.
+        """
+
+        keyword = self.take()  # '__declspec'
+        if not self.at("("):
+            self.error("__declspec takes a parenthesised attribute", keyword)
+        depth = 0
+        while True:
+            if self.token.kind == "eof":
+                self.error("unterminated __declspec", keyword)
+            if self.at("("):
+                depth += 1
+            elif self.at(")"):
+                depth -= 1
+            elif self.token.kind == "identifier" and self.token.value == "align":
+                self.error(
+                    "__declspec(align) decides where every member after it "
+                    "sits, and py2bin does not implement it. Dropping it "
+                    "would build a struct of a different shape than the one "
+                    "written, so it is refused instead",
+                    self.token,
+                )
+            self.index += 1
+            if depth == 0:
+                return
 
     def pointer_suffix(self, base: CType) -> CType:
         while True:
@@ -2034,7 +2086,7 @@ class Parser:
 
     def array_length(self) -> int:
         token = self.token
-        value = ConstantEvaluator(self.filename).value(self.assignment_expression())
+        value = ConstantEvaluator(self.filename, self.enumerators).value(self.assignment_expression())
         if value <= 0:
             self.error("an array needs a positive constant length", token)
         return value
@@ -2846,8 +2898,14 @@ class ConstantEvaluator:
     interpreter over the syntax tree rather than a pass over the IR.
     """
 
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, names: "dict[str, int] | None" = None):
         self.filename = filename
+        #: The enumeration constants in scope. C makes each one an integer
+        #: constant expression, so it may stand in an array length, a `case`
+        #: label, or the value of a later enumerator - which is how every
+        #: enum a COM header generates is written: each entry is the one
+        #: before it plus one.
+        self.names = names if names is not None else {}
 
     def error(self, message: str, token: Token):
         raise CCompileError(
@@ -2861,6 +2919,14 @@ class ConstantEvaluator:
     def evaluate(self, node: Node) -> int:
         if isinstance(node, IntLiteral):
             return node.value
+        if isinstance(node, Identifier):
+            if node.name in self.names:
+                return self.names[node.name]
+            self.error(
+                f"{node.name!r} is not a constant; only an enumeration "
+                "constant may stand in a constant expression",
+                node.token,
+            )
         if isinstance(node, FloatLiteral):
             self.error(
                 "a floating constant is not an integer constant expression; an "
@@ -5768,7 +5834,7 @@ class Lowerer:
             if not self.switches:
                 self.error("'case' is not inside a switch", node.token)
             context = self.switches[-1]
-            raw = ConstantEvaluator(self.filename).value(node.value)
+            raw = ConstantEvaluator(self.filename, self.enumerators).value(node.value)
             value = _s64(_wrap(raw, context.ctype.size, context.ctype.signed))
             if value in context.seen:
                 self.error(f"duplicate case value {raw}", node.token)

@@ -4208,6 +4208,33 @@ _NOT_A_TYPE = frozenset(
 
 
 
+def _opens_a_line(text: str, index: int) -> bool:
+    """Whether only whitespace stands between `index` and the line's start."""
+
+    at = index - 1
+    while at >= 0 and text[at] in " \t":
+        at -= 1
+    return at < 0 or text[at] == "\n"
+
+
+def _after_directive(text: str, index: int) -> int:
+    """The end of the directive at `index`, continuation lines included."""
+
+    at = index
+    length = len(text)
+    while at < length:
+        if text[at] == "\\" and at + 1 < length and text[at + 1] == "\n":
+            at += 2
+            continue
+        if text[at] == "\\" and text[at + 1:at + 3] == "\r\n":
+            at += 3
+            continue
+        if text[at] == "\n":
+            return at
+        at += 1
+    return length
+
+
 def _without_literals(text: str) -> str:
     """The text with every literal blanked, for scanning rather than editing.
 
@@ -4216,13 +4243,25 @@ def _without_literals(text: str) -> str:
     """
 
     return "".join(
-        part if kind == "code" else " " * len(part)
+        part
+        if kind == "code"
+        else "".join(" " if letter != "\n" else "\n" for letter in part)
         for kind, part in _split_literals(text)
     )
 
 
 def _split_literals(text: str) -> "list[tuple[str, str]]":
-    """The text as alternating ("code", ...) and ("literal", ...) pieces."""
+    """The text as alternating ("code", ...) and ("literal", ...) pieces.
+
+    A preprocessing directive counts as a literal here, its continuation
+    lines with it. It is not C++ and rewriting it is never right: a
+    generated COM header defines a macro per method, each body a call
+    through a vtable, and the translator rewrote those bodies as if they
+    were code - leaving `#define NAME(args) \\` with nothing after the
+    backslash, which then swallowed the line below it and every `#endif`
+    that followed. What the preprocessor makes of a directive is the
+    preprocessor's business, and it runs after this.
+    """
 
     pieces: list[tuple[str, str]] = []
     chunk: list[str] = []
@@ -4230,6 +4269,12 @@ def _split_literals(text: str) -> "list[tuple[str, str]]":
     length = len(text)
     while index < length:
         char = text[index]
+        if char == "#" and _opens_a_line(text, index):
+            pieces.append(("code", "".join(chunk)))
+            chunk = []
+            pieces.append(("literal", text[index:_after_directive(text, index)]))
+            index = _after_directive(text, index)
+            continue
         if char in "\"'":
             pieces.append(("code", "".join(chunk)))
             chunk = []
@@ -10851,9 +10896,145 @@ public:
 #endif
 """
 
+_OBJIDL_HEADER = r"""
+
+/* The COM interfaces a program is handed rather than ones it writes. Like
+   <unknwn.h>, no implementation publishes this as a file: it is generated
+   from an .idl at build time, and the vendor's ships inside a toolchain.
+   Written here as the classes it describes, at the slots it puts them.
+
+   Only what a caller reaches for. A generated header that names IStream in
+   a signature needs the type to exist with the right table; the rest of the
+   .idl would be an ABI written from memory, which is the one thing worth
+   less than nothing here. */
+#ifndef __py2bin_objidl_h
+#define __py2bin_objidl_h
+#include <unknwn.h>
+
+/* The eight-byte integer the SDK spells as a one-member union. Written as
+   the integer it is, deliberately: a struct passed BY VALUE through a
+   foreign vtable is the one thing py2bin cannot spell, and IStream::Seek
+   takes one. On both Windows machines an eight-byte struct travels in the
+   same register as an eight-byte integer, so the bits and the ABI are the
+   same either way, and this way it can be called. */
+typedef long long __py2bin_LARGE;
+typedef unsigned long long __py2bin_ULARGE;
+
+typedef struct __py2bin_STATSTG {
+    wchar_t *pwcsName;
+    unsigned long type;
+    __py2bin_ULARGE cbSize;
+    unsigned long mtime_low, mtime_high;
+    unsigned long ctime_low, ctime_high;
+    unsigned long atime_low, atime_high;
+    unsigned long grfMode;
+    unsigned long grfLocksSupported;
+    GUID clsid;
+    unsigned long grfStateBits;
+    unsigned long reserved;
+} STATSTG;
+
+/* Slots 3 and 4, after IUnknown's three. */
+class ISequentialStream : public IUnknown {
+public:
+    virtual HRESULT Read(void *pv, unsigned long cb, unsigned long *read) = 0;
+    virtual HRESULT Write(const void *pv, unsigned long cb,
+                          unsigned long *written) = 0;
+};
+
+/* Slots 5 through 13, in the order the .idl declares them. */
+class IStream : public ISequentialStream {
+public:
+    virtual HRESULT Seek(__py2bin_LARGE move, unsigned long origin,
+                         __py2bin_ULARGE *position) = 0;
+    virtual HRESULT SetSize(__py2bin_ULARGE size) = 0;
+    virtual HRESULT CopyTo(IStream *other, __py2bin_ULARGE cb,
+                           __py2bin_ULARGE *read, __py2bin_ULARGE *written) = 0;
+    virtual HRESULT Commit(unsigned long flags) = 0;
+    virtual HRESULT Revert() = 0;
+    virtual HRESULT LockRegion(__py2bin_ULARGE offset, __py2bin_ULARGE cb,
+                               unsigned long type) = 0;
+    virtual HRESULT UnlockRegion(__py2bin_ULARGE offset, __py2bin_ULARGE cb,
+                                 unsigned long type) = 0;
+    virtual HRESULT Stat(STATSTG *out, unsigned long flag) = 0;
+    virtual HRESULT Clone(IStream **out) = 0;
+};
+
+#define STREAM_SEEK_SET 0
+#define STREAM_SEEK_CUR 1
+#define STREAM_SEEK_END 2
+
+#endif
+"""
+
+
+_OAIDL_HEADER = r"""
+
+/* What Automation passes a value in. Sixteen bytes on both Windows
+   machines: a two-byte tag, six the SDK reserves, and eight of value -
+   which is what every member of that union is, or fits in. Written as the
+   layout rather than as the union, because the union's members are a
+   hundred names for the same eight bytes and the layout is the part that
+   has to be right. */
+#ifndef __py2bin_oaidl_h
+#define __py2bin_oaidl_h
+#include <unknwn.h>
+
+typedef unsigned short VARTYPE;
+
+typedef struct __py2bin_VARIANT {
+    VARTYPE vt;
+    unsigned short wReserved1;
+    unsigned short wReserved2;
+    unsigned short wReserved3;
+    long long value;
+} VARIANT;
+typedef VARIANT VARIANTARG;
+typedef VARIANT *LPVARIANT;
+
+#define VT_EMPTY 0
+#define VT_NULL 1
+#define VT_I2 2
+#define VT_I4 3
+#define VT_R4 4
+#define VT_R8 5
+#define VT_BSTR 8
+#define VT_DISPATCH 9
+#define VT_BOOL 11
+#define VT_UNKNOWN 13
+#define VT_I8 20
+#define VT_UI8 21
+
+#endif
+"""
+
+
+_EVENTTOKEN_HEADER = r"""
+
+/* One struct, which a generated header then names two thousand times: the
+   handle registering for an event hands back, so that the registration can
+   be taken off again. */
+#ifndef __py2bin_eventtoken_h
+#define __py2bin_eventtoken_h
+
+typedef struct EventRegistrationToken {
+    long long value;
+} EventRegistrationToken;
+
+#endif
+"""
+
+
 _BUILTIN_CPP_HEADERS = {
     # COM's root, which no implementation publishes as a file.
     "unknwn.h": _UNKNWN_HEADER,
+    # And the interfaces a generated header names in its signatures. Same
+    # reason and same shape: the classes they are, at the slots the .idl
+    # puts them at.
+    "objidl.h": _OBJIDL_HEADER,
+    "oaidl.h": _OAIDL_HEADER,
+    "EventToken.h": _EVENTTOKEN_HEADER,
+    "eventtoken.h": _EVENTTOKEN_HEADER,
     "string": _STRING_HEADER,
     "map": _MAP_HEADER,
     # An unordered map is the same interface with no promise about order,
@@ -10887,6 +11068,16 @@ _BUILTIN_CPP_HEADERS = {
 #: A quoted include names a file of this project; an angled one names a header
 #: py2bin ships, which is C already and left for the preprocessor.
 _LOCAL_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$', re.M)
+
+#: An include of either spelling. Which one it is stopped mattering once a
+#: quoted include had to fall back to what py2bin ships and an angled one had
+#: to reach the project's own headers - both of which C already says.
+_ANY_INCLUDE = re.compile(
+    r'#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)'
+)
+
+#: A header that declares one thing or another according to a macro.
+_CHOOSES_A_BRANCH = re.compile(r"(?m)^[ \t]*#[ \t]*(?:else|elif)\b")
 
 #: Suffixes that mean C++ rather than C.
 CPP_SUFFIXES = (".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx")
@@ -10926,24 +11117,12 @@ def inline_local_includes(
     seen.add(settled)
     text = path.read_text(encoding="utf-8", errors="replace")
 
-    def paste(match: "re.Match[str]") -> str:
-        named = match.group(1)
-        for folder in (path.parent, *(Path(d) for d in include_dirs)):
-            candidate = folder / named
-            if candidate.is_file():
-                return inline_local_includes(
-                    candidate, include_dirs, seen, seen_headers
-                )
-        # Not ours to paste; leave it for the preprocessor to fail on clearly.
-        return match.group(0)
+    def supply(named: str) -> "str | None":
+        """One of py2bin's own C++ headers, pasted once per unit."""
 
-    text = _LOCAL_INCLUDE.sub(paste, text)
-
-    def paste_builtin(match: "re.Match[str]") -> str:
-        named = match.group(1)
         supplied = _BUILTIN_CPP_HEADERS.get(named)
         if supplied is None:
-            return match.group(0)
+            return None
         if named in seen_headers:
             return ""
         seen_headers.add(named)
@@ -10951,9 +11130,51 @@ def inline_local_includes(
         # of <string> - so what is pasted is pasted again. Without it the
         # inner include survived into the C, and the compiler reported a
         # missing header the user never wrote.
-        return re.sub(r'#\s*include\s*<([^>]+)>', paste_builtin, supplied)
+        return _ANY_INCLUDE.sub(reach, supplied)
 
-    return re.sub(r'#\s*include\s*<([^>]+)>', paste_builtin, text)
+    def reach(match: "re.Match[str]") -> str:
+        """Whatever this include names, however it is spelled.
+
+        A quoted include falls back to what py2bin ships when the local
+        search finds nothing, which is what C says.
+        """
+
+        named = match.group(1) or match.group(2)
+        supplied = supply(named)
+        if supplied is not None:
+            return supplied
+        if match.group(2) is not None:
+            # Angled and not one of py2bin's own: the preprocessor's.
+            return match.group(0)
+        for folder in (path.parent, *(Path(d) for d in include_dirs)):
+            candidate = folder / named
+            if not candidate.is_file():
+                continue
+            if _CHOOSES_A_BRANCH.search(
+                candidate.read_text(encoding="utf-8", errors="replace")
+            ):
+                # A header that declares one thing or another depending on a
+                # macro is not this pass's to read. The translator runs
+                # before the preprocessor and has no `#if`, so it would
+                # translate both branches - and the branch meant for C is
+                # written in shapes that mean something else to it. A
+                # generated COM header is entirely this: `interface X { ... }`
+                # in the branch py2bin actually takes came out as
+                # `interface X = { ... };`, and the macro bodies beside it
+                # lost the calls they were made of.
+                #
+                # Left alone, the preprocessor picks the branch, and the
+                # branch it picks here is the C one - py2bin defines no
+                # __cplusplus - which is a table of function pointers and
+                # compiles as it stands.
+                return match.group(0)
+            return inline_local_includes(
+                candidate, include_dirs, seen, seen_headers
+            )
+        # Not ours to paste; leave it for the preprocessor to fail on clearly.
+        return match.group(0)
+
+    return _ANY_INCLUDE.sub(reach, text)
 
 
 def translate_project(

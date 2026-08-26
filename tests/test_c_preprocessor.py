@@ -1054,6 +1054,58 @@ int main(void) {
                     target,
                 )
 
+    def test_a_generated_com_header_takes_its_c_branch(self):
+        """MIDL output declares an interface twice - once as C++ classes,
+        once as a table of function pointers - and chooses with
+
+            #if defined(__cplusplus) && !defined(CINTERFACE)
+
+        py2bin defines no __cplusplus, so the second is the branch taken, and
+        the second is the one it can compile: a COM object IS that table."""
+
+        self.compile_for_windows(
+            """
+#include <windows.h>
+#include <unknwn.h>
+#include <objidl.h>
+#include <oaidl.h>
+#include <EventToken.h>
+
+#if defined(__cplusplus) && !defined(CINTERFACE)
+#error py2bin must not present itself as a C++ compiler to a generated header
+#endif
+
+int main(void) {
+    IStream *stream = (IStream *)0;
+    IUnknown *root = (IUnknown *)0;
+    VARIANT value;
+    EventRegistrationToken token;
+    value.vt = VT_I8;
+    value.value = 7;
+    token.value = 3;
+    if (stream != (IStream *)0) { stream->lpVtbl->Release(stream); }
+    if (root != (IUnknown *)0) { root->lpVtbl->AddRef(root); }
+    return (int)(value.value + token.value) - 10;
+}
+"""
+        )
+
+    def test_the_com_tables_are_the_right_depth(self):
+        """A slot out of place is a call to a different function, and a
+        vtable call is a load and a branch, so nothing would report it."""
+
+        from py2bin.c_preprocessor import _OBJIDL_H, _UNKNWN_H
+
+        root = _UNKNWN_H[_UNKNWN_H.index("IUnknownVtbl {"):]
+        self.assertEqual(root[: root.index("}")].count(");"), 3)
+        for owner, slots in (("ISequentialStreamVtbl {", 5), ("IStreamVtbl {", 14)):
+            table = _OBJIDL_H[_OBJIDL_H.index(owner):]
+            self.assertEqual(
+                table[: table.index("} ")].count(");"),
+                slots,
+                f"{owner} is not {slots} slots deep",
+            )
+
     def test_a_piece_still_says_it_is_for_windows(self):
         with self.assertRaises(Exception) as caught:
             self.compile_for_windows(
