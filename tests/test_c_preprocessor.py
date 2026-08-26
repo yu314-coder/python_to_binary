@@ -792,6 +792,45 @@ class RejectionTests(PreprocessorTestCase):
             "unknown preprocessing directive",
         )
 
+    def test_an_error_says_which_branches_it_fell_through(self):
+        """A header that stops at the end of a chain is saying what it wanted.
+
+        Naming the branches is the whole answer: it says which conditions
+        would have had to hold, and lets the author see whether any of them
+        is one they can arrange. Guessing at a flag instead got it wrong -
+        `#error You must define NtCurrentTeb()` cannot be answered with a
+        `-D` of that name, because the chain never tests for it.
+        """
+
+        with self.assertRaises(CCompileError) as caught:
+            preprocess(
+                "#ifdef WINE_UNIX_LIB\n"
+                "#elif defined(__i386__) && defined(__GNUC__)\n"
+                "#elif defined(__x86_64__) && defined(_MSC_VER)\n"
+                "#elif !defined(RC_INVOKED)\n"
+                "# error You must define NtCurrentTeb() for your architecture\n"
+                "#endif\n",
+                "t.c",
+                target="windows-x86_64",
+            )
+        message = str(caught.exception)
+        self.assertIn("You must define NtCurrentTeb()", message)
+        self.assertIn("none of these held", message)
+        self.assertIn("#ifdef WINE_UNIX_LIB", message)
+        self.assertIn("defined(__x86_64__) && defined(_MSC_VER)", message)
+        # The branch that *was* taken is not among them: it is the one that
+        # led here, not one that failed.
+        self.assertNotIn("RC_INVOKED", message)
+
+    def test_a_branch_that_held_is_not_reported_as_a_failure(self):
+        # Nothing falls through here, so there is nothing to explain.
+        tokens = preprocess(
+            "#if 1\nint main(void) { return 0; }\n"
+            "#else\n# error unreachable\n#endif\n",
+            "t.c",
+        )
+        self.assertTrue(any(token.value == "main" for token in tokens))
+
     def test_a_header_of_its_own_may_define_null_first(self):
         """C says a redefinition has to be identical, and both spellings are
         valid null pointer constants - so py2bin's own headers must not fight

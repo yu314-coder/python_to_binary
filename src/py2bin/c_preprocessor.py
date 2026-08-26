@@ -453,6 +453,11 @@ class _Condition:
     active: bool  # is the current branch emitting?
     seen_else: bool
     token: PPToken
+    #: What each branch of this group asked for, in order, and whether it
+    #: held. Kept so a `#error` at the end of a chain can say why it was
+    #: reached: a header that falls through every branch is telling you what
+    #: it wanted, and reading that off the source is the whole answer.
+    tried: "list[tuple[str, bool]]" = dataclasses.field(default_factory=list)
 
 
 _MAXIMUM_INCLUDE_DEPTH = 64
@@ -587,7 +592,12 @@ class Preprocessor:
                 conditions.append(_Condition(False, False, False, False, name_token))
                 return
             value = self._condition(name, rest, name_token)
-            conditions.append(_Condition(True, value, value, False, name_token))
+            conditions.append(
+                _Condition(
+                    True, value, value, False, name_token,
+                    [(f"#{name} {_respaced(rest)}".strip(), value)],
+                )
+            )
             return
         if name == "elif":
             if not conditions:
@@ -597,10 +607,13 @@ class Preprocessor:
                 self.error("#elif after #else", name_token)
             if not condition.outer or condition.taken:
                 condition.active = False
+                if condition.outer:
+                    condition.tried.append((f"#elif {_respaced(rest)}", False))
                 return
             value = self._condition("if", rest, name_token)
             condition.active = value
             condition.taken = condition.taken or value
+            condition.tried.append((f"#elif {_respaced(rest)}", value))
             return
         if name == "else":
             if not conditions:
@@ -648,15 +661,7 @@ class Preprocessor:
             # the one the author took the trouble to write.
             message = _respaced(rest)
             spelled = f"#error {message}" if message else "#error"
-            if re.search(r"\bdefine\b", message, re.I):
-                # The header is telling whoever is compiling to define
-                # something. Saying how is worth a line: `py2bin cc` has
-                # always taken `--define`, and `build.py` takes `-D`.
-                spelled += (
-                    "\n  This header is asking you to define something. "
-                    "Pass it with `-D NAME` (build.py) or `--define NAME` "
-                    "(py2bin cc)."
-                )
+            spelled += self._why_here(conditions)
             self.error(spelled, name_token)
         if name == "pragma":
             self._pragma(rest, name_token)
@@ -844,6 +849,36 @@ class Preprocessor:
     #: Read this way rather than by naming the compilers, which is a thing
     #: no module here is allowed to do.
     _INERT_SECOND = frozenset({"diagnostic", "system_header", "poison"})
+
+    def _why_here(self, conditions: "list[_Condition]") -> str:
+        """What the chain around a `#error` asked for, and did not get.
+
+        A header that falls through every branch of a chain and stops is
+        telling you what it wanted. Naming the branches is the whole answer:
+        it says which conditions would have to hold, and whether any of them
+        is one you can arrange - which guessing at `-D` cannot say, and got
+        wrong when it tried.
+        """
+
+        if not conditions or not conditions[-1].tried:
+            return ""
+        tried = [spelled for spelled, held in conditions[-1].tried if not held]
+        if not tried:
+            return ""
+        lines = "\n".join(f"      {one}" for one in tried[:12])
+        more = (
+            f"\n      ... and {len(tried) - 12} more" if len(tried) > 12 else ""
+        )
+        return (
+            f"\n  Reached because none of these held:\n{lines}{more}\n"
+            f"  Each names what that branch needed. py2bin defines the "
+            f"platform and architecture macros for the target it is building "
+            f"for, and does not define another compiler's - a header that "
+            f"believed it was being compiled by one would reach for builtins "
+            f"that are not here. Where a branch asks for something you can "
+            f"arrange, `-D NAME` (build.py) or `--define NAME` (py2bin cc) "
+            f"is how."
+        )
 
     def _pragma(self, rest: "list[PPToken]", name_token: "PPToken") -> None:
         """`#pragma once`, the ones that mean nothing here, and the rest.

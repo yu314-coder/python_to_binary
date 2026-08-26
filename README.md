@@ -555,9 +555,27 @@ py2bin fetch-header thing.h --from https://example.com/thing.h --into vendor
 python3 build.py app.cpp -D SOME_MACRO -I vendor
 ```
 
-`-D NAME` (or `--define NAME=VALUE`, repeatable) is what a header means when
-its `#error` says you must define something — and a `#error` that says so now
-points at the flag.
+`-D NAME` (or `--define NAME=VALUE`, repeatable) is how you answer a header
+that asks for a macro.
+
+**A `#error` says why it was reached.** A header that falls through every
+branch of an `#if`/`#elif` chain and stops is telling you what it wanted, so
+py2bin lists the branches that did not hold:
+
+```
+winnt.h:2638:3: #error You must define NtCurrentTeb() for your architecture
+  Reached because none of these held:
+      #ifdef WINE_UNIX_LIB
+      #elif defined(__i386__) && defined(__GNUC__)
+      #elif defined(__x86_64__) && defined(_MSC_VER)
+      ...
+```
+
+That is the whole answer to "what do I do about this": each line names what
+that branch needed, and you can see whether any of them is something you can
+arrange. It replaced a guess — py2bin used to read the word "define" in a
+`#error` and suggest `-D`, which is wrong here, because that chain never
+tests whether `NtCurrentTeb` is defined.
 
 A platform header — `rpc.h`, `objbase.h` — is never published on its own and
 is never in a repository named after it: it belongs to a *set*. Those sets are
