@@ -554,12 +554,24 @@ py2bin fetch-header nlohmann/json.hpp --into vendor
 py2bin fetch-header thing.h --from https://example.com/thing.h --into vendor
 ```
 
-Every header near the one asked for comes with it, because a header includes
-its neighbours and one at a time would ask again immediately; each build says
-which package or repository a header came from, so you can judge it. What
-arrives is a header and not a toolchain: whether py2bin's C understands what
-is inside it is a separate question, answered by the compiler in the usual
-way — `WebView2.h` downloads and then stops on the COM above.
+A platform header — `rpc.h`, `objbase.h` — is never published on its own and
+is never in a repository named after it: it belongs to a *set*. Those sets are
+searched by path, and what comes down is the closure over the header's own
+`#include` lines rather than the directory it sits in, which is a few dozen
+files where the directory is a few thousand. A small library's directory is
+taken whole, because that directory *is* the library.
+
+Each build says which package or repository a header came from, so you can
+judge it. What arrives is a header and not a toolchain: whether py2bin's C
+understands what is inside it is a separate question, answered by the compiler
+in the usual way.
+
+**Some headers cannot be fetched by anyone.** A COM header is generated from
+a `.idl` by a tool that runs at build time, and a platform's own set usually
+has a core header its configure step writes — neither exists as a file in any
+repository or package. `WebView2.h` needs both, so no amount of fetching
+reaches it; what reaches it is declaring by hand the two or three interfaces a
+program actually calls, which py2bin's vtables express directly.
 
 **Which is why `<windows.h>` is py2bin's own too.** Microsoft's is tens of
 thousands of declarations written in extensions this compiler does not have.

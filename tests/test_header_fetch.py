@@ -248,6 +248,70 @@ class FetchFromSourceTests(unittest.TestCase):
         self.assertIn("who/what: holds no who/what.hpp", str(refused.exception))
 
 
+class CollectionTests(unittest.TestCase):
+    """A platform header is in a *set*, never in a repository named after it."""
+
+    _TREE = json.dumps(
+        {
+            "tree": [
+                {"type": "blob", "path": "headers/include/rpc.h"},
+                {"type": "blob", "path": "headers/include/rpcdce.h"},
+                {"type": "blob", "path": "headers/include/windef.h"},
+                {"type": "blob", "path": "headers/include/unrelated.h"},
+            ]
+            # Enough of them that the directory is taken by closure rather
+            # than whole; the real one holds fifteen hundred.
+            + [
+                {"type": "blob", "path": f"headers/include/other{index}.h"}
+                for index in range(80)
+            ]
+        }
+    ).encode()
+
+    def _table(self, collection):
+        raw = "https://raw.githubusercontent.com/" + collection + "/main/"
+        return {
+            "https://api.github.com/search": json.dumps({"items": []}).encode(),
+            "https://azuresearch": json.dumps({"data": []}).encode(),
+            f"https://api.github.com/repos/{collection}/git/trees": self._TREE,
+            f"https://api.github.com/repos/{collection}": json.dumps(
+                {"default_branch": "main"}
+            ).encode(),
+            raw + "headers/include/rpc.h": b'#include "rpcdce.h"\n#include <stdio.h>\n',
+            raw + "headers/include/rpcdce.h": b'#include "windef.h"\n',
+            raw + "headers/include/windef.h": b"/* the end */\n",
+        }
+
+    def test_a_header_is_found_in_a_set_that_is_not_named_after_it(self):
+        from py2bin.header_fetch import _COLLECTIONS
+
+        collection = _COLLECTIONS[0]
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work) / "headers"
+            with _Downloader(self._table(collection)):
+                kept = fetch_header("rpc.h", into)
+            self.assertEqual(kept, into / "rpc.h")
+
+    def test_only_the_headers_it_reaches_come_with_it(self):
+        """A platform's include directory is thousands of files.
+
+        What has to come down is the closure over a header's own `#include`
+        lines, which is a handful - taking the directory whole would download
+        a set nearly none of which is wanted.
+        """
+
+        from py2bin.header_fetch import _COLLECTIONS
+
+        collection = _COLLECTIONS[0]
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work) / "headers"
+            with _Downloader(self._table(collection)):
+                fetch_header("rpc.h", into)
+            names = {path.name for path in found_headers(into)}
+            self.assertEqual(names, {"rpc.h", "rpcdce.h", "windef.h"})
+            self.assertNotIn("unrelated.h", names)
+
+
 class FetchFromAUrlTests(unittest.TestCase):
     def test_a_header_named_outright_is_written_where_it_was_asked_for(self):
         with tempfile.TemporaryDirectory() as work:

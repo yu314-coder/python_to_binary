@@ -338,6 +338,16 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
         if brace >= 0 and (statement_end < 0 or brace < statement_end):
             head = body[index:brace].strip()
             close = _matching(body, brace)
+            if _TAGGED_MEMBER.match(head):
+                # `union { int i; float f; } value;` - a type written where a
+                # member is declared, which is how a program says "one of
+                # these, whichever is live". The brace is a body and not a
+                # method's, and reading it as one asked what `union` returns.
+                found.members.append(
+                    _tagged_member(body, brace, close, head, filename, at + index)
+                )
+                index = body.find(";", close) + 1
+                continue
             method = _method_from(head, body[brace:close], filename, at + index)
             found.methods.append(method)
             index = close
@@ -381,6 +391,38 @@ _FUNCTION_POINTER_MEMBER = re.compile(
     r"^(.+?)\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*(\([^()]*\))$"
 )
 
+
+
+#: `union {`, `struct {`, `enum {` written where a member goes - with or
+#: without a tag. The body is the type's, not a function's.
+_TAGGED_MEMBER = re.compile(r"^(?:struct|union|enum)\b\s*[A-Za-z_]?\w*\s*$")
+
+
+def _tagged_member(
+    body: str, brace: int, close: int, head: str, filename: str, at: int
+) -> Member:
+    """`union { ... } value;` as one member, with the type carried whole."""
+
+    rest = body[close:]
+    named = re.match(r"\s*(\*?)\s*([A-Za-z_]\w*)?\s*(\[[^\]]*\])?\s*;", rest)
+    if named is None:
+        raise CppTranslationError(
+            filename, at, f"cannot read the member {head!r} written here"
+        )
+    spelled = f"{head} {body[brace:close]}".strip()
+    if not named.group(2):
+        raise CppTranslationError(
+            filename,
+            at,
+            f"an anonymous {head.split()[0]} member has no name, so C++ reaches "
+            f"its fields directly; py2bin does not do that yet - give it a "
+            f"name and reach them through it",
+        )
+    return Member(
+        name=named.group(2),
+        ctype=f"{spelled}{' ' + named.group(1) if named.group(1) else ''}",
+        array=named.group(3) or "",
+    )
 
 def _members_from(
     declaration: str, filename: str, at: int
@@ -1146,6 +1188,40 @@ _ENUM_BASE = re.compile(
 #: type and C does not.
 _TAGGED_TYPE = re.compile(r"\b(enum|union)\s+([A-Za-z_]\w*)\s*\{")
 
+
+
+def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]]":
+    """Take each plain struct's body out, to be emitted above the classes.
+
+    A `struct` with no methods is C already and is left exactly as written -
+    but a class holding one is emitted above whatever is left of the file, so
+    the class named a type C had not seen. The bodies come up in the order
+    they were written, which keeps one holding another after it.
+    """
+
+    if not plain:
+        return text, []
+    wanted = set(plain)
+    bodies: "list[str]" = []
+    out: list[str] = []
+    at = 0
+    for head in _CLASS_HEAD.finditer(text):
+        if head.start() < at or head.group(2) not in wanted:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        end = closing
+        while end < len(text) and text[end] in " \t":
+            end += 1
+        if end < len(text) and text[end] == ";":
+            end += 1
+        bodies.append(text[head.start():end])
+        out.append(text[at:head.start()])
+        at = end
+    out.append(text[at:])
+    return "".join(out), bodies
 
 def _hoist_tagged_types(text: str) -> "tuple[str, str]":
     """Take every top-level `enum`/`union` definition out, with its typedef.
@@ -8340,6 +8416,12 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # a struct may hold one, and C needs the complete type to lay the field
     # out. A nested enum lifted out of a class is exactly that case.
     remainder, tagged = _hoist_tagged_types(remainder)
+    # A `struct` with no methods is emitted exactly where it was written, and
+    # a class holding one is emitted above whatever is left of the file - so
+    # the class named a type C had not seen yet. The bodies of those go up
+    # too, in the order they were written, so one holding another still comes
+    # after it.
+    remainder, plain_bodies = _hoist_plain_structs(remainder, plain)
     # The name a function's own type was given goes up with the rest of them:
     # a template copy taking one is emitted above whatever is left of the
     # file, and the typedef was still down where the function was defined.
@@ -8362,7 +8444,11 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # type to lay out the field. Emitting in source order put `Car` before
     # `Engine` whenever that is how they were written.
     declarations = "\n".join(
-        _emit_class(classes[name], classes) for name in _by_dependency(order, classes)
+        [*plain_bodies]
+        + [
+            _emit_class(classes[name], classes)
+            for name in _by_dependency(order, classes)
+        ]
     )
     tables = _emit_vtables(order, classes)
     if tables:

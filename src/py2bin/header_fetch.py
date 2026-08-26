@@ -66,8 +66,39 @@ _SOURCE_TREE = "https://api.github.com/repos"
 _SOURCE_RAW = "https://raw.githubusercontent.com"
 
 #: A ceiling on what one repository's headers may come to.
-_MAX_HEADERS = 400
-_MAX_HEADER_BYTES = 32 * 1024 * 1024
+_MAX_HEADERS = 600
+_MAX_HEADER_BYTES = 64 * 1024 * 1024
+
+#: Repositories that hold a whole *set* of headers rather than one library's.
+#: A platform header - `rpc.h`, `objbase.h`, `unknwn.h` - is never published
+#: on its own and is never in a repository named after it, so searching by
+#: name never finds one. These are asked by path instead: the file list of a
+#: repository arrives in a single request, and the header is looked for in it.
+#:
+#: This one is the header set that a program written against the Windows API
+#: is written against. It is headers only - no compiler, no library, nothing
+#: py2bin runs - and it is what makes `#include <windows.h>`-shaped code
+#: reachable at all, since the vendor's own set ships with a toolchain and is
+#: published nowhere a build can fetch it from.
+#: Two of them, because neither is complete on its own: each generates part
+#: of its set from templates its own build system fills in, and what one
+#: generates the other often ships. Tried in order, and the one that answered
+#: last is tried first next time - the headers of a set belong together, and
+#: a program that needed one usually needs its neighbours.
+#: In this order because this is the order that was tried end to end. Each
+#: set generates part of its own contents at build time - one writes a core
+#: header from a template, the other generates its COM headers from `.idl` -
+#: so neither is complete as published, and a header taken from either may
+#: reach an `#include` that exists nowhere as a file. Which one answers first
+#: only decides which is asked first: a set that does not hold the header
+#: falls through to the next.
+_COLLECTIONS = ["mingw-w64/mingw-w64", "wine-mirror/wine"]
+
+#: File lists already fetched, by (repository, branch). One of these is a
+#: single request answering thousands of paths, and a build that fetches a
+#: dozen headers from one set would otherwise ask a dozen times - which is
+#: most of an anonymous caller's hourly allowance.
+_TREES: "dict[tuple[str, str], list[str]]" = {}
 
 #: How many results a search looks at. A header that is not in the first few
 #: packages named after it is not going to be in the twentieth.
@@ -226,6 +257,10 @@ def fetch_header(
     spelled = "\n    ".join(reasons) or "nothing was found to try"
     raise HeaderFetchError(
         f"{stem!r} was not found:\n    {spelled}\n"
+        f"  Some headers are not published as files at all - a COM or IDL one "
+        f"is generated from a .idl by a tool that runs at build time, and a "
+        f"platform's own set often has a core header its configure step "
+        f"writes. Nothing can fetch those.\n"
         f"  Give the URL of the header itself, or put it in a directory and "
         f"name that with --include"
     )
@@ -306,6 +341,11 @@ def _from_source(
         reasons.append(f"the source host: {error}")
         if not repositories:
             return None
+    # And the sets: a platform header is in one of those and in no repository
+    # named after it, so the search above was never going to find one.
+    for full in _COLLECTIONS:
+        if full not in repositories:
+            repositories.append(full)
     for full in repositories:
         try:
             say(f"  trying {full}")
@@ -315,6 +355,10 @@ def _from_source(
             continue
         if found is not None:
             say(f"  {wanted} came from {full}")
+            if full in _COLLECTIONS:
+                # Its neighbours are there too, so ask it first next time.
+                _COLLECTIONS.remove(full)
+                _COLLECTIONS.insert(0, full)
             return found
         reasons.append(f"{full}: holds no {wanted}")
     return None
@@ -337,22 +381,25 @@ def _take_from_repository(
         if not isinstance(branch, str) or not branch:
             raise HeaderFetchError(f"{full} has no default branch")
         _BRANCHES[full] = branch
-    listed = _read_json(
-        f"{_SOURCE_TREE}/{urllib.parse.quote(owner)}/"
-        f"{urllib.parse.quote(repository)}/git/trees/"
-        f"{urllib.parse.quote(branch)}?recursive=1",
-        f"the files of {full}",
-    )
-    tree = listed.get("tree")
-    if not isinstance(tree, list):
-        raise HeaderFetchError(f"{full} answered no file list")
-    paths = [
-        entry["path"]
-        for entry in tree
-        if isinstance(entry, dict)
-        and entry.get("type") == "blob"
-        and isinstance(entry.get("path"), str)
-    ]
+    paths = _TREES.get((full, branch))
+    if paths is None:
+        listed = _read_json(
+            f"{_SOURCE_TREE}/{urllib.parse.quote(owner)}/"
+            f"{urllib.parse.quote(repository)}/git/trees/"
+            f"{urllib.parse.quote(branch)}?recursive=1",
+            f"the files of {full}",
+        )
+        tree = listed.get("tree")
+        if not isinstance(tree, list):
+            raise HeaderFetchError(f"{full} answered no file list")
+        paths = [
+            entry["path"]
+            for entry in tree
+            if isinstance(entry, dict)
+            and entry.get("type") == "blob"
+            and isinstance(entry.get("path"), str)
+        ]
+        _TREES[(full, branch)] = paths
     matching = [
         path for path in paths if path == wanted or path.endswith("/" + wanted)
     ]
@@ -363,26 +410,48 @@ def _take_from_repository(
     chosen = min(matching, key=len)
     # The directory it is written against, which is what `#include
     # "nlohmann/json.hpp"` names: as many parents up as the wanted name has
-    # pieces. Everything under that comes too, because a header includes its
-    # neighbours and one at a time would ask again immediately.
+    # pieces.
     depth = wanted.count("/") + 1
     root = "/".join(chosen.split("/")[:-depth])
     prefix = f"{root}/" if root else ""
-    neighbours = [
+    under = [
         path
         for path in paths
         if path.startswith(prefix)
         and path.lower().endswith((".h", ".hpp", ".hxx", ".hh", ".inc", ".ipp"))
     ]
-    if len(neighbours) > _MAX_HEADERS:
-        raise HeaderFetchError(
-            f"{full} keeps {len(neighbours)} headers under {root or '/'}, "
-            f"which is more than one build will pull down"
-        )
     into.mkdir(parents=True, exist_ok=True)
+    if len(under) <= _WHOLE_DIRECTORY:
+        # A small directory *is* the library, and taking it whole costs
+        # little and cannot miss a header hidden behind a condition.
+        return _take_paths(full, branch, under, prefix, chosen, into, say)
+    # A big one is a platform's whole set - thousands of files, nearly none
+    # of them wanted. Take the header asked for and the ones it reaches: a
+    # header's own `#include` lines say what it needs, and that closure is a
+    # few dozen where the directory is a few thousand.
+    say(f"  {root or '/'} holds {len(under)} headers; taking what {wanted} reaches")
+    return _take_closure(full, branch, under, prefix, chosen, into, say)
+
+
+def _take_paths(
+    full: str,
+    branch: str,
+    paths: "list[str]",
+    prefix: str,
+    chosen: str,
+    into: Path,
+    say,
+) -> "Path | None":
+    """Download every one of these and keep it under `into`."""
+
+    if len(paths) > _MAX_HEADERS:
+        raise HeaderFetchError(
+            f"{full} keeps {len(paths)} headers under {prefix or '/'}, which "
+            f"is more than one build will pull down"
+        )
     spent = 0
     answer: "Path | None" = None
-    for path in neighbours:
+    for path in paths:
         payload = _read_bytes(
             f"{_SOURCE_RAW}/{full}/{urllib.parse.quote(branch)}/"
             f"{urllib.parse.quote(path)}",
@@ -393,7 +462,7 @@ def _take_from_repository(
         if spent > _MAX_HEADER_BYTES:
             raise HeaderFetchError(
                 f"{full} keeps more than {_MAX_HEADER_BYTES // (1024 * 1024)}MB "
-                f"of headers under {root or '/'}"
+                f"of headers under {prefix or '/'}"
             )
         written = into / path[len(prefix):]
         written.parent.mkdir(parents=True, exist_ok=True)
@@ -401,6 +470,77 @@ def _take_from_repository(
         if path == chosen:
             answer = written
     return answer
+
+
+def _take_closure(
+    full: str,
+    branch: str,
+    paths: "list[str]",
+    prefix: str,
+    chosen: str,
+    into: Path,
+    say,
+) -> "Path | None":
+    """Download the header asked for and every header it reaches.
+
+    A header says what it needs in its own `#include` lines, so the set that
+    has to come down is a closure over those and not a whole directory. The
+    conditions around them are not read: a header included only on some
+    platform comes too, which costs a file and cannot leave one out.
+    """
+
+    by_name = {path[len(prefix):]: path for path in paths}
+    answer: "Path | None" = None
+    pending = [chosen[len(prefix):]]
+    seen: "set[str]" = set()
+    spent = 0
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        path = by_name.get(name)
+        if path is None:
+            continue
+        if len(seen) > _MAX_HEADERS:
+            raise HeaderFetchError(
+                f"{chosen} reaches more than {_MAX_HEADERS} headers in {full}, "
+                f"which is more than one build will pull down"
+            )
+        payload = _read_bytes(
+            f"{_SOURCE_RAW}/{full}/{urllib.parse.quote(branch)}/"
+            f"{urllib.parse.quote(path)}",
+            f"{path} from {full}",
+            _MAX_HEADER_BYTES,
+        )
+        spent += len(payload)
+        if spent > _MAX_HEADER_BYTES:
+            raise HeaderFetchError(
+                f"{chosen} reaches more than "
+                f"{_MAX_HEADER_BYTES // (1024 * 1024)}MB of headers in {full}"
+            )
+        written = into / name
+        written.parent.mkdir(parents=True, exist_ok=True)
+        written.write_bytes(payload)
+        if path == chosen:
+            answer = written
+        for reached in _INCLUDED.findall(payload.decode("utf-8", "replace")):
+            spelled = reached.strip().replace("\\", "/")
+            if spelled in by_name and spelled not in seen:
+                pending.append(spelled)
+    say(f"  took {len(seen)} headers, {spent // 1024}KB")
+    return answer
+
+
+#: How many headers a directory may hold before it is taken by closure rather
+#: than whole. A library's own include directory is a handful; a platform's is
+#: thousands, nearly none of them wanted.
+_WHOLE_DIRECTORY = 60
+
+#: `#include <x/y.h>` and `#include "x/y.h"` - what a header says it needs.
+_INCLUDED = re.compile(r'(?m)^[ \t]*#[ \t]*include[ \t]*[<"]([^>"]+)[>"]')
+
+
 
 
 def fetch_header_from(
