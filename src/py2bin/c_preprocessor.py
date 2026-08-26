@@ -1501,6 +1501,91 @@ extern DWORD GetCurrentDirectoryA(DWORD, LPSTR);
 #define FILE_BEGIN 0
 #define FILE_CURRENT 1
 #define FILE_END 2
+
+/* Windowing. A program that wants a window rather than a console had no way
+   to ask for one here: the vendor's headers declare all of this, and they
+   cannot be compiled by anything but the two compilers they are written for.
+   These are ordinary imports the loader binds, like everything above. */
+typedef void *HINSTANCE;
+typedef void *HICON;
+typedef void *HCURSOR;
+typedef void *HBRUSH;
+typedef void *HMENU;
+typedef void *HMODULE;
+typedef void *WPARAM;
+typedef void *LPARAM;
+typedef void *LRESULT;
+typedef unsigned short ATOM;
+
+typedef struct tagPOINT { LONG x; LONG y; } POINT;
+typedef struct tagRECT { LONG left; LONG top; LONG right; LONG bottom; } RECT;
+typedef struct tagMSG {
+    HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
+    DWORD time; POINT pt;
+} MSG;
+
+/* The window procedure a program writes, and the loader calls back into. */
+typedef LRESULT (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);
+
+typedef struct tagWNDCLASSEXW {
+    UINT cbSize; UINT style; WNDPROC lpfnWndProc;
+    int cbClsExtra; int cbWndExtra;
+    HINSTANCE hInstance; HICON hIcon; HCURSOR hCursor; HBRUSH hbrBackground;
+    LPCWSTR lpszMenuName; LPCWSTR lpszClassName; HICON hIconSm;
+} WNDCLASSEXW;
+
+extern ATOM RegisterClassExW(LPVOID);
+extern BOOL UnregisterClassW(LPCWSTR, HINSTANCE);
+extern HWND CreateWindowExW(DWORD, LPCWSTR, LPCWSTR, DWORD,
+                            int, int, int, int,
+                            HWND, HMENU, HINSTANCE, LPVOID);
+extern BOOL DestroyWindow(HWND);
+extern BOOL ShowWindow(HWND, int);
+extern BOOL UpdateWindow(HWND);
+extern BOOL GetMessageW(LPVOID, HWND, UINT, UINT);
+extern BOOL PeekMessageW(LPVOID, HWND, UINT, UINT, UINT);
+extern BOOL TranslateMessage(LPVOID);
+extern LRESULT DispatchMessageW(LPVOID);
+extern void PostQuitMessage(int);
+extern LRESULT DefWindowProcW(HWND, UINT, WPARAM, LPARAM);
+extern BOOL PostMessageW(HWND, UINT, WPARAM, LPARAM);
+extern LRESULT SendMessageW(HWND, UINT, WPARAM, LPARAM);
+extern BOOL GetClientRect(HWND, LPVOID);
+extern BOOL GetWindowRect(HWND, LPVOID);
+extern BOOL MoveWindow(HWND, int, int, int, int, BOOL);
+extern BOOL SetWindowTextW(HWND, LPCWSTR);
+extern HCURSOR LoadCursorW(HINSTANCE, LPCWSTR);
+extern HICON LoadIconW(HINSTANCE, LPCWSTR);
+extern LRESULT SetWindowLongPtrW(HWND, int, LPVOID);
+extern LRESULT GetWindowLongPtrW(HWND, int);
+extern HMODULE GetModuleHandleW(LPCWSTR);
+
+#define WS_OVERLAPPED 0x00000000
+#define WS_CAPTION 0x00C00000
+#define WS_SYSMENU 0x00080000
+#define WS_THICKFRAME 0x00040000
+#define WS_MINIMIZEBOX 0x00020000
+#define WS_MAXIMIZEBOX 0x00010000
+#define WS_VISIBLE 0x10000000
+#define WS_CHILD 0x40000000
+#define WS_OVERLAPPEDWINDOW 0x00CF0000
+#define CW_USEDEFAULT ((int)0x80000000)
+#define SW_HIDE 0
+#define SW_SHOWNORMAL 1
+#define SW_SHOW 5
+#define WM_DESTROY 0x0002
+#define WM_SIZE 0x0005
+#define WM_CLOSE 0x0010
+#define WM_QUIT 0x0012
+#define WM_PAINT 0x000F
+#define WM_KEYDOWN 0x0100
+#define WM_COMMAND 0x0111
+#define WM_USER 0x0400
+#define GWLP_USERDATA (-21)
+#define IDC_ARROW ((LPCWSTR)32512)
+#define IDI_APPLICATION ((LPCWSTR)32512)
+#define COLOR_WINDOW 5
+#define PM_REMOVE 0x0001
 """
 
 #: The platform half of <filesystem>, in C. It lives here rather than in the

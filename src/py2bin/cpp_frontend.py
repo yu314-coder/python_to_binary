@@ -2916,8 +2916,12 @@ def _into_class_body(
 
 #: `typedef T *iterator;` written inside a class. C has no such scope, so the
 #: name is resolved where it is used and the typedef itself goes.
+#: The stars may have spaces between them: `vector<Shape *>` puts `Shape *`
+#: where `T` was and leaves `typedef Shape * *iterator;`. Written to allow
+#: only adjacent stars, this matched nothing there, the typedef stayed inside
+#: the struct, and C rejected a program for holding a vector of pointers.
 _NESTED_TYPEDEF = re.compile(
-    r"\btypedef\s+([A-Za-z_][\w\s]*?)\s*(\**)\s*([A-Za-z_]\w*)\s*;"
+    r"\btypedef\s+([A-Za-z_][\w\s]*?)\s*((?:\*\s*)*)([A-Za-z_]\w*)\s*;"
 )
 
 
@@ -2945,7 +2949,7 @@ def _resolve_nested_typedefs(text: str) -> str:
 
         def taken(match: "re.Match[str]", o=owner) -> str:
             names[(o, match.group(3))] = (
-                f"{match.group(1).strip()} {match.group(2)}".strip()
+                f"{match.group(1).strip()} {match.group(2).strip()}".strip()
             )
             return ""
 
@@ -5366,6 +5370,39 @@ _COPY_INIT = re.compile(
     r"(\*?\s*(?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*\[[^\]]*\])?)\s*;"
 )
 
+#: `string s = "abc";` or `Money m = 500;` - a declaration whose value is
+#: neither another object nor a call on one. C++ reads `C name = value;` as
+#: `C name(value);` and looks for a constructor that takes it, which is how a
+#: class says what it can be made from. Without this the value was handed
+#: straight to C, which has no idea how to make a struct out of a `char *`.
+#: The characters that make an expression more than one thing. `->` is not
+#: among them once it is read as the single step it is, so `Money m = p->fee;`
+#: is still a value standing on its own.
+_AN_OPERATOR = "+-*/%<>!&|^~?"
+
+
+def _has_a_loose_operator(value: str) -> bool:
+    """Whether an operator stands outside every bracket in `value`."""
+
+    depth = 0
+    for letter in value.replace("->", "  "):
+        if letter in "([":
+            depth += 1
+        elif letter in ")]":
+            depth -= 1
+        elif depth == 0 and letter in _AN_OPERATOR:
+            return True
+    return False
+
+
+#: Everything between the `=` and the `;` is one group, spaces and all: a
+#: literal is blanked to spaces of its own length before this is matched, so
+#: a pattern that trims whitespace at the edges trims the literal away with
+#: it and hands back half a string.
+_CONVERTING_INIT = re.compile(
+    r"(?<![.\w>])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=([^;{}=][^;{}]*);"
+)
+
 #: `Vec c = a.add(b);` - a declaration whose value comes from a method that
 #: returns an object. The space is the caller's to provide.
 _VALUE_INIT = re.compile(
@@ -5418,6 +5455,24 @@ _BASE_PARAMETERS_SEEN: "dict[tuple[str, int], dict[str, list]]" = {}
 _BASE_PARAMETERS_KEPT = 16
 
 
+#: The tags C writes before a struct's name. A parameter list that has been
+#: through the type pass says `struct Shape *value` where the C++ said
+#: `Shape *value`, and reading the first word of that answered `struct` -
+#: so a call handing a derived pointer to a base parameter was left uncast,
+#: which C refuses. Every container of base pointers reached this, because
+#: the copy of `push_back` a container is made into takes exactly that.
+_A_TAG = frozenset({"struct", "union", "enum"})
+
+
+def _class_named(spelled: str) -> str:
+    """The class a parameter's type names, without its stars or its tag."""
+
+    for word in spelled.replace("*", " ").replace("const", " ").split():
+        if word not in _A_TAG:
+            return word
+    return ""
+
+
 def _parameters_wanting_a_base(
     scope: str, classes: "dict[str, Class]", remember: bool = False
 ) -> "dict[str, list[tuple[int, str]]]":
@@ -5442,11 +5497,9 @@ def _parameters_wanting_a_base(
         if _depth_at(scope, match.end() - 1) != 0:
             continue
         wanted_at = [
-            (index, part.replace("*", " ").replace("const", " ").strip())
+            (index, _class_named(part))
             for index, part in enumerate(_split_arguments(match.group(3)))
-            if "*" in part
-            and part.replace("*", " ").replace("const", " ").split()
-            and part.replace("*", " ").replace("const", " ").split()[0] in classes
+            if "*" in part and _class_named(part) in classes
         ]
         if wanted_at:
             found[match.group(2)] = wanted_at
@@ -5525,11 +5578,9 @@ def _upcast_pointers(
     signatures = _call_signatures(classes)
     for name, (owner, method) in signatures.items():
         wanted_at = [
-            (index, part.replace("*", "").strip())
+            (index, _class_named(part))
             for index, part in enumerate(_split_arguments(method.parameters))
-            if "*" in part
-            and part.replace("*", "").replace("const", "").strip().split()
-            and part.replace("*", "").replace("const", "").strip().split()[0] in classes
+            if "*" in part and _class_named(part) in classes
         ]
         if not wanted_at:
             continue
@@ -5571,14 +5622,22 @@ def _cast_at_positions(
         given = _call_arguments(body, call.end() - 1)
         changed = False
         for index, spelled in wanted_at:
-            wanted = spelled.replace("const", "").strip().split()[0]
+            wanted = _class_named(spelled)
             where = index + skip
             if where >= len(given):
                 continue
             value = given[where].strip()
             if value.startswith("(struct"):
                 continue
+            # `&this->__base` already *is* the base subobject, whatever the
+            # class the enclosing `this` belongs to. Reading its type off
+            # `this` answers the derived class and asks for a cast that says
+            # nothing - and the receiver of a method written as a free
+            # function is spelled exactly this way.
+            if value.endswith("__base"):
+                continue
             held = (_deduced_type(value, scope) or "").replace("*", "").strip()
+            held = held or _allocated_class(value)
             if not held or held == wanted or not _derives_from(held, wanted, classes):
                 continue
             given[where] = f"(struct {wanted} *){value}"
@@ -5672,6 +5731,19 @@ def _upcast_assignments(
         return f"{head}= (struct {wanted} *){call.lstrip()}"
 
     return _map_code(body, lambda part: _ASSIGNED_FROM_NEW.sub(assigned, part))
+
+
+#: `Sub__new(...)` standing on its own, as an argument rather than as the
+#: right of an assignment: `v.push_back(new Sub())` never names the thing it
+#: made, so nothing in the scope says what its type is.
+_AN_ALLOCATION = re.compile(r"^([A-Za-z_]\w*)__new(?:__\d+|_array)?\s*\(")
+
+
+def _allocated_class(value: str) -> str:
+    """The class an allocation makes, for a value no declaration describes."""
+
+    match = _AN_ALLOCATION.match(value.strip())
+    return match.group(1) if match else ""
 
 
 #: `struct Base *p = Sub__new(` - an allocation stored as a pointer to a base.
@@ -6414,6 +6486,57 @@ def _rewrite_body(
             f"({address}, &{variable}{passed});"
         )
 
+    def convert_initialiser(match: "re.Match[str]", whole: str) -> "str | None":
+        """`C name = value;` becomes `C name(value);` where C is a class.
+
+        Left for the passes below wherever one of them already knows the
+        shape: another object is a copy, a call on an object is a value
+        returned, and both are constructed in their own way. What is left is
+        a value of some other type entirely, and a class takes one of those
+        through a constructor that names it.
+        """
+
+        type_name, variable, value = match.group(1), match.group(2), match.group(3)
+        if type_name not in classes or type_name in _NOT_A_TYPE:
+            return None
+        # The real text of the value, since the match was made against a copy
+        # with every literal blanked out.
+        value = whole[match.start(3): match.end(3)].strip()
+        if not value or value.startswith("{"):
+            return None
+        if _COPY_INIT.fullmatch(match.group(0).strip()) or _VALUE_INIT.fullmatch(
+            match.group(0).strip()
+        ):
+            return None
+        # `C c = C(...)` and `C c = make()` both hand back a C already.
+        if re.match(rf"^{re.escape(type_name)}\s*\(", value):
+            return None
+        # Only a value standing on its own. An operator between two things is
+        # an overload to resolve - `a + "cd"` on strings is `operator+` - and
+        # a constructor wrapped around it hides it from the pass that would
+        # have found it. The match was made against a copy with the literals
+        # blanked, which is what an operator has to be looked for in.
+        if _has_a_loose_operator(match.group(3)):
+            return None
+        held = (
+            known.get(value)
+            or (_deduced_type(value, scope()) or "").replace("*", "").strip()
+        )
+        # Only where the value's type is known and is something else. An
+        # expression this cannot read is left alone rather than guessed at:
+        # `full = first + last` is an overloaded `+` that the operator pass
+        # below turns into a call, and wrapping it in a constructor here put
+        # it out of that pass's reach.
+        if not held or held == type_name:
+            return None
+        if not any(
+            method.name == "" and len(_split_arguments(method.parameters)) == 1
+            for method in classes[type_name].methods
+        ):
+            return None
+        return f"{type_name} {variable}({value});"
+
+    body = _sub_code(_CONVERTING_INIT, body, convert_initialiser)
     body = _split_object_declarators(body, classes)
     body = _OBJECT_ARRAY.sub(declare_array, body)
     body = _OBJECT.sub(declare, body)

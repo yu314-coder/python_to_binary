@@ -213,6 +213,58 @@ def exception_ancestry(name: str) -> tuple[str, ...]:
 #: describe; nothing here passes or returns a struct by value.
 WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     # name: (symbol, argument kinds, result kind, DLL)
+    #
+    # Windowing, which is what a program needs to be more than a console
+    # program. It is here for the same reason the rest is: the vendor's own
+    # headers cannot be compiled by anything but the two compilers they are
+    # written for, so a program that wanted a window had no way to ask for
+    # one without them. Every argument is an integer or a pointer.
+    "RegisterClassExW": ("RegisterClassExW", ("ptr",), "int", "USER32.dll"),
+    "UnregisterClassW": ("UnregisterClassW", ("ptr", "ptr"), "int", "USER32.dll"),
+    "CreateWindowExW": (
+        "CreateWindowExW",
+        ("int", "ptr", "ptr", "int", "int", "int", "int", "int",
+         "ptr", "ptr", "ptr", "ptr"),
+        "ptr",
+        "USER32.dll",
+    ),
+    "DestroyWindow": ("DestroyWindow", ("ptr",), "int", "USER32.dll"),
+    "ShowWindow": ("ShowWindow", ("ptr", "int"), "int", "USER32.dll"),
+    "UpdateWindow": ("UpdateWindow", ("ptr",), "int", "USER32.dll"),
+    "GetMessageW": (
+        "GetMessageW", ("ptr", "ptr", "int", "int"), "int", "USER32.dll"
+    ),
+    "PeekMessageW": (
+        "PeekMessageW", ("ptr", "ptr", "int", "int", "int"), "int", "USER32.dll"
+    ),
+    "TranslateMessage": ("TranslateMessage", ("ptr",), "int", "USER32.dll"),
+    "DispatchMessageW": ("DispatchMessageW", ("ptr",), "ptr", "USER32.dll"),
+    "PostQuitMessage": ("PostQuitMessage", ("int",), "void", "USER32.dll"),
+    "DefWindowProcW": (
+        "DefWindowProcW", ("ptr", "int", "ptr", "ptr"), "ptr", "USER32.dll"
+    ),
+    "PostMessageW": (
+        "PostMessageW", ("ptr", "int", "ptr", "ptr"), "int", "USER32.dll"
+    ),
+    "SendMessageW": (
+        "SendMessageW", ("ptr", "int", "ptr", "ptr"), "ptr", "USER32.dll"
+    ),
+    "GetClientRect": ("GetClientRect", ("ptr", "ptr"), "int", "USER32.dll"),
+    "GetWindowRect": ("GetWindowRect", ("ptr", "ptr"), "int", "USER32.dll"),
+    "MoveWindow": (
+        "MoveWindow", ("ptr", "int", "int", "int", "int", "int"), "int",
+        "USER32.dll",
+    ),
+    "SetWindowTextW": ("SetWindowTextW", ("ptr", "ptr"), "int", "USER32.dll"),
+    "LoadCursorW": ("LoadCursorW", ("ptr", "ptr"), "ptr", "USER32.dll"),
+    "LoadIconW": ("LoadIconW", ("ptr", "ptr"), "ptr", "USER32.dll"),
+    "SetWindowLongPtrW": (
+        "SetWindowLongPtrW", ("ptr", "int", "ptr"), "ptr", "USER32.dll"
+    ),
+    "GetWindowLongPtrW": (
+        "GetWindowLongPtrW", ("ptr", "int"), "ptr", "USER32.dll"
+    ),
+    "GetModuleHandleW": ("GetModuleHandleW", ("ptr",), "ptr", "KERNEL32.dll"),
     "Sleep": ("Sleep", ("int",), "void", "KERNEL32.dll"),
     "GetTickCount": ("GetTickCount", (), "int", "KERNEL32.dll"),
     "GetTickCount64": ("GetTickCount64", (), "int", "KERNEL32.dll"),
