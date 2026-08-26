@@ -1399,6 +1399,28 @@ typedef long LONG;
 typedef unsigned long ULONG;
 typedef long long LONGLONG;
 typedef unsigned long long ULONGLONG;
+typedef short SHORT;
+typedef unsigned short USHORT;
+typedef unsigned char UCHAR;
+typedef unsigned char BOOLEAN;
+typedef void *PVOID;
+typedef long long LONG_PTR;
+typedef unsigned long long ULONG_PTR;
+typedef long long INT_PTR;
+typedef unsigned long long UINT_PTR;
+typedef unsigned long long DWORD_PTR;
+typedef BYTE *PBYTE;
+typedef BYTE *LPBYTE;
+/* Written as the struct alone rather than the union the SDK spells, because
+   the two anonymous members of that union are one name for the halves and
+   another for the whole, and `QuadPart` is what a program reaches for. */
+typedef struct _LARGE_INTEGER { LONGLONG QuadPart; } LARGE_INTEGER;
+typedef struct _ULARGE_INTEGER { ULONGLONG QuadPart; } ULARGE_INTEGER;
+typedef struct _LUID { DWORD LowPart; LONG HighPart; } LUID;
+typedef struct _FILETIME {
+    DWORD dwLowDateTime;
+    DWORD dwHighDateTime;
+} FILETIME;
 typedef unsigned long SIZE_T;
 typedef void *HANDLE;
 typedef void *HWND;
@@ -2201,6 +2223,13 @@ void *CoTaskMemAlloc(SIZE_T bytes);
 #endif
 """
 
+#: Every SDK header that is a piece of <windows.h> is that header. Written
+#: as an include so the text is entered once however many of its names a
+#: program uses: a built-in is remembered by the name it was read under, and
+#: the same content under two names would be read twice and redefine
+#: everything in it.
+_PART_OF_WINDOWS_H = "#include <windows.h>\n"
+
 _BUILTIN_HEADERS = {
     "sys/types.h": _SYS_TYPES_H,
     "time.h": _TIME_H,
@@ -2220,6 +2249,25 @@ _BUILTIN_HEADERS = {
     "string.h": _STRING_H,
     "ctype.h": _CTYPE_H,
     "windows.h": _WINDOWS_H,
+    # The SDK splits <windows.h> across a dozen files and a program is as
+    # likely to name one of those as the whole. Each is py2bin's own
+    # <windows.h>, written as an include rather than the same text under a
+    # second name, so a program that asks for both gets it once.
+    #
+    # Not fetching them is the point. The published sets are written for a
+    # compiler that is GCC or MSVC and say so: Wine's `winnt.h` runs a chain
+    # of nine branches looking for one of those two paired with an
+    # architecture, and where none holds it stops with "You must define
+    # NtCurrentTeb() for your architecture" - every branch that would have
+    # matched needing inline assembly or an MSVC intrinsic. py2bin is neither
+    # compiler, so it brings its own, the way it does for COM.
+    "winnt.h": _PART_OF_WINDOWS_H,
+    "windef.h": _PART_OF_WINDOWS_H,
+    "minwindef.h": _PART_OF_WINDOWS_H,
+    "minwinbase.h": _PART_OF_WINDOWS_H,
+    "winbase.h": _PART_OF_WINDOWS_H,
+    "winuser.h": _PART_OF_WINDOWS_H,
+    "basetsd.h": _PART_OF_WINDOWS_H,
     "py2bin_fs.h": _PY2BIN_FS_H,
     "assert.h": _ASSERT_H,
     "float.h": _FLOAT_H,

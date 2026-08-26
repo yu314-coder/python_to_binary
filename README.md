@@ -631,6 +631,33 @@ that compiles and fails to resolve; and on a target that is not Windows the
 header says so instead of letting the program build against declarations that
 cannot bind.
 
+**And so are its pieces.** The SDK splits `<windows.h>` across a dozen files,
+and a program is as likely to include one of those - `winnt.h`, `windef.h`,
+`basetsd.h`, `winbase.h`, `winuser.h`, `minwindef.h`, `minwinbase.h` - as the
+whole. Each of those names is py2bin's own `<windows.h>`, entered once however
+many of them a program asks for.
+
+Fetching them instead does not work, and it is worth saying why rather than
+leaving it to be found. The published sets are written for a compiler that is
+GCC or MSVC, and they check. Wine's `winnt.h` runs nine branches looking for
+one of those two paired with an architecture:
+
+```
+winnt.h:2638: #error You must define NtCurrentTeb() for your architecture
+```
+
+Every branch that would have matched needs something no branch could give:
+inline assembly reading `gs:0x30`, a register variable pinned to `x18`, or an
+MSVC intrinsic behind `#pragma intrinsic`. py2bin is neither of those
+compilers and does not claim to be one, so it brings its own header - the same
+answer, and for the same reason, as the COM headers above.
+
+**`inline` is accepted and ignored**, along with `__inline` and
+`__forceinline`. py2bin decides for itself whether a call is a real call or an
+inlined body, so the specifier says nothing to it - but refusing it stopped
+every real header at its first small function, since `static inline` is how a
+platform header writes one.
+
 **The platform macros are defined**, which they were not before: `_WIN32`,
 `_WIN64`, `__APPLE__`, `__linux__`, `__unix__`, `__x86_64__`, `__aarch64__`,
 `_M_X64`, `_M_ARM64`. A file that picks its headers with `#ifdef _WIN32` took
@@ -894,7 +921,7 @@ your own file — every target, and the comparison — and is the thing to run
 before shipping.
 
 It does not run the cross-builds; five of the six machines are not this
-computer. 267 programs × 6 targets is 1602 builds, and the two projects are
+computer. 268 programs × 6 targets is 1608 builds, and the two projects are
 built for this machine and run.
 
 What is in the corpus is what broke at some point: enums, static members,

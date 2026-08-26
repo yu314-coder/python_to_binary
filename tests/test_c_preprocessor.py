@@ -993,5 +993,75 @@ class RejectionTests(PreprocessorTestCase):
         )
 
 
+class WindowsHeaderPieceTests(PreprocessorTestCase):
+    """The SDK splits <windows.h> up; every piece of it is py2bin's own."""
+
+    def compile_for_windows(self, source: str, target: str = "windows-x86_64") -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            where = Path(directory) / "piece.c"
+            where.write_text(source, newline="\n")
+            compile_c_native(where, Path(directory) / "piece.exe", target=target)
+
+    def test_winnt_h_is_served_rather_than_fetched(self):
+        """Wine's is the copy a fetch finds, and it stops at
+
+            winnt.h:2638: #error You must define NtCurrentTeb() for your architecture
+
+        because every branch of that chain wants GCC or MSVC paired with an
+        architecture, and each of those bodies wants inline assembly or an
+        MSVC intrinsic. py2bin is neither compiler, so it brings its own.
+        """
+
+        self.compile_for_windows(
+            """
+#include <winnt.h>
+int main(void) {
+    LARGE_INTEGER n;
+    n.QuadPart = 42;
+    return (int)n.QuadPart - 42;
+}
+"""
+        )
+
+    def test_every_piece_names_the_same_header_once(self):
+        """Read twice under two names, the text would redefine everything."""
+
+        for target in ("windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                self.compile_for_windows(
+                    """
+#include <windows.h>
+#include <winnt.h>
+#include <windef.h>
+#include <minwindef.h>
+#include <minwinbase.h>
+#include <winbase.h>
+#include <winuser.h>
+#include <basetsd.h>
+int main(void) {
+    LUID id;
+    id.LowPart = 1;
+    id.HighPart = 2;
+    FILETIME stamp;
+    stamp.dwLowDateTime = 0;
+    stamp.dwHighDateTime = 0;
+    BOOLEAN ok = TRUE;
+    UCHAR c = 3;
+    PVOID nothing = (PVOID)0;
+    return (int)(id.LowPart + id.HighPart + ok + c) - 7 + (nothing != 0);
+}
+""",
+                    target,
+                )
+
+    def test_a_piece_still_says_it_is_for_windows(self):
+        with self.assertRaises(Exception) as caught:
+            self.compile_for_windows(
+                "#include <winnt.h>\nint main(void) { return 0; }\n",
+                "linux-x86_64",
+            )
+        self.assertIn("is for Windows targets", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

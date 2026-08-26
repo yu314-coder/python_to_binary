@@ -1513,9 +1513,16 @@ _UNSUPPORTED_KEYWORDS = {
     "_Complex": "complex types are not implemented",
     "_Atomic": "atomic types are not implemented; py2bin emits no atomic instructions",
     "_Thread_local": "thread-local storage is not implemented",
-    "inline": "the 'inline' specifier is not accepted; py2bin decides for itself "
-    "whether a call is a real call or an inlined body",
 }
+
+#: Specifiers that say how a call should be made rather than what anything
+#: is. py2bin decides that for itself, so each is read and dropped. Refusing
+#: them instead bought nothing and cost everything: `static inline` is how a
+#: platform header writes every small function, so a fetched SDK header set
+#: stopped at its first one.
+_IGNORED_SPECIFIERS = frozenset(
+    {"inline", "__inline", "__inline__", "__forceinline"}
+)
 
 
 
@@ -1842,6 +1849,9 @@ class Parser:
                 continue
             if name == "enum" and base is None and not words:
                 base = self.enum_specifier()
+                continue
+            if name in _IGNORED_SPECIFIERS:
+                self.index += 1
                 continue
             if name in _UNSUPPORTED_KEYWORDS:
                 self.error(_UNSUPPORTED_KEYWORDS[name])
@@ -2335,9 +2345,11 @@ class Parser:
         # here. Read off before the type, which is where C++ and C both put
         # it and where the type reader would otherwise refuse it.
         stored = False
-        while self.token.kind == "identifier" and self.token.value == "static":
+        while self.token.kind == "identifier" and (
+            self.token.value == "static" or self.token.value in _IGNORED_SPECIFIERS
+        ):
+            stored = stored or self.token.value == "static"
             self.index += 1
-            stored = True
         base = self.type_specifier()
         entries: list[tuple[CType, str, object]] = []
         while True:
@@ -2515,7 +2527,9 @@ class Parser:
         no linker has no linkage to limit.
         """
 
-        if self.token.kind == "identifier" and self.token.value == "static":
+        while self.token.kind == "identifier" and (
+            self.token.value == "static" or self.token.value in _IGNORED_SPECIFIERS
+        ):
             self.take()
         base = self.type_specifier()
         if self.at_function_declarator():

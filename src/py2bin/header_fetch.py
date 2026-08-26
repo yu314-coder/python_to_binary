@@ -341,19 +341,24 @@ def _from_source(
         named = re.sub(r"\.(h|hpp|hxx|hh)$", "", spelled, flags=re.I)
         if holder and named:
             repositories.append(f"{holder}/{named}")
+    # The curated sets before any search, because a search ranks repositories
+    # by their names and a platform header's name is a common word. Asking
+    # for `winnt.h` returned a leaked NT5 source dump, an nmap script and a
+    # Program Manager clone ahead of either header set, and the dump held a
+    # 725-line file under that name - so the build got it, and nothing about
+    # it was the header. A set that does not hold the header falls through in
+    # one cached request, which is what makes trying them first affordable.
+    for full in _COLLECTIONS:
+        if full not in repositories:
+            repositories.append(full)
     try:
         for full in search_source(wanted, results=results):
             if full not in repositories:
                 repositories.append(full)
     except FetchError as error:
+        # Not fatal any more: the sets are already on the list, and they are
+        # where a platform header was always going to come from.
         reasons.append(f"the source host: {error}")
-        if not repositories:
-            return None
-    # And the sets: a platform header is in one of those and in no repository
-    # named after it, so the search above was never going to find one.
-    for full in _COLLECTIONS:
-        if full not in repositories:
-            repositories.append(full)
     for full in repositories:
         try:
             say(f"  trying {full}")

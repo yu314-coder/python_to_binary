@@ -1146,6 +1146,25 @@ def _main(argv: list[str] | None = None) -> int:
             f"{result.pack} ({result.files} files, {result.bytes} bytes)"
         )
         return 0
+    # Before the entry is worked out, because this one names a header rather
+    # than a program: reading `args.entry` for it raised an AttributeError,
+    # so the command this readme tells people to run could not run at all.
+    if args.command == "fetch-header":
+        from .header_fetch import fetch_header, fetch_header_from
+
+        into = args.into.expanduser().resolve()
+        try:
+            if args.url:
+                kept = fetch_header_from(args.url, args.name, into)
+            else:
+                kept = fetch_header(args.name, into, say=print)
+        except (ValueError, OSError) as error:
+            print(f"py2bin: error: {error}", file=sys.stderr)
+            return 2
+        print(f"wrote {kept}")
+        print(f"compile with --include-dir {_include_root(kept, args.name)}")
+        return 0
+
     # `cc` takes a list, since several .c files are compiled together into one
     # translation unit. Every other command names exactly one entry.
     entry = (
@@ -1168,20 +1187,6 @@ def _main(argv: list[str] | None = None) -> int:
             )
             if bridge.c_artifact is not None:
                 print(f"retained parsed C source at {bridge.c_artifact}")
-            return 0
-        if args.command == "fetch-header":
-            from .header_fetch import fetch_header, fetch_header_from
-
-            into = args.into.expanduser().resolve()
-            if args.url:
-                kept = fetch_header_from(args.url, args.name, into)
-            else:
-                kept = fetch_header(args.name, into, say=print)
-            print(f"wrote {kept}")
-            print(
-                f"compile with --include-dir "
-                f"{_include_root(kept, args.name)}"
-            )
             return 0
         if args.command == "cc":
             # Defaults chosen so the common case needs no flags at all:
