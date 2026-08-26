@@ -566,12 +566,27 @@ judge it. What arrives is a header and not a toolchain: whether py2bin's C
 understands what is inside it is a separate question, answered by the compiler
 in the usual way.
 
-**Some headers cannot be fetched by anyone.** A COM header is generated from
-a `.idl` by a tool that runs at build time, and a platform's own set usually
-has a core header its configure step writes — neither exists as a file in any
-repository or package. `WebView2.h` needs both, so no amount of fetching
-reaches it; what reaches it is declaring by hand the two or three interfaces a
-program actually calls, which py2bin's vtables express directly.
+Two sets of Windows headers are known, and which is tried first was decided by
+walking both closures and counting. Taking `rpc.h` from each: one gives 80
+headers and cannot resolve 11, every one of them a COM header generated from a
+`.idl`; the other gives 144 and cannot resolve 13, two of which are its own
+core headers — and *every* header in that set includes those at the top,
+unconditionally, so nothing from it compiles at all. The first is tried first
+for that reason. A fetch says which files a set does not publish, so you can
+see what it left out rather than discovering it one build at a time.
+
+**Some headers cannot be fetched by anyone**, and a Windows one usually cannot
+be *compiled* here either. A COM header is generated from a `.idl` at build
+time and a platform set writes its own core header at configure time — neither
+exists as a file. And the parts that do exist are written for one of two
+specific compilers: `winnt.h` picks its `NtCurrentTeb()` by testing `__GNUC__`
+or `_MSC_VER`, and every branch is inline assembly or that compiler's
+intrinsics. py2bin is neither compiler and implements neither, and it does not
+claim to be one — a header that believed it was would reach for builtins that
+are not there and produce something plausible and wrong instead of a refusal
+that says where it stopped. Fetching gets `WebView2.h` about 2,600 lines into
+`winnt.h`; what gets a program to WebView2 is declaring by hand the two or
+three interfaces it actually calls, which py2bin's vtables express directly.
 
 **Which is why `<windows.h>` is py2bin's own too.** Microsoft's is tens of
 thousands of declarations written in extensions this compiler does not have.

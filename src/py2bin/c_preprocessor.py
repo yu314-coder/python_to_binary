@@ -1332,7 +1332,9 @@ _WINDOWS_H = """
 or windows-arm64, or guard the include with #ifdef _WIN32
 #endif
 
+#ifndef NULL
 #define NULL ((void *)0)
+#endif
 #define WINAPI
 #define APIENTRY
 #define CALLBACK
@@ -1617,7 +1619,9 @@ _FLOAT_H = """
 """
 
 _STRING_H = """
+#ifndef NULL
 #define NULL ((void *)0)
+#endif
 
 unsigned long strlen(const char *__s) {
     unsigned long __n = 0;
@@ -1759,7 +1763,9 @@ int memcmp(const void *__a, const void *__b, unsigned long __n) {
 """
 
 _WCHAR_H = """
+#ifndef NULL
 #define NULL ((void *)0)
+#endif
 #define WEOF ((wchar_t)-1)
 
 unsigned long wcslen(const wchar_t *__s) {
@@ -1786,7 +1792,9 @@ wchar_t *wcscpy(wchar_t *__to, const wchar_t *__from) {
 """
 
 _STDLIB_H = f"#define __PY2BIN_ARENA_BYTES {ARENA_BYTES}UL\n" + """
+#ifndef NULL
 #define NULL ((void *)0)
+#endif
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 
@@ -1857,8 +1865,14 @@ int abs(int __value) { return __value < 0 ? -__value : __value; }
 long labs(long __value) { return __value < 0 ? -__value : __value; }
 """
 
+#: How py2bin gives a program `NULL`. Guarded, because C says a redefinition
+#: has to be identical and a vendored header spelling it `0` is just as valid
+#: a null pointer constant - so whichever got there first keeps it, which is
+#: what every real header does.
+_NULL = "#ifndef NULL\n#define NULL ((void *)0)\n#endif\n"
+
 _BUILTIN_HEADERS = {
-    "stdio.h": "#define EOF (-1)\n#define NULL ((void *)0)\n",
+    "stdio.h": "#define EOF (-1)\n" + _NULL,
     # <stdlib.h> brings the heap, and brings it as C source for the same
     # reason <math.h> does: an allocator you can read is one you can check.
     # The compiler itself supplies exactly one thing, __py2bin_arena(), which
@@ -1872,7 +1886,7 @@ _BUILTIN_HEADERS = {
     "py2bin_fs.h": _PY2BIN_FS_H,
     "assert.h": _ASSERT_H,
     "float.h": _FLOAT_H,
-    "stddef.h": "#define NULL ((void *)0)\n",
+    "stddef.h": _NULL,
     # A `va_list` is a pointer to the cells the call wrote its extra arguments
     # into, and the four names that walk one are compiled rather than called -
     # so this header is the typedef and nothing else.
@@ -1881,7 +1895,7 @@ _BUILTIN_HEADERS = {
     # are in C++, so these headers have no typedefs to give. What they do
     # bring is the handful of functions that go with them, written in C.
     "wchar.h": _WCHAR_H,
-    "uchar.h": "#define NULL ((void *)0)\n",
+    "uchar.h": _NULL,
     "stdbool.h": "#define bool _Bool\n#define true 1\n#define false 0\n"
     "#define __bool_true_false_are_defined 1\n",
     # <math.h> supplies its functions as C source that py2bin then

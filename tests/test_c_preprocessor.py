@@ -792,6 +792,22 @@ class RejectionTests(PreprocessorTestCase):
             "unknown preprocessing directive",
         )
 
+    def test_a_header_of_its_own_may_define_null_first(self):
+        """C says a redefinition has to be identical, and both spellings are
+        valid null pointer constants - so py2bin's own headers must not fight
+        a vendored one over it. Whichever got there first keeps it.
+        """
+
+        for spelled in ("0", "((void *)0)", "0L"):
+            with self.subTest(spelled=spelled):
+                tokens = preprocess(
+                    f"#define NULL {spelled}\n#include <stddef.h>\n"
+                    "#include <stdio.h>\n"
+                    "int main(void) { return NULL == 0; }\n",
+                    "t.c",
+                )
+                self.assertTrue(any(token.value == "main" for token in tokens))
+
     def test_a_pragma_that_says_nothing_about_the_program_is_accepted(self):
         """Diagnostics, folding, linking: none of them change the C.
 

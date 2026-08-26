@@ -85,14 +85,22 @@ _MAX_HEADER_BYTES = 64 * 1024 * 1024
 #: generates the other often ships. Tried in order, and the one that answered
 #: last is tried first next time - the headers of a set belong together, and
 #: a program that needed one usually needs its neighbours.
-#: In this order because this is the order that was tried end to end. Each
-#: set generates part of its own contents at build time - one writes a core
-#: header from a template, the other generates its COM headers from `.idl` -
-#: so neither is complete as published, and a header taken from either may
-#: reach an `#include` that exists nowhere as a file. Which one answers first
-#: only decides which is asked first: a set that does not hold the header
-#: falls through to the next.
-_COLLECTIONS = ["mingw-w64/mingw-w64", "wine-mirror/wine"]
+#: In this order because the closures were walked and counted. Neither set is
+#: complete as published - each generates part of itself at build time - but
+#: they are incomplete in different places. Taking `rpc.h` from each:
+#:
+#:   the reimplementation  80 headers, 11 it cannot resolve, every one of
+#:                         them a COM header generated from a `.idl`;
+#:   the runtime package  144 headers, 13 it cannot resolve, two of which are
+#:                         its own core header and its unicode header - and
+#:                         *every* header in that set includes those at the
+#:                         top, unconditionally, so nothing from it compiles
+#:                         without a file its configure step writes.
+#:
+#: So the first is tried first: what it is missing is reached only by the
+#: part of a program that uses COM, and what the second is missing is reached
+#: by everything. A set that does not hold the header at all falls through.
+_COLLECTIONS = ["wine-mirror/wine", "mingw-w64/mingw-w64"]
 
 #: File lists already fetched, by (repository, branch). One of these is a
 #: single request answering thousands of paths, and a build that fetches a
@@ -414,22 +422,26 @@ def _take_from_repository(
     depth = wanted.count("/") + 1
     root = "/".join(chosen.split("/")[:-depth])
     prefix = f"{root}/" if root else ""
-    under = [
+    # Every file under it, not only the ones spelled like a header: an
+    # `#include` names a *file*, and a header set includes its resource
+    # headers - `winnt.rh` - and its generated fragments by name. Filtering
+    # those out of the closure left the build asking for one that was there.
+    under = [path for path in paths if path.startswith(prefix)]
+    headers = [
         path
-        for path in paths
-        if path.startswith(prefix)
-        and path.lower().endswith((".h", ".hpp", ".hxx", ".hh", ".inc", ".ipp"))
+        for path in under
+        if path.lower().endswith((".h", ".hpp", ".hxx", ".hh", ".inc", ".ipp"))
     ]
     into.mkdir(parents=True, exist_ok=True)
-    if len(under) <= _WHOLE_DIRECTORY:
+    if len(headers) <= _WHOLE_DIRECTORY:
         # A small directory *is* the library, and taking it whole costs
         # little and cannot miss a header hidden behind a condition.
-        return _take_paths(full, branch, under, prefix, chosen, into, say)
+        return _take_paths(full, branch, headers, prefix, chosen, into, say)
     # A big one is a platform's whole set - thousands of files, nearly none
     # of them wanted. Take the header asked for and the ones it reaches: a
     # header's own `#include` lines say what it needs, and that closure is a
     # few dozen where the directory is a few thousand.
-    say(f"  {root or '/'} holds {len(under)} headers; taking what {wanted} reaches")
+    say(f"  {root or '/'} holds {len(headers)} headers; taking what {wanted} reaches")
     return _take_closure(full, branch, under, prefix, chosen, into, say)
 
 
@@ -493,6 +505,12 @@ def _take_closure(
     answer: "Path | None" = None
     pending = [chosen[len(prefix):]]
     seen: "set[str]" = set()
+    taken: "set[str]" = set()
+    #: What the closure reaches and this set does not hold. Not an error -
+    #: an `#include` behind a condition this does not read may never be
+    #: reached - but worth saying, because a set that generates part of
+    #: itself has no file to fetch for those at all.
+    unresolved: "set[str]" = set()
     spent = 0
     while pending:
         name = pending.pop()
@@ -522,13 +540,26 @@ def _take_closure(
         written = into / name
         written.parent.mkdir(parents=True, exist_ok=True)
         written.write_bytes(payload)
+        taken.add(name)
         if path == chosen:
             answer = written
         for reached in _INCLUDED.findall(payload.decode("utf-8", "replace")):
             spelled = reached.strip().replace("\\", "/")
-            if spelled in by_name and spelled not in seen:
-                pending.append(spelled)
-    say(f"  took {len(seen)} headers, {spent // 1024}KB")
+            if spelled in by_name:
+                if spelled not in seen:
+                    pending.append(spelled)
+            elif spelled not in _SUPPLIED:
+                unresolved.add(spelled)
+    say(f"  took {len(taken)} headers, {spent // 1024}KB")
+    if unresolved:
+        # Said rather than left to be discovered: a set that generates part
+        # of itself at build time has no file to fetch for those, and the
+        # build will ask for the first one it actually reaches.
+        say(
+            f"  {full} publishes no file for: "
+            f"{', '.join(sorted(unresolved)[:8])}"
+            f"{' and more' if len(unresolved) > 8 else ''}"
+        )
     return answer
 
 
@@ -539,6 +570,17 @@ _WHOLE_DIRECTORY = 60
 
 #: `#include <x/y.h>` and `#include "x/y.h"` - what a header says it needs.
 _INCLUDED = re.compile(r'(?m)^[ \t]*#[ \t]*include[ \t]*[<"]([^>"]+)[>"]')
+
+
+def _supplied() -> "frozenset[str]":
+    """The headers py2bin ships, which a set does not have to hold."""
+
+    from .c_preprocessor import _BUILTIN_HEADERS
+
+    return frozenset(_BUILTIN_HEADERS)
+
+
+_SUPPLIED = _supplied()
 
 
 
