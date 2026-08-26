@@ -668,13 +668,30 @@ py2bin answers no to all of them, which is what makes a library take the
 portable path it keeps for compilers without the extension, and answers
 `__has_include` truthfully by looking.
 
-**A standard C++ header py2bin does not implement now says so.** `<type_traits>`
-fetched from a real standard library is written in namespaces, SFINAE and
-partial specialisation - none of which this subset has - so it used to fail
-somewhere deep inside itself about something that was not the reason. A
-header spelled the way only a standard one is, that py2bin does not ship and
-that no `--include` directory holds, is refused with the list of the ones it
-does ship. Your own copy under `--include` still wins.
+**A class template may be written again for a shape of argument.**
+`template <class T> struct is_pointer<T *>` is the whole mechanism a traits
+header is made of, and it works now, along with the full form
+(`template <> struct Name<int>`). Which copy a use gets is decided the way
+C++ decides it: the narrowest pattern that fits. A type named outright beats
+one written around a parameter, `T **` beats `T *`, and `<T, T>` - which says
+the two arguments are the same type - beats `<T, U>`, which says nothing.
+
+**So `<type_traits>` is py2bin's own now**, written the way the standard
+describes each answer rather than the way a real library implements it: a
+general class that says no and a narrower one that says yes. `is_same`,
+`is_pointer`, `is_reference`, `is_const`, `is_void`, `is_integral`,
+`is_floating_point`, `is_signed`, `is_unsigned`, `remove_reference`,
+`remove_pointer`, `remove_const`, `remove_volatile`, `add_pointer`,
+`add_const`, `conditional`, `integral_constant`, `true_type`/`false_type`.
+It costs nothing at run time: the copies are made while translating and the
+answer is a constant before any code runs.
+
+**A standard C++ header py2bin does not implement still says so.** One
+spelled the way only a standard header is, that py2bin does not ship and that
+no `--include` directory holds, is refused by name with the list of the ones
+it does - rather than fetching a real standard library's copy and failing
+four thousand lines inside it about something that is not the reason. Your
+own copy under `--include` still wins.
 
 **A header that chooses a branch is not the translator's to read.** The C++
 translator runs before the preprocessor and has no `#if`, so pasting one in

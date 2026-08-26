@@ -299,6 +299,13 @@ _CLASS_HEAD = re.compile(
     r"([A-Za-z_]\w*)\s*)?\{"
 )
 
+#: `struct is_pointer<T *> {` - a class template written again for a shape of
+#: argument rather than for every argument. Every entry in a traits header is
+#: one of these; it is how the answer is arrived at.
+_SPECIALISED_HEAD = re.compile(
+    r"\b(class|struct)\s+([A-Za-z_]\w*)\s*<"
+)
+
 
 
 #: `int n = 7;` written on the member itself. Only the `=` form: `Point p{1,
@@ -1637,6 +1644,36 @@ def _has_a_constructor(text: str, head: "re.Match[str]") -> bool:
     body = text[head.end() - 1: closing]
     return re.search(rf"(?<![.\w>~]){re.escape(head.group(2))}\s*\(", body) is not None
 
+def _is_a_template_pattern(text: str, at: int) -> bool:
+    """Whether the class starting at `at` is written `template <...> class`.
+
+    A pattern is not a class yet: it has no name until it is written out for
+    something. Taking a static member out of one took it out of every copy
+    that had not been made, and put the storage at file scope under the
+    pattern's own name - so `is_same<int, char>::value` was left as C++ and
+    an `is_same__value` nobody asked for was defined beside it.
+    """
+
+    back = at - 1
+    while back >= 0 and text[back] in " \t\n":
+        back -= 1
+    if back < 0 or text[back] != ">":
+        return False
+    depth = 0
+    while back >= 0:
+        if text[back] == ">":
+            depth += 1
+        elif text[back] == "<":
+            depth -= 1
+            if not depth:
+                break
+        back -= 1
+    if back < 0:
+        return False
+    before = text[:back].rstrip()
+    return bool(re.search(r"\btemplate$", before))
+
+
 def _rewrite_static_members(text: str, filename: str) -> str:
     """A static member is one object for the class, so it becomes one object.
 
@@ -1645,12 +1682,19 @@ def _rewrite_static_members(text: str, filename: str) -> str:
     a `count` without either being the other's.
     """
 
-    owners: "dict[str, str]" = {}
+    #: Keyed by the class as well as the member: two classes may each have a
+    #: `value`, and keyed by the name alone the second took the first's -
+    #: after which `A::value` was left as C++ because the table said `value`
+    #: belonged to B. A traits header is nothing but classes with a member
+    #: called `value`.
+    owners: "dict[tuple[str, str], str]" = {}
     given: "dict[str, str]" = {}
     out: list[str] = []
     at = 0
     for head in _CLASS_HEAD.finditer(text):
         if head.start() < at:
+            continue
+        if _is_a_template_pattern(text, head.start()):
             continue
         try:
             closing = _matching(text, head.end() - 1)
@@ -1660,7 +1704,7 @@ def _rewrite_static_members(text: str, filename: str) -> str:
         body = text[head.end() - 1: closing]
 
         def taken(match: "re.Match[str]", o=owner) -> str:
-            owners[match.group(2)] = o
+            owners[(o, match.group(2))] = o
             if match.group(3):
                 # Given its value here, so this is where it is defined; there
                 # is no `int C::limit = 10;` anywhere else to find.
@@ -1681,7 +1725,7 @@ def _rewrite_static_members(text: str, filename: str) -> str:
     # `int C::count = 0;` becomes the file-scope object itself.
     def defined(match: "re.Match[str]") -> str:
         spelled, owner, name, value = match.groups()
-        if owners.get(name) != owner:
+        if (owner, name) not in owners:
             return match.group(0)
         return f"{spelled} {_c_name(owner, name)} {value or '= 0'};"
 
@@ -1691,7 +1735,7 @@ def _rewrite_static_members(text: str, filename: str) -> str:
         text = "\n".join(given.values()) + "\n" + text
     # And every mention of it - `C::count` from outside, `count` from within -
     # is that object.
-    for name, owner in owners.items():
+    for (owner, name) in owners:
         spelled = _c_name(owner, name)
         text = _map_code(
             text,
@@ -1699,6 +1743,18 @@ def _rewrite_static_members(text: str, filename: str) -> str:
                 rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", s, part
             ),
         )
+    # A bare mention of one - `count` written inside its own class - only
+    # where exactly one class has a member of that name. Where two do, the
+    # bare name is whichever class the mention is inside, which this pass
+    # cannot see once the bodies have been taken apart; `C::count` is written
+    # out and is unambiguous either way.
+    once = [
+        (owner, name)
+        for (owner, name) in owners
+        if sum(1 for (_o, other) in owners if other == name) == 1
+    ]
+    for (owner, name) in once:
+        spelled = _c_name(owner, name)
         text = _map_code(
             text,
             lambda part, n=name, s=spelled: re.sub(
@@ -2969,6 +3025,115 @@ def _resolve_nested_typedefs(text: str) -> str:
         )
     return text
 
+
+def _fits_the_shape(
+    shape: str, argument: str, parameters: "set[str]", bound: "dict[str, str]"
+) -> bool:
+    """Whether one argument has the shape a narrower copy was written for.
+
+    `T *` fits `int *` and binds T to `int`; `T` fits anything; `int` fits
+    only `int`. A parameter named twice has to be bound to the same thing
+    both times, which is the whole of how `is_same<T, T>` answers.
+    """
+
+    shape = shape.strip()
+    argument = argument.strip()
+    if shape in parameters:
+        settled = bound.get(shape)
+        if settled is not None:
+            return _same_type(settled, argument)
+        bound[shape] = argument
+        return True
+    for tail in ("*", "&"):
+        if shape.endswith(tail):
+            if not argument.endswith(tail):
+                return False
+            return _fits_the_shape(
+                shape[:-1], argument[:-1], parameters, bound
+            )
+    for head in ("const", "volatile"):
+        if re.match(rf"^{head}\b", shape):
+            if not re.match(rf"^{head}\b", argument):
+                return False
+            return _fits_the_shape(
+                shape[len(head):], argument[len(head):], parameters, bound
+            )
+    # Nothing of the pattern left to take apart: it names a type outright,
+    # and only that type fits it.
+    return _same_type(shape, argument)
+
+
+def _same_type(one: str, other: str) -> bool:
+    """Whether two spellings name the same type, spacing aside."""
+
+    return re.sub(r"\s+", " ", one).strip() == re.sub(r"\s+", " ", other).strip()
+
+
+def _how_narrow(shapes: "list[str]", parameters: "set[str]") -> int:
+    """How specialised a copy is, for choosing between two that both fit.
+
+    C++ orders these by which pattern is more specialised than the other.
+    Counted here instead: a position naming a type outright is narrower than
+    one naming a parameter with something around it, which is narrower than a
+    bare parameter - and a parameter used twice narrows both places it stands.
+    """
+
+    score = 0
+    seen: "dict[str, int]" = {}
+    for shape in shapes:
+        spelled = shape.strip()
+        if spelled in parameters:
+            # A bare parameter narrows nothing, except where the same one
+            # stands in another position too: `<T, T>` says the two arguments
+            # are the same type, which not every pair of arguments is.
+            seen[spelled] = seen.get(spelled, 0) + 1
+            if seen[spelled] > 1:
+                score += 4
+            continue
+        mentioned = [
+            name
+            for name in parameters
+            if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", spelled)
+        ]
+        if not mentioned:
+            # A type named outright fits one argument and no other.
+            score += 100
+            continue
+        # Something written around a parameter, and more of it is narrower:
+        # `T **` is a `T *` that is itself a pointer, so where both fit, the
+        # second is the one C++ picks.
+        bare = sum(len(name) for name in mentioned)
+        score += 2 + max(0, len(re.sub(r"\s+", "", spelled)) - bare)
+    return score
+
+
+def _narrower_copy(
+    entries: "list[tuple[list, list[str], str, str]]", arguments: "list[str]"
+) -> "tuple[list, list[str], str, str, dict[str, str]] | None":
+    """The narrowest copy whose shape these arguments have, if any."""
+
+    best = None
+    best_score = -1
+    for parameters, shapes, body, keyword in entries:
+        if len(shapes) != len(arguments):
+            continue
+        names = {name for name, _is_type in parameters}
+        bound: "dict[str, str]" = {}
+        if not all(
+            _fits_the_shape(shape, argument, names, bound)
+            for shape, argument in zip(shapes, arguments)
+        ):
+            continue
+        if len(bound) != len(names):
+            # A parameter the shape never mentions cannot be worked out from
+            # the arguments, so this copy is not the one being asked for.
+            continue
+        score = _how_narrow(shapes, names)
+        if score > best_score:
+            best, best_score = (parameters, shapes, body, keyword, bound), score
+    return best
+
+
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
 
@@ -2976,12 +3141,41 @@ def _expand_templates(text: str, filename: str) -> str:
     #: Copies the author wrote out by hand, under the name the expander would
     #: have used. They seed `made`, so the pattern is never copied over them.
     written: "dict[str, str]" = {}
+    #: The narrower copies of a class template, by name: each is the pattern
+    #: its arguments have to have, and the body to use when they do.
+    narrower: "dict[str, list[tuple[list, list[str], str, str]]]" = {}
     cut: list[tuple[int, int]] = []
     for match in _TEMPLATE.finditer(text):
         if _depth_at(text, match.start()) != 0:
             continue
         parameters = _template_parameters(match.group(1))
         rest = text[match.end():]
+        narrowed = _SPECIALISED_HEAD.match(rest)
+        if narrowed is not None:
+            shut = _closing_angle(rest, narrowed.end() - 1)
+            body = rest[shut + 1:] if shut >= 0 else ""
+            opening = body.find("{")
+            if shut >= 0 and opening >= 0 and not body[:opening].strip():
+                # `_matching` answers the index just past the `}`, which is
+                # where the `;` after a class body sits.
+                closing = _matching(body, opening)
+                end = shut + 1 + closing
+                while end < len(rest) and rest[end] in " \t":
+                    end += 1
+                if end < len(rest) and rest[end] == ";":
+                    end += 1
+                narrower.setdefault(narrowed.group(2), []).append(
+                    (
+                        parameters,
+                        [a.strip() for a in _split_arguments(
+                            rest[narrowed.end(): shut]
+                        )],
+                        body[opening:closing],
+                        narrowed.group(1),
+                    )
+                )
+                cut.append((match.start(), match.end() + end))
+                continue
         head = _CLASS_HEAD.match(rest)
         if head is not None:
             closing = _matching(rest, head.end() - 1)
@@ -3030,7 +3224,7 @@ def _expand_templates(text: str, filename: str) -> str:
         )
         cut.append((match.start(), match.end() + closing))
 
-    if not patterns and not written:
+    if not patterns and not written and not narrower:
         return text
 
     # The patterns themselves are not code, so they go; what replaces them is
@@ -3100,7 +3294,7 @@ def _expand_templates(text: str, filename: str) -> str:
                     unread.append((name, call.start()))
                     continue
                 asked.append((name, deduced, (parameters, kind, pattern_text)))
-        for name in patterns:
+        for name in {**patterns, **narrower}:
             for found in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*<", region):
                 close = _closing_angle(region, found.end() - 1)
                 if close < 0:
@@ -3110,9 +3304,16 @@ def _expand_templates(text: str, filename: str) -> str:
                     re.search(
                         rf"(?<![.\w>]){re.escape(other)}\s*<", ",".join(arguments)
                     )
-                    for other in patterns
+                    for other in {**patterns, **narrower}
                 ):
                     continue  # an inner template first; next round
+                if name not in patterns:
+                    # Only narrower copies and no general one. Legal C++ only
+                    # if one of them fits, and `_narrower_copy` decides that.
+                    asked.append(
+                        (name, [a.strip() for a in arguments], ([], "class", ""))
+                    )
+                    continue
                 # Spelled out, so the entry is whichever takes that many
                 # template parameters.
                 for entry in patterns[name]:
@@ -3136,7 +3337,9 @@ def _expand_templates(text: str, filename: str) -> str:
         out: list[str] = []
         at = 0
         spelled_out = re.compile(
-            r"(?<![.\w>])(" + "|".join(re.escape(n) for n in patterns) + r")\s*<"
+            r"(?<![.\w>])("
+            + "|".join(re.escape(n) for n in {**patterns, **narrower})
+            + r")\s*<"
         )
         for found in spelled_out.finditer(region):
             if found.start() < at:
@@ -3211,6 +3414,28 @@ def _expand_templates(text: str, filename: str) -> str:
         ]
         for name, arguments, entry in fresh:
             parameters, kind, pattern = entry
+            # A copy written for this shape of argument wins over the one
+            # written for every shape. That is how a traits header answers a
+            # question: the general copy says no, and a narrower one written
+            # for `T *` or for `T, T` says yes, and which of them is used is
+            # decided here.
+            narrowed = _narrower_copy(narrower.get(name, []), arguments)
+            if narrowed is not None:
+                narrow_parameters, _shapes, body, keyword, bound = narrowed
+                named = _instantiated_name(name, arguments)
+                copy = _substituted(
+                    f"{keyword} {name} {body};",
+                    [p for p, _is_type in narrow_parameters],
+                    [bound[p] for p, _is_type in narrow_parameters],
+                )
+                copy = _map_code(
+                    copy,
+                    lambda part, n=name, s=named: re.sub(
+                        rf"(?<![.\w>]){re.escape(n)}\b(?!\s*<)", s, part
+                    ),
+                )
+                made[named] = copy
+                continue
             if len(arguments) != len(parameters):
                 raise CppTranslationError(
                     filename,
@@ -8440,7 +8665,34 @@ _OUT_OF_LINE = re.compile(
 )
 
 
+#: `struct A { };` - which C++ allows and C does not.
+_AN_EMPTY_STRUCT = re.compile(r"\b(struct|union)\s+([A-Za-z_]\w*)\s*\{\s*\}")
+
+
+def _fill_empty_structs(text: str) -> str:
+    """Give a struct with nothing in it something, because C insists.
+
+    A class whose members are all static has no data members at all - which
+    is exactly what a traits class is, and what `struct is_same__int_int { };`
+    came out as. C++ gives such a class a size of one; C has no way to write
+    one, so it gets a member nothing reads.
+    """
+
+    return _map_code(
+        text,
+        lambda part: _AN_EMPTY_STRUCT.sub(
+            lambda m: f"{m.group(1)} {m.group(2)} {{ int __empty; }}", part
+        ),
+    )
+
+
 def translate(source: str, filename: str = "<c++>") -> str:
+    """The C for one C++ translation unit."""
+
+    return _fill_empty_structs(_translate(source, filename))
+
+
+def _translate(source: str, filename: str = "<c++>") -> str:
     """Translate the C++ subset in `source` into C.
 
     The result is ordinary C: structs where the classes were, free functions
@@ -8492,6 +8744,11 @@ def translate(source: str, filename: str = "<c++>") -> str:
     # call sites, and the copies it leaves are ordinary members.
     text = _expand_member_templates(text, filename)
     text = _expand_templates(text, filename)
+    # Again, because a template's own body was a pattern when the pass above
+    # ran and is a class only now. Every traits class is exactly this: a
+    # template whose one member is static, written out once per question
+    # asked of it.
+    text = _rewrite_static_members(text, filename)
     # After them: a function's name passed as a value needs a type that can
     # be written where a template argument goes, and the deduction above has
     # already used the name this writes the typedef for. Not before, or the
@@ -11025,9 +11282,119 @@ typedef struct EventRegistrationToken {
 """
 
 
+_TYPE_TRAITS_HEADER = r"""
+
+/* <type_traits>, as py2bin's own. A real standard library's is written in
+   namespaces, SFINAE and variadic templates; what is here is the same
+   answers arrived at the way the standard describes them - a general class
+   that says no, and a narrower one written for the shape that says yes.
+
+   Each is a class whose whole content is static, which is why it costs
+   nothing: the copies are made at translation time and the answer is a
+   constant by the time any code runs. */
+#ifndef __py2bin_type_traits
+#define __py2bin_type_traits
+
+/* In `namespace std`, which is flattened, so `std::is_same` resolves to this
+   exactly as the qualifier says - and so does the bare name after a
+   `using namespace std;`. */
+namespace std {
+
+template <class T, T v> struct integral_constant {
+    typedef T value_type;
+    static const T value = v;
+};
+
+template <bool B> struct bool_constant { static const bool value = B; };
+typedef bool_constant<true> true_type;
+typedef bool_constant<false> false_type;
+
+/* The shape questions. Each is a no with a yes written for one shape. */
+template <class T, class U> struct is_same { static const bool value = false; };
+template <class T> struct is_same<T, T> { static const bool value = true; };
+
+template <class T> struct is_pointer { static const bool value = false; };
+template <class T> struct is_pointer<T *> { static const bool value = true; };
+
+template <class T> struct is_reference { static const bool value = false; };
+template <class T> struct is_reference<T &> { static const bool value = true; };
+
+template <class T> struct is_lvalue_reference { static const bool value = false; };
+template <class T> struct is_lvalue_reference<T &> { static const bool value = true; };
+
+template <class T> struct is_const { static const bool value = false; };
+template <class T> struct is_const<const T> { static const bool value = true; };
+
+template <class T> struct is_array { static const bool value = false; };
+
+template <class T> struct is_void { static const bool value = false; };
+template <> struct is_void<void> { static const bool value = true; };
+
+/* The ones that are true for a list of types rather than for a shape. */
+template <class T> struct is_integral { static const bool value = false; };
+template <> struct is_integral<bool> { static const bool value = true; };
+template <> struct is_integral<char> { static const bool value = true; };
+template <> struct is_integral<signed char> { static const bool value = true; };
+template <> struct is_integral<unsigned char> { static const bool value = true; };
+template <> struct is_integral<short> { static const bool value = true; };
+template <> struct is_integral<unsigned short> { static const bool value = true; };
+template <> struct is_integral<int> { static const bool value = true; };
+template <> struct is_integral<unsigned int> { static const bool value = true; };
+template <> struct is_integral<long> { static const bool value = true; };
+template <> struct is_integral<unsigned long> { static const bool value = true; };
+template <> struct is_integral<long long> { static const bool value = true; };
+template <> struct is_integral<unsigned long long> { static const bool value = true; };
+
+template <class T> struct is_floating_point { static const bool value = false; };
+template <> struct is_floating_point<float> { static const bool value = true; };
+template <> struct is_floating_point<double> { static const bool value = true; };
+template <> struct is_floating_point<long double> { static const bool value = true; };
+
+template <class T> struct is_signed { static const bool value = false; };
+template <> struct is_signed<signed char> { static const bool value = true; };
+template <> struct is_signed<short> { static const bool value = true; };
+template <> struct is_signed<int> { static const bool value = true; };
+template <> struct is_signed<long> { static const bool value = true; };
+template <> struct is_signed<long long> { static const bool value = true; };
+template <> struct is_signed<float> { static const bool value = true; };
+template <> struct is_signed<double> { static const bool value = true; };
+
+template <class T> struct is_unsigned { static const bool value = false; };
+template <> struct is_unsigned<bool> { static const bool value = true; };
+template <> struct is_unsigned<unsigned char> { static const bool value = true; };
+template <> struct is_unsigned<unsigned short> { static const bool value = true; };
+template <> struct is_unsigned<unsigned int> { static const bool value = true; };
+template <> struct is_unsigned<unsigned long> { static const bool value = true; };
+template <> struct is_unsigned<unsigned long long> { static const bool value = true; };
+
+/* The ones that answer with a type rather than with yes or no. */
+template <class T> struct remove_reference { typedef T type; };
+template <class T> struct remove_reference<T &> { typedef T type; };
+
+template <class T> struct remove_pointer { typedef T type; };
+template <class T> struct remove_pointer<T *> { typedef T type; };
+
+template <class T> struct remove_const { typedef T type; };
+template <class T> struct remove_const<const T> { typedef T type; };
+
+template <class T> struct remove_volatile { typedef T type; };
+template <class T> struct remove_volatile<volatile T> { typedef T type; };
+
+template <class T> struct add_pointer { typedef T *type; };
+template <class T> struct add_const { typedef const T type; };
+
+template <bool B, class T, class F> struct conditional { typedef T type; };
+template <class T, class F> struct conditional<false, T, F> { typedef F type; };
+
+}
+
+#endif
+"""
+
 _BUILTIN_CPP_HEADERS = {
     # COM's root, which no implementation publishes as a file.
     "unknwn.h": _UNKNWN_HEADER,
+    "type_traits": _TYPE_TRAITS_HEADER,
     # And the interfaces a generated header names in its signatures. Same
     # reason and same shape: the classes they are, at the slots the .idl
     # puts them at.

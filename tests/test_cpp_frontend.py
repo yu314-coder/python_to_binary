@@ -270,6 +270,90 @@ int main() { Thing t; return (int)t.DoIt(0); }
         self.assertIn("Twice", slots[4])
 
 
+class PartialSpecialisation(unittest.TestCase):
+    """A class template written again for a shape of argument.
+
+    Which copy a use gets is decided by which pattern is narrower, and
+    getting that wrong is not a build failure - it is a different answer.
+    """
+
+    _SHAPES = """#include <stdio.h>
+template <class T> struct Name { static const int id = 0; };
+template <> struct Name<int> { static const int id = 1; };
+template <class T> struct Name<T *> { static const int id = 2; };
+template <class T> struct Name<T **> { static const int id = 3; };
+int main() {
+    return Name<double>::id + Name<int>::id
+         + Name<double *>::id + Name<double **>::id;
+}
+"""
+
+    def test_the_narrower_pattern_wins(self):
+        """A copy is made for each use, and each use gets the narrowest
+        pattern that fits it - the general one only where none does."""
+
+        out = with_headers(self._SHAPES)
+        self.assertIn("Name__double__id = 0", out)
+        self.assertIn("Name__int__id = 1", out)
+        self.assertIn("Name__double_p__id = 2", out)
+        self.assertIn("Name__double_p_p__id = 3", out)
+
+    def test_a_deeper_pattern_beats_a_shallower_one(self):
+        """`T **` and `T *` both fit `int **`; C++ takes the first."""
+
+        from py2bin.cpp_frontend import _how_narrow, _narrower_copy
+
+        parameters = {"T"}
+        self.assertGreater(
+            _how_narrow(["T **"], parameters), _how_narrow(["T *"], parameters)
+        )
+        self.assertGreater(
+            _how_narrow(["int"], parameters), _how_narrow(["T **"], parameters)
+        )
+        # `<T, T>` says the two arguments are the same, which `<T, U>` does not.
+        self.assertGreater(
+            _how_narrow(["T", "T"], parameters),
+            _how_narrow(["T", "U"], {"T", "U"}),
+        )
+
+    def test_a_parameter_named_twice_has_to_match_twice(self):
+        from py2bin.cpp_frontend import _narrower_copy
+
+        entries = [([("T", True)], ["T", "T"], "{ int a; }", "struct")]
+        self.assertIsNotNone(_narrower_copy(entries, ["int", "int"]))
+        self.assertIsNone(_narrower_copy(entries, ["int", "char"]))
+
+    def test_a_shape_that_does_not_fit_is_not_used(self):
+        from py2bin.cpp_frontend import _narrower_copy
+
+        entries = [([("T", True)], ["T *"], "{ int a; }", "struct")]
+        self.assertIsNotNone(_narrower_copy(entries, ["int *"]))
+        self.assertIsNone(_narrower_copy(entries, ["int"]))
+
+    def test_two_classes_may_each_have_a_member_called_value(self):
+        """Keyed by the member's name alone, the second took the first's -
+        and a traits header is nothing but classes with a `value`."""
+
+        out = with_headers(
+            "struct A { static const int value = 1; };\n"
+            "struct B { static const int value = 2; };\n"
+            "int main() { return A::value + B::value; }\n"
+        )
+        self.assertIn("A__value", out)
+        self.assertIn("B__value", out)
+        self.assertNotIn("A::value", out)
+        self.assertNotIn("B::value", out)
+
+    def test_a_class_with_only_static_members_is_still_a_type(self):
+        """C has no empty struct, and a traits class has no data at all."""
+
+        out = with_headers(
+            "struct A { static const int value = 1; };\n"
+            "int main() { return A::value; }\n"
+        )
+        self.assertIn("__empty", out)
+
+
 if __name__ == "__main__":
     unittest.main()
 
