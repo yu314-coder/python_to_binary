@@ -325,6 +325,48 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
         "MessageBoxW", ("ptr", "ptr", "ptr", "int"), "int", "USER32.dll",
     ),
     "GetSystemMetrics": ("GetSystemMetrics", ("int",), "int", "USER32.dll"),
+    "SetWindowPos": (
+        "SetWindowPos",
+        ("ptr", "ptr", "int", "int", "int", "int", "int"),
+        "int",
+        "USER32.dll",
+    ),
+
+    # A DLL somebody else wrote. This is the general answer to a vendor
+    # component - WebView2Loader.dll is one, and so is every other SDK that
+    # ships a DLL and a header py2bin cannot compile: load it by name, ask
+    # for the entry point by name, and call the pointer. Naming the vendor's
+    # DLL in the import table instead would make every program that links it
+    # refuse to start without it, and would put a list of other people's
+    # products in this table.
+    "LoadLibraryW": ("LoadLibraryW", ("ptr",), "ptr", "KERNEL32.dll"),
+    "LoadLibraryA": ("LoadLibraryA", ("ptr",), "ptr", "KERNEL32.dll"),
+    "FreeLibrary": ("FreeLibrary", ("ptr",), "int", "KERNEL32.dll"),
+    "GetProcAddress": (
+        "GetProcAddress", ("ptr", "ptr"), "ptr", "KERNEL32.dll"
+    ),
+    "GetModuleHandleA": ("GetModuleHandleA", ("ptr",), "ptr", "KERNEL32.dll"),
+
+    # COM. py2bin has been able to *call* through a vtable since it had
+    # classes - what it had no way to do was come by the first interface
+    # pointer, which is what these four are for. Without them a COM program
+    # could express every call it wanted to make and had nothing to make one
+    # on.
+    "CoInitialize": ("CoInitialize", ("ptr",), "int", "ole32.dll"),
+    "CoInitializeEx": ("CoInitializeEx", ("ptr", "int"), "int", "ole32.dll"),
+    "CoUninitialize": ("CoUninitialize", (), "int", "ole32.dll"),
+    "CoCreateInstance": (
+        "CoCreateInstance",
+        ("ptr", "ptr", "int", "ptr", "ptr"),
+        "int",
+        "ole32.dll",
+    ),
+    # What a COM method hands back a string in, and how it is given back.
+    "CoTaskMemAlloc": ("CoTaskMemAlloc", ("int",), "ptr", "ole32.dll"),
+    "CoTaskMemFree": ("CoTaskMemFree", ("ptr",), "int", "ole32.dll"),
+    "SysAllocString": ("SysAllocString", ("ptr",), "ptr", "OLEAUT32.dll"),
+    "SysFreeString": ("SysFreeString", ("ptr",), "int", "OLEAUT32.dll"),
+    "SysStringLen": ("SysStringLen", ("ptr",), "int", "OLEAUT32.dll"),
     "MessageBeep": ("MessageBeep", ("int",), "int", "USER32.dll"),
     # What <filesystem> and <stdio.h>'s FILE layer reach for on Windows,
     # where there are no syscalls to make and these are the interface.

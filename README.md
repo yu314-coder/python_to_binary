@@ -624,7 +624,18 @@ py2bin ships the part a program usually wants - the types (`DWORD`, `HANDLE`,
 `LPCSTR`, ...), the constants, and prototypes for about thirty functions from
 `KERNEL32` and `USER32`: `Sleep`, `GetTickCount`, `GetStdHandle`, `WriteFile`,
 `CreateFileA`, `SetConsoleOutputCP`, `MessageBoxA`, `MultiByteToWideChar` and
-so on. Each is an ordinary import the loader binds, the same mechanism a
+so on. A window is there too - `RegisterClassExW`, `CreateWindowExW`, the
+message loop - and so is COM: `CoInitializeEx`, `CoCreateInstance`,
+`CoTaskMemFree` and the three `Sys*String` calls. Calling *through* a vtable is
+something py2bin could always express; those are how a program comes by the
+pointer to call it on, which is what it had no way to do.
+
+A DLL somebody else wrote is reached with `LoadLibraryW`, `GetProcAddress` and
+`FreeLibrary` rather than by naming it here. That is the general answer to a
+vendor component - WebView2Loader.dll is one, and so is every other SDK that
+ships a DLL beside a header py2bin cannot compile - and it keeps the vendor's
+name out of the import table, where it would stop the program from starting on
+a machine that does not have it. Each is an ordinary import the loader binds, the same mechanism a
 program driving CPython already uses, so calling one still needs no toolchain.
 A name it does not declare is a name the compiler reports, rather than one
 that compiles and fails to resolve; and on a target that is not Windows the
@@ -932,7 +943,7 @@ your own file — every target, and the comparison — and is the thing to run
 before shipping.
 
 It does not run the cross-builds; five of the six machines are not this
-computer. 269 programs × 6 targets is 1614 builds, and the two projects are
+computer. 270 programs × 6 targets is 1620 builds, and the two projects are
 built for this machine and run.
 
 What is in the corpus is what broke at some point: enums, static members,

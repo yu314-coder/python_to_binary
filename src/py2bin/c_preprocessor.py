@@ -1520,6 +1520,56 @@ extern BOOL QueryPerformanceFrequency(LPVOID);
 extern int MessageBoxA(HWND, LPCSTR, LPCSTR, UINT);
 extern int MessageBoxW(HWND, LPCWSTR, LPCWSTR, UINT);
 extern int GetSystemMetrics(int);
+extern BOOL SetWindowPos(HWND, HWND, int, int, int, int, UINT);
+
+/* A DLL somebody else wrote: load it, ask for the entry point, call the
+   pointer. This is how a vendor component is reached - WebView2Loader.dll
+   is one - without naming anybody's product in py2bin's import table. */
+typedef int (*FARPROC)(void);
+extern HMODULE LoadLibraryW(LPCWSTR);
+extern HMODULE LoadLibraryA(LPCSTR);
+extern BOOL FreeLibrary(HMODULE);
+extern FARPROC GetProcAddress(HMODULE, LPCSTR);
+extern HMODULE GetModuleHandleA(LPCSTR);
+
+/* COM. Calling through a vtable is something py2bin has always been able to
+   express; these are how a program comes by the pointer to call it on. */
+typedef LONG HRESULT;
+#define S_OK 0
+#define S_FALSE 1
+#define E_NOINTERFACE ((HRESULT)0x80004002L)
+#define E_POINTER ((HRESULT)0x80004003L)
+#define E_FAIL ((HRESULT)0x80004005L)
+#define E_OUTOFMEMORY ((HRESULT)0x8007000EL)
+#define SUCCEEDED(hr) (((HRESULT)(hr)) >= 0)
+#define FAILED(hr) (((HRESULT)(hr)) < 0)
+#define COINIT_APARTMENTTHREADED 2
+#define COINIT_MULTITHREADED 0
+#define CLSCTX_INPROC_SERVER 1
+#define CLSCTX_LOCAL_SERVER 4
+#define CLSCTX_ALL 23
+
+typedef struct _GUID {
+    DWORD Data1;
+    WORD Data2;
+    WORD Data3;
+    BYTE Data4[8];
+} GUID;
+typedef GUID IID;
+typedef GUID CLSID;
+typedef const GUID *REFIID;
+typedef const GUID *REFCLSID;
+typedef wchar_t *BSTR;
+
+extern HRESULT CoInitialize(LPVOID);
+extern HRESULT CoInitializeEx(LPVOID, DWORD);
+extern int CoUninitialize(void);
+extern HRESULT CoCreateInstance(REFCLSID, LPVOID, DWORD, REFIID, LPVOID);
+extern LPVOID CoTaskMemAlloc(SIZE_T);
+extern int CoTaskMemFree(LPVOID);
+extern BSTR SysAllocString(LPCWSTR);
+extern int SysFreeString(BSTR);
+extern UINT SysStringLen(BSTR);
 extern BOOL MessageBeep(UINT);
 extern BOOL CreateDirectoryA(LPCSTR, LPVOID);
 extern BOOL RemoveDirectoryA(LPCSTR);
