@@ -1917,7 +1917,213 @@ long labs(long __value) { return __value < 0 ? -__value : __value; }
 #: what every real header does.
 _NULL = "#ifndef NULL\n#define NULL ((void *)0)\n#endif\n"
 
+#: The types a header reaches for when it wants the ones a platform is
+#: expected to have. py2bin has no system to take them from, so it says what
+#: they are for the target it is building for - which is the same thing every
+#: other header here does. Each is guarded: a header that defines its own
+#: first keeps it, the way `NULL` does.
+_SYS_TYPES_H = """
+#ifndef __py2bin_ssize_t_defined
+#define __py2bin_ssize_t_defined
+typedef long ssize_t;
+#endif
+#ifndef __py2bin_off_t_defined
+#define __py2bin_off_t_defined
+typedef long off_t;
+#endif
+#ifndef __py2bin_time_t_defined
+#define __py2bin_time_t_defined
+typedef long time_t;
+#endif
+#ifndef __py2bin_clock_t_defined
+#define __py2bin_clock_t_defined
+typedef long clock_t;
+#endif
+#ifndef __py2bin_pid_t_defined
+#define __py2bin_pid_t_defined
+typedef int pid_t;
+typedef int mode_t;
+typedef unsigned int uid_t;
+typedef unsigned int gid_t;
+typedef unsigned long ino_t;
+typedef unsigned long dev_t;
+typedef unsigned long nlink_t;
+#endif
+/* The short names a socket header still asks for by tradition. */
+#ifndef __py2bin_u_char_defined
+#define __py2bin_u_char_defined
+typedef unsigned char u_char;
+typedef unsigned short u_short;
+typedef unsigned int u_int;
+typedef unsigned long u_long;
+#endif
+"""
+
+#: `<time.h>`: the types and the shape of a broken-down time. The functions
+#: are not here - py2bin has no clock to read without asking the system for
+#: one - so a program that calls `time()` is told at the call rather than
+#: given something that answers zero.
+_TIME_H = """
+#ifndef __py2bin_time_t_defined
+#define __py2bin_time_t_defined
+typedef long time_t;
+#endif
+#ifndef __py2bin_clock_t_defined
+#define __py2bin_clock_t_defined
+typedef long clock_t;
+#endif
+#ifndef __py2bin_tm_defined
+#define __py2bin_tm_defined
+struct tm {
+    int tm_sec; int tm_min; int tm_hour;
+    int tm_mday; int tm_mon; int tm_year;
+    int tm_wday; int tm_yday; int tm_isdst;
+};
+#endif
+#ifndef CLOCKS_PER_SEC
+#define CLOCKS_PER_SEC 1000000
+#endif
+"""
+
+
+
+#: COM, as py2bin's own headers rather than as a fetch.
+#:
+#: `wtypes.h`, `unknwn.h`, `objidl.h` and the rest do not exist as files
+#: anywhere: every open implementation of the Windows API generates them from
+#: `.idl` with a tool that runs at build time, and the vendor's own set ships
+#: inside a toolchain nothing can fetch. Checked against three of those
+#: implementations - none publishes one.
+#:
+#: So they are written here, the way `<windows.h>` is. What COM actually *is*
+#: is a struct whose first member points at a table of function pointers, and
+#: py2bin builds those already: a class with virtual methods is exactly that
+#: layout. These headers say so in C, so a program can declare an interface
+#: and call through it with nothing underneath but py2bin.
+_WTYPES_H = """
+#ifndef __py2bin_wtypes_h
+#define __py2bin_wtypes_h
+#include <windows.h>
+
+typedef long HRESULT;
+typedef unsigned short VARIANT_BOOL;
+typedef const wchar_t *LPCOLESTR;
+typedef wchar_t *LPOLESTR;
+typedef wchar_t OLECHAR;
+typedef wchar_t *BSTR;
+typedef double DATE;
+
+typedef struct _GUID {
+    unsigned int Data1;
+    unsigned short Data2;
+    unsigned short Data3;
+    unsigned char Data4[8];
+} GUID;
+
+typedef GUID IID;
+typedef GUID CLSID;
+typedef const GUID *REFGUID;
+typedef const GUID *REFIID;
+typedef const GUID *REFCLSID;
+
+#ifndef S_OK
+#define S_OK ((HRESULT)0)
+#endif
+#ifndef S_FALSE
+#define S_FALSE ((HRESULT)1)
+#endif
+#ifndef E_NOINTERFACE
+#define E_NOINTERFACE ((HRESULT)0x80004002)
+#endif
+#ifndef E_POINTER
+#define E_POINTER ((HRESULT)0x80004003)
+#endif
+#ifndef E_FAIL
+#define E_FAIL ((HRESULT)0x80004005)
+#endif
+#ifndef E_OUTOFMEMORY
+#define E_OUTOFMEMORY ((HRESULT)0x8007000E)
+#endif
+#ifndef E_INVALIDARG
+#define E_INVALIDARG ((HRESULT)0x80070057)
+#endif
+#ifndef SUCCEEDED
+#define SUCCEEDED(hr) ((HRESULT)(hr) >= 0)
+#endif
+#ifndef FAILED
+#define FAILED(hr) ((HRESULT)(hr) < 0)
+#endif
+#endif
+"""
+
+#: What a generated interface header spells its declarations with. Every one
+#: of these is punctuation to a compiler that lays a vtable out itself: the
+#: calling convention is the one py2bin uses for every call, and the rest say
+#: things about linkage and documentation tools.
+_RPCNDR_H = """
+#ifndef __py2bin_rpcndr_h
+#define __py2bin_rpcndr_h
+#include <wtypes.h>
+
+#define __RPC_STUB
+#define __RPC_FAR
+#define RPC_ENTRY
+#define STDMETHODCALLTYPE
+#define STDMETHODVCALLTYPE
+#define STDAPICALLTYPE
+#define WINOLEAPI HRESULT
+#define EXTERN_C
+#define DECLSPEC_UUID(x)
+#define DECLSPEC_NOVTABLE
+#define MIDL_INTERFACE(x) struct
+#define interface struct
+#define BEGIN_INTERFACE
+#define END_INTERFACE
+#define PURE = 0
+#define THIS_
+#define THIS void
+#define STDMETHOD(name) virtual HRESULT name
+#define STDMETHOD_(type, name) virtual type name
+#define STDMETHODIMP HRESULT
+#define STDMETHODIMP_(type) type
+#endif
+"""
+
+_OBJBASE_H = """
+#ifndef __py2bin_objbase_h
+#define __py2bin_objbase_h
+#include <rpcndr.h>
+
+#ifndef COINIT_APARTMENTTHREADED
+#define COINIT_APARTMENTTHREADED 0x2
+#endif
+#ifndef COINIT_MULTITHREADED
+#define COINIT_MULTITHREADED 0x0
+#endif
+#ifndef CLSCTX_INPROC_SERVER
+#define CLSCTX_INPROC_SERVER 0x1
+#endif
+#ifndef CLSCTX_ALL
+#define CLSCTX_ALL 0x17
+#endif
+
+HRESULT CoInitializeEx(void *reserved, unsigned int model);
+void CoUninitialize(void);
+HRESULT CoCreateInstance(REFCLSID clsid, void *outer,
+                         unsigned int context, REFIID riid, void **object);
+void CoTaskMemFree(void *block);
+void *CoTaskMemAlloc(SIZE_T bytes);
+#endif
+"""
+
 _BUILTIN_HEADERS = {
+    "sys/types.h": _SYS_TYPES_H,
+    "time.h": _TIME_H,
+    "wtypes.h": _WTYPES_H,
+    "rpcndr.h": _RPCNDR_H,
+    "objbase.h": _OBJBASE_H,
+    "combaseapi.h": _OBJBASE_H,
+    "ole2.h": _OBJBASE_H,
     "stdio.h": "#define EOF (-1)\n" + _NULL,
     # <stdlib.h> brings the heap, and brings it as C source for the same
     # reason <math.h> does: an allocator you can read is one you can check.

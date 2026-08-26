@@ -790,6 +790,20 @@ not special cases in the compiler:
   of a `vector`, reassigned from a lambda to a function and back, and `if (cb)`
   before calling it — those all work; C++'s conversion to `bool` has no
   spelling here, so `if (cb)` and `if (!cb)` are read as what they mean.
+* `<unknwn.h>` — COM's root interface, because nobody publishes one. Every
+  open implementation of the Windows API generates `unknwn.h`, `wtypes.h`,
+  `objidl.h` and the rest from an `.idl` at build time, and the vendor's own
+  set ships inside a toolchain: there is no file to fetch, from any of them.
+  So py2bin writes it. What COM *is* is a struct whose first member points at
+  a table of function pointers — which is exactly how py2bin lays out a class
+  with virtual methods — so the header says that in C++, and a program
+  declares an interface by deriving from `IUnknown` the way a generated header
+  does. `HRESULT`, `GUID`/`IID`/`CLSID`, `S_OK`, `SUCCEEDED`/`FAILED` come
+  with it; `<wtypes.h>`, `<rpcndr.h>` and `<objbase.h>` are there for the C
+  side, with the `MIDL_INTERFACE`/`STDMETHODCALLTYPE` spellings a generated
+  header uses. An interface, an implementation of it, and a call through an
+  interface pointer build for all six targets with nothing underneath but
+  py2bin.
 * `<utility>` (`pair`), `<numeric>` (`accumulate`), and `<cassert>`,
   `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
   `<cmath>`, `<cstdint>` as names for the C headers underneath.

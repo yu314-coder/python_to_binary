@@ -15,3 +15,6 @@ dist_release/
 # worktrees a background workflow makes (each is a copy of this repo). None of
 # it is part of what py2bin is, and it does not belong to anyone who clones.
 .claude/
+
+# What an example builds when you run it.
+examples/**/dist/

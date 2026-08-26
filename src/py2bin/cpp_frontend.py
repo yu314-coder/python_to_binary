@@ -1190,6 +1190,13 @@ _TAGGED_TYPE = re.compile(r"\b(enum|union)\s+([A-Za-z_]\w*)\s*\{")
 
 
 
+#: A plain struct's definition, or a typedef with no body of its own. Both
+#: belong above the classes, and which one matched decides how much is taken.
+_HOISTED_TO_THE_TOP = re.compile(
+    _CLASS_HEAD.pattern + r"|(?P<typedef>(?m:^)[ \t]*typedef[^;{}]*;)"
+)
+
+
 def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]]":
     """Take each plain struct's body out, to be emitted above the classes.
 
@@ -1199,26 +1206,41 @@ def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]
     they were written, which keeps one holding another after it.
     """
 
-    if not plain:
-        return text, []
     wanted = set(plain)
     bodies: "list[str]" = []
     out: list[str] = []
     at = 0
-    for head in _CLASS_HEAD.finditer(text):
-        if head.start() < at or head.group(2) not in wanted:
+    # Both, in the order they were written: a typedef at file scope names a
+    # type the classes below may be declared in terms of, and it was being
+    # emitted after them - so `typedef long HRESULT;` came after the first
+    # thing that answered one.
+    for head in _HOISTED_TO_THE_TOP.finditer(text):
+        if head.start() < at:
+            continue
+        if head.group("typedef") is not None:
+            bodies.append(head.group(0))
+            out.append(text[at:head.start()])
+            at = head.end()
+            continue
+        if head.group(2) not in wanted:
             continue
         try:
             closing = _matching(text, head.end() - 1)
         except ValueError:
             continue
-        end = closing
-        while end < len(text) and text[end] in " \t":
-            end += 1
-        if end < len(text) and text[end] == ";":
-            end += 1
-        bodies.append(text[head.start():end])
-        out.append(text[at:head.start()])
+        # To the end of the statement, not just past the brace: `typedef
+        # struct P { ... } P;` names the type *after* the body, and stopping
+        # at the `}` left ` P;` behind as a statement of its own.
+        end = text.find(";", closing)
+        end = closing if end < 0 else end + 1
+        # And back to the front of it, for the same reason: taking the struct
+        # out of the middle left the `typedef` standing alone.
+        begins = head.start()
+        before = text[:begins].rstrip()
+        if before.endswith("typedef"):
+            begins = len(before) - len("typedef")
+        bodies.append(text[begins:end])
+        out.append(text[at:begins])
         at = end
     out.append(text[at:])
     return "".join(out), bodies
@@ -10511,7 +10533,75 @@ public:
 }
 """
 
+
+_UNKNWN_HEADER = r"""
+
+/* COM's root interface, as py2bin's own header rather than as a fetch.
+   `unknwn.h` does not exist as a file anywhere: every open implementation of
+   the Windows API generates it from an `.idl` at build time, and the
+   vendor's own ships inside a toolchain. What COM *is* is a struct whose
+   first member points at a table of function pointers - which is exactly
+   what py2bin lays a class with virtual methods out as - so it is written
+   here as that class, and a program declares an interface by deriving from
+   it the way a generated header does. */
+#ifndef __py2bin_unknwn_h
+#define __py2bin_unknwn_h
+
+typedef long HRESULT;
+typedef struct __py2bin_GUID {
+    unsigned int Data1;
+    unsigned short Data2;
+    unsigned short Data3;
+    unsigned char Data4[8];
+} GUID;
+typedef GUID IID;
+typedef GUID CLSID;
+typedef const GUID *REFGUID;
+typedef const GUID *REFIID;
+typedef const GUID *REFCLSID;
+
+#ifndef S_OK
+#define S_OK ((HRESULT)0)
+#endif
+#ifndef S_FALSE
+#define S_FALSE ((HRESULT)1)
+#endif
+#ifndef E_NOINTERFACE
+#define E_NOINTERFACE ((HRESULT)0x80004002)
+#endif
+#ifndef E_POINTER
+#define E_POINTER ((HRESULT)0x80004003)
+#endif
+#ifndef E_FAIL
+#define E_FAIL ((HRESULT)0x80004005)
+#endif
+#ifndef E_OUTOFMEMORY
+#define E_OUTOFMEMORY ((HRESULT)0x8007000E)
+#endif
+#ifndef E_INVALIDARG
+#define E_INVALIDARG ((HRESULT)0x80070057)
+#endif
+#ifndef SUCCEEDED
+#define SUCCEEDED(hr) ((HRESULT)(hr) >= 0)
+#endif
+#ifndef FAILED
+#define FAILED(hr) ((HRESULT)(hr) < 0)
+#endif
+
+class IUnknown {
+public:
+    virtual HRESULT QueryInterface(REFIID riid, void **object) = 0;
+    virtual unsigned long AddRef() = 0;
+    virtual unsigned long Release() = 0;
+    virtual ~IUnknown() { }
+};
+
+#endif
+"""
+
 _BUILTIN_CPP_HEADERS = {
+    # COM's root, which no implementation publishes as a file.
+    "unknwn.h": _UNKNWN_HEADER,
     "string": _STRING_HEADER,
     "map": _MAP_HEADER,
     # An unordered map is the same interface with no promise about order,

@@ -763,6 +763,51 @@ class Templates(unittest.TestCase):
         self.assertIn("twice__int", out)
 
 
+class ComHeaders(unittest.TestCase):
+    """py2bin's own `<unknwn.h>`, because nobody publishes one.
+
+    Every open implementation of the Windows API generates `unknwn.h` from an
+    `.idl` at build time, and the vendor's own ships inside a toolchain - so
+    there is no file to fetch. What COM *is* is a struct whose first member
+    points at a table of function pointers, which is what py2bin lays a class
+    with virtual methods out as, so the header says that in C++.
+    """
+
+    def test_an_interface_derives_from_it_and_dispatches(self) -> None:
+        out = with_headers(
+            "#include <unknwn.h>\n"
+            "class ICounter : public IUnknown {\n"
+            "public: virtual HRESULT Next(int *out) = 0; };\n"
+            "class Counter : public ICounter {\n"
+            "public: unsigned long refs; int value;\n"
+            "  Counter() { refs = 1; value = 0; }\n"
+            "  HRESULT QueryInterface(REFIID riid, void **object)"
+            " { *object = this; return S_OK; }\n"
+            "  unsigned long AddRef() { refs = refs + 1; return refs; }\n"
+            "  unsigned long Release() { refs = refs - 1; return refs; }\n"
+            "  HRESULT Next(int *out) { value = value + 1; *out = value;"
+            " return S_OK; } };\n"
+            "int main(){ Counter c; ICounter *p = &c; int got = 0;\n"
+            "  p->Next(&got); return got; }\n"
+        )
+        # The interface's own table, and a call that goes through it.
+        self.assertIn("Counter__vtable", out)
+        self.assertIn("__vptr", out)
+        # The types the header gives, emitted before whatever answers one.
+        self.assertLess(out.index("typedef long HRESULT;"), out.index("HRESULT Counter"))
+
+    def test_the_header_is_pasted_before_the_translation(self) -> None:
+        """It has to be: the translator reads classes, and the C preprocessor
+        runs after it - so a class declared in a preprocessor header would be
+        invisible to the very pass that needs it.
+        """
+
+        from py2bin.cpp_frontend import _BUILTIN_CPP_HEADERS
+
+        self.assertIn("unknwn.h", _BUILTIN_CPP_HEADERS)
+        self.assertIn("class IUnknown", _BUILTIN_CPP_HEADERS["unknwn.h"])
+
+
 class OverloadsByType(unittest.TestCase):
     """Where two overloads take the same number, the types decide.
 
