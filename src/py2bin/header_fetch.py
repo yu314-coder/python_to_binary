@@ -215,6 +215,12 @@ def fetch_header(
 
     wanted = _valid_name(name)
     stem = wanted.rsplit("/", 1)[-1]
+    if stem in _SUPPLIED:
+        raise HeaderFetchError(
+            f"{stem} is one of the headers py2bin ships, so there is nothing "
+            f"to fetch. A published copy is written for a compiler that is "
+            f"GCC or MSVC, and does not compile here"
+        )
     into = Path(into)
     already = into / stem
     if already.is_file():
@@ -550,10 +556,18 @@ def _take_closure(
             answer = written
         for reached in _INCLUDED.findall(payload.decode("utf-8", "replace")):
             spelled = reached.strip().replace("\\", "/")
+            # A header py2bin ships is not taken even when the set has one.
+            # Its copy would land in the cache directory beside the ones that
+            # were wanted, and an include directory is searched before a
+            # built-in - so one fetch of anything from a Windows set left
+            # that set's `winnt.h` shadowing py2bin's own for every build
+            # afterwards, which is how a fixed build came back broken.
+            if spelled in _SUPPLIED or spelled.rsplit("/", 1)[-1] in _SUPPLIED:
+                continue
             if spelled in by_name:
                 if spelled not in seen:
                     pending.append(spelled)
-            elif spelled not in _SUPPLIED:
+            else:
                 unresolved.add(spelled)
     say(f"  took {len(taken)} headers, {spent // 1024}KB")
     if unresolved:

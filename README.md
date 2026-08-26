@@ -652,6 +652,17 @@ MSVC intrinsic behind `#pragma intrinsic`. py2bin is neither of those
 compilers and does not claim to be one, so it brings its own header - the same
 answer, and for the same reason, as the COM headers above.
 
+A fetch does not bring one of these along either, and that mattered more than
+it sounds: `--auto-fetch` takes the closure over what a header includes, so
+fetching anything from a Windows set once left that set's `winnt.h` sitting in
+`.py2bin-headers/`. An include directory is searched before a built-in, so
+py2bin's own was shadowed by a copy that cannot compile here - for every build
+afterwards, which is how a build that had been fixed came back with the same
+error. Now a header py2bin ships is never taken along, never taken from that
+cache directory even if an older run left one there, and asking for one
+outright says so rather than downloading it. A header you name yourself with
+`-I` is your own choice and still wins.
+
 **`inline` is accepted and ignored**, along with `__inline` and
 `__forceinline`. py2bin decides for itself whether a call is a real call or an
 inlined body, so the specifier says nothing to it - but refusing it stopped

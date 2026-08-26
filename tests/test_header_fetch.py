@@ -308,8 +308,31 @@ class CollectionTests(unittest.TestCase):
             with _Downloader(self._table(collection)):
                 fetch_header("rpc.h", into)
             names = {path.name for path in found_headers(into)}
-            self.assertEqual(names, {"rpc.h", "rpcdce.h", "windef.h"})
+            # windef.h is reached, and is not taken: py2bin ships that one,
+            # and a downloaded copy in the cache directory would shadow it.
+            self.assertEqual(names, {"rpc.h", "rpcdce.h"})
             self.assertNotIn("unrelated.h", names)
+
+    def test_a_header_py2bin_ships_is_not_taken_along(self):
+        """The cache directory is searched before a built-in, so a copy left
+        there shadows py2bin's own for every build afterwards - which is how
+        a Windows build that had been fixed came back with the same error."""
+
+        from py2bin.header_fetch import _COLLECTIONS, _SUPPLIED
+
+        self.assertIn("windef.h", _SUPPLIED)
+        collection = _COLLECTIONS[0]
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work) / "headers"
+            with _Downloader(self._table(collection)):
+                fetch_header("rpc.h", into)
+            self.assertFalse((into / "windef.h").exists())
+
+    def test_asking_outright_for_one_py2bin_ships_says_so(self):
+        with tempfile.TemporaryDirectory() as work:
+            with self.assertRaises(HeaderFetchError) as caught:
+                fetch_header("winnt.h", Path(work))
+            self.assertIn("py2bin ships", str(caught.exception))
 
 
 class FetchFromAUrlTests(unittest.TestCase):

@@ -945,11 +945,21 @@ class Preprocessor:
         if not angled and directory is not None:
             candidates.append(directory / name)
         candidates.extend(item / name for item in self.include_dirs)
-        for candidate in candidates:
-            if candidate.is_file():
-                self._read(candidate, at)
-                return
         builtin = _BUILTIN_HEADERS.get(name)
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            # A header py2bin ships is never taken from the directory py2bin
+            # downloads into. A fetched set brings its neighbours along, so a
+            # build that once fetched anything from a Windows set left that
+            # set's `winnt.h` in the cache - and an include directory is
+            # searched before a built-in, so py2bin's own was shadowed by a
+            # copy that cannot compile here, for every build after. A header
+            # named with -I is somebody's own choice and still wins.
+            if builtin is not None and _FETCHED_INTO in candidate.parts:
+                continue
+            self._read(candidate, at)
+            return
         if builtin is not None:
             if name in self._builtins_read:
                 # C says a standard header may be included more than once, and
@@ -2229,6 +2239,11 @@ void *CoTaskMemAlloc(SIZE_T bytes);
 #: the same content under two names would be read twice and redefine
 #: everything in it.
 _PART_OF_WINDOWS_H = "#include <windows.h>\n"
+
+#: Where `--auto-fetch` keeps what it downloaded. Named here rather than
+#: imported, because the fetcher imports this module for the list of headers
+#: py2bin ships and the two would chase each other.
+_FETCHED_INTO = ".py2bin-headers"
 
 _BUILTIN_HEADERS = {
     "sys/types.h": _SYS_TYPES_H,
