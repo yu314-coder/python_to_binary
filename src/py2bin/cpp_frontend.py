@@ -1031,6 +1031,17 @@ def _declared_return(text: str, owner: "str | None", method: str) -> "str | None
         if not words or words[-1] != method or len(words) < 2:
             continue
         return " ".join(words[:-1]).replace("&", "*").strip()
+    # A declaration says the same thing a definition does, and the methods
+    # this translator emits are declared before they are defined - so a call
+    # to one is often read where only the declaration is in view.
+    for match in _PROTOTYPE.finditer(where):
+        if match.group(3) != method:
+            continue
+        spelled = match.group(1).strip()
+        # How it is stored is not part of what it answers.
+        while spelled.split() and spelled.split()[0] in _STORAGE:
+            spelled = spelled.split(None, 1)[1] if " " in spelled else ""
+        return f"{spelled} {match.group(2) or ''}".strip()
     return None
 
 def _deduce_arguments(
@@ -1821,49 +1832,398 @@ def _settled_parameters(
     return ", ".join(out)
 
 
-#: `std::function<int(int)> f = ...` - by the time this runs the `std::` is
-#: gone. The signature is not a type this subset can name, so what is kept is
-#: the thing on the right.
-_STD_FUNCTION = re.compile(
-    r"(?<![.\w>])function\s*<([^;{}]*?)>\s*(?=[A-Za-z_*&])"
-)
+#: `std::function<int(int)>` - by the time this runs the `std::` is gone.
+_STD_FUNCTION = re.compile(r"(?<![.\w>])function\s*<")
+
+#: How many different callables one signature may be given. A backstop: the
+#: class below holds one member per callable, and a program with more than
+#: this many going into one `std::function` is doing something this was not
+#: written for.
+_ERASED_LIMIT = 32
+
+
+def _signature_of(text: str, at: int) -> "tuple[str, list[str], int] | None":
+    """Read `<R(A, B)>` starting at the `<`, as (result, parameters, end)."""
+
+    depth = 0
+    index = at
+    while index < len(text):
+        if text[index] == "<":
+            depth += 1
+        elif text[index] == ">":
+            depth -= 1
+            if depth == 0:
+                break
+        index += 1
+    if index >= len(text):
+        return None
+    spelled = text[at + 1: index].strip()
+    opened = spelled.find("(")
+    if opened < 0 or not spelled.endswith(")"):
+        return None
+    result = spelled[:opened].strip()
+    inside = spelled[opened + 1: -1].strip()
+    parameters = (
+        [one.strip() for one in _split_arguments(inside) if one.strip()]
+        if inside and inside != "void"
+        else []
+    )
+    return result, parameters, index + 1
+
+
+def _erased_name(result: str, parameters: "list[str]") -> str:
+    """A class name for one signature, made of the signature itself."""
+
+    spelled = "__".join([result, *parameters]) or "void"
+    return "__py2bin_call_" + re.sub(r"[^A-Za-z0-9]+", "_", spelled).strip("_")
 
 
 def _rewrite_std_function(text: str, filename: str) -> str:
-    """`std::function<int(int)> f = g;` becomes `auto f = g;`.
+    """`std::function<int(int)>` becomes a class that holds any of them.
 
-    What `std::function` adds over the thing it holds is type erasure - two
-    different callables of the same signature stored in one variable - and
-    that needs a table this subset does not build for a closure. What it is
-    almost always used for is holding one callable under a name, which `auto`
-    does exactly: a lambda keeps its own class, a functor keeps its own, and
-    a function's name keeps the type this translator gives it.
+    What `std::function` adds over the thing it holds is type erasure: two
+    different callables of one signature stored in one variable, called
+    without knowing which is in there. Every implementation of it reaches for
+    an indirect call through a pointer to a thunk, because it is compiled
+    without knowing what will be put in.
 
-    Anywhere `auto` will not do - a parameter, a member - it says so, because
-    silently holding the first callable assigned would run and be wrong.
+    py2bin does know. It has no linker, so a translation unit is the whole
+    program and every callable that is ever assigned to one of these is in
+    front of it while it translates. So the class holds one member per
+    callable and a tag saying which is live, and the call is a comparison and
+    a direct call. That is the same argument `dynamic_cast` uses, and it
+    gives what the pointer version cannot: the closure is *copied* into the
+    object, so a `std::function` held as a member outlives the scope the
+    lambda was written in - which is the whole reason a program stores one.
+
+    A plain function goes in as a pointer to itself, because that is what its
+    name already is.
     """
 
-    out: list[str] = []
-    at = 0
-    for found in _STD_FUNCTION.finditer(_without_literals(text)):
-        if found.start() < at:
-            continue
-        rest = text[found.end():]
-        held = re.match(r"([A-Za-z_]\w*)\s*=", rest)
-        if held is None:
+    if _STD_FUNCTION.search(_without_literals(text)) is None:
+        return text
+    # Every signature the file names, and the class each becomes.
+    signatures: "dict[str, tuple[str, list[str]]]" = {}
+    while True:
+        bare = _without_literals(text)
+        found = _STD_FUNCTION.search(bare)
+        if found is None:
+            break
+        read = _signature_of(text, found.end() - 1)
+        if read is None:
             raise CppTranslationError(
                 filename,
                 _line_of(text, found.start()),
-                "std::function here is not initialised where it is declared, "
-                "so there is nothing to say which callable it holds. py2bin "
-                "keeps the callable's own type; write the parameter as a "
-                "template parameter, or take a pointer to a function",
+                "std::function names a signature, as in "
+                "`std::function<int(int)>`; py2bin could not read this one",
             )
-        out.append(text[at:found.start()])
-        out.append("auto ")
-        at = found.end()
-    out.append(text[at:])
-    return "".join(out)
+        result, parameters, end = read
+        name = _erased_name(result, parameters)
+        signatures[name] = (result, parameters)
+        text = text[:found.start()] + name + text[end:]
+    if not signatures:
+        return text
+
+    # What each one is given, anywhere in the file. Read before anything is
+    # rewritten, because the class has to hold a member for every one.
+    held: "dict[str, list[tuple[str, bool]]]" = {name: [] for name in signatures}
+    functions = _function_definitions(text)
+    for name in signatures:
+        for value in _assigned_to(text, name, filename):
+            spelled = _deduced_type(value, text)
+            if spelled is not None and _names_a_class(text, spelled.strip()):
+                entry = (spelled.strip(), False)
+            elif value in functions:
+                entry = (value, True)
+            else:
+                raise CppTranslationError(
+                    filename,
+                    _line_of(text, text.find(value)),
+                    f"py2bin cannot tell what {value!r} is, and a "
+                    f"std::function has to be given a lambda, an object with "
+                    f"a call operator, or the name of a function",
+                )
+            if entry not in held[name]:
+                held[name].append(entry)
+        if len(held[name]) > _ERASED_LIMIT:
+            raise CppTranslationError(
+                filename, 0,
+                f"more than {_ERASED_LIMIT} different callables go into one "
+                f"std::function here; py2bin writes out a member for each",
+            )
+
+    made = [
+        _emit_erased(name, *signatures[name], held[name]) for name in signatures
+    ]
+    text = _fill_erased(text, held)
+    return "\n".join(made) + "\n" + text
+
+
+#: `f = value;` - an assignment to something, with the name on the left kept
+#: whole so a member reached through `this` or through an object is one too.
+_ERASED_ASSIGN = re.compile(
+    r"(?<![.\w>])((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*[A-Za-z_]\w*)\s*=(?!=)\s*"
+    r"([A-Za-z_]\w*)\s*;"
+)
+
+
+def _erased_holders(text: str, name: str) -> "set[str]":
+    """Every name declared to hold this signature: a variable, a member."""
+
+    return {
+        match.group(1)
+        for match in re.finditer(
+            rf"(?<![.\w>]){re.escape(name)}\s*&?\s*([A-Za-z_]\w*)\s*[;=,)]", text
+        )
+    }
+
+
+def _erased_parameters(text: str, name: str) -> "dict[str, list[int]]":
+    """Which functions take this signature, and at which positions.
+
+    A `std::function` parameter is how a program says "give me something to
+    call", and passing a lambda to one is the commonest thing done with the
+    type at all.
+    """
+
+    found: "dict[str, list[int]]" = {}
+    for match in _DEFINITION.finditer(text):
+        if _depth_at(text, match.end() - 1) != 0:
+            continue
+        at = [
+            index
+            for index, part in enumerate(_split_arguments(match.group(3)))
+            if re.match(rf"\s*(?:const\s+)?{re.escape(name)}\s*&?\s*\w*\s*$", part)
+        ]
+        if at:
+            found[match.group(2)] = at
+    return found
+
+
+def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
+    """Every value this signature is given: assigned, declared, or passed."""
+
+    holders = _erased_holders(text, name)
+    found: "list[str]" = []
+    bare = _without_literals(text)
+    # Passed to a function that takes one.
+    for called, positions in _erased_parameters(text, name).items():
+        for match in re.finditer(rf"(?<![.\w>]){re.escape(called)}\s*\(", bare):
+            close = _closing_paren(bare, match.end() - 1)
+            if close < 0 or _is_a_definition(bare, close):
+                continue
+            given = _split_arguments(bare[match.end(): close])
+            for index in positions:
+                if index >= len(given):
+                    continue
+                value = given[index].strip()
+                if value.isidentifier() and value not in holders:
+                    found.append(value)
+    # `NAME f = value;` - given where it is declared.
+    for match in re.finditer(
+        rf"(?<![.\w>]){re.escape(name)}\s+[A-Za-z_]\w*\s*=\s*([A-Za-z_]\w*)\s*;",
+        bare,
+    ):
+        found.append(match.group(1))
+    # `f = value;` - given later, to a variable or to a member.
+    for match in _ERASED_ASSIGN.finditer(bare):
+        target = re.sub(r"\s+", "", match.group(1)).split("->")[-1].split(".")[-1]
+        if target in holders and match.group(2) not in holders:
+            found.append(match.group(2))
+    return list(dict.fromkeys(found))
+
+
+def _emit_erased(
+    name: str,
+    result: str,
+    parameters: "list[str]",
+    held: "list[tuple[str, bool]]",
+) -> str:
+    """The class one signature becomes: a tag, a member per callable, a call."""
+
+    named = [f"a{index}" for index in range(len(parameters))]
+    spelled = ", ".join(
+        f"{held_type} {variable}" for held_type, variable in zip(parameters, named)
+    )
+    passed = ", ".join(named)
+    answer = "" if result.strip() in ("", "void") else "return "
+    lines = [f"class {name} {{", "public:", "    int __which;"]
+    for index, (what, is_function) in enumerate(held, 1):
+        if is_function:
+            lines.append(
+                f"    {result} (*__held{index})({', '.join(parameters) or 'void'});"
+            )
+        else:
+            lines.append(f"    {what} __held{index};")
+    lines.append(f"    {name}() {{ __which = 0; }}")
+    lines.append(f"    int empty() {{ return __which == 0; }}")
+    lines.append(f"    {result} operator()({spelled}) {{")
+    for index, (_what, _is_function) in enumerate(held, 1):
+        lines.append(
+            f"        if (__which == {index}) {{ {answer}__held{index}({passed}); }}"
+        )
+    if answer:
+        # Nothing was put in it. C++ throws `bad_function_call`; there is no
+        # unwinder here, so what comes back is the zero a C function that
+        # falls off its end would answer - and `empty()` is how a program
+        # asks before it calls.
+        lines.append(f"        {result} __nothing; return __nothing;")
+    lines.append("    }")
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def _fill_erased(
+    text: str, held: "dict[str, list[tuple[str, bool]]]"
+) -> str:
+    """Rewrite each place a callable goes in: the tag, and the member."""
+
+    for name, entries in held.items():
+        if not entries:
+            continue
+        holders = _erased_holders(text, name)
+        places = {what: index for index, (what, _fn) in enumerate(entries, 1)}
+        by_value = {
+            what: index for index, (what, is_fn) in enumerate(entries, 1) if is_fn
+        }
+
+        def one(match: "re.Match[str]", whole: str) -> "str | None":
+            target = re.sub(r"\s+", "", match.group(1))
+            plain = target.split("->")[-1].split(".")[-1]
+            if plain not in holders:
+                return None
+            value = match.group(2)
+            if value in by_value:
+                index = by_value[value]
+            else:
+                spelled = _deduced_type(value, whole)
+                index = places.get((spelled or "").strip())
+            if index is None:
+                return None
+            return (
+                f"{match.group(1)}.__which = {index}; "
+                f"{match.group(1)}.__held{index} = {value};"
+            ).replace(f"{target}.", f"{target}." if "." in target else f"{target}.")
+
+        # The declaration first: `NAME f = value;` also reads as an assignment
+        # to `f`, and rewriting that one first left the type name in front of
+        # a statement that was no longer a declaration.
+        pattern = re.compile(
+            rf"(?<![.\w>])({re.escape(name)})\s+([A-Za-z_]\w*)\s*=\s*"
+            rf"([A-Za-z_]\w*)\s*;"
+        )
+
+        def declared(match: "re.Match[str]", whole: str) -> "str | None":
+            value = match.group(3)
+            if value in by_value:
+                index = by_value[value]
+            else:
+                spelled = _deduced_type(value, whole)
+                index = places.get((spelled or "").strip())
+            if index is None:
+                return None
+            return (
+                f"{name} {match.group(2)}; {match.group(2)}.__which = {index}; "
+                f"{match.group(2)}.__held{index} = {value};"
+            )
+
+        text = _sub_code(pattern, text, declared)
+        text = _sub_code(_ERASED_ASSIGN, text, one)
+        text = _erased_given(text, name, holders, places, by_value)
+        text = _erased_truth(text, holders)
+    return text
+
+
+def _erased_given(
+    text: str,
+    name: str,
+    holders: "set[str]",
+    places: "dict[str, int]",
+    by_value: "dict[str, int]",
+) -> str:
+    """Wrap a callable passed where one of these is wanted.
+
+    `twice([](int v){ ... })` is a lambda by the time this runs, and the
+    parameter is one of these - so an object of it is made ahead of the call
+    and the lambda goes into it, which is what C++ does with the temporary.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        for called, positions in _erased_parameters(text, name).items():
+            bare = _without_literals(text)
+            for match in re.finditer(
+                rf"(?<![.\w>]){re.escape(called)}\s*\(", bare
+            ):
+                close = _closing_paren(bare, match.end() - 1)
+                if close < 0 or _is_a_definition(bare, close):
+                    continue
+                given = _split_arguments(text[match.end(): close])
+                for index in positions:
+                    if index >= len(given):
+                        continue
+                    value = given[index].strip()
+                    if not value.isidentifier() or value in holders:
+                        continue
+                    if value in by_value:
+                        which = by_value[value]
+                    else:
+                        spelled = _deduced_type(value, text)
+                        which = places.get((spelled or "").strip())
+                    if which is None:
+                        continue
+                    made = f"__py2bin_given_{abs(hash((called, index, value))) % 100000}"
+                    given[index] = made
+                    start = _statement_start(text, match.start())
+                    text = (
+                        text[:start]
+                        + f" {name} {made}; {made}.__which = {which}; "
+                        f"{made}.__held{which} = {value}; "
+                        + text[start:match.end()]
+                        + ", ".join(one.strip() for one in given)
+                        + text[close:]
+                    )
+                    holders.add(made)
+                    changed = True
+                    break
+                if changed:
+                    break
+            if changed:
+                break
+        if not changed:
+            return text
+    return text
+
+
+#: `if (cb)` and `if (!cb)` - how a program asks whether one of these holds
+#: anything before it calls it. C++ answers with a conversion to `bool`; this
+#: subset has no conversion operator, so the two spellings that matter are
+#: read here and the tag is what they become.
+_ERASED_TRUTH = re.compile(
+    r"(?<![.\w>])(!?)\s*((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*[A-Za-z_]\w*)\s*\)"
+)
+
+
+def _erased_truth(text: str, holders: "set[str]") -> str:
+    """`if (cb)` becomes a test of which callable is in it."""
+
+    if not holders:
+        return text
+
+    def one(match: "re.Match[str]", whole: str) -> "str | None":
+        spelled = re.sub(r"\s+", "", match.group(2))
+        if spelled.split("->")[-1].split(".")[-1] not in holders:
+            return None
+        # Only in a condition: `if (cb)` and `while (cb)`. Anywhere else a
+        # bare name is the object itself and means what it says.
+        before = whole[:match.start()].rstrip()
+        if not re.search(r"\b(?:if|while)\s*\($", before):
+            return None
+        compared = "==" if match.group(1) else "!="
+        return f"{match.group(2)}.__which {compared} 0)"
+
+    return _sub_code(_ERASED_TRUTH, text, one)
+
 
 def _expand_lambdas(
     text: str, filename: str, counter: "list[int] | None" = None
@@ -6770,6 +7130,10 @@ def _rewrite_operators(
     # holds. None of the three takes a right operand, so the two-operand pass
     # above has nothing to match; each is written where it stands.
     body = _rewrite_holder_operators(body, classes, known, pointers)
+    # `(*v[i])(x)` - a call on something that is not a name. `v[i]` has
+    # already become a call answering an address by here, and a container of
+    # callables is exactly what a program keeps one of.
+    body = _rewrite_dereferenced_calls(body, classes, scope)
     return body
 
 
@@ -7039,6 +7403,85 @@ def _bracket_end(text: str, at: int) -> int:
                 return index
         index += 1
     return -1
+
+
+#: `)(` - a call on what a call answered. Searched for from the *second*
+#: parenthesis, because that pair is rare and a call is not: starting from
+#: every call and asking what follows it walked the whole body once per call.
+_CALL_ON_A_CALL = re.compile(r"\)\s*\(")
+
+
+def _rewrite_dereferenced_calls(
+    body: str, classes: "dict[str, Class]", scope: str
+) -> str:
+    """`v[i](x)` becomes the call operator of whatever the element is.
+
+    A subscript on a container has become a call answering an address by the
+    time this runs, so what is left is one call standing in front of another
+    - which is what a container of callables reads as.
+    """
+
+    if not classes:
+        return body
+    bare = _without_literals(body)
+    out: list[str] = []
+    at = 0
+    for found in _CALL_ON_A_CALL.finditer(bare):
+        if found.start() < at:
+            continue
+        first = _opening_paren(bare, found.start())
+        if first < 0:
+            continue
+        head = re.search(r"(?<![.\w>])([A-Za-z_]\w*)\s*$", bare[:first])
+        if head is not None:
+            begins = head.start(1)
+        elif bare[first + 1:].lstrip().startswith("*"):
+            # `(*X)(args)`: the pass that follows a reference return has
+            # already written the star, so the whole group is the object.
+            begins = first
+        else:
+            continue
+        opening = found.end() - 1
+        end = _closing_paren(bare, opening)
+        if end < 0:
+            continue
+        inner = body[begins: found.start() + 1]
+        held = (_deduced_type(inner, f"{body}\n{scope}") or "").strip()
+        held = held.replace("const", "").replace("struct", "").strip()
+        spelled = held.replace("*", "").strip()
+        owner = _find_method(spelled, "op_call", classes) if spelled in classes else None
+        if owner is None:
+            continue
+        arguments = body[opening + 1: end].strip()
+        passed = f", {arguments}" if arguments else ""
+        # `&` in front, unless the star is already there. The pass that
+        # follows a reference return puts one on every call it recognises,
+        # including the one being written here - and `&(*p)` is `p`. Written
+        # without it, that pass left an object where a receiver goes.
+        followed = re.fullmatch(r"\(\s*\*\s*(.*)\)", inner, re.S)
+        receiver = followed.group(1).strip() if followed else f"&{inner}"
+        out.append(body[at:begins])
+        out.append(f"{_c_name(owner, 'op_call')}({receiver}{passed})")
+        at = end + 1
+    out.append(body[at:])
+    return "".join(out)
+
+
+def _opening_paren(text: str, at: int) -> int:
+    """Where the `)` at `at` was opened, or -1."""
+
+    depth = 0
+    index = at
+    while index >= 0:
+        if text[index] == ")":
+            depth += 1
+        elif text[index] == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+        index -= 1
+    return -1
+
 
 def _call_signatures(
     classes: "dict[str, Class]"
@@ -7678,12 +8121,12 @@ def translate(source: str, filename: str = "<c++>") -> str:
     text = _lift_nested_classes(text)
     text = _rewrite_default_arguments(text)
     text = _rewrite_range_for(text, [0])
-    # Before the lambdas, because that pass reads `auto f = <lambda>` to find
-    # out what the closure is held under.
-    text = _rewrite_std_function(text, filename)
     # Before the templates: a lambda becomes a class, and a class may be a
     # template argument.
     text = _expand_lambdas(text, filename)
+    # After the lambdas, because what a `std::function` is given is a closure
+    # by then - an object with a name and a class, which is what this reads.
+    text = _rewrite_std_function(text, filename)
     # After the lambdas: `auto f = <lambda>` is the one `auto` whose type has
     # no spelling, and it is already gone by here.
     text = _rewrite_auto(text)

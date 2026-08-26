@@ -741,11 +741,26 @@ class Templates(unittest.TestCase):
         with self.assertRaises(CppTranslationError) as caught:
             translate(
                 "template<typename T>\nT twice(T v){ return v + v; }\n"
-                "int pick(void);\n"
                 "int main(void){ return twice(pick()); }",
                 "t.cpp",
             )
         self.assertIn("twice<type>", str(caught.exception))
+
+    def test_a_prototype_says_what_a_call_answers(self) -> None:
+        """A declaration says the same thing a definition does.
+
+        `int pick(void);` is how C++ writes a function whose body is
+        elsewhere, and deduction reads it the same way it reads a definition -
+        it used to refuse this, which is not something C++ does.
+        """
+
+        out = translate(
+            "template<typename T>\nT twice(T v){ return v + v; }\n"
+            "int pick(void);\n"
+            "int main(void){ return twice(pick()); }",
+            "t.cpp",
+        )
+        self.assertIn("twice__int", out)
 
 
 class OverloadsByType(unittest.TestCase):
@@ -782,7 +797,6 @@ class OverloadsByType(unittest.TestCase):
     def test_one_it_cannot_choose_between_is_refused(self) -> None:
         with self.assertRaises(CppTranslationError) as caught:
             translate(
-                "int pick(void);\n"
                 "class L{public:int n;\n L(){n=0;}\n"
                 " int show(int v){return v;}\n"
                 " int show(double v){return (int)v;}};\n"
@@ -790,6 +804,17 @@ class OverloadsByType(unittest.TestCase):
                 "t.cpp",
             )
         self.assertIn("cannot tell which is meant", str(caught.exception))
+
+    def test_a_prototype_is_enough_to_choose_between_them(self) -> None:
+        out = translate(
+            "int pick(void);\n"
+            "class L{public:int n;\n L(){n=0;}\n"
+            " int show(int v){return v;}\n"
+            " int show(double v){return (int)v;}};\n"
+            "int main(void){ L l; return l.show(pick()); }",
+            "t.cpp",
+        )
+        self.assertIn("L__show__1__int", out)
 
 
 class FileScopeObjects(unittest.TestCase):

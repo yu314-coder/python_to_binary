@@ -650,7 +650,7 @@ code before it emits anything, which is where they are done here:
 | **Namespaces** | flattened. One translation unit, no linker, so scoping is the whole of what a namespace can mean here |
 | **Operators** | `a + b` becomes the call the class declared for it, including a value return through a hidden pointer. The right side is an operand, not just a name: `a += " x"` and `a + f(1)` work too. Unary ones as well — `*p`, `!p`, `-v`, `p->m()`, `++c` and `c++` — each told from the two-operand spelling by taking no parameter, which is the only thing that says |
 | **Exceptions** | a flag and a return, tested by the caller immediately after the call. `try`/`catch` becomes a jump to a label. A thrown object is copied to the heap so it outlives the frame |
-| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is how one is held, because the class's name is generated — and `std::function<int(int)> f = ...` becomes exactly that. `[x]` copies, `[&x]` holds the address and every use follows it, `[this]` holds the enclosing object and bare member names go through it, `[=]`/`[&]` capture what the body uses — including the object, the same rule C++ applies — and `[v = n * 2]` is a member initialised from an expression the scope has no name for. `[](auto a, auto b)` is a member template in C++; here the types are read from the calls, and calls that disagree are refused rather than compiled once and run for both. A lambda written inside another is expanded first, so what the outer one returns can be read: `auto add5 = outer(5);` holds a closure a closure made |
+| **Lambdas** | a class with a call operator and a member per capture — which is what the standard says one *is*. `auto` is how one is held directly, because the class's name is generated; `std::function` holds one too, and copies it. `[x]` copies, `[&x]` holds the address and every use follows it, `[this]` holds the enclosing object and bare member names go through it, `[=]`/`[&]` capture what the body uses — including the object, the same rule C++ applies — and `[v = n * 2]` is a member initialised from an expression the scope has no name for. `[](auto a, auto b)` is a member template in C++; here the types are read from the calls, and calls that disagree are refused rather than compiled once and run for both. A lambda written inside another is expanded first, so what the outer one returns can be read: `auto add5 = outer(5);` holds a closure a closure made |
 | **Plain structs** | a `struct` with no methods is C already and is emitted exactly as written — but py2bin's C can neither pass nor answer one in a register, so `Point add(Point a, Point b)` gets the same treatment a class does: passed by address and copied on entry, answered through the pointer the caller provides |
 | **`dynamic_cast`** | answered from the table the object carries. py2bin has no linker, so a translation unit is the whole program and there is no class it has not seen: an object is a `D` if its table is D's own or belongs to something derived from D. A cast that fails answers null |
 | **The rest of it** | enums (plain, scoped, and with an underlying type named), unions, bitfields, `static` data members, member functions and block-scope statics, objects at file scope with or without constructor arguments, nested classes, nested namespaces (`namespace a::b`), member typedefs (`vector<int>::iterator`), range-`for` (over a container, over a plain array, and by reference), member initialiser lists (including a member of class type, built with what the list gave it), default member initialisers (`int n = 7;`), `= default` and `= delete`, `final` and `override`, default arguments, named casts, `explicit`, function-pointer members, `auto`, `using X = Y`, aggregate and braced initialisers, arrays of objects built from a brace list, `bool`/`true`/`false`/`nullptr`, forward declarations, members defined outside their class, prototypes in headers, and free functions that return a class by value |
@@ -706,13 +706,18 @@ not special cases in the compiler:
   wrong gives plausible answers.
 * `<functional>` — `less`, `greater`, `plus`, `equal_to` and the rest of the
   comparison and arithmetic objects, which are small classes with a call
-  operator. `std::function` erases the type of what it holds, and every
-  callable py2bin makes is a class of its own with nothing common to erase
-  to — so what it is nearly always written for is written out instead.
-  `std::function<int(int)> f = g;` becomes `auto f = g;`: a lambda keeps its own class, a functor
-  keeps its own, and a function's name keeps the type py2bin gives it. Where
-  `auto` will not do — a parameter, a member — it says so, because silently
-  keeping the first callable assigned would run and be wrong.
+  operator. `std::function<int(int)>` becomes a class that holds any of them,
+  built the way `dynamic_cast` is answered: py2bin has no linker, so a
+  translation unit is the whole program, and every callable that is ever put
+  into one of these is in front of it while it translates. So the class has a
+  member per callable and a tag saying which is live, and the call is a
+  comparison and a direct call — no thunk, no `void *`. It gives what an
+  indirect call cannot: the closure is *copied* into the object, so one held
+  as a member outlives the scope its lambda was written in, which is the whole
+  reason a program stores one. A variable, a member, a parameter, an element
+  of a `vector`, reassigned from a lambda to a function and back, and `if (cb)`
+  before calling it — those all work; C++'s conversion to `bool` has no
+  spelling here, so `if (cb)` and `if (!cb)` are read as what they mean.
 * `<utility>` (`pair`), `<numeric>` (`accumulate`), and `<cassert>`,
   `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
   `<cmath>`, `<cstdint>` as names for the C headers underneath.
