@@ -825,6 +825,28 @@ inheritance and the rest of RTTI (`typeid`, `type_info`) are not implemented;
 `dynamic_cast` is, because the table the object already carries answers it. Two overloads that
 differ only in types py2bin cannot read are refused rather than guessed at.
 
+**What a build reads.** Nothing off the machine it runs on. Compiling a C or
+a C++ program opens the program's own files, py2bin's own source, and the
+interpreter running the build — and no third thing. There is no system include
+path, no host library is opened to read a symbol out of it, and no toolchain
+is looked for. `tests/test_bundles_use_no_system_files.py` says so the only way
+it can be said honestly: it watches every file-opening call while a build runs
+and compares what was touched against those three places, so a convenience
+fallback added later fails a test rather than the next machine.
+
+The names that *do* appear in the output — `/usr/lib/libSystem.B.dylib`,
+`/lib64/ld-linux-x86-64.so.2`, `KERNEL32.dll` — are written into the artifact,
+never read during the build. They name the target's own loader, which is what
+being a native executable for that target means, and they are the same names
+whichever machine did the building.
+
+**What it costs.** Translating C++ is the long pole, and it used to grow with
+the square of the program: reading brace depth counted from the first
+character each time it was asked, and the scan for which functions take a base
+pointer walked every definition once per method body. On a program of 320
+classes that was 8.9 seconds of CPU; it is 2.1 now, and the same three sweeps
+agree with `clang++` either way.
+
 **How it is checked.** One command, three questions:
 
 ```sh
@@ -872,13 +894,14 @@ your own file — every target, and the comparison — and is the thing to run
 before shipping.
 
 It does not run the cross-builds; five of the six machines are not this
-computer. 204 programs × 6 targets is 1224 builds, and the two projects are
+computer. 267 programs × 6 targets is 1602 builds, and the two projects are
 built for this machine and run.
 
 What is in the corpus is what broke at some point: enums, static members,
 nested classes, range-`for`, member initialiser lists, default arguments,
-named casts, `operator=`, deep inheritance, every header above, and a program
-for each container and each operator. `tools/cpp_differential.sh` still works
+named casts, `operator=`, deep inheritance, a container of base pointers, a
+string made from a literal, every header above, and a program for each
+container and each operator. `tools/cpp_differential.sh` still works
 and is the meaning half under its old name. The test suite additionally
 translates every corpus program on each change, so one that stops working is
 caught whether or not the sweep is run that day.
@@ -1134,6 +1157,23 @@ can. On macOS Nuitka declines that shape once pyobjc is in the graph
 program; for a plain program it builds one, 4.5 MB against py2bin's 9.5 MB
 `.dmg`, and pays 261 ms of unpacking on every run unless told to cache, or
 771 ms once and 38 ms after if it is.
+
+**What the one-file stub asks of the machine it runs on.** This is the one
+place in py2bin where an artifact reaches outside itself, and it is worth
+being exact about it. The stub is machine code and the payload travels inside
+it, but the unpacking is handed to the platform: on macOS and Linux the stub
+runs `/bin/sh -c` over a script that calls `mkdir`, `rm`, `rmdir`, `tar` and
+`printf`, and on Windows it starts PowerShell. Run one with `PATH` emptied and
+it stops at `mkdir: command not found`. Nothing is *read* from the machine at
+build time - the audit above holds for every bundle kind - and the runtime the
+bundle carries is its own copy, so this is a run-time dependency on five
+ordinary commands and not on anything installed. It is still a dependency, and
+the shape that removes it is a stub compiled from C by py2bin's own compiler:
+the file primitives it needs (`open`, `read`, `write`, `mkdir`, `rmdir`,
+`unlink`) are already in the C tier on all four POSIX targets, and Windows
+reaches the same ground through the `<windows.h>` imports. A directory bundle
+- anything without `--onefile` - has nothing to unpack and asks for none of
+this.
 
 ### How the targets are reached
 
