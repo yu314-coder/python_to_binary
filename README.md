@@ -676,13 +676,36 @@ C++ decides it: the narrowest pattern that fits. A type named outright beats
 one written around a parameter, `T **` beats `T *`, and `<T, T>` - which says
 the two arguments are the same type - beats `<T, U>`, which says nothing.
 
+**A parameter may stand for however many arguments are left.**
+`template <class... Ts>` is a pack: `sizeof...(Ts)` is how many there are,
+`Ts...` is the types, and a parameter declared `Rest... rest` becomes one
+parameter each. A pack of nothing is a pack. Recursion over one stops the way
+C++ stops it - an ordinary function is preferred to a copy of a template, so
+`total(int)` written out by hand is the end of `total(int, Rest...)`.
+
+**And a function's return type may decide whether it is a candidate at all.**
+
+```cpp
+template <class T>
+typename enable_if<is_pointer<T>::value, int>::type kind(T v) { return 1; }
+template <class T>
+typename enable_if<!is_pointer<T>::value, int>::type kind(T v) { return 2; }
+```
+
+Where the guard says no there is no `type` in it, and a function whose return
+type does not exist is not a candidate - another of the same name answers the
+call instead. That is what SFINAE means and it is what py2bin does: the guard
+is worked out for the arguments the call deduced, the class it names is
+written out, and if the member is not in it the copy is never made.
+
 **So `<type_traits>` is py2bin's own now**, written the way the standard
 describes each answer rather than the way a real library implements it: a
 general class that says no and a narrower one that says yes. `is_same`,
 `is_pointer`, `is_reference`, `is_const`, `is_void`, `is_integral`,
 `is_floating_point`, `is_signed`, `is_unsigned`, `remove_reference`,
 `remove_pointer`, `remove_const`, `remove_volatile`, `add_pointer`,
-`add_const`, `conditional`, `integral_constant`, `true_type`/`false_type`.
+`add_const`, `conditional`, `enable_if`, `integral_constant`, and
+`true_type`/`false_type`.
 It costs nothing at run time: the copies are made while translating and the
 answer is a constant before any code runs.
 

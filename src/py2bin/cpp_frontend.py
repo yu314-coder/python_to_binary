@@ -616,16 +616,24 @@ def _is_a_definition(text: str, close: int) -> bool:
     return rest.startswith("{")
 
 
-def _template_parameters(spelled: str) -> "list[tuple[str, bool]]":
-    """Each parameter as (name, is_a_type)."""
+def _template_parameters(spelled: str) -> "list[tuple[str, bool, bool]]":
+    """Each parameter as (name, is_a_type, is_a_pack).
 
-    found: list[tuple[str, bool]] = []
+    `class... Ts` is a pack: one parameter standing for however many
+    arguments are left, which is nought or more.
+    """
+
+    found: list[tuple[str, bool, bool]] = []
     for part in _split_arguments(spelled):
-        words = part.strip().split()
+        spelling = part.strip()
+        if not spelling:
+            continue
+        is_a_pack = "..." in spelling
+        words = spelling.replace("...", " ").split()
         if not words:
             continue
         is_a_type = words[0] in ("typename", "class")
-        found.append((words[-1], is_a_type))
+        found.append((words[-1], is_a_type, is_a_pack))
     return found
 
 
@@ -663,17 +671,110 @@ def _instantiated_name(name: str, arguments: "list[str]") -> str:
     return f"{name}__" + "_".join(spelled)
 
 
-def _substituted(body: str, names: "list[str]", arguments: "list[str]") -> str:
-    """Replace each template parameter with the argument given for it."""
+def _arity_fits(
+    parameters: "list[tuple[str, bool, bool]]", arguments: "list[str]"
+) -> bool:
+    """Whether this many arguments can fill these parameters.
 
-    for parameter, argument in zip(names, arguments):
+    Exactly as many, unless one of them is a pack - which stands for however
+    many are left over, including none at all.
+    """
+
+    if any(is_pack for _n, _t, is_pack in parameters):
+        return len(arguments) >= len(parameters) - 1
+    return len(arguments) == len(parameters)
+
+
+def _substituted(
+    body: str, parameters: "list[tuple[str, bool, bool]]", arguments: "list[str]"
+) -> str:
+    """Replace each template parameter with the argument given for it.
+
+    A pack stands for however many arguments are left rather than for one, so
+    it is not replaced but expanded: `sizeof...(Ts)` becomes how many there
+    are, `Ts...` becomes them separated by commas, and a parameter declared
+    `Ts... rest` becomes one declaration each.
+    """
+
+    packed = [(name, is_pack) for name, _is_type, is_pack in parameters]
+    fixed: "list[tuple[str, str]]" = []
+    pack_name = ""
+    pack_arguments: "list[str]" = []
+    at = 0
+    for index, (name, is_pack) in enumerate(packed):
+        if is_pack:
+            pack_name = name
+            pack_arguments = [a.strip() for a in arguments[at:]]
+            at = len(arguments)
+            continue
+        if at < len(arguments):
+            fixed.append((name, arguments[at].strip()))
+            at += 1
+    if pack_name:
+        body = _expanded_pack(body, pack_name, pack_arguments)
+    for parameter, argument in fixed:
         body = _map_code(
             body,
-            lambda part, p=parameter, a=argument.strip(): re.sub(
+            lambda part, p=parameter, a=argument: re.sub(
                 rf"\b{re.escape(p)}\b", a, part
             ),
         )
     return body
+
+
+#: `Ts... rest` - a parameter declared as however many the pack holds.
+def _expanded_pack(body: str, name: str, arguments: "list[str]") -> str:
+    """Write a pack out: one of everything it stands for, in order."""
+
+    # How many, first: `sizeof...(Ts)` is a number and nothing else in the
+    # body should see the name inside it.
+    body = _map_code(
+        body,
+        lambda part: re.sub(
+            rf"\bsizeof\s*\.\.\.\s*\(\s*{re.escape(name)}\s*\)",
+            str(len(arguments)),
+            part,
+        ),
+    )
+
+    # `Ts... rest` in a parameter list: one parameter for each, named apart.
+    held: "list[str]" = []
+
+    def declared(match: "re.Match[str]") -> str:
+        variable = match.group(1)
+        held.append(variable)
+        if not arguments:
+            return ""
+        return ", ".join(
+            f"{spelled} {variable}__{index}"
+            for index, spelled in enumerate(arguments)
+        )
+
+    body = _map_code(
+        body,
+        lambda part: re.sub(
+            rf"\b{re.escape(name)}\s*\.\.\.\s*([A-Za-z_]\w*)", declared, part
+        ),
+    )
+    # `rest...` where the values are used: the names just written.
+    for variable in dict.fromkeys(held):
+        body = _map_code(
+            body,
+            lambda part, v=variable: re.sub(
+                rf"\b{re.escape(v)}\s*\.\.\.",
+                ", ".join(f"{v}__{index}" for index in range(len(arguments))),
+                part,
+            ),
+        )
+    # And `Ts...` on its own, which is the types.
+    body = _map_code(
+        body,
+        lambda part: re.sub(
+            rf"\b{re.escape(name)}\s*\.\.\.", ", ".join(arguments), part
+        ),
+    )
+    # A pack with nothing in it leaves `f(a, )` behind.
+    return _map_code(body, lambda part: re.sub(r",\s*\)", ")", part))
 
 
 #: What a literal is. `1` is an int, `1.0` a double, `"s"` a `const char *`.
@@ -1109,10 +1210,22 @@ def _deduce_arguments(
     """
 
     wanted = [part.strip() for part in _split_arguments(declared) if part.strip()]
-    if len(wanted) != len(given):
+    pack = next((name for name, _t, is_pack in parameters if is_pack), "")
+    tail: "list[str]" = []
+    if pack:
+        # A pack takes whatever is left over, so the declared parameters
+        # before it have to match one for one and the rest are its.
+        spelled = next(
+            (index for index, part in enumerate(wanted) if "..." in part), -1
+        )
+        if spelled < 0 or len(given) < spelled:
+            return None
+        tail = given[spelled:]
+        wanted, given = wanted[:spelled], given[:spelled]
+    elif len(wanted) != len(given):
         return None
     found: dict[str, str] = {}
-    names = {name for name, is_type in parameters if is_type}
+    names = {name for name, is_type, _pack in parameters if is_type}
     for part, argument in zip(wanted, given):
         stars = part.count("*")
         words = part.replace("*", " * ").replace("&", " ").split()
@@ -1137,9 +1250,26 @@ def _deduce_arguments(
                 peeled = peeled[::-1].replace("*", "", 1)[::-1].strip()
             deduced = peeled
         found[named] = deduced
-    if len(found) != len([1 for _n, is_type in parameters if is_type]):
+    if pack:
+        held: "list[str]" = []
+        for argument in tail:
+            deduced = _deduced_type(argument, text, before)
+            if deduced is None:
+                return None
+            held.append(deduced)
+        found[pack] = ""  # counted below; the values are spliced in instead
+        if len(found) != len([1 for _n, is_type, _p in parameters if is_type]):
+            return None
+        answer: "list[str]" = []
+        for name, _is_type, is_pack in parameters:
+            if is_pack:
+                answer.extend(held)
+            else:
+                answer.append(found[name])
+        return answer
+    if len(found) != len([1 for _n, is_type, _p in parameters if is_type]):
         return None
-    return [found[name] for name, _is_type in parameters]
+    return [found[name] for name, _is_type, _pack in parameters]
 
 
 # --- lambdas ---------------------------------------------------------------
@@ -2885,9 +3015,7 @@ def _member_copies(
             continue
         named = _instantiated_name(name, deduced)
         if named not in made:
-            copy = _substituted(
-                pattern, [held for held, _is_type in parameters], deduced
-            )
+            copy = _substituted(pattern, parameters, deduced)
             made[named] = _map_code(
                 copy,
                 lambda part, n=name, s=named: re.sub(
@@ -3117,7 +3245,7 @@ def _narrower_copy(
     for parameters, shapes, body, keyword in entries:
         if len(shapes) != len(arguments):
             continue
-        names = {name for name, _is_type in parameters}
+        names = {name for name, _is_type, _pack in parameters}
         bound: "dict[str, str]" = {}
         if not all(
             _fits_the_shape(shape, argument, names, bound)
@@ -3132,6 +3260,198 @@ def _narrower_copy(
         if score > best_score:
             best, best_score = (parameters, shapes, body, keyword, bound), score
     return best
+
+
+
+#: `typename enable_if<C, T>::type name(params) {` - a function whose return
+#: type is a question asked about its own template arguments. Where the
+#: answer is that there is no such type, the function is not a candidate at
+#: all and another of the same name is used instead. That is the whole of
+#: what SFINAE is for in practice, and the whole of what is implemented.
+_GUARDED_HEAD = re.compile(r"(?:typename\s+)?([A-Za-z_]\w*)\s*<")
+
+
+def _guarded_definition(text: str) -> "dict | None":
+    """Read `typename Guard<...>::member name(params) {`, or answer None."""
+
+    head = _GUARDED_HEAD.match(text)
+    if head is None:
+        return None
+    shut = _closing_angle(text, head.end() - 1)
+    if shut < 0:
+        return None
+    rest = text[shut + 1:]
+    tail = re.match(
+        r"\s*::\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*\{",
+        rest,
+    )
+    if tail is None:
+        return None
+    return {
+        "guard": head.group(1),
+        "arguments": text[head.end(): shut],
+        "member": tail.group(1),
+        "name": tail.group(2),
+        "parameters": tail.group(3),
+        "opens": shut + 1 + tail.end() - 1,
+    }
+
+
+def _member_of(copy: str, member: str) -> "str | None":
+    """What a made class calls `member`, or None where it has no such name."""
+
+    typedef = re.search(
+        rf"\btypedef\s+(.+?)\s+{re.escape(member)}\s*;", copy, re.S
+    )
+    if typedef is not None:
+        return typedef.group(1).strip()
+    constant = re.search(
+        rf"\b{re.escape(member)}\s*=\s*([^;]+);", copy
+    )
+    return constant.group(1).strip() if constant is not None else None
+
+
+def _settled(spelled: str, made: "dict[str, str]") -> "str | None":
+    """Work an instantiated constant down to what it is, or answer None.
+
+    `is_pointer<int>::value` is a class that has been written out and a name
+    in it; `!` in front of one turns it around. Anything else is handed back
+    as it stands, which is what a plain `true` or a number is already.
+    """
+
+    spelled = spelled.strip()
+    negated = False
+    while spelled.startswith("!"):
+        negated = not negated
+        spelled = spelled[1:].strip()
+    asked = re.match(r"^([A-Za-z_]\w*)\s*<", spelled)
+    if asked is not None:
+        shut = _closing_angle(spelled, asked.end() - 1)
+        after = re.match(r"\s*::\s*([A-Za-z_]\w*)\s*$", spelled[shut + 1:])
+        if shut < 0 or after is None:
+            return None
+        inside = [
+            a.strip()
+            for a in _split_arguments(spelled[asked.end(): shut])
+            if a.strip()
+        ]
+        copy = made.get(_instantiated_name(asked.group(1), inside))
+        if copy is None:
+            return None
+        spelled = _member_of(copy, after.group(1))
+        if spelled is None:
+            return None
+    spelled = spelled.strip()
+    # One spelling for a yes and one for a no, because the name a copy is
+    # made under is built out of this: `true` and `1` are the same answer,
+    # and two names for it are two copies of the same class.
+    if spelled in ("true", "1"):
+        spelled = "0" if negated else "1"
+    elif spelled in ("false", "0"):
+        spelled = "1" if negated else "0"
+    elif negated:
+        return None
+    return spelled
+
+
+
+#: Answered where a guard cannot be settled yet, as against not at all.
+_LATER = object()
+
+
+def _guard_asked(
+    parameters: "list[tuple[str, bool, bool]]",
+    arguments: "list[str]",
+    pattern: str,
+) -> "tuple[str, list[str], str] | None":
+    """The guard a pattern asks, with this call's arguments put in."""
+
+    read = _guarded_definition(pattern)
+    if read is None:
+        return None
+    spelled = _substituted(read["arguments"], parameters, arguments)
+    inside = [a.strip() for a in _split_arguments(spelled) if a.strip()]
+    return read["guard"], inside, read["member"]
+
+
+def _asked_by_the_guard(
+    parameters: "list[tuple[str, bool, bool]]",
+    arguments: "list[str]",
+    pattern: str,
+) -> "list[tuple[str, list[str]]]":
+    """Every class a guard has to have written out before it can answer."""
+
+    asked = _guard_asked(parameters, arguments, pattern)
+    if asked is None:
+        return []
+    guard, inside, _member = asked
+    wanted: "list[tuple[str, list[str]]]" = []
+    for part in inside:
+        spelled = part.strip().lstrip("!").strip()
+        named = re.match(r"^([A-Za-z_]\w*)\s*<", spelled)
+        if named is None:
+            continue
+        shut = _closing_angle(spelled, named.end() - 1)
+        if shut < 0:
+            continue
+        wanted.append(
+            (
+                named.group(1),
+                [
+                    a.strip()
+                    for a in _split_arguments(spelled[named.end(): shut])
+                    if a.strip()
+                ],
+            )
+        )
+    return wanted
+
+
+def _guarded_copy(
+    name: str,
+    named: str,
+    parameters: "list[tuple[str, bool, bool]]",
+    arguments: "list[str]",
+    pattern: str,
+    made: "dict[str, str]",
+):
+    """The copy for a guarded function, or None where the guard says no.
+
+    `_LATER` where the classes the guard asks about have not been written
+    out yet, which is how the rounds get told to come back to it.
+    """
+
+    read = _guarded_definition(pattern)
+    asked = _guard_asked(parameters, arguments, pattern)
+    if read is None or asked is None:
+        return None
+    guard, inside, member = asked
+    settled: "list[str]" = []
+    for part in inside:
+        answer = _settled(part, made)
+        if answer is None:
+            return _LATER
+        settled.append(answer)
+    copy = made.get(_instantiated_name(guard, settled))
+    if copy is None:
+        # The guard itself, once its arguments are numbers rather than
+        # questions. Asked for by the caller and looked at again next round.
+        return _LATER
+    returns = _member_of(copy, member)
+    if returns is None:
+        return None
+    body = _substituted(pattern[read["opens"]:], parameters, arguments)
+    return f"{returns} {named}({_substituted(read['parameters'], parameters, arguments)}) {body}"
+
+
+class _Declared:
+    """A parameter list, wearing the face a match object wears."""
+
+    def __init__(self, spelled: str) -> None:
+        self._spelled = spelled
+
+    def group(self, which: int) -> str:
+        return self._spelled
 
 
 def _expand_templates(text: str, filename: str) -> str:
@@ -3206,6 +3526,14 @@ def _expand_templates(text: str, filename: str) -> str:
             )
             cut.append((match.start(), match.end() + closing + 1))
             continue
+        guarded = _guarded_definition(rest)
+        if guarded is not None and _DEFINITION.match(rest) is None:
+            closing = _matching(rest, guarded["opens"])
+            patterns.setdefault(guarded["name"], []).append(
+                (parameters, "guarded", rest[:closing])
+            )
+            cut.append((match.start(), match.end() + closing))
+            continue
         definition = _DEFINITION.match(rest)
         if definition is None:
             raise CppTranslationError(
@@ -3237,7 +3565,26 @@ def _expand_templates(text: str, filename: str) -> str:
     kept.append(text[at:])
     text = "".join(kept)
 
+    #: The ordinary functions left once the patterns are cut out, and how
+    #: many arguments each takes. C++ prefers one of these to a copy of a
+    #: template when both would do - which is what makes a variadic recursion
+    #: stop: `total(int)` written out by hand is the end of it, and without
+    #: this the pattern answered the last call with an empty pack and asked
+    #: for a `total()` that nothing declares.
+    ordinary: "dict[str, set[int]]" = {}
+    for definition in _DEFINITION.finditer(_without_literals(text)):
+        if _depth_at(text, definition.start()) != 0:
+            continue
+        ordinary.setdefault(definition.group(2), set()).add(
+            len([a for a in _split_arguments(definition.group(3)) if a.strip()])
+        )
+
     made: "dict[str, str]" = dict(written)
+    #: Candidates whose return type turned out not to exist. Kept so the
+    #: rounds do not ask for them again for ever.
+    refused: "set[tuple[str, tuple[str, ...]]]" = set()
+    #: Instantiations a guard needs before it can be answered.
+    pending: "list[tuple[str, list[str]]]" = []
     # Repeated, because a copy may itself name a template - `Stack<Pair<int>>`
     # asks for `Pair<int>` too, and the inner one is only visible once the
     # outer has been written out.
@@ -3257,13 +3604,14 @@ def _expand_templates(text: str, filename: str) -> str:
         unread: list[tuple[str, int]] = []
         for name, entries in patterns.items():
           for parameters, kind, pattern_text in entries:
-            if kind != "function":
+            if kind not in ("function", "guarded"):
                 continue
             # A call that did not spell the arguments out: `twice(5)` rather
             # than `twice<int>(5)`. What it means is read off the arguments.
-            declared = _DEFINITION.match(pattern_text)
-            if declared is None:
+            spelled = _spelled_parameters(kind, pattern_text)
+            if spelled is None:
                 continue
+            declared = _Declared(spelled)
             for call in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", region):
                 close = _closing_paren(region, call.end() - 1)
                 if close < 0:
@@ -3282,6 +3630,8 @@ def _expand_templates(text: str, filename: str) -> str:
                     # never `std::find`, whatever the template would deduce.
                     continue
                 given = _call_arguments(region, call.end() - 1)
+                if len(given) in ordinary.get(name, ()):
+                    continue  # an ordinary function of that name takes this
                 deduced = _deduce_arguments(
                     parameters, declared.group(3), given, scope, call.start()
                 )
@@ -3299,7 +3649,10 @@ def _expand_templates(text: str, filename: str) -> str:
                 close = _closing_angle(region, found.end() - 1)
                 if close < 0:
                     continue
-                arguments = _split_arguments(region[found.end(): close])
+                arguments = [
+                    a for a in _split_arguments(region[found.end(): close])
+                    if a.strip()
+                ]
                 if any(
                     re.search(
                         rf"(?<![.\w>]){re.escape(other)}\s*<", ",".join(arguments)
@@ -3319,12 +3672,19 @@ def _expand_templates(text: str, filename: str) -> str:
                 for entry in patterns[name]:
                     # `entry[0]` is the parameter list already read, not the
                     # text it was read from.
-                    if len(entry[0]) == len(arguments):
+                    if _arity_fits(entry[0], arguments):
                         asked.append(
                             (name, [a.strip() for a in arguments], entry)
                         )
                         break
         return asked, unread
+
+    def _spelled_parameters(kind: str, pattern_text: str) -> "str | None":
+        if kind == "guarded":
+            read = _guarded_definition(pattern_text)
+            return None if read is None else read["parameters"]
+        declared = _DEFINITION.match(pattern_text)
+        return None if declared is None else declared.group(3)
 
     def point(region: str, scope: str) -> str:
         """Send every use in this region to the copy written for it.
@@ -3348,7 +3708,9 @@ def _expand_templates(text: str, filename: str) -> str:
             if close < 0:
                 continue
             arguments = [
-                a.strip() for a in _split_arguments(region[found.end(): close])
+                a.strip()
+                for a in _split_arguments(region[found.end(): close])
+                if a.strip()
             ]
             named = _instantiated_name(found.group(1), arguments)
             if named not in made:
@@ -3362,11 +3724,12 @@ def _expand_templates(text: str, filename: str) -> str:
         # The same for the calls that named no arguments at all.
         for name, entries in patterns.items():
           for parameters, kind, pattern_text in entries:
-            if kind != "function":
+            if kind not in ("function", "guarded"):
                 continue
-            declared = _DEFINITION.match(pattern_text)
-            if declared is None:
+            spelled = _spelled_parameters(kind, pattern_text)
+            if spelled is None:
                 continue
+            declared = _Declared(spelled)
             out = []
             at = 0
             for call in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", region):
@@ -3378,6 +3741,8 @@ def _expand_templates(text: str, filename: str) -> str:
                 if _hidden_by_a_member(_member_spans(region), name, call.start()):
                     continue
                 given = _call_arguments(region, call.end() - 1)
+                if len(given) in ordinary.get(name, ()):
+                    continue  # an ordinary function of that name takes this
                 deduced = _deduce_arguments(
                     parameters, declared.group(3), given, scope, call.start()
                 )
@@ -3407,10 +3772,22 @@ def _expand_templates(text: str, filename: str) -> str:
             asked, _unread = uses(copy, scope)
             wanted.extend(asked)
 
+        for wanted_name, wanted_arguments in pending:
+            for entry in patterns.get(wanted_name, ()):
+                if _arity_fits(entry[0], wanted_arguments):
+                    wanted.append((wanted_name, wanted_arguments, entry))
+                    break
+            else:
+                if wanted_name in narrower:
+                    wanted.append(
+                        (wanted_name, wanted_arguments, ([], "class", ""))
+                    )
+        pending = []
         fresh = [
             (name, arguments, entry)
             for name, arguments, entry in wanted
             if _instantiated_name(name, arguments) not in made
+            and (name, tuple(arguments)) not in refused
         ]
         for name, arguments, entry in fresh:
             parameters, kind, pattern = entry
@@ -3425,8 +3802,8 @@ def _expand_templates(text: str, filename: str) -> str:
                 named = _instantiated_name(name, arguments)
                 copy = _substituted(
                     f"{keyword} {name} {body};",
-                    [p for p, _is_type in narrow_parameters],
-                    [bound[p] for p, _is_type in narrow_parameters],
+                    narrow_parameters,
+                    [bound[p] for p, _is_type, _pack in narrow_parameters],
                 )
                 copy = _map_code(
                     copy,
@@ -3436,7 +3813,7 @@ def _expand_templates(text: str, filename: str) -> str:
                 )
                 made[named] = copy
                 continue
-            if len(arguments) != len(parameters):
+            if not _arity_fits(parameters, arguments):
                 raise CppTranslationError(
                     filename,
                     _line_of(text, text.index(name)),
@@ -3444,17 +3821,58 @@ def _expand_templates(text: str, filename: str) -> str:
                     f"and is used here with {len(arguments)}",
                 )
             named = _instantiated_name(name, arguments)
+            if kind == "guarded":
+                answered = _guarded_copy(
+                    name, named, parameters, arguments, pattern, made
+                )
+                if answered is _LATER:
+                    # The class the guard asks about has not been written out
+                    # yet. Asked for below, and this candidate is looked at
+                    # again next round.
+                    for wanted_name, wanted_arguments in _asked_by_the_guard(
+                        parameters, arguments, pattern
+                    ):
+                        pending.append((wanted_name, wanted_arguments))
+                    asked = _guard_asked(parameters, arguments, pattern)
+                    if asked is not None:
+                        guard, inside, _member = asked
+                        settled = [_settled(part, made) for part in inside]
+                        if all(part is not None for part in settled):
+                            pending.append((guard, settled))
+                    continue
+                if answered is None:
+                    # No such type, so this one is not a candidate at all.
+                    # Another of the same name answers the call, and if none
+                    # does the call is reported where it is written.
+                    refused.add((name, tuple(arguments)))
+                    continue
+                made[named] = answered
+                continue
             copy = _substituted(
-                pattern, [p for p, _is_type in parameters], arguments
+                pattern, parameters, arguments
             )
-            # Rename the pattern itself, and the constructors and destructors
-            # inside it, which are spelled with the class's own name.
-            copy = _map_code(
-                copy,
-                lambda part, n=name, s=named: re.sub(
-                    rf"(?<![.\w>]){re.escape(n)}\b(?!\s*<)", s, part
-                ),
-            )
+            if kind == "function":
+                # Only the name in the head. A function template may call
+                # itself, and a recursive call is not a call to this copy:
+                # `total(rest...)` inside the copy for three arguments is a
+                # call for two, which is a different copy. Renamed wholesale,
+                # every step of a variadic recursion called itself with one
+                # argument fewer than it takes, and the copy it should have
+                # reached was never asked for.
+                head = _DEFINITION.match(copy)
+                if head is not None:
+                    copy = (
+                        copy[: head.start(2)] + named + copy[head.end(2):]
+                    )
+            else:
+                # A class, where the name inside it is the constructors and
+                # the destructors, which are spelled with the class's own.
+                copy = _map_code(
+                    copy,
+                    lambda part, n=name, s=named: re.sub(
+                        rf"(?<![.\w>]){re.escape(n)}\b(?!\s*<)", s, part
+                    ),
+                )
             made[named] = copy
 
         scope = text + "\n" + "\n".join(made.values())
@@ -11385,6 +11803,15 @@ template <class T> struct add_const { typedef const T type; };
 
 template <bool B, class T, class F> struct conditional { typedef T type; };
 template <class T, class F> struct conditional<false, T, F> { typedef F type; };
+
+/* The one a function's return type is written as. When the answer is false
+   there is no `type` in it at all, which is what takes the function out of
+   the running rather than making it an error - the whole point of the
+   thing, and why it is spelled the way it is. */
+template <bool B, class T> struct enable_if {};
+template <class T> struct enable_if<true, T> { typedef T type; };
+
+template <class... Ts> struct how_many { static const int value = sizeof...(Ts); };
 
 }
 

@@ -319,14 +319,14 @@ int main() {
     def test_a_parameter_named_twice_has_to_match_twice(self):
         from py2bin.cpp_frontend import _narrower_copy
 
-        entries = [([("T", True)], ["T", "T"], "{ int a; }", "struct")]
+        entries = [([("T", True, False)], ["T", "T"], "{ int a; }", "struct")]
         self.assertIsNotNone(_narrower_copy(entries, ["int", "int"]))
         self.assertIsNone(_narrower_copy(entries, ["int", "char"]))
 
     def test_a_shape_that_does_not_fit_is_not_used(self):
         from py2bin.cpp_frontend import _narrower_copy
 
-        entries = [([("T", True)], ["T *"], "{ int a; }", "struct")]
+        entries = [([("T", True, False)], ["T *"], "{ int a; }", "struct")]
         self.assertIsNotNone(_narrower_copy(entries, ["int *"]))
         self.assertIsNone(_narrower_copy(entries, ["int"]))
 
@@ -352,6 +352,77 @@ int main() {
             "int main() { return A::value; }\n"
         )
         self.assertIn("__empty", out)
+
+
+class PacksAndGuards(unittest.TestCase):
+    """A parameter standing for however many, and a return type that decides
+    whether the function is a candidate at all."""
+
+    def test_a_pack_is_counted(self):
+        out = with_headers(
+            "template <class... Ts> struct arity "
+            "{ static const int value = sizeof...(Ts); };\n"
+            "int main() { return arity<int, char, double>::value; }\n"
+        )
+        self.assertIn("arity__int_char_double__value = 3", out)
+
+    def test_a_pack_may_stand_for_nothing(self):
+        out = with_headers(
+            "template <class... Ts> struct arity "
+            "{ static const int value = sizeof...(Ts); };\n"
+            "int main() { return arity<>::value; }\n"
+        )
+        self.assertIn("= 0", out)
+
+    def test_a_recursive_pack_stops_on_the_ordinary_function(self):
+        """C++ prefers an ordinary function to a copy of a template, which is
+        what ends the recursion. Renamed wholesale, each copy called itself
+        with one argument fewer than it takes."""
+
+        out = with_headers(
+            "static int total(int a) { return a; }\n"
+            "template <class... Rest> static int total(int a, Rest... rest) "
+            "{ return a + total(rest...); }\n"
+            "int main() { return total(1, 2, 3); }\n"
+        )
+        self.assertIn("total__int_int(", out)
+        self.assertIn("total__int(", out)
+        # The two-argument copy calls the one-argument copy, not itself.
+        two = out[out.index("total__int_int("):]
+        self.assertIn("total__int(", two[: two.index("}")])
+
+    def test_a_guard_that_says_no_takes_the_function_out_of_the_running(self):
+        out = with_headers(
+            "template <bool B, class T> struct enable_if {};\n"
+            "template <class T> struct enable_if<true, T> { typedef T type; };\n"
+            "template <class T> struct is_pointer "
+            "{ static const bool value = false; };\n"
+            "template <class T> struct is_pointer<T *> "
+            "{ static const bool value = true; };\n"
+            "template <class T> typename enable_if<is_pointer<T>::value, int>::type"
+            " kind(T v) { return 1; }\n"
+            "template <class T> typename enable_if<!is_pointer<T>::value, int>::type"
+            " kind(T v) { return 2; }\n"
+            "int main() { int n = 5; return kind(&n) + kind(n); }\n"
+        )
+        # One copy per call, each from the pattern whose guard held.
+        self.assertIn("kind__int_p", out)
+        self.assertIn("kind__int", out)
+        self.assertNotIn("enable_if", out.split("int main")[-1])
+
+    def test_a_boolean_has_one_spelling(self):
+        """`true` and `1` are the same answer, and a copy is named after it -
+        two spellings made two copies of the same class."""
+
+        from py2bin.cpp_frontend import _settled
+
+        made = {"is_pointer__int": "struct is_pointer__int "
+                                   "{ static const bool value = false; };"}
+        self.assertEqual(_settled("is_pointer<int>::value", made), "0")
+        self.assertEqual(_settled("!is_pointer<int>::value", made), "1")
+        self.assertEqual(_settled("true", made), "1")
+        self.assertEqual(_settled("!false", made), "1")
+        self.assertIsNone(_settled("is_pointer<char>::value", made))
 
 
 if __name__ == "__main__":
