@@ -591,7 +591,7 @@ class Preprocessor:
                 # keeps every branch of this group dark, whatever it says.
                 conditions.append(_Condition(False, False, False, False, name_token))
                 return
-            value = self._condition(name, rest, name_token)
+            value = self._condition(name, rest, name_token, directory)
             conditions.append(
                 _Condition(
                     True, value, value, False, name_token,
@@ -610,7 +610,7 @@ class Preprocessor:
                 if condition.outer:
                     condition.tried.append((f"#elif {_respaced(rest)}", False))
                 return
-            value = self._condition("if", rest, name_token)
+            value = self._condition("if", rest, name_token, directory)
             condition.active = value
             condition.taken = condition.taken or value
             condition.tried.append((f"#elif {_respaced(rest)}", value))
@@ -928,6 +928,15 @@ class Preprocessor:
             name_token,
         )
 
+    def _search_path(self, directory: "Path | None") -> "list[Path]":
+        """Every directory an include is looked for in, nearest first.
+
+        The asking file's own comes first, the way it does for an include
+        written with quotes - which is what `__has_include` is asking about.
+        """
+
+        return [*([] if directory is None else [directory]), *self.include_dirs]
+
     def _include(self, rest: list[PPToken], at: PPToken, directory: Path | None) -> None:
         name, angled = self._header_name(rest, at)
         if name is None:
@@ -1038,7 +1047,13 @@ class Preprocessor:
 
     # --- conditionals ---
 
-    def _condition(self, name: str, rest: list[PPToken], at: PPToken) -> bool:
+    def _condition(
+        self,
+        name: str,
+        rest: list[PPToken],
+        at: PPToken,
+        directory: "Path | None" = None,
+    ) -> bool:
         if name in ("ifdef", "ifndef"):
             if not rest or rest[0].kind != "identifier":
                 self.error(f"#{name} needs a macro name", at)
@@ -1049,7 +1064,7 @@ class Preprocessor:
         if not rest:
             self.error("#if needs an expression", at)
         tokens = self.expand(self._defined(rest, at))
-        return _Evaluator(tokens, at).run() != 0
+        return _Evaluator(tokens, at, self._search_path(directory)).run() != 0
 
     def _defined(self, rest: list[PPToken], at: PPToken) -> list[PPToken]:
         """Apply the ``defined`` operator before anything is macro-expanded."""
@@ -2560,6 +2575,27 @@ _SAL_H = """
 """
 
 
+#: The operators a header uses to ask a compiler what it can do. Each takes
+#: an argument, so none of them can be left to the rule that turns an unknown
+#: identifier into 0 - that leaves the `(` behind, and a standard C++ header
+#: stops on its first line of feature detection.
+_ASKS_WHAT_THIS_COMPILER_HAS = frozenset(
+    {
+        "__has_include",
+        "__has_include_next",
+        "__has_feature",
+        "__has_extension",
+        "__has_builtin",
+        "__has_attribute",
+        "__has_c_attribute",
+        "__has_cpp_attribute",
+        "__has_declspec_attribute",
+        "__has_keyword",
+        "__is_identifier",
+        "__has_unique_object_representations",
+    }
+)
+
 #: Where `--auto-fetch` keeps what it downloaded. Named here rather than
 #: imported, because the fetcher imports this module for the list of headers
 #: py2bin ships and the two would chase each other.
@@ -2773,11 +2809,19 @@ class _Evaluator:
     #: Python stack it is written on.
     MAXIMUM_NESTING = 200
 
-    def __init__(self, tokens: list[PPToken], at: PPToken):
+    def __init__(
+        self,
+        tokens: list[PPToken],
+        at: PPToken,
+        look_in: "list[Path] | None" = None,
+    ):
         self.tokens = tokens
         self.index = 0
         self.at = at
         self.depth = 0
+        #: Where `__has_include` looks, in order. The directory of the file
+        #: asking comes first, as it does for an include written with quotes.
+        self.look_in = look_in if look_in is not None else []
 
     def deeper(self) -> None:
         self.depth += 1
@@ -2949,11 +2993,64 @@ class _Evaluator:
                     "undefined; write it directly in the #if",
                     token,
                 )
+            if token.spelling in _ASKS_WHAT_THIS_COMPILER_HAS:
+                return self.what_this_compiler_has(token)
             # C11 6.10.1p4: every identifier that is left is replaced by 0.
             return _Number(0, False)
         if token.kind in ("number", "character"):
             return self.constant(token)
         self.error(f"unexpected {token.spelling!r} in a #if expression", token)
+
+    def what_this_compiler_has(self, token: PPToken) -> _Number:
+        """`__has_feature(x)` and its family, which take an argument.
+
+        Left as an ordinary identifier each became 0, and the `(` after it
+        was then a stray - which is what stopped a standard C++ header at its
+        first line of feature detection. They are operators, not macros: a
+        compiler answers them about itself, and every compiler that does not
+        have one still has to read past the argument.
+
+        py2bin answers no to all of them but `__has_include`, which it can
+        answer truthfully by looking. Saying no is what makes a library take
+        the portable path it keeps for compilers without the extension, which
+        is the path py2bin wants.
+        """
+
+        if self.spelling() != "(":
+            self.error(f"{token.spelling!r} takes a parenthesised argument", token)
+        self.index += 1
+        depth = 1
+        inside: "list[PPToken]" = []
+        while depth:
+            here = self.token
+            if here is None:
+                self.error(f"this {token.spelling!r} has no ')'", token)
+            if here.kind == "punctuator" and here.spelling == "(":
+                depth += 1
+            elif here.kind == "punctuator" and here.spelling == ")":
+                depth -= 1
+                if not depth:
+                    self.index += 1
+                    break
+            inside.append(here)
+            self.index += 1
+        if token.spelling != "__has_include":
+            return _Number(0, False)
+        return _Number(int(self.can_find_header(inside)), False)
+
+    def can_find_header(self, inside: "list[PPToken]") -> bool:
+        """Whether `__has_include`'s argument names a header that is there."""
+
+        spelled = "".join(item.spelling for item in inside).strip()
+        if spelled.startswith("<") and spelled.endswith(">"):
+            name, angled = spelled[1:-1], True
+        elif len(spelled) >= 2 and spelled[0] == spelled[-1] == '"':
+            name, angled = spelled[1:-1], False
+        else:
+            return False
+        if name in _BUILTIN_HEADERS:
+            return True
+        return any((folder / name).is_file() for folder in self.look_in)
 
     def constant(self, token: PPToken) -> _Number:
         converted = _convert(token, lambda message, item: self.error(message, item))

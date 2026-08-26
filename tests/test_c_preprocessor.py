@@ -1106,6 +1106,50 @@ int main(void) {
                 f"{owner} is not {slots} slots deep",
             )
 
+    def test_a_header_may_ask_what_this_compiler_has(self):
+        """`__has_feature(x)` and its family take an argument, so leaving each
+        to the rule that turns an unknown identifier into 0 left the `(`
+        behind - which stopped libc++'s <type_traits> on its first line of
+        feature detection, at
+
+            #if __has_feature(is_union) || (_GNUC_VER >= 403)
+        """
+
+        self.assertEqual(
+            expand(
+                "#if __has_feature(is_union) || (_GNUC_VER >= 403)\n"
+                "no\n"
+                "#else\n"
+                "yes\n"
+                "#endif\n"
+            ),
+            "yes",
+        )
+        for asking in (
+            "__has_builtin(__builtin_expect)",
+            "__has_attribute(always_inline)",
+            "__has_cpp_attribute(nodiscard)",
+            "__has_extension(c_atomic)",
+            "__has_declspec_attribute(dllimport)",
+            "__has_keyword(constexpr)",
+        ):
+            with self.subTest(asking=asking):
+                self.assertEqual(
+                    expand(f"#if {asking}\nno\n#else\nyes\n#endif\n"), "yes"
+                )
+
+    def test_has_include_is_answered_by_looking(self):
+        self.assertEqual(
+            expand("#if __has_include(<stdio.h>)\nyes\n#else\nno\n#endif\n"),
+            "yes",
+        )
+        self.assertEqual(
+            expand(
+                "#if __has_include(<nowhere_at_all.h>)\nno\n#else\nyes\n#endif\n"
+            ),
+            "yes",
+        )
+
     def test_a_piece_still_says_it_is_for_windows(self):
         with self.assertRaises(Exception) as caught:
             self.compile_for_windows(

@@ -11076,6 +11076,12 @@ _ANY_INCLUDE = re.compile(
     r'#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)'
 )
 
+def _line_of(text: str, index: int) -> int:
+    """Which line `index` falls on, counting from one."""
+
+    return text.count("\n", 0, index) + 1
+
+
 #: A header that declares one thing or another according to a macro.
 _CHOOSES_A_BRANCH = re.compile(r"(?m)^[ \t]*#[ \t]*(?:else|elif)\b")
 
@@ -11144,6 +11150,29 @@ def inline_local_includes(
         if supplied is not None:
             return supplied
         if match.group(2) is not None:
+            # Angled, so the file's own directory is not searched - which
+            # is the rule C gives and matters here, because a fetch leaves
+            # its copy right beside the program.
+            if "." not in named and not any(
+                (Path(folder) / named).is_file() for folder in include_dirs
+            ):
+                # A C++ standard header, spelled the way only those are, that
+                # py2bin does not implement. Left to be fetched, what arrives
+                # is a real standard library's copy - written in namespaces,
+                # SFINAE and partial specialisation, none of which this
+                # subset has - and it fails somewhere deep inside itself
+                # about something that is not the reason.
+                raise CppTranslationError(
+                    str(path),
+                    _line_of(text, match.start()),
+                    f"<{named}> is a C++ standard header py2bin does not "
+                    f"implement. A copy fetched from a real standard library "
+                    f"is written in C++ this subset does not have, so it "
+                    f"would fail somewhere inside itself rather than here. "
+                    f"py2bin ships "
+                    f"{', '.join(sorted(h for h in _BUILTIN_CPP_HEADERS if '.' not in h))}; "
+                    f"name a directory with --include DIR to use your own.",
+                )
             # Angled and not one of py2bin's own: the preprocessor's.
             return match.group(0)
         for folder in (path.parent, *(Path(d) for d in include_dirs)):

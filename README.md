@@ -658,6 +658,24 @@ enumeration constant may now stand in a constant expression, which is how a
 generated enum is written (each entry is the one before it plus one), and an
 enumerator may be `0xffffffff`, which is how a flag enum spells all its bits.
 
+**A header may ask what this compiler has.** `__has_feature(x)`,
+`__has_builtin`, `__has_attribute`, `__has_cpp_attribute` and the rest are
+operators rather than macros: they take an argument, and a compiler that does
+not have the thing still has to read past it. Left to the rule that turns an
+unknown identifier into 0, each became `0(x)` and the `(` was a stray - which
+stopped a standard C++ header on its first line of feature detection.
+py2bin answers no to all of them, which is what makes a library take the
+portable path it keeps for compilers without the extension, and answers
+`__has_include` truthfully by looking.
+
+**A standard C++ header py2bin does not implement now says so.** `<type_traits>`
+fetched from a real standard library is written in namespaces, SFINAE and
+partial specialisation - none of which this subset has - so it used to fail
+somewhere deep inside itself about something that was not the reason. A
+header spelled the way only a standard one is, that py2bin does not ship and
+that no `--include` directory holds, is refused with the list of the ones it
+does ship. Your own copy under `--include` still wins.
+
 **A header that chooses a branch is not the translator's to read.** The C++
 translator runs before the preprocessor and has no `#if`, so pasting one in
 meant translating both branches - and the branch meant for C is written in
