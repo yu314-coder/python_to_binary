@@ -784,13 +784,43 @@ class RejectionTests(PreprocessorTestCase):
             "#warning hmm\nint main(void) { return 0; }\n", "#warning is not implemented"
         )
         self.reject(
-            "#pragma pack(1)\nint main(void) { return 0; }\n",
-            "the only #pragma py2bin implements is 'once'",
+            "#pragma unheard_of\nint main(void) { return 0; }\n",
+            "#pragma unheard_of is not implemented",
         )
         self.reject(
             "#unheard_of\nint main(void) { return 0; }\n",
             "unknown preprocessing directive",
         )
+
+    def test_a_pragma_that_says_nothing_about_the_program_is_accepted(self):
+        """Diagnostics, folding, linking: none of them change the C.
+
+        The reason the rest are refused is that a pragma can change the
+        layout or the ABI of what follows it. These provably cannot, and
+        refusing them stopped ordinary headers on their first line.
+        """
+
+        for spelled in (
+            "#pragma warning( disable: 4049 )",
+            "#pragma region setup",
+            "#pragma endregion",
+            "#pragma GCC diagnostic ignored \"-Wunused\"",
+            "#pragma clang diagnostic push",
+            "#pragma comment(lib, \"user32.lib\")",
+            "#pragma message(\"building\")",
+            "#pragma",
+        ):
+            with self.subTest(spelled=spelled):
+                self.assertIn(
+                    "main",
+                    " ".join(
+                        token.value
+                        for token in preprocess(
+                            f"{spelled}\nint main(void) {{ return 0; }}\n", "t.c"
+                        )
+                        if isinstance(token.value, str)
+                    ),
+                )
 
     def test_error_stops_the_compilation_with_its_message(self):
         self.reject(

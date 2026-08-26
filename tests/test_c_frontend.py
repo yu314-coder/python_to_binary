@@ -1599,6 +1599,52 @@ class RejectionTests(CProgramTestCase):
             "must be a constant expression",
         )
 
+    def test_pragma_pack_caps_how_far_a_member_is_padded(self):
+        self.run_c(
+            "#pragma pack(1)\nstruct P { char a; int b; };\n"
+            "int main(void) { return (int)sizeof(struct P); }\n",
+            status=5,
+        )
+
+    def test_pragma_pack_pushes_and_pops(self):
+        self.run_c(
+            _STDIO
+            + "struct A { char a; int b; };\n"
+            "#pragma pack(push, 1)\nstruct B { char a; int b; };\n"
+            "#pragma pack(push, 2)\nstruct C { char a; int b; };\n"
+            "#pragma pack(pop)\nstruct D { char a; int b; };\n"
+            "#pragma pack(pop)\nstruct E { char a; int b; };\n"
+            "int main(void) { printf(\"%d %d %d %d %d\","
+            " (int)sizeof(struct A), (int)sizeof(struct B),"
+            " (int)sizeof(struct C), (int)sizeof(struct D),"
+            " (int)sizeof(struct E)); return 0; }\n",
+            stdout="8 5 6 5 8",
+        )
+
+    def test_pragma_pack_with_nothing_goes_back_to_the_abi(self):
+        self.run_c(
+            "#pragma pack(1)\n#pragma pack()\n"
+            "struct P { char a; int b; };\n"
+            "int main(void) { return (int)sizeof(struct P); }\n",
+            status=8,
+        )
+
+    def test_pragma_pack_is_a_cap_and_not_a_setting(self):
+        # A member narrower than the cap keeps its own alignment, so a struct
+        # of chars is the same size packed or not.
+        self.run_c(
+            "#pragma pack(4)\nstruct W { char a; double b; char c; };\n"
+            "int main(void) { return (int)sizeof(struct W); }\n",
+            status=16,
+        )
+
+    def test_a_pack_that_is_not_a_power_of_two_is_refused(self):
+        self.reject(
+            "#pragma pack(3)\nstruct P { char a; int b; };\n"
+            "int main(void) { return 0; }\n",
+            "power of two",
+        )
+
     def test_a_bitfield_reads_back_what_was_written_to_it(self):
         self.run_c(
             "struct F { unsigned int a : 3; unsigned int b : 5; };\n"

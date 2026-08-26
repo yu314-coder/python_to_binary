@@ -703,6 +703,10 @@ class FunctionType:
 #: tell padding from something a program can write to.
 _UNNAMED_BITFIELD = "__py2bin_pad_"
 
+#: What `#pragma pack` reaches the parser as. The preprocessor emits it: a
+#: directive is not a token, and this is the only channel between the two.
+_PACK_MARKER = "__py2bin_pragma_pack"
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Member:
@@ -791,6 +795,7 @@ def align_of(ctype: "CType") -> int:
 def lay_out(
     struct: StructType,
     members: "list[tuple[str, CType] | tuple[str, CType, int]]",
+    pack: "int | None" = None,
 ) -> None:
     """Assign member offsets and set the struct's size and alignment.
 
@@ -798,6 +803,11 @@ def lay_out(
     its own declared type, and the next one continues in the same unit while
     it fits. That is what every ABI py2bin targets does, and it is the only
     part of a bitfield's layout C says anything about beyond "it fits".
+
+    `pack` is what `#pragma pack` last said: a cap on how far any member may
+    be padded forward, and on the whole struct's own alignment. It is a cap
+    and not a setting, which is what the directive means - a member whose
+    type is already narrower than it keeps its own alignment.
     """
 
     placed: list[Member] = []
@@ -811,6 +821,8 @@ def lay_out(
         name, ctype = entry[0], entry[1]
         width = entry[2] if len(entry) > 2 else None
         member_alignment = align_of(ctype)
+        if pack is not None:
+            member_alignment = min(member_alignment, pack)
         member_size = size_of(ctype) or 0
         alignment = max(alignment, member_alignment)
         if width is not None and not struct.is_union:
@@ -1543,6 +1555,10 @@ class Parser:
         self.index = 0
         self.functions: dict[str, Function] = {}
         self.externs: dict[str, CType] = {}
+        #: What `#pragma pack` last said, and what `push` saved. None is the
+        #: ABI's own answer, which is what a file without one gets.
+        self.pack: "int | None" = None
+        self.pack_stack: "list[int | None]" = []
         # struct/union tags are shared across the translation unit, so a
         # tag mentioned inside its own body refers to the same type.
         self.struct_tags: dict[str, StructType] = {}
@@ -1783,7 +1799,7 @@ class Parser:
             self.take(";")
         if not members:
             self.error("an empty struct has no size in C", keyword)
-        lay_out(struct, members)
+        lay_out(struct, members, self.pack)
         return struct
 
     def bitfield_width(self, ctype: CType, name: str, token: Token) -> int:
@@ -2369,8 +2385,75 @@ class Parser:
 
     # --- translation unit ---
 
+    def pragma_pack(self) -> None:
+        """`#pragma pack(...)`, handed here as tokens by the preprocessor.
+
+        It caps how far a member may be padded forward, which is how every
+        binary format and every platform header describes a layout that is
+        not the one the ABI would choose. The forms are the ones MSVC and GCC
+        both take: a number, `push`/`pop` with or without one, and nothing at
+        all, which goes back to the ABI's own answer.
+        """
+
+        marker = self.take()
+        given: "list[object]" = []
+        if self.accept("("):
+            while not self.accept(")"):
+                if self.token.kind == "eof":
+                    self.error("#pragma pack is not closed", marker)
+                item = self.take()
+                if item.value != ",":
+                    given.append(item.value)
+        self.accept(";")
+        words = [one for one in given if isinstance(one, str)]
+        numbers = [one for one in given if isinstance(one, int)]
+        if "show" in words:
+            return
+        if "pop" in words:
+            self.pack = self.pack_stack.pop() if self.pack_stack else None
+            if numbers:
+                self.pack = self.checked_pack(numbers[-1], marker)
+            return
+        if "push" in words:
+            self.pack_stack.append(self.pack)
+            if numbers:
+                self.pack = self.checked_pack(numbers[-1], marker)
+            return
+        if not given:
+            # `#pragma pack()` goes back to what the ABI says.
+            self.pack = None
+            return
+        if numbers:
+            self.pack = self.checked_pack(numbers[-1], marker)
+            return
+        self.error(
+            f"py2bin does not know what `#pragma pack` means with "
+            f"{', '.join(str(one) for one in given)}; it takes a number, "
+            f"`push`, `pop`, or nothing",
+            marker,
+        )
+
+    def checked_pack(self, value: object, token: Token) -> int:
+        """The alignment a pack directive named, which C says is a power of two."""
+
+        if not isinstance(value, int) or value <= 0 or value & (value - 1):
+            self.error(
+                f"#pragma pack takes a power of two, not {value!r}", token
+            )
+        if value > 16:
+            self.error(
+                f"#pragma pack({value}) is wider than any alignment py2bin "
+                f"gives a type, so it would change nothing; py2bin says so "
+                f"rather than accepting a number it cannot honour",
+                token,
+            )
+        return int(value)
+
     def translation_unit(self) -> TranslationUnit:
         while self.token.kind != "eof":
+            if self.token.kind == "identifier" and self.token.value == _PACK_MARKER:
+                self.pragma_pack()
+                continue
             if self.accept("extern"):
                 self.extern_prototype()
                 continue

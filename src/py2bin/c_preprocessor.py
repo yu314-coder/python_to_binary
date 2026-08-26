@@ -79,6 +79,12 @@ __all__ = ["preprocess"]
 # --- preprocessing tokens ----------------------------------------------------
 
 
+#: What `#pragma pack` is handed to the parser as. A name no program can
+#: write, so nothing else can be mistaken for one. Stated in `c_frontend`,
+#: which is what reads it, and checked against that here.
+from .c_frontend import _PACK_MARKER
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class PPToken:
     """One preprocessing token, with where it was written and what hides it.
@@ -642,15 +648,8 @@ class Preprocessor:
             message = _respaced(rest)
             self.error(f"#error {message}" if message else "#error", name_token)
         if name == "pragma":
-            if [item.spelling for item in rest] == ["once"]:
-                self.once.add(name_token.origin)
-                return
-            self.error(
-                "the only #pragma py2bin implements is 'once'; it refuses to "
-                "ignore a pragma it does not know, because a pragma can change "
-                "the layout or the ABI of everything after it",
-                name_token,
-            )
+            self._pragma(rest, name_token)
+            return
         if name == "line":
             self.error(
                 "#line is not implemented; py2bin reports the line a token was "
@@ -799,6 +798,89 @@ class Preprocessor:
         )
 
     # --- #include ---
+
+    #: Pragmas that say something to a *compiler* and nothing about the
+    #: program: which warnings to show, where an editor may fold, which
+    #: library a linker should look in. None of them can change the layout or
+    #: the ABI of what follows, which is the reason the rest are refused - so
+    #: these are read and dropped rather than being refused along with them.
+    _INERT_PRAGMAS = frozenset(
+        {
+            "warning",       # MSVC: push, pop, disable, suppress
+            "region",        # editor folding
+            "endregion",
+            "message",       # a note to whoever is compiling
+            "comment",       # comment(lib, ...), which needs a linker to mean
+            "push_macro",    # saves and restores a macro this preprocessor
+            "pop_macro",     # keeps by name anyway
+            "component",
+            "function",
+            "intrinsic",
+            "auto_inline",
+            "inline_depth",
+            "inline_recursion",
+            "optimize",
+            "float_control",
+            "fenv_access",
+            "STDC",          # C99 says an implementation may ignore these
+        }
+    )
+
+    #: Pragmas whose *second* word is what says they are inert. Every
+    #: compiler that has these spells them `<who> diagnostic ...`, and which
+    #: compiler it is addressed to does not matter: a pragma about
+    #: diagnostics says nothing about the program whoever is being told.
+    #: Read this way rather than by naming the compilers, which is a thing
+    #: no module here is allowed to do.
+    _INERT_SECOND = frozenset({"diagnostic", "system_header", "poison"})
+
+    def _pragma(self, rest: "list[PPToken]", name_token: "PPToken") -> None:
+        """`#pragma once`, the ones that mean nothing here, and the rest.
+
+        A pragma is where an implementation is allowed to be told anything at
+        all, so most of them are refused: one can change the layout or the ABI
+        of everything after it, and a compiler that ignored `#pragma pack`
+        would lay every struct out wrong and say nothing. The ones accepted
+        here are the ones that provably cannot - they speak to a compiler
+        about diagnostics, folding, or linking, and say nothing about the
+        program itself.
+        """
+
+        spelled = [item.spelling for item in rest]
+        if spelled == ["once"]:
+            self.once.add(name_token.origin)
+            return
+        if not spelled:
+            # `#pragma` with nothing after it. C says an implementation may
+            # do what it likes, and there is nothing here to do.
+            return
+        if spelled[0] in self._INERT_PRAGMAS:
+            return
+        if len(spelled) > 1 and spelled[1] in self._INERT_SECOND:
+            return
+        if spelled[0] == "pack":
+            # It changes how every struct after it is laid out, so it cannot
+            # be dropped the way the ones above are. It is passed on to the
+            # parser as tokens - a directive is not one, and this is the only
+            # channel there is between the two.
+            self.output.append(
+                dataclasses.replace(
+                    name_token, kind="identifier", spelling=_PACK_MARKER
+                )
+            )
+            self.output.extend(rest[1:])
+            self.output.append(
+                dataclasses.replace(name_token, kind="punctuator", spelling=";")
+            )
+            return
+        self.error(
+            f"#pragma {spelled[0]} is not implemented; py2bin refuses a pragma "
+            f"it does not know, because a pragma can change the layout or the "
+            f"ABI of everything after it. The ones it accepts are 'once' and "
+            f"those that speak only to a compiler - "
+            f"{', '.join(sorted(self._INERT_PRAGMAS))}",
+            name_token,
+        )
 
     def _include(self, rest: list[PPToken], at: PPToken, directory: Path | None) -> None:
         name, angled = self._header_name(rest, at)

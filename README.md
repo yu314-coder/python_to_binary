@@ -489,6 +489,21 @@ frame is what makes it work the same whether the callee was inlined or really
 called, and it means a `va_list` can be handed on to another function, which is
 how every logging helper in C is written.
 
+**`#pragma`.** `once` is honoured, and so is every pragma that provably says
+nothing about the program: `warning`, `region`, `message`, `comment`, and any
+whose second word is `diagnostic` or `system_header` — which is how every
+compiler that has them spells them, and which one it is addressed to does not
+matter. Refusing those stopped ordinary headers on
+their first line — `WebView2.h` begins with `#pragma warning( disable: 4049 )`
+— and none of them can change what the C means.
+
+`#pragma pack` *can*, so it is implemented rather than ignored: a cap on how
+far a member may be padded forward and on the struct's own alignment, with
+`push`, `pop`, a bare `pack()` to go back to the ABI's answer, and a refusal
+for a width that is not a power of two. A compiler that ignored it would give
+every struct after it the wrong offsets and say nothing, which is why the
+other pragmas are still refused by name rather than skipped.
+
 **Bitfields** are laid out, read and written: `unsigned int flags : 3;` packs
 into a storage unit of its declared type and the next field continues in the
 same unit while it fits, which is what every ABI py2bin targets does. A read
