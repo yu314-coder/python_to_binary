@@ -11,6 +11,7 @@ rather than mistranslated into C that fails somewhere the author never wrote.
 
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -214,6 +215,59 @@ class Naming(unittest.TestCase):
         self.assertTrue(is_cpp(Path("a.hpp")))
         self.assertFalse(is_cpp(Path("a.c")))
         self.assertFalse(is_cpp(Path("a.h")))
+
+
+class ComVtableLayout(unittest.TestCase):
+    """A COM interface's layout is its ABI, and nothing reports getting it wrong.
+
+    A call through a vtable is a load and a branch: a method one slot away
+    from where the object actually has it jumps into whatever is next, on an
+    object somebody else built, in a process that was working a moment ago.
+    """
+
+    _INTERFACE = """#include <unknwn.h>
+class IThing : public IUnknown {
+public:
+    virtual HRESULT DoIt(int n) = 0;
+    virtual HRESULT Twice(int n) = 0;
+};
+class Thing : public IThing {
+public:
+    HRESULT QueryInterface(REFIID riid, void **o) { *o = (void *)this; return S_OK; }
+    unsigned long AddRef() { return 1; }
+    unsigned long Release() { return 0; }
+    HRESULT DoIt(int n) { return (HRESULT)n; }
+    HRESULT Twice(int n) { return (HRESULT)n; }
+};
+int main() { Thing t; return (int)t.DoIt(0); }
+"""
+
+    def _table(self, out: str, owner: str) -> "list[str]":
+        found = re.search(
+            rf"static void \*{owner}__vtable\[(\d+)\] = \{{([^}}]*)\}}", out
+        )
+        self.assertIsNotNone(found, f"no vtable emitted for {owner}")
+        slots = [entry.strip() for entry in found.group(2).split(",")]
+        self.assertEqual(len(slots), int(found.group(1)))
+        return slots
+
+    def test_iunknown_is_three_slots_and_not_four(self):
+        """py2bin's own <unknwn.h> once gave IUnknown a virtual destructor,
+        which is a fourth entry - and pushed every derived interface's methods
+        one slot down from where COM puts them."""
+
+        out = with_headers(self._INTERFACE)
+        self.assertEqual(len(self._table(out, "IUnknown")), 3)
+
+    def test_a_derived_interface_starts_at_slot_three(self):
+        out = with_headers(self._INTERFACE)
+        slots = self._table(out, "Thing")
+        self.assertEqual(len(slots), 5)
+        self.assertIn("QueryInterface", slots[0])
+        self.assertIn("AddRef", slots[1])
+        self.assertIn("Release", slots[2])
+        self.assertIn("DoIt", slots[3])
+        self.assertIn("Twice", slots[4])
 
 
 if __name__ == "__main__":

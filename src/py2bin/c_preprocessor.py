@@ -2232,6 +2232,12 @@ _RPCNDR_H = """
 #define __py2bin_rpcndr_h
 #include <wtypes.h>
 
+/* MIDL output checks this before it will compile, and says only "this stub
+   requires an updated version of <rpcndr.h>" when it is missing. 500 is past
+   every __REQUIRED_RPCNDR_H_VERSION__ a generated header asks for. */
+#define __RPCNDR_H_VERSION__ 500
+#define __MIDL_user_allocate_free_DEFINED__
+
 #define __RPC_STUB
 #define __RPC_FAR
 #define RPC_ENTRY
@@ -2300,6 +2306,12 @@ _BUILTIN_HEADERS = {
     "time.h": _TIME_H,
     "wtypes.h": _WTYPES_H,
     "rpcndr.h": _RPCNDR_H,
+    # MIDL output opens with <rpc.h> and <rpcndr.h> together. What a *caller*
+    # needs from the first is what the second already gives: the calling
+    # convention spellings and the interface macros. The RPC runtime itself
+    # is for a program that serves an interface over a wire, which is not
+    # what a program calling a COM object in its own process is doing.
+    "rpc.h": "#include <rpcndr.h>\n",
     "objbase.h": _OBJBASE_H,
     "combaseapi.h": _OBJBASE_H,
     "ole2.h": _OBJBASE_H,

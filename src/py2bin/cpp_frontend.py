@@ -10833,12 +10833,19 @@ typedef const GUID *REFCLSID;
 #define FAILED(hr) ((HRESULT)(hr) < 0)
 #endif
 
+/* Three slots, and no destructor among them. A virtual destructor would be
+   a fourth entry in the table, and every method of every interface derived
+   from this would sit one slot further down than COM puts it - so a call on
+   a real object would load the wrong pointer and jump into whatever was
+   next. Nothing would say so: a vtable call is a load and a branch.
+   COM does not destroy through the interface anyway. `Release` is how an
+   object is let go, and the object frees itself when its own count reaches
+   zero, which is what the count is for. */
 class IUnknown {
 public:
     virtual HRESULT QueryInterface(REFIID riid, void **object) = 0;
     virtual unsigned long AddRef() = 0;
     virtual unsigned long Release() = 0;
-    virtual ~IUnknown() { }
 };
 
 #endif

@@ -254,8 +254,8 @@ class CollectionTests(unittest.TestCase):
     _TREE = json.dumps(
         {
             "tree": [
-                {"type": "blob", "path": "headers/include/rpc.h"},
-                {"type": "blob", "path": "headers/include/rpcdce.h"},
+                {"type": "blob", "path": "headers/include/commctrl.h"},
+                {"type": "blob", "path": "headers/include/commctrl_dce.h"},
                 {"type": "blob", "path": "headers/include/windef.h"},
                 {"type": "blob", "path": "headers/include/unrelated.h"},
             ]
@@ -277,8 +277,8 @@ class CollectionTests(unittest.TestCase):
             f"https://api.github.com/repos/{collection}": json.dumps(
                 {"default_branch": "main"}
             ).encode(),
-            raw + "headers/include/rpc.h": b'#include "rpcdce.h"\n#include <stdio.h>\n',
-            raw + "headers/include/rpcdce.h": b'#include "windef.h"\n',
+            raw + "headers/include/commctrl.h": b'#include "commctrl_dce.h"\n#include <stdio.h>\n',
+            raw + "headers/include/commctrl_dce.h": b'#include "windef.h"\n',
             raw + "headers/include/windef.h": b"/* the end */\n",
         }
 
@@ -289,8 +289,8 @@ class CollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             into = Path(work) / "headers"
             with _Downloader(self._table(collection)):
-                kept = fetch_header("rpc.h", into)
-            self.assertEqual(kept, into / "rpc.h")
+                kept = fetch_header("commctrl.h", into)
+            self.assertEqual(kept, into / "commctrl.h")
 
     def test_only_the_headers_it_reaches_come_with_it(self):
         """A platform's include directory is thousands of files.
@@ -306,11 +306,11 @@ class CollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             into = Path(work) / "headers"
             with _Downloader(self._table(collection)):
-                fetch_header("rpc.h", into)
+                fetch_header("commctrl.h", into)
             names = {path.name for path in found_headers(into)}
             # windef.h is reached, and is not taken: py2bin ships that one,
             # and a downloaded copy in the cache directory would shadow it.
-            self.assertEqual(names, {"rpc.h", "rpcdce.h"})
+            self.assertEqual(names, {"commctrl.h", "commctrl_dce.h"})
             self.assertNotIn("unrelated.h", names)
 
     def test_a_header_py2bin_ships_is_not_taken_along(self):
@@ -325,7 +325,7 @@ class CollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             into = Path(work) / "headers"
             with _Downloader(self._table(collection)):
-                fetch_header("rpc.h", into)
+                fetch_header("commctrl.h", into)
             self.assertFalse((into / "windef.h").exists())
 
     def test_asking_outright_for_one_py2bin_ships_says_so(self):
