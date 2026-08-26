@@ -270,6 +270,7 @@ def main(
     method: str | None = None,
     include_dirs: "tuple[str, ...]" = (),
     auto_fetch: bool = False,
+    defines: "tuple[str, ...]" = (),
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -343,7 +344,7 @@ def main(
         say(f"\n  building for {target}")
 
     if program.suffix in _SOURCE_SUFFIXES:
-        return _build_c(program, target, include_dirs, auto_fetch)
+        return _build_c(program, target, include_dirs, auto_fetch, defines)
 
     system = target.split("-")[0]
     offered = methods_for(target)
@@ -621,6 +622,7 @@ def _build_c(
     target: str,
     include_dirs: "tuple[str, ...]" = (),
     auto_fetch: bool = False,
+    defines: "tuple[str, ...]" = (),
 ) -> int:
     """Compile a C or C++ program, and everything beside it, into one binary.
 
@@ -668,6 +670,7 @@ def _build_c(
                     target=target,
                     clean=True,
                     include_dirs=tuple(includes),
+                    defines=tuple(defines),
                     extra_sources=tuple(others),
                 )
                 break

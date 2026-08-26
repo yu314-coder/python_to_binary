@@ -69,6 +69,7 @@ import pathlib
 
 import collections
 import dataclasses
+import re
 from pathlib import Path
 
 from .c_frontend import ARENA_BYTES, CCompileError, Lexer, Token
@@ -646,7 +647,17 @@ class Preprocessor:
             # `< windows . h > is for Windows`, which is a worse message than
             # the one the author took the trouble to write.
             message = _respaced(rest)
-            self.error(f"#error {message}" if message else "#error", name_token)
+            spelled = f"#error {message}" if message else "#error"
+            if re.search(r"\bdefine\b", message, re.I):
+                # The header is telling whoever is compiling to define
+                # something. Saying how is worth a line: `py2bin cc` has
+                # always taken `--define`, and `build.py` takes `-D`.
+                spelled += (
+                    "\n  This header is asking you to define something. "
+                    "Pass it with `-D NAME` (build.py) or `--define NAME` "
+                    "(py2bin cc)."
+                )
+            self.error(spelled, name_token)
         if name == "pragma":
             self._pragma(rest, name_token)
             return

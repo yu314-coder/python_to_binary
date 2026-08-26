@@ -94,10 +94,10 @@ def main() -> int:
     sys.path.insert(0, str(SOURCE))
     from py2bin.interactive import main as ask
 
-    where, target, method, includes, fetch = _read_arguments(sys.argv[1:])
+    where, target, method, includes, fetch, defines = _read_arguments(sys.argv[1:])
     if where is _BAD:
         return 2
-    return ask(where, target, method, includes, fetch)
+    return ask(where, target, method, includes, fetch, defines)
 
 
 #: What `_read_arguments` returns when it could not read them.
@@ -106,7 +106,7 @@ _BAD = object()
 
 def _read_arguments(
     given: "list[str]",
-) -> "tuple[str | None, str | None, str | None, tuple[str, ...], bool]":
+) -> "tuple[str | None, str | None, str | None, tuple[str, ...], bool, tuple[str, ...]]":
     """The path, and any of the three questions answered in advance.
 
         python3 build.py app.py
@@ -114,6 +114,7 @@ def _read_arguments(
         python3 build.py app.cpp --include vendor/include
         python3 build.py app.py --target linux-x86_64 --how freeze
         python3 build.py app.cpp --auto-fetch
+        python3 build.py app.c --define NDEBUG -D VERSION=3
 
     Answering them on the command line is what lets a script use this same
     entry point rather than a different one - a build that is only reachable
@@ -126,22 +127,30 @@ def _read_arguments(
     `--auto-fetch` says that a header py2bin cannot find here may be looked
     up in a package index and downloaded. Without it nothing reaches the
     network, which is what keeps a build the same on a machine with none.
+
+    `--define NAME` or `--define NAME=VALUE` (`-D` for short, repeatable) is
+    what a header means when it says you must define something: `py2bin cc`
+    has always taken these and this entry point had not, so the one thing a
+    header asked for could not be given to it the documented way.
     """
 
     where = target = method = None
     fetch = False
     includes: "list[str]" = []
+    defines: "list[str]" = []
     index = 0
     while index < len(given):
         piece = given[index]
-        if piece in ("--target", "--how", "--include", "-I"):
+        if piece in ("--target", "--how", "--include", "-I", "--define", "-D"):
             if index + 1 >= len(given):
                 print(f"{piece} needs a value after it.")
-                return _BAD, None, None, ()
+                return _BAD, None, None, (), False, ()
             if piece == "--target":
                 target = given[index + 1]
             elif piece == "--how":
                 method = given[index + 1]
+            elif piece in ("--define", "-D"):
+                defines.append(given[index + 1])
             else:
                 includes.append(given[index + 1])
             index += 2
@@ -156,13 +165,14 @@ def _read_arguments(
             print("  --how NAME       compile-capi, freeze, or compile")
             print("  --include DIR    where to look for headers (repeatable)")
             print("  --auto-fetch     download a header this cannot find here")
-            return _BAD, None, None, (), False
+            print("  --define NAME    define a macro before the file is read")
+            return _BAD, None, None, (), False, ()
         if piece.startswith("-"):
             print(f"{piece} is not an option this understands.")
-            return _BAD, None, None, (), False
+            return _BAD, None, None, (), False, ()
         where = piece
         index += 1
-    return where, target, method, tuple(includes), fetch
+    return where, target, method, tuple(includes), fetch, tuple(defines)
 
 
 if __name__ == "__main__":

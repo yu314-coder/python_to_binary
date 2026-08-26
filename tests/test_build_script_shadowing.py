@@ -113,3 +113,51 @@ def test_the_script_still_works_the_way_it_is_documented():
     # rather than raising - which is the same path a user takes before they
     # point it at a program.
     assert "py2bin" in done.stdout
+
+
+def test_it_takes_every_answer_the_documented_way():
+    """The entry point the readme gives people takes all of them.
+
+    A build that is only reachable by typing at it is a build nothing can
+    check, and `--define` was the one a header can ask for by name: `py2bin
+    cc` has always taken it and this had not, so the one thing a `#error`
+    tells an author to do could not be done the documented way.
+    """
+
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("_build_py", root / "build.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    where, target, method, includes, fetch, defines = module._read_arguments(
+        [
+            "app.cpp",
+            "--target", "windows-x86_64",
+            "--how", "compile",
+            "-I", "vendor",
+            "--include", "more",
+            "--auto-fetch",
+            "-D", "WANTED",
+            "--define", "OTHER=3",
+        ]
+    )
+    assert where == "app.cpp"
+    assert target == "windows-x86_64"
+    assert method == "compile"
+    assert includes == ("vendor", "more")
+    assert fetch is True
+    assert defines == ("WANTED", "OTHER=3")
+
+
+def test_an_option_with_nothing_after_it_is_reported():
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("_build_py2", root / "build.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    where, *_rest = module._read_arguments(["app.c", "--define"])
+    assert where is module._BAD

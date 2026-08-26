@@ -552,7 +552,12 @@ what a vendor ships in a package.
 python3 build.py app.cpp --auto-fetch
 py2bin fetch-header nlohmann/json.hpp --into vendor
 py2bin fetch-header thing.h --from https://example.com/thing.h --into vendor
+python3 build.py app.cpp -D SOME_MACRO -I vendor
 ```
+
+`-D NAME` (or `--define NAME=VALUE`, repeatable) is what a header means when
+its `#error` says you must define something — and a `#error` that says so now
+points at the flag.
 
 A platform header — `rpc.h`, `objbase.h` — is never published on its own and
 is never in a repository named after it: it belongs to a *set*. Those sets are
@@ -584,9 +589,16 @@ or `_MSC_VER`, and every branch is inline assembly or that compiler's
 intrinsics. py2bin is neither compiler and implements neither, and it does not
 claim to be one — a header that believed it was would reach for builtins that
 are not there and produce something plausible and wrong instead of a refusal
-that says where it stopped. Fetching gets `WebView2.h` about 2,600 lines into
-`winnt.h`; what gets a program to WebView2 is declaring by hand the two or
-three interfaces it actually calls, which py2bin's vtables express directly.
+that says where it stopped. That is a decision, not an oversight: py2bin will
+not define another compiler's identity macro to get past a `#error`.
+
+Where such a header offers a branch for a compiler that is neither, `-D` will
+take it — that set's `NtCurrentTeb()` has one, and choosing it moves the wall
+from `winnt.h` to `winsock.h`. Read what the macro means before you use it:
+that one selects a different view of the platform, so it gets further without
+getting closer. What gets a program to a COM library is declaring by hand the
+two or three interfaces it actually calls, which py2bin's vtables express
+directly.
 
 **Which is why `<windows.h>` is py2bin's own too.** Microsoft's is tens of
 thousands of declarations written in extensions this compiler does not have.
