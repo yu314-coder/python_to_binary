@@ -932,7 +932,7 @@ your own file — every target, and the comparison — and is the thing to run
 before shipping.
 
 It does not run the cross-builds; five of the six machines are not this
-computer. 268 programs × 6 targets is 1608 builds, and the two projects are
+computer. 269 programs × 6 targets is 1614 builds, and the two projects are
 built for this machine and run.
 
 What is in the corpus is what broke at some point: enums, static members,

@@ -116,6 +116,24 @@ def _frame_bytes(stack_slots: int, base: int = 0, owner: str = "this module") ->
     return (base + stack_slots * 8 + 15) & ~15
 
 
+def _stack_move(words: "list[int]", take: int, put: int) -> None:
+    """Carry eight bytes from one place on the stack to another, through x9.
+
+    Eight bytes either way whether the argument is a pointer or a double: the
+    cell is the same size and the bits are the same bits. x9 is a scratch
+    register the caller does not have to preserve, and by this point every
+    argument has been worked out already, so there is nothing of ours in it.
+    """
+
+    if take % 8 or put % 8 or take // 8 > 0xFFF or put // 8 > 0xFFF:
+        raise ValueError(
+            "ARM64 external call arguments do not fit the addressable range "
+            "of one frame"
+        )
+    words.append(0xF94003E9 | ((take // 8) << 10))  # ldr x9, [sp, #take]
+    words.append(0xF90003E9 | ((put // 8) << 10))   # str x9, [sp, #put]
+
+
 def _sub_sp(amount: int) -> int:
     if not 0 <= amount <= 0xFFF:
         raise ValueError("ARM64 native stack frame exceeds immediate range")
@@ -355,20 +373,30 @@ def _external_call(
     # A per-position (is_float, register) plan, from a forward scan with the two
     # counters AAPCS64 defines. The register is NOT the argument's position once
     # the two kinds are mixed.
-    plan: list[tuple[bool, int]] = []
+    # Each entry is (is_float, register) for one that travels in a register,
+    # or (is_float, None) with a place in `on_the_stack` for one that does
+    # not. A register class running out does not stop the other: a double
+    # after eight words is still d0, which is what the two counters mean.
+    plan: "list[tuple[bool, int | None]]" = []
+    on_the_stack: "list[int]" = []
     integers = floats = 0
-    for argument in expression.arguments:
+    for position, argument in enumerate(expression.arguments):
         if is_float_expression(argument):
-            plan.append((True, floats))
-            floats += 1
-        else:
+            if floats < 8:
+                plan.append((True, floats))
+                floats += 1
+                continue
+        elif integers < 8:
             plan.append((False, integers))
             integers += 1
-    if integers > 8 or floats > 8:
-        raise ValueError(
-            "ARM64 external calls support at most 8 integer and 8 float "
-            "arguments; there is no stack-argument path"
-        )
+            continue
+        plan.append((is_float_expression(argument), None))
+        on_the_stack.append(position)
+    # Where the callee looks for the rest: one eight-byte cell each, in the
+    # order they were written, starting at the stack pointer as it stands
+    # when the call is made. Rounded to 16 because sp has to be.
+    outgoing = (len(on_the_stack) * 8 + 15) & ~15
+
     for argument, (is_float, _register) in zip(expression.arguments, plan):
         if is_float:
             _float_expression(words, argument, slot_base, refs)  # arg -> d0
@@ -376,18 +404,36 @@ def _external_call(
         else:
             _expression(words, argument, slot_base, refs)  # arg -> x0
             words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-    for is_float, register in reversed(plan):
+    parked = 16 * len(expression.arguments)
+    words.extend(_frame_sub(outgoing))
+
+    # Argument `position` was parked at [sp + outgoing + (last - position)*16]:
+    # they were written in order and the stack grows down.
+    last = len(expression.arguments) - 1
+    for cell, position in enumerate(on_the_stack):
+        _stack_move(
+            words, outgoing + (last - position) * 16, cell * 8
+        )
+    for position, (is_float, register) in enumerate(plan):
+        if register is None:
+            continue
+        where = (outgoing + (last - position) * 16) // 8
+        if where > 0xFFF:
+            raise ValueError(
+                "ARM64 external call arguments do not fit the addressable "
+                "range of one frame"
+            )
         if is_float:
-            words.append(0xFD4003E0 | register)  # ldr d{register}, [sp]
+            words.append(0xFD4003E0 | (where << 10) | register)
         else:
-            words.append(0xF94003E0 | register)  # ldr x{register}, [sp]
-        words.append(0x910043FF)  # add sp, sp, #16
+            words.append(0xF94003E0 | (where << 10) | register)
     call_index = len(words)
     # adrp x16, <got page>; ldr x16, [x16, #got_off]; blr x16. The two leading
     # words are placeholders patched by the Mach-O writer once the GOT address
     # is known; the result is returned by the callee in x0.
     words.extend((0x90000010, 0xF9400210, 0xD63F0200))
     refs.externs.append((call_index, expression.symbol))
+    words.extend(_frame_add(outgoing + parked))
     # AAPCS64 leaves bits 32-63 of x0 UNSPECIFIED when the callee returns a
     # 32-bit type, so a C ``int`` result must be widened before it is treated
     # as a signed 64-bit value. Skipping this makes CPython's -1 failure return

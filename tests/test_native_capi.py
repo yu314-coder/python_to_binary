@@ -506,18 +506,42 @@ class Arm64ExternAbiTests(unittest.TestCase):
         code, externs, _statics = encode_darwin_extern(module, 0x100004000)
         return code, externs
 
+    @staticmethod
+    def _loads(words, upto):
+        """Every `ldr x<n>/d<n>, [sp, #off]` before `upto`, as (float, n, off).
+
+        The offset matters now: an argument is parked in a cell of its own and
+        read from where it was parked, rather than popped off the top.
+        """
+
+        found = []
+        for word in words[:upto]:
+            if word & 0xFFC003E0 == 0xF94003E0:
+                found.append((False, word & 0x1F, ((word >> 10) & 0xFFF) * 8))
+            elif word & 0xFFC003E0 == 0xFD4003E0:
+                found.append((True, word & 0x1F, ((word >> 10) & 0xFFF) * 8))
+        return found
+
+    @staticmethod
+    def _words(code):
+        return list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
+
     def test_arguments_land_in_x0_through_x7(self):
         code, externs = self._encode(8)
-        words = struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4])
-        # Each argument is pushed in a 16-byte slot, then popped back into its
-        # AAPCS64 register from the last one to the first.
-        loads = [word for word in words if word & 0xFFFFFFF8 == 0xF94003E0]
-        self.assertEqual([word & 7 for word in loads[:8]], [7, 6, 5, 4, 3, 2, 1, 0])
+        words = self._words(code)
+        branch = externs[0][0] // 4
+        loads = [load for load in self._loads(words, branch) if load[1] != 9]
+        # Eight arguments, each parked in a 16-byte cell in order, so the
+        # first one is the deepest: x0 reads the cell 7 above the last.
+        self.assertEqual(
+            loads,
+            [(False, register, (7 - register) * 16) for register in range(8)],
+        )
         self.assertEqual([symbol for _offset, symbol in externs], ["PyFile_WriteObject"])
 
     def test_stack_is_sixteen_byte_aligned_at_the_branch(self):
         code, externs = self._encode(3)
-        words = list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
+        words = self._words(code)
         branch = externs[0][0] // 4 + 2  # adrp, ldr, blr
         self.assertEqual(words[branch], 0xD63F0200)  # blr x16
         offset = 0
@@ -527,11 +551,53 @@ class Arm64ExternAbiTests(unittest.TestCase):
             elif word & 0xFFC003FF == 0x910003FF:  # add sp, sp, #imm
                 offset += (word >> 10) & 0xFFF
             self.assertEqual(offset % 16, 0, "sp left unaligned before a call")
-        self.assertEqual(offset, -16, "argument spills were not unwound")
+        # The function's own 16-byte frame, and three argument cells still
+        # held: an argument is read from where it was parked, so nothing is
+        # released until the call has been made.
+        self.assertEqual(offset, -(16 + 48))
+        for word in words[branch + 1:]:
+            if word & 0xFFC003FF == 0x910003FF:
+                offset += (word >> 10) & 0xFFF
+                break
+        self.assertEqual(offset, -16, "the cells were not released after the call")
 
-    def test_more_arguments_than_registers_is_refused_not_truncated(self):
-        with self.assertRaisesRegex(ValueError, "at most 8 integer and 8 float"):
-            self._encode(9)
+    def test_a_ninth_argument_goes_on_the_stack(self):
+        """AAPCS64 puts what the registers cannot hold in the caller's frame,
+        one eight-byte cell each, in order, from the stack pointer up."""
+
+        code, externs = self._encode(11)
+        words = self._words(code)
+        branch = externs[0][0] // 4
+        # Three past the eight registers: 24 bytes rounded to 32 so sp stays
+        # 16-byte aligned when the branch pushes.
+        outgoing = 32
+        parked = 11 * 16
+        carried = [
+            (((word >> 10) & 0xFFF) * 8, index)
+            for index, word in enumerate(words[:branch])
+            if word & 0xFFC003FF == 0xF90003E9  # str x9, [sp, #off]
+        ]
+        self.assertEqual([where for where, _ in carried], [0, 8, 16])
+        taken = [
+            ((word >> 10) & 0xFFF) * 8
+            for word in words[:branch]
+            if word & 0xFFC003E0 == 0xF94003E0 and word & 0x1F == 9
+        ]
+        # Arguments 8, 9 and 10 of eleven, parked deepest-first.
+        self.assertEqual(
+            taken, [outgoing + (10 - position) * 16 for position in (8, 9, 10)]
+        )
+        registers = [load for load in self._loads(words, branch) if load[1] != 9]
+        self.assertEqual(
+            registers,
+            [(False, register, outgoing + (10 - register) * 16) for register in range(8)],
+        )
+        released = [
+            (word >> 10) & 0xFFF
+            for word in words[branch:]
+            if word & 0xFFC003FF == 0x910003FF
+        ]
+        self.assertEqual(released[0], outgoing + parked)
 
     def test_nine_arguments_fit_when_four_of_them_are_doubles(self):
         """The two register files are counted apart, so this is a legal call.
@@ -558,25 +624,22 @@ class Arm64ExternAbiTests(unittest.TestCase):
         code, externs, _statics = arm64.encode_darwin_extern(
             Module([Store(0, call)], 4), 0x100004000
         )
-        words = list(struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4]))
+        words = self._words(code)
         branch = externs[0][0] // 4
-        reloads = [
-            word
-            for word in words[:branch]
-            if word & 0xFFFFFFE0 in (0xF94003E0, 0xFD4003E0)
-        ]
+        # Nine arguments, none of them on the stack: five integers and four
+        # doubles, and neither file ran out.
         self.assertEqual(
-            reloads,
+            self._loads(words, branch),
             [
-                0xF94003E4,  # ldr x4, [sp]   defer
-                0xF94003E3,  # ldr x3, [sp]   backing
-                0xF94003E2,  # ldr x2, [sp]   styleMask
-                0xFD4003E3,  # ldr d3, [sp]   height
-                0xFD4003E2,  # ldr d2, [sp]   width
-                0xFD4003E1,  # ldr d1, [sp]   origin y
-                0xFD4003E0,  # ldr d0, [sp]   origin x
-                0xF94003E1,  # ldr x1, [sp]   _cmd
-                0xF94003E0,  # ldr x0, [sp]   self
+                (False, 0, 128),  # self
+                (False, 1, 112),  # _cmd
+                (True, 0, 96),    # origin x
+                (True, 1, 80),    # origin y
+                (True, 2, 64),    # width
+                (True, 3, 48),    # height
+                (False, 2, 32),   # styleMask
+                (False, 3, 16),   # backing
+                (False, 4, 0),    # defer
             ],
         )
 
@@ -585,15 +648,15 @@ class Arm64ExternAbiTests(unittest.TestCase):
 
         for count in range(9):
             with self.subTest(arguments=count):
-                code, _externs = self._encode(count)
-                words = list(
-                    struct.unpack(f"<{len(code) // 4}I", code[: len(code) // 4 * 4])
-                )
-                reloads = [
-                    word for word in words if word & 0xFFFFFFE0 == 0xF94003E0
-                ]
+                code, externs = self._encode(count)
+                words = self._words(code)
+                branch = externs[0][0] // 4 if externs else len(words)
                 self.assertEqual(
-                    reloads, [0xF94003E0 | index for index in reversed(range(count))]
+                    self._loads(words, branch),
+                    [
+                        (False, register, (count - 1 - register) * 16)
+                        for register in range(count)
+                    ],
                 )
                 self.assertNotIn(0xFD0003E0, words)  # no str d0, [sp]
 

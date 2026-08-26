@@ -622,21 +622,43 @@ class _WindowsStatics(list):
 #: Microsoft x64 argument registers, by POSITION rather than by kind. This is
 #: where it parts company with System V: the second argument is rdx or xmm1
 #: according to its own type, never "the first integer" - so a double followed
-#: by a pointer puts the pointer in rdx, not in rcx.
-_MS_INTEGER_RELOAD = (
-    b"\x48\x8b\x0c\x24",  # rcx
-    b"\x48\x8b\x14\x24",  # rdx
-    b"\x4c\x8b\x04\x24",  # r8
-    b"\x4c\x8b\x0c\x24",  # r9
-)
+#: by a pointer puts the pointer in rdx, not in rcx. Past the fourth there is
+#: no register at all and the argument is written into the caller's frame.
 #: movq <integer register>, xmm<n>. A variadic callee reads a double out of
-#: the integer register, so every float argument goes in both.
+#: the integer register, so every float argument goes in both. The source is
+#: xmm<n> and not xmm0: the reload above puts each argument in the register
+#: its own position names, and three of these four named xmm0 whatever had
+#: been loaded - so a second float argument to an imported function was sent
+#: the first one's value.
 _MS_FLOAT_TO_INTEGER = (
-    b"\x66\x48\x0f\x7e\xc1",  # rcx
-    b"\x66\x48\x0f\x7e\xc2",  # rdx
-    b"\x66\x49\x0f\x7e\xc0",  # r8
-    b"\x66\x49\x0f\x7e\xc1",  # r9
+    b"\x66\x48\x0f\x7e\xc1",  # movq rcx, xmm0
+    b"\x66\x48\x0f\x7e\xca",  # movq rdx, xmm1
+    b"\x66\x49\x0f\x7e\xd0",  # movq r8,  xmm2
+    b"\x66\x49\x0f\x7e\xd9",  # movq r9,  xmm3
 )
+
+#: mov <integer register>, [rsp+disp32], by argument position.
+_MS_INTEGER_FROM_STACK = (
+    b"\x48\x8b\x8c\x24",  # rcx
+    b"\x48\x8b\x94\x24",  # rdx
+    b"\x4c\x8b\x84\x24",  # r8
+    b"\x4c\x8b\x8c\x24",  # r9
+)
+
+#: movsd xmm<n>, [rsp+disp32], by argument position.
+_MS_FLOAT_FROM_STACK = (
+    b"\xf2\x0f\x10\x84\x24",  # xmm0
+    b"\xf2\x0f\x10\x8c\x24",  # xmm1
+    b"\xf2\x0f\x10\x94\x24",  # xmm2
+    b"\xf2\x0f\x10\x9c\x24",  # xmm3
+)
+
+#: mov rax, [rsp+disp32] and mov [rsp+disp32], rax - how an argument past the
+#: fourth is carried from where it was worked out to where the callee reads
+#: it. Eight bytes either way, whether it is a pointer or a double: the cell
+#: is the same size and the bits are the same bits.
+_MS_TAKE = b"\x48\x8b\x84\x24"
+_MS_PUT = b"\x48\x89\x84\x24"
 
 
 def _external_call_windows(
@@ -645,11 +667,10 @@ def _external_call_windows(
     """Emit a Microsoft x64 call to a symbol bound through the import table."""
 
     arguments = expression.arguments
-    if len(arguments) > 4:
-        raise ValueError(
-            "Windows x64 external calls support at most 4 arguments here; "
-            "there is no stack-argument path"
-        )
+    # Each argument is worked out and parked in a cell of its own, in order,
+    # before any of them is put where the call wants it. Working one out can
+    # take a call of its own, and a call clobbers exactly the registers this
+    # would have been holding.
     for argument in arguments:
         if is_float_expression(argument):
             _float_expression(code, argument, slot_base, refs)
@@ -659,19 +680,34 @@ def _external_call_windows(
             _expression(code, argument, slot_base, refs)
             code.extend(b"\x48\x83\xec\x10")
             code.extend(b"\x48\x89\x04\x24")        # mov [rsp], rax
-    for position in reversed(range(len(arguments))):
+    parked = 16 * len(arguments)
+
+    # What the call needs below rsp: the 32 bytes of shadow space a callee may
+    # spill rcx-r9 into - reserved by the caller, released by the caller, and
+    # not optional even when the callee takes no arguments at all - and then
+    # one eight-byte cell for each argument past the fourth. Rounded up to 16
+    # so that rsp is still 16-byte aligned when the call pushes its return
+    # address, which is what the ABI asks and what SSE in the callee needs.
+    outgoing = 32 + 8 * max(0, len(arguments) - 4)
+    outgoing = (outgoing + 15) & ~15
+    code.extend(b"\x48\x81\xec" + struct.pack("<I", outgoing))  # sub rsp, imm32
+
+    # Argument `position` was parked at [rsp + outgoing + (last - position)*16],
+    # because they were pushed in order and the stack grows down.
+    last = len(arguments) - 1
+    for position in range(len(arguments) - 1, 3, -1):
+        code.extend(_MS_TAKE + struct.pack("<I", outgoing + (last - position) * 16))
+        code.extend(_MS_PUT + struct.pack("<I", 32 + (position - 4) * 8))
+    for position in range(min(4, len(arguments)) - 1, -1, -1):
+        where = struct.pack("<I", outgoing + (last - position) * 16)
         if is_float_expression(arguments[position]):
-            code.extend(b"\xf2\x0f\x10" + bytes((0x04 | (position << 3), 0x24)))
+            code.extend(_MS_FLOAT_FROM_STACK[position] + where)
             code.extend(_MS_FLOAT_TO_INTEGER[position])
         else:
-            code.extend(_MS_INTEGER_RELOAD[position])
-        code.extend(b"\x48\x83\xc4\x10")            # add rsp, 16
-    # The 32 bytes of shadow space a callee may spill rcx-r9 into. Reserved by
-    # the caller, released by the caller, and not optional even when the callee
-    # takes no arguments at all.
-    code.extend(b"\x48\x83\xec\x20")
+            code.extend(_MS_INTEGER_FROM_STACK[position] + where)
+
     call(expression.symbol)
-    code.extend(b"\x48\x83\xc4\x20")
+    code.extend(b"\x48\x81\xc4" + struct.pack("<I", outgoing + parked))
 
 
 def _indirect_call_x86(
