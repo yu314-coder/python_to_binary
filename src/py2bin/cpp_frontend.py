@@ -34,6 +34,7 @@ is not a shortcut taken here - it is the shape of what is underneath.
 
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -4755,6 +4756,7 @@ def _emit_one(
         # declaration nearest above the use. Both spellings, so that whichever
         # name the body has reached by now is found.
         unit=f"{scope}\n{parameters};",
+        stable=scope,
         returns=method.returns,
         referenced=set(references),
     )
@@ -5406,6 +5408,59 @@ def _derives_from(derived: str, base: str, classes: "dict[str, Class]") -> bool:
 
 
 
+
+#: Which free functions take a pointer to a class, and at which positions.
+#: Answered once per scope: this is asked while emitting *every* method body,
+#: and the scan walks every definition in the whole unit - which made a build
+#: quadratic in the size of the program, and was most of what a C++ build
+#: spent its time on.
+_BASE_PARAMETERS_SEEN: "dict[tuple[str, int], dict[str, list]]" = {}
+_BASE_PARAMETERS_KEPT = 16
+
+
+def _parameters_wanting_a_base(
+    scope: str, classes: "dict[str, Class]", remember: bool = False
+) -> "dict[str, list[tuple[int, str]]]":
+    """Every function in `scope` whose parameters name a class, by position.
+
+    Keyed on the text itself, not on its identity: the scope handed in is
+    built fresh for each body, and an `id` is reused once the last one is
+    collected - which would answer a different scope from a stale scan.
+    """
+
+    key = (scope, id(classes))
+    if remember:
+        remembered = _BASE_PARAMETERS_SEEN.get(key)
+        if remembered is not None:
+            return remembered
+    found: "dict[str, list[tuple[int, str]]]" = {}
+    for match in _DEFINITION.finditer(scope):
+        # Nothing here wants a base unless something here is a pointer, and
+        # splitting a parameter list is the dearest step in the scan.
+        if "*" not in match.group(3) or match.group(2) in _NOT_A_TYPE:
+            continue
+        if _depth_at(scope, match.end() - 1) != 0:
+            continue
+        wanted_at = [
+            (index, part.replace("*", " ").replace("const", " ").strip())
+            for index, part in enumerate(_split_arguments(match.group(3)))
+            if "*" in part
+            and part.replace("*", " ").replace("const", " ").split()
+            and part.replace("*", " ").replace("const", " ").split()[0] in classes
+        ]
+        if wanted_at:
+            found[match.group(2)] = wanted_at
+    if remember:
+        # Only the unit is worth keeping: it is the same text for every body
+        # in a pass, where a body's own scan is asked once and never again.
+        # A pass has more than one unit in the air - the text as the bodies
+        # before this one left it, and the text a later pass rebuilt - so a
+        # single slot holds none of them and a handful holds them all.
+        while len(_BASE_PARAMETERS_SEEN) >= _BASE_PARAMETERS_KEPT:
+            del _BASE_PARAMETERS_SEEN[next(iter(_BASE_PARAMETERS_SEEN))]
+        _BASE_PARAMETERS_SEEN[key] = found
+    return found
+
 def _upcast_pointers(
     body: str,
     classes: "dict[str, Class]",
@@ -5413,6 +5468,8 @@ def _upcast_pointers(
     pointers: "set[str]",
     returns: str,
     scope: str,
+    unit: str = "",
+    stable: str = "",
 ) -> str:
     """Insert the cast C wants wherever a derived pointer stands for a base.
 
@@ -5443,20 +5500,26 @@ def _upcast_pointers(
     # `f(derived)` where a free function's parameter is a base pointer. Read
     # from the definitions, because a free function has no entry in the class
     # table and its parameters are written nowhere else.
-    for match in _DEFINITION.finditer(scope):
-        if _depth_at(scope, match.end() - 1) != 0 or match.group(2) in _NOT_A_TYPE:
-            continue
-        wanted_at = [
-            (index, part.replace("*", " ").replace("const", " ").strip())
-            for index, part in enumerate(_split_arguments(match.group(3)))
-            if "*" in part
-            and part.replace("*", " ").replace("const", " ").split()
-            and part.replace("*", " ").replace("const", " ").split()[0] in classes
-        ]
-        if wanted_at:
-            body = _cast_at_positions(
-                body, match.group(2), wanted_at, classes, scope, None
-            )
+    # Over the unit, which is the same text for every body in a pass, and
+    # then over the body for anything it declares itself. Asked of the whole
+    # scope instead, this walked every definition in the program once per
+    # method - which is where a C++ build spent most of its time.
+    # The unit is the same program for every body in a pass with this
+    # method's own parameters glued on the end, so the scan is split there:
+    # the part every body shares is walked once and remembered, and the tail
+    # is a line. Walking the whole of it per body is what made a build
+    # quadratic in the length of the program.
+    if unit and stable and unit.startswith(stable):
+        texts = ((stable, True), (unit[len(stable):], False), (body, False))
+    elif unit:
+        texts = ((unit, True), (body, False))
+    else:
+        texts = ((body, False),)
+    for text, keep in texts:
+        for name, wanted_at in _parameters_wanting_a_base(
+            text, classes, keep
+        ).items():
+            body = _cast_at_positions(body, name, wanted_at, classes, scope, None)
 
     # And the same for a method, whose parameters the class table has.
     signatures = _call_signatures(classes)
@@ -5484,6 +5547,12 @@ def _cast_at_positions(
 ) -> str:
     """Cast the arguments at those positions where they name a derived class."""
 
+    # A body that never mentions the name has no call to it. Asked without
+    # this, every body was searched once per function in the unit - which is
+    # quadratic in the size of the program, and was two thirds of the time a
+    # C++ build took.
+    if name not in body:
+        return body
     pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
     out: list[str] = []
     at = 0
@@ -6149,6 +6218,7 @@ def _rewrite_body(
     returns: str = "",
     inherited_references: "dict[str, str] | None" = None,
     referenced: "set[str] | None" = None,
+    stable: str = "",
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -6596,7 +6666,9 @@ def _rewrite_body(
                 reached,
             )
     body = _fill_member_defaults(body, classes)
-    body = _upcast_pointers(body, classes, known, pointers, returns, scope())
+    body = _upcast_pointers(
+        body, classes, known, pointers, returns, scope(), unit, stable
+    )
     body = _fix_call_arguments(body, classes, known, pointers)
 
     # After the dereference pass, not before it: each call in a chain hands
@@ -6624,6 +6696,7 @@ def _rewrite_body(
             dict(pointer_arrays),
             returns,
             {**outer_references, **local_references},
+            stable=stable,
         )
         for inner in blocks
     ]
@@ -7581,11 +7654,25 @@ def _opening_paren(text: str, at: int) -> int:
     return -1
 
 
+#: `_call_signatures` answers the same thing for the same classes, and is
+#: asked once per method body. Keyed on how many methods there are as well as
+#: on the table itself, so a class that gains one is not answered from before.
+_SIGNATURES_SEEN: "dict[tuple[int, int, int], dict[str, tuple[str, Method]]]" = {}
+
+
 def _call_signatures(
     classes: "dict[str, Class]"
 ) -> "dict[str, tuple[str, Method]]":
     """Every method by the C name it is emitted under."""
 
+    key = (
+        id(classes),
+        len(classes),
+        sum(len(held.methods) for held in classes.values()),
+    )
+    remembered = _SIGNATURES_SEEN.get(key)
+    if remembered is not None:
+        return remembered
     found: dict[str, tuple[str, Method]] = {}
     for owner, held in classes.items():
         for method in held.methods:
@@ -7602,6 +7689,8 @@ def _call_signatures(
                     suffix if _has_several_constructors(owner, classes) else None,
                 )
                 found[made] = (owner, method)
+    _SIGNATURES_SEEN.clear()
+    _SIGNATURES_SEEN[key] = found
     return found
 
 
@@ -9344,6 +9433,7 @@ def _rewrite_functions(
             inner, classes, known, pointers,
             unit=f"{unit}\n{head[head.rfind('(') + 1: head.rfind(')')]};"
             if opened >= 0 else unit,
+            stable=unit,
             pointer_arrays=indexed,
             # `S *pick` splits into the type `S *` and the name `pick`;
             # splitting on whitespace put the star with the name and lost it.
@@ -9410,10 +9500,42 @@ def _parameters_of(
             arrays.add(name)
     return known, pointers, arrays
 
+#: Where every brace in a text sits, and how deep it left the text after it.
+#: Counting from the start on each question is what a scan does, and a scan
+#: asks once per match - which makes reading a program quadratic in its own
+#: length. Kept against the text itself, so a scan of the same text answers
+#: from one walk; a handful of texts is all any pass has open at once.
+_DEPTHS_SEEN: "dict[str, tuple[list[int], list[int]]]" = {}
+_DEPTHS_KEPT = 8
+
+_A_BRACE = re.compile(r"[{}]")
+
+
+def _brace_depths(text: str) -> "tuple[list[int], list[int]]":
+    """Every brace position in `text`, and the depth just after each."""
+
+    walked = _DEPTHS_SEEN.get(text)
+    if walked is not None:
+        return walked
+    at: "list[int]" = []
+    depth: "list[int]" = []
+    level = 0
+    for match in _A_BRACE.finditer(text):
+        level += 1 if match.group(0) == "{" else -1
+        at.append(match.start())
+        depth.append(level)
+    while len(_DEPTHS_SEEN) >= _DEPTHS_KEPT:
+        del _DEPTHS_SEEN[next(iter(_DEPTHS_SEEN))]
+    _DEPTHS_SEEN[text] = (at, depth)
+    return at, depth
+
+
 def _depth_at(text: str, index: int) -> int:
     """How many braces are open just before `index`."""
 
-    return text.count("{", 0, index) - text.count("}", 0, index)
+    at, depth = _brace_depths(text)
+    before = bisect.bisect_left(at, index)
+    return depth[before - 1] if before else 0
 
 
 def _rewrite_declarations(text: str, classes: "dict[str, Class]") -> str:
