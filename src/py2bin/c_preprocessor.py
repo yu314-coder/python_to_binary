@@ -1500,7 +1500,10 @@ typedef struct _FILETIME {
     DWORD dwLowDateTime;
     DWORD dwHighDateTime;
 } FILETIME;
-typedef unsigned long SIZE_T;
+/* As wide as a pointer, which on Windows is not `unsigned long`: it is
+   LLP64, so a `long` there is four bytes and a pointer is eight. */
+typedef unsigned long long SIZE_T;
+typedef long long SSIZE_T;
 typedef void *HANDLE;
 typedef void *HWND;
 typedef void *HINSTANCE;
@@ -2709,6 +2712,14 @@ struct IStream { const IStreamVtbl *lpVtbl; };
 
    Written out, with real tables, when something needs to call one. IStream
    above is the shape that takes. */
+/* What a COM object passes data through. Transcribed from the set rather
+   than written from memory, because the whole worth of a struct here is that
+   every member sits where the platform puts it: `LONG lindex` is four bytes
+   on Windows, and eight of them would move `tymed` and make the struct the
+   wrong size to hand to anything.
+
+   `hMetaFilePict` and the rest of the union are handles, which are pointers,
+   and the union is as wide as the widest of them either way. */
 typedef struct IDataObject IDataObject;
 typedef struct IAdviseSink IAdviseSink;
 typedef struct IBindCtx IBindCtx;
@@ -2727,6 +2738,68 @@ typedef struct IRunningObjectTable IRunningObjectTable;
 typedef struct IPersist IPersist;
 typedef struct IMessageFilter IMessageFilter;
 typedef struct IMarshal IMarshal;
+
+typedef unsigned short CLIPFORMAT;
+typedef void *HMETAFILEPICT;
+typedef void *HENHMETAFILE;
+typedef void *HMETAFILE;
+
+typedef struct tagDVTARGETDEVICE {
+    DWORD tdSize;
+    WORD tdDriverNameOffset;
+    WORD tdDeviceNameOffset;
+    WORD tdPortNameOffset;
+    WORD tdExtDevmodeOffset;
+    BYTE tdData[1];
+} DVTARGETDEVICE;
+
+typedef struct tagFORMATETC {
+    CLIPFORMAT cfFormat;
+    DVTARGETDEVICE *ptd;
+    DWORD dwAspect;
+    LONG lindex;
+    DWORD tymed;
+} FORMATETC;
+typedef struct tagFORMATETC *LPFORMATETC;
+
+typedef struct tagSTGMEDIUM {
+    DWORD tymed;
+    union {
+        HBITMAP hBitmap;
+        HMETAFILEPICT hMetaFilePict;
+        HENHMETAFILE hEnhMetaFile;
+        HGLOBAL hGlobal;
+        LPOLESTR lpszFileName;
+        IStream *pstm;
+        IStorage *pstg;
+    };
+    IUnknown *pUnkForRelease;
+} STGMEDIUM;
+typedef struct tagSTGMEDIUM *LPSTGMEDIUM;
+typedef STGMEDIUM uSTGMEDIUM;
+
+typedef struct tagSTATDATA {
+    FORMATETC formatetc;
+    DWORD advf;
+    IAdviseSink *pAdvSink;
+    DWORD dwConnection;
+} STATDATA;
+
+#define TYMED_NULL 0
+#define TYMED_HGLOBAL 1
+#define TYMED_FILE 2
+#define TYMED_ISTREAM 4
+#define TYMED_ISTORAGE 8
+#define TYMED_GDI 16
+#define TYMED_MFPICT 32
+#define TYMED_ENHMF 64
+
+#define DVASPECT_CONTENT 1
+#define DVASPECT_THUMBNAIL 2
+#define DVASPECT_ICON 4
+#define DVASPECT_DOCPRINT 8
+
+
 #endif
 """
 

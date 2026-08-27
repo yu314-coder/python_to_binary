@@ -1196,6 +1196,84 @@ int main(void) { return (int)(E_OUTOFMEMORY == E_OUTOFMEMORY) - 1; }
             "redefined with a different replacement list",
         )
 
+    def test_windows_is_llp64(self):
+        """A negative array length is an error, so this builds only where the
+        widths are the ones the data model gives. py2bin was LP64 on every
+        target, on the reasoning that it shared no layout with a platform C
+        library - which stopped being true the day it compiled a vendor's
+        header."""
+
+        self.compile_for_windows(
+            """
+#include <stdint.h>
+static int windows_long_is_four[sizeof(long) == 4 ? 1 : -1];
+static int windows_size_t_is_eight[sizeof(size_t) == 8 ? 1 : -1];
+static int windows_pointer_is_eight[sizeof(void *) == 8 ? 1 : -1];
+static int windows_intptr_is_eight[sizeof(intptr_t) == 8 ? 1 : -1];
+static int windows_long_long_is_eight[sizeof(long long) == 8 ? 1 : -1];
+int main(void) { return 0; }
+"""
+        )
+
+    def test_everywhere_else_is_lp64(self):
+        source = """
+static int elsewhere_long_is_eight[sizeof(long) == 8 ? 1 : -1];
+int main(void) { return 0; }
+"""
+        for target in ("linux-x86_64", "darwin-arm64"):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as directory:
+                    where = Path(directory) / "model.c"
+                    where.write_text(source, newline="\n")
+                    compile_c_native(
+                        where, Path(directory) / "model", target=target
+                    )
+
+    def test_the_ole_structs_are_laid_out_as_the_platform_lays_them(self):
+        """Every size and offset here was computed from the same fields at
+        the widths Windows gives them, not remembered. A struct's whole worth
+        is that each member sits where the platform puts it: `LONG lindex` is
+        four bytes there, and eight would move `tymed` and make the struct the
+        wrong size to hand to anything."""
+
+        from py2bin.c_frontend import Parser
+        from py2bin.c_preprocessor import preprocess
+
+        source = "#include <windows.h>\n#include <objidl.h>\nint main(void){return 0;}\n"
+        for target in ("windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                parser = Parser(
+                    list(preprocess(source, "t.c", target=target)), "t.c", target
+                )
+                parser.translation_unit()
+                for tag, size in (
+                    ("tagFORMATETC", 32),
+                    ("tagSTGMEDIUM", 24),
+                    ("tagDVTARGETDEVICE", 16),
+                    ("tagSTATDATA", 56),
+                ):
+                    self.assertEqual(parser.struct_tags[tag].size, size, tag)
+                spelled = parser.struct_tags["tagFORMATETC"]
+                for name, offset in (
+                    ("cfFormat", 0),
+                    ("ptd", 8),
+                    ("dwAspect", 16),
+                    ("lindex", 20),
+                    ("tymed", 24),
+                ):
+                    self.assertEqual(spelled.member(name).offset, offset, name)
+                medium = parser.struct_tags["tagSTGMEDIUM"]
+                # Reached through the unnamed union, which is what makes them
+                # members of this struct at all.
+                for name, offset in (
+                    ("tymed", 0),
+                    ("hGlobal", 8),
+                    ("pstm", 8),
+                    ("pstg", 8),
+                    ("pUnkForRelease", 16),
+                ):
+                    self.assertEqual(medium.member(name).offset, offset, name)
+
     def test_a_piece_still_says_it_is_for_windows(self):
         with self.assertRaises(Exception) as caught:
             self.compile_for_windows(

@@ -732,6 +732,26 @@ compiler reading it, which extensions it has and how it spells an attribute,
 so py2bin is the one that knows the answers. Nearly all of them are nothing,
 which is how a compiler without an extension has always been told about it.
 
+**Windows is LLP64, and py2bin now is too on that target.** `long` is four
+bytes on Windows and eight everywhere else; py2bin was LP64 on all six, on
+the stated reasoning that it shared no layout with a platform C library. That
+was true while it compiled nobody's headers but its own and stopped being
+true the day it compiled a vendor's. `FORMATETC` holds a `LONG`, and eight
+bytes where the platform has four moves every member after it and makes the
+struct the wrong size to hand to anything. `size_t` and the pointer-width
+integers stay eight bytes there, which is why they are named rather than left
+to whatever `long` turned out to be.
+
+**Anonymous struct and union members work**, which C11 has and the SDK uses
+throughout: `STGMEDIUM` holds an unnamed union of handles and reaches into it
+without naming it. The member is laid out so its size and alignment count,
+and looked through so its members are the enclosing struct's.
+
+**`FORMATETC`, `STGMEDIUM`, `DVTARGETDEVICE` and `STATDATA`** are py2bin's
+own, transcribed from the published set rather than written from memory - and
+every size and offset checked against the same fields computed at the widths
+Windows gives them. 32, 24, 16 and 56 bytes, on both Windows targets.
+
 **What py2bin's own headers define is a default, not a claim.** `S_OK` is
 `((HRESULT)0)` here and `((HRESULT)0x00000000)` in the set a fetch brings
 down, and neither is wrong - so a real header may redefine what py2bin

@@ -701,6 +701,11 @@ class FunctionType:
 
 #: What an unnamed bitfield is called, so the passes that walk members can
 #: tell padding from something a program can write to.
+#: What an anonymous struct or union member is called while it is laid out.
+#: It has no name in the program, so this cannot collide with one; `member`
+#: looks through anything called this.
+_ANONYMOUS_MEMBER = "\x00anonymous"
+
 _UNNAMED_BITFIELD = "__py2bin_pad_"
 
 #: What `#pragma pack` reaches the parser as. The preprocessor emits it: a
@@ -742,6 +747,21 @@ class StructType:
         for item in self.members or ():
             if item.name == name:
                 return item
+        # An anonymous member's members are this one's members. C11 says so
+        # and the Windows SDK is written that way throughout: `STGMEDIUM`
+        # holds an unnamed union of handles, and `m.hGlobal` reaches into it
+        # without naming it. The offset is the anonymous member's plus the
+        # inner one's, which is all that being inside it means.
+        for item in self.members or ():
+            if not item.name.startswith(_ANONYMOUS_MEMBER):
+                continue
+            if not isinstance(item.ctype, StructType):
+                continue
+            inner = item.ctype.member(name)
+            if inner is not None:
+                return dataclasses.replace(
+                    inner, offset=item.offset + inner.offset
+                )
         return None
 
     def __str__(self) -> str:
@@ -950,10 +970,54 @@ BOOL = IntegerType("_Bool", 1, False, 0)
 FLOAT = FloatingType("float", 4, 6)
 DOUBLE = FloatingType("double", 8, 7)
 
-# py2bin's C is LP64 on every target it emits, including Windows. The compiler
-# never shares a header or an ABI with a platform C library beyond the vetted
-# adapter table (whose Py_ssize_t is 64-bit everywhere), so one model keeps the
-# same source producing the same values on all six targets.
+#: `long` on Windows, which is four bytes there and eight everywhere else.
+#: Windows is LLP64: it widened its pointers and left `long` where it was, so
+#: `LONG` in a platform header is a 32-bit field. py2bin was LP64 on every
+#: target, on the reasoning that it never shared a layout with a platform C
+#: library - which was true while it compiled nobody's headers but its own,
+#: and stopped being true the day it compiled a vendor's. `FORMATETC` holds a
+#: `LONG`, and eight bytes where the platform has four moves every member
+#: after it and makes the struct the wrong size to hand to anything.
+#:
+#: The rank stays where `long`'s rank is. Rank is the order the usual
+#: arithmetic conversions go in, not a width, and `long` outranks `int` on
+#: Windows as everywhere else even though the two are the same size there.
+LONG_LLP64 = IntegerType("long", 4, True, 4)
+ULONG_LLP64 = IntegerType("unsigned long", 4, False, 4)
+
+
+def long_for(target: str) -> IntegerType:
+    return LONG_LLP64 if target.startswith("windows-") else LONG
+
+
+def ulong_for(target: str) -> IntegerType:
+    return ULONG_LLP64 if target.startswith("windows-") else ULONG
+
+
+def typedefs_for(target: str) -> "dict[str, CType]":
+    """The standard typedefs, with the ones a data model decides settled.
+
+    `size_t` and the pointer-width integers are as wide as a pointer on every
+    target; on Windows that is not `unsigned long`, which is why they are
+    named here rather than left to whatever `long` turned out to be.
+    """
+
+    found = dict(_TYPEDEFS)
+    if target.startswith("windows-"):
+        found.update(
+            {
+                "ssize_t": LLONG,
+                "size_t": ULLONG,
+                "ptrdiff_t": LLONG,
+                "intptr_t": LLONG,
+                "uintptr_t": ULLONG,
+            }
+        )
+    return found
+
+
+# The model everywhere but Windows: LP64, where a `long` and a pointer are
+# both eight bytes.
 _TYPEDEFS: dict[str, CType] = {
     "Py_ssize_t": LLONG,
     "ssize_t": LONG,
@@ -979,7 +1043,13 @@ _OPAQUE_NAMES = frozenset(
     {"PyObject", "PyTypeObject", "PyThreadState", "PyCodeObject", "FILE"}
 )
 
-_UNSIGNED_COUNTERPART = {INT: UINT, LONG: ULONG, LLONG: ULLONG}
+_UNSIGNED_COUNTERPART = {
+    INT: UINT,
+    LONG: ULONG,
+    LLONG: ULLONG,
+    # And the Windows `long`, which is its own type at its own width.
+    LONG_LLP64: ULONG_LLP64,
+}
 
 _TYPE_KEYWORDS = frozenset(
     {
@@ -1571,7 +1641,7 @@ class Parser:
         self.struct_tags: dict[str, StructType] = {}
         # Copied per parse: a typedef in one translation unit must not
         # leak into the next compilation in the same process.
-        self.typedefs: dict[str, CType] = dict(_TYPEDEFS)
+        self.typedefs: dict[str, CType] = typedefs_for(target)
         self.enum_tags: dict[str, CType] = {}
         self.enumerators: dict[str, int] = {}
         self.globals: dict[str, GlobalObject] = {}
@@ -1760,6 +1830,15 @@ class Parser:
                 self.error("unterminated struct body", keyword)
             member_start = self.token
             base = self.type_specifier()
+            if self.at(";") and isinstance(base, StructType) and base.name is None:
+                # `union { ... };` with no name of its own. Laid out as one
+                # member so its size and alignment count, and looked through
+                # by `member` so its members are reachable without it.
+                if base.members is None:
+                    self.error("an anonymous member needs a body", member_start)
+                members.append((f"{_ANONYMOUS_MEMBER}{len(members)}", base))
+                self.take(";")
+                continue
             while True:
                 name_token = self.token
                 if self.at(":"):
@@ -1900,6 +1979,10 @@ class Parser:
                 resolved = _SPECIFIER_COMBINATIONS.get(key)
                 if resolved is None:
                     resolved = _SPECIFIER_COMBINATIONS.get(tuple(sorted(key)))
+                if resolved is LONG:
+                    resolved = long_for(self.target)
+                elif resolved is ULONG:
+                    resolved = ulong_for(self.target)
             if resolved is None:
                 self.error(f"unsupported type specifier {' '.join(words)!r}", start)
             base = resolved
@@ -2220,7 +2303,11 @@ class Parser:
                         token.encoding, wchar_for(self.target)
                     ) if token.encoding != "L" else wchar_for(self.target),
                 )
-            return IntLiteral(token, int(token.value), _literal_type(token, self.filename))
+            return IntLiteral(
+                token,
+                int(token.value),
+                _literal_type(token, self.filename, self.target),
+            )
         if token.kind == "float":
             self.take()
             # An unsuffixed floating constant has type double; 'f' makes it a
@@ -2831,7 +2918,7 @@ class Parser:
         self.externs[name] = result
 
 
-def _literal_type(token: Token, filename: str) -> CType:
+def _literal_type(token: Token, filename: str, target: str = "") -> CType:
     """The type C gives an integer constant: C11 6.4.4.1 table.
 
     The first type in the list that can represent the value wins. A ``u``
@@ -2844,12 +2931,17 @@ def _literal_type(token: Token, filename: str) -> CType:
     suffix = token.suffix
     value = int(token.value)
     longs = min(suffix.count("l"), 2)
+    # `long` is as wide as the target says, so which type a constant lands in
+    # is the target's answer too: on Windows a value past 32 bits written
+    # with one `l` is a `long long`, because a `long` there cannot hold it.
+    long_type = long_for(target)
+    ulong_type = ulong_for(target)
     if "u" in suffix:
-        candidates = [UINT, ULONG, ULLONG][longs:]
+        candidates = [UINT, ulong_type, ULLONG][longs:]
     elif token.radix == 10:
-        candidates = [INT, LONG, LLONG][longs:]
+        candidates = [INT, long_type, LLONG][longs:]
     else:
-        candidates = [INT, UINT, LONG, ULONG, LLONG, ULLONG][longs * 2 :]
+        candidates = [INT, UINT, long_type, ulong_type, LLONG, ULLONG][longs * 2 :]
     for candidate in candidates:
         bits = candidate.size * 8
         low = 0 if not candidate.signed else -(1 << (bits - 1))
