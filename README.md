@@ -732,13 +732,26 @@ it does - rather than fetching a real standard library's copy and failing
 four thousand lines inside it about something that is not the reason. Your
 own copy under `--include` still wins.
 
-**A header that chooses a branch is not the translator's to read.** The C++
-translator runs before the preprocessor and has no `#if`, so pasting one in
-meant translating both branches - and the branch meant for C is written in
-shapes that mean something else in C++: `interface X { ... }` came out as
-`interface X = { ... };`, and the macro bodies beside it lost the calls they
-were made of. A header with an `#else` in it is now left for the preprocessor,
-which is the pass that knows which half is real.
+**A header that chooses a branch is preprocessed before it is translated.**
+The C++ translator runs before the preprocessor and has no `#if`, so pasting
+one in meant translating both branches - and the branch meant for C is
+written in shapes that mean something else in C++. Leaving it to the
+preprocessor instead took the *C* branch, and a program calling an interface
+the C++ way - `view->Navigate(url)`, which is how one is written - was told
+the struct had no such member.
+
+So the preprocessor runs first for that header alone, with `__cplusplus`
+defined, and hands the translator the one branch a C++ compiler would have
+been given. Both spellings of the vendor's header work now:
+
+```cpp
+ICoreWebView2 *view = ...;
+view->Navigate(L"https://example.com");   // slot 5, and the code loads 0x28
+```
+
+What that branch carries with it - py2bin's own headers, expanded - is not
+read a second time by the run that reads the rest of the program: the first
+says what it supplied, and the second is told.
 
 **`_mingw.h` is py2bin's own too**, and for a reason worth stating: it is the
 one file in the mingw-w64 set that does not exist. Every header in that set

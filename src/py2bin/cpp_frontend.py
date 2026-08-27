@@ -1345,6 +1345,12 @@ _TAGGED_TYPE = re.compile(r"\b(enum|union)\s+([A-Za-z_]\w*)\s*\{")
 
 #: A plain struct's definition, or a typedef with no body of its own. Both
 #: belong above the classes, and which one matched decides how much is taken.
+#: A typedef naming an enum is not hoisted with the rest. C has no
+#: incomplete enum, so `typedef enum Mode Mode;` above the body it names is
+#: not a forward declaration but an error - and the pass that writes one puts
+#: it directly after the body for exactly that reason.
+_A_TYPEDEF_OF_AN_ENUM = re.compile(r"\btypedef\s+enum\b")
+
 _HOISTED_TO_THE_TOP = re.compile(
     _CLASS_HEAD.pattern + r"|(?P<typedef>(?m:^)[ \t]*typedef[^;{}]*;)"
 )
@@ -1368,6 +1374,8 @@ def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]
     # emitted after them - so `typedef long HRESULT;` came after the first
     # thing that answered one.
     for head in _HOISTED_TO_THE_TOP.finditer(text):
+        if head.group("typedef") and _A_TYPEDEF_OF_AN_ENUM.search(head.group(0)):
+            continue
         if head.start() < at:
             continue
         if head.group("typedef") is not None:
@@ -1416,19 +1424,39 @@ def _hoist_tagged_types(text: str) -> "tuple[str, str]":
             closing = _matching(text, match.end() - 1)
         except ValueError:
             continue
+        # `typedef enum M { ... } M;` is one declaration, and the words in
+        # front of the body belong to it. Taking the body alone left the
+        # `typedef` where it was and the name after the brace with it, which
+        # is two fragments and neither of them C. A generated COM header
+        # writes every one of its enums this way.
+        start = match.start()
+        before = text[:start].rstrip()
+        if before.endswith("typedef"):
+            start = len(before) - len("typedef")
         end = closing
-        while end < len(text) and text[end] in " \t":
+        while end < len(text) and text[end] in " \t\n":
             end += 1
         if end < len(text) and text[end] == ";":
             end += 1
+        elif start != match.start():
+            # A typedef, so what follows the brace is the name it is being
+            # given - as many as it declares, up to the semicolon.
+            named = re.match(r"[^;{}]*;", text[end:])
+            if named is None:
+                continue
+            end += named.end()
+        else:
+            # Neither a typedef nor a bare definition: `enum M { ... } v;`
+            # declares an object, and moving that is moving the object.
+            continue
         # The typedef this file's own spelling pass wrote just after it.
         following = re.match(
             r"\s*typedef\s+(?:enum|union)\s+\w+\s+\w+\s*;", text[end:]
         )
         if following:
             end += following.end()
-        taken.append(text[match.start():end])
-        out.append(text[at:match.start()])
+        taken.append(text[start:end])
+        out.append(text[at:start])
         at = end
     out.append(text[at:])
     return "".join(out), "\n".join(taken)
@@ -1509,10 +1537,17 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
         except ValueError:
             continue
         end = closing
-        while end < len(text) and text[end] in " \t":
+        while end < len(text) and text[end] in " \t\n":
             end += 1
-        if end < len(text) and text[end] == ";":
-            end += 1
+        if end >= len(text) or text[end] != ";":
+            # Something is declared with the body - `enum M { ... } M;`,
+            # which is C's own way of writing this and is already what the
+            # typedef below would say, or `enum M { ... } value;`, which
+            # declares an object. Either way the declaration is not over,
+            # and putting a typedef in the middle of it left the rest of it
+            # stranded on its own.
+            continue
+        end += 1
         kind, name = match.group(1), match.group(2)
         out.append(text[at:end])
         out.append(f"\ntypedef {kind} {name} {name};\n")
@@ -4979,6 +5014,54 @@ def _namespace_aliases(text: str) -> "tuple[str, set[str]]":
         return ""
 
     return _map_code(text, lambda part: _NAMESPACE_ALIAS.sub(taken, part)), found
+
+
+#: `extern "C" {` and `extern "C" <one declaration>`.
+_LINKAGE = re.compile(r'\bextern\s*"C(?:\+\+)?"\s*')
+
+
+def _strip_linkage(text: str) -> str:
+    """`extern "C" { ... }` is its contents, and the braces go.
+
+    A linkage specification says how a name is to be spelled for a linker.
+    py2bin has one translation unit and no linker, so there is nothing for it
+    to say - and the braces are not a scope, so what is inside them is at the
+    same level as what is outside. Left in, the translator read `extern "C"`
+    as a declaration and stopped on the string.
+    """
+
+    at = 0
+    while True:
+        # Searched in the text itself and not in the copy with the literals
+        # blanked, because the `"C"` *is* the literal: blanked, there is
+        # nothing left to match. So the copy is consulted the other way -
+        # to check the match is code, and not the words `extern "C"` inside
+        # a string the program is printing.
+        found = _LINKAGE.search(text, at)
+        if found is None:
+            return text
+        bare = _without_literals(text)
+        if bare[found.start(): found.start() + 6] != "extern":
+            at = found.start() + 1
+            continue
+        after = text[found.end():]
+        opening = len(after) - len(after.lstrip(" \t\n"))
+        if after[opening: opening + 1] != "{":
+            # `extern "C" void f(void);` - one declaration, and only the
+            # words in front of it go.
+            text = text[:found.start()] + text[found.end():]
+            continue
+        at = found.end() + opening
+        try:
+            closing = _matching(text, at)
+        except ValueError:
+            return text[:found.start()] + text[found.end():]
+        # `_matching` answers just past the `}`.
+        text = (
+            text[:found.start()]
+            + text[at + 1: closing - 1]
+            + text[closing:]
+        )
 
 
 def _strip_namespace_qualifiers(text: str, namespaces: "set[str]") -> str:
@@ -9331,6 +9414,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     before_patterns = text
     # Before the spellings: that pass writes `typedef enum Mode Mode;` right
     # after the enum body, and a typedef written inside a class body is not C.
+    # Before anything reads a declaration: a linkage specification is words
+    # in front of one, and its braces are not a scope.
+    text = _strip_linkage(text)
     text = _lift_nested_enums(text)
     text, scoped_enums = _rewrite_cpp_spellings(text)
     text = _strip_namespace_qualifiers(text, scoped_enums)
@@ -12163,6 +12249,13 @@ def _line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
+#: Headers py2bin supplied while preprocessing a branch-selecting one, so
+#: the run that reads the rest of the program is told not to supply them
+#: again. Written at the top of the unit rather than where the header was
+#: pasted, which may be below the program's own include of the same thing.
+_SUPPLIED_BY_A_BRANCH: "set[str]" = set()
+
+
 #: A header that declares one thing or another according to a macro.
 _CHOOSES_A_BRANCH = re.compile(r"(?m)^[ \t]*#[ \t]*(?:else|elif)\b")
 
@@ -12179,6 +12272,7 @@ def inline_local_includes(
     include_dirs: "tuple[str, ...]" = (),
     seen: "set[Path] | None" = None,
     seen_headers: "set[str] | None" = None,
+    target: "str | None" = None,
 ) -> str:
     """Paste this project's own headers in, so the translator can see them.
 
@@ -12219,6 +12313,18 @@ def inline_local_includes(
         # missing header the user never wrote.
         return _ANY_INCLUDE.sub(reach, supplied)
 
+    def chosen_branch(named: str, candidate: Path) -> str:
+        """The one branch of a header that declares two, as C++ sees it."""
+
+        if named in seen_headers:
+            return ""
+        seen_headers.add(named)
+        from .c_preprocessor import as_cplusplus
+
+        return as_cplusplus(
+            named, candidate.parent, include_dirs, target, _SUPPLIED_BY_A_BRANCH
+        )
+
     def reach(match: "re.Match[str]") -> str:
         """Whatever this include names, however it is spelled.
 
@@ -12254,7 +12360,17 @@ def inline_local_includes(
                     f"{', '.join(sorted(h for h in _BUILTIN_CPP_HEADERS if '.' not in h))}; "
                     f"name a directory with --include DIR to use your own.",
                 )
-            # Angled and not one of py2bin's own: the preprocessor's.
+            # Angled and not one of py2bin's own. Still looked for on the
+            # search path, because one that chooses a branch has to be read
+            # here rather than left to the preprocessor - a program writes
+            # `#include <WebView2.h>` as readily as it writes the other
+            # spelling, and which one it used says nothing about that.
+            for folder in (Path(d) for d in include_dirs):
+                candidate = folder / named
+                if candidate.is_file() and _CHOOSES_A_BRANCH.search(
+                    candidate.read_text(encoding="utf-8", errors="replace")
+                ):
+                    return chosen_branch(named, candidate)
             return match.group(0)
         for folder in (path.parent, *(Path(d) for d in include_dirs)):
             candidate = folder / named
@@ -12263,23 +12379,22 @@ def inline_local_includes(
             if _CHOOSES_A_BRANCH.search(
                 candidate.read_text(encoding="utf-8", errors="replace")
             ):
-                # A header that declares one thing or another depending on a
-                # macro is not this pass's to read. The translator runs
-                # before the preprocessor and has no `#if`, so it would
-                # translate both branches - and the branch meant for C is
-                # written in shapes that mean something else to it. A
-                # generated COM header is entirely this: `interface X { ... }`
-                # in the branch py2bin actually takes came out as
-                # `interface X = { ... };`, and the macro bodies beside it
-                # lost the calls they were made of.
+                # A header that declares one thing or another according to a
+                # macro cannot be read as it stands: this pass runs before
+                # the preprocessor and has no `#if`, so it would take both
+                # branches - and the one meant for C is written in shapes
+                # that mean something else here. `interface X { ... }` came
+                # out as `interface X = { ... };`.
                 #
-                # Left alone, the preprocessor picks the branch, and the
-                # branch it picks here is the C one - py2bin defines no
-                # __cplusplus - which is a table of function pointers and
-                # compiles as it stands.
-                return match.group(0)
+                # So the preprocessor runs first, for this header alone and
+                # with `__cplusplus` defined, and what comes back is the one
+                # branch a C++ compiler would have been handed. A generated
+                # COM header declares each interface twice and picks between
+                # them on exactly that, and a program calling one the C++ way
+                # - `view->Navigate(url)` - needs the classes.
+                return chosen_branch(named, candidate)
             return inline_local_includes(
-                candidate, include_dirs, seen, seen_headers
+                candidate, include_dirs, seen, seen_headers, target
             )
         # Not ours to paste; leave it for the preprocessor to fail on clearly.
         return match.group(0)
@@ -12287,16 +12402,31 @@ def inline_local_includes(
     return _ANY_INCLUDE.sub(reach, text)
 
 
+def _already_supplied() -> str:
+    """The line that tells the preprocessor what a branch already brought."""
+
+    return "".join(
+        f'#pragma py2bin supplied "{name}"\n'
+        for name in sorted(_SUPPLIED_BY_A_BRANCH)
+    )
+
+
 def translate_project(
-    path: Path, include_dirs: "tuple[str, ...]" = ()
+    path: Path,
+    include_dirs: "tuple[str, ...]" = (),
+    target: "str | None" = None,
 ) -> str:
     """The C for one C++ source, with this project's headers pasted in."""
 
-    return translate(inline_local_includes(path, include_dirs), str(path))
+    _SUPPLIED_BY_A_BRANCH.clear()
+    inlined = inline_local_includes(path, include_dirs, None, None, target)
+    return translate(_already_supplied() + inlined, str(path))
 
 
 def translate_unity(
-    sources: "tuple[Path, ...]", include_dirs: "tuple[str, ...]" = ()
+    sources: "tuple[Path, ...]",
+    include_dirs: "tuple[str, ...]" = (),
+    target: "str | None" = None,
 ) -> str:
     """One C translation unit from several C++ sources and their headers.
 
@@ -12313,8 +12443,10 @@ def translate_unity(
 
     seen: set[Path] = set()
     shared: set[str] = set()
+    _SUPPLIED_BY_A_BRANCH.clear()
     pieces = [
-        inline_local_includes(path, include_dirs, seen, shared) for path in sources
+        inline_local_includes(path, include_dirs, seen, shared, target)
+        for path in sources
     ]
-    joined = "\n".join(pieces)
+    joined = _already_supplied() + "\n".join(pieces)
     return translate(joined, str(sources[0]) if sources else "<c++>")

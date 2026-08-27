@@ -1274,6 +1274,51 @@ int main(void) { return 0; }
                 ):
                     self.assertEqual(medium.member(name).offset, offset, name)
 
+    def test_a_generated_header_can_be_read_the_cpp_way(self):
+        """MIDL declares each interface twice and picks with
+
+            #if defined(__cplusplus) && !defined(CINTERFACE)
+
+        The translator runs before the preprocessor and has no `#if`, so a
+        header like that used to be left to the preprocessor - which took the
+        C branch, and a program calling an interface the C++ way was told the
+        struct had no such member. The preprocessor now runs first for that
+        header alone, with `__cplusplus` defined, and hands the translator
+        the one branch a C++ compiler would have been given."""
+
+        from py2bin.c_preprocessor import as_cplusplus
+
+        with tempfile.TemporaryDirectory() as directory:
+            where = Path(directory)
+            (where / "chooses.h").write_text(
+                "#if defined(__cplusplus) && !defined(CINTERFACE)\n"
+                "struct IThing { virtual int Poke(int n) = 0; };\n"
+                "#else\n"
+                "typedef struct IThingVtbl { int (*Poke)(void *, int); } IThingVtbl;\n"
+                "struct IThing { const IThingVtbl *lpVtbl; };\n"
+                "#endif\n",
+                newline="\n",
+            )
+            supplied: "set[str]" = set()
+            text = as_cplusplus(
+                "chooses.h", where, (str(where),), "windows-x86_64", supplied
+            )
+            self.assertIn("virtual", text)
+            self.assertNotIn("lpVtbl", text)
+
+    def test_what_one_run_supplied_the_next_is_told(self):
+        """The preprocessed branch carries py2bin's own headers expanded into
+        it. Read again by the run that reads the rest of the program, every
+        struct in them would be defined twice."""
+
+        self.compile_for_windows(
+            """
+#pragma py2bin supplied "wtypes.h"
+typedef struct _GUID { int mine; } GUID;
+int main(void) { GUID g; g.mine = 1; return g.mine - 1; }
+"""
+        )
+
     def test_a_piece_still_says_it_is_for_windows(self):
         with self.assertRaises(Exception) as caught:
             self.compile_for_windows(

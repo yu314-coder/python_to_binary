@@ -302,6 +302,67 @@ def _respaced(tokens: "list[PPToken]") -> str:
     return "".join(out)
 
 
+def _as_written(tokens: "list[PPToken]") -> str:
+    """The tokens back as text, keeping the lines they came from.
+
+    `_respaced` puts a run back together on one line, which is right for one
+    directive and wrong for a file: the C++ translator reads line by line in
+    places, and an error it reports names a line. So a token that came from
+    further down the file starts a new line here, and a run of them that came
+    from the same one stays on it.
+    """
+
+    out: "list[str]" = []
+    line = 0
+    for token in tokens:
+        if token.line != line:
+            if out:
+                out.append("\n")
+            line = token.line
+        elif out and token.spaced:
+            out.append(" ")
+        out.append(token.spelling)
+    return "".join(out) + "\n"
+
+
+def as_cplusplus(
+    named: str,
+    directory: "Path | None",
+    include_dirs: "tuple[str, ...]",
+    target: "str | None",
+    supplied: "set[str]",
+) -> str:
+    """One header, preprocessed as a C++ compiler would see it.
+
+    A header that declares one thing or another according to a macro cannot
+    be handed to the C++ translator as it stands: the translator runs before
+    the preprocessor and has no `#if`, so it would read both branches. A
+    generated COM header is exactly that - `#if defined(__cplusplus) &&
+    !defined(CINTERFACE)` picks between classes and a table of function
+    pointers - and a program that calls one the C++ way needs the first.
+
+    So the preprocessor runs first, for this header alone, with
+    `__cplusplus` defined. What comes back is one branch, with its own
+    includes taken and its macros expanded, which is what a C++ compiler's
+    parser is handed too.
+    """
+
+    engine = Preprocessor(include_dirs, target)
+    engine.run(
+        "#define __cplusplus 201703L\n#define __py2bin_translating 1\n",
+        "<c++>",
+        None,
+    )
+    engine.run(f'#include "{named}"\n', f"<{named}>", directory)
+    # What py2bin supplied while reading it, remembered so the run that
+    # reads the rest of the program does not supply it a second time. Handed
+    # back rather than written into the text here: the text is pasted where
+    # the include was, which may be below the program's own `#include
+    # <windows.h>`, and by then it would be too late to say so.
+    supplied.update(engine._builtins_read)
+    return _as_written(engine.output)
+
+
 def _scan(source: str, origin: str) -> list[list[PPToken]]:
     """Split cleaned source into logical lines of preprocessing tokens."""
 
@@ -915,6 +976,17 @@ class Preprocessor:
         spelled = [item.spelling for item in rest]
         if spelled == ["once"]:
             self.once.add(name_token.origin)
+            return
+        if len(spelled) == 3 and spelled[:2] == ["py2bin", "supplied"]:
+            # py2bin's own, and only py2bin writes it: the header named here
+            # has already been read out into this text by another run of this
+            # preprocessor. A header of py2bin's own is remembered by name
+            # rather than by a guard, and that memory does not survive from
+            # one run to the next - so it is written down instead. Without
+            # it, a program that includes <windows.h> and a header that was
+            # preprocessed separately gets both copies and is told its
+            # structs are defined twice.
+            self._builtins_read.add(spelled[2].strip('"'))
             return
         if not spelled:
             # `#pragma` with nothing after it. C says an implementation may
@@ -2632,6 +2704,19 @@ _UNKNWN_H = """
    is what the object is - the C++ spelling of it is the same bytes - and it
    is the branch a generated header takes here, py2bin defining no
    __cplusplus. Three slots, which is what IUnknown has. */
+/* Both shapes, chosen the way a generated header chooses: the same object
+   either way - a pointer to a table of function pointers is what a class
+   with virtual methods is laid out as - and which spelling a program uses
+   decides which it wants to see. */
+#ifdef __cplusplus
+class IUnknown {
+public:
+    virtual HRESULT QueryInterface(REFIID riid, void **object) = 0;
+    virtual unsigned long AddRef() = 0;
+    virtual unsigned long Release() = 0;
+};
+typedef IUnknown *LPUNKNOWN;
+#else
 typedef struct IUnknown IUnknown;
 typedef struct IUnknownVtbl {
     HRESULT (*QueryInterface)(IUnknown *, REFIID, void **);
@@ -2640,6 +2725,7 @@ typedef struct IUnknownVtbl {
 } IUnknownVtbl;
 struct IUnknown { const IUnknownVtbl *lpVtbl; };
 typedef IUnknown *LPUNKNOWN;
+#endif
 #endif
 """
 
@@ -2663,8 +2749,10 @@ _OBJIDL_H = """
    the one thing py2bin cannot spell, and Seek takes one; on both Windows
    machines an eight-byte struct travels in the register an eight-byte
    integer travels in, so this is the same ABI and can be called. */
+#ifndef __cplusplus
 typedef struct IStream IStream;
 typedef struct ISequentialStream ISequentialStream;
+#endif
 
 typedef struct __py2bin_STATSTG {
     LPOLESTR pwcsName;
@@ -2680,6 +2768,16 @@ typedef struct __py2bin_STATSTG {
     unsigned long reserved;
 } STATSTG;
 
+/* Both shapes, the way <unknwn.h> gives IUnknown both. Same object, same
+   slots; which spelling a program uses decides which it is shown. */
+#ifdef __cplusplus
+class ISequentialStream : public IUnknown {
+public:
+    virtual HRESULT Read(void *pv, unsigned long cb, unsigned long *read) = 0;
+    virtual HRESULT Write(const void *pv, unsigned long cb,
+                          unsigned long *written) = 0;
+};
+#else
 typedef struct ISequentialStreamVtbl {
     HRESULT (*QueryInterface)(ISequentialStream *, REFIID, void **);
     unsigned long (*AddRef)(ISequentialStream *);
@@ -2688,7 +2786,27 @@ typedef struct ISequentialStreamVtbl {
     HRESULT (*Write)(ISequentialStream *, const void *, unsigned long, unsigned long *);
 } ISequentialStreamVtbl;
 struct ISequentialStream { const ISequentialStreamVtbl *lpVtbl; };
+#endif
 
+#ifdef __cplusplus
+class IStream : public ISequentialStream {
+public:
+    virtual HRESULT Seek(long long move, unsigned long origin,
+                         unsigned long long *position) = 0;
+    virtual HRESULT SetSize(unsigned long long size) = 0;
+    virtual HRESULT CopyTo(IStream *other, unsigned long long cb,
+                           unsigned long long *read,
+                           unsigned long long *written) = 0;
+    virtual HRESULT Commit(unsigned long flags) = 0;
+    virtual HRESULT Revert() = 0;
+    virtual HRESULT LockRegion(unsigned long long offset,
+                               unsigned long long cb, unsigned long type) = 0;
+    virtual HRESULT UnlockRegion(unsigned long long offset,
+                                 unsigned long long cb, unsigned long type) = 0;
+    virtual HRESULT Stat(STATSTG *out, unsigned long flag) = 0;
+    virtual HRESULT Clone(IStream **out) = 0;
+};
+#else
 typedef struct IStreamVtbl {
     HRESULT (*QueryInterface)(IStream *, REFIID, void **);
     unsigned long (*AddRef)(IStream *);
@@ -2709,6 +2827,7 @@ typedef struct IStreamVtbl {
     HRESULT (*Clone)(IStream *, IStream **);
 } IStreamVtbl;
 struct IStream { const IStreamVtbl *lpVtbl; };
+#endif
 
 #define STREAM_SEEK_SET 0
 #define STREAM_SEEK_CUR 1

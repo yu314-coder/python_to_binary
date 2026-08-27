@@ -1360,7 +1360,9 @@ def compile_c_native(
         # the C once per architecture, and handing that path C++ meant the
         # frontend was asked to compile `darwin-universal2`, which is not a
         # machine and has none of the rules a machine has.
-        translated = translate_unity((entry, *extra_sources), include_dirs)
+        translated = translate_unity(
+            (entry, *extra_sources), include_dirs, resolved
+        )
     if extra_sources and translated is None:
         missing = [str(path) for path in extra_sources if not path.is_file()]
         if missing:
