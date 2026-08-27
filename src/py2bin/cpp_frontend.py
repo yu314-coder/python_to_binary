@@ -1312,6 +1312,12 @@ _FRIEND = re.compile(r"\bfriend\b[^;{}]*;")
 
 #: `class B;` - a forward declaration. The typedefs this emits already name
 #: every class before any body, so there is nothing left for one to do.
+#: `class X final {`, `void f() override {`, `void f() final;`. Both words
+#: are checks C++ makes and C cannot, so both go.
+_FINAL_OR_OVERRIDE = re.compile(
+    r"(?<=\w)\s+(?:final|override)\b(?=\s*[{;:,)])"
+)
+
 _FORWARD_DECLARATION = re.compile(
     r"(?m)^[ \t]*(?:class|struct|union)\s+[A-Za-z_]\w*\s*;[ \t]*$"
 )
@@ -1485,6 +1491,11 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     # `using Number = int;` is a typedef written the other way round, which
     # is the only way C++11 and later spell one in new code.
     text = _map_code(text, lambda part: _ALIAS.sub(r"typedef \2 \1;", part))
+    # `class X final {` and `void f() override` say a thing may not be
+    # derived from or overridden again. C++ checks that and C has nothing to
+    # check, so the word is what is lost and nothing else - but left in, it
+    # reaches the C compiler as a name where a name cannot be.
+    text = _map_code(text, lambda part: _FINAL_OR_OVERRIDE.sub("", part))
     text = _FORWARD_DECLARATION.sub("", text)
     # `friend class X;` and `friend int f();` grant access to what is private.
     # py2bin emits a plain struct and enforces no access at all, so a friend
@@ -1784,8 +1795,16 @@ def _close_range_bodies(text: str) -> str:
 #: `P a{1, 2};` or `int n{5};` - a declaration initialised with braces. No
 #: nested braces and a `;` right after, which is what tells it from a class
 #: body or a function.
+#: `P a{1, 2};` - a declaration with a brace initialiser.
+#:
+#: Not `class Thing final { ... };`, which reads exactly the same way: a
+#: name, a space, a name, a brace. That one is a class whose body has no
+#: braces of its own, and read as an initialiser it became
+#: `Thing final( ... );` - the class turned inside out, and every member
+#: after it lost.
 _BRACE_INIT = re.compile(
-    r"(?<![.\w>])([A-Za-z_]\w*)\s+(\*?)\s*([A-Za-z_]\w*)\s*\{([^{}]*)\}\s*;"
+    r"(?<![.\w>])(?<!class )(?<!struct )([A-Za-z_]\w*)\s+(\*?)\s*"
+    r"([A-Za-z_]\w*)\s*\{([^{}]*)\}\s*;"
 )
 
 
@@ -3267,7 +3286,59 @@ def _resolve_nested_typedefs(text: str) -> str:
                 rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", h, part
             ),
         )
+    # And the bare name, which is how the class's own members say it:
+    # `using Handler = ...;` written inside a class is `Handler` everywhere
+    # in that class and in its methods, spelled out or not. Only there - a
+    # member typedef names a type inside its class and nowhere else, and the
+    # same word outside is somebody else's.
+    for (owner, name), held in names.items():
+        text = _within_the_class(text, owner, name, held)
     return text
+
+
+def _within_the_class(text: str, owner: str, name: str, held: str) -> str:
+    """Replace a bare `name` inside `owner`'s body and in its methods."""
+
+    spans: "list[tuple[int, int]]" = []
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) != owner:
+            continue
+        try:
+            spans.append((head.end() - 1, _matching(text, head.end() - 1)))
+        except ValueError:
+            continue
+    # `Thing::fire(Handler h) { ... }` written outside the class is still
+    # inside it as far as a name is concerned.
+    for out_of_line in re.finditer(
+        rf"(?<![.\w>]){re.escape(owner)}\s*::\s*~?[A-Za-z_]\w*\s*\(", text
+    ):
+        opening = text.find("{", out_of_line.end())
+        if opening < 0:
+            continue
+        try:
+            spans.append((out_of_line.start(), _matching(text, opening)))
+        except ValueError:
+            continue
+    if not spans:
+        return text
+    spans.sort()
+    out: "list[str]" = []
+    at = 0
+    for start, end in spans:
+        if start < at:
+            continue
+        out.append(text[at:start])
+        out.append(
+            _map_code(
+                text[start:end],
+                lambda part: re.sub(
+                    rf"(?<![.\w>:]){re.escape(name)}\b(?!\s*::)", held, part
+                ),
+            )
+        )
+        at = end
+    out.append(text[at:])
+    return "".join(out)
 
 
 #: What each copy was made from: `Box__int` came from `Box` with `int`. The
@@ -11802,28 +11873,22 @@ _UNKNWN_HEADER = r"""
    what py2bin lays a class with virtual methods out as - so it is written
    here as that class, and a program declares an interface by deriving from
    it the way a generated header does. */
-#ifndef __py2bin_unknwn_h
-#define __py2bin_unknwn_h
+/* No include guard: this text is pasted by the pass that reads C++, which
+   pastes each of py2bin's own headers once however many files ask for it -
+   and a guard here would be torn from what it guards when the directives
+   are moved to the top. */
 
-/* <wtypes.h> has these too, and a program that reaches both - anything
-   using <wrl.h> beside <windows.h> - had the same names against two
-   different structs. Whichever is read first defines them; the other sees
-   its guard and does not. The guard is a preprocessing directive, which the
-   translator leaves alone and the preprocessor settles later. */
-#ifndef __py2bin_wtypes_h
-typedef long HRESULT;
-typedef struct _GUID {
-    unsigned int Data1;
-    unsigned short Data2;
-    unsigned short Data3;
-    unsigned char Data4[8];
-} GUID;
-typedef GUID IID;
-typedef GUID CLSID;
-typedef const GUID *REFGUID;
-typedef const GUID *REFIID;
-typedef const GUID *REFCLSID;
-#endif
+/* HRESULT, GUID and the rest come from <wtypes.h>, which is py2bin's own
+   as well. Asked for rather than written out again, because written out in
+   both they were the same names against two different structs - and a guard
+   is no answer here: the translator moves every directive to the top of the
+   file it emits, so a `#ifndef` around a declaration ends up above what it
+   was meant to guard and guards nothing. An `#include` is a directive all
+   through and survives that move intact.
+
+   The translator does not need these to be declared, only named, and it has
+   the names from the declarations it is reading. */
+#include <wtypes.h>
 
 #ifndef S_OK
 #define S_OK ((HRESULT)0)
@@ -11868,8 +11933,6 @@ public:
     virtual unsigned long AddRef() = 0;
     virtual unsigned long Release() = 0;
 };
-
-#endif
 """
 
 _OBJIDL_HEADER = r"""

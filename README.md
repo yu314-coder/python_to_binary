@@ -676,6 +676,18 @@ C++ decides it: the narrowest pattern that fits. A type named outright beats
 one written around a parameter, `T **` beats `T *`, and `<T, T>` - which says
 the two arguments are the same type - beats `<T, U>`, which says nothing.
 
+**`class X final { ... };` is a class**, and used not to be. It reads exactly
+like `Type name { ... };` - a name, a space, a name, a brace - and the pass
+that rewrites a brace initialiser took it for one: the class came out as
+`X final( ... );`, turned inside out, with every member after it lost. Any
+class written with `final` was destroyed silently. `final` and `override` are
+now dropped where they stand, both being checks C++ makes that C cannot.
+
+**A `using` alias written inside a class** is that class's name for a type,
+and is resolved wherever the class says it - in its body and in its methods,
+spelled out or bare. `using Handler = std::function<void(const string&)>;` is
+how a class declares what it will call back into.
+
 **A template may be written inside a template.** `ComPtr<T>::As` is one, and
 it could not be read before: a member template's calls are on objects of a
 type that does not exist until the class around it has been written out, and
@@ -749,9 +761,21 @@ ICoreWebView2 *view = ...;
 view->Navigate(L"https://example.com");   // slot 5, and the code loads 0x28
 ```
 
-What that branch carries with it - py2bin's own headers, expanded - is not
-read a second time by the run that reads the rest of the program: the first
-says what it supplied, and the second is told.
+What that branch carries with it is split in two. The headers that declare
+COM interfaces stay in it, because the translator is about to read
+`struct ICoreWebView2 : public IUnknown` and a base it cannot see is a base it
+cannot lay out; those are reported, so the run that reads the rest of the
+program leaves them alone. The rest are plain C - types and prototypes - and
+are left to that run entirely, which reads them at the top where it puts
+every directive. That is the order they have to be in: `<shellapi.h>` asks
+for `HINSTANCE`, and the answer has to be above it.
+
+**A guard is no answer here**, which is worth knowing before reaching for
+one: the translator moves every directive to the top of the file it emits, so
+a `#ifndef` written around a *declaration* ends up above the thing it was
+meant to guard and guards nothing. An `#include` is a directive all through
+and survives that move intact, which is why py2bin's own `<unknwn.h>` asks
+`<wtypes.h>` for `HRESULT` and `GUID` rather than writing them out again.
 
 **`_mingw.h` is py2bin's own too**, and for a reason worth stating: it is the
 one file in the mingw-w64 set that does not exist. Every header in that set

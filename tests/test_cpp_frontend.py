@@ -1002,8 +1002,15 @@ class ComHeaders(unittest.TestCase):
         # The interface's own table, and a call that goes through it.
         self.assertIn("Counter__vtable", out)
         self.assertIn("__vptr", out)
-        # The types the header gives, emitted before whatever answers one.
-        self.assertLess(out.index("typedef long HRESULT;"), out.index("HRESULT Counter"))
+        # HRESULT and GUID are asked for rather than written out again: they
+        # are <wtypes.h>'s, and py2bin's own <unknwn.h> declaring them too
+        # made the same names against two different structs for any program
+        # reaching both. A guard would not answer it - the translator moves
+        # every directive to the top, so a `#ifndef` around a declaration
+        # ends up above what it was meant to guard.
+        self.assertIn("#include <wtypes.h>", out)
+        self.assertNotIn("typedef long HRESULT;", out)
+        self.assertLess(out.index("#include <wtypes.h>"), out.index("HRESULT Counter"))
 
     def test_the_header_is_pasted_before_the_translation(self) -> None:
         """It has to be: the translator reads classes, and the C preprocessor

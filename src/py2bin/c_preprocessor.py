@@ -325,6 +325,12 @@ def _as_written(tokens: "list[PPToken]") -> str:
     return "".join(out) + "\n"
 
 
+#: The headers of py2bin's own that declare a COM interface rather than a
+#: plain C type. Under `__cplusplus` each of these gives classes, and the
+#: translator has to see one to lay out anything derived from it.
+_DECLARES_INTERFACES = frozenset({"unknwn.h", "objidl.h", "oaidl.h"})
+
+
 def as_cplusplus(
     named: str,
     directory: "Path | None",
@@ -353,14 +359,42 @@ def as_cplusplus(
         "<c++>",
         None,
     )
+    if (target or "").startswith("windows-"):
+        # The plain-C types first, so that what is kept below does not
+        # declare them. py2bin's own <unknwn.h> writes out GUID and HRESULT
+        # only where <wtypes.h> has not - and <wtypes.h> is one of the ones
+        # left to the other run, so it has to have been seen here for that
+        # guard to hold.
+        engine.run("#include <wtypes.h>\n", "<c++>", None)
     engine.run(f'#include "{named}"\n', f"<{named}>", directory)
-    # What py2bin supplied while reading it, remembered so the run that
-    # reads the rest of the program does not supply it a second time. Handed
-    # back rather than written into the text here: the text is pasted where
-    # the include was, which may be below the program's own `#include
-    # <windows.h>`, and by then it would be too late to say so.
-    supplied.update(engine._builtins_read)
-    return _as_written(engine.output)
+
+    # py2bin's own headers were read for their macros - a generated header is
+    # written in `STDMETHODCALLTYPE` and `MIDL_INTERFACE` and says nothing
+    # without them. What they *declare* is another matter, and the two kinds
+    # part company here.
+    #
+    # The ones that declare COM interfaces stay, because the translator is
+    # about to read `struct ICoreWebView2 : public IUnknown` and a base it
+    # cannot see is a base it cannot lay out. They are reported as supplied,
+    # so the run that reads the rest of the program leaves them alone.
+    #
+    # The rest are plain C - types and prototypes - and are dropped and left
+    # to that run entirely. Not reported, so it reads them itself, at the top
+    # where it puts every directive. That is the order they have to be in:
+    # <shellapi.h> asks for HINSTANCE, and the answer has to be above it.
+    ours = set(engine._builtins_read)
+    kept = ours & _DECLARES_INTERFACES
+    dropped = ours - kept
+    supplied.update(kept)
+    # The dropped ones are asked for by name, so the other run reads them -
+    # at the top, where it puts every directive, which is above every use.
+    # Dropped without asking, a generated header named a type nothing had
+    # declared: `EventRegistrationToken` is in one of them and appears in
+    # two thousand of its own signatures.
+    asked = "".join(f"#include <{name}>\n" for name in sorted(dropped))
+    return asked + _as_written(
+        [item for item in engine.output if item.origin.strip("<>") not in dropped]
+    )
 
 
 def _scan(source: str, origin: str) -> list[list[PPToken]]:
@@ -2319,19 +2353,23 @@ struct tm {
 _WTYPES_H = """
 #ifndef __py2bin_wtypes_h
 #define __py2bin_wtypes_h
-#include <windows.h>
-
-#ifndef __py2bin_unknwn_h
+/* COM's own types are the same shape wherever they are described, and this
+   header is asked for on every target: py2bin's C++ <unknwn.h> asks it for
+   HRESULT and GUID rather than writing them out again. So the platform's
+   own header is taken where there is one and the handful of spellings it
+   would have given are written out where there is not - which is what lets
+   a program declare a COM interface and build for six machines. */
+/* Before the platform's header and not after it: <windows.h> asks
+   <objbase.h> for the COM entry points, <objbase.h> is written in HRESULT,
+   and its own way back here is closed by the guard above. Whatever a header
+   includes may include it back, so what it needs first has to be first. */
 typedef long HRESULT;
-#endif
 typedef unsigned short VARIANT_BOOL;
 typedef const wchar_t *LPCOLESTR;
 typedef wchar_t *LPOLESTR;
 typedef wchar_t OLECHAR;
 typedef wchar_t *BSTR;
 typedef double DATE;
-
-#ifndef __py2bin_unknwn_h
 typedef struct _GUID {
     unsigned int Data1;
     unsigned short Data2;
@@ -2344,7 +2382,26 @@ typedef GUID CLSID;
 typedef const GUID *REFGUID;
 typedef const GUID *REFIID;
 typedef const GUID *REFCLSID;
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+typedef unsigned char BYTE;
+typedef unsigned short WORD;
+typedef unsigned int DWORD;
+typedef unsigned int UINT;
+typedef int BOOL;
+typedef long LONG;
+typedef unsigned long ULONG;
+typedef void *LPVOID;
+typedef char *LPSTR;
+typedef const char *LPCSTR;
+typedef wchar_t *LPWSTR;
+typedef const wchar_t *LPCWSTR;
+typedef unsigned long long SIZE_T;
 #endif
+
+
 
 /* A generated header names its interface IDs with this. The SDK writes it
    two ways - a declaration everywhere, and a definition in the one file that
