@@ -2340,21 +2340,30 @@ _STDLIB_H = f"#define __PY2BIN_ARENA_BYTES {ARENA_BYTES}UL\n" + """
 
 /* The bump pointer and the end of the reservation. Both zero until the first
    allocation, which is what makes the mapping happen on demand: a program
-   that includes this header and never allocates reserves nothing. */
-static unsigned long __py2bin_heap_bump = 0;
-static unsigned long __py2bin_heap_end = 0;
+   that includes this header and never allocates reserves nothing.
 
-void *malloc(unsigned long __n) {
-    unsigned long __p;
+   `size_t` and not `unsigned long`. Windows is LLP64, where a `long` is four
+   bytes and a pointer is eight, so an address held in one is an address with
+   its top half cut off - and the arena is mapped wherever the kernel likes,
+   which on a 64-bit process is usually above the four gigabytes that fit.
+   Every pointer this handed out was then a low address that belongs to
+   nobody, which is a program that either faults or quietly writes over
+   something else. `size_t` is the width of a pointer on every target py2bin
+   has, which is the property being relied on. */
+static size_t __py2bin_heap_bump = 0;
+static size_t __py2bin_heap_end = 0;
+
+void *malloc(size_t __n) {
+    size_t __p;
     if (__py2bin_heap_end == 0) {
-        __py2bin_heap_bump = (unsigned long)__py2bin_arena();
+        __py2bin_heap_bump = (size_t)__py2bin_arena();
         __py2bin_heap_end = __py2bin_heap_bump + __PY2BIN_ARENA_BYTES;
     }
     /* Round up to 16, which is the alignment any C object may ask for, so
        every block this returns is aligned for every type. A request of zero
        still gets a distinct address, as C says it may. */
-    __n = (__n + 15UL) & ~15UL;
-    if (__n == 0UL) __n = 16UL;
+    __n = (__n + (size_t)15) & ~(size_t)15;
+    if (__n == (size_t)0) __n = (size_t)16;
     /* Written as a subtraction so a size near the top of the range cannot
        wrap the sum past the end and be let through. */
     if (__n > __py2bin_heap_end - __py2bin_heap_bump) return NULL;
@@ -2363,17 +2372,17 @@ void *malloc(unsigned long __n) {
     return (void *)__p;
 }
 
-void *calloc(unsigned long __count, unsigned long __size) {
-    unsigned long __total;
+void *calloc(size_t __count, size_t __size) {
+    size_t __total;
     unsigned char *__block;
-    unsigned long __i;
-    if (__count != 0UL && __size > 0xFFFFFFFFFFFFFFFFUL / __count) return NULL;
+    size_t __i;
+    if (__count != (size_t)0 && __size > ((size_t)-1) / __count) return NULL;
     __total = __count * __size;
     __block = (unsigned char *)malloc(__total);
     if (__block == NULL) return NULL;
     /* The arena is zero-filled when it is mapped, but a block reused after a
        realloc is not, so this clears rather than assuming. */
-    for (__i = 0UL; __i < __total; __i++) __block[__i] = 0;
+    for (__i = (size_t)0; __i < __total; __i++) __block[__i] = 0;
     return (void *)__block;
 }
 
@@ -2383,10 +2392,10 @@ void free(void *__block) {
     (void)__block;
 }
 
-void *realloc(void *__block, unsigned long __size) {
+void *realloc(void *__block, size_t __size) {
     unsigned char *__old;
     unsigned char *__new;
-    unsigned long __i;
+    size_t __i;
     if (__block == NULL) return malloc(__size);
     __new = (unsigned char *)malloc(__size);
     if (__new == NULL) return NULL;
@@ -2394,8 +2403,8 @@ void *realloc(void *__block, unsigned long __size) {
        of the two -- the new size -- and reads no more of the old block than
        the arena holds. Growing is exact; shrinking copies only what stays. */
     __old = (unsigned char *)__block;
-    for (__i = 0UL; __i < __size; __i++) {
-        if ((unsigned long)(__old + __i) >= __py2bin_heap_bump) break;
+    for (__i = (size_t)0; __i < __size; __i++) {
+        if ((size_t)(__old + __i) >= __py2bin_heap_bump) break;
         __new[__i] = __old[__i];
     }
     return (void *)__new;

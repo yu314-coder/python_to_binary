@@ -102,12 +102,25 @@ class FindingIt(unittest.TestCase):
             self.assertEqual([p.name for p in others], ["sum.c"])
             self.assertIn(str(native), includes)
 
-    def test_native_directories_are_not_the_data_ones(self) -> None:
-        # `web/` is carried as it is; `native/` is compiled. Confusing the two
+    def test_a_directory_of_c_is_compiled_rather_than_carried(self) -> None:
+        # Assets are carried as they are; C is compiled. Confusing the two
         # would either compile a stylesheet or ship C source as an asset.
-        from py2bin.interactive import _DATA_DIRECTORIES
+        # Told apart by what is inside, not by the name: a program's assets
+        # live in `web`, `ui`, `frontend` or whatever the author called them.
+        from py2bin.interactive import _worth_carrying
 
-        self.assertFalse(set(_NATIVE_DIRECTORIES) & set(_DATA_DIRECTORIES))
+        with tempfile.TemporaryDirectory() as where:
+            here = Path(where)
+            (here / "native").mkdir()
+            (here / "native" / "helper.c").write_text(
+                "int main(void) { return 0; }\n"
+            )
+            (here / "native" / "notes.txt").write_text("read me\n")
+            (here / "frontend").mkdir()
+            (here / "frontend" / "index.html").write_text("<h1>hi</h1>\n")
+
+            self.assertFalse(_worth_carrying(here / "native"))
+            self.assertTrue(_worth_carrying(here / "frontend"))
         self.assertIn("native", _NATIVE_DIRECTORIES)
 
 

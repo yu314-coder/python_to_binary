@@ -240,3 +240,38 @@ class NoExternalToolchainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AllocatorIsPointerWide(unittest.TestCase):
+    """py2bin's own `<stdlib.h>` holds addresses in a pointer-wide type.
+
+    Windows is LLP64: a `long` is four bytes there and a pointer is eight.
+    An arena address held in an `unsigned long` loses its top half, and the
+    kernel maps that arena wherever it likes - above four gigabytes, on a
+    64-bit process, more often than not. Every pointer the allocator handed
+    out was then a low address belonging to nobody.
+    """
+
+    def test_the_heap_holds_no_address_in_a_long(self) -> None:
+        from py2bin.c_preprocessor import _BUILTIN_HEADERS
+
+        text = _BUILTIN_HEADERS["stdlib.h"]
+        for line in text.split("\n"):
+            if "__py2bin_heap" not in line and "__py2bin_arena" not in line:
+                continue
+            self.assertNotRegex(
+                line,
+                r"\bunsigned\s+long\b(?!\s+long)",
+                f"an address in a 32-bit type on Windows: {line.strip()}",
+            )
+
+    def test_the_allocator_takes_and_answers_size_t(self) -> None:
+        from py2bin.c_preprocessor import _BUILTIN_HEADERS
+
+        text = _BUILTIN_HEADERS["stdlib.h"]
+        for spelled in (
+            "void *malloc(size_t __n)",
+            "void *calloc(size_t __count, size_t __size)",
+            "void *realloc(void *__block, size_t __size)",
+        ):
+            self.assertIn(spelled, text)

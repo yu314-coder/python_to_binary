@@ -94,10 +94,11 @@ def main() -> int:
     sys.path.insert(0, str(SOURCE))
     from py2bin.interactive import main as ask
 
-    where, target, method, includes, fetch, defines = _read_arguments(sys.argv[1:])
-    if where is _BAD:
+    read = _read_arguments(sys.argv[1:])
+    if read[0] is _BAD:
         return 2
-    return ask(where, target, method, includes, fetch, defines)
+    where, target, method, includes, fetch, defines, libraries = read
+    return ask(where, target, method, includes, fetch, defines, libraries)
 
 
 #: What `_read_arguments` returns when it could not read them.
@@ -106,7 +107,7 @@ _BAD = object()
 
 def _read_arguments(
     given: "list[str]",
-) -> "tuple[str | None, str | None, str | None, tuple[str, ...], bool, tuple[str, ...]]":
+) -> "tuple[str | None, str | None, str | None, tuple[str, ...], bool, tuple[str, ...], tuple[str, ...]]":
     """The path, and any of the three questions answered in advance.
 
         python3 build.py app.py
@@ -115,6 +116,7 @@ def _read_arguments(
         python3 build.py app.py --target linux-x86_64 --how freeze
         python3 build.py app.cpp --auto-fetch
         python3 build.py app.c --define NDEBUG -D VERSION=3
+        python3 build.py app.cpp --library WebView2Loader.dll
 
     Answering them on the command line is what lets a script use this same
     entry point rather than a different one - a build that is only reachable
@@ -132,25 +134,38 @@ def _read_arguments(
     what a header means when it says you must define something: `py2bin cc`
     has always taken these and this entry point had not, so the one thing a
     header asked for could not be given to it the documented way.
+
+    `--library NAME.dll` (repeatable) names a shared library holding a
+    function the program calls and never defines. With `--auto-fetch` this is
+    usually not needed: the component that declared the function shipped the
+    library too, and py2bin reads what that library exports to find out which
+    one it is. It is here for a header supplied by hand, where there is no
+    package to look in.
     """
 
     where = target = method = None
     fetch = False
     includes: "list[str]" = []
     defines: "list[str]" = []
+    libraries: "list[str]" = []
     index = 0
     while index < len(given):
         piece = given[index]
-        if piece in ("--target", "--how", "--include", "-I", "--define", "-D"):
+        if piece in (
+            "--target", "--how", "--include", "-I", "--define", "-D",
+            "--library", "-l",
+        ):
             if index + 1 >= len(given):
                 print(f"{piece} needs a value after it.")
-                return _BAD, None, None, (), False, ()
+                return _BAD, None, None, (), False, (), ()
             if piece == "--target":
                 target = given[index + 1]
             elif piece == "--how":
                 method = given[index + 1]
             elif piece in ("--define", "-D"):
                 defines.append(given[index + 1])
+            elif piece in ("--library", "-l"):
+                libraries.append(given[index + 1])
             else:
                 includes.append(given[index + 1])
             index += 2
@@ -166,13 +181,17 @@ def _read_arguments(
             print("  --include DIR    where to look for headers (repeatable)")
             print("  --auto-fetch     download a header this cannot find here")
             print("  --define NAME    define a macro before the file is read")
-            return _BAD, None, None, (), False, ()
+            print("  --library NAME   a DLL a called function lives in")
+            return _BAD, None, None, (), False, (), ()
         if piece.startswith("-"):
             print(f"{piece} is not an option this understands.")
-            return _BAD, None, None, (), False, ()
+            return _BAD, None, None, (), False, (), ()
         where = piece
         index += 1
-    return where, target, method, tuple(includes), fetch, tuple(defines)
+    return (
+        where, target, method, tuple(includes), fetch, tuple(defines),
+        tuple(libraries),
+    )
 
 
 if __name__ == "__main__":

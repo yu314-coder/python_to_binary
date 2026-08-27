@@ -2101,6 +2101,27 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the allocator was 32-bit on Windows
+
+**Every `malloc` on a Windows target handed back a truncated address.** The
+arena's bump pointer was held in an `unsigned long`, which is eight bytes on
+every platform py2bin targets except the one it matters on: Windows is LLP64,
+where a `long` is four bytes and a pointer is eight. The kernel maps the arena
+wherever it likes and on a 64-bit process that is usually above the four
+gigabytes that fit, so the top half of the address was cut off and every
+block handed out was a low address belonging to nobody.
+
+Nothing said so. A program that never allocates was unaffected, which is most
+of the corpus; one that did either faulted or quietly wrote somewhere else.
+It was found by a real program on a real machine: SidecarBridge got as far as
+its own error dialog, reporting `E_POINTER` from a WebView2 call it had handed
+an object that `new` had just failed to make.
+
+`size_t` now, which is the width of a pointer on every target - which is the
+property being relied on, so it is the one named. A corpus program checks
+that an address above four gigabytes survives the allocator intact, and a
+test reads the header to make sure no address goes back into a `long`.
+
 ### 0.9.13 - a Windows WebView2 program, from C++, with no toolchain
 
 SidecarBridge - three C++ files, a fetched WebView2 header and a vendor DLL -

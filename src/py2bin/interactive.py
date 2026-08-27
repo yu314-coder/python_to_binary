@@ -23,9 +23,37 @@ _OURS = {"build.py", "get-py2bin.py", "setup.py", "conftest.py", "noxfile.py"}
 #: macOS wants .icns; either is converted if the other is what is there.
 _ICONS = ("icon.ico", "icon.icns", "icon.png", "app.ico", "app.icns")
 
-#: Directories a program opens rather than imports - templates, web assets,
-#: icons. They are carried beside it, because that is where it looks.
-_DATA_DIRECTORIES = ("web", "assets", "static", "templates", "resources", "data")
+#: What is beside a program but is not the program: version control, caches,
+#: virtual environments, the output of a previous build, an editor's notes.
+#: None of it is opened at run time and some of it is enormous.
+_NOT_CARRIED = {
+    ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".tox", ".nox", ".venv", "venv", "env", "node_modules",
+    ".idea", ".vscode", ".DS_Store", "dist", "build", ".eggs", ".mypy",
+    ".py2bin-headers", ".py2bin-work", ".cache",
+}
+
+#: Suffixes that are the program rather than what it opens. A `.py` is
+#: imported, a `.c` is compiled, a `.pyc` is a cache of a `.py`.
+_IS_THE_PROGRAM = {
+    ".py", ".pyc", ".pyo", ".pyd", ".pyw", ".c", ".cpp", ".cc", ".cxx",
+    ".h", ".hpp", ".hxx", ".hh", ".o", ".obj", ".so", ".a",
+}
+
+#: A file beside a program that nothing opens at run time: notes, licences,
+#: packaging metadata. Carrying one is harmless and carrying all of them is
+#: noise, so the ones that are always this are left out by name.
+_NOT_DATA = {
+    "readme", "readme.md", "readme.rst", "readme.txt", "license", "licence",
+    "license.txt", "license.md", "copying", "changelog", "changelog.md",
+    "pyproject.toml", "setup.cfg", "setup.py", "requirements.txt",
+    "makefile", ".gitignore", ".gitattributes", ".editorconfig",
+}
+
+#: How deep to look for what a program opens. Deep enough for
+#: `resources/web/index.html`, shallow enough that a directory of source
+#: trees is not walked to the bottom.
+_CARRY_DEPTH = 3
 
 #: Directories holding C to build with the program rather than data to carry.
 _NATIVE_DIRECTORIES = ("native", "c", "csrc", "lib")
@@ -422,13 +450,23 @@ def main(
     # Anything the program opens rather than imports. Found rather than asked
     # for: a directory of web assets beside a program is what it is, and a
     # bundle without it is a bundle that starts and then cannot draw anything.
-    carried = [
-        here / name
-        for name in _DATA_DIRECTORIES
-        if (here / name).is_dir()
-    ]
+    carried, named, outside = _what_it_opens(program, here, needs.local)
     if carried:
-        say(f"  carrying {', '.join(path.name + '/' for path in carried)}")
+        say(
+            "  carrying "
+            + ", ".join(
+                path.name + ("/" if path.is_dir() else "") for path in carried
+            )
+        )
+        for path in named:
+            say(f"    {path.name}{'/' if path.is_dir() else ''}: the source names it")
+    for path in outside:
+        say(
+            f"\n  it opens {path}, which is outside {here}.\n"
+            f"  Everything carried is placed beside the program by its own\n"
+            f"  name, so that path will not resolve where this runs. Move it\n"
+            f"  under {here.name}/ and open it from there."
+        )
 
     # C beside the program is compiled for the same machine and carried with
     # it. Found rather than asked for, like the data directories: a `native/`
@@ -589,6 +627,158 @@ _FETCH_ROUNDS = 24
 #: What the preprocessor says when it cannot find one. Read back rather than
 #: raised as a type of its own, so this stays out of the compiler's way.
 _MISSING_HEADER = re.compile(r"cannot find the header '([^']+)'")
+
+
+def _what_it_opens(
+    program: Path, here: Path, local: "list[str]"
+) -> "tuple[list[Path], list[Path], list[Path]]":
+    """Everything beside the program that it opens rather than imports.
+
+    Two questions, because either alone gets it wrong. What does the source
+    *name*? A program that writes `create_window(..., "ui/index.html")` has
+    said where its assets are, whatever the directory is called - and it may
+    say a path that is not beside the program at all. And what is *there*?
+    A program that builds its path at run time - from `__file__`, from a
+    config, out of `os.path.join` of two variables - has named nothing, and
+    the directory of HTML beside it is still what it opens.
+
+    Answers what to carry, which of those the source named - so the reason
+    can be shown rather than only the result - and what it names that is not
+    under the folder being built, which cannot be carried at all.
+    """
+
+    root = here.resolve()
+    every = _paths_the_source_names(program, here, local)
+    # What the program names from outside the folder being built cannot come
+    # with it: everything carried is placed *beside* the program by its own
+    # name, so `../shared/web` would arrive as `web` and the program would
+    # still be looking one directory up. Carrying it would produce a bundle
+    # that starts and cannot draw anything, which is the failure this whole
+    # step exists to prevent - so it is reported rather than half-done.
+    named = [path for path in every if root in path.parents or path == root]
+    outside = [path for path in every if path not in named]
+    found = [
+        path
+        for path in sorted(here.iterdir())
+        if path not in named and _worth_carrying(path)
+    ]
+    both = sorted(set(named) | set(found), key=lambda path: path.name)
+    # A directory carries what is inside it, so naming a file within one that
+    # is already going says the same thing twice.
+    carried = [
+        path
+        for path in both
+        if not any(
+            other != path and other.is_dir() and other in path.parents
+            for other in both
+        )
+    ]
+    return carried, [path for path in carried if path in named], outside
+
+
+def _worth_carrying(path: Path) -> bool:
+    """Whether something beside the program is data it opens."""
+
+    if path.name in _NOT_CARRIED or path.name.lower() in _NOT_DATA:
+        return False
+    if path.name.startswith("."):
+        return False
+    if path.is_dir():
+        # A directory holding C with a `main` is compiled and carried as the
+        # helper it becomes, not copied as data. Asked of what is in it
+        # rather than of its name, for the same reason as below.
+        if c_programs(path):
+            return False
+        # A directory of source is the program; a directory with anything
+        # else in it is what the program opens. Asked of what is inside
+        # rather than of the name, because the name is the author's and
+        # `web`, `ui`, `frontend` and `gui` are all the same directory.
+        return any(_worth_carrying(item) for item in _within(path))
+    return path.suffix.lower() not in _IS_THE_PROGRAM
+
+
+def _within(folder: Path, depth: int = _CARRY_DEPTH) -> "list[Path]":
+    """What is inside a directory, without walking a whole source tree."""
+
+    if depth <= 0:
+        return []
+    try:
+        items = sorted(folder.iterdir())
+    except OSError:
+        return []
+    found: "list[Path]" = []
+    for item in items:
+        if item.name in _NOT_CARRIED or item.name.startswith("."):
+            continue
+        found.append(item)
+        if item.is_dir():
+            found.extend(_within(item, depth - 1))
+    return found
+
+
+def _paths_the_source_names(
+    program: Path, here: Path, local: "list[str]"
+) -> "list[Path]":
+    """Every existing path the program, or a module beside it, writes down.
+
+    A string in the source that names something on disk is the program
+    saying what it opens. It is the only signal that reaches a directory
+    the program does not sit in - `"../shared/web"` - and the only one that
+    is right when the directory is called something nobody would guess.
+    """
+
+    import ast
+
+    sources = [program]
+    for name in local:
+        beside = here / f"{name}.py"
+        if beside.is_file():
+            sources.append(beside)
+        package = here / name / "__init__.py"
+        if package.is_file():
+            sources.append(package)
+    found: "set[Path]" = set()
+    for source in sources:
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            spelled = node.value.strip()
+            if not spelled or len(spelled) > 200 or "\n" in spelled:
+                continue
+            for root in (source.parent, here):
+                try:
+                    candidate = (root / spelled).resolve()
+                except (OSError, ValueError):
+                    continue
+                if not candidate.exists() or candidate == here.resolve():
+                    continue
+                # What to carry is the outermost piece under the project
+                # that is not the project itself: `ui/index.html` means the
+                # whole of `ui`, because the page asks for its own stylesheet
+                # and nothing in the source says so.
+                found.add(_outermost(candidate, here))
+    return sorted(found)
+
+
+def _outermost(path: Path, here: Path) -> Path:
+    """The topmost part of `path` inside `here`.
+
+    A file named inside a directory means the whole directory: the page asks
+    for its own stylesheet and its own script, and nothing in the source says
+    so. Outside `here` the answer is the directory holding it, which is what
+    the caller reports as unreachable.
+    """
+
+    root = here.resolve()
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return path.parent if path.is_file() else path
+    return root / parts[0] if parts else path
 
 
 def _header_that_is_missing(message: str) -> "str | None":
