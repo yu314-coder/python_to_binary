@@ -14242,6 +14242,20 @@ def is_cpp(path: Path) -> bool:
     return path.suffix.lower() in CPP_SUFFIXES
 
 
+def _somebody_supplies(named: str, include_dirs: "tuple[str, ...]") -> bool:
+    """Whether anything will ever hand this header over.
+
+    py2bin's own C++ headers, py2bin's own C ones, and the search path. A
+    name none of those holds is a name no pass below can answer either.
+    """
+
+    from .c_preprocessor import _BUILTIN_HEADERS
+
+    if named in _BUILTIN_CPP_HEADERS or named in _BUILTIN_HEADERS:
+        return True
+    return any((Path(folder) / named).is_file() for folder in include_dirs)
+
+
 def inline_local_includes(
     path: Path,
     include_dirs: "tuple[str, ...]" = (),
@@ -14351,6 +14365,19 @@ def inline_local_includes(
                     candidate.read_text(encoding="utf-8", errors="replace")
                 ):
                     return chosen_branch(named, candidate)
+            # Nothing on the search path holds it, py2bin does not ship it,
+            # and neither does the preprocessor below. Nothing later will
+            # supply it either, so the program cannot build - and saying so
+            # here, by name, is what lets `--auto-fetch` go and get it. Left
+            # for the preprocessor, the translator ran on a file missing
+            # every class that header declares and reported whichever pass
+            # first tripped over one, which named a symptom and not this.
+            if not _somebody_supplies(named, include_dirs):
+                raise CppTranslationError(
+                    str(path),
+                    _line_of(text, match.start()),
+                    f"cannot find the header {named!r}",
+                )
             return match.group(0)
         for folder in (path.parent, *(Path(d) for d in include_dirs)):
             candidate = folder / named

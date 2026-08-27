@@ -4839,7 +4839,9 @@ class Lowerer:
             self.error(
                 f"call to {node.name!r}, which is declared but never defined; "
                 "py2bin has no linker, so the body of every function a program "
-                "calls has to be in this translation unit",
+                "calls has to be in this translation unit - or, where it lives "
+                "in a shared library somebody else shipped, name that library "
+                "with --library NAME.dll and it becomes an import",
                 node.token,
             )
         if function.name == "main":

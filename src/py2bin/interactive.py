@@ -179,9 +179,16 @@ def c_programs(here: Path) -> list[Path]:
     return found
 
 
-#: `int main(` or `int main (`, at the start of a line so a call or a
-#: declaration inside another function is not mistaken for the definition.
-_DEFINES_MAIN = __import__("re").compile(r"^[ \t]*(?:int|void)[ \t]+main[ \t]*\(", __import__("re").M)
+#: `int main(`, at the start of a line so a call or a declaration inside
+#: another function is not mistaken for the definition - and `wWinMain`,
+#: which is where Windows starts a desktop program and is the only `main` a
+#: program written for it has. `WINAPI` sits between the two words there.
+_DEFINES_MAIN = __import__("re").compile(
+    r"^[ \t]*(?:int|void)[ \t]+"
+    r"(?:(?:WINAPI|APIENTRY|__stdcall)[ \t]+)?"
+    r"(?:main|wWinMain|WinMain)[ \t]*\(",
+    __import__("re").M,
+)
 
 
 def c_sources_beside(program: Path) -> "tuple[list[Path], list[str]]":
@@ -271,6 +278,7 @@ def main(
     include_dirs: "tuple[str, ...]" = (),
     auto_fetch: bool = False,
     defines: "tuple[str, ...]" = (),
+    libraries: "tuple[str, ...]" = (),
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -284,6 +292,10 @@ def main(
     a build that reaches the network on its own is a build that stops working
     on a machine without one, and says something different each time the
     index changes.
+
+    `libraries` names the shared libraries a function the program calls but
+    never defines lives in - `WebView2Loader.dll` and the like - the way a
+    build with a linker is given an import library.
     """
 
     # Everything is said on stdout. Some editors show only that, and an
@@ -344,7 +356,9 @@ def main(
         say(f"\n  building for {target}")
 
     if program.suffix in _SOURCE_SUFFIXES:
-        return _build_c(program, target, include_dirs, auto_fetch, defines)
+        return _build_c(
+            program, target, include_dirs, auto_fetch, defines, libraries
+        )
 
     system = target.split("-")[0]
     offered = methods_for(target)
@@ -623,6 +637,7 @@ def _build_c(
     include_dirs: "tuple[str, ...]" = (),
     auto_fetch: bool = False,
     defines: "tuple[str, ...]" = (),
+    libraries: "tuple[str, ...]" = (),
 ) -> int:
     """Compile a C or C++ program, and everything beside it, into one binary.
 
@@ -672,6 +687,7 @@ def _build_c(
                     include_dirs=tuple(includes),
                     defines=tuple(defines),
                     extra_sources=tuple(others),
+                    libraries=tuple(libraries),
                 )
                 break
             except Exception as refused:
