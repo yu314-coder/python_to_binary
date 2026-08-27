@@ -23,37 +23,26 @@ _OURS = {"build.py", "get-py2bin.py", "setup.py", "conftest.py", "noxfile.py"}
 #: macOS wants .icns; either is converted if the other is what is there.
 _ICONS = ("icon.ico", "icon.icns", "icon.png", "app.ico", "app.icns")
 
-#: What is beside a program but is not the program: version control, caches,
-#: virtual environments, the output of a previous build, an editor's notes.
-#: None of it is opened at run time and some of it is enormous.
+#: What is beside a program and is not the program's own: the machinery of
+#: version control, of caching, of packaging, of an editor. None of it is a
+#: layout - a program does not choose where `.git` goes - and none of it is
+#: opened at run time. Everything else is carried, wherever it sits and
+#: whatever it is called, because where a program keeps its own files is the
+#: author's business and not something to have opinions about.
 _NOT_CARRIED = {
     ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".tox", ".nox", ".venv", "venv", "env", "node_modules",
-    ".idea", ".vscode", ".DS_Store", "dist", "build", ".eggs", ".mypy",
-    ".py2bin-headers", ".py2bin-work", ".cache",
+    ".ruff_cache", ".tox", ".nox", ".venv", "venv", ".eggs", "node_modules",
+    ".idea", ".vscode", ".DS_Store", "dist", "build", ".py2bin-headers",
 }
 
 #: Suffixes that are the program rather than what it opens. A `.py` is
-#: imported, a `.c` is compiled, a `.pyc` is a cache of a `.py`.
+#: imported and a `.c` is compiled; both are handled already, and carrying
+#: one again would put source in a bundle whose whole point is that it has
+#: none.
 _IS_THE_PROGRAM = {
     ".py", ".pyc", ".pyo", ".pyd", ".pyw", ".c", ".cpp", ".cc", ".cxx",
-    ".h", ".hpp", ".hxx", ".hh", ".o", ".obj", ".so", ".a",
+    ".h", ".hpp", ".hxx", ".hh", ".o", ".obj",
 }
-
-#: A file beside a program that nothing opens at run time: notes, licences,
-#: packaging metadata. Carrying one is harmless and carrying all of them is
-#: noise, so the ones that are always this are left out by name.
-_NOT_DATA = {
-    "readme", "readme.md", "readme.rst", "readme.txt", "license", "licence",
-    "license.txt", "license.md", "copying", "changelog", "changelog.md",
-    "pyproject.toml", "setup.cfg", "setup.py", "requirements.txt",
-    "makefile", ".gitignore", ".gitattributes", ".editorconfig",
-}
-
-#: How deep to look for what a program opens. Deep enough for
-#: `resources/web/index.html`, shallow enough that a directory of source
-#: trees is not walked to the bottom.
-_CARRY_DEPTH = 3
 
 #: Directories holding C to build with the program rather than data to carry.
 _NATIVE_DIRECTORIES = ("native", "c", "csrc", "lib")
@@ -450,7 +439,7 @@ def main(
     # Anything the program opens rather than imports. Found rather than asked
     # for: a directory of web assets beside a program is what it is, and a
     # bundle without it is a bundle that starts and then cannot draw anything.
-    carried, named, outside = _what_it_opens(program, here, needs.local)
+    carried, skipped, outside = _what_it_opens(program, here)
     if carried:
         say(
             "  carrying "
@@ -458,14 +447,26 @@ def main(
                 path.name + ("/" if path.is_dir() else "") for path in carried
             )
         )
-        for path in named:
-            say(f"    {path.name}{'/' if path.is_dir() else ''}: the source names it")
     for path in outside:
+        # Everything carried is placed beside the program by its own name, so
+        # something the code reaches for from above the folder being built
+        # arrives in a different place than the code expects. Said plainly:
+        # it is there, and it is not where the path in the source points.
         say(
-            f"\n  it opens {path}, which is outside {here}.\n"
-            f"  Everything carried is placed beside the program by its own\n"
-            f"  name, so that path will not resolve where this runs. Move it\n"
-            f"  under {here.name}/ and open it from there."
+            f"\n  {path} is outside {here}.\n"
+            f"  It is carried, and it arrives as {path.name} beside the\n"
+            f"  program - so open it from beside the program rather than by\n"
+            f"  the path this found it at."
+        )
+    # Said rather than left silent: what is not carried is not there when the
+    # program looks for it, and a bundle that starts and cannot draw anything
+    # is worse than one that says what it left behind.
+    passed = [path for path in skipped if path.name in _NOT_CARRIED]
+    if passed:
+        say(
+            "  passing over "
+            + ", ".join(path.name for path in passed)
+            + " - name one with --include to carry it anyway"
         )
 
     # C beside the program is compiled for the same machine and carried with
@@ -630,155 +631,304 @@ _MISSING_HEADER = re.compile(r"cannot find the header '([^']+)'")
 
 
 def _what_it_opens(
-    program: Path, here: Path, local: "list[str]"
+    program: Path, here: Path
 ) -> "tuple[list[Path], list[Path], list[Path]]":
-    """Everything beside the program that it opens rather than imports.
+    """Everything the program opens rather than imports.
 
-    Two questions, because either alone gets it wrong. What does the source
-    *name*? A program that writes `create_window(..., "ui/index.html")` has
-    said where its assets are, whatever the directory is called - and it may
-    say a path that is not beside the program at all. And what is *there*?
-    A program that builds its path at run time - from `__file__`, from a
-    config, out of `os.path.join` of two variables - has named nothing, and
-    the directory of HTML beside it is still what it opens.
+    Read out of the code first, because that is the only thing that finds a
+    directory the program does not sit next to. A program says where its
+    files are - outright, in pieces, or through a constant - and following
+    what it says works whatever the directory is called and wherever it is.
 
-    Answers what to carry, which of those the source named - so the reason
-    can be shown rather than only the result - and what it names that is not
-    under the folder being built, which cannot be carried at all.
+    Then what is beside the program, because a path assembled at run time out
+    of something static reading cannot see is written down nowhere, and the
+    directory of pages beside the program is still what it opens.
+
+    Neither half knows a layout. There is no list of names here and no depth:
+    `web`, `ui`, `frontend`, `pages`, an `index.html` lying loose, or a tree
+    ten deep with a name nobody would guess all arrive the same way.
+
+    Answers what to carry, what was passed over, and what it found that sits
+    outside the program's own folder - which is carried too, but arrives
+    somewhere else, so it is worth saying.
     """
 
     root = here.resolve()
-    every = _paths_the_source_names(program, here, local)
-    # What the program names from outside the folder being built cannot come
-    # with it: everything carried is placed *beside* the program by its own
-    # name, so `../shared/web` would arrive as `web` and the program would
-    # still be looking one directory up. Carrying it would produce a bundle
-    # that starts and cannot draw anything, which is the failure this whole
-    # step exists to prevent - so it is reported rather than half-done.
-    named = [path for path in every if root in path.parents or path == root]
-    outside = [path for path in every if path not in named]
-    found = [
+    named = _carry_units(_paths_the_code_names(program, here), root)
+    beside = [
         path
         for path in sorted(here.iterdir())
-        if path not in named and _worth_carrying(path)
+        if path != program and _worth_carrying(path)
     ]
-    both = sorted(set(named) | set(found), key=lambda path: path.name)
-    # A directory carries what is inside it, so naming a file within one that
-    # is already going says the same thing twice.
-    carried = [
+    skipped = [
+        path
+        for path in sorted(here.iterdir())
+        if path != program and not _worth_carrying(path)
+    ]
+    both = {path.resolve() for path in beside} | set(named)
+    # A directory carries everything under it, so naming something inside one
+    # that is already going says the same thing twice.
+    carried = sorted(
         path
         for path in both
-        if not any(
-            other != path and other.is_dir() and other in path.parents
-            for other in both
-        )
+        if not any(other != path and other in path.parents for other in both)
+    )
+    outside = [
+        path for path in carried if root not in path.parents and path != root
     ]
-    return carried, [path for path in carried if path in named], outside
+    return carried, skipped, outside
+
+
+def _carry_units(found: "list[Path]", root: Path) -> "set[Path]":
+    """What to carry for each path the code named.
+
+    A file is carried with the directory holding it: a page asks for its own
+    stylesheet and its own script, and nothing in the code says so. Unless it
+    sits in the program's own folder, where the directory is the project and
+    the file is the whole of what was named.
+    """
+
+    units: "set[Path]" = set()
+    for path in found:
+        if path.is_dir():
+            units.add(path)
+            continue
+        holder = path.parent
+        units.add(path if holder == root else holder)
+    return units
 
 
 def _worth_carrying(path: Path) -> bool:
-    """Whether something beside the program is data it opens."""
+    """Whether something beside the program is data the program opens."""
 
-    if path.name in _NOT_CARRIED or path.name.lower() in _NOT_DATA:
+    if path.name in _NOT_CARRIED or path.name.startswith("."):
         return False
-    if path.name.startswith("."):
+    if not path.is_dir():
+        return path.suffix.lower() not in _IS_THE_PROGRAM
+    # A directory holding C with a `main` is compiled and carried as the
+    # helper it becomes, not copied as data.
+    if c_programs(path):
         return False
-    if path.is_dir():
-        # A directory holding C with a `main` is compiled and carried as the
-        # helper it becomes, not copied as data. Asked of what is in it
-        # rather than of its name, for the same reason as below.
-        if c_programs(path):
-            return False
-        # A directory of source is the program; a directory with anything
-        # else in it is what the program opens. Asked of what is inside
-        # rather than of the name, because the name is the author's and
-        # `web`, `ui`, `frontend` and `gui` are all the same directory.
-        return any(_worth_carrying(item) for item in _within(path))
-    return path.suffix.lower() not in _IS_THE_PROGRAM
+    # A directory of nothing but source is the program, and the program is
+    # already handled. Anything else in it makes the whole directory data,
+    # because what carries it carries all of it. Asked of the contents and
+    # not of the name, and to the bottom rather than to a fixed depth: a
+    # program may keep its pages three directories down or ten.
+    return _holds_something_opened(path)
 
 
-def _within(folder: Path, depth: int = _CARRY_DEPTH) -> "list[Path]":
-    """What is inside a directory, without walking a whole source tree."""
+def _holds_something_opened(folder: Path) -> bool:
+    """Whether anything under here is a file the program could open.
 
-    if depth <= 0:
-        return []
-    try:
-        items = sorted(folder.iterdir())
-    except OSError:
-        return []
-    found: "list[Path]" = []
-    for item in items:
-        if item.name in _NOT_CARRIED or item.name.startswith("."):
-            continue
-        found.append(item)
-        if item.is_dir():
-            found.extend(_within(item, depth - 1))
-    return found
+    Stops at the first one. A tree of nothing but source is walked whole,
+    which is the only case that costs anything and is the case where the
+    answer is no.
+    """
+
+    import os
+
+    for where, folders, files in os.walk(folder):
+        folders[:] = [
+            name
+            for name in folders
+            if name not in _NOT_CARRIED and not name.startswith(".")
+        ]
+        for name in files:
+            if name.startswith("."):
+                continue
+            if Path(name).suffix.lower() not in _IS_THE_PROGRAM:
+                return True
+    return False
 
 
-def _paths_the_source_names(
-    program: Path, here: Path, local: "list[str]"
-) -> "list[Path]":
-    """Every existing path the program, or a module beside it, writes down.
+class _Paths:
+    """Works out, without running anything, which paths a module names.
 
-    A string in the source that names something on disk is the program
-    saying what it opens. It is the only signal that reaches a directory
-    the program does not sit in - `"../shared/web"` - and the only one that
-    is right when the directory is called something nobody would guess.
+    A program says where its files are. `create_window(..., "ui/index.html")`
+    says it outright; `os.path.join(os.path.dirname(__file__), "pages",
+    name)` says it in pieces; `ROOT / "assets" / "app.css"` says it through a
+    constant declared above. All three are written down, and all three can be
+    read without guessing at a layout and without needing the files to sit
+    anywhere in particular - which is the only way to find a directory that
+    is nowhere near the program.
+
+    What cannot be worked out is left alone rather than approximated. A path
+    assembled out of a variable this cannot see is not a path this knows.
+    """
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.known: "dict[str, str]" = {}
+        self.found: "set[str]" = set()
+
+    def read(self, tree) -> None:
+        import ast
+
+        # Two passes: a constant declared at the bottom of a file is still in
+        # scope for a function written at the top of it.
+        for _round in range(2):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    spelled = self.fold(node.value)
+                    if spelled is None:
+                        continue
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            self.known[target.id] = spelled
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    spelled = self.fold(node.value)
+                    if spelled is not None and isinstance(node.target, ast.Name):
+                        self.known[node.target.id] = spelled
+        for node in ast.walk(tree):
+            spelled = self.fold(node)
+            if spelled is not None:
+                self.found.add(spelled)
+
+    def fold(self, node) -> "str | None":
+        """The string this expression is, where that can be worked out."""
+
+        import ast
+
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else None
+        if isinstance(node, ast.Name):
+            if node.id == "__file__":
+                # The module's own path. A real one, so that `.parent` and
+                # `parents[2]` above it are ordinary text arithmetic and can
+                # climb as far as the program wrote.
+                return str(self.folder / "__init__.py")
+            return self.known.get(node.id)
+        if isinstance(node, ast.JoinedStr):
+            pieces = [self.fold(part) for part in node.values]
+            return "".join(pieces) if all(p is not None for p in pieces) else None
+        if isinstance(node, ast.FormattedValue):
+            return self.fold(node.value)
+        if isinstance(node, ast.BinOp):
+            left, right = self.fold(node.left), self.fold(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Div):
+                # `Path(a) / b`, which is how a path is written now.
+                return left.rstrip("/") + "/" + right.lstrip("/")
+            return None
+        if isinstance(node, ast.Attribute):
+            # `Path(__file__).parent`, and `.parent.parent` above it.
+            if node.attr == "parent":
+                inner = self.fold(node.value)
+                return None if inner is None else _up(inner)
+            if node.attr in ("parents",):
+                return None
+            return None
+        if isinstance(node, ast.Subscript):
+            # `Path(__file__).parents[1]`
+            inner = node.value
+            if (
+                isinstance(inner, ast.Attribute)
+                and inner.attr == "parents"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+            ):
+                held = self.fold(inner.value)
+                if held is None:
+                    return None
+                for _step in range(node.slice.value + 1):
+                    held = _up(held)
+                return held
+            return None
+        if isinstance(node, ast.Call):
+            return self.call(node)
+        return None
+
+    def call(self, node) -> "str | None":
+        """The string a call answers, for the handful that name a path."""
+
+        import ast
+
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else (
+            node.func.id if isinstance(node.func, ast.Name) else ""
+        )
+        folded = [self.fold(argument) for argument in node.args]
+        if name in ("join",) and folded and all(p is not None for p in folded):
+            return "/".join(piece.strip("/") if index else piece.rstrip("/")
+                            for index, piece in enumerate(folded))
+        if name in ("dirname",) and len(folded) == 1 and folded[0] is not None:
+            return _up(folded[0])
+        if name in ("abspath", "realpath", "normpath", "expanduser", "str",
+                    "Path", "PurePath", "fspath", "resolve"):
+            if len(folded) == 1 and folded[0] is not None:
+                return folded[0]
+            if not folded and isinstance(node.func, ast.Attribute):
+                return self.fold(node.func.value)
+        return None
+
+
+def _up(spelled: str) -> str:
+    """One directory up, on the text rather than on the disk."""
+
+    trimmed = spelled.rstrip("/")
+    cut = trimmed.rfind("/")
+    return trimmed[:cut] if cut > 0 else "/"
+
+
+def _paths_the_code_names(program: Path, here: Path) -> "list[Path]":
+    """Every existing path the program, or a module it imports, writes down.
+
+    Read rather than guessed at, which is what lets this reach a directory
+    that is nowhere near the program - `../../shared/web` is as findable as
+    `web`, because the program said so either way.
     """
 
     import ast
 
+    from py2bin.requirements import discover
+
     sources = [program]
-    for name in local:
-        beside = here / f"{name}.py"
-        if beside.is_file():
-            sources.append(beside)
-        package = here / name / "__init__.py"
-        if package.is_file():
-            sources.append(package)
+    try:
+        for name in discover(program).local:
+            for candidate in (here / f"{name}.py", here / name / "__init__.py"):
+                if candidate.is_file():
+                    sources.append(candidate)
+    except Exception:  # a program this cannot read is still worth trying
+        pass
     found: "set[Path]" = set()
     for source in sources:
         try:
             tree = ast.parse(source.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, SyntaxError):
+        except (OSError, SyntaxError, ValueError):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                continue
-            spelled = node.value.strip()
-            if not spelled or len(spelled) > 200 or "\n" in spelled:
-                continue
-            for root in (source.parent, here):
-                try:
-                    candidate = (root / spelled).resolve()
-                except (OSError, ValueError):
-                    continue
-                if not candidate.exists() or candidate == here.resolve():
-                    continue
-                # What to carry is the outermost piece under the project
-                # that is not the project itself: `ui/index.html` means the
-                # whole of `ui`, because the page asks for its own stylesheet
-                # and nothing in the source says so.
-                found.add(_outermost(candidate, here))
+        reader = _Paths(source.parent)
+        reader.read(tree)
+        for spelled in reader.found:
+            for resolved in _resolve(spelled, source.parent, here):
+                found.add(resolved)
     return sorted(found)
 
 
-def _outermost(path: Path, here: Path) -> Path:
-    """The topmost part of `path` inside `here`.
+def _resolve(spelled: str, folder: Path, here: Path) -> "list[Path]":
+    """Which real paths a worked-out string could be naming."""
 
-    A file named inside a directory means the whole directory: the page asks
-    for its own stylesheet and its own script, and nothing in the source says
-    so. Outside `here` the answer is the directory holding it, which is what
-    the caller reports as unreachable.
-    """
-
-    root = here.resolve()
-    try:
-        parts = path.relative_to(root).parts
-    except ValueError:
-        return path.parent if path.is_file() else path
-    return root / parts[0] if parts else path
+    if not spelled or len(spelled) > 4096 or "\n" in spelled or "\x00" in spelled:
+        return []
+    candidates = []
+    written = Path(spelled)
+    for root in ({folder, here} if not written.is_absolute() else {None}):
+        try:
+            whole = written if root is None else (root / written)
+            resolved = whole.resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if not resolved.exists():
+            continue
+        # A directory the program sits inside is the project, not something
+        # it opens: `ROOT = Path(__file__).parent.parent` is how a program
+        # says where it is, and carrying that would carry itself.
+        root = here.resolve()
+        if resolved == root or resolved in root.parents:
+            continue
+        candidates.append(resolved)
+    return candidates
 
 
 def _header_that_is_missing(message: str) -> "str | None":

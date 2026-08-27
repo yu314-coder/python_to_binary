@@ -2101,6 +2101,38 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - assets are found by reading the program, not by knowing a layout
+
+**What a program opens is read out of the program.** py2bin used to look for
+six directory names beside the entry - `web`, `assets`, `static`,
+`templates`, `resources`, `data` - which is six of the names an author might
+pick and not the one they did. `ui`, `frontend`, `gui`, `pages`, `site`, an
+`index.html` lying loose with no directory at all: none of them were carried,
+and the bundle started and could not draw anything.
+
+There is no list now, and no depth. A program says where its files are, and
+what it says is worked out without running it:
+
+```python
+webview.create_window("App", "ui/index.html")                  # outright
+os.path.join(os.path.dirname(__file__), "pages", "index.html")  # in pieces
+ROOT = Path(__file__).parent.parent                             # through a
+STYLE = ROOT / "assets" / "app.css"                             # constant
+```
+
+All three are followed, along with the modules the program imports from
+beside it. That is what reaches a directory the program does not sit next to
+- `../shared/web` and `parents[2] / "elsewhere"` are as findable as `web`,
+because the program said so either way.
+
+What a path assembled at run time cannot be read, so what is beside the
+program is carried as well - judged by what is in it, not by what it is
+called. A directory of nothing but source is the program and is already
+handled; a directory with anything else in it is data and travels whole,
+however deep it goes. Version control, caches, virtual environments and the
+output directory are passed over, and py2bin says which, because something
+not carried is worth seeing rather than guessing at.
+
 ### 0.9.13 - the allocator was 32-bit on Windows
 
 **Every `malloc` on a Windows target handed back a truncated address.** The
