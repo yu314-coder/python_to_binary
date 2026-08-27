@@ -339,6 +339,20 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     # DLL in the import table instead would make every program that links it
     # refuse to start without it, and would put a list of other people's
     # products in this table.
+    # The shell, which is one DLL further out than USER32.
+    "ShellExecuteW": (
+        "ShellExecuteW",
+        ("ptr", "ptr", "ptr", "ptr", "ptr", "int"),
+        "ptr",
+        "SHELL32.dll",
+    ),
+    "ShellExecuteA": (
+        "ShellExecuteA",
+        ("ptr", "ptr", "ptr", "ptr", "ptr", "int"),
+        "ptr",
+        "SHELL32.dll",
+    ),
+
     "LoadLibraryW": ("LoadLibraryW", ("ptr",), "ptr", "KERNEL32.dll"),
     "LoadLibraryA": ("LoadLibraryA", ("ptr",), "ptr", "KERNEL32.dll"),
     "FreeLibrary": ("FreeLibrary", ("ptr",), "int", "KERNEL32.dll"),

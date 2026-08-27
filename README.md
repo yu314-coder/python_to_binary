@@ -676,6 +676,22 @@ C++ decides it: the narrowest pattern that fits. A type named outright beats
 one written around a parameter, `T **` beats `T *`, and `<T, T>` - which says
 the two arguments are the same type - beats `<T, U>`, which says nothing.
 
+**A template may be written inside a template.** `ComPtr<T>::As` is one, and
+it could not be read before: a member template's calls are on objects of a
+type that does not exist until the class around it has been written out, and
+the pass that expands member templates ran first and threw it away as unused.
+It runs again afterwards now, and what a member template takes may be spelled
+in terms of another template - `As(ComPtr<U> *other)` says what it was handed
+only that way - so deduction takes a parameter's spelling apart against the
+argument's. Each copy of a class template gets its own copies of the member,
+which is what two `ComPtr`s of different interfaces each having an `As`
+means.
+
+**`<wrl.h>` is py2bin's own**, which is what a WebView2 program includes for
+`ComPtr<T>` - a pointer that counts, releasing what it held when it is given
+something else or goes out of scope. `__uuidof(T)` is the `IID_T` a generated
+header writes out beside the interface.
+
 **A parameter may stand for however many arguments are left.**
 `template <class... Ts>` is a pack: `sizeof...(Ts)` is how many there are,
 `Ts...` is the types, and a parameter declared `Rest... rest` becomes one

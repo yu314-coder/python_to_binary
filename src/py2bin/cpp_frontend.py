@@ -1233,6 +1233,21 @@ def _deduce_arguments(
             continue
         named = words[0] if words[0] not in ("const",) else (words[1] if len(words) > 2 else "")
         if named not in names:
+            # Not `T v`, so try the shape: a parameter written in terms of
+            # another template - `Box<U> *` - deduces from an argument of
+            # that template. The plain rule reads the first word and this one
+            # takes the spelling apart, which is the only way `ComPtr<U> *`
+            # says anything about what it was handed.
+            spelled = re.sub(r"\b[A-Za-z_]\w*$", "", part).strip()
+            if "<" not in spelled:
+                continue
+            deduced = _deduced_type(argument, text, before)
+            if deduced is None:
+                continue
+            settled: "dict[str, str]" = {}
+            if _fits_the_shape(spelled, deduced.strip(), names, settled):
+                for held, value in settled.items():
+                    found.setdefault(held, value)
             continue
         if named in found:
             continue
@@ -2934,6 +2949,33 @@ _OUT_OF_LINE_ROUNDS = 512
 
 
 
+def _class_around(text: str, at: int) -> "tuple[int, str] | None":
+    """Where the innermost class holding `at` starts, and what it is called.
+
+    Not to be confused with `_enclosing_class` above, which answers the same
+    question for a different purpose and in a different shape.
+    """
+
+    innermost = None
+    for head in _CLASS_HEAD.finditer(text):
+        if head.end() > at:
+            break
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        if head.end() <= at < closing:
+            innermost = (head.start(), head.group(2))
+    return innermost
+
+
+def _inside_a_template_pattern(text: str, at: int) -> bool:
+    """Whether the class enclosing `at` is itself `template <...> class`."""
+
+    found = _class_around(text, at)
+    return found is not None and _is_a_template_pattern(text, found[0])
+
+
 def _expand_member_templates(text: str, filename: str) -> str:
     """`template<typename T> T twice(T v)` written inside a class.
 
@@ -2946,9 +2988,17 @@ def _expand_member_templates(text: str, filename: str) -> str:
     for _round in range(_OUT_OF_LINE_ROUNDS):
         found = None
         for match in _TEMPLATE.finditer(text):
-            if _depth_at(text, match.start()) > 0:
-                found = match
-                break
+            if _depth_at(text, match.start()) <= 0:
+                continue
+            if _inside_a_template_pattern(text, match.start()):
+                # The class around it is a pattern, so its objects do not
+                # exist yet and no call can say which copy it wants. Left for
+                # the pass that runs after the class has been written out;
+                # taken now, it was taken away - nothing called it under the
+                # pattern's own name, so it was dropped as unused.
+                continue
+            found = match
+            break
         if found is None:
             return text
         rest = text[found.end():]
@@ -2969,8 +3019,14 @@ def _expand_member_templates(text: str, filename: str) -> str:
         pattern = rest[:closing + 1]
         name = definition.group(2)
         without = text[:found.start()] + text[found.end() + closing + 1:]
+        holder = _class_around(text, found.start())
         copies, without = _member_copies(
-            without, name, parameters, definition.group(3), pattern
+            without,
+            name,
+            parameters,
+            definition.group(3),
+            pattern,
+            holder[1] if holder else "",
         )
         if not copies:
             # Nothing calls it, so there is nothing to write. The pattern is
@@ -2989,14 +3045,34 @@ def _expand_member_templates(text: str, filename: str) -> str:
     )
 
 
+def _receiver_before(text: str, at: int) -> str:
+    """The expression a `.` or `->` at `at` is written on."""
+
+    back = at
+    while back > 0 and text[back - 1] in " \t\n":
+        back -= 1
+    end = back
+    while back > 0 and (text[back - 1].isalnum() or text[back - 1] in "_]>"):
+        back -= 1
+    return text[back:end].strip()
+
+
 def _member_copies(
     text: str,
     name: str,
     parameters: "list[tuple[str, bool]]",
     declared: str,
     pattern: str,
+    holder: str = "",
 ) -> "tuple[list[str], str]":
-    """One copy per set of argument types the calls to `name` ask for."""
+    """One copy per set of argument types the calls to `name` ask for.
+
+    Only the calls made on an object of the class this member belongs to.
+    Two copies of one class template each have their own copy of the member
+    template inside them, and both are called `As`; taking every call that
+    spells that name put `ComPtr<A>`'s copies inside `ComPtr<B>` and left the
+    other class without the member at all.
+    """
 
     made: "dict[str, str]" = {}
     out: list[str] = []
@@ -3009,6 +3085,11 @@ def _member_copies(
         close = _closing_paren(text, call.end() - 1)
         if close < 0:
             continue
+        if holder:
+            receiver = _receiver_before(text, call.start())
+            held = (_deduced_type(receiver, text) or "").replace("*", "").strip()
+            if held and held != holder:
+                continue
         given = _call_arguments(text, call.end() - 1)
         deduced = _deduce_arguments(parameters, declared, given, text, call.start())
         if deduced is None:
@@ -3154,6 +3235,15 @@ def _resolve_nested_typedefs(text: str) -> str:
     return text
 
 
+#: What each copy was made from: `Box__int` came from `Box` with `int`. The
+#: name a copy is written under says what it holds only by convention and
+#: the mangling cannot be read back - `int_p` is `int *` and `a_b` could be
+#: either - so what it was asked for is remembered instead. A member
+#: template deduces against it: `fill(Box<U> *)` handed a `Box__int` learns
+#: `U` is `int` from here, the shape having been mangled away by then.
+_INSTANTIATED: "dict[str, tuple[str, list[str]]]" = {}
+
+
 def _fits_the_shape(
     shape: str, argument: str, parameters: "set[str]", bound: "dict[str, str]"
 ) -> bool:
@@ -3186,6 +3276,61 @@ def _fits_the_shape(
             return _fits_the_shape(
                 shape[len(head):], argument[len(head):], parameters, bound
             )
+    # `Box<U>` against `Box<int>`: the same template, and its arguments have
+    # to fit one for one. This is what lets a parameter spelled in terms of
+    # another template deduce anything at all - `As(ComPtr<U> *other)` is
+    # written that way, and so is half of what a container's members take.
+    shaped = re.match(r"^([A-Za-z_]\w*)\s*<", shape)
+    given = re.match(r"^([A-Za-z_]\w*)\s*<", argument)
+    if shaped is not None and given is None:
+        # The argument is a copy that has already been written out, so its
+        # shape is in its name and not in its spelling. What it was made from
+        # was kept when it was made.
+        came_from = _INSTANTIATED.get(argument.strip())
+        if came_from is None:
+            return False
+        made_of, held = came_from
+        if made_of != shaped.group(1):
+            return False
+        shut = _closing_angle(shape, shaped.end() - 1)
+        if shut < 0 or shape[shut + 1:].strip():
+            return False
+        inside = [
+            a.strip()
+            for a in _split_arguments(shape[shaped.end(): shut])
+            if a.strip()
+        ]
+        if len(inside) != len(held):
+            return False
+        return all(
+            _fits_the_shape(one, other, parameters, bound)
+            for one, other in zip(inside, held)
+        )
+    if shaped is not None and given is not None:
+        if shaped.group(1) != given.group(1):
+            return False
+        shut_shape = _closing_angle(shape, shaped.end() - 1)
+        shut_given = _closing_angle(argument, given.end() - 1)
+        if shut_shape < 0 or shut_given < 0:
+            return False
+        if shape[shut_shape + 1:].strip() or argument[shut_given + 1:].strip():
+            return False
+        inside_shape = [
+            a.strip()
+            for a in _split_arguments(shape[shaped.end(): shut_shape])
+            if a.strip()
+        ]
+        inside_given = [
+            a.strip()
+            for a in _split_arguments(argument[given.end(): shut_given])
+            if a.strip()
+        ]
+        if len(inside_shape) != len(inside_given):
+            return False
+        return all(
+            _fits_the_shape(one, other, parameters, bound)
+            for one, other in zip(inside_shape, inside_given)
+        )
     # Nothing of the pattern left to take apart: it names a type outright,
     # and only that type fits it.
     return _same_type(shape, argument)
@@ -3454,8 +3599,41 @@ class _Declared:
         return self._spelled
 
 
+def _point_at_existing_copies(text: str) -> str:
+    """`Box<int>` written after the expander ran is the `Box__int` it made."""
+
+    if not _INSTANTIATED:
+        return text
+    names = {made_of for made_of, _held in _INSTANTIATED.values()}
+    spelled = re.compile(
+        r"(?<![.\w>])(" + "|".join(re.escape(n) for n in names) + r")\s*<"
+    )
+    out: "list[str]" = []
+    at = 0
+    for found in spelled.finditer(text):
+        if found.start() < at:
+            continue
+        shut = _closing_angle(text, found.end() - 1)
+        if shut < 0:
+            continue
+        arguments = [
+            a.strip()
+            for a in _split_arguments(text[found.end(): shut])
+            if a.strip()
+        ]
+        named = _instantiated_name(found.group(1), arguments)
+        if named not in _INSTANTIATED:
+            continue
+        out.append(text[at:found.start()])
+        out.append(named)
+        at = shut + 1
+    out.append(text[at:])
+    return "".join(out)
+
+
 def _expand_templates(text: str, filename: str) -> str:
     """Replace every template with the copies this file actually asks for."""
+
 
     patterns: dict[str, tuple[list[tuple[str, bool]], str, str]] = {}
     #: Copies the author wrote out by hand, under the name the expander would
@@ -3600,6 +3778,21 @@ def _expand_templates(text: str, filename: str) -> str:
         scope = region + "\n" + scope
         hidden = _member_spans(region)
 
+        # A name that is a template parameter *of this region* is not a type
+        # yet: `Box<U>` inside a member template of a class already written
+        # out is asking for nothing, and a copy made for it was named
+        # `Box__U` and took the shape the call deduces from with it.
+        #
+        # Read from the region and not from the file, because a parameter's
+        # name means something only inside the pattern that declares it. A
+        # program is free to call its own class `T`, and one in the corpus
+        # does - `unique_ptr<T>` there is a real instantiation and skipping
+        # it left the type undeclared.
+        in_scope: "set[str]" = set()
+        for clause in _TEMPLATE.finditer(region):
+            for held, _is_type, _is_pack in _template_parameters(clause.group(1)):
+                in_scope.add(held)
+
         asked: list[tuple[str, list[str]]] = []
         unread: list[tuple[str, int]] = []
         for name, entries in patterns.items():
@@ -3660,6 +3853,8 @@ def _expand_templates(text: str, filename: str) -> str:
                     for other in {**patterns, **narrower}
                 ):
                     continue  # an inner template first; next round
+                if any(argument.strip() in in_scope for argument in arguments):
+                    continue
                 if name not in patterns:
                     # Only narrower copies and no general one. Legal C++ only
                     # if one of them fits, and `_narrower_copy` decides that.
@@ -3812,6 +4007,7 @@ def _expand_templates(text: str, filename: str) -> str:
                     ),
                 )
                 made[named] = copy
+                _INSTANTIATED[named] = (name, list(arguments))
                 continue
             if not _arity_fits(parameters, arguments):
                 raise CppTranslationError(
@@ -3874,6 +4070,7 @@ def _expand_templates(text: str, filename: str) -> str:
                     ),
                 )
             made[named] = copy
+            _INSTANTIATED[named] = (name, list(arguments))
 
         scope = text + "\n" + "\n".join(made.values())
         text = point(text, scope)
@@ -9162,6 +9359,16 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # call sites, and the copies it leaves are ordinary members.
     text = _expand_member_templates(text, filename)
     text = _expand_templates(text, filename)
+    # Again, because a member template inside a class template could not be
+    # read until the class had been written out: until then its calls are on
+    # objects of a type that does not exist yet. `ComPtr<T>::As` is one -
+    # `webView_.As(&extendedWebView)` says which copy it wants only once
+    # `ComPtr<ICoreWebView2>` is a class.
+    text = _expand_member_templates(text, filename)
+    # A copy that pass wrote may name a template by its arguments - `Box<U>`
+    # with `U` settled is `Box<int>` - and the patterns are gone by now. The
+    # copy it means was written out earlier, so it is pointed at that.
+    text = _point_at_existing_copies(text)
     # Again, because a template's own body was a pattern when the pass above
     # ran and is a class only now. Every traits class is exactly this: a
     # template whose one member is static, written out once per question
@@ -11512,8 +11719,14 @@ _UNKNWN_HEADER = r"""
 #ifndef __py2bin_unknwn_h
 #define __py2bin_unknwn_h
 
+/* <wtypes.h> has these too, and a program that reaches both - anything
+   using <wrl.h> beside <windows.h> - had the same names against two
+   different structs. Whichever is read first defines them; the other sees
+   its guard and does not. The guard is a preprocessing directive, which the
+   translator leaves alone and the preprocessor settles later. */
+#ifndef __py2bin_wtypes_h
 typedef long HRESULT;
-typedef struct __py2bin_GUID {
+typedef struct _GUID {
     unsigned int Data1;
     unsigned short Data2;
     unsigned short Data3;
@@ -11524,6 +11737,7 @@ typedef GUID CLSID;
 typedef const GUID *REFGUID;
 typedef const GUID *REFIID;
 typedef const GUID *REFCLSID;
+#endif
 
 #ifndef S_OK
 #define S_OK ((HRESULT)0)
@@ -11552,6 +11766,7 @@ typedef const GUID *REFCLSID;
 #ifndef FAILED
 #define FAILED(hr) ((HRESULT)(hr) < 0)
 #endif
+
 
 /* Three slots, and no destructor among them. A virtual destructor would be
    a fourth entry in the table, and every method of every interface derived
@@ -11818,10 +12033,82 @@ template <class... Ts> struct how_many { static const int value = sizeof...(Ts);
 #endif
 """
 
+_WRL_HEADER = r"""
+
+/* The two things a WebView2 program uses out of the Windows Runtime C++
+   Template Library. The vendor's own is a template library that ships inside
+   a toolchain and is written in C++ this subset does not have; what a caller
+   reaches for out of it is smaller than that, and this is that.
+
+   `ComPtr<T>` is a pointer that counts: it releases what it held when it is
+   given something else or goes out of scope, and hands out its address for a
+   call that fills it in. That is the whole of what the name means. */
+#ifndef __py2bin_wrl_h
+#define __py2bin_wrl_h
+#include <unknwn.h>
+
+namespace Microsoft { namespace WRL {
+
+template <class T> class ComPtr {
+public:
+    T *ptr_;
+
+    ComPtr() { ptr_ = 0; }
+    ComPtr(T *given) { ptr_ = given; if (ptr_) { ptr_->AddRef(); } }
+    ComPtr(const ComPtr<T> &other) {
+        ptr_ = other.ptr_;
+        if (ptr_) { ptr_->AddRef(); }
+    }
+    ~ComPtr() { if (ptr_) { ptr_->Release(); ptr_ = 0; } }
+
+    /* Assignment releases what was held first, and in that order: a pointer
+       assigned to itself would otherwise be released and then kept. */
+    void operator=(T *given) {
+        if (given) { given->AddRef(); }
+        if (ptr_) { ptr_->Release(); }
+        ptr_ = given;
+    }
+    void operator=(const ComPtr<T> &other) {
+        if (other.ptr_) { other.ptr_->AddRef(); }
+        if (ptr_) { ptr_->Release(); }
+        ptr_ = other.ptr_;
+    }
+
+    T *Get() const { return ptr_; }
+    T *operator->() const { return ptr_; }
+    T **GetAddressOf() { return &ptr_; }
+    /* No `operator&`: py2bin does not overload a prefix operator yet, so a
+       call that fills one in is written `GetAddressOf()` here rather than
+       `&`. Both are the vendor's own spellings. */
+    T *Detach() { T *held = ptr_; ptr_ = 0; return held; }
+    void Attach(T *given) { if (ptr_) { ptr_->Release(); } ptr_ = given; }
+    void Reset() { if (ptr_) { ptr_->Release(); ptr_ = 0; } }
+
+    int operator==(const void *other) const { return (const void *)ptr_ == other; }
+    int operator!=(const void *other) const { return (const void *)ptr_ != other; }
+
+    /* `As` asks the object whether it is also something else, which is what
+       QueryInterface is for. The answer goes into the pointer handed in. */
+    template <class U> HRESULT As(ComPtr<U> *other) {
+        if (!ptr_) { return E_POINTER; }
+        void *found = 0;
+        HRESULT asked = ptr_->QueryInterface(__uuidof(U), &found);
+        if (SUCCEEDED(asked)) { other->Attach((U *)found); }
+        return asked;
+    }
+};
+
+} }
+
+#endif
+"""
+
 _BUILTIN_CPP_HEADERS = {
     # COM's root, which no implementation publishes as a file.
     "unknwn.h": _UNKNWN_HEADER,
     "type_traits": _TYPE_TRAITS_HEADER,
+    "wrl.h": _WRL_HEADER,
+    "wrl/client.h": _WRL_HEADER,
     # And the interfaces a generated header names in its signatures. Same
     # reason and same shape: the classes they are, at the slots the .idl
     # puts them at.
