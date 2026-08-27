@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import struct
 import urllib.parse
 from pathlib import Path
 
@@ -280,6 +281,73 @@ def fetch_header(
     )
 
 
+def exports_of(image: bytes) -> "set[str]":
+    """Every name a PE exports, read out of its own export table.
+
+    py2bin writes these; reading one is the same layout in the other
+    direction. This is what lets a build *check* which library holds the
+    function a program calls rather than guess from a name - a package ships
+    several DLLs and only one of them exports what is wanted.
+
+    An image that is not a PE, or is one with no exports, answers with
+    nothing rather than raising: it is one candidate among several.
+    """
+
+    try:
+        if image[:2] != b"MZ":
+            return set()
+        at = struct.unpack_from("<I", image, 0x3C)[0]
+        if image[at:at + 4] != b"PE\0\0":
+            return set()
+        sections = struct.unpack_from("<H", image, at + 6)[0]
+        optional = struct.unpack_from("<H", image, at + 20)[0]
+        head = at + 24
+        magic = struct.unpack_from("<H", image, head)[0]
+        # The data directories sit after the optional header's fixed part,
+        # which is eight bytes longer in a 64-bit image than in a 32-bit one.
+        directories = head + (112 if magic == 0x20B else 96)
+        rva, size = struct.unpack_from("<II", image, directories)
+        if not rva or not size:
+            return set()
+        table = []
+        for index in range(sections):
+            spot = head + optional + index * 40
+            start, where, raw, offset = struct.unpack_from("<IIII", image, spot + 8)
+            table.append((where, max(start, raw), offset))
+
+        def at_rva(wanted: int) -> "int | None":
+            for where, span, offset in table:
+                if where <= wanted < where + span:
+                    return offset + (wanted - where)
+            return None
+
+        base = at_rva(rva)
+        if base is None:
+            return set()
+        # NumberOfNames at 24, AddressOfNames at 32. Between them sits
+        # AddressOfFunctions, which is the ordinal table and not this one.
+        count = struct.unpack_from("<I", image, base + 24)[0]
+        names_rva = struct.unpack_from("<I", image, base + 32)[0]
+        walk = at_rva(names_rva)
+        if walk is None:
+            return set()
+        found: "set[str]" = set()
+        for index in range(min(count, _MOST_EXPORTS)):
+            spot = at_rva(struct.unpack_from("<I", image, walk + index * 4)[0])
+            if spot is None:
+                continue
+            end = image.index(b"\0", spot)
+            found.add(image[spot:end].decode("ascii", "replace"))
+        return found
+    except (struct.error, ValueError, IndexError):
+        return set()
+
+
+#: A guard on a malformed image, not a real limit: a DLL with more exports
+#: than this is not one anybody links against by name.
+_MOST_EXPORTS = 200000
+
+
 #: Where a package keeps the machine-code half of what it ships, by the
 #: architecture a target names. NuGet's own conventions, in the order a
 #: package is likely to use them.
@@ -287,6 +355,70 @@ _RUNTIME_FOLDERS = {
     "x86_64": ("runtimes/win-x64/native/", "build/native/x64/", "/x64/"),
     "arm64": ("runtimes/win-arm64/native/", "build/native/arm64/", "/arm64/"),
 }
+
+
+def library_exporting(
+    symbol: str,
+    into: Path,
+    architecture: str,
+    *,
+    cache: "Path | None" = None,
+    say=lambda message: None,
+) -> "Path | None":
+    """The library that exports `symbol`, kept in `into`. None if none does.
+
+    A program calling into somebody else's component names the function and
+    not the library it lives in - the header declares it and a build with a
+    linker is handed the import library separately. What py2bin has instead
+    is the package the header came from: it holds the library too, and the
+    library says what it exports. So the question is answered by looking
+    rather than by guessing from a name, and the answer is either right or
+    absent.
+    """
+
+    into = Path(into)
+    folders = _RUNTIME_FOLDERS.get(architecture)
+    if folders is None:
+        return None
+    store = Path(cache) if cache is not None else into / ".cache"
+    if not store.is_dir():
+        return None
+    for archive in sorted(store.glob("*.blob")):
+        found = _exporter_in(archive, into, symbol, folders)
+        if found is not None:
+            say(f"  {symbol} is exported by {found.name}, which came with it")
+            return found
+    return None
+
+
+def _exporter_in(
+    archive: Path, into: Path, symbol: str, folders: "tuple[str, ...]"
+) -> "Path | None":
+    """Which library in one package exports `symbol`, for this machine."""
+
+    import tempfile
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(archive) as held:
+            names = [
+                item.filename
+                for item in held.infolist()
+                if item.filename.lower().endswith(".dll")
+                and any(f.lower() in item.filename.lower() for f in folders)
+            ]
+            if not names:
+                return None
+            for spelled in names:
+                if symbol not in exports_of(held.read(spelled)):
+                    continue
+                into.mkdir(parents=True, exist_ok=True)
+                written = into / spelled.rsplit("/", 1)[-1]
+                written.write_bytes(held.read(spelled))
+                return written
+    except (OSError, zipfile.BadZipFile, KeyError):
+        return None
+    return None
 
 
 def fetch_library(

@@ -598,6 +598,49 @@ def _header_that_is_missing(message: str) -> "str | None":
     return found.group(1) if found is not None else None
 
 
+#: `call to 'X', which is declared but never defined` - a function the
+#: program calls, declared by a header, whose body is nobody's here.
+_MISSING_SYMBOL = re.compile(
+    r"call to '([A-Za-z_]\w*)', which is declared but never defined"
+)
+
+
+def _symbol_that_is_missing(message: str) -> "str | None":
+    """The function name out of the compiler's own refusal, if that is it."""
+
+    found = _MISSING_SYMBOL.search(message)
+    return found.group(1) if found is not None else None
+
+
+def _library_holding(program: Path, symbol: str, target: str) -> "str | None":
+    """Which shared library exports `symbol`, if one that was fetched does."""
+
+    if not target.startswith("windows-"):
+        return None
+    from .header_fetch import CACHE_DIRECTORY, library_exporting
+
+    beside = program.parent / CACHE_DIRECTORY
+    say(f"\n  Nothing here defines {symbol}. Looking for the library it is in.")
+    try:
+        found = library_exporting(
+            symbol,
+            beside,
+            target.rsplit("-", 1)[-1],
+            cache=beside / ".cache",
+            say=say,
+        )
+    except Exception as error:  # a package that will not open
+        say(f"  could not look: {error}")
+        return None
+    if found is None:
+        say(
+            "  Nothing fetched for this build exports it. If it lives in a\n"
+            "  library somebody else ships, name it with --library NAME.dll."
+        )
+        return None
+    return found.name
+
+
 def _fetch_one_header(program: Path, wanted: str) -> "Path | None":
     """Look `wanted` up, keep it beside the program, and say where to search.
 
@@ -691,16 +734,30 @@ def _build_c(
                 )
                 break
             except Exception as refused:
-                wanted = (
-                    _header_that_is_missing(str(refused)) if auto_fetch else None
-                )
-                if wanted is None:
+                if not auto_fetch:
                     raise
-                kept = _fetch_one_header(program, wanted)
-                if kept is None:
+                wanted = _header_that_is_missing(str(refused))
+                if wanted is not None:
+                    kept = _fetch_one_header(program, wanted)
+                    if kept is None:
+                        raise
+                    if str(kept) not in includes:
+                        includes = [str(kept), *includes]
+                    continue
+                # A function the program calls and nothing defines. The
+                # component that declared it shipped it too, in the package
+                # its header came from - and that library says what it
+                # exports, so which one it is can be looked up rather than
+                # asked for.
+                missing = _symbol_that_is_missing(str(refused))
+                if missing is None:
                     raise
-                if str(kept) not in includes:
-                    includes = [str(kept), *includes]
+                holder = _library_holding(program, missing, target)
+                if holder is None:
+                    raise
+                if holder not in libraries:
+                    libraries = (*libraries, holder)
+                continue
         else:
             raise RuntimeError(
                 f"still asking for headers after {_FETCH_ROUNDS} were "

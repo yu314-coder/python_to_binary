@@ -288,12 +288,12 @@ machine here, nothing else.
 **A program written against somebody else's component builds there too.**
 SidecarBridge is a Windows WebView2 app in C++: three sources, a header from
 the WebView2 SDK, and the loader DLL that header is for. With `--auto-fetch`
-and `--library WebView2Loader.dll`, a folder holding only the three sources
-produces a `dist/` with the executable and that DLL beside it, on both
-`windows-x86_64` and `windows-arm64`. The header and the library are the only
-things that came from anywhere else, and both came over HTTPS from the
-package that publishes them - which is the one thing a tablet can do that a
-toolchain cannot be made to.
+and nothing else named, a folder holding only the three sources produces a
+`dist/` with the executable and that DLL beside it, on both `windows-x86_64`
+and `windows-arm64`. The header and the library are the only things that came
+from anywhere else, and both came over HTTPS from the package that publishes
+them - which is the one thing a tablet can do that a toolchain cannot be made
+to.
 
 **Why the tablet can do this at all** is the thing worth taking from the
 table. py2bin has no compiler, assembler, linker or toolchain behind it - it
@@ -856,8 +856,21 @@ A DLL somebody else wrote is reached one of two ways. `LoadLibraryW`,
 `GetProcAddress` and `FreeLibrary` are all there, which asks for the entry
 point by name at run time and lets a program carry on without it. Where the
 program calls the vendor's function directly - as everything written against
-an SDK does - `--library WebView2Loader.dll` names the library it lives in,
-the way a build with a linker names an import library:
+an SDK does - **`--auto-fetch` works the library out on its own.** A function
+the program calls and nothing defines was declared by a header; that header
+came out of a package; that package ships the library too, and a library says
+what it exports. So py2bin reads the export tables of what it downloaded and
+takes the one that has the name, which is an answer that is either right or
+absent rather than a guess:
+
+```
+Nothing here defines CreateCoreWebView2EnvironmentWithOptions. Looking for the library it is in.
+CreateCoreWebView2EnvironmentWithOptions is exported by WebView2Loader.dll, which came with it
+```
+
+`--library WebView2Loader.dll` names it outright where that is wanted - where
+the header was supplied by hand, say, so there is no package to look in - the
+way a build with a linker names an import library:
 
 ```bash
 py2bin cc main.cpp webview.cpp -I vendor --library WebView2Loader.dll \
