@@ -479,6 +479,13 @@ terminator where the copy stopped. A size of zero writes nothing at all, as C
 says. A program that defines its own `printf`, `sprintf` or `snprintf` gets
 that one; these are only what a program calls without having written.
 
+`swprintf` and `swprintf_s` are the same formatter again, storing two bytes a
+character on Windows and four elsewhere - whatever `wchar_t` is on the target.
+`%ls` reads a wide string and everything else writes the same characters it
+always did, one to a cell instead of one to a byte. C++'s array overload -
+`swprintf_s(buffer, L"...")`, with no count - takes its room from the array it
+is writing to, which is the whole reason a program reaches for it.
+
 **Variadic functions** work, and `<stdarg.h>` is the typedef that goes with
 them. The arguments past the named ones are promoted the way C promotes them —
 narrow integers to `int`, `float` to `double` — and written into a run of
@@ -800,6 +807,27 @@ throughout: `STGMEDIUM` holds an unnamed union of handles and reaches into it
 without naming it. The member is laid out so its size and alignment count,
 and looked through so its members are the enclosing struct's.
 
+**`Callback<I>(lambda)` is written out as the class it is.** WRL's helper
+builds a COM object around a closure: a reference count, the three `IUnknown`
+methods, and the interface's own method forwarding to the body. The vendor's
+is a template whose machinery this subset does not have; its *result* is an
+ordinary class, and that is what py2bin emits - one per callback, deriving
+from the interface, with the lambda's body as the method and the enclosing
+object carried in a member.
+
+Innermost first, which matters as soon as there is more than one: a callback
+is usually written inside another, and `this` in each means the object the
+body *around* it was written in. Taken from the outside in, the outer pass
+would already have turned that into its own member and the inner one would
+have carried the wrong object.
+
+**Windows starts a desktop program at `wWinMain`, and C starts one at
+`main`.** The wrapper between them is written in C, below the entry point it
+calls, because there is no C runtime here to link that would do it - the four
+things `wWinMain` is handed are all things the program could have asked the
+kernel for. The image is marked as a desktop one too, so no console opens in
+front of the window.
+
 **`FORMATETC`, `STGMEDIUM`, `DVTARGETDEVICE` and `STATDATA`** are py2bin's
 own, transcribed from the published set rather than written from memory - and
 every size and offset checked against the same fields computed at the widths
@@ -814,12 +842,27 @@ it, because a set that has one relies on that order: `<urlmon.h>` writes
 `#ifndef E_PENDING` around its own spelling, which only does its job if the
 real one has been read already.
 
-A DLL somebody else wrote is reached with `LoadLibraryW`, `GetProcAddress` and
-`FreeLibrary` rather than by naming it here. That is the general answer to a
-vendor component - WebView2Loader.dll is one, and so is every other SDK that
-ships a DLL beside a header py2bin cannot compile - and it keeps the vendor's
-name out of the import table, where it would stop the program from starting on
-a machine that does not have it. Each is an ordinary import the loader binds, the same mechanism a
+A DLL somebody else wrote is reached one of two ways. `LoadLibraryW`,
+`GetProcAddress` and `FreeLibrary` are all there, which asks for the entry
+point by name at run time and lets a program carry on without it. Where the
+program calls the vendor's function directly - as everything written against
+an SDK does - `--library WebView2Loader.dll` names the library it lives in,
+the way a build with a linker names an import library:
+
+```bash
+py2bin cc main.cpp webview.cpp -I vendor --library WebView2Loader.dll \
+  --target windows-x86_64 -o app.exe
+```
+
+Every function the program declares and never defines is then an import from
+that library, with the shape of the call read off the prototype the program
+wrote - which is what a linker reads out of a `.lib`. `NAME:one,two` claims
+only the symbols named, for a program calling into two components. py2bin
+knows the library behind every function it vets and does not guess at one it
+has never seen, so this is asked for rather than assumed: an image naming a
+DLL will not start on a machine without it.
+
+Each is an ordinary import the loader binds, the same mechanism a
 program driving CPython already uses, so calling one still needs no toolchain.
 A name it does not declare is a name the compiler reports, rather than one
 that compiles and fails to resolve; and on a target that is not Windows the
@@ -2026,6 +2069,27 @@ runtime and library adapters.
 
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
+
+### 0.9.13 - a Windows WebView2 program, from C++, with no toolchain
+
+SidecarBridge - three C++ files, a fetched WebView2 header and a vendor DLL -
+builds to a 627 KB PE32+ for windows-x86_64 with py2bin alone. What it needed
+along the way is listed under [C++, translated to C](#c-translated-to-c):
+`Callback<I>(lambda)` written out as the class it is, `--library` for a DLL
+somebody else shipped, `wWinMain` and the desktop subsystem, `swprintf`, and
+the ordinary C++ a corpus program never happens to write - `operator&` on a
+holder, a method called on a pointer parameter, `operator=` chosen by what is
+being assigned, a destructor that must not run at a `return` above the
+declaration it belongs to.
+
+Three of those were silent rather than loud, which is the kind worth naming.
+A `{` inside a string literal opened a block that never closed, so the rest of
+the statement was lifted out and put back with whatever had been written into
+it in the meantime - inside the string. A reference to a class is a pointer
+here, which made `r[i]` on one read as an element of an array rather than as
+the class's own subscript. And `path a = base() / "web";` read the call as the
+whole initialiser and dropped the operator, so the program compiled and
+quietly did half of what it says.
 
 ### 0.9.13 - what a real Intel Mac refuses
 
