@@ -220,6 +220,13 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     # written for, so a program that wanted a window had no way to ask for
     # one without them. Every argument is an integer or a pointer.
     "RegisterClassExW": ("RegisterClassExW", ("ptr",), "int", "USER32.dll"),
+    "GetClassInfoExW": (
+        "GetClassInfoExW", ("ptr", "ptr", "ptr"), "int", "USER32.dll",
+    ),
+    "SetProcessDpiAwarenessContext": (
+        "SetProcessDpiAwarenessContext", ("ptr",), "int", "USER32.dll",
+    ),
+    "GetDpiForWindow": ("GetDpiForWindow", ("ptr",), "int", "USER32.dll"),
     "UnregisterClassW": ("UnregisterClassW", ("ptr", "ptr"), "int", "USER32.dll"),
     "CreateWindowExW": (
         "CreateWindowExW",
@@ -265,6 +272,9 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
         "GetWindowLongPtrW", ("ptr", "int"), "ptr", "USER32.dll"
     ),
     "GetModuleHandleW": ("GetModuleHandleW", ("ptr",), "ptr", "KERNEL32.dll"),
+    "GetModuleFileNameW": (
+        "GetModuleFileNameW", ("ptr", "ptr", "int"), "int", "KERNEL32.dll",
+    ),
     "Sleep": ("Sleep", ("int",), "void", "KERNEL32.dll"),
     "GetTickCount": ("GetTickCount", (), "int", "KERNEL32.dll"),
     "GetTickCount64": ("GetTickCount64", (), "int", "KERNEL32.dll"),

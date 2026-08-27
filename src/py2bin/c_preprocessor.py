@@ -337,6 +337,7 @@ def as_cplusplus(
     include_dirs: "tuple[str, ...]",
     target: "str | None",
     supplied: "set[str]",
+    already: "set[str]",
 ) -> str:
     """One header, preprocessed as a C++ compiler would see it.
 
@@ -383,9 +384,16 @@ def as_cplusplus(
     # where it puts every directive. That is the order they have to be in:
     # <shellapi.h> asks for HINSTANCE, and the answer has to be above it.
     ours = set(engine._builtins_read)
-    kept = ours & _DECLARES_INTERFACES
-    dropped = ours - kept
+    # One py2bin already pasted into this unit is not put in again: the pass
+    # that reads C++ pastes each of its own headers once, and a program
+    # reaching <wrl.h> has had <unknwn.h> from it before this header was
+    # touched. Kept as well, IUnknown was declared twice and its table
+    # written out twice.
+    pasted = ours & already
+    kept = (ours & _DECLARES_INTERFACES) - pasted
+    dropped = ours - kept - pasted
     supplied.update(kept)
+    already.update(kept)
     # The dropped ones are asked for by name, so the other run reads them -
     # at the top, where it puts every directive, which is above every use.
     # Dropped without asking, a generated header named a type nothing had
@@ -393,7 +401,11 @@ def as_cplusplus(
     # two thousand of its own signatures.
     asked = "".join(f"#include <{name}>\n" for name in sorted(dropped))
     return asked + _as_written(
-        [item for item in engine.output if item.origin.strip("<>") not in dropped]
+        [
+            item
+            for item in engine.output
+            if item.origin.strip("<>") not in dropped | pasted
+        ]
     )
 
 
@@ -1799,7 +1811,19 @@ typedef struct tagWNDCLASSEXW {
     LPCWSTR lpszMenuName; LPCWSTR lpszClassName; HICON hIconSm;
 } WNDCLASSEXW;
 
+/* What WM_NCCREATE carries: the window's own creation parameters, which is
+   how a program written in classes finds its object from inside a window
+   procedure - the procedure is static, so nothing else could. */
+typedef struct tagCREATESTRUCTW {
+    LPVOID lpCreateParams;
+    HINSTANCE hInstance; HMENU hMenu; HWND hwndParent;
+    int cy; int cx; int y; int x;
+    LONG style; LPCWSTR lpszName; LPCWSTR lpszClass; DWORD dwExStyle;
+} CREATESTRUCTW, *LPCREATESTRUCTW;
+
 extern ATOM RegisterClassExW(LPVOID);
+extern BOOL GetClassInfoExW(HINSTANCE, LPCWSTR, LPVOID);
+extern DWORD GetModuleFileNameW(HMODULE, LPWSTR, DWORD);
 extern BOOL UnregisterClassW(LPCWSTR, HINSTANCE);
 extern HWND CreateWindowExW(DWORD, LPCWSTR, LPCWSTR, DWORD,
                             int, int, int, int,
@@ -1847,6 +1871,32 @@ extern HMODULE GetModuleHandleW(LPCWSTR);
 #define WM_COMMAND 0x0111
 #define WM_USER 0x0400
 #define GWLP_USERDATA (-21)
+#define CS_VREDRAW 0x0001
+#define CS_HREDRAW 0x0002
+#define CS_DBLCLKS 0x0008
+#define CS_OWNDC 0x0020
+#define WM_NCCREATE 0x0081
+#define WM_NCDESTROY 0x0082
+#define WM_DPICHANGED 0x02E0
+#define WM_GETMINMAXINFO 0x0024
+#define WM_SETFOCUS 0x0007
+#define WM_ERASEBKGND 0x0014
+#define SW_SHOWDEFAULT 10
+#define SW_SHOWMAXIMIZED 3
+#define SW_SHOWMINIMIZED 2
+#define SW_RESTORE 9
+#define MB_ERR_INVALID_CHARS 0x00000008
+#define WC_ERR_INVALID_CHARS 0x00000080
+
+/* Per-monitor DPI. The context is an opaque handle whose well-known values
+   are small negative numbers cast to it, which is how the SDK spells them. */
+typedef HANDLE DPI_AWARENESS_CONTEXT;
+#define DPI_AWARENESS_CONTEXT_UNAWARE ((DPI_AWARENESS_CONTEXT)-1)
+#define DPI_AWARENESS_CONTEXT_SYSTEM_AWARE ((DPI_AWARENESS_CONTEXT)-2)
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE ((DPI_AWARENESS_CONTEXT)-3)
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+extern BOOL SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT);
+extern UINT GetDpiForWindow(HWND);
 #define IDC_ARROW ((LPCWSTR)32512)
 #define IDI_APPLICATION ((LPCWSTR)32512)
 #define COLOR_WINDOW 5

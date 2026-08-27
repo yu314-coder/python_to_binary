@@ -706,6 +706,10 @@ class FunctionType:
 #: looks through anything called this.
 _ANONYMOUS_MEMBER = "\x00anonymous"
 
+#: What a parameter with no name is called while the frame is laid out. Not
+#: a name a program can write, so nothing can reach it by accident.
+_UNNAMED_PARAMETER = "\x00parameter"
+
 _UNNAMED_BITFIELD = "__py2bin_pad_"
 
 #: What `#pragma pack` reaches the parser as. The preprocessor emits it: a
@@ -2801,10 +2805,17 @@ class Parser:
             return
         if previous is not None and previous.body is not None:
             self.error(f"{name!r} is already defined", name_token)
+        # A parameter with no name is one the body does not use, which C++
+        # has always allowed and C allows as of C23 - and which a generated
+        # callback is full of: an event handler takes the object it fired on
+        # and usually wants only the arguments. Given a name nothing can
+        # spell, so it takes its place in the frame and nothing reaches it.
+        parameters = [
+            (held, spelled or f"{_UNNAMED_PARAMETER}{index}")
+            for index, (held, spelled) in enumerate(parameters)
+        ]
         seen: set[str] = set()
         for parameter_type, parameter_name in parameters:
-            if not parameter_name:
-                self.error("every parameter needs a name", name_token)
             if parameter_name in seen:
                 self.error(f"duplicate parameter {parameter_name!r}", name_token)
             seen.add(parameter_name)

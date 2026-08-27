@@ -1301,7 +1301,8 @@ int main(void) { return 0; }
             )
             supplied: "set[str]" = set()
             text = as_cplusplus(
-                "chooses.h", where, (str(where),), "windows-x86_64", supplied
+                "chooses.h", where, (str(where),), "windows-x86_64", supplied,
+                set(),
             )
             self.assertIn("virtual", text)
             self.assertNotIn("lpVtbl", text)
