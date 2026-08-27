@@ -1338,7 +1338,7 @@ _WINDOWS_ENTRY = re.compile(
 _PLAIN_ENTRY = re.compile(r"(?<![.\w])int\s+main\s*\(")
 
 
-def _with_windows_entry(source: str, target: str) -> str:
+def _with_windows_entry(source: str, target: str) -> "tuple[str, bool]":
     """Give a program whose entry point is wWinMain the `main` C asks for.
 
     Windows starts a desktop program at `wWinMain`, and the four things it is
@@ -1354,10 +1354,10 @@ def _with_windows_entry(source: str, target: str) -> str:
     """
 
     if not target.startswith("windows"):
-        return source
+        return source, False
     found = _WINDOWS_ENTRY.search(source)
     if found is None or _PLAIN_ENTRY.search(source) is not None:
-        return source
+        return source, False
     line = "GetCommandLineW()" if found.group(1) == "wWinMain" else "GetCommandLineA()"
     return source + (
         "\n/* Written by py2bin: Windows starts a desktop program at "
@@ -1365,7 +1365,7 @@ def _with_windows_entry(source: str, target: str) -> str:
         "int main(void) {\n"
         f"    return {found.group(1)}(GetModuleHandleW(0), 0, {line}, 10);\n"
         "}\n"
-    )
+    ), True
 
 
 def compile_c_native(
@@ -1381,6 +1381,7 @@ def compile_c_native(
     icon: Path | None = None,
     python_dylib: str | None = None,
     extra_sources: "tuple[Path, ...]" = (),
+    libraries: tuple[str, ...] = (),
 ) -> NativeResult:
     """Compile a C file to machine code with only py2bin's own implementation.
 
@@ -1407,8 +1408,9 @@ def compile_c_native(
         translated = translate_unity(
             (entry, *extra_sources), include_dirs, resolved
         )
+    windowed = False
     if translated is not None:
-        translated = _with_windows_entry(translated, resolved)
+        translated, windowed = _with_windows_entry(translated, resolved)
     if extra_sources and translated is None:
         missing = [str(path) for path in extra_sources if not path.is_file()]
         if missing:
@@ -1433,6 +1435,7 @@ def compile_c_native(
                         f"darwin-{architecture}",
                         include_dirs=include_dirs,
                         defines=defines,
+                        libraries=libraries,
                     )
                 )[0]
                 for architecture in UNIVERSAL_SLICES
@@ -1451,8 +1454,10 @@ def compile_c_native(
                 resolved,
                 include_dirs=include_dirs,
                 defines=defines,
+                libraries=libraries,
             )
         )
+        module.windowed = windowed
     except CCompileError as error:
         # Several files were joined, so the line the compiler saw is a line of
         # the joined text. Put it back where the user wrote it; a diagnostic

@@ -1525,6 +1525,12 @@ class TranslationUnit:
     externs: dict[str, CType]  # local name -> declared C result type
     enumerators: dict[str, int] = dataclasses.field(default_factory=dict)
     globals: dict[str, GlobalObject] = dataclasses.field(default_factory=dict)
+    #: A function this program declares, never defines, and that a library
+    #: the program named is claimed to hold: the symbol, the kind of each
+    #: argument, and the kind of the result. Read alongside the vetted table.
+    library_symbols: dict[str, tuple[str, tuple[str, ...], str]] = (
+        dataclasses.field(default_factory=dict)
+    )
 
 
 # --- parser ------------------------------------------------------------------
@@ -1636,6 +1642,12 @@ class Parser:
         self.index = 0
         self.functions: dict[str, Function] = {}
         self.externs: dict[str, CType] = {}
+        #: Shared libraries the program named, and which symbols each claims.
+        self.libraries: "list[tuple[str, frozenset[str]]]" = []
+        #: Where each symbol taken from one of them comes from.
+        self.symbol_libraries: dict[str, str] = {}
+        #: The shape of a call to each, read off the prototype.
+        self.library_symbols: "dict[str, tuple[str, tuple[str, ...], str]]" = {}
         #: What `#pragma pack` last said, and what `push` saved. None is the
         #: ABI's own answer, which is what a file without one gets.
         self.pack: "int | None" = None
@@ -2626,9 +2638,53 @@ class Parser:
                 self.take(";")
                 continue
             self.external_declaration()
+        self.bind_libraries()
         return TranslationUnit(
-            self.functions, self.externs, self.enumerators, self.globals
+            self.functions,
+            self.externs,
+            self.enumerators,
+            self.globals,
+            self.library_symbols,
         )
+
+    def bind_libraries(self) -> None:
+        """Bind each undefined function a named library is claimed to hold.
+
+        py2bin has no linker, so a function this unit declares and never
+        defines is normally a mistake worth reporting. Where the program has
+        named the library it lives in, it is not a mistake: it is an import,
+        and the shape of the call is read off the prototype the program
+        wrote - which is the same thing a linker reads out of an import
+        library, said in the source instead.
+        """
+
+        if not self.libraries:
+            return
+        for name, function in self.functions.items():
+            if function.body is not None or name in self.externs:
+                continue
+            library = self.library_for(name)
+            if library is None:
+                continue
+            kinds = tuple(
+                _abi_kind(held) for held, _spelled in function.parameters
+            )
+            if any(kind is None for kind in kinds):
+                continue
+            result = _abi_kind(function.result, result=True)
+            if result is None:
+                continue
+            self.library_symbols[name] = (name, kinds, result)
+            self.externs[name] = function.result
+            self.symbol_libraries[name] = library
+
+    def library_for(self, name: str) -> "str | None":
+        """Which named library claims that symbol, if any."""
+
+        for library, claimed in self.libraries:
+            if not claimed or name in claimed:
+                return library
+        return None
 
     def declares_type_only(self) -> bool:
         """Whether a struct/union specifier is followed straight by ``;``.
@@ -2927,6 +2983,25 @@ class Parser:
         if name in self.functions or name in self.externs:
             self.error(f"{name!r} is already declared", name_token)
         self.externs[name] = result
+
+
+def _abi_kind(held: CType, result: bool = False) -> "str | None":
+    """How a value of this type travels: a pointer, a word, or a double.
+
+    None where py2bin cannot pass it at all - a struct by value, which no
+    part of this compiler does - so the caller leaves the function alone and
+    the ordinary diagnostic reports it.
+    """
+
+    if isinstance(held, VoidType):
+        return "void" if result else None
+    if isinstance(held, (PointerType, ArrayType)):
+        return "ptr"
+    if isinstance(held, FloatingType):
+        return "double"
+    if isinstance(held, IntegerType):
+        return "int"
+    return None
 
 
 def _literal_type(token: Token, filename: str, target: str = "") -> CType:
@@ -3356,7 +3431,17 @@ _MAXIMUM_FIELD = 120
 #: The two that format into a buffer rather than onto stdout. Compiled like
 #: `printf` is - the format is read here, and the code that writes it out is
 #: emitted - so there is no C library underneath these either.
-_INTO_A_BUFFER = frozenset({"sprintf", "snprintf"})
+_INTO_A_BUFFER = frozenset(
+    {"sprintf", "snprintf", "swprintf", "swprintf_s", "_snwprintf"}
+)
+
+#: The ones that write wide characters. Same formatting, wider stores: what
+#: a program reaches for when the thing it is talking to takes UTF-16.
+_WIDE_BUFFER = frozenset({"swprintf", "swprintf_s", "_snwprintf"})
+
+#: The ones told how much room they have. `sprintf` is not; the rest are,
+#: except where C++'s array overload took the room from the array instead.
+_BOUNDED_BUFFER = frozenset({"snprintf", "swprintf", "swprintf_s", "_snwprintf"})
 
 #: What `<stdarg.h>` gives a program. Each is compiled rather than called:
 #: a `va_list` is a pointer into the cells the call wrote, `va_arg` reads one
@@ -3373,11 +3458,22 @@ _VARIADIC_PARAMETER = "__py2bin_va_area"
 _DIGIT_BYTES = 1024
 _TEXT_BYTES = 512
 
+#: Stands in for `wchar_t *` and `wchar_t` in the table below, because how
+#: wide one is depends on the target and the table is built once.
+_WIDE_STRING = PointerType(VoidType())
+_WIDE_CHAR = IntegerType("__py2bin_wchar", 0, True, 0)
+
 _LENGTHS = {
     "": {},
     "hh": {"d": SCHAR, "i": SCHAR, "u": UCHAR, "x": UCHAR, "X": UCHAR},
     "h": {"d": SHORT, "i": SHORT, "u": USHORT, "x": USHORT, "X": USHORT},
-    "l": {"d": LONG, "i": LONG, "u": ULONG, "x": ULONG, "X": ULONG},
+    # `%ls` and `%lc` name a wide string and a wide character. The type they
+    # want depends on the platform, so it is filled in where the target is
+    # known rather than named here.
+    "l": {
+        "d": LONG, "i": LONG, "u": ULONG, "x": ULONG, "X": ULONG,
+        "s": _WIDE_STRING, "c": _WIDE_CHAR,
+    },
     "ll": {"d": LLONG, "i": LLONG, "u": ULLONG, "x": ULLONG, "X": ULLONG},
     "z": {"d": LONG, "i": LONG, "u": ULONG, "x": ULONG, "X": ULONG},
     "j": {"d": LLONG, "i": LLONG, "u": ULLONG, "x": ULLONG, "X": ULLONG},
@@ -3458,6 +3554,9 @@ class Lowerer:
         #: Where formatted output goes when it is not going to stdout:
         #: (buffer slot, limit slot, count slot) for `snprintf`.
         self.sink: "tuple[int, int, int] | None" = None
+        #: Bytes per character the sink stores. One for a `char` buffer, two
+        #: or four for a `wchar_t` one - the platform decides which.
+        self.sink_width = 1
         self.digit_slot: int | None = None
         self.text_slot: int | None = None
         self.float_scratch: dict[str, int] = {}
@@ -4714,7 +4813,7 @@ class Lowerer:
         if node.name in _VARIADIC_BUILTINS and node.name not in self.unit.functions:
             return self.variadic_builtin(node)
         if node.name in _INTO_A_BUFFER and node.name not in self.unit.functions:
-            return self.formatted_into(node, bounded=node.name == "snprintf")
+            return self.formatted_into(node, bounded=node.name in _BOUNDED_BUFFER)
         if node.name == "printf" and "printf" not in self.unit.functions:
             self.error(
                 "printf's return value is not implemented; call it as a "
@@ -4821,8 +4920,13 @@ class Lowerer:
 
     def extern_call(self, node: Call, *, discarded: bool) -> Value:
         name = node.name
-        symbol, signature = _CABI_SYMBOLS[name]
-        result_kind = _CABI_RESULTS[name]
+        # The vetted table first, then whatever a named library claimed:
+        # nothing a program says may replace a shape py2bin has checked.
+        if name in _CABI_SYMBOLS:
+            symbol, signature = _CABI_SYMBOLS[name]
+            result_kind = _CABI_RESULTS[name]
+        else:
+            symbol, signature, result_kind = self.unit.library_symbols[name]
         if result_kind == "void" and not discarded:
             self.error(
                 f"extern call {name}() returns void; its result is not a value and "
@@ -5334,7 +5438,7 @@ class Lowerer:
                 self.printf(node)
                 return
             if node.name in _INTO_A_BUFFER and node.name not in self.unit.functions:
-                self.formatted_into(node, bounded=node.name == "snprintf")
+                self.formatted_into(node, bounded=node.name in _BOUNDED_BUFFER)
                 return
             if node.name in _VARIADIC_BUILTINS and node.name not in self.unit.functions:
                 self.variadic_builtin(node)
@@ -6036,13 +6140,21 @@ class Lowerer:
         )
         self.emit(
             HeapStore(
-                _binary("add", IntLoad(buffer), IntLoad(count)), character, 1
+                _binary(
+                    "add",
+                    IntLoad(buffer),
+                    _binary("mul", IntLoad(count), IntConstant(self.sink_width)),
+                ),
+                character,
+                self.sink_width,
             )
         )
         self.emit(Label(past))
         self.emit(Store(count, _binary("add", IntLoad(count), IntConstant(1))))
 
-    def put_runtime(self, address: IntExpression, length: IntExpression) -> None:
+    def put_runtime(
+        self, address: IntExpression, length: IntExpression, read: int = 1
+    ) -> None:
         """Write `length` bytes from `address`, wherever the output is going.
 
         Into a buffer, the copy stops at what the caller said it holds and the
@@ -6076,14 +6188,18 @@ class Lowerer:
         )
         self.emit(
             HeapStore(
-                _binary("add", IntLoad(buffer), IntLoad(count)),
-                HeapLoad(IntLoad(source), 1),
-                1,
+                _binary(
+                    "add",
+                    IntLoad(buffer),
+                    _binary("mul", IntLoad(count), IntConstant(self.sink_width)),
+                ),
+                HeapLoad(IntLoad(source), read),
+                self.sink_width,
             )
         )
         self.emit(Label(past))
         self.emit(Store(count, _binary("add", IntLoad(count), IntConstant(1))))
-        self.emit(Store(source, _binary("add", IntLoad(source), IntConstant(1))))
+        self.emit(Store(source, _binary("add", IntLoad(source), IntConstant(read))))
         # The loop below repeats from here.
         self.emit(Store(left, _binary("sub", IntLoad(left), IntConstant(1))))
         self.emit(Jump(top))
@@ -6097,6 +6213,14 @@ class Lowerer:
         the terminator goes at the end of what was kept.
         """
 
+        wide = node.name in _WIDE_BUFFER
+        # `swprintf_s(buffer, L"...")` is C++'s array overload: the room is
+        # the array's own size and is not written at the call. Told apart by
+        # what sits second - a size, or the format itself.
+        if wide and len(node.arguments) >= 2 and isinstance(
+            node.arguments[1], StringLiteral
+        ):
+            bounded = False
         wanted = 3 if bounded else 2
         if len(node.arguments) < wanted:
             self.error(
@@ -6122,17 +6246,23 @@ class Lowerer:
             self.emit(Store(limit, room.expr))
         else:
             # `sprintf` has no limit. Said as a number rather than as a
-            # special case, so the copy is the same code either way.
-            self.emit(Store(limit, IntConstant(_MAXIMUM_STATIC_BYTES)))
+            # special case, so the copy is the same code either way. The
+            # array overload does have one - the array's own length - and
+            # saying so is the whole reason a program reaches for it.
+            self.emit(Store(limit, IntConstant(self.room_in(node.arguments[0]))))
         count = self.new_temp()
         self.emit(Store(count, IntConstant(0)))
         held, self.sink = self.sink, (buffer, limit, count)
+        was, self.sink_width = self.sink_width, (
+            wchar_for(self.target).size if wide else 1
+        )
         try:
             self.printf(
                 Call(node.token, node.name, list(node.arguments[wanted - 1:]))
             )
         finally:
             self.sink = held
+            self.sink_width = was
         # The terminator goes where the copy stopped, which is the shorter of
         # what was written and one less than the room. `snprintf(b, 0, ...)`
         # writes nothing at all, which is what C says a size of zero means.
@@ -6153,13 +6283,40 @@ class Lowerer:
         )
         self.emit(Store(stop, _binary("sub", IntLoad(limit), IntConstant(1))))
         self.emit(Label(fits))
+        width = wchar_for(self.target).size if wide else 1
         self.emit(
             HeapStore(
-                _binary("add", IntLoad(buffer), IntLoad(stop)), IntConstant(0), 1
+                _binary(
+                    "add",
+                    IntLoad(buffer),
+                    _binary("mul", IntLoad(stop), IntConstant(width)),
+                ),
+                IntConstant(0),
+                width,
             )
         )
         self.emit(Label(past))
         return Value(INT, IntLoad(count))
+
+    def room_in(self, node: object) -> int:
+        """How many characters the array being written to holds.
+
+        Only where the buffer is a name that holds an array: that is what the
+        overload taking no size is for, and anything else is refused rather
+        than given a number nobody wrote.
+        """
+
+        if isinstance(node, Identifier):
+            local = self.lookup(node.name)
+            held = local.ctype if local is not None else None
+            if isinstance(held, ArrayType) and held.count:
+                return held.count
+        self.error(
+            "this form of the call takes its room from the array it writes "
+            "to, and the first argument is not one; pass the count instead",
+            getattr(node, "token", None),
+        )
+        return 0
 
     def printf(self, node: Call) -> None:
         if not node.arguments or not isinstance(node.arguments[0], StringLiteral):
@@ -6192,7 +6349,7 @@ class Lowerer:
             prepared.append((style, ctype, precision, value, argument, flags, width))
         held: list[object] = []
         for style, ctype, precision, value, argument, flags, width in prepared:
-            if style == "string":
+            if style in ("string", "wide_string"):
                 held.append((style, precision, value, argument, flags, width))
                 continue
             if style in _FLOAT_CONVERSIONS:
@@ -6246,18 +6403,32 @@ class Lowerer:
             if style in _FLOAT_CONVERSIONS:
                 self.emit_floating(value, style, precision, flags, width)
                 continue
-            if style == "string":
+            if style in ("string", "wide_string"):
                 if value.null or not isinstance(value.ctype, PointerType):
                     self.error(
                         "a %s conversion needs a character pointer", argument.token
                     )
-                if not _is_character(value.ctype.target):
+                wanted = (
+                    value.ctype.target == wchar_for(self.target)
+                    if style == "wide_string"
+                    else _is_character(value.ctype.target)
+                )
+                if not wanted:
                     self.error(
-                        f"a %s conversion needs a character pointer, not "
-                        f"{value.ctype}",
+                        f"a %{'l' if style == 'wide_string' else ''}s "
+                        f"conversion needs a "
+                        f"{'wide ' if style == 'wide_string' else ''}character "
+                        f"pointer, not {value.ctype}",
                         argument.token,
                     )
-                self.emit_string(value.expr, flags, width)
+                self.emit_string(
+                    value.expr,
+                    flags,
+                    width,
+                    size_of(value.ctype.target) or 1
+                    if style == "wide_string"
+                    else 1,
+                )
                 continue
             expression = value
             if style == "char":
@@ -6401,6 +6572,11 @@ class Lowerer:
                     literal.token,
                 )
             ctype = table.get(specifier, default) if length else default
+            if ctype is _WIDE_STRING:
+                ctype = PointerType(wchar_for(self.target))
+                style = "wide_string"
+            elif ctype is _WIDE_CHAR:
+                ctype = wchar_for(self.target)
             if text:
                 segments.append(("text", bytes(text)))
                 text.clear()
@@ -7307,8 +7483,14 @@ class Lowerer:
             self.put(b" " * (width - 1))
 
     def emit_string(
-        self, pointer: IntExpression, flags: str = "", width: int = 0
+        self,
+        pointer: IntExpression,
+        flags: str = "",
+        width: int = 0,
+        read: int = 1,
     ) -> None:
+        """Write a string out. `read` is how wide one of its characters is."""
+
         pointer_slot = self.new_temp()
         length_slot = self.new_temp()
         self.emit(Store(pointer_slot, pointer))
@@ -7319,7 +7501,12 @@ class Lowerer:
         self.emit(
             JumpIfFalse(
                 HeapLoad(
-                    _binary("add", IntLoad(pointer_slot), IntLoad(length_slot)), 1
+                    _binary(
+                        "add",
+                        IntLoad(pointer_slot),
+                        _binary("mul", IntLoad(length_slot), IntConstant(read)),
+                    ),
+                    read,
                 ),
                 end,
             )
@@ -7331,7 +7518,7 @@ class Lowerer:
         self.emit(Label(end))
         if width and "-" not in flags:
             self.pad_forward(width, IntLoad(length_slot))
-        self.put_runtime(IntLoad(pointer_slot), IntLoad(length_slot))
+        self.put_runtime(IntLoad(pointer_slot), IntLoad(length_slot), read)
         if width and "-" in flags:
             self.pad_forward(width, IntLoad(length_slot))
 
@@ -7617,11 +7804,18 @@ def compile_c_to_ir(
     *,
     include_dirs: tuple[str, ...] = (),
     defines: tuple[str, ...] = (),
+    libraries: tuple[str, ...] = (),
 ) -> Module:
     """Compile C source text to a py2bin native IR module.
 
     ``include_dirs`` is the ``-I`` search path the preprocessor uses, and
     ``defines`` the ``-D`` macros (``NAME`` or ``NAME=value``) it starts with.
+
+    ``libraries`` names the shared libraries a function this program calls but
+    never defines may be found in - what a build with a linker would name as
+    an import library. py2bin knows the library behind every function it
+    vets; it cannot know the one behind a component somebody else shipped, so
+    the program says.
     """
 
     # Imported here rather than at the top because the preprocessor is written
@@ -7636,5 +7830,34 @@ def compile_c_to_ir(
         include_dirs=include_dirs,
         defines=defines,
     )
-    unit = Parser(tokens, filename, target).translation_unit()
-    return Lowerer(unit, filename, target).compile()
+    parser = Parser(tokens, filename, target)
+    parser.libraries = _libraries_named(libraries)
+    unit = parser.translation_unit()
+    module = Lowerer(unit, filename, target).compile()
+    module.symbol_libraries = dict(parser.symbol_libraries)
+    return module
+
+
+def _libraries_named(
+    libraries: "tuple[str, ...]",
+) -> "list[tuple[str, frozenset[str]]]":
+    """Read `--library` into (library, the symbols it is claimed for).
+
+    `NAME` claims every function the program declares and never defines;
+    `NAME:one,two` claims exactly those. The second form is what a program
+    calling into two components needs, and the first is what almost every
+    program needs.
+    """
+
+    found: "list[tuple[str, frozenset[str]]]" = []
+    for spelled in libraries:
+        library, _colon, named = spelled.partition(":")
+        found.append(
+            (
+                library.strip(),
+                frozenset(
+                    one.strip() for one in named.split(",") if one.strip()
+                ),
+            )
+        )
+    return found

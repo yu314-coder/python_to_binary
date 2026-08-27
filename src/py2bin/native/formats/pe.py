@@ -334,6 +334,7 @@ def write_pe_x86_64_dynamic(
     module: Module,
     symbol_libraries: "dict[str, str]",
     static_bytes: int = 0,
+    windowed: bool = False,
 ) -> bytes:
     """A PE that imports from several DLLs, one of them the interpreter's.
 
@@ -390,6 +391,10 @@ def write_pe_x86_64_dynamic(
         iat_offset=iat_offset,
         iat_size=iat_size,
         writable_rdata=True,
+        # A desktop program says so here. Left as a console one, Windows
+        # opens a console for it and the window comes up in front of an
+        # empty black rectangle.
+        subsystem=2 if windowed else 3,
         stack_bytes=slots * 8 + 0x200 * (1 + len(module.functions)),
     )
 
@@ -398,6 +403,7 @@ def write_pe_arm64_dynamic(
     module: Module,
     symbol_libraries: "dict[str, str]",
     static_bytes: int = 0,
+    windowed: bool = False,
 ) -> bytes:
     """The ARM64 counterpart of the writer above: a PE importing several DLLs.
 
@@ -464,6 +470,10 @@ def write_pe_arm64_dynamic(
         iat_offset=iat_offset,
         iat_size=iat_size,
         writable_rdata=True,
+        # A desktop program says so here. Left as a console one, Windows
+        # opens a console for it and the window comes up in front of an
+        # empty black rectangle.
+        subsystem=2 if windowed else 3,
         stack_bytes=slots * 8 + 0x200 * (1 + len(module.functions)),
     )
 

@@ -143,6 +143,15 @@ def optimize(module: Module) -> tuple[Module, OptimizationReport]:
     # control flow and their own terminator (Return), so none of the rules
     # above -- which all reason about the entry point's single exit -- apply.
     return (
-        Module(optimized, module.stack_slots, functions, module.static_bytes),
+        Module(
+            optimized,
+            module.stack_slots,
+            functions,
+            module.static_bytes,
+            # Carried through: which library a symbol comes from is a fact
+            # about the program, not about the shape of its code.
+            dict(module.symbol_libraries),
+            module.windowed,
+        ),
         report,
     )

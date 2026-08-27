@@ -482,8 +482,12 @@ def _emit_native_module(
         # The interpreter's DLL is version-specific because its ABI is, and
         # the build machine's interpreter is the one the C was written against.
         python_dll = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+        # What the program named comes first: py2bin has no library for a
+        # component somebody else shipped, and asking its table for one
+        # raises rather than answering.
+        named = module.symbol_libraries
         symbol_libraries = {
-            symbol: windows_symbol_library(symbol, python_dll)
+            symbol: named.get(symbol) or windows_symbol_library(symbol, python_dll)
             for symbol in _extern_symbols(module)
         }
         writer = (
@@ -491,7 +495,9 @@ def _emit_native_module(
             if target == "windows-arm64"
             else write_pe_x86_64_dynamic
         )
-        image = writer(module, symbol_libraries, module.static_bytes)
+        image = writer(
+            module, symbol_libraries, module.static_bytes, module.windowed
+        )
     elif target == "windows-x86_64":
         image = write_pe_x86_64(module)
     elif target == "windows-arm64":

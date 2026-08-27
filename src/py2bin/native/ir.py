@@ -532,6 +532,17 @@ class Module:
     # before the first operation runs, and starts out entirely zero; every
     # reference to it is a ``GlobalAddress``. Zero means the module has none.
     static_bytes: int = 0
+    # Where a symbol comes from, where the program said so. py2bin knows the
+    # DLL behind every function it vets; a program calling into a component
+    # somebody else shipped has to name the library itself, the way a build
+    # that had a linker would name the import library. Empty for a program
+    # that calls nothing but what py2bin knows.
+    symbol_libraries: dict[str, str] = field(default_factory=dict)
+    # Whether this program is a desktop one rather than a console one. Windows
+    # decides by a field in the image: a console program is given a console
+    # whether it wants one or not, and a window opening in front of an empty
+    # black rectangle is how every program that gets this wrong looks.
+    windowed: bool = False
 
 
 #: The most stack slots one frame may hold. A frame is real OS stack, and the

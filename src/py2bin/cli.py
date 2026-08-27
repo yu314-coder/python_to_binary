@@ -402,6 +402,15 @@ def _parser() -> argparse.ArgumentParser:
         "--define", "-D", action="append", default=[], metavar="NAME[=VALUE]",
         help="define a macro before the file is preprocessed",
     )
+    cc_parser.add_argument(
+        "--library", "-l", action="append", default=[],
+        metavar="NAME[:SYMBOL,...]",
+        help=(
+            "a shared library holding functions this program calls but never "
+            "defines, as a build with a linker would name an import library. "
+            "Name symbols after a colon to claim only those"
+        ),
+    )
     target_options(cc_parser)
     cc_parser.add_argument(
         "--keep",
@@ -1209,6 +1218,7 @@ def _main(argv: list[str] | None = None) -> int:
                 include_dirs=tuple(args.include_dir),
                 defines=tuple(args.define),
                 extra_sources=tuple(sources[1:]),
+                libraries=tuple(args.library),
             )
             print(
                 f"{result.artifact} ({result.bytes} bytes, {result.target})",
