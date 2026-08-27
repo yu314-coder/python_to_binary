@@ -285,6 +285,16 @@ App Store app cannot `exec` an arbitrary binary, so there is no such thing as
 a py2bin artifact that runs on the tablet that made it. The iPad is a build
 machine here, nothing else.
 
+**A program written against somebody else's component builds there too.**
+SidecarBridge is a Windows WebView2 app in C++: three sources, a header from
+the WebView2 SDK, and the loader DLL that header is for. With `--auto-fetch`
+and `--library WebView2Loader.dll`, a folder holding only the three sources
+produces a `dist/` with the executable and that DLL beside it, on both
+`windows-x86_64` and `windows-arm64`. The header and the library are the only
+things that came from anywhere else, and both came over HTTPS from the
+package that publishes them - which is the one thing a tablet can do that a
+toolchain cannot be made to.
+
 **Why the tablet can do this at all** is the thing worth taking from the
 table. py2bin has no compiler, assembler, linker or toolchain behind it - it
 writes the machine code, the Mach-O, the PE and the ELF itself, in Python -
@@ -861,6 +871,14 @@ only the symbols named, for a program calling into two components. py2bin
 knows the library behind every function it vets and does not guess at one it
 has never seen, so this is asked for rather than assumed: an image naming a
 DLL will not start on a machine without it.
+
+**And the library itself is put beside the binary.** A component ships two
+things: the header, to compile against, and the library, to run against.
+`--auto-fetch` already brings the header down; the same package holds the
+library, so the one matching the target's architecture is written next to the
+executable. What comes out of `dist/` is a program that starts, rather than
+one that needs a component installed by hand - which matters most on the
+machine that cannot install anything, and is the one it was written for.
 
 Each is an ordinary import the loader binds, the same mechanism a
 program driving CPython already uses, so calling one still needs no toolchain.

@@ -280,6 +280,153 @@ def fetch_header(
     )
 
 
+#: Where a package keeps the machine-code half of what it ships, by the
+#: architecture a target names. NuGet's own conventions, in the order a
+#: package is likely to use them.
+_RUNTIME_FOLDERS = {
+    "x86_64": ("runtimes/win-x64/native/", "build/native/x64/", "/x64/"),
+    "arm64": ("runtimes/win-arm64/native/", "build/native/arm64/", "/arm64/"),
+}
+
+
+def fetch_library(
+    name: str,
+    into: Path,
+    architecture: str,
+    *,
+    cache: "Path | None" = None,
+    results: int = _RESULTS,
+    say=lambda message: None,
+) -> Path:
+    """Download the shared library `name` and keep the copy for this machine.
+
+    A program built against somebody else's component needs two things from
+    them: the header, to compile, and the library itself, to run. py2bin
+    fetches the header already; this is the other half, and without it the
+    binary that comes out cannot start on a machine that has not installed
+    the component separately - which is the whole difficulty on a machine
+    that cannot install anything.
+
+    Only what the program asked for by name. A package holds a great many
+    files and nearly all of them are somebody else's business; the one
+    matching the name given, for the architecture being built, is the one
+    that was asked for.
+    """
+
+    stem = _valid_name(name).rsplit("/", 1)[-1]
+    if not stem.lower().endswith(".dll"):
+        raise HeaderFetchError(
+            f"{stem!r} is not a shared library name that can be fetched"
+        )
+    into = Path(into)
+    already = into / stem
+    if already.is_file():
+        return already
+    wanted = _RUNTIME_FOLDERS.get(architecture)
+    if wanted is None:
+        raise HeaderFetchError(
+            f"nothing is known about where a package keeps a library for "
+            f"{architecture!r}"
+        )
+    reasons: "list[str]" = []
+    # What was downloaded for the header first, and without asking the
+    # network again. A component ships its header and its library in one
+    # package - fetching the header brought the library with it - and the
+    # package is named after the component rather than after the file, so
+    # searching an index for `WebView2Loader` finds everything except the
+    # package that holds it.
+    store = Path(cache) if cache is not None else into / ".cache"
+    for archive in sorted(store.glob("*.blob")) if store.is_dir() else ():
+        found = _library_from(archive, into, stem, wanted)
+        if found is not None:
+            say(f"  {stem} came with the package the header came from")
+            return found
+    try:
+        packages = search_index(stem, results=results)
+    except FetchError as error:
+        packages = []
+        reasons.append(f"the package index: {error}")
+    for package in packages:
+        try:
+            version = _latest_version(package)
+            say(f"  trying {package} {version}")
+            found = _take_library(
+                _package_url(package, version),
+                f"{package} {version}",
+                into,
+                stem,
+                wanted,
+                cache=cache,
+            )
+        except FetchError as error:
+            reasons.append(f"{package}: {error}")
+            continue
+        if found is not None:
+            say(f"  {stem} came from the package {package} {version}")
+            return found
+        reasons.append(f"{package}: holds no {stem} for {architecture}")
+    spelled = "\n    ".join(reasons) or "nothing was found to try"
+    raise HeaderFetchError(
+        f"{stem!r} was not found:\n    {spelled}\n"
+        f"  The program names it with --library, so it has to be beside the "
+        f"binary to run. Put a copy there yourself, or install the component "
+        f"on the machine that will run it"
+    )
+
+
+def _take_library(
+    url: str,
+    label: str,
+    into: Path,
+    stem: str,
+    folders: "tuple[str, ...]",
+    *,
+    cache: "Path | None" = None,
+) -> "Path | None":
+    """Download one package and keep the named library for this machine."""
+
+    into.mkdir(parents=True, exist_ok=True)
+    store = Path(cache) if cache is not None else into / ".cache"
+    archive, _digest = download_verified(
+        url, store, label=label, max_download=_MAX_PACKAGE
+    )
+    return _library_from(archive, into, stem, folders)
+
+
+def _library_from(
+    archive: Path, into: Path, stem: str, folders: "tuple[str, ...]"
+) -> "Path | None":
+    """The named library for this machine, out of one downloaded package."""
+
+    import tempfile
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(archive) as held:
+            if not any(
+                item.filename.rsplit("/", 1)[-1].lower() == stem.lower()
+                for item in held.infolist()
+            ):
+                return None
+    except (OSError, zipfile.BadZipFile):
+        return None
+    with tempfile.TemporaryDirectory(dir=str(into)) as work:
+        opened = Path(work)
+        extract_zip(archive, opened)
+        candidates = [
+            path
+            for path in opened.rglob("*")
+            if path.is_file() and path.name.lower() == stem.lower()
+        ]
+        for folder in folders:
+            for path in candidates:
+                if folder.lower() in path.as_posix().lower():
+                    written = into / stem
+                    written.write_bytes(path.read_bytes())
+                    return written
+        return None
+
+
 def search_source(name: str, *, results: int = _RESULTS) -> "list[str]":
     """Repositories that might hold this header, most starred first.
 

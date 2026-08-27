@@ -713,9 +713,57 @@ def _build_c(
             "  standard headers; it has no system include path, and no C++."
         )
         return 1
+    _carry_libraries(program, result.artifact, target, libraries, auto_fetch)
     say(f"\n  done: {result.artifact}")
     _say_what_it_runs_on(result.artifact, target)
     return 0
+
+
+def _carry_libraries(
+    program: Path,
+    output: Path,
+    target: str,
+    libraries: "tuple[str, ...]",
+    auto_fetch: bool,
+) -> None:
+    """Put the shared libraries the program names beside the binary.
+
+    A program built against somebody else's component imports from a DLL,
+    and the loader looks for that DLL beside the program before it looks
+    anywhere else. Without it the binary does not start - and a machine that
+    cannot run a compiler usually cannot run the component's installer
+    either, which is exactly the machine this is for.
+
+    Only what `--library` named, and only when the build was allowed to
+    reach the network. A file somebody else wrote, going into what the user
+    is about to ship, is not something to do without being asked.
+    """
+
+    if not libraries or not auto_fetch:
+        return
+    from .header_fetch import CACHE_DIRECTORY, HeaderFetchError, fetch_library
+
+    # Where the headers were downloaded to. A component ships its header and
+    # its library together, so what was fetched to compile is where to look
+    # first for what is needed to run.
+    cache = program.parent / CACHE_DIRECTORY / ".cache"
+    architecture = target.rsplit("-", 1)[-1]
+    for spelled in libraries:
+        name = spelled.partition(":")[0].strip()
+        if not name.lower().endswith(".dll"):
+            continue
+        beside = output.parent / name
+        if beside.is_file():
+            continue
+        say(f"\n  {name} goes beside the program. Looking for it.")
+        try:
+            fetch_library(
+                name, output.parent, architecture, cache=cache, say=say
+            )
+        except HeaderFetchError as error:
+            say(f"  {error}")
+        except Exception as error:  # a network that is not there
+            say(f"  could not fetch {name}: {error}")
 
 def _say_what_it_runs_on(output: Path, target: str) -> None:
     """For a universal build, name the architectures actually in the file.
