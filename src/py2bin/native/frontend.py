@@ -354,7 +354,7 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     # on.
     "CoInitialize": ("CoInitialize", ("ptr",), "int", "ole32.dll"),
     "CoInitializeEx": ("CoInitializeEx", ("ptr", "int"), "int", "ole32.dll"),
-    "CoUninitialize": ("CoUninitialize", (), "int", "ole32.dll"),
+    "CoUninitialize": ("CoUninitialize", (), "void", "ole32.dll"),
     "CoCreateInstance": (
         "CoCreateInstance",
         ("ptr", "ptr", "int", "ptr", "ptr"),
@@ -363,9 +363,9 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     ),
     # What a COM method hands back a string in, and how it is given back.
     "CoTaskMemAlloc": ("CoTaskMemAlloc", ("int",), "ptr", "ole32.dll"),
-    "CoTaskMemFree": ("CoTaskMemFree", ("ptr",), "int", "ole32.dll"),
+    "CoTaskMemFree": ("CoTaskMemFree", ("ptr",), "void", "ole32.dll"),
     "SysAllocString": ("SysAllocString", ("ptr",), "ptr", "OLEAUT32.dll"),
-    "SysFreeString": ("SysFreeString", ("ptr",), "int", "OLEAUT32.dll"),
+    "SysFreeString": ("SysFreeString", ("ptr",), "void", "OLEAUT32.dll"),
     "SysStringLen": ("SysStringLen", ("ptr",), "int", "OLEAUT32.dll"),
     "MessageBeep": ("MessageBeep", ("int",), "int", "USER32.dll"),
     # What <filesystem> and <stdio.h>'s FILE layer reach for on Windows,

@@ -453,7 +453,7 @@ def _take_from_repository(
     # header's own `#include` lines say what it needs, and that closure is a
     # few dozen where the directory is a few thousand.
     say(f"  {root or '/'} holds {len(headers)} headers; taking what {wanted} reaches")
-    return _take_closure(full, branch, under, prefix, chosen, into, say)
+    return _take_closure(full, branch, under, prefix, chosen, into, say, paths)
 
 
 def _take_paths(
@@ -503,6 +503,7 @@ def _take_closure(
     chosen: str,
     into: Path,
     say,
+    everywhere: "list[str] | None" = None,
 ) -> "Path | None":
     """Download the header asked for and every header it reaches.
 
@@ -513,6 +514,16 @@ def _take_closure(
     """
 
     by_name = {path[len(prefix):]: path for path in paths}
+    # A set does not have to keep all of itself in one directory. mingw-w64
+    # writes its headers under `include` and the support files they all
+    # include - `_mingw_unicode.h` and its neighbours - under `crt`, so a
+    # closure that only ever looked below the header asked for could not
+    # resolve them and the build stopped on the first one. Anywhere else in
+    # the same repository is still that set; the shortest path wins, the way
+    # it does when the header itself is chosen.
+    for path in sorted(everywhere or (), key=len):
+        stem = path.rsplit("/", 1)[-1]
+        by_name.setdefault(stem, path)
     answer: "Path | None" = None
     pending = [chosen[len(prefix):]]
     seen: "set[str]" = set()

@@ -724,6 +724,23 @@ shapes that mean something else in C++: `interface X { ... }` came out as
 were made of. A header with an `#else` in it is now left for the preprocessor,
 which is the pass that knows which half is real.
 
+**`_mingw.h` is py2bin's own too**, and for a reason worth stating: it is the
+one file in the mingw-w64 set that does not exist. Every header in that set
+opens with `#include <_mingw.h>`, and what a fetch finds is `_mingw.h.in` -
+the template a configure step fills in. What it holds is a description of the
+compiler reading it, which extensions it has and how it spells an attribute,
+so py2bin is the one that knows the answers. Nearly all of them are nothing,
+which is how a compiler without an extension has always been told about it.
+
+**What py2bin's own headers define is a default, not a claim.** `S_OK` is
+`((HRESULT)0)` here and `((HRESULT)0x00000000)` in the set a fetch brings
+down, and neither is wrong - so a real header may redefine what py2bin
+supplied, and only two definitions that are both somebody else's still clash.
+And where a fetched `winerror.h` is on the path, py2bin's `<windows.h>` takes
+it, because a set that has one relies on that order: `<urlmon.h>` writes
+`#ifndef E_PENDING` around its own spelling, which only does its job if the
+real one has been read already.
+
 A DLL somebody else wrote is reached with `LoadLibraryW`, `GetProcAddress` and
 `FreeLibrary` rather than by naming it here. That is the general answer to a
 vendor component - WebView2Loader.dll is one, and so is every other SDK that

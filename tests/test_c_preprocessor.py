@@ -1150,6 +1150,52 @@ int main(void) {
             "yes",
         )
 
+    def test_the_header_a_set_generates_is_py2bin_s_own(self):
+        """mingw-w64 writes `#include <_mingw.h>` at the top of every header
+        it has, and that is the one file in the set which does not exist:
+        it is made from `_mingw.h.in` by a configure step. What it holds is a
+        description of the compiler reading it, so py2bin is the one that
+        knows the answers."""
+
+        self.compile_for_windows(
+            """
+#include <_mingw.h>
+#include <stdio.h>
+struct sized { __LONG32 a; __int64 b; __int32 c; };
+int main(void) {
+    struct sized s;
+    s.a = 1;
+    s.b = 2;
+    s.c = 3;
+    _CRT_UNUSED(s);
+    return (int)(s.a + s.b + s.c) - 6;
+}
+"""
+        )
+
+    def test_what_py2bin_supplies_is_a_default(self):
+        """py2bin's own header says what `S_OK` is so a program that never
+        reaches a platform set still has it. A program that does reach one
+        has the real thing, and every set spells these differently - so the
+        real one wins rather than being reported as a clash."""
+
+        # Redefining one is not a clash, and the second definition is the
+        # one that stands.
+        self.compile_for_windows(
+            """
+#include <windows.h>
+#define E_OUTOFMEMORY _HRESULT_TYPEDEF_(0x8007000E)
+#define _HRESULT_TYPEDEF_(x) ((HRESULT)x)
+int main(void) { return (int)(E_OUTOFMEMORY == E_OUTOFMEMORY) - 1; }
+"""
+        )
+
+    def test_two_definitions_of_a_macro_nobody_supplied_still_clash(self):
+        self.reject(
+            "#define OURS 1\n#define OURS 2\nint main(void) { return OURS; }\n",
+            "redefined with a different replacement list",
+        )
+
     def test_a_piece_still_says_it_is_for_windows(self):
         with self.assertRaises(Exception) as caught:
             self.compile_for_windows(

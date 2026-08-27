@@ -488,6 +488,13 @@ class Preprocessor:
         self.include_dirs = [Path(item) for item in include_dirs]
         #: Standard headers already supplied. See the include path below.
         self._builtins_read: set[str] = set()
+        #: Names one of py2bin's own headers defined, which a real platform
+        #: header may redefine. They are defaults so a program that never
+        #: reaches a fetched set still has them, not claims about how the
+        #: platform spells them.
+        self._defaults: set[str] = set()
+        #: Whether the file being read is one py2bin supplies.
+        self._reading_a_builtin = False
         self.output: list[PPToken] = []
         self.depth = 0
         self.once: set[str] = set()
@@ -748,6 +755,17 @@ class Preprocessor:
         macro = Macro(name, parameters, variadic, tuple(body), name_token)
         existing = self.macros.get(name)
         if existing is not None and not self._same(existing, macro):
+            # What py2bin's own header said is a default, not a definition:
+            # it is there so a program that never sees a real platform header
+            # still has the name. A program that does see one has the real
+            # thing, and it wins. Every implementation spells these
+            # differently - `S_OK` is `((HRESULT)0)` here and
+            # `((HRESULT)0x00000000)` in the set a fetch brings down - and
+            # neither is wrong, so this is not a mistake to report.
+            if name in self._defaults:
+                self._defaults.discard(name)
+                self.macros[name] = macro
+                return
             self.error(
                 f"macro {name!r} is redefined with a different replacement list; "
                 "C requires every definition of a macro to be identical "
@@ -755,6 +773,8 @@ class Preprocessor:
                 f"{existing.token.column})",
                 name_token,
             )
+        if self._reading_a_builtin:
+            self._defaults.add(name)
         self.macros[name] = macro
 
     def _check_body(
@@ -978,7 +998,12 @@ class Preprocessor:
                 # carry functions, and a second copy is a redefinition.
                 return
             self._builtins_read.add(name)
-            self._enter(builtin, f"<{name}>", None, at)
+            was = self._reading_a_builtin
+            self._reading_a_builtin = True
+            try:
+                self._enter(builtin, f"<{name}>", None, at)
+            finally:
+                self._reading_a_builtin = was
             return
         # Deduped and one per line: the list repeated itself where two search
         # roots coincided, and a wall of comma-separated paths is hard to read
@@ -1583,6 +1608,15 @@ extern HMODULE GetModuleHandleA(LPCSTR);
    the same names twice, and a program that included both was told its GUID
    was defined twice - which it was, by us. */
 #include <wtypes.h>
+/* The vendor's <windows.h> includes <winerror.h>, and a set that has one
+   relies on that order: <urlmon.h> writes `#ifndef E_PENDING` around its own
+   spelling, which only does its job if the real one has been read already.
+   Taken where a fetch has brought one down and skipped where it has not,
+   which is what __has_include is for. */
+#if __has_include(<winerror.h>)
+#include <winerror.h>
+#endif
+
 /* The SDK defines these to nothing when the reader is not a C++ compiler,
    which py2bin is not: it defines no __cplusplus, so a generated header
    takes its C branch throughout. */
@@ -1598,20 +1632,17 @@ extern HMODULE GetModuleHandleA(LPCSTR);
 #ifndef DECLSPEC_IMPORT
 #define DECLSPEC_IMPORT
 #endif
-#define COINIT_APARTMENTTHREADED 2
-#define COINIT_MULTITHREADED 0
-#define CLSCTX_INPROC_SERVER 1
-#define CLSCTX_LOCAL_SERVER 4
-#define CLSCTX_ALL 23
+/* COM has one home here, which is <objbase.h>: the entry points, the
+   threading models and the class contexts are declared there, and declaring
+   them again under this name was the same functions twice. */
+#include <objbase.h>
+#ifndef CLSCTX_LOCAL_SERVER
+#define CLSCTX_LOCAL_SERVER 0x4
+#endif
 
 extern HRESULT CoInitialize(LPVOID);
-extern HRESULT CoInitializeEx(LPVOID, DWORD);
-extern int CoUninitialize(void);
-extern HRESULT CoCreateInstance(REFCLSID, LPVOID, DWORD, REFIID, LPVOID);
-extern LPVOID CoTaskMemAlloc(SIZE_T);
-extern int CoTaskMemFree(LPVOID);
 extern BSTR SysAllocString(LPCWSTR);
-extern int SysFreeString(BSTR);
+extern void SysFreeString(BSTR);
 extern UINT SysStringLen(BSTR);
 extern BOOL MessageBeep(UINT);
 extern BOOL CreateDirectoryA(LPCSTR, LPVOID);
@@ -2236,6 +2267,33 @@ typedef const GUID *REFGUID;
 typedef const GUID *REFIID;
 typedef const GUID *REFCLSID;
 
+/* A generated header names its interface IDs with this. The SDK writes it
+   two ways - a declaration everywhere, and a definition in the one file that
+   defines INITGUID - because a program is several translation units and the
+   value has to live in exactly one of them. py2bin has one, so the value
+   always lives here: there is no other file for it to clash with, and a
+   declaration with no definition anywhere would be a name nothing could
+   resolve, py2bin having no linker either. */
+#define DEFINE_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \\
+    const GUID name = {l, w1, w2, {b1, b2, b3, b4, b5, b6, b7, b8}}
+#define DEFINE_OLEGUID(name, l, w1, w2) \\
+    DEFINE_GUID(name, l, w1, w2, 0xC0, 0, 0, 0, 0, 0, 0, 0x46)
+
+#define IsEqualGUID(a, b) (__py2bin_same_guid(&(a), &(b)))
+#define IsEqualIID(a, b) IsEqualGUID(a, b)
+#define IsEqualCLSID(a, b) IsEqualGUID(a, b)
+
+static int __py2bin_same_guid(const GUID *__a, const GUID *__b) {
+    int __i;
+    if (__a->Data1 != __b->Data1) { return 0; }
+    if (__a->Data2 != __b->Data2) { return 0; }
+    if (__a->Data3 != __b->Data3) { return 0; }
+    for (__i = 0; __i < 8; __i = __i + 1) {
+        if (__a->Data4[__i] != __b->Data4[__i]) { return 0; }
+    }
+    return 1;
+}
+
 #ifndef S_OK
 #define S_OK ((HRESULT)0)
 #endif
@@ -2348,12 +2406,13 @@ _OBJBASE_H = """
 #define CLSCTX_ALL 0x17
 #endif
 
-HRESULT CoInitializeEx(void *reserved, unsigned int model);
-void CoUninitialize(void);
-HRESULT CoCreateInstance(REFCLSID clsid, void *outer,
-                         unsigned int context, REFIID riid, void **object);
-void CoTaskMemFree(void *block);
-void *CoTaskMemAlloc(SIZE_T bytes);
+extern HRESULT CoInitializeEx(void *reserved, unsigned int model);
+extern void CoUninitialize(void);
+extern HRESULT CoCreateInstance(REFCLSID clsid, void *outer,
+                                unsigned int context, REFIID riid,
+                                void **object);
+extern void CoTaskMemFree(void *block);
+extern void *CoTaskMemAlloc(SIZE_T bytes);
 #endif
 """
 
@@ -2363,6 +2422,145 @@ void *CoTaskMemAlloc(SIZE_T bytes);
 #: the same content under two names would be read twice and redefine
 #: everything in it.
 _PART_OF_WINDOWS_H = "#include <windows.h>\n"
+
+_MINGW_H = """
+#ifndef __py2bin_mingw_h
+#define __py2bin_mingw_h
+#define _INC__MINGW_H
+
+/* The header the mingw-w64 set writes at the top of every file it has, and
+   the one file in that set that does not exist: it is generated from
+   `_mingw.h.in` by a configure step, so a fetch finds `_mingw.h.in` and no
+   `_mingw.h` anywhere. What it holds is a description of the compiler
+   reading it - which extensions it has, how it spells an attribute, how wide
+   its `long` is - so py2bin is the one that knows the answers, and this is
+   py2bin's answers.
+
+   Nearly all of it is nothing. An attribute that asks for an optimisation,
+   a deprecation warning or a calling convention has nothing to say to a
+   compiler that has one convention and makes its own decisions about
+   inlining, and a macro that expands to nothing is how a compiler without
+   the extension has always been told about it. */
+
+#define __MINGW_EXTENSION
+#define __MINGW_NOTHROW
+#define __MINGW_IMPORT extern
+#define __MINGW_INTRIN_INLINE static
+#define __MINGW_ATTRIB_NORETURN
+#define __MINGW_ATTRIB_CONST
+#define __MINGW_ATTRIB_MALLOC
+#define __MINGW_ATTRIB_PURE
+#define __MINGW_ATTRIB_UNUSED
+#define __MINGW_ATTRIB_USED
+#define __MINGW_ATTRIB_NONNULL(x)
+#define __MINGW_ATTRIB_DEPRECATED
+#define __MINGW_ATTRIB_DEPRECATED_MSG(x)
+#define __MINGW_ATTRIB_DEPRECATED_STR(x)
+#define __MINGW_ATTRIB_DEPRECATED_SEC_WARN
+#define __MINGW_ATTRIB_NO_OPTIMIZE
+#define __MINGW_BROKEN_INTERFACE(x)
+#define __MINGW_PRAGMA_PARAM(x)
+#define __MINGW_SEC_WARN_STR(x)
+#define __MINGW_MSVC2005_DEPRECATE_STR(x)
+#define __MINGW_CXX11_CONSTEXPR
+#define __MINGW_CXX14_CONSTEXPR
+#define __MINGW_POISON_NAME(x) x
+#define __MINGW_ASM_CALL(x)
+#define __MINGW_UCRT_ASM_CALL(x)
+
+/* How the set spells the things a compiler is asked to do to a declaration.
+   py2bin decides its own linkage, its own inlining and its own convention,
+   so each of these says nothing. */
+#define _CRTIMP
+#define _CRTIMP2
+#define _CRTIMP_ALTERNATIVE
+#define _CRTIMP_NOIA64
+#define _CRTIMP_PURE
+#define _MCRTIMP
+#define _MRTIMP2
+#define _CRTDECL
+#define __CRTDECL
+#define __CRT_INLINE static
+#define _CRT_ALIGN(x)
+#define _CRT_DEPRECATE_TEXT(x)
+#define _CRT_INSECURE_DEPRECATE(x)
+#define _CRT_INSECURE_DEPRECATE_GLOBALS(x)
+#define _CRT_INSECURE_DEPRECATE_MEMORY(x)
+#define _CRT_MANAGED_HEAP_DEPRECATE
+#define _CRT_OBSOLETE(x)
+#define _CRT_BEGIN_C_HEADER
+#define _CRT_END_C_HEADER
+#define _CRT_UNUSED(x) (void)(x)
+#define __CRT_UUID_DECL(type, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8)
+#define _SECURECRT_FILL_BUFFER_PATTERN 0xFD
+#define _TRUNCATE ((size_t)-1)
+#define __CRT__NO_INLINE 1
+
+/* Spellings of a type or a qualifier that only one compiler has. */
+#define __LONG32 long
+#define __int8 char
+#define __int16 short
+#define __int32 int
+#define __int64 long long
+#define __ptr32
+#define __ptr64
+#define __unaligned
+#define UNALIGNED
+#define __w64
+#define __nothrow
+#define __restrict__
+#define __restrict_arr
+#define __forceinline __inline
+
+/* An anonymous member is one py2bin has, so these say to leave it
+   anonymous - which is what the set does for every compiler that has them. */
+#define _ANONYMOUS_UNION
+#define _ANONYMOUS_STRUCT
+#define __ANONYMOUS_DEFINED
+#define _UNION_NAME(x)
+#define _STRUCT_NAME(x)
+#define DUMMYUNIONNAME
+#define DUMMYUNIONNAME1
+#define DUMMYUNIONNAME2
+#define DUMMYUNIONNAME3
+#define DUMMYUNIONNAME4
+#define DUMMYUNIONNAME5
+#define DUMMYUNIONNAME6
+#define DUMMYUNIONNAME7
+#define DUMMYUNIONNAME8
+#define DUMMYUNIONNAME9
+#define DUMMYSTRUCTNAME
+#define DUMMYSTRUCTNAME1
+#define DUMMYSTRUCTNAME2
+#define DUMMYSTRUCTNAME3
+#define DUMMYSTRUCTNAME4
+#define DUMMYSTRUCTNAME5
+#define __C89_NAMELESS
+#define __C89_NAMELESSSTRUCTNAME
+#define __C89_NAMELESSUNIONNAME
+
+#define __CRT_STRINGIZE(x) #x
+#define _CRT_STRINGIZE(x) __CRT_STRINGIZE(x)
+#define __CRT_WIDE(x) L ## x
+#define _CRT_WIDE(x) __CRT_WIDE(x)
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER _WIN32_WINNT
+#endif
+#ifndef __MSVCRT_VERSION__
+#define __MSVCRT_VERSION__ 0x700
+#endif
+#define __USE_MINGW_ANSI_STDIO 0
+#define _INT128_DEFINED
+#define USE___UUIDOF 0
+#define __DECLSPEC_SUPPORTED 1
+#define _ARGMAX 100
+
+#endif
+"""
 
 _EVENTTOKEN_H = """
 #ifndef __py2bin_eventtoken_h
@@ -2502,13 +2700,33 @@ struct IStream { const IStreamVtbl *lpVtbl; };
 #define STREAM_SEEK_CUR 1
 #define STREAM_SEEK_END 2
 
-/* Named in signatures and passed along, never called: WebView2 hands one to
-   a drag-and-drop handler and takes it back. Left incomplete rather than
-   written out, because its table is nine methods over structs whose layout
-   would be being guessed at here - and a program that does want to call one
-   is told the type is incomplete, which is true, instead of being handed a
-   table that might be wrong. */
+/* Named in signatures and passed along, never called by the programs that
+   name them: a generated header takes one of these and hands it back. Left
+   incomplete rather than written out, because each of their tables is a
+   dozen methods over structs whose layout would be being guessed at here -
+   and a program that does want to call one is told the type is incomplete,
+   which is true, rather than handed a table that might be wrong.
+
+   Written out, with real tables, when something needs to call one. IStream
+   above is the shape that takes. */
 typedef struct IDataObject IDataObject;
+typedef struct IAdviseSink IAdviseSink;
+typedef struct IBindCtx IBindCtx;
+typedef struct IClassFactory IClassFactory;
+typedef struct IDispatch IDispatch;
+typedef struct IEnumFORMATETC IEnumFORMATETC;
+typedef struct IEnumSTATDATA IEnumSTATDATA;
+typedef struct IEnumString IEnumString;
+typedef struct IEnumUnknown IEnumUnknown;
+typedef struct IMalloc IMalloc;
+typedef struct IMoniker IMoniker;
+typedef struct IStorage IStorage;
+typedef struct ITypeInfo ITypeInfo;
+typedef struct ITypeLib ITypeLib;
+typedef struct IRunningObjectTable IRunningObjectTable;
+typedef struct IPersist IPersist;
+typedef struct IMessageFilter IMessageFilter;
+typedef struct IMarshal IMarshal;
 #endif
 """
 
@@ -2618,6 +2836,12 @@ _BUILTIN_HEADERS = {
     # false and the interface arrives as a table of function pointers - which
     # is what the object is, and what py2bin's C compiles.
     "sal.h": _SAL_H,
+    # The one file in the mingw-w64 set that does not exist as a file: it is
+    # generated by a configure step, and what it holds is a description of
+    # the compiler reading it - which py2bin is the one that knows.
+    "_mingw.h": _MINGW_H,
+    # The same header under the name a generated one asks for.
+    "guiddef.h": "#include <wtypes.h>\n",
     "unknwn.h": _UNKNWN_H,
     "specstrings.h": _SAL_H,
     "objidl.h": _OBJIDL_H,
