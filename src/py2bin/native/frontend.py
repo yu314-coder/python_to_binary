@@ -266,12 +266,18 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     "LoadCursorW": ("LoadCursorW", ("ptr", "ptr"), "ptr", "USER32.dll"),
     "LoadIconW": ("LoadIconW", ("ptr", "ptr"), "ptr", "USER32.dll"),
     "SetWindowLongPtrW": (
-        "SetWindowLongPtrW", ("ptr", "int", "ptr"), "ptr", "USER32.dll"
+        "SetWindowLongPtrW", ("ptr", "int", "int"), "int", "USER32.dll"
     ),
+    "SetWindowLongW": (
+        "SetWindowLongW", ("ptr", "int", "int"), "int", "USER32.dll",
+    ),
+    "GetWindowLongW": ("GetWindowLongW", ("ptr", "int"), "int", "USER32.dll"),
     "GetWindowLongPtrW": (
-        "GetWindowLongPtrW", ("ptr", "int"), "ptr", "USER32.dll"
+        "GetWindowLongPtrW", ("ptr", "int"), "int", "USER32.dll"
     ),
     "GetModuleHandleW": ("GetModuleHandleW", ("ptr",), "ptr", "KERNEL32.dll"),
+    "GetCommandLineW": ("GetCommandLineW", (), "ptr", "KERNEL32.dll"),
+    "GetCommandLineA": ("GetCommandLineA", (), "ptr", "KERNEL32.dll"),
     "GetModuleFileNameW": (
         "GetModuleFileNameW", ("ptr", "ptr", "int"), "int", "KERNEL32.dll",
     ),

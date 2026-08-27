@@ -983,8 +983,14 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # The trailing `[` is how an array is declared, and an array used as a
     # value is a pointer to its first element - which is what `sort(raw, raw
     # + 8)` passes.
+    # The `(` is a declaration whose declarator is a constructor call:
+    # `wstring buffer(512, L'\0');` declares `buffer` as surely as `wstring
+    # buffer;` does, and without it the type of one was never read - so a
+    # call taking it picked the wrong overload, silently, by falling back to
+    # the first.
     pattern = re.compile(
-        rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*(\*?)\s*\b{re.escape(spelled)}\b\s*([=;,)\[])"
+        rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*(\*?)\s*"
+        rf"\b{re.escape(spelled)}\b\s*([=;,)\[(])"
     )
     code = _without_literals(text)
     found = [
@@ -1104,7 +1110,6 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
             )
             if held is not None:
                 return held
-        return None
     # Arithmetic: `raw + 8` is where `raw` points moved along, and `x * 2.0`
     # is whichever of the two is wider - which is what C++ does with them.
     # Not the `-` of an arrow: that is a member read, handled above, and
@@ -1152,6 +1157,10 @@ _DISPATCHED = re.compile(r"^\(\(\s*(.+?)\s*\(\s*\*\s*\)\s*\(", re.S)
 
 #: `(int)x`, `(const char *)p` - a cast, which says what something is.
 _CAST = re.compile(r"^\(\s*((?:const\s+)?[A-Za-z_]\w*(?:\s*\*)*)\s*\)\s*(.+)$", re.S)
+#: What the pass that hoists a value return calls what it writes. Read back
+#: by the caller, which has to know these are objects of the scope.
+_VALUE_PREFIX = "__py2bin_value_"
+
 #: `return {};` - the answer, value initialised, with no type written
 #: because the function's own declaration says which one.
 _EMPTY_RETURN = re.compile(r"(?<![.\w>])return\s*\{\s*\}\s*;")
@@ -1642,13 +1651,22 @@ _AUTO_DECLARATION = re.compile(
     r"(?<![.\w>])auto\s*([*&]*)\s*([A-Za-z_]\w*)\s*=\s*([^;]+);"
 )
 
-#: `C(int x, int y) : a(x), b(y) {` - a constructor's initialiser list.
-_INITIALISER_LIST = re.compile(
-    r"\)\s*:\s*((?:[A-Za-z_]\w*\s*\([^()]*\)\s*,?\s*)+)\{"
+#: A parenthesised group that may hold three more inside it. What an
+#: initialiser is given is an expression, and an expression is often a call:
+#: `handler_(move(handler))` is the ordinary way to write one, and a pattern
+#: that stops at the first `)` stops inside it.
+_NESTED_PARENS = (
+    r"\((?:[^()]|\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))*\)"
 )
 
-#: `a(x)` inside one.
-_ONE_INITIALISER = re.compile(r"([A-Za-z_]\w*)\s*\(([^()]*)\)")
+#: `C(int x, int y) : a(x), b(y) {` - a constructor's initialiser list.
+_INITIALISER_LIST = re.compile(
+    rf"\)\s*:\s*((?:[A-Za-z_]\w*\s*{_NESTED_PARENS}\s*,?\s*)+)\{{"
+)
+
+#: `a(x)` inside one, with the parentheses kept: what is between them may
+#: itself hold a pair, so the group is taken whole and opened here.
+_ONE_INITIALISER = re.compile(rf"([A-Za-z_]\w*)\s*({_NESTED_PARENS})")
 
 
 def _rewrite_auto(text: str) -> str:
@@ -1748,7 +1766,8 @@ def _rewrite_initialiser_lists(text: str) -> str:
         for found in _ONE_INITIALISER.finditer(
             text[match.start(1): match.end(1)]
         ):
-            name, value = found.group(1), found.group(2).strip()
+            name = found.group(1)
+            value = found.group(2).strip()[1:-1].strip()
             if name == base:
                 assignments.append(f"{_BASE_INIT}({value});")
                 continue
@@ -2426,13 +2445,48 @@ _ERASED_ASSIGN = re.compile(
 )
 
 
+def _erased_spellings(text: str, name: str) -> str:
+    """Every name this signature goes by here, as one pattern.
+
+    A program almost always gives the signature a name of its own - `using
+    EventHandler = std::function<void(const string &)>;` - and writes that
+    everywhere afterwards. The pass that resolves an alias runs after this
+    one, so the alias is followed here instead: without it a constructor
+    taking an `EventHandler` was not a constructor taking one of these, and
+    the lambda handed to it was passed as itself.
+    """
+
+    spellings = {name}
+    for _round in range(4):
+        found = set(spellings)
+        for spelled in spellings:
+            for match in re.finditer(
+                rf"(?<![.\w>])using\s+([A-Za-z_]\w*)\s*=\s*"
+                rf"{re.escape(spelled)}\s*;",
+                text,
+            ):
+                found.add(match.group(1))
+            for match in re.finditer(
+                rf"(?<![.\w>])typedef\s+{re.escape(spelled)}\s+"
+                rf"([A-Za-z_]\w*)\s*;",
+                text,
+            ):
+                found.add(match.group(1))
+        if found == spellings:
+            break
+        spellings = found
+    return "|".join(re.escape(one) for one in sorted(spellings))
+
+
 def _erased_holders(text: str, name: str) -> "set[str]":
     """Every name declared to hold this signature: a variable, a member."""
 
     return {
         match.group(1)
         for match in re.finditer(
-            rf"(?<![.\w>]){re.escape(name)}\s*&?\s*([A-Za-z_]\w*)\s*[;=,)]", text
+            rf"(?<![.\w>])(?:{_erased_spellings(text, name)})"
+            rf"\s*&?\s*([A-Za-z_]\w*)\s*[;=,)]",
+            text,
         )
     }
 
@@ -2452,11 +2506,122 @@ def _erased_parameters(text: str, name: str) -> "dict[str, list[int]]":
         at = [
             index
             for index, part in enumerate(_split_arguments(match.group(3)))
-            if re.match(rf"\s*(?:const\s+)?{re.escape(name)}\s*&?\s*\w*\s*$", part)
+            if re.match(
+                rf"\s*(?:const\s+)?(?:{_erased_spellings(text, name)})"
+                rf"\s*&?\s*\w*\s*$",
+                part,
+            )
         ]
         if at:
             found[match.group(2)] = at
     return found
+
+
+def _erased_constructors(text: str, name: str) -> "dict[str, list[int]]":
+    """Which classes take this signature in a constructor, and where.
+
+    Read from the class bodies rather than from the definitions at the top
+    level, because a constructor is declared inside its class and is spelled
+    `Class::Class` where it is defined - neither of which is a definition the
+    scanner above recognises. Passing a lambda to a constructor is how a
+    program hands an object something to call back into, so leaving these out
+    left the commonest use of the type untranslated.
+    """
+
+    found: "dict[str, list[int]]" = {}
+    wants = re.compile(
+        rf"\s*(?:const\s+)?(?:{_erased_spellings(text, name)})"
+        rf"\s*&?\s*\w*\s*$"
+    )
+    for head in _CLASS_HEAD.finditer(text):
+        owner = head.group(2)
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        inside = text[head.end(): closing - 1]
+        for written in re.finditer(
+            rf"(?<![.\w>~]){re.escape(owner)}\s*\(", inside
+        ):
+            shut = _closing_paren(inside, written.end() - 1)
+            if shut < 0:
+                continue
+            at = [
+                index
+                for index, part in enumerate(
+                    _split_arguments(inside[written.end(): shut])
+                )
+                if wants.match(part)
+            ]
+            if at:
+                found.setdefault(owner, at)
+    return found
+
+
+def _erased_methods(text: str, name: str) -> "dict[str, list[int]]":
+    """Which members take this signature, and at which positions.
+
+    The same reason as the constructors above: a member is declared inside
+    its class and defined as `Class::member`, and the scanner that reads
+    definitions at the top level sees neither. A method taking a callback is
+    as ordinary as a constructor taking one.
+    """
+
+    found: "dict[str, list[int]]" = {}
+    wants = re.compile(
+        rf"\s*(?:const\s+)?(?:{_erased_spellings(text, name)})"
+        rf"\s*&?\s*\w*\s*$"
+    )
+    for head in _CLASS_HEAD.finditer(text):
+        owner = head.group(2)
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        inside = text[head.end(): closing - 1]
+        for written in re.finditer(r"(?<![.\w>~])([A-Za-z_]\w*)\s*\(", inside):
+            method = written.group(1)
+            if method == owner or method in _NOT_A_TYPE:
+                continue
+            shut = _closing_paren(inside, written.end() - 1)
+            if shut < 0:
+                continue
+            at = [
+                index
+                for index, part in enumerate(
+                    _split_arguments(inside[written.end(): shut])
+                )
+                if wants.match(part)
+            ]
+            if at:
+                found.setdefault(method, at)
+    return found
+
+
+def _erased_places(text: str, name: str) -> "list[tuple[int, int, list[int]]]":
+    """Every call that may be handed one of these: where it starts and opens.
+
+    A plain call is the name and its parentheses. A constructor is written
+    three ways - `C v(x);`, `C(x)` as a temporary, and `new C(x)` - and the
+    name in front of the parentheses is the class rather than the callee.
+    """
+
+    bare = _without_literals(text)
+    places: "list[tuple[int, int, list[int]]]" = []
+    for called, positions in _erased_parameters(text, name).items():
+        for match in re.finditer(rf"(?<![.\w>]){re.escape(called)}\s*\(", bare):
+            places.append((match.start(), match.end() - 1, positions))
+    for owner, positions in _erased_constructors(text, name).items():
+        for match in re.finditer(
+            rf"(?<![.\w>~]){re.escape(owner)}\s*(?:[A-Za-z_]\w*\s*)?\(", bare
+        ):
+            places.append((match.start(), match.end() - 1, positions))
+    for method, positions in _erased_methods(text, name).items():
+        for match in re.finditer(
+            rf"(?:\.|->)\s*{re.escape(method)}\s*\(", bare
+        ):
+            places.append((match.start(), match.end() - 1, positions))
+    return places
 
 
 def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
@@ -2465,19 +2630,18 @@ def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
     holders = _erased_holders(text, name)
     found: "list[str]" = []
     bare = _without_literals(text)
-    # Passed to a function that takes one.
-    for called, positions in _erased_parameters(text, name).items():
-        for match in re.finditer(rf"(?<![.\w>]){re.escape(called)}\s*\(", bare):
-            close = _closing_paren(bare, match.end() - 1)
-            if close < 0 or _is_a_definition(bare, close):
+    # Passed to a function or a constructor that takes one.
+    for _start, opening, positions in _erased_places(text, name):
+        close = _closing_paren(bare, opening)
+        if close < 0 or _is_a_definition(bare, close):
+            continue
+        given = _split_arguments(bare[opening + 1: close])
+        for index in positions:
+            if index >= len(given):
                 continue
-            given = _split_arguments(bare[match.end(): close])
-            for index in positions:
-                if index >= len(given):
-                    continue
-                value = given[index].strip()
-                if value.isidentifier() and value not in holders:
-                    found.append(value)
+            value = given[index].strip()
+            if value.isidentifier() and value not in holders:
+                found.append(value)
     # `NAME f = value;` - given where it is declared.
     for match in re.finditer(
         rf"(?<![.\w>]){re.escape(name)}\s+[A-Za-z_]\w*\s*=\s*([A-Za-z_]\w*)\s*;",
@@ -2609,44 +2773,42 @@ def _erased_given(
 
     for _round in range(_HOIST_ROUNDS):
         changed = False
-        for called, positions in _erased_parameters(text, name).items():
-            bare = _without_literals(text)
-            for match in re.finditer(
-                rf"(?<![.\w>]){re.escape(called)}\s*\(", bare
-            ):
-                close = _closing_paren(bare, match.end() - 1)
-                if close < 0 or _is_a_definition(bare, close):
+        bare = _without_literals(text)
+        for begins, opening, positions in _erased_places(text, name):
+            close = _closing_paren(bare, opening)
+            if close < 0 or _is_a_definition(bare, close):
+                continue
+            given = _split_arguments(text[opening + 1: close])
+            for index in positions:
+                if index >= len(given):
                     continue
-                given = _split_arguments(text[match.end(): close])
-                for index in positions:
-                    if index >= len(given):
-                        continue
-                    value = given[index].strip()
-                    if not value.isidentifier() or value in holders:
-                        continue
-                    if value in by_value:
-                        which = by_value[value]
-                    else:
-                        spelled = _deduced_type(value, text)
-                        which = places.get((spelled or "").strip())
-                    if which is None:
-                        continue
-                    made = f"__py2bin_given_{abs(hash((called, index, value))) % 100000}"
-                    given[index] = made
-                    start = _statement_start(text, match.start())
-                    text = (
-                        text[:start]
-                        + f" {name} {made}; {made}.__which = {which}; "
-                        f"{made}.__held{which} = {value}; "
-                        + text[start:match.end()]
-                        + ", ".join(one.strip() for one in given)
-                        + text[close:]
-                    )
-                    holders.add(made)
-                    changed = True
-                    break
-                if changed:
-                    break
+                value = given[index].strip()
+                if not value.isidentifier() or value in holders:
+                    continue
+                if value in by_value:
+                    which = by_value[value]
+                else:
+                    spelled = _deduced_type(value, text)
+                    which = places.get((spelled or "").strip())
+                if which is None:
+                    continue
+                made = (
+                    f"__py2bin_given_"
+                    f"{abs(hash((begins, index, value))) % 100000}"
+                )
+                given[index] = made
+                start = _statement_start(text, begins)
+                text = (
+                    text[:start]
+                    + f" {name} {made}; {made}.__which = {which}; "
+                    f"{made}.__held{which} = {value}; "
+                    + text[start: opening + 1]
+                    + ", ".join(one.strip() for one in given)
+                    + text[close:]
+                )
+                holders.add(made)
+                changed = True
+                break
             if changed:
                 break
         if not changed:
@@ -5196,6 +5358,107 @@ def _namespace_aliases(text: str) -> "tuple[str, set[str]]":
 _LINKAGE = re.compile(r'\bextern\s*"C(?:\+\+)?"\s*')
 
 
+#: `constexpr` - a promise about *when* a value can be worked out, which is
+#: a promise C does not make. What it says about the value itself is what
+#: `const` says, and that is the part the C needs.
+_CONSTEXPR = re.compile(r"(?<![.\w>])constexpr\b\s*")
+
+#: `constexpr int kLimit = 12;` - a named integer known at compile time,
+#: which is the one thing C has a spelling for.
+_CONSTEXPR_INTEGER = re.compile(
+    r"(?<![.\w>])(?:static\s+)?constexpr\s+"
+    r"(?:(?:unsigned|signed|short|long|int|char|size_t|bool)\s+)*"
+    r"(?:unsigned|signed|short|long|int|char|size_t|bool)\s+"
+    r"([A-Za-z_]\w*)\s*=\s*([^;{}]+);"
+)
+
+#: What may stand in one: names, numbers and arithmetic. A literal would
+#: have ended the stretch of code this is matched against, so there is none
+#: to worry about; a `.` is a floating value and not an enumerator.
+_AN_INTEGER_EXPRESSION = re.compile(r"^[\w\s+\-*/%()<>|&^~!=]+$")
+
+#: What the enum holding one named constant is called. Nothing writes this
+#: name; it is there because C++ has anonymous class-scope constants and the
+#: pass that lifts a nested enum out needs one to lift.
+_CONSTANT_ENUM = "__py2bin_constant_"
+
+
+#: `std::move(v)` and `std::forward<T>(v)` - the two ways a program says
+#: "this may be taken from". Written with the qualifier, so what is caught
+#: here is the standard one and not a function the program wrote.
+_A_MOVE = re.compile(
+    r"(?<![.\w>])std\s*::\s*(?:move|forward)\s*(?:<[^<>;{}]*>\s*)?\("
+)
+
+
+#: A name, or a member reached through one: what needs no parentheses.
+_A_PLAIN_NAME = re.compile(
+    r"^[A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*$"
+)
+
+
+def _strip_moves(text: str) -> str:
+    """`std::move(v)` becomes `(v)`.
+
+    A move is permission to take what an object holds rather than copy it,
+    which is worth having when the copy is expensive. This subset has no
+    move constructor and no rvalue reference, so every one of these is a
+    copy - which is what the program would have done had it not asked, and
+    is right, only slower. Taken out here rather than declared as a
+    function, because a function answering `T &&` is a type the rest of
+    this does not have.
+    """
+
+    while True:
+        bare = _without_literals(text)
+        found = _A_MOVE.search(bare)
+        if found is None:
+            return text
+        close = _closing_paren(bare, found.end() - 1)
+        if close < 0:
+            return text
+        inside = text[found.end(): close]
+        # Parenthesised only where it has to be. A name is one already, and
+        # wrapped it stopped being one for the passes that read what an
+        # initialiser was given by looking at the name it names.
+        kept = (
+            inside.strip()
+            if _A_PLAIN_NAME.match(inside.strip())
+            else f"({inside})"
+        )
+        text = text[:found.start()] + kept + text[close + 1:]
+
+
+def _strip_constexpr(text: str) -> str:
+    """`constexpr T k = v;` becomes `const T k = v;`.
+
+    C++ asks for the value at compile time; py2bin's C works it out at
+    compile time anyway wherever it can, and where it cannot the program
+    still runs - so the difference is a diagnostic C++ gives and this does
+    not, which is permissive and never wrong for a program that is right.
+
+    On a function the word says the same thing about its result, and a
+    `const` return type is something C accepts and ignores.
+    """
+
+    def named(match: "re.Match[str]") -> str:
+        value = match.group(2).strip()
+        if not _AN_INTEGER_EXPRESSION.match(value) or "." in value:
+            return match.group(0)
+        # An enumerator, because that is what C accepts where a constant is
+        # required: `int room[kLimit];` is a declaration in C++ and, with
+        # `kLimit` a `const int`, is not one in C.
+        # Named, not anonymous: written inside a class this has to be lifted
+        # out of it, and the pass that does that works on enums with names.
+        return (
+            f"enum {_CONSTANT_ENUM}{match.group(1)} "
+            f"{{ {match.group(1)} = {value} }};"
+        )
+
+    text = _map_code(text, lambda part: _CONSTEXPR_INTEGER.sub(named, part))
+    return _map_code(text, lambda part: _CONSTEXPR.sub("const ", part))
+
+
 def _strip_linkage(text: str) -> str:
     """`extern "C" { ... }` is its contents, and the braces go.
 
@@ -5599,6 +5862,32 @@ def _slot_method(
     return None
 
 
+def _passed_by_address(spelled: str, classes: "dict[str, Class]") -> bool:
+    """Whether a parameter written like this is a pointer in the C.
+
+    A class, because that is how this translator passes one. A struct the
+    platform declares, because py2bin's C can neither pass nor answer one by
+    value - and because the ABI it is talking to passes a struct of that size
+    by address anyway, which is what makes this the right shape and not only
+    the possible one.
+    """
+
+    if "*" in spelled or "&" in spelled:
+        return False
+    words = re.sub(r"\b(?:const|struct|volatile|union)\b", " ", spelled).split()
+    if not words:
+        return False
+    return words[0] in classes or words[0] in _platform_structs()
+
+
+def _platform_structs() -> "frozenset[str]":
+    """The struct names py2bin's own platform headers declare."""
+
+    from .c_preprocessor import platform_structs
+
+    return platform_structs()
+
+
 def _c_signature(
     owner: str, method: "Method", classes: "dict[str, Class]"
 ) -> "tuple[str, str]":
@@ -5618,9 +5907,16 @@ def _c_signature(
         if not part.strip():
             continue
         spelled = _rewrite_types(part, classes).strip()
-        held = part.replace("*", "").strip().split()
-        if "*" not in part and held and held[0] in classes:
-            spelled = f"struct {held[0]} *"
+        held = re.sub(
+            r"\b(?:const|struct|volatile|union)\b", " ", part.replace("*", " ")
+        ).split()
+        if _passed_by_address(part, classes) and held:
+            # `struct` in front of a class, because that is what it is
+            # emitted as; the plain name for a platform struct, which is a
+            # typedef and whose tag is something else again.
+            spelled = (
+                f"struct {held[0]} *" if held[0] in classes else f"{held[0]} *"
+            )
         else:
             # Drop the parameter's name: a cast is types only.
             spelled = re.sub(r"\b[A-Za-z_]\w*\s*(\[\s*\d*\s*\])?$", "", spelled).strip()
@@ -6126,6 +6422,17 @@ def _open_with_member_values(
     return body[:opening + 1] + " " + spelled + body[opening + 1:]
 
 
+def _constructor_taking(
+    held: str, count: int, classes: "dict[str, Class]"
+) -> bool:
+    """Whether that class declares a constructor of that many parameters."""
+
+    return any(
+        item.name == "" and _arity(item.parameters) == count
+        for item in classes.get(held, Class("")).methods
+    )
+
+
 def _same_class(
     value: str, held: str, scope: str, classes: "dict[str, Class]"
 ) -> bool:
@@ -6180,10 +6487,17 @@ def _open_with_subobjects(
                 if arguments.strip()
                 else []
             )
-            if len(given) == 1 and _same_class(given[0], held, reading, classes):
+            if len(given) == 1 and (
+                _same_class(given[0], held, reading, classes)
+                or not _constructor_taking(held, 1, classes)
+            ):
                 # `Person(string n) : name(n)` names the copy constructor,
                 # and a class that wrote none has the memberwise copy py2bin
                 # already does everywhere else. Nothing to construct.
+                # Also where the type of what is passed cannot be read but
+                # the class has no constructor of that shape either: there
+                # is nothing else this could mean, and calling one that does
+                # not exist says so about the wrong line.
                 calls.append(
                     _copied_in(held, address.lstrip("&"), f"&{given[0]}", classes)
                 )
@@ -6621,6 +6935,14 @@ _VALUE_INIT = re.compile(
 _OBJECT_ARRAY = re.compile(
     r"(?<!struct )\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*;"
 )
+
+#: `path webRoot = executablePath / L"web";` - a declaration whose initialiser
+#: is an expression rather than one of the shapes above. What it holds is
+#: still an object of that class, and a pass that did not know it was one
+#: left every call on it alone.
+_ANY_INIT = re.compile(
+    r"(?<!struct )(?<![.\w>])\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=[^=][^;]*;"
+)
 #: `Shape *all[3];` - an array of pointers, which is how a program holds a
 #: mixture of things that share a base.
 _POINTER_ARRAY = re.compile(
@@ -6979,13 +7301,103 @@ def _declared_objects(
     """
 
     found: dict[str, str] = {}
-    for pattern in (_OBJECT, _OBJECT_ARRAY, _OBJECT_POINTER, _VALUE_INIT):
-        for match in pattern.finditer(body):
+    # Against a copy with the literals blanked: `"int n = 1;"` inside a
+    # string is text and declares nothing.
+    bare = _without_literals(body)
+    for pattern in (
+        _OBJECT, _OBJECT_ARRAY, _OBJECT_POINTER, _VALUE_INIT, _ANY_INIT
+    ):
+        for match in pattern.finditer(bare):
             held, name = match.group(1), match.group(2)
             if held in classes:
                 found[name] = held
     return found
 
+
+
+def _hoist_object_operators(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    counter: "list[int]",
+    pointers: "set[str]" = frozenset(),
+) -> str:
+    """`b = a / "x";` becomes a temporary the operator fills, and a copy.
+
+    An operator answering an object answers it the way any function does -
+    through a pointer the caller provides - so it is not an expression that
+    can sit on the right of an assignment or inside an argument list. The
+    one place it can sit is the initialiser of a declaration, because the
+    object being declared is the space; so everything else is turned into
+    that form here and the pass that reads it needs to know nothing new.
+    """
+
+    if not known:
+        return body
+    for _round in range(_HOIST_ROUNDS):
+        found = None
+        for variable in sorted(known, key=len, reverse=True):
+            if variable in pointers:
+                # `items + count` on a `T *` is where the pointer moves to,
+                # not the class's operator. The class it points at has one
+                # and the pointer does not.
+                continue
+            for symbol in _OPERATOR_SYMBOLS:
+                if symbol in ("[]", "()", "=", "<<", ">>"):
+                    continue
+                name = _OPERATOR_NAMES[symbol]
+                owner = _find_method(known[variable], name, classes)
+                if owner is None:
+                    continue
+                held = _method_named_returning(owner, name, classes)
+                if held is None:
+                    continue
+                bare = _without_literals(body)
+                for match in re.finditer(
+                    rf"(?<![.\w>]){re.escape(variable)}\s*"
+                    rf"{re.escape(symbol)}(?![=])",
+                    bare,
+                ):
+                    end = _one_operand(body, match.end())
+                    if end < 0:
+                        continue
+                    begins = _statement_start(body, match.start())
+                    while begins < len(body) and body[begins] in " \t\n":
+                        begins += 1
+                    # The declaration form is the one this writes, and the
+                    # one the operator pass reads. Left in, each round wrote
+                    # a temporary holding the temporary before it.
+                    lead = re.match(
+                        r"[A-Za-z_]\w*(?:\s+|\s*&\s*)[A-Za-z_]\w*\s*=\s*$",
+                        body[begins: match.start()],
+                    )
+                    if lead is not None and body[end:].lstrip()[:1] == ";":
+                        continue
+                    found = (begins, match.start(), end, held)
+                    break
+                if found is not None:
+                    break
+            if found is not None:
+                break
+        if found is None:
+            return body
+        begins, at, end, held = found
+        counter[0] += 1
+        made = f"{_OPERATOR_PREFIX}{counter[0]}"
+        known[made] = held
+        body = (
+            body[:begins]
+            + f"{held} {made} = {body[at:end].strip()}; "
+            + body[begins:at]
+            + made
+            + body[end:]
+        )
+    return body
+
+
+#: What the pass above calls what it writes. Its own prefix, so a temporary
+#: holding an operator's answer is told from one holding a call's.
+_OPERATOR_PREFIX = "__py2bin_operand_"
 
 
 def _already_a_declaration(text: str, match: "re.Match[str]") -> bool:
@@ -6995,8 +7407,16 @@ def _already_a_declaration(text: str, match: "re.Match[str]") -> bool:
     the callee writes through. It also covers what this pass writes itself -
     the same thing with a `&` in it - which was otherwise hoisted again, and
     again, until the round limit stopped it.
+
+    The whole of it, not the start of it. `path a = base() / "web";` declares
+    `a` and the call is only the left operand of what fills it, so `a` is not
+    the space that call writes through - and treated as though it were, the
+    operator was quietly dropped.
     """
 
+    close = _closing_paren(text, match.end() - 1)
+    if close >= 0 and text[close + 1:].lstrip()[:1] != ";":
+        return False
     begins = _statement_start(text, match.start())
     while begins < len(text) and text[begins] in " \t\n":
         begins += 1
@@ -7127,6 +7547,13 @@ def _free_value_initialisers(
             return None
         close = _closing_paren(match.string, match.end() - 1)
         if close < 0:
+            return None
+        # And the call has to *be* the initialiser, not the start of one.
+        # `path a = base() / "web";` is a declaration whose initialiser is an
+        # operator, and read as this form the marker below swallowed the rest
+        # of the statement - so the program compiled and quietly did half of
+        # what it says.
+        if match.string[close + 1:].lstrip()[:1] != ";":
             return None
         # From the real text: an argument that is a string literal is blanked
         # in the copy the match was found against, and writing that back
@@ -7259,7 +7686,7 @@ def _hoist_value_returns(
             return body
         match, close, held, by_reference = found
         counter[0] += 1
-        name = f"__py2bin_value_{counter[0]}"
+        name = f"{_VALUE_PREFIX}{counter[0]}"
         known[name] = held
         start = _statement_start(body, match.start())
         call = body[match.start(): close + 1]
@@ -7706,21 +8133,69 @@ def _rewrite_body(
     # declarations have not been read yet - they are rewritten below, and
     # this has to run before that - so what this body declares is scanned for
     # first, without touching it.
-    body = _hoist_value_returns(
-        body, classes, {**_declared_objects(body, classes), **known}, [0], unit
-    )
+    hoisted = {**_declared_objects(body, classes), **known}
+    body = _hoist_value_returns(body, classes, hoisted, [0], unit)
+    # The names it wrote are objects of this scope from here on. Left out,
+    # `webRoot = current_path() / L"web";` had its call hoisted into a
+    # temporary that nothing afterwards knew held a `path` - so the operator
+    # on the next line was not that class's operator and was left as C++.
+    # Overwritten, not filled in: a block starts its own count, so the name
+    # this scope gave a temporary may be the name an enclosing scope gave a
+    # different one. In the C that is an inner declaration shadowing an outer
+    # and is fine; here it means the older type must not win.
+    fresh = {
+        name: held
+        for name, held in hoisted.items()
+        if name.startswith(_VALUE_PREFIX)
+    }
+    if fresh:
+        known.update(fresh)
+        receivers = dict(receivers or {})
+        for name in fresh:
+            # A reference return is hoisted as a reference - `B &r = ...` -
+            # which is a pointer already. Given the address of one, every
+            # call on it was handed a `B **`.
+            if re.search(rf"&\s*{re.escape(name)}\s*=", body):
+                pointers = set(pointers)
+                pointers.add(name)
+                receivers[name] = name
+                continue
+            receivers[name] = f"&{name}"
     # And the declarations that hoist just wrote: a free function answering an
     # object fills a space the caller provides, here as everywhere else. The
     # file-scope pass does not reach a method body, which is emitted on its
     # own - so `held.append(to_string(v))` inside one was left calling a
     # function with one argument too few.
     body = _free_value_initialisers(body, classes, f"{body}\n{unit}")
+    # `b = a / "x";` where that operator answers an object: the caller has to
+    # provide the space, so the call cannot stand in an expression. Given a
+    # name of its own here, before the declarations are read, so the only
+    # form left for the operator pass is the one it already handles.
+    # What this body declares as well as what the scope brought in: the
+    # object on the left of the operator is usually one the statement above
+    # declared, and `known` holds only what came from outside.
+    operands = {**hoisted, **known}
+    body = _hoist_object_operators(body, classes, operands, [0], pointers)
+    # And what it wrote is an object of this scope too, for the same reason:
+    # `a + b + c` is two operators, and the second is applied to what the
+    # first answered.
+    for name, held in operands.items():
+        if name.startswith(_OPERATOR_PREFIX):
+            known[name] = held
+            receivers = dict(receivers or {})
+            receivers[name] = f"&{name}"
     # And the arguments of a call to a static member, for the same reason: the
     # file-scope pass ran before this body existed in its rewritten form, so
     # the temporary a value return was hoisted into was not there yet to have
     # its address taken.
     body = _address_reference_arguments(
-        body, _static_member_signatures(classes), classes
+        body,
+        {
+            **_function_signatures(f"{body}\n{unit}", classes),
+            **_static_member_signatures(classes),
+        },
+        classes,
+        unit,
     )
 
     # `int &r = a.v;` is a pointer whose uses are dereferenced. Done before
@@ -7921,7 +8396,9 @@ def _rewrite_body(
     # After the declarations, because it has to know what the receiver is, and
     # before the ordinary call rewriting, which would otherwise turn
     # `V c = a.plus(b);` into an assignment from a function that returns void.
-    body, from_operators = _rewrite_value_operators(body, classes, known, pointers)
+    body, from_operators = _rewrite_value_operators(
+        body, classes, known, pointers, unit
+    )
     known.update(from_operators)
     # `v[i].get()` where `v[i]` is what an index operator returns. Before the
     # operator pass, which turns the subscript itself into a call and leaves
@@ -8097,6 +8574,17 @@ def _rewrite_body(
         body, classes, known, pointers, returns, scope(), unit, stable
     )
     body = _fix_call_arguments(body, classes, known, pointers)
+    # `f("x")` where the parameter is a `const string &`. C++ builds a
+    # temporary from the literal and binds the reference to it; C has no such
+    # step, so the literal was passed as itself and the callee read a `char *`
+    # as an object.
+    # A call through the object's table is not a call to a name, so the pass
+    # above does not see it. What its parameters want is written into the
+    # cast, which is the one place that says so.
+    body = _address_dispatched_arguments(body, classes, known, pointers)
+    body = _convert_class_arguments(
+        body, classes, known, pointers, [0], f"{scope()}\n{stable}"
+    )
 
     # After the dereference pass, not before it: each call in a chain hands
     # back the stream as an address and the next call takes it as its
@@ -8215,8 +8703,16 @@ def _rewrite_value_operators(
     classes: "dict[str, Class]",
     known: "dict[str, str]",
     pointers: "set[str]",
+    scope: str = "",
 ) -> "tuple[str, dict[str, str]]":
     """`V c = a + b;` - an operator answering an object, given somewhere to put it."""
+
+    # Which overload is meant is read from the type of what is passed, and
+    # that may be declared outside this body: `s + kHost` where `kHost` is a
+    # file-scope array had no type here, so a class with two of these could
+    # not be told which was meant. The body comes first and the file after
+    # it, so the offsets below still point where they did.
+    reading = body if not scope else f"{body}\n{scope}"
 
     added: dict[str, str] = {}
     for symbol in _OPERATOR_SYMBOLS:
@@ -8271,7 +8767,9 @@ def _rewrite_value_operators(
             passed = (
                 f"&{right}" if right in known and right not in pointers else right
             )
-            suffix = _call_suffix(owner, name, classes, [right], body, match.start())
+            suffix = _call_suffix(
+                owner, name, classes, [right], reading, match.start()
+            )
             out.append(body[at:match.start()])
             out.append(
                 f"struct {type_name} {variable}; "
@@ -8767,11 +9265,18 @@ def _rewrite_holder_operators(
                     provider = _find_method(reached, method, classes)
                     if provider is None:
                         continue
+                    # Through the object's own table where the method is
+                    # virtual. A COM interface is nothing but virtuals and is
+                    # reached through a holder of exactly this kind, so a
+                    # direct call here named a function that does not exist -
+                    # the interface declares its methods and defines none.
                     body = _rewrite_calls(
                         body,
                         rf"(?<![.\w>]){re.escape(variable)}\s*->\s*"
                         rf"{re.escape(method)}\s*\(",
-                        _name_for(provider, method, classes, body),
+                        _dispatched(
+                            reached, method, classes, call, provider, body
+                        ),
                         call,
                     )
                 # A member reached through it, rather than a method.
@@ -9241,16 +9746,11 @@ def _fix_call_arguments(
             value = given[skip + index].strip()
             if value.startswith("&") or not _has_an_address(value):
                 continue
-            words = declared.replace("*", " * ").split()
-            by_value = (
-                "*" not in declared
-                and "&" not in declared
-                and len(words) == 2
-                and words[0] in classes
-            )
             if value in pointers:
                 continue
-            if by_value or _REFERENCE.search(declared):
+            if _passed_by_address(declared, classes) or _REFERENCE.search(
+                declared
+            ):
                 given[skip + index] = f"&{value}"
         spelled = ", ".join(part.strip() for part in given)
         if _returns_reference(method):
@@ -9266,6 +9766,242 @@ def _fix_call_arguments(
         at = close
     out.append(body[at:])
     return "".join(out)
+
+
+#: What the pass below calls the temporary it builds.
+_MADE_PREFIX = "__py2bin_made_"
+
+
+def _convert_class_arguments(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    counter: "list[int]",
+    scope: str = "",
+) -> str:
+    """Build the temporary a parameter of class type is given.
+
+    `widthOf("narrow")` where the parameter is a `const std::string &` is a
+    conversion: C++ constructs a string from the literal, binds the
+    reference to it, and destroys it after the call. Nothing in C does that
+    on its own, so the object is declared ahead of the statement and its
+    address is what the call is handed.
+
+    Only where the class has a constructor that takes what is being passed.
+    Where it has none this is not a conversion C++ would do either, and
+    leaving the argument alone lets the type error be reported against the
+    line that has it.
+    """
+
+    signatures = dict(_call_signatures(classes))
+    # And the free functions, which are not methods and are the other half of
+    # what a program calls. Read from the file rather than tracked, the same
+    # way every other pass here reads a signature it did not write.
+    reading = scope or body
+    for definition in _DEFINITION.finditer(reading):
+        if _depth_at(reading, definition.end() - 1) != 0:
+            continue
+        signatures.setdefault(
+            definition.group(2),
+            ("", Method("", "void", definition.group(3).strip(), "", 0)),
+        )
+    if not signatures:
+        return body
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(body)
+        change = None
+        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", bare):
+            entry = signatures.get(match.group(1))
+            if entry is None:
+                continue
+            close = _closing_paren(bare, match.end() - 1)
+            if close < 0:
+                continue
+            owner, method = entry
+            inside = body[match.end(): close]
+            given = _split_arguments(inside) if inside.strip() else []
+            made = match.group(1)
+            # A free function takes no receiver; a method takes `this` first,
+            # and a value return puts the caller's space after it.
+            skip = (
+                0 if not owner or made.endswith("new") or "__new__" in made else 1
+            )
+            if skip and _returns_object(method, classes):
+                skip += 1
+            elif not owner and _free_returns_object(made, scope or body, classes):
+                skip += 1
+            wanted = [
+                part.strip()
+                for part in _split_arguments(method.parameters)
+                if part.strip()
+            ]
+            if len(given) - skip != len(wanted):
+                continue
+            for index, declared in enumerate(wanted):
+                if "*" in declared:
+                    continue
+                held = re.sub(
+                    r"\b(?:const|struct|volatile)\b", " ", declared.replace("&", " ")
+                ).split()
+                if len(held) != 2 or held[0] not in classes:
+                    continue
+                holds = held[0]
+                value = given[skip + index].strip()
+                if not value or value.startswith("&") or value in known:
+                    continue
+                spelled = _deduced_type(value, body, match.start())
+                if spelled is None:
+                    continue
+                if spelled.replace("const", "").strip() == holds:
+                    continue
+                if _find_method(holds, "", classes) is None:
+                    continue
+                try:
+                    suffix = _call_suffix(
+                        holds, "", classes, [value], body, match.start()
+                    )
+                except CppTranslationError:
+                    continue
+                if _chosen_overload(
+                    _overload_set(holds, "", classes), [value], body, match.start()
+                ) is None and len(_overload_set(holds, "", classes)) > 1:
+                    continue
+                change = (match, close, skip + index, holds, value, suffix, given)
+                break
+            if change is not None:
+                break
+        if change is None:
+            return body
+        match, close, where, holds, value, suffix, given = change
+        counter[0] += 1
+        temporary = f"{_MADE_PREFIX}{counter[0]}"
+        given[where] = f"&{temporary}"
+        begins = _statement_start(body, match.start())
+        body = (
+            body[:begins]
+            + f"struct {holds} {temporary}; "
+            f"{_c_name(holds, '', suffix)}(&{temporary}, {value}); "
+            + body[begins: match.end()]
+            + ", ".join(one.strip() for one in given)
+            + body[close:]
+        )
+    return body
+
+
+def _free_returns_object(
+    name: str, text: str, classes: "dict[str, Class]"
+) -> bool:
+    """Whether that free function answers an object, so takes the space first."""
+
+    for definition in _DEFINITION.finditer(text):
+        if definition.group(2) != name:
+            continue
+        spelled = definition.group(1).strip()
+        if "*" in spelled or "&" in spelled or not spelled.split():
+            continue
+        if spelled.split()[-1] in classes:
+            return True
+    return False
+
+
+#: `((int (*)(struct Base *, struct P *))((p)->__vptr[2]))(` - the head of a
+#: virtual call as this translator writes one. The cast opens the parameter
+#: list, and the parameter list says what each argument has to be.
+_A_DISPATCH_CAST = re.compile(r"\(\(\s*[^()]*?\(\s*\*\s*\)\s*\(")
+
+
+def _address_dispatched_arguments(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+) -> str:
+    """Take the address of what a virtual call's parameters ask for.
+
+    The call is made through a pointer rather than a name, so nothing that
+    reads a signature out of a declaration applies to it. It carries its own
+    signature instead: the cast in front of it names every parameter, and a
+    parameter that is a pointer to an object wants the address of one.
+    """
+
+    out: "list[str]" = []
+    at = 0
+    for cast in _A_DISPATCH_CAST.finditer(body):
+        if cast.start() < at:
+            continue
+        shut = _closing_paren(body, cast.end() - 1)
+        if shut < 0:
+            continue
+        wanted = _split_arguments(body[cast.end(): shut])
+        whole = _closing_paren(body, cast.start())
+        if whole < 0 or body[whole + 1: whole + 2] != "(":
+            continue
+        opening = whole + 1
+        closing = _closing_paren(body, opening)
+        if closing < 0:
+            continue
+        given = _split_arguments(body[opening + 1: closing])
+        if len(given) != len(wanted):
+            continue
+        changed = False
+        for index, declared in enumerate(wanted):
+            if not declared.strip().endswith("*"):
+                continue
+            value = given[index].strip()
+            if value.startswith("&") or value in pointers:
+                continue
+            # A name, or a member reached through one: both have an address,
+            # and both are how a program holds a struct it hands over.
+            if not _A_PLAIN_NAME.match(value):
+                continue
+            held = re.sub(
+                r"\b(?:const|struct|volatile|union)\b",
+                " ",
+                declared.replace("*", " "),
+            ).split()
+            # An object this scope knows, or a plain struct declared with the
+            # type the cast asks for. The second is how a program hands a
+            # `RECT` to an interface: it is not a class, so nothing tracks
+            # it, and the declaration is the only place that says what it is.
+            tail = re.split(r"\.|->", value)[-1].strip()
+            if value not in known and not (
+                held
+                and (
+                    re.search(
+                        rf"(?<![.\w>]){re.escape(held[0])}\s+{re.escape(tail)}\b",
+                        body,
+                    )
+                    or _a_member_of_type(tail, held[0], classes)
+                )
+            ):
+                continue
+            given[index] = f"&{value}"
+            changed = True
+        if not changed:
+            continue
+        out.append(body[at: opening + 1])
+        out.append(", ".join(one.strip() for one in given))
+        at = closing
+    out.append(body[at:])
+    return "".join(out)
+
+
+def _a_member_of_type(
+    name: str, held: str, classes: "dict[str, Class]"
+) -> bool:
+    """Whether some class declares a member of that name holding that type."""
+
+    for owner in classes.values():
+        for member in owner.members:
+            if member.name != name or member.array or "*" in member.ctype:
+                continue
+            spelled = re.sub(
+                r"\b(?:const|struct|volatile|union)\b", " ", member.ctype
+            ).split()
+            if spelled and spelled[0] == held:
+                return True
+    return False
 
 
 def _addressed_arguments(
@@ -9703,10 +10439,17 @@ _OUT_OF_LINE = re.compile(
     # no space between the `*` and the class, so a pattern ending the return
     # type with whitespace matched from `Square` onwards and left `const char
     # *` standing in the output as something C cannot read.
+    # It stops at the opening parenthesis and the rest is read by matching
+    # that: a parameter may be a function type - `Session::Session(function
+    # <void(const string &)> h)` - and a pattern that ends the list at the
+    # first `)` ended it inside one, so the definition was not recognised at
+    # all and its head was left in the C as a call to a constructor.
     r"(?<![#\w])(?:([A-Za-z_][\w \t]*?)\s*([*&]*)\s*)?"
-    r"\b([A-Za-z_]\w*)::(~?[A-Za-z_]\w*)\s*"
-    r"\(([^)]*)\)\s*(?:const\s*)?\{"
+    r"\b([A-Za-z_]\w*)::(~?[A-Za-z_]\w*)\s*\("
 )
+
+#: What may sit between an out-of-line member's parameters and its body.
+_AFTER_PARAMETERS = re.compile(r"\s*(?:const\s*)?(?:noexcept\s*)?\{")
 
 
 #: `struct A { };` - which C++ allows and C does not.
@@ -9744,6 +10487,10 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     """
 
     text = _strip_comments(source)
+    # Before the namespace qualifiers go: what makes one of these the
+    # standard `move` rather than a function the program wrote is the `std::`
+    # in front of it, and that is gone three lines below.
+    text = _strip_moves(text)
     # Before anything else reads the text: a class inside a namespace is a
     # class, and every pass below looks for classes at the top level.
     text, namespaces = _flatten_namespaces(text, filename)
@@ -9763,6 +10510,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Before anything reads a declaration: a linkage specification is words
     # in front of one, and its braces are not a scope.
     text = _strip_linkage(text)
+    text = _strip_constexpr(text)
     text = _lift_nested_enums(text)
     text, scoped_enums = _rewrite_cpp_spellings(text)
     text = _strip_namespace_qualifiers(text, scoped_enums)
@@ -9931,27 +10679,56 @@ def _translate(source: str, filename: str = "<c++>") -> str:
 
     # Members defined outside their class, folded back into it.
     for out in _OUT_OF_LINE.finditer(text):
-        spelled, stars, owner, method, parameters = out.groups()
+        spelled, stars, owner, method = out.groups()
         returns = f"{(spelled or '').strip()} {stars or ''}".strip()
         if owner not in classes:
             continue
-        closing = _matching(text, out.end() - 1)
-        body = text[out.end() - 1: closing]
+        shut = _closing_paren(text, out.end() - 1)
+        if shut < 0:
+            continue
+        after = _AFTER_PARAMETERS.match(text, shut + 1)
+        if after is None:
+            continue
+        opening = after.end() - 1
+        closing = _matching(text, opening)
+        parameters = text[out.end(): shut]
+        body = text[opening: closing]
         held = classes[owner]
-        for existing in held.methods:
-            spelled = "~" if method.startswith("~") else method
-            if existing.name == spelled or (
-                spelled == owner and existing.name == ""
-            ):
-                existing.body = body
-                existing.parameters = "" if parameters.strip() in ("", "void") else parameters.strip()
-                break
+        wanted = "~" if method.startswith("~") else (
+            "" if method == owner else method
+        )
+        written = "" if parameters.strip() in ("", "void") else parameters.strip()
+        # Which of the declarations this defines. By name alone, two
+        # constructors written outside their class both matched the first,
+        # so one lost its body and the other was never given one - and the
+        # class ended up with two members of the same shape.
+        matching = [item for item in held.methods if item.name == wanted]
+        count = _arity(written)
+        chosen = next(
+            (
+                item
+                for item in matching
+                if not (item.body or "").strip()
+                and _arity(item.parameters) == count
+            ),
+            None,
+        )
+        if chosen is None:
+            chosen = next(
+                (item for item in matching if not (item.body or "").strip()),
+                None,
+            )
+        if chosen is None and matching:
+            chosen = matching[0]
+        if chosen is not None:
+            chosen.body = body
+            chosen.parameters = written
         else:
-            spelled = "~" if method.startswith("~") else ("" if method == owner else method)
             held.methods.append(
-                Method(spelled, returns or "void",
-                       "" if parameters.strip() in ("", "void") else parameters.strip(),
-                       body, _line_of(text, out.start()))
+                Method(
+                    wanted, returns or "void", written, body,
+                    _line_of(text, out.start()),
+                )
             )
         pieces.append((out.start(), closing, ""))
 
@@ -10613,6 +11390,19 @@ def _deref_references(
                     rf"\b{re.escape(n)}\s*\.", f"{n}->", part
                 ),
             )
+            # `held_ = other;` where `other` is a reference to a class: the
+            # pointer is how the reference is carried, and what is being
+            # assigned is the object it names. Left as the pointer, this was
+            # an assignment of a `T *` to a `T`.
+            body = _map_code(
+                body,
+                lambda part, n=name: re.sub(
+                    rf"(?<![=!<>+\-*/%&|^])=\s*(?<![.\w>&])"
+                    rf"{re.escape(n)}\b\s*;",
+                    f"= *{n};",
+                    part,
+                ),
+            )
             continue
         body = _map_code(
             body,
@@ -10682,6 +11472,7 @@ def _address_reference_arguments(
     text: str,
     signatures: "dict[str, list[int]]",
     classes: "dict[str, Class]" = {},
+    scope: str = "",
 ) -> str:
     """`bump(a, 9)` becomes `bump(&a, 9)` where the parameter is a reference.
 
@@ -10700,8 +11491,12 @@ def _address_reference_arguments(
     #: those are is not decidable here - two passes insert it, at different
     #: times - so it is read off the call itself.
     arity: "dict[str, int]" = {}
-    for match in _DEFINITION.finditer(text):
-        if _depth_at(text, match.end() - 1) != 0:
+    # From the file as well as from this text: a body is rewritten on its own
+    # and the free functions it calls are defined elsewhere, so read only
+    # here their shapes were unknown and every call to one was left alone.
+    reading = f"{text}\n{scope}" if scope else text
+    for match in _DEFINITION.finditer(reading):
+        if _depth_at(reading, match.end() - 1) != 0:
             continue
         spelled_parts = _split_arguments(match.group(3))
         arity[match.group(2)] = len(
@@ -11750,7 +12545,29 @@ public:
     std::string text;
     path() { }
     path(const char *s) { text.assign(s); }
+    /* A path is UTF-16 on Windows, so this is how one arrives there: from
+       the kernel, from a wide literal, or from a wstring the program built.
+       The conversion is asked of <py2bin_fs.h>, which is C and knows which
+       platform this is. */
+    path(const wchar_t *s) {
+        char __narrow[520];
+        __py2bin_fs_narrow(s, __narrow, 520);
+        text.assign(__narrow);
+    }
+    path(const std::wstring &s) {
+        char __narrow[520];
+        __py2bin_fs_narrow(s.c_str(), __narrow, 520);
+        text.assign(__narrow);
+    }
     const char *c_str() { return text.c_str(); }
+    std::string string() { return text; }
+    std::wstring wstring() {
+        wchar_t __wide[520];
+        std::wstring out;
+        __py2bin_fs_widen(text.c_str(), __wide, 520);
+        out.assign(__wide);
+        return out;
+    }
     int empty() { return text.empty(); }
     /* Written as a member rather than `out.text.push_back(c)` at each call:
        reaching through a member of a local to call one of *its* methods is
@@ -11773,6 +12590,24 @@ public:
             }
         }
         joined.__add_text(piece);
+        return joined;
+    }
+
+    /* The same, given a wide piece: `root / L"web"` is how a program that
+       writes its literals wide builds a path. */
+    path operator/(const wchar_t *piece) {
+        char __narrow[520];
+        __py2bin_fs_narrow(piece, __narrow, 520);
+        path joined;
+        int i;
+        i = 0;
+        while (i < this->__size()) { joined.__add(this->__at(i)); i = i + 1; }
+        if (joined.__size() > 0) {
+            if (joined.text.at(joined.__size() - 1) != '/') {
+                joined.__add_text("/");
+            }
+        }
+        joined.__add_text(__narrow);
         return joined;
     }
 

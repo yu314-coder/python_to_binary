@@ -1845,9 +1845,16 @@ extern BOOL MoveWindow(HWND, int, int, int, int, BOOL);
 extern BOOL SetWindowTextW(HWND, LPCWSTR);
 extern HCURSOR LoadCursorW(HINSTANCE, LPCWSTR);
 extern HICON LoadIconW(HINSTANCE, LPCWSTR);
-extern LRESULT SetWindowLongPtrW(HWND, int, LPVOID);
-extern LRESULT GetWindowLongPtrW(HWND, int);
+/* LONG_PTR, not a pointer: the SDK says so, and a program storing its own
+   object here casts to it rather than to `void *`. Wide enough to hold
+   either, which is the point of the type. */
+extern LONG_PTR SetWindowLongPtrW(HWND, int, LONG_PTR);
+extern LONG_PTR GetWindowLongPtrW(HWND, int);
+extern LONG_PTR SetWindowLongW(HWND, int, LONG);
+extern LONG_PTR GetWindowLongW(HWND, int);
 extern HMODULE GetModuleHandleW(LPCWSTR);
+extern LPWSTR GetCommandLineW(void);
+extern char *GetCommandLineA(void);
 
 #define WS_OVERLAPPED 0x00000000
 #define WS_CAPTION 0x00C00000
@@ -1944,6 +1951,25 @@ int __py2bin_fs_cwd(char *__into, int __room) {
     return (int)GetCurrentDirectoryA((unsigned int)__room, __into);
 }
 
+/* A path on Windows is UTF-16 and py2bin's `path` holds UTF-8, so a path
+   that came from the kernel or is going back to it is converted rather than
+   truncated: a user directory is as likely to hold a character outside
+   ASCII as not, and dropping the high byte gives a name that does not
+   exist. */
+int __py2bin_fs_narrow(const wchar_t *__wide, char *__into, int __room) {
+    int __got;
+    __got = WideCharToMultiByte(65001, 0, __wide, -1, __into, __room, 0, 0);
+    if (__got <= 0) { if (__room > 0) { __into[0] = 0; } return 0; }
+    return __got - 1;
+}
+
+int __py2bin_fs_widen(const char *__narrow, wchar_t *__into, int __room) {
+    int __got;
+    __got = MultiByteToWideChar(65001, 0, __narrow, -1, __into, __room);
+    if (__got <= 0) { if (__room > 0) { __into[0] = 0; } return 0; }
+    return __got - 1;
+}
+
 #else
 
 int __py2bin_fs_exists(const char *__p) {
@@ -1991,6 +2017,74 @@ int __py2bin_fs_cwd(char *__into, int __room) {
        path is resolved against, which is the answer callers use it for. */
     if (__room > 1) { __into[0] = '.'; __into[1] = 0; return 1; }
     return 0;
+}
+
+/* Everywhere else a `wchar_t` holds one code point, so the conversion is
+   UTF-8 against UTF-32 and is written out rather than asked of the
+   platform. Both stop one short of the room they are given, for the
+   terminator, and both answer with the length they wrote. */
+int __py2bin_fs_narrow(const wchar_t *__wide, char *__into, int __room) {
+    int __at;
+    int __out;
+    unsigned int __c;
+    __at = 0;
+    __out = 0;
+    while (__wide[__at] != 0) {
+        __c = (unsigned int)__wide[__at];
+        if (__c < 0x80) {
+            if (__out + 1 >= __room) { break; }
+            __into[__out] = (char)__c; __out = __out + 1;
+        } else if (__c < 0x800) {
+            if (__out + 2 >= __room) { break; }
+            __into[__out] = (char)(0xC0 | (__c >> 6));
+            __into[__out + 1] = (char)(0x80 | (__c & 0x3F));
+            __out = __out + 2;
+        } else if (__c < 0x10000) {
+            if (__out + 3 >= __room) { break; }
+            __into[__out] = (char)(0xE0 | (__c >> 12));
+            __into[__out + 1] = (char)(0x80 | ((__c >> 6) & 0x3F));
+            __into[__out + 2] = (char)(0x80 | (__c & 0x3F));
+            __out = __out + 3;
+        } else {
+            if (__out + 4 >= __room) { break; }
+            __into[__out] = (char)(0xF0 | (__c >> 18));
+            __into[__out + 1] = (char)(0x80 | ((__c >> 12) & 0x3F));
+            __into[__out + 2] = (char)(0x80 | ((__c >> 6) & 0x3F));
+            __into[__out + 3] = (char)(0x80 | (__c & 0x3F));
+            __out = __out + 4;
+        }
+        __at = __at + 1;
+    }
+    if (__room > 0) { __into[__out] = 0; }
+    return __out;
+}
+
+int __py2bin_fs_widen(const char *__narrow, wchar_t *__into, int __room) {
+    int __at;
+    int __out;
+    unsigned int __c;
+    int __more;
+    __at = 0;
+    __out = 0;
+    while (__narrow[__at] != 0) {
+        __c = (unsigned int)(unsigned char)__narrow[__at];
+        __more = 0;
+        if (__c >= 0xF0) { __c = __c & 0x07; __more = 3; }
+        else if (__c >= 0xE0) { __c = __c & 0x0F; __more = 2; }
+        else if (__c >= 0xC0) { __c = __c & 0x1F; __more = 1; }
+        while (__more > 0) {
+            __at = __at + 1;
+            if (__narrow[__at] == 0) { __more = 0; break; }
+            __c = (__c << 6) | ((unsigned int)(unsigned char)__narrow[__at] & 0x3F);
+            __more = __more - 1;
+        }
+        if (__out + 1 >= __room) { break; }
+        __into[__out] = (wchar_t)__c;
+        __out = __out + 1;
+        __at = __at + 1;
+    }
+    if (__room > 0) { __into[__out] = 0; }
+    return __out;
 }
 
 #endif
@@ -3149,6 +3243,66 @@ _ASKS_WHAT_THIS_COMPILER_HAS = frozenset(
 #: imported, because the fetcher imports this module for the list of headers
 #: py2bin ships and the two would chase each other.
 _FETCHED_INTO = ".py2bin-headers"
+
+#: `typedef struct tagRECT { ... } RECT;` and `} RECT, *LPRECT;` - the name a
+#: platform header gives a struct, which is the name a program writes.
+_A_STRUCT_TYPEDEF = re.compile(
+    r"\}\s*((?:\s*\*?\s*[A-Za-z_]\w*\s*,?)+)\s*;"
+)
+
+
+def platform_structs() -> "frozenset[str]":
+    """Every name py2bin's own headers give to a struct.
+
+    The C++ translator runs before the preprocessor, so it never sees these
+    declarations and cannot tell `RECT` - a struct - from `HRESULT`, which is
+    a `long`. It has to: a parameter of struct type is passed as a pointer in
+    the C this emits, and one of arithmetic type is passed as it is written.
+    Read from the headers rather than listed, so a type added to one of them
+    is known here without being named twice.
+    """
+
+    global _PLATFORM_STRUCTS
+    if _PLATFORM_STRUCTS is not None:
+        return _PLATFORM_STRUCTS
+    found: "set[str]" = set()
+    for text in _BUILTIN_HEADERS.values():
+        if not isinstance(text, str):
+            continue
+        for match in re.finditer(r"\btypedef\s+(?:struct|union)\b", text):
+            opening = text.find("{", match.end())
+            semicolon = text.find(";", match.end())
+            if opening < 0 or (0 <= semicolon < opening):
+                # `typedef struct IUnknown IUnknown;` - a name for a type
+                # declared elsewhere, with no body here to read.
+                continue
+            depth = 0
+            at = opening
+            while at < len(text):
+                if text[at] == "{":
+                    depth += 1
+                elif text[at] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                at += 1
+            if at >= len(text):
+                continue
+            names = _A_STRUCT_TYPEDEF.match(text, at)
+            if names is None:
+                continue
+            for spelled in names.group(1).split(","):
+                spelled = spelled.strip()
+                # Only the plain name: `*LPRECT` is a pointer to one, and a
+                # parameter declared with it is a pointer already.
+                if spelled and not spelled.startswith("*"):
+                    found.add(spelled)
+    _PLATFORM_STRUCTS = frozenset(found)
+    return _PLATFORM_STRUCTS
+
+
+#: Worked out once; the headers do not change while the process runs.
+_PLATFORM_STRUCTS: "frozenset[str] | None" = None
 
 _BUILTIN_HEADERS = {
     "sys/types.h": _SYS_TYPES_H,

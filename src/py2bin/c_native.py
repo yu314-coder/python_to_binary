@@ -1324,6 +1324,50 @@ def _where_it_was_written(
             break
     return chosen, line - chosen_start + 1
 
+#: `int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {` - what a Windows
+#: program written for the desktop calls its entry point. The wide form takes
+#: the command line as UTF-16 and the narrow one as bytes; nothing else about
+#: them differs.
+_WINDOWS_ENTRY = re.compile(
+    r"(?<![.\w])(?:int\s+)?(?:WINAPI\s+|APIENTRY\s+|__stdcall\s+)*"
+    r"(wWinMain|WinMain)\s*\([^;{}]*\)\s*\{"
+)
+
+#: `int main(` - looked for first, because a program that has both means the
+#: one C names.
+_PLAIN_ENTRY = re.compile(r"(?<![.\w])int\s+main\s*\(")
+
+
+def _with_windows_entry(source: str, target: str) -> str:
+    """Give a program whose entry point is wWinMain the `main` C asks for.
+
+    Windows starts a desktop program at `wWinMain`, and the four things it is
+    handed are all things the program could have asked the kernel for itself.
+    The C runtime a real toolchain links in does exactly this: it defines
+    `main`, works the arguments out, and calls what the program wrote. py2bin
+    has no such library to link, so the wrapper is written here, in C, below
+    the entry point it calls.
+
+    `nShowCmd` is SW_SHOWDEFAULT, which tells a window to open however the
+    shortcut that started the program asked it to - the same default the
+    startup code uses when the process was given no startup information.
+    """
+
+    if not target.startswith("windows"):
+        return source
+    found = _WINDOWS_ENTRY.search(source)
+    if found is None or _PLAIN_ENTRY.search(source) is not None:
+        return source
+    line = "GetCommandLineW()" if found.group(1) == "wWinMain" else "GetCommandLineA()"
+    return source + (
+        "\n/* Written by py2bin: Windows starts a desktop program at "
+        f"{found.group(1)}, and C starts one at main. */\n"
+        "int main(void) {\n"
+        f"    return {found.group(1)}(GetModuleHandleW(0), 0, {line}, 10);\n"
+        "}\n"
+    )
+
+
 def compile_c_native(
     entry: Path,
     output: Path,
@@ -1363,6 +1407,8 @@ def compile_c_native(
         translated = translate_unity(
             (entry, *extra_sources), include_dirs, resolved
         )
+    if translated is not None:
+        translated = _with_windows_entry(translated, resolved)
     if extra_sources and translated is None:
         missing = [str(path) for path in extra_sources if not path.is_file()]
         if missing:
