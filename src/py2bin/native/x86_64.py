@@ -114,6 +114,18 @@ def _sub_stack(amount: int) -> bytes:
     return b"\x48\x81\xec" + struct.pack("<I", amount)
 
 
+#: The 32 bytes above the return address that a Microsoft x64 callee owns and
+#: may write to whenever it likes. The caller reserves them; a call made
+#: without them lets the callee write over whatever is there, and inside a
+#: function body what is there is that function's own first four slots.
+#:
+#: Written at each call rather than once in the frame because the frame a
+#: function gets is exactly its locals - `_frame_bytes(slots, 0)` - and every
+#: other call site here already does the same thing for the same reason.
+_SHADOW = b"\x48\x83\xec\x20"    # sub rsp, 32
+_UNSHADOW = b"\x48\x83\xc4\x20"  # add rsp, 32
+
+
 def _frame_bytes(stack_slots: int, base: int = 0, owner: str = "this module") -> int:
     check_stack_slots(stack_slots, owner)
     variable_bytes = (stack_slots * 8 + 15) & ~15
@@ -1246,7 +1258,9 @@ def encode_windows(
                 code.extend(b"\x48\xc7\xc2" + struct.pack("<I", operation.size))
                 code.extend(b"\x41\xb8\x00\x30\x00\x00")  # mov r8d, MEM_COMMIT|MEM_RESERVE
                 code.extend(b"\x41\xb9\x04\x00\x00\x00")  # mov r9d, PAGE_READWRITE
+                code.extend(_SHADOW)
                 indirect_call("VirtualAlloc")
+                code.extend(_UNSHADOW)
                 code.extend(
                     b"\x48\x89\x85"
                     + struct.pack("<i", slot_base + operation.slot * 8)
@@ -1257,6 +1271,7 @@ def encode_windows(
                 jump_at = len(code)
                 code.extend(b"\x75\x00")  # jnz over the failure path
                 code.extend(b"\xb9\x03\x00\x00\x00")  # mov ecx, 3
+                code.extend(_SHADOW)
                 indirect_call("ExitProcess")
                 code[jump_at + 1] = len(code) - (jump_at + 2)
                 continue
@@ -1318,16 +1333,24 @@ def encode_windows(
             if isinstance(operation, Write):
                 # STD_OUTPUT_HANDLE (-11) for fd 1, STD_ERROR_HANDLE (-12) for fd 2.
                 handle = -11 if operation.fd == 1 else -12
+                # 48 bytes, not 32: WriteFile takes five arguments, so above
+                # the shadow area there is the fifth at [rsp+0x20] and the
+                # count it writes back at [rsp+0x28]. Rounded to a multiple
+                # of sixteen, because the ABI wants rsp aligned at the call.
                 code.extend(b"\xb9" + struct.pack("<i", handle))
+                code.extend(_SHADOW)
                 indirect_call("GetStdHandle")
+                code.extend(_UNSHADOW)
                 code.extend(b"\x48\x89\xc1")
                 displacement_position = len(code) + 3
                 code.extend(b"\x48\x8d\x15\x00\x00\x00\x00")
                 string_patches.append((displacement_position, operation.data))
                 code.extend(b"\x41\xb8" + struct.pack("<I", len(operation.data)))
+                code.extend(b"\x48\x83\xec\x30")  # sub rsp, 48
                 code.extend(b"\x4c\x8d\x4c\x24\x28")
                 code.extend(b"\x48\xc7\x44\x24\x20\x00\x00\x00\x00")
                 indirect_call("WriteFile")
+                code.extend(b"\x48\x83\xc4\x30")  # add rsp, 48
             elif isinstance(operation, Store):
                 _expression(code, operation.value, slot_base, refs)
                 code.extend(
@@ -1351,10 +1374,12 @@ def encode_windows(
                 branches.append((len(code) - 4, operation.target))
             elif isinstance(operation, Exit):
                 code.extend(b"\xb9" + struct.pack("<I", operation.status))
+                code.extend(_SHADOW)
                 indirect_call("ExitProcess")
             elif isinstance(operation, ExitValue):
                 _expression(code, operation.value, slot_base, refs)
                 code.extend(b"\x89\xc1")  # mov ecx, eax
+                code.extend(_SHADOW)
                 indirect_call("ExitProcess")
             else:
                 # Silently skipping an operation would produce an image that

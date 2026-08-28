@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,012 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,019 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; 314 C and C++ programs whose output matches `clang++`, built for all
@@ -2295,12 +2295,58 @@ property being relied on, so it is the one named. A corpus program checks
 that an address above four gigabytes survives the allocator intact, and a
 test reads the header to make sure no address goes back into a `long`.
 
+**And then the first `malloc` on Windows still answered nothing.** The same
+program, the same dialog, the same `E_POINTER` - after the address width was
+fixed. The cause was next to it and had been there all along.
+
+The Microsoft x64 ABI gives a callee 32 bytes above the return address to
+spill its four register arguments into, and makes the *caller* reserve them.
+py2bin's module body does. A *function* body does not: the frame a function
+gets is `_frame_bytes(slots, 0)`, which is exactly its locals and nothing
+else, so a call that does not reserve the space itself lets the callee write
+over that function's own first four slots.
+
+`HeapInit` - the one-time `VirtualAlloc` that reserves the arena - was such a
+call, and it runs inside `malloc`:
+
+```c
+void *malloc(size_t __n) {
+    if (__py2bin_heap_end == 0) {
+        __py2bin_heap_bump = (size_t)__py2bin_arena();  /* clobbers __n */
+    }
+    __n = (__n + 15) & ~15;
+    if (__n > __py2bin_heap_end - __py2bin_heap_bump) return NULL;
+```
+
+`__n` is slot zero. So the first `malloc` in every Windows program compared a
+size it no longer held against the arena and answered NULL - and only the
+first, because the reservation happens once. Everything after it was correct,
+which is exactly what made it invisible: the window opened, the program ran,
+and the single allocation that failed was whichever one happened to come
+first. In SidecarBridge that was the WebView2 callback, so the loader was
+handed a null handler and said `E_POINTER` - and the program blamed a missing
+runtime, on a machine where the runtime was installed and answering.
+
+Four other call sites had the same gap - `Write`'s `GetStdHandle` and
+`WriteFile`, and both `ExitProcess` paths. All nine Windows call sites reserve
+it now: 32 bytes, or 48 where the call takes a fifth argument and writes a
+count back above the shadow area. Three tests read the emitted `.text` and
+fail if any `call [rip + disp32]` in it has no reservation in front of it.
+
+Twice now a Windows-only mistake in this file has been found by running a real
+program on a real machine rather than by anything here. Both were invisible to
+2,000 tests and 300 corpus programs for the same reason: they are properties
+of an ABI that only one target has, and nothing on this side of the build
+executes that target's code.
+
 ### 0.9.13 - a Windows WebView2 program, from C++, with no toolchain
 
 SidecarBridge - three C++ files, a fetched WebView2 header and a vendor DLL -
 builds to a 627 KB PE32+ for windows-x86_64 with py2bin alone. What it needed
 along the way is listed under [C++, translated to C](#c-translated-to-c):
-`Callback<I>(lambda)` written out as the class it is, `--library` for a DLL
+`Callback<I>(lambda)` written out as the class it is - carrying the enclosing
+object or carrying nothing, `[]` being as ordinary as `[this]` and having been
+refused until a diagnostic needed one - `--library` for a DLL
 somebody else shipped, `wWinMain` and the desktop subsystem, `swprintf`, and
 the ordinary C++ a corpus program never happens to write - `operator&` on a
 holder, a method called on a pointer parameter, `operator=` chosen by what is

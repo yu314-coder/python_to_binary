@@ -2072,3 +2072,98 @@ class OutOfLineAndLiterals(unittest.TestCase):
             "t.cpp",
         )
         self.assertIn("__py2bin_self", out)
+
+
+class WrlCallbacks(unittest.TestCase):
+    """`Microsoft::WRL::Callback<I>(lambda)` written out as the class it is.
+
+    This is how every WebView2 program hands a completion handler to the
+    loader, and the loader calls straight into the table the object carries.
+    Nothing in the corpus reaches it - a COM interface needs a platform header
+    - so it is checked here instead, and a shape that used to be refused is
+    checked alongside the one that was not.
+    """
+
+    interfaces = """
+    struct IUnknown {
+        virtual HRESULT QueryInterface(REFIID, void **) = 0;
+        virtual unsigned long AddRef() = 0;
+        virtual unsigned long Release() = 0;
+    };
+    struct IDone : public IUnknown {
+        virtual HRESULT Invoke(HRESULT, int) = 0;
+    };
+    """
+
+    def translated(self, body: str) -> str:
+        return translate(
+            "typedef int HRESULT; typedef int REFIID;\n"
+            "#define S_OK 0\n"
+            "#define E_POINTER 1\n"
+            + self.interfaces
+            + body
+        )
+
+    def test_a_callback_that_carries_the_enclosing_object(self):
+        out = self.translated(
+            "struct Host {\n"
+            "    int seen;\n"
+            "    IDone *make() {\n"
+            "        return Microsoft::WRL::Callback<IDone>(\n"
+            "            [this](HRESULT code, int value) -> HRESULT {\n"
+            "                seen = value; return code;\n"
+            "            }).Get();\n"
+            "    }\n"
+            "};\n"
+        )
+        # The object holds the host it was written in, and reaches its member
+        # through it rather than through a `this` that is now somebody else.
+        self.assertIn("Host * __py2bin_self", out.replace("  ", " "))
+        self.assertRegex(out, r"__py2bin_callback_\d+__vtable\[4\]")
+
+    def test_a_callback_that_carries_nothing(self):
+        # `[]` is ordinary C++ and used to be refused: py2bin always wrote a
+        # member for the enclosing object, so a lambda with nothing to carry
+        # had nowhere to be written and no class to be written in.
+        out = self.translated(
+            "IDone *make() {\n"
+            "    return Microsoft::WRL::Callback<IDone>(\n"
+            "        [](HRESULT code, int value) -> HRESULT {\n"
+            "            return value == 0 ? code : S_OK;\n"
+            "        }).Get();\n"
+            "}\n"
+        )
+        self.assertRegex(out, r"__py2bin_callback_\d+__vtable\[4\]")
+        self.assertNotIn("__py2bin_self", out)
+        # And its constructor asks for nothing, because there is nothing to
+        # hand it.
+        self.assertRegex(out, r"__py2bin_callback_\d+__ctor\(struct \w+ \*this\)")
+
+    def test_the_table_is_in_the_order_the_abi_says(self):
+        # QueryInterface, AddRef, Release, then the interface's own method.
+        # The order is the ABI: the loader reads slot 3 to invoke.
+        out = self.translated(
+            "IDone *make() {\n"
+            "    return Microsoft::WRL::Callback<IDone>(\n"
+            "        [](HRESULT code, int value) -> HRESULT { return code; }\n"
+            "    ).Get();\n"
+            "}\n"
+        )
+        table = re.search(r"__py2bin_callback_\d+__vtable\[4\] = \{([^}]*)\}", out)
+        self.assertIsNotNone(table)
+        slots = [one.strip() for one in table.group(1).split(",")]
+        for wanted, slot in zip(
+            ("QueryInterface", "AddRef", "Release", "Invoke"), slots
+        ):
+            self.assertTrue(slot.endswith(f"__{wanted}"), f"{slot} is not {wanted}")
+
+    def test_a_capture_it_cannot_write_is_still_refused(self):
+        with self.assertRaises(CppTranslationError) as raised:
+            self.translated(
+                "IDone *make(int held) {\n"
+                "    return Microsoft::WRL::Callback<IDone>(\n"
+                "        [held](HRESULT code, int value) -> HRESULT { return held; }\n"
+                "    ).Get();\n"
+                "}\n"
+            )
+        self.assertIn("captures held", str(raised.exception))

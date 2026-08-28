@@ -3251,12 +3251,16 @@ def _rewrite_wrl_callbacks(text: str, filename: str) -> str:
                 "to build one around otherwise",
             )
         captured = written.group(1).strip()
-        if captured not in ("this", "=", "&"):
+        # `[]` - a callback that carries nothing. Ordinary C++, and the
+        # simpler of the two: the object it becomes has no member to hold an
+        # enclosing object and needs no class around it to be written in.
+        alone = captured == ""
+        if not alone and captured not in ("this", "=", "&"):
             raise CppTranslationError(
                 filename, _line_of(text, at.start()),
-                f"a Callback<> lambda captures {captured or 'nothing'}; "
-                f"py2bin writes the object it becomes and can carry the "
-                f"enclosing object - `[this]` - and nothing else yet",
+                f"a Callback<> lambda captures {captured}; py2bin writes the "
+                f"object it becomes and can carry the enclosing object - "
+                f"`[this]` - or nothing at all, and nothing else yet",
             )
         opening = written.end() - 1
         shut = _matching(text, opening)
@@ -3264,8 +3268,8 @@ def _rewrite_wrl_callbacks(text: str, filename: str) -> str:
         # `_enclosing_class` and not the brace scan: a method defined
         # outside its class is still inside it as far as `this` is
         # concerned, and that is where a callback is usually written.
-        owner = _enclosing_class(text, at.start())
-        if owner is None:
+        owner = None if alone else _enclosing_class(text, at.start())
+        if owner is None and not alone:
             raise CppTranslationError(
                 filename, _line_of(text, at.start()),
                 "a Callback<> lambda capturing `this` is written outside any "
@@ -3278,14 +3282,16 @@ def _rewrite_wrl_callbacks(text: str, filename: str) -> str:
         # types, and an unnamed parameter has to keep its place either way.
         head = _callback_parameters(parameters, written.group(2))
         made.append(
-            _CALLBACK_CLASS_TEXT.format(
+            (_CALLBACK_CLASS_ALONE if alone else _CALLBACK_CLASS_TEXT).format(
                 name=name,
                 interface=interface,
                 owner=owner,
                 method=method,
                 result=result or "HRESULT",
                 parameters=head,
-                body=_qualified_shared_names(
+                body=body
+                if alone
+                else _qualified_shared_names(
                     _through_self(body, owner, text), owner, text
                 ),
                 self=_SELF,
@@ -3304,7 +3310,7 @@ def _rewrite_wrl_callbacks(text: str, filename: str) -> str:
         ends = after + taken.end() if taken else close + 1
         text = (
             text[:at.start()]
-            + f"(({interface} *)(new {name}(this)))"
+            + f"(({interface} *)(new {name}({'' if alone else 'this'})))"
             + text[ends:]
         )
     if not made:
@@ -3363,6 +3369,35 @@ public:
     {name}({owner} *__py2bin_given) {{
         __py2bin_refs = 0;
         {self} = __py2bin_given;
+    }}
+    HRESULT QueryInterface(REFIID __py2bin_asked, void **__py2bin_into) {{
+        if (__py2bin_into == 0) {{ return E_POINTER; }}
+        *__py2bin_into = (void *)this;
+        __py2bin_refs = __py2bin_refs + 1;
+        return S_OK;
+    }}
+    unsigned long AddRef() {{
+        __py2bin_refs = __py2bin_refs + 1;
+        return __py2bin_refs;
+    }}
+    unsigned long Release() {{
+        __py2bin_refs = __py2bin_refs - 1;
+        if (__py2bin_refs == 0) {{ delete this; return 0; }}
+        return __py2bin_refs;
+    }}
+    {result} {method}({parameters}) {body}
+}};
+"""
+
+
+#: The same object for a lambda that carries nothing: no member to hold an
+#: enclosing object, and a constructor that asks for none.
+_CALLBACK_CLASS_ALONE = """
+class {name} : public {interface} {{
+public:
+    unsigned long __py2bin_refs;
+    {name}() {{
+        __py2bin_refs = 0;
     }}
     HRESULT QueryInterface(REFIID __py2bin_asked, void **__py2bin_into) {{
         if (__py2bin_into == 0) {{ return E_POINTER; }}
