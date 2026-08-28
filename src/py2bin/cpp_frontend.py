@@ -12324,6 +12324,94 @@ def _reachable_methods(name: str, classes: "dict[str, Class]") -> "list[str]":
     return found
 
 
+#: `struct Counted *c = &t;` and `c = &t;` - a pointer to a base being given
+#: the address of something derived.
+_TAKES_A_BASE = re.compile(
+    r"(?<![.\w>])struct\s+([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*&\s*"
+    # Nothing reached through it: `&t.__base1` is already the subobject, and
+    # matching the `&t` inside one would step through it a second time.
+    r"([A-Za-z_]\w*)(?![\w.\[])"
+)
+_ASSIGNS_A_BASE = re.compile(
+    r"(?<![.\w>])([A-Za-z_]\w*)\s*=\s*&\s*([A-Za-z_]\w*)(?![\w.\[])\s*;"
+)
+#: `(struct Counted *)&t` - the conversion this translator writes when a base
+#: is wanted. Right for the first base, whose address is the object's own,
+#: and wrong for every other one.
+_CAST_TO_A_BASE = re.compile(
+    r"\(\s*struct\s+([A-Za-z_]\w*)\s*\*\s*\)\s*&\s*([A-Za-z_]\w*)"
+    r"(?![\w.\[])"
+)
+
+
+def _move_to_second_base(text: str, classes: "dict[str, Class]") -> str:
+    """Point at the base subobject, where the base is not the first one.
+
+    The first base is at offset zero, so the address of the object is the
+    address of it and a cast is the whole of the conversion. A second base is
+    a member after the first: its address is further along, and saying which
+    member is what moves the pointer there.
+
+    This does the two forms a program writes most - a pointer declared from
+    an object's address, and one assigned it. What it does not reach, the C
+    compiler does: a pointer of the wrong type is a type error there, named
+    with its line. So being incomplete here is a build that stops, and not a
+    program that runs and is wrong - which is the only reason it is safe to
+    do this in pieces at all.
+    """
+
+    if not any(found.mixins for found in classes.values()):
+        return text
+    holds: "dict[str, str]" = {}
+    for found in re.finditer(
+        r"(?<![.\w>])struct\s+([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[;,=\[)]", text
+    ):
+        if found.group(1) in classes:
+            holds[found.group(2)] = found.group(1)
+    pointers: "dict[str, str]" = {}
+    for found in re.finditer(
+        r"(?<![.\w>])struct\s+([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)", text
+    ):
+        pointers[found.group(2)] = found.group(1)
+
+    def stepped(source: "str | None", wanted: str) -> "str | None":
+        if source is None or wanted not in classes or source not in classes:
+            return None
+        path = _subobject_path(source, wanted, classes)
+        if not path or set(path.split(".")) <= {"__base"}:
+            return None
+        return path
+
+    def declared(match: "re.Match[str]") -> str:
+        path = stepped(holds.get(match.group(3)), match.group(1))
+        if path is None:
+            return match.group(0)
+        return (
+            f"struct {match.group(1)} *{match.group(2)} = "
+            f"&{match.group(3)}.{path}"
+        )
+
+    def assigned(match: "re.Match[str]") -> str:
+        path = stepped(holds.get(match.group(2)), pointers.get(match.group(1), ""))
+        if path is None:
+            return match.group(0)
+        return f"{match.group(1)} = &{match.group(2)}.{path};"
+
+    def cast(match: "re.Match[str]") -> str:
+        # A cast is the whole conversion only where the base is at offset
+        # zero. Left standing for a second base it says the right type and
+        # points at the wrong bytes - and, being a cast, it stops the C
+        # compiler from noticing.
+        path = stepped(holds.get(match.group(2)), match.group(1))
+        if path is None:
+            return match.group(0)
+        return f"&{match.group(2)}.{path}"
+
+    text = _map_code(text, lambda part: _CAST_TO_A_BASE.sub(cast, part))
+    text = _map_code(text, lambda part: _TAKES_A_BASE.sub(declared, part))
+    return _map_code(text, lambda part: _ASSIGNS_A_BASE.sub(assigned, part))
+
+
 def _every_base(name: str, classes: "dict[str, Class]") -> "list[str]":
     """Every class this one inherits from, however many chains there are."""
 
@@ -12824,18 +12912,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
                     f"py2bin does not write - only the first base may be "
                     f"polymorphic",
                 )
-            if re.search(rf"(?<![.\w>]){re.escape(mixin)}\s*[*&]", _without_literals(text)):
-                raise CppTranslationError(
-                    filename,
-                    found.methods[0].line if found.methods else 0,
-                    f"{name} inherits from {mixin} as a second base, and this "
-                    f"file takes a pointer or a reference to {mixin}. A second "
-                    f"base sits after the first, so that pointer is not the "
-                    f"object's own address and py2bin does not move it "
-                    f"everywhere it would have to - which would be a wrong "
-                    f"answer rather than a failure. Reach it through the "
-                    f"object instead, or make {mixin} the first base",
-                )
+
 
     # Members defined outside their class, folded back into it.
     for out in _OUT_OF_LINE.finditer(text):
@@ -13092,7 +13169,10 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             _emit_heap_helpers(classes[name], classes)
             for name in [*order, *allocated]
         )
-    return f"{head}\n{typedefs}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
+    whole = f"{head}\n{typedefs}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
+    # Last, on the C itself, because that is where every type is written out
+    # and a pointer to a base can be told from a pointer to what holds it.
+    return _move_to_second_base(whole, classes)
 
 
 

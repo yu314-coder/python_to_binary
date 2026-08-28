@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,019 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 330 C and C++ programs whose output matches `clang++`, built for all
+programs; 331 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -854,15 +854,20 @@ became - so what used to be a depth counted along one chain is a *path*
 along whichever chain the base is on. Construction and destruction run in the
 order C++ says, both ways round.
 
-What is *not* done is the pointer. A second base sits after the first, so
-converting a `Thing *` to its second base has to move the address, and that
-has to happen everywhere such a conversion can occur - arguments, yes, but
-also every initialisation, assignment, return and cast. py2bin has no type
-checker, and a site missed there is a wrong answer rather than a failure:
-`Counted *c = &t;` produced a number with nothing to do with the object, and
-compiled. So taking a pointer or a reference to a second base is refused by
-name, with the two ways out. Inheriting behaviour and using it on the object -
-which is what a mix-in is for - works.
+**And the pointer moves too**, which it did not at first. A second base sits
+after the first, so converting a `Thing *` to it has to move the address -
+at the argument, the initialisation, the assignment, the return and the cast.
+`Counted *c = &t;` gave a number with nothing to do with the object, and
+compiled.
+
+What made it safe to do in pieces is that py2bin's C checks all four: an
+initialiser, an assignment, a `return` and an argument of the wrong pointer
+type are each an error there, named with a line. So a conversion this misses
+is a build that stops rather than a program that runs and is wrong. The one
+thing that would have broken that is a *cast*, which silences the check - and
+a cast to a base was exactly what the translator wrote. It writes the member
+now, for a base that is not the first, and the cast only where the address
+really is the same.
 
 **Four more, and one of them was recursion.** A `constexpr` function is
 answered while translating now, so `int room[fact(4)];` is a declaration
