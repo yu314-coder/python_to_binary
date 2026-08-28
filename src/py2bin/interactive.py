@@ -1248,7 +1248,24 @@ def _build_c(
             "  standard headers; it has no system include path, and no C++."
         )
         return 1
-    _carry_libraries(program, result.artifact, target, libraries, auto_fetch)
+    beside = _carry_libraries(
+        program, result.artifact, target, libraries, auto_fetch
+    )
+    if beside:
+        # One file to send. A program that needs a second file beside it is
+        # a program somebody has to be told about, and being told is the
+        # step that gets missed.
+        from .onefile import pack_beside_executable
+
+        held, total = pack_beside_executable(
+            result.artifact, target, [path.name for path in beside]
+        )
+        for path in beside:
+            path.unlink(missing_ok=True)
+        say(
+            f"\n  folded {', '.join(path.name for path in beside)} into the "
+            f"program ({held} files, {total // 1024} KB)"
+        )
     say(f"\n  done: {result.artifact}")
     _say_what_it_runs_on(result.artifact, target)
     return 0
@@ -1260,7 +1277,7 @@ def _carry_libraries(
     target: str,
     libraries: "tuple[str, ...]",
     auto_fetch: bool,
-) -> None:
+) -> "list[Path]":
     """Put the shared libraries the program names beside the binary.
 
     A program built against somebody else's component imports from a DLL,
@@ -1274,8 +1291,9 @@ def _carry_libraries(
     is about to ship, is not something to do without being asked.
     """
 
+    carried: "list[Path]" = []
     if not libraries or not auto_fetch:
-        return
+        return carried
     from .header_fetch import CACHE_DIRECTORY, HeaderFetchError, fetch_library
 
     # Where the headers were downloaded to. A component ships its header and
@@ -1289,16 +1307,19 @@ def _carry_libraries(
             continue
         beside = output.parent / name
         if beside.is_file():
+            carried.append(beside)
             continue
         say(f"\n  {name} goes beside the program. Looking for it.")
         try:
-            fetch_library(
+            found = fetch_library(
                 name, output.parent, architecture, cache=cache, say=say
             )
+            carried.append(found)
         except HeaderFetchError as error:
             say(f"  {error}")
         except Exception as error:  # a network that is not there
             say(f"  could not fetch {name}: {error}")
+    return carried
 
 def _say_what_it_runs_on(output: Path, target: str) -> None:
     """For a universal build, name the architectures actually in the file.

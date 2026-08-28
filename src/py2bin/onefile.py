@@ -5,6 +5,7 @@ import hashlib
 import shlex
 import shutil
 import stat
+import struct
 import tarfile
 import tempfile
 import zipfile
@@ -603,6 +604,27 @@ def pack_app_bundle(
     return held, total
 
 
+def _is_windowed(program: Path) -> bool:
+    """Whether this PE asks Windows for a desktop program rather than a console.
+
+    Read off the image rather than passed in. The launcher stands in front of
+    the program and inherits how it looks: a console launcher in front of a
+    windowed program flashes a black rectangle on every start, and nobody
+    passes a flag for a thing they did not know was happening.
+    """
+
+    try:
+        image = program.read_bytes()
+        if image[:2] != b"MZ":
+            return False
+        at = struct.unpack_from("<I", image, 0x3C)[0]
+        if image[at:at + 4] != b"PE\0\0":
+            return False
+        return struct.unpack_from("<H", image, at + 24 + 68)[0] == 2
+    except (OSError, struct.error, IndexError):
+        return False
+
+
 def pack_beside_executable(
     program: Path, target: str, carried: list[str]
 ) -> tuple[int, int]:
@@ -657,6 +679,7 @@ def pack_beside_executable(
             output=single,
             target=target,
             launcher=staged / program.name,
+            windows_windowed=_is_windowed(program),
         )
         # Only the program is replaced. What sat beside it is left exactly
         # where it was, because there is no way from here to tell a directory

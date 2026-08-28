@@ -2101,6 +2101,23 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a C or C++ program that needs a library is still one file
+
+A program built against somebody else's component came out of `dist/` as two
+files: the executable and the DLL the loader wants beside it. Two files is
+one more than somebody can send, and the second one is the one that gets
+left behind.
+
+The library is folded into the program now. `py2bin cc --onefile` does it on
+request, and the path that asks three questions does it whenever there is
+anything to fold - SidecarBridge comes out as a single 220 KB `main.exe`
+with `WebView2Loader.dll` inside it.
+
+The launcher that stands in front of the program is read off the program:
+where that is a desktop program, so is the launcher, because a console
+launcher in front of a windowed program flashes a black rectangle on every
+start and nobody passes a flag for a thing they did not know was happening.
+
 ### 0.9.13 - the program is run once, and what it opened is carried
 
 Reading a program finds every branch without taking any of them. Running it

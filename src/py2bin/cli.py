@@ -403,6 +403,14 @@ def _parser() -> argparse.ArgumentParser:
         help="define a macro before the file is preprocessed",
     )
     cc_parser.add_argument(
+        "--onefile",
+        action="store_true",
+        help=(
+            "fold the program and the libraries carried beside it into one "
+            "self-extracting file, so there is a single thing to ship"
+        ),
+    )
+    cc_parser.add_argument(
         "--library", "-l", action="append", default=[],
         metavar="NAME[:SYMBOL,...]",
         help=(
@@ -1220,6 +1228,27 @@ def _main(argv: list[str] | None = None) -> int:
                 extra_sources=tuple(sources[1:]),
                 libraries=tuple(args.library),
             )
+            if args.onefile:
+                from .onefile import pack_beside_executable
+
+                # The libraries named are what sits beside the program: the
+                # loader looks for them there, so they have to be there when
+                # it runs, and a program that needs a second file is not a
+                # program somebody can send.
+                beside = [
+                    spelled.partition(":")[0].strip()
+                    for spelled in args.library
+                ]
+                held, total = pack_beside_executable(
+                    result.artifact, result.target, beside
+                )
+                print(
+                    f"packed the program and what it carries into one file "
+                    f"({held} files -> {total} bytes)",
+                    file=sys.stderr,
+                )
+                print(f"{result.artifact} ({total} bytes, {result.target})")
+                return 0
             print(
                 f"{result.artifact} ({result.bytes} bytes, {result.target})",
             )

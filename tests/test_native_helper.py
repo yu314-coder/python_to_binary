@@ -290,3 +290,42 @@ class IncludeDirectories(unittest.TestCase):
             if line.strip().endswith("nowhere.h")
         ]
         self.assertEqual(len(listed), len(set(listed)))
+
+
+class OneFileMatchesWhatItLaunches(unittest.TestCase):
+    """The launcher in front of a program looks like that program.
+
+    A console launcher wrapping a desktop program flashes a black rectangle
+    on every start, and nobody passes a flag for a thing they did not know
+    was happening - so it is read off the image being packed.
+    """
+
+    def _pe(self, subsystem: int) -> bytes:
+        # The smallest thing `_is_windowed` has to read: a DOS stub pointing
+        # at a PE header whose optional header names a subsystem.
+        image = bytearray(b"MZ" + b"\0" * 0x3E)
+        image += b"\0" * (0x40 - len(image))
+        image[0x3C:0x40] = (0x40).to_bytes(4, "little")
+        header = bytearray(b"PE\0\0" + b"\0" * 20 + b"\0" * 96)
+        header[24 + 68: 24 + 70] = subsystem.to_bytes(2, "little")
+        return bytes(image) + bytes(header)
+
+    def test_a_desktop_program_gets_a_desktop_launcher(self) -> None:
+        from py2bin.onefile import _is_windowed
+
+        with tempfile.TemporaryDirectory() as where:
+            windowed = Path(where) / "gui.exe"
+            windowed.write_bytes(self._pe(2))
+            console = Path(where) / "cli.exe"
+            console.write_bytes(self._pe(3))
+            self.assertTrue(_is_windowed(windowed))
+            self.assertFalse(_is_windowed(console))
+
+    def test_something_that_is_not_a_pe_is_not_windowed(self) -> None:
+        from py2bin.onefile import _is_windowed
+
+        with tempfile.TemporaryDirectory() as where:
+            elf = Path(where) / "prog"
+            elf.write_bytes(b"\x7fELF" + b"\0" * 64)
+            self.assertFalse(_is_windowed(elf))
+            self.assertFalse(_is_windowed(Path(where) / "nothing-here"))
