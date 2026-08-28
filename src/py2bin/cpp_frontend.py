@@ -1560,8 +1560,18 @@ _AUTO_FROM_LAMBDA = re.compile(
 )
 
 #: `[captures](params) -> result {` - the head of a lambda.
+#: The parameter list may be left out where there are no parameters: `[] { }`
+#: is a lambda as surely as `[]() { }` is, and is how one taking nothing is
+#: usually written. Read as needing the parentheses, one written that way was
+#: not a lambda at all and stayed in the C as square brackets and a block.
 _LAMBDA = re.compile(
-    r"\[([^\]\[]*)\]\s*\(([^()]*)\)\s*(?:mutable\s*)?(?:->\s*([^{;]+?))?\s*\{"
+    # Nothing that can be indexed in front of it. `int room[2] { 1, 2 };` is
+    # an array with its values, and once the parentheses are optional it
+    # reads exactly like a lambda capturing `2`. A subscript always follows
+    # something - a name, a `]`, a `)` - and a capture list never does.
+    r"(?<![\w\]\)])"
+    r"\[([^\]\[]*)\]\s*(?:\(([^()]*)\)\s*)?(?:mutable\s*)?"
+    r"(?:->\s*([^{;]+?))?\s*\{"
 )
 
 
@@ -3063,6 +3073,9 @@ def _expand_lambdas(
         numbered[0] += 1
         name = f"__py2bin_lambda_{numbered[0]}"
         captures, parameters, declared = found.groups()
+        # A lambda taking nothing may leave the list out entirely - `[] { }`
+        # is one - and everything below reads the parameters as text.
+        parameters = parameters or ""
         try:
             closing = _matching(text, found.end() - 1)
         except ValueError:
@@ -3343,6 +3356,7 @@ def _rewrite_wrl_callbacks(text: str, filename: str) -> str:
                 "to build one around otherwise",
             )
         captured = written.group(1).strip()
+        spelled_parameters = written.group(2) or ""
         # `[]` - a callback that carries nothing. Ordinary C++, and the
         # simpler of the two: the object it becomes has no member to hold an
         # enclosing object and needs no class around it to be written in.
@@ -3372,7 +3386,7 @@ def _rewrite_wrl_callbacks(text: str, filename: str) -> str:
         # The lambda's own parameter names, with the interface's types: the
         # body was written against the names and the vtable against the
         # types, and an unnamed parameter has to keep its place either way.
-        head = _callback_parameters(parameters, written.group(2))
+        head = _callback_parameters(parameters, spelled_parameters)
         made.append(
             (_CALLBACK_CLASS_ALONE if alone else _CALLBACK_CLASS_TEXT).format(
                 name=name,
@@ -6467,6 +6481,136 @@ _DEDUCED_CLASS = re.compile(
 )
 
 
+#: `std::thread worker(f);` and `worker_ = std::thread(&Host::run, this);` -
+#: a thread being given what to run. The `std::` is gone by the time this
+#: runs, and both spellings name the same thing.
+_A_THREAD_MADE = re.compile(
+    r"(?<![.\w>])thread\s*(?:([A-Za-z_]\w*)\s*)?\(([^;{}()]*)\)"
+)
+
+#: What the pass below calls the function it writes.
+_THREAD_ENTRY_PREFIX = "__py2bin_thread_run_"
+
+
+def _rewrite_threads(text: str, filename: str) -> str:
+    """Give each `std::thread` a plain function to start.
+
+    A platform starts a thread at a function taking one pointer. C++ starts
+    one at anything callable, and a callable here is a class with a call
+    operator, or a member function and an object to call it on. Neither is a
+    plain function, so one is written - a trampoline that takes the pointer,
+    puts it back into the shape it came from, and makes the call.
+
+    Which shape that is, is decided here and not while running, which is why
+    the thread object itself holds only a handle: what it runs was settled
+    where it was written.
+    """
+
+    if not re.search(r"(?<![.\w>])(?:class|struct)\s+thread\b", text):
+        return text
+    made: "list[str]" = []
+    counter = 0
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        found = None
+        for match in _A_THREAD_MADE.finditer(bare):
+            if _is_a_definition(bare, match.end() - 1):
+                continue
+            given = [
+                one.strip()
+                for one in _split_arguments(match.group(2))
+                if one.strip()
+            ]
+            if not given:
+                continue
+            found = (match, given)
+            break
+        if found is None:
+            break
+        match, given = found
+        counter += 1
+        entry = f"{_THREAD_ENTRY_PREFIX}{counter}"
+        held = given[0]
+        member = re.match(r"^&\s*([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)$", held)
+        if member is not None and len(given) == 2:
+            # `thread(&Host::run, this)` - a member function and the object
+            # to call it on. The object is the argument, and the trampoline
+            # is the call.
+            owner, method = member.group(1), member.group(2)
+            # Through a name and not through the cast: a call on a cast is
+            # not a shape the pass that rewrites member calls reads, and a
+            # pointer that has a name is.
+            made.append(
+                f"static long {entry}(void *__py2bin_given) {{ "
+                f"{owner} *__py2bin_on = ({owner} *)__py2bin_given; "
+                f"__py2bin_on->{method}(); return 0; }}"
+            )
+            passed = f"(void *)({given[1]})"
+        elif len(given) == 1:
+            # Anything callable held in a name: the object is what the
+            # trampoline calls, and it is the argument too.
+            # A callable held in a name. What class it is comes from where
+            # it was declared, which is the only place that says.
+            holds = _deduced_type(held, text, match.start())
+            owner = (
+                re.sub(r"\b(?:const|struct|volatile)\b", " ", holds or "")
+                .replace("*", " ")
+                .strip()
+            )
+            if not owner:
+                raise CppTranslationError(
+                    filename, _line_of(text, match.start()),
+                    f"a thread is started here on `{held}`, and py2bin "
+                    f"cannot read what that is. It writes the function the "
+                    f"platform starts a thread at, and needs the type to "
+                    f"know what that function should call",
+                )
+            made.append(
+                f"static long {entry}(void *__py2bin_given) {{ "
+                f"{owner} *__py2bin_on = ({owner} *)__py2bin_given; "
+                f"(*__py2bin_on)(); return 0; }}"
+            )
+            passed = f"(void *)(&{held})"
+        else:
+            raise CppTranslationError(
+                filename, _line_of(text, match.start()),
+                f"a thread is started here with {len(given)} arguments; "
+                f"py2bin writes the function a platform starts a thread at, "
+                f"and can write one for a callable on its own or for a "
+                f"member function and the object to call it on - not for "
+                f"arguments bound to it as well",
+            )
+        naming = match.group(1)
+        ends = match.end()
+        if naming:
+            spelled = f"thread {naming}; {naming}.__begin({entry}, {passed});"
+            begins = match.start()
+            if bare[ends: ends + 1] == ";":
+                ends += 1
+        else:
+            # `worker_ = thread(...);` - the thread is made and moved into
+            # something that already exists. There is nothing to move here:
+            # the handle is the whole of the object, so the one that exists
+            # is simply the one that is started.
+            assigned = re.search(
+                r"(?<![.\w>])((?:this\s*->\s*)?[A-Za-z_]\w*)\s*=\s*$",
+                bare[: match.start()],
+            )
+            if assigned is None:
+                raise CppTranslationError(
+                    filename, _line_of(text, match.start()),
+                    "a thread is made here without being named or given to "
+                    "anything; py2bin starts one where it can see what holds "
+                    "the handle, because the handle is how it is joined",
+                )
+            begins = assigned.start(1)
+            spelled = f"{assigned.group(1)}.__begin({entry}, {passed})"
+        text = text[:begins] + spelled + text[ends:]
+    if not made:
+        return text
+    return _above_the_first_use(text, "\n".join(made))
+
+
 def _deduce_class_arguments(text: str) -> str:
     """`lock_guard hold(m);` becomes `lock_guard<mutex> hold(m);`.
 
@@ -7507,6 +7651,13 @@ def _emit_one(
     scope = f"{unit}\n{method.parameters};" if method.parameters else unit
     body = _bare_method_calls(body, found, classes, scope)
     known = {"this": found.name}
+    # And every object the file declares outside a function. A method may name
+    # one as readily as a free function may, and only the free functions knew
+    # about them: `total.fetch_add(1)` written inside a method - or inside a
+    # lambda, which becomes one - was left as C++ and reported against a
+    # struct that has no such member.
+    for spelled, (holds, _arguments) in _file_scope_objects(unit, classes).items():
+        known.setdefault(spelled, holds)
     pointers: "set[str]" = {"this"}
     for referenced, held in references.items():
         if held in classes:
@@ -12921,6 +13072,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Before the copies are written out: a class named without its arguments
     # has to have them by the time the copy is asked for.
     text = _deduce_class_arguments(text)
+    text = _rewrite_threads(text, filename)
     text = _rewrite_tuple_get(text)
     text = _rewrite_variant_alternatives(text)
     text = _rewrite_duration_cast(text)
@@ -15229,7 +15381,7 @@ __setprecision setprecision(int n) { __setprecision made; made.__n = n; return m
 #: what is in the way is one thing and it is fixable, and a person reading
 #: the message should be told which thing.
 _NEEDS_ATOMICS = frozenset(
-    {"thread", "condition_variable", "future",
+    {"condition_variable", "future",
      "shared_mutex", "latch", "barrier", "semaphore", "stop_token"}
 )
 
@@ -15360,6 +15512,90 @@ public:
     variant(B v) { __1 = v; __tag = 1; }
     variant(C v) { __2 = v; __tag = 2; }
     int index() const { return __tag; }
+};
+}
+"""
+
+#: How each platform starts a thread and waits for one. Written per target
+#: rather than with an `#ifdef`, for the reason the clock is: the translator
+#: runs before the preprocessor and would read both branches.
+#:
+#: One entry point shape serves both. POSIX wants `void *(*)(void *)` and
+#: Windows wants `DWORD (*)(LPVOID)`; on x86-64 and ARM64 alike that is one
+#: pointer argument in the first register and an answer in the first result
+#: register, so a function taking a pointer and answering a long is callable
+#: as either.
+_THREADS = {
+    "windows": r"""
+extern void *CreateThread(void *security, unsigned long stack,
+                          __py2bin_thread_entry entry, void *argument,
+                          unsigned long flags, void *id);
+extern int WaitForSingleObject(void *handle, unsigned long milliseconds);
+extern int CloseHandle(void *handle);
+
+static unsigned long __py2bin_thread_start(__py2bin_thread_entry entry, void *argument) {
+    return (unsigned long)CreateThread(0, 0, entry, argument, 0, 0);
+}
+static void __py2bin_thread_wait(unsigned long handle) {
+    WaitForSingleObject((void *)handle, 0xFFFFFFFF);
+    CloseHandle((void *)handle);
+}
+""",
+    "posix": r"""
+extern int pthread_create(void *handle, void *attributes,
+                          __py2bin_thread_entry entry, void *argument);
+extern int pthread_join(void *handle, void *answer);
+
+static unsigned long __py2bin_thread_start(__py2bin_thread_entry entry, void *argument) {
+    /* The identity is a word on every platform py2bin targets, and the one
+       the caller keeps is that word rather than a pointer to it. */
+    void *made;
+    made = 0;
+    if (pthread_create(&made, 0, entry, argument) != 0) { return 0; }
+    return (unsigned long)made;
+}
+static void __py2bin_thread_wait(unsigned long handle) {
+    pthread_join((void *)handle, 0);
+}
+""",
+}
+
+
+def _thread_header(target: "str | None") -> str:
+    """<thread>, over whichever way this machine starts one."""
+
+    named = (target or "").split("-", 1)[0]
+    return _THREAD_HEADER.replace(
+        "/*START*/", _THREADS["windows" if named == "windows" else "posix"]
+    )
+
+
+#: <thread>. The object holds the handle and nothing else: what the thread
+#: runs was settled where it was written, by the pass that builds a trampoline
+#: for the callable and hands this the address of one.
+_THREAD_HEADER = r"""
+typedef long (*__py2bin_thread_entry)(void *);
+namespace std {
+/*START*/
+
+class thread {
+public:
+    unsigned long __handle;
+    thread() { __handle = 0; }
+    /* Started by `__begin` rather than by a constructor taking a callable:
+       a callable is a class here, and which class it is decides what the
+       trampoline has to call - which is a thing settled while translating
+       and not while running. */
+    void __begin(__py2bin_thread_entry entry, void *argument) {
+        __handle = __py2bin_thread_start(entry, argument);
+    }
+    int joinable() const { return __handle != 0; }
+    void join() {
+        if (__handle != 0) { __py2bin_thread_wait(__handle); __handle = 0; }
+    }
+    /* Detaching leaves the thread running and forgets the handle. Nothing is
+       reclaimed, which is what the arena does with everything. */
+    void detach() { __handle = 0; }
 };
 }
 """
@@ -16697,6 +16933,7 @@ _BUILTIN_CPP_HEADERS = {
     "list": _LIST_HEADER,
     "bitset": _BITSET_HEADER,
     "atomic": _ATOMIC_HEADER,
+    "thread": _thread_header,
     "mutex": _MUTEX_HEADER,
     "variant": _VARIANT_HEADER,
     # Answered per target, so it is a function rather than a text.

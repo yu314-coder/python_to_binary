@@ -84,6 +84,30 @@ class _Timespec(ctypes.Structure):
 _libc.clock_gettime.restype = ctypes.c_int
 _libc.clock_gettime.argtypes = (ctypes.c_int, ctypes.POINTER(_Timespec))
 
+# The thread pair, passed straight through. The entry point is an address the
+# compiled side produced and nothing here reads it, which is what this module
+# does for every symbol it forwards.
+_libc.pthread_create.restype = ctypes.c_int
+_libc.pthread_create.argtypes = (
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+)
+_libc.pthread_join.restype = ctypes.c_int
+_libc.pthread_join.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+
+
+def pthread_create(
+    handle: object, attributes: object, entry: object, argument: object
+) -> int:
+    """POSIX ``pthread_create``: start a thread running ``entry(argument)``."""
+
+    return int(_libc.pthread_create(handle, attributes, entry, argument))
+
+
+def pthread_join(handle: object, answer: object) -> int:
+    """POSIX ``pthread_join``: wait for that thread to finish."""
+
+    return int(_libc.pthread_join(handle, answer))
+
 
 def clock_gettime(which: int, into: object) -> int:
     """POSIX ``clock_gettime``: the seconds and nanoseconds of one clock.

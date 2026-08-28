@@ -328,6 +328,19 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
         "int",
         "KERNEL32.dll",
     ),
+    #: Threads, the Windows way. No vetted entry and no shim for these: a
+    #: Windows import is named with the library it comes from and is bound by
+    #: the loader, where a POSIX one is a symbol in libc that the adapter
+    #: tier can also be asked to forward.
+    "CreateThread": (
+        "CreateThread",
+        ("ptr", "int", "ptr", "ptr", "int", "ptr"),
+        "ptr",
+        "KERNEL32.dll",
+    ),
+    "WaitForSingleObject": (
+        "WaitForSingleObject", ("ptr", "int"), "int", "KERNEL32.dll",
+    ),
     "QueryPerformanceCounter": (
         "QueryPerformanceCounter", ("ptr",), "int", "KERNEL32.dll",
     ),
@@ -417,6 +430,10 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     #: `clock_gettime(which, &into)` - POSIX's monotonic clock. Windows has
     #: no such symbol and uses QueryPerformanceCounter, which is already here.
     "clock_gettime": ("clock_gettime", ("int", "ptr")),
+    #: `pthread_create(&id, 0, entry, argument)` and its join. The entry is a
+    #: pointer to a function, which at this level is a pointer like any other.
+    "pthread_create": ("pthread_create", ("ptr", "ptr", "ptr", "ptr")),
+    "pthread_join": ("pthread_join", ("ptr", "ptr")),
     "getppid": ("getppid", ()),
     "getuid": ("getuid", ()),
     "getgid": ("getgid", ()),
@@ -604,6 +621,8 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
 _CABI_RESULTS: dict[str, str] = {
     "getpid": "int",
     "clock_gettime": "int",
+    "pthread_create": "int",
+    "pthread_join": "int",
     "getppid": "int",
     "getuid": "int",
     "getgid": "int",
@@ -760,6 +779,8 @@ _CABI_RESULT_WIDTH: dict[str, str] = {
     # POSIX: pid_t/uid_t/gid_t and int abs(int) are 32 bits.
     "getpid": "i32",
     "clock_gettime": "i32",
+    "pthread_create": "i32",
+    "pthread_join": "i32",
     "getppid": "i32",
     "getuid": "u32",
     "getgid": "u32",

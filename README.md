@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 336 C and C++ programs whose output matches `clang++`, built for all
+programs; 340 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -1003,29 +1003,43 @@ how a reference is carried - ran after the `&` had been taken off, and once it
 is off there is nothing left to tell the two apart. Its own guard already
 excluded a leading `&`; it only had to run first.
 
-**Threads are refused, and the reason is the interesting part.** py2bin emits
-no atomic instruction on any target - `_Atomic` is refused in the C front end
-with that on it - and the heap underneath every program is a bump pointer read
-and written without one:
+**And then threads, in that order and not before.** `<thread>` was refused for
+a while with the obstacle written out: the allocator was a bump pointer read
+and written without an atomic, so two threads would have been handed the same
+address, and every `std::string` and `new` is an allocation. Threads on that
+would not have been slow or limited - they would have been quietly wrong.
 
-```c
-__p = __py2bin_heap_bump;
-__py2bin_heap_bump = __p + __n;
-```
+So the atomic came first, then the allocator, then threads, and each was shown
+to work before the next was written. Two threads sharing a counter answer
+200000 with none lost. Two threads taking 8,000 blocks between them collide on
+zero addresses and corrupt none of them. Only then a thread object.
 
-Two threads reaching that at once are handed the same address. A
-`std::string`, a `vector`, a `new` - each is an allocation, so the first
-thread that does anything at all would hit it. `<thread>` written on top of
-that would not be slow or limited: it would be quietly wrong, which is the
-one kind of wrong this file spends most of its length on.
+It holds a handle and nothing else. What a thread *runs* is settled where it
+is written: a platform starts a thread at a plain function taking one pointer,
+and C++ starts one at anything callable, so a trampoline is written for each
+callable - a function that takes the pointer, puts it back into the shape it
+came from, and makes the call. One entry shape serves both platforms, because
+POSIX wanting `void *(*)(void *)` and Windows wanting `DWORD (*)(LPVOID)` are
+the same thing on x86-64 and ARM64: one pointer in the first register, an
+answer in the first result register.
 
-So `<thread>`, `<mutex>`, `<atomic>`, `<condition_variable>` and the rest say
-that, rather than taking a place in the list of headers that are merely not
-written yet. What has to come first is an atomic exchange in the instruction
-selector for both architectures and an allocator that uses it; threads are
-what comes after. It is also the one thing the corpus could not check if it
-were written - two threads racing is not a program whose output can be
-compared with `clang++`'s.
+`std::thread(&Host::run, this)`, `std::thread(callable)`, assignment into a
+member, `joinable`, `join` and `detach` all work, with `<mutex>` and
+`<atomic>` beside them. Five programs in the corpus start real threads.
+
+Two of the three bugs that took the longest were not about threads at all.
+`[] { }` was not read as a lambda, because the parameter list may be left out
+and the pattern wanted the parentheses - and making them optional then made
+`int room[2] { 1, 2 };` read as a lambda capturing `2`, which is why the
+capture list now has to not follow something that can be indexed. And a method
+body could not see an object declared outside every function: only free
+functions knew about those, so `total.fetch_add(1)` inside a method - or
+inside a lambda, which becomes one - was left as C++.
+
+They are run on this machine, which is one of six. `pthread_create` is what
+POSIX targets use and `CreateThread` is what Windows targets use; the second
+has never executed. That is said here rather than left to be discovered,
+because it is exactly the shape of both Windows mistakes on this page.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that
