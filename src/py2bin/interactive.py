@@ -297,7 +297,7 @@ def main(
     auto_fetch: bool = False,
     defines: "tuple[str, ...]" = (),
     libraries: "tuple[str, ...]" = (),
-    watch: bool = False,
+    watch: bool = True,
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -317,10 +317,11 @@ def main(
     build with a linker is given an import library.
 
     `watch` runs the program once, here, and adds the files it opened to the
-    ones reading it found. It is off unless asked for: running a program is
-    not free of consequence - it may write, send, or want a password - and a
-    build that does that without being asked is a build that surprises
-    somebody.
+    ones reading it found. On, because a bundle missing a file it opens is a
+    bundle that starts and then cannot do the thing it was built for, and
+    finding that out on somebody else's machine is worse than the cost of a
+    run here. Pass `watch=False` where running the program is not wanted -
+    it may write, send, or want a password.
     """
 
     # Everything is said on stdout. Some editors show only that, and an
@@ -449,6 +450,7 @@ def main(
     # bundle without it is a bundle that starts and then cannot draw anything.
     if watch:
         say("\n  running it once to see which files it opens")
+        say("  (say no to this with --no-watch)")
     carried, skipped, outside = _what_it_opens(program, here, watch)
     if carried:
         say(

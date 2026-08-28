@@ -264,13 +264,24 @@ class WatchingAddsToReading(unittest.TestCase):
         )
         return where / "app" / "main.py"
 
+    def test_watching_is_on_unless_it_is_turned_off(self) -> None:
+        import inspect
+
+        from py2bin.interactive import main
+
+        self.assertIs(
+            inspect.signature(main).parameters["watch"].default,
+            True,
+            "a bundle missing a file it opens is worse than the cost of a run",
+        )
+
     def test_a_name_read_at_run_time_is_found_only_by_running(self) -> None:
         from py2bin.interactive import _what_it_opens
 
         with tempfile.TemporaryDirectory() as spelled:
             program = self._project(Path(spelled))
             here = program.parent
-            read, _skipped, _outside = _what_it_opens(program, here)
+            read, _skipped, _outside = _what_it_opens(program, here, watch=False)
             self.assertNotIn(
                 "skin", {path.name for path in read},
                 "reading should not find a directory named nowhere in the code",
