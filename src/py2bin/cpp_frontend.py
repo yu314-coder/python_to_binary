@@ -15125,6 +15125,15 @@ __setprecision setprecision(int n) { __setprecision made; made.__n = n; return m
 #: `CLOCK_MONOTONIC` is 6 on macOS and 1 on Linux. It is a number in a header
 #: on each, and the number is different, so it is written out per platform
 #: rather than assumed to be the same.
+#: The headers that are about doing two things at once. Each is refused with
+#: what is actually in the way rather than with "not implemented", because
+#: what is in the way is one thing and it is fixable, and a person reading
+#: the message should be told which thing.
+_NEEDS_ATOMICS = frozenset(
+    {"thread", "mutex", "atomic", "condition_variable", "future",
+     "shared_mutex", "latch", "barrier", "semaphore", "stop_token"}
+)
+
 #: How each platform is asked what time it is. Written per target rather than
 #: with an `#ifdef`, because the C++ translator runs before the preprocessor
 #: and would read both branches - and two definitions of one function is not
@@ -16664,6 +16673,24 @@ def inline_local_includes(
                 # SFINAE and partial specialisation, none of which this
                 # subset has - and it fails somewhere deep inside itself
                 # about something that is not the reason.
+                if named in _NEEDS_ATOMICS:
+                    raise CppTranslationError(
+                        str(path),
+                        _line_of(text, match.start()),
+                        f"<{named}> is not implemented, and the reason is "
+                        f"worth having rather than a place in a list. py2bin "
+                        f"emits no atomic instruction on any target - "
+                        f"`_Atomic` is refused for the same reason - and the "
+                        f"heap underneath every program is a bump pointer "
+                        f"read and written without one. Two threads "
+                        f"allocating at once would be handed the same "
+                        f"address, and a `std::string` or a `new` inside a "
+                        f"thread is an allocation. Threads on top of that "
+                        f"would not be slow or limited; they would be wrong, "
+                        f"quietly. What has to come first is an atomic "
+                        f"exchange in the instruction selector for both "
+                        f"architectures, and an allocator that uses it",
+                    )
                 raise CppTranslationError(
                     str(path),
                     _line_of(text, match.start()),

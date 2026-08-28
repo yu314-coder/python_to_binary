@@ -951,9 +951,29 @@ character, because the loop that pads borrows the same one-byte scratch the
 character had been put in; the character is stored after the padding now. And
 the test that said `%*` was refused is now three tests that say what it does.
 
-**What is still missing.** `<thread>` and `<mutex>` need a way to start a
-thread *and* a trampoline, because `std::thread(lambda)` has to arrive at a
-plain function pointer taking one argument.
+**Threads are refused, and the reason is the interesting part.** py2bin emits
+no atomic instruction on any target - `_Atomic` is refused in the C front end
+with that on it - and the heap underneath every program is a bump pointer read
+and written without one:
+
+```c
+__p = __py2bin_heap_bump;
+__py2bin_heap_bump = __p + __n;
+```
+
+Two threads reaching that at once are handed the same address. A
+`std::string`, a `vector`, a `new` - each is an allocation, so the first
+thread that does anything at all would hit it. `<thread>` written on top of
+that would not be slow or limited: it would be quietly wrong, which is the
+one kind of wrong this file spends most of its length on.
+
+So `<thread>`, `<mutex>`, `<atomic>`, `<condition_variable>` and the rest say
+that, rather than taking a place in the list of headers that are merely not
+written yet. What has to come first is an atomic exchange in the instruction
+selector for both architectures and an allocator that uses it; threads are
+what comes after. It is also the one thing the corpus could not check if it
+were written - two threads racing is not a program whose output can be
+compared with `clang++`'s.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that
