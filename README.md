@@ -10,10 +10,10 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,019 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,022 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 332 C and C++ programs whose output matches `clang++`, built for all
+programs; 333 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -931,13 +931,29 @@ It is run on one machine of the six. The Windows and Linux clocks build and
 have not executed, which is exactly the shape of the two worst mistakes on
 this page.
 
+**`printf("%*d")` takes its width from the argument in front of the value.**
+What was not known while compiling was the number and only the number - the
+padding loops have always worked out their counts while running. What made it
+awkward is that the loop which pads a *number* fills a fixed frame buffer
+backwards, and a count nobody wrote down has no bound that can be checked
+against it.
+
+So a width handed over does not touch that buffer at all: it pads the output,
+which has no bound to check. Both pads are written every time, and each loop
+stops at once when its count is not positive - which is how a *negative*
+width argument comes out as C says it should, `-` and that width without its
+sign, with no branch of its own. `%0*d` is still refused, and the reason is
+the real one: the zeros go between the sign and the digits, and with the
+width unknown the sign has been written by then.
+
+Two things that fell out of writing it. `%*c` printed the padding and not the
+character, because the loop that pads borrows the same one-byte scratch the
+character had been put in; the character is stored after the padding now. And
+the test that said `%*` was refused is now three tests that say what it does.
+
 **What is still missing.** `<thread>` and `<mutex>` need a way to start a
 thread *and* a trampoline, because `std::thread(lambda)` has to arrive at a
-plain function pointer. `printf("%*d")` takes its width from an argument
-where py2bin reads a format while compiling; the padding loops already take a
-count that is worked out at run time, but the one that pads a number fills a
-fixed buffer backwards, so a width from an argument needs a bound that is
-exactly right or it writes off the front of it.
+plain function pointer taking one argument.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

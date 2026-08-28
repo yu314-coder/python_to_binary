@@ -1161,10 +1161,49 @@ int main(void) {
             stdout="[    3.14][3.14    ][00003.14][+2.5]",
         )
 
+    def test_a_field_width_may_come_from_an_argument(self):
+        """`%*d` takes its width from the argument before the value.
+
+        The padding loops already worked out their counts while running; what
+        was not known while compiling was the number, and only that. It pads
+        the output rather than the frame buffer the digits are built in -
+        that buffer is a fixed size and is filled backwards, so a count
+        nobody wrote down has no bound that can be checked against it, and
+        the output has no bound to check.
+        """
+
+        self.run_c(
+            'int main(void) { printf("[%*d][%-*d][%*s][%*c]",'
+            ' 5, 42, 5, 42, 4, "ab", 3, \'z\'); return 0; }\n',
+            stdout="[   42][42   ][  ab][  z]",
+        )
+
+    def test_a_negative_width_argument_is_the_other_alignment(self):
+        """C7.21.6.1p5: a negative width is `-` and that width without it."""
+
+        self.run_c(
+            'int main(void) { printf("[%*d][%*s][%*c]",'
+            ' -5, 42, -4, "ab", -3, \'z\'); return 0; }\n',
+            stdout="[42   ][ab  ][z  ]",
+        )
+
+    def test_a_width_from_an_argument_is_not_bounded_by_the_frame(self):
+        """It pads the output, so the 120 the frame buffer holds is no limit."""
+
+        self.run_c(
+            'int main(void) { printf("[%*d]", 200, 7); return 0; }\n',
+            stdout="[" + " " * 199 + "7]",
+        )
+
     def test_what_printf_still_refuses(self):
         self.reject(
-            'int main(void) { printf("%*d", 5, 1); return 0; }\n',
-            "given as '*'",
+            'int main(void) { printf("%0*d", 5, 1); return 0; }\n',
+            "'0' flag with a width given as '*'",
+        )
+        self.reject(
+            'int main(void) { printf("%*d", 5); return 0; }\n',
+            # Two: the width and then the value.
+            r"2 conversion\(s\) but 1 argument",
         )
         self.reject(
             'int main(void) { printf("%#x", 255u); return 0; }\n',

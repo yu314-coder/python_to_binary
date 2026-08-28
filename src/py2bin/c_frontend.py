@@ -3424,6 +3424,34 @@ _FLOAT_CONVERSIONS = frozenset({"f", "F", "e", "E", "g", "G"})
 #: needs in %f, with the sign and the point, inside _TEXT_BYTES.
 _MAXIMUM_PRECISION = 120
 
+#: `%*d` - the width is the argument before the value. Stands for a width in
+#: the parsed format where a number would be, so every pass below can tell the
+#: two apart by asking rather than by guessing at a sentinel number.
+def _negated(width: object) -> IntExpression:
+    """The other sign of a width handed over at run time.
+
+    C7.21.6.1p5: a negative width argument means the `-` flag and that width
+    without its sign. Both pads are written for a width nobody wrote down,
+    and each loop stops at once when its count is not positive - so the sign
+    of the number chooses between them without a branch of its own.
+    """
+
+    return _binary("sub", IntConstant(0), _width_of(width))
+
+
+def _width_of(width: object) -> IntExpression:
+    """A field width, whether it was written down or handed over."""
+
+    return IntConstant(width) if isinstance(width, int) else width
+
+
+class _FromAnArgument:
+    def __repr__(self) -> str:  # pragma: no cover - a marker, shown in traces
+        return "<width from an argument>"
+
+
+_FROM_AN_ARGUMENT = _FromAnArgument()
+
 #: The widest field printf will pad to. The formatter builds its answer in a
 #: fixed frame buffer, and a width past that would write off the end of it.
 _MAXIMUM_FIELD = 120
@@ -6329,7 +6357,11 @@ class Lowerer:
             )
         segments = self.parse_format(node.arguments[0])
         arguments = node.arguments[1:]
-        expected = sum(1 for kind, _ in segments if kind != "text")
+        conversions = [payload for kind, payload in segments if kind != "text"]
+        # A `%*d` wants two: the width and then the value.
+        expected = sum(
+            2 if one[4] is _FROM_AN_ARGUMENT else 1 for one in conversions
+        )
         if expected != len(arguments):
             self.error(
                 f"printf has {expected} conversion(s) but {len(arguments)} "
@@ -6343,10 +6375,23 @@ class Lowerer:
         # interleave with the literal parts. Evaluate everything first, hold
         # each result in a slot, then emit the output.
         prepared: list[object] = []
-        for position, argument in enumerate(arguments):
-            style, ctype, precision, flags, width = segments[
-                [i for i, (kind, _) in enumerate(segments) if kind != "text"][position]
-            ][1]
+        at = 0
+        for style, ctype, precision, flags, width in conversions:
+            if width is _FROM_AN_ARGUMENT:
+                asked = arguments[at]
+                at += 1
+                given = self.rvalue(asked)
+                if not is_integer(given.ctype):
+                    self.error(
+                        "a width given as '*' is read from an int argument, "
+                        f"not from {given.ctype}",
+                        asked.token,
+                    )
+                # Pinned in a slot like every other argument, so evaluating a
+                # later one cannot change the width this conversion pads to.
+                width = self.materialize(self.fit(given.expr, INT))
+            argument = arguments[at]
+            at += 1
             value = self.rvalue(argument)
             prepared.append((style, ctype, precision, value, argument, flags, width))
         held: list[object] = []
@@ -6471,18 +6516,27 @@ class Lowerer:
             while position < len(data) and chr(data[position]) in "-+ #0":
                 flags += chr(data[position])
                 position += 1
-            width = 0
+            width: object = 0
             if position < len(data) and chr(data[position]) == "*":
-                self.error(
-                    "a field width given as '*' is not implemented; py2bin "
-                    "reads the format at compile time, and a width taken from "
-                    "an argument is not known then. Write the number",
-                    literal.token,
-                )
+                # The width comes from an argument. The format is still read
+                # while compiling - what is not known then is the number, and
+                # the padding loops take a count worked out at run time
+                # already, so the number is the only thing that has to wait.
+                position += 1
+                if "0" in flags:
+                    self.error(
+                        "a '0' flag with a width given as '*' is not "
+                        "implemented; the zeros go between the sign and the "
+                        "digits, and with the width unknown the sign has been "
+                        "written by then. Write the width as a number, or "
+                        "drop the '0'",
+                        literal.token,
+                    )
+                width = _FROM_AN_ARGUMENT
             while position < len(data) and chr(data[position]).isdigit():
                 width = width * 10 + (data[position] - 48)
                 position += 1
-            if width > _MAXIMUM_FIELD:
+            if isinstance(width, int) and width > _MAXIMUM_FIELD:
                 self.error(
                     f"a field width of {width} is beyond the {_MAXIMUM_FIELD} "
                     f"py2bin implements; the formatter pads inside a fixed "
@@ -7474,9 +7528,29 @@ class Lowerer:
         self.emit(Label(end))
 
     def emit_character(
-        self, expression: IntExpression, flags: str = "", width: int = 0
+        self, expression: IntExpression, flags: str = "", width: object = 0
     ) -> None:
         base = SlotAddress(self.print_buffer())
+        if not isinstance(width, int):
+            # The character is stored after the padding and not before it:
+            # `pad_runtime` writes its own character into the same first byte
+            # of this buffer, so a character put there first is padded over.
+            held = self.materialize(expression)
+            if "-" not in flags:
+                self.pad_runtime(
+                    _binary("sub", width, IntConstant(1)), IntConstant(32)
+                )
+            self.emit(HeapStore(base, held, 1))
+            self.put_runtime(base, IntConstant(1))
+            if "-" in flags:
+                self.pad_runtime(
+                    _binary("sub", width, IntConstant(1)), IntConstant(32)
+                )
+            else:
+                self.pad_runtime(
+                    _binary("sub", _negated(width), IntConstant(1)), IntConstant(32)
+                )
+            return
         self.emit(HeapStore(base, expression, 1))
         if width > 1 and "-" not in flags:
             self.put(b" " * (width - 1))
@@ -7488,7 +7562,7 @@ class Lowerer:
         self,
         pointer: IntExpression,
         flags: str = "",
-        width: int = 0,
+        width: object = 0,
         read: int = 1,
     ) -> None:
         """Write a string out. `read` is how wide one of its characters is."""
@@ -7523,6 +7597,8 @@ class Lowerer:
         self.put_runtime(IntLoad(pointer_slot), IntLoad(length_slot), read)
         if width and "-" in flags:
             self.pad_forward(width, IntLoad(length_slot))
+        elif not isinstance(width, int):
+            self.pad_forward(_negated(width), IntLoad(length_slot))
 
     def emit_sign(
         self,
@@ -7623,11 +7699,11 @@ class Lowerer:
         self.emit(Jump(top))
         self.emit(Label(end))
 
-    def pad_forward(self, width: int, written: IntExpression) -> None:
+    def pad_forward(self, width: object, written: IntExpression) -> None:
         """Write spaces after what was emitted, for a left-aligned field."""
 
         left = self.new_temp()
-        self.emit(Store(left, _binary("sub", IntConstant(width), written)))
+        self.emit(Store(left, _binary("sub", _width_of(width), written)))
         top = self.new_label("pad_right")
         end = self.new_label("pad_right_end")
         self.emit(Label(top))
@@ -7722,18 +7798,34 @@ class Lowerer:
         )
         # Zero padding goes between the sign and the digits, which is why it
         # is written before the sign and space padding after it.
-        if width and "0" in flags and "-" not in flags:
+        given = not isinstance(width, int)
+        if width and not given and "0" in flags and "-" not in flags:
             room = width - (1 if signed and ("+" in flags or " " in flags) else 0)
             self.pad_back(buffer, index_slot, room, 48, signed, negative_slot)
         if signed:
             self.emit_sign(buffer, index_slot, negative_slot, flags)
-        if width and ("0" not in flags or "-" in flags):
+        if width and not given and ("0" not in flags or "-" in flags):
             if "-" not in flags:
                 self.pad_back(buffer, index_slot, width, 32, False, None)
-        self.put_runtime(
-            _binary("add", buffer, IntLoad(index_slot)),
-            _binary("sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)),
+        written = _binary(
+            "sub", IntConstant(self._BUFFER_BYTES), IntLoad(index_slot)
         )
+        if given and "-" not in flags:
+            # In front of the digits and into the output rather than into the
+            # buffer. The buffer is a fixed frame filled backwards, so a count
+            # that is not known while compiling has no bound that can be
+            # checked against it - and the output has no bound to check.
+            length = self.new_temp()
+            self.emit(Store(length, written))
+            self.pad_runtime(
+                _binary("sub", _width_of(width), IntLoad(length)), IntConstant(32)
+            )
+            written = IntLoad(length)
+            self.put_runtime(_binary("add", buffer, IntLoad(index_slot)), written)
+            # And the other side, for a width that came over negative.
+            self.pad_forward(_negated(width), IntLoad(length))
+            return
+        self.put_runtime(_binary("add", buffer, IntLoad(index_slot)), written)
         if width and "-" in flags:
             self.pad_forward(
                 width,
