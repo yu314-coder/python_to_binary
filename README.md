@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,006 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,012 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; 314 C and C++ programs whose output matches `clang++`, built for all
@@ -959,6 +959,30 @@ A name it does not declare is a name the compiler reports, rather than one
 that compiles and fails to resolve; and on a target that is not Windows the
 header says so instead of letting the program build against declarations that
 cannot bind.
+
+**Two ways that carrying went silently wrong**, both found by building a real
+project rather than a test. A build that is wrong about what it carries says
+nothing: it reports success, and what fails is the program, later, on somebody
+else's machine.
+
+*A library named without its suffix was not carried.* `--library
+WebView2Loader` is how the component names itself and how a `CMakeLists.txt`
+asks for it - `find_library(NAMES WebView2LoaderStatic WebView2Loader)`. The
+step that resolves symbols took the bare name; the step that puts the file
+beside the program wanted `.dll` and skipped it without a word. So the build
+succeeded, the symbols bound, and the program could not start, because the
+library it loads at run time was not there. A bare name is given the suffix
+its target spells - `.dll`, `.dylib`, `.so`.
+
+*A source directory named relatively was never looked above.* The finder that
+reads what a program opens walks one level up from the sources, because
+`src/main.cpp` naming `web` means `../web` nearly every time. `build.py
+src/main.cpp` hands it `src` - and `Path("src").parent` is `Path(".")`, whose
+parent is itself, so the walk stopped on its first step and the directory
+above was never searched. Handed an absolute path the same finder had always
+worked, which is why nothing caught it: the build carried nothing, said
+nothing, and produced a program with no pages to show. The directory is
+resolved before anything walks up from it.
 
 **And so are its pieces.** The SDK splits `<windows.h>` across a dozen files,
 and a program is as likely to include one of those - `winnt.h`, `windef.h`,

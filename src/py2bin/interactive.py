@@ -1354,6 +1354,12 @@ def _what_the_c_opens(sources: "list[Path]", here: Path) -> "list[Path]":
             if spelled.strip(". ") == "":
                 continue
             named.add(spelled)
+    # Resolved before anything walks up from it. `Path("src").parent` is
+    # `Path(".")`, whose parent is itself - so a relative path stopped the
+    # walk on its first step and the directory above the sources was never
+    # looked in. Which is the one that matters: `src/main.cpp` opening `web`
+    # means `../web` nearly every time.
+    here = here.resolve()
     roots = [here]
     walk = here
     for _step in range(_UP_FROM_SOURCE):
@@ -1431,9 +1437,24 @@ def _carry_libraries(
     # first for what is needed to run.
     cache = program.parent / CACHE_DIRECTORY / ".cache"
     architecture = target.rsplit("-", 1)[-1]
+    #: What a shared library is called on each target. A name written without
+    #: one is the name the loader will look for, spelled the way that target
+    #: spells it - which is what has to go beside the program.
+    suffix = {"windows": ".dll", "darwin": ".dylib"}.get(
+        target.split("-", 1)[0], ".so"
+    )
     for spelled in libraries:
         name = spelled.partition(":")[0].strip()
-        if not name.lower().endswith(".dll"):
+        if not name:
+            continue
+        if "." not in Path(name).name:
+            # `--library WebView2Loader` is how the component names itself and
+            # how a CMakeLists asks for it. Read as a filename it is not one,
+            # and the library was left behind without a word: the build
+            # succeeded, the symbols resolved, and the program could not
+            # start because the file it loads at run time was not there.
+            name += suffix
+        if not name.lower().endswith(suffix):
             continue
         beside = output.parent / name
         if beside.is_file():
