@@ -94,121 +94,117 @@ def main() -> int:
     sys.path.insert(0, str(SOURCE))
     from py2bin.interactive import main as ask
 
-    read = _read_arguments(sys.argv[1:])
-    if read[0] is _BAD:
+    answers = _read_arguments(sys.argv[1:])
+    if answers is None:
         return 2
-    where, target, method, includes, fetch, defines, libraries, watch = read
-    return ask(
-        where, target, method, includes, fetch, defines, libraries, watch
-    )
+    return ask(**answers)
 
 
-#: What `_read_arguments` returns when it could not read them.
-_BAD = object()
+#: Every question this can answer in advance, and what it answers with when
+#: nothing is said. The names are `py2bin.interactive.main`'s own parameters,
+#: so an answer added there is added here by writing it down once.
+_ANSWERS = {
+    "where": None,
+    "target": None,
+    "method": None,
+    "include_dirs": (),
+    "auto_fetch": False,
+    "defines": (),
+    "libraries": (),
+    "watch": True,
+    "onefile": True,
+}
+
+#: The options that take a value, and which answer each fills in. Repeatable
+#: ones collect; the rest replace.
+_TAKES_A_VALUE = {
+    "--target": ("target", False),
+    "--how": ("method", False),
+    "--include": ("include_dirs", True),
+    "-I": ("include_dirs", True),
+    "--define": ("defines", True),
+    "-D": ("defines", True),
+    "--library": ("libraries", True),
+    "-l": ("libraries", True),
+}
+
+#: The options that are a yes or a no on their own.
+_SWITCHES = {
+    "--auto-fetch": ("auto_fetch", True),
+    "--watch": ("watch", True),
+    "--no-watch": ("watch", False),
+    "--onefile": ("onefile", True),
+    "--no-onefile": ("onefile", False),
+}
+
+#: What each is for, in the order `--help` should list them.
+_EXPLAINED = (
+    ("--target NAME", "which machine, without being asked"),
+    ("--how NAME", "compile-capi, freeze, or compile"),
+    ("--include DIR", "where to look for headers (repeatable)"),
+    ("--auto-fetch", "download a header or library this cannot find here"),
+    ("--define NAME", "define a macro before the file is read"),
+    ("--library NAME", "a DLL a called function lives in (repeatable)"),
+    ("--no-watch", "do not run the program to see what it opens"),
+    ("--no-onefile", "leave what is carried beside the program"),
+)
 
 
-def _read_arguments(
-    given: "list[str]",
-) -> "tuple[str | None, str | None, str | None, tuple[str, ...], bool, tuple[str, ...], tuple[str, ...]]":
-    """The path, and any of the three questions answered in advance.
+def _read_arguments(given: "list[str]") -> "dict | None":
+    """The path, and any of the questions answered in advance. None if unread.
 
         python3 build.py app.py
         python3 build.py app.cpp --target windows-arm64
-        python3 build.py app.cpp --include vendor/include
-        python3 build.py app.py --target linux-x86_64 --how freeze
         python3 build.py app.cpp --auto-fetch
         python3 build.py app.c --define NDEBUG -D VERSION=3
         python3 build.py app.cpp --library WebView2Loader.dll
-        python3 build.py app.py --no-watch
+        python3 build.py app.py --no-watch --no-onefile
 
-    Answering them on the command line is what lets a script use this same
-    entry point rather than a different one - a build that is only reachable
-    by typing at it is a build nothing can check.
+    Answering them here is what lets a script use this same entry point
+    rather than a different one - a build that is only reachable by typing at
+    it is a build nothing can check.
 
-    `--include` may be given more than once. Directories called `include`,
-    `inc`, `headers` or `src` beside the program are searched anyway; this is
-    for headers that live somewhere else.
-
-    `--auto-fetch` says that a header py2bin cannot find here may be looked
-    up in a package index and downloaded. Without it nothing reaches the
-    network, which is what keeps a build the same on a machine with none.
-
-    `--define NAME` or `--define NAME=VALUE` (`-D` for short, repeatable) is
-    what a header means when it says you must define something: `py2bin cc`
-    has always taken these and this entry point had not, so the one thing a
-    header asked for could not be given to it the documented way.
-
-    The program is run once, here, and the files it opened are added to the
-    ones reading it found. Reading finds every branch without taking any;
-    running takes one branch and finds what only that branch knows - a path
-    read out of a config file, say. Neither is the whole answer, so the two
-    are added together. `--no-watch` turns the run off, for a program that
-    should not be started here - one that writes, sends, or wants a
-    password.
-
-    `--library NAME.dll` (repeatable) names a shared library holding a
-    function the program calls and never defines. With `--auto-fetch` this is
-    usually not needed: the component that declared the function shipped the
-    library too, and py2bin reads what that library exports to find out which
-    one it is. It is here for a header supplied by hand, where there is no
-    package to look in.
+    Read into a dict rather than a tuple in a fixed order. The tuple grew a
+    field every time this learned another answer, and every caller and every
+    early return had to grow with it in the same order; one of them did not,
+    and the mistake was silent until something ran.
     """
 
-    where = target = method = None
-    fetch = False
-    includes: "list[str]" = []
-    defines: "list[str]" = []
-    libraries: "list[str]" = []
-    watch = True
+    answers = dict(_ANSWERS)
+    collected: "dict[str, list[str]]" = {}
     index = 0
     while index < len(given):
         piece = given[index]
-        if piece in (
-            "--target", "--how", "--include", "-I", "--define", "-D",
-            "--library", "-l",
-        ):
+        if piece in _TAKES_A_VALUE:
             if index + 1 >= len(given):
                 print(f"{piece} needs a value after it.")
-                return _BAD, None, None, (), False, (), (), False
-            if piece == "--target":
-                target = given[index + 1]
-            elif piece == "--how":
-                method = given[index + 1]
-            elif piece in ("--define", "-D"):
-                defines.append(given[index + 1])
-            elif piece in ("--library", "-l"):
-                libraries.append(given[index + 1])
+                return None
+            key, repeats = _TAKES_A_VALUE[piece]
+            if repeats:
+                collected.setdefault(key, []).append(given[index + 1])
             else:
-                includes.append(given[index + 1])
+                answers[key] = given[index + 1]
             index += 2
             continue
-        if piece == "--auto-fetch":
-            fetch = True
-            index += 1
-            continue
-        if piece in ("--watch", "--no-watch"):
-            watch = piece == "--watch"
+        if piece in _SWITCHES:
+            key, value = _SWITCHES[piece]
+            answers[key] = value
             index += 1
             continue
         if piece in ("-h", "--help"):
             print(__doc__.strip().split("\n\n")[0])
-            print("\n  --target NAME    which machine, without being asked")
-            print("  --how NAME       compile-capi, freeze, or compile")
-            print("  --include DIR    where to look for headers (repeatable)")
-            print("  --auto-fetch     download a header this cannot find here")
-            print("  --define NAME    define a macro before the file is read")
-            print("  --library NAME   a DLL a called function lives in")
-            print("  --no-watch       do not run it to see what it opens")
-            return _BAD, None, None, (), False, (), (), False
+            print()
+            for spelled, why in _EXPLAINED:
+                print(f"  {spelled:16s} {why}")
+            return None
         if piece.startswith("-"):
             print(f"{piece} is not an option this understands.")
-            return _BAD, None, None, (), False, (), (), False
-        where = piece
+            return None
+        answers["where"] = piece
         index += 1
-    return (
-        where, target, method, tuple(includes), fetch, tuple(defines),
-        tuple(libraries), watch,
-    )
+    for key, values in collected.items():
+        answers[key] = tuple(values)
+    return answers
 
 
 if __name__ == "__main__":

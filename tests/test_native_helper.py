@@ -329,3 +329,63 @@ class OneFileMatchesWhatItLaunches(unittest.TestCase):
             elf.write_bytes(b"\x7fELF" + b"\0" * 64)
             self.assertFalse(_is_windowed(elf))
             self.assertFalse(_is_windowed(Path(where) / "nothing-here"))
+
+
+class BuildScriptAnswersMatchTheEntryPoint(unittest.TestCase):
+    """Every answer `build.py` collects is one `interactive.main` takes.
+
+    They were a tuple in a fixed order, and the tuple grew a field each time
+    this learned another answer - every caller and every early return had to
+    grow with it, in the same order. One of them did not, and the mistake was
+    silent until something ran. A dict keyed by the parameter's own name
+    cannot drift that way, and this makes sure the names stay real ones.
+    """
+
+    def _script(self):
+        import importlib.util
+
+        where = Path(__file__).resolve().parent.parent / "build.py"
+        spec = importlib.util.spec_from_file_location("py2bin_build", where)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_every_answer_is_a_parameter_of_main(self) -> None:
+        import inspect
+
+        from py2bin.interactive import main
+
+        script = self._script()
+        takes = set(inspect.signature(main).parameters)
+        for name in script._ANSWERS:
+            self.assertIn(name, takes, f"build.py answers {name!r}, main does not")
+
+    def test_every_option_fills_in_an_answer(self) -> None:
+        script = self._script()
+        for spelled, (name, _repeats) in script._TAKES_A_VALUE.items():
+            self.assertIn(name, script._ANSWERS, spelled)
+        for spelled, (name, _value) in script._SWITCHES.items():
+            self.assertIn(name, script._ANSWERS, spelled)
+
+    def test_the_reader_answers_what_it_was_given(self) -> None:
+        script = self._script()
+        answers = script._read_arguments(
+            [
+                "app.cpp", "--target", "windows-x86_64", "--auto-fetch",
+                "-I", "one", "--include", "two",
+                "--library", "A.dll", "-l", "B.dll",
+                "--no-watch", "--no-onefile",
+            ]
+        )
+        self.assertEqual(answers["where"], "app.cpp")
+        self.assertEqual(answers["target"], "windows-x86_64")
+        self.assertTrue(answers["auto_fetch"])
+        self.assertEqual(answers["include_dirs"], ("one", "two"))
+        self.assertEqual(answers["libraries"], ("A.dll", "B.dll"))
+        self.assertFalse(answers["watch"])
+        self.assertFalse(answers["onefile"])
+
+    def test_an_option_with_no_value_is_refused(self) -> None:
+        script = self._script()
+        self.assertIsNone(script._read_arguments(["app.py", "--target"]))
+        self.assertIsNone(script._read_arguments(["--not-an-option"]))

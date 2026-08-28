@@ -298,6 +298,7 @@ def main(
     defines: "tuple[str, ...]" = (),
     libraries: "tuple[str, ...]" = (),
     watch: bool = True,
+    onefile: bool = True,
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -322,6 +323,11 @@ def main(
     finding that out on somebody else's machine is worse than the cost of a
     run here. Pass `watch=False` where running the program is not wanted -
     it may write, send, or want a password.
+
+    `onefile` folds whatever is carried beside a compiled program into the
+    program, so there is one thing to send. `onefile=False` leaves the
+    pieces where they are, which is what somebody debugging wants and what
+    somebody shipping a folder wants.
     """
 
     # Everything is said on stdout. Some editors show only that, and an
@@ -383,7 +389,8 @@ def main(
 
     if program.suffix in _SOURCE_SUFFIXES:
         return _build_c(
-            program, target, include_dirs, auto_fetch, defines, libraries
+            program, target, include_dirs, auto_fetch, defines, libraries,
+            onefile,
         )
 
     system = target.split("-")[0]
@@ -1159,6 +1166,7 @@ def _build_c(
     auto_fetch: bool = False,
     defines: "tuple[str, ...]" = (),
     libraries: "tuple[str, ...]" = (),
+    onefile: bool = True,
 ) -> int:
     """Compile a C or C++ program, and everything beside it, into one binary.
 
@@ -1251,7 +1259,7 @@ def _build_c(
     beside = _carry_libraries(
         program, result.artifact, target, libraries, auto_fetch
     )
-    if beside:
+    if beside and onefile:
         # One file to send. A program that needs a second file beside it is
         # a program somebody has to be told about, and being told is the
         # step that gets missed.
@@ -1265,6 +1273,11 @@ def _build_c(
         say(
             f"\n  folded {', '.join(path.name for path in beside)} into the "
             f"program ({held} files, {total // 1024} KB)"
+        )
+    elif beside:
+        say(
+            f"\n  {', '.join(path.name for path in beside)} sits beside the "
+            f"program and has to travel with it"
         )
     say(f"\n  done: {result.artifact}")
     _say_what_it_runs_on(result.artifact, target)
