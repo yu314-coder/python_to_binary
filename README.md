@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,019 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 314 C and C++ programs whose output matches `clang++`, built for all
+programs; 324 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -813,6 +813,56 @@ things. Which ones exist is asked of the headers py2bin's C ships rather than
 kept as a list beside them - written as a list it went stale, and a program
 including `<cstdarg>` was told py2bin does not implement it while
 `<stdarg.h>` sat in the same build.
+
+**Ten more of the language, found by asking what it still could not do.**
+Fourteen programs written against features nothing here had been asked for.
+One of them built. Thirteen do now.
+
+*A function template whose result is a template* - `template <class T>
+std::vector<T> collect()` - was not read as a function at all. The pattern
+that finds one reads a return type as word characters and stars, and `<T>` is
+neither, so a great many of the functions in a real header were invisible.
+That one blocked the rest: py2bin's own `<optional>` could not be written
+until it was fixed.
+
+*Variadic templates* unrolled correctly and never stopped. `total(1)` matches
+both `total(T)` and `total(T, R...)` with nothing in its pack, C++ picks the
+first as the more specialised, and this picked the second - so the last step
+of every recursion called `total()` with no arguments. The copy without a
+pack is tried first now, and a call it settles is not offered to a copy with
+one. Only to a copy with one: two guarded copies of a name both deduce, the
+guard being what tells them apart, so neither may shut the other out.
+
+*`if constexpr`* is chosen while translating, which is the point of it: the
+arm that loses is the arm C++ never compiles, and left as an ordinary `if`
+both reach the C compiler. The condition is worked out from literals, from
+`sizeof` of a type whose size is the same on every target, and from the
+constants a trait's `::value` becomes - and where it cannot be settled it is
+refused, because guessing which arm survives is the one thing that must not
+happen.
+
+*Structured bindings*, *`new` on a plain struct* - which emitted an allocator
+it never defined - and `<optional>`, `<list>`, `<deque>` and `<tuple>`, each
+written in py2bin's own subset. `std::get<0>(t)` is rewritten to the member
+it names, because it spells one template argument and leaves the rest to be
+deduced, which is a shape nothing here writes out.
+
+**Multiple inheritance, as far as it can go without being wrong.** A class may
+name several bases now. The first is at offset zero, as it always was; the
+rest are members after it, and reaching one means naming the member it
+became - so what used to be a depth counted along one chain is a *path*
+along whichever chain the base is on. Construction and destruction run in the
+order C++ says, both ways round.
+
+What is *not* done is the pointer. A second base sits after the first, so
+converting a `Thing *` to its second base has to move the address, and that
+has to happen everywhere such a conversion can occur - arguments, yes, but
+also every initialisation, assignment, return and cast. py2bin has no type
+checker, and a site missed there is a wrong answer rather than a failure:
+`Counted *c = &t;` produced a number with nothing to do with the object, and
+compiled. So taking a pointer or a reference to a second base is refused by
+name, with the two ways out. Inheriting behaviour and using it on the object -
+which is what a mix-in is for - works.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that
