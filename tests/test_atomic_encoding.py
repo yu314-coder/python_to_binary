@@ -19,8 +19,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from py2bin.native.arm64 import _atomic_add_words
-from py2bin.native.x86_64 import _LOCK_XADD
+from py2bin.native.arm64 import _atomic_add_words, _atomic_swap_words
+from py2bin.native.x86_64 import _LOCK_XADD, _XCHG
 
 #: What the ARM64 words are meant to say, in the order they are emitted.
 _ARM64_SOURCE = """
@@ -37,6 +37,22 @@ loop:
 _X86_SOURCE = """
 .text
     lock xadd %rax, (%rcx)
+"""
+
+#: The exchange, which the mutex is built on.
+_ARM64_SWAP_SOURCE = """
+.text
+loop:
+    ldaxr x2, [x0]
+    stlxr w4, x1, [x0]
+    cbnz  w4, loop
+    mov   x0, x2
+"""
+
+#: No `lock` written: an exchange with a memory operand is locked anyway.
+_X86_SWAP_SOURCE = """
+.text
+    xchg %rax, (%rcx)
 """
 
 
@@ -119,6 +135,29 @@ class AtomicEncoding(unittest.TestCase):
 
     def test_the_x86_bytes_begin_with_the_lock_prefix(self):
         self.assertEqual(_LOCK_XADD[0], 0xF0)
+
+    def test_the_arm64_swap_words_are_the_instructions_they_claim(self):
+        wanted = _assembled(_ARM64_SWAP_SOURCE, "arm64-apple-macos")
+        if wanted is None:
+            self.skipTest("no assembler for arm64 on this machine")
+        got = b"".join(struct.pack("<I", one) for one in _atomic_swap_words())
+        self.assertEqual(got.hex(), wanted[: len(got)].hex())
+
+    def test_the_arm64_swap_branch_goes_back_to_the_load(self):
+        """Two instructions back this time, not three: there is no add."""
+
+        branch = _atomic_swap_words()[2]
+        self.assertEqual(branch >> 24, 0x35, "not a CBNZ")
+        offset = (branch >> 5) & 0x7FFFF
+        if offset >= 1 << 18:
+            offset -= 1 << 19
+        self.assertEqual(offset, -2)
+
+    def test_the_x86_exchange_is_the_instruction_it_claims(self):
+        wanted = _assembled(_X86_SWAP_SOURCE, "x86_64-apple-macos")
+        if wanted is None:
+            self.skipTest("no assembler for x86-64 on this machine")
+        self.assertEqual(_XCHG.hex(), wanted[: len(_XCHG)].hex())
 
 
 if __name__ == "__main__":

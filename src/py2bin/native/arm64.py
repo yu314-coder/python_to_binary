@@ -27,6 +27,7 @@ from .ir import (
     HeapLoad,
     HeapStore,
     AtomicAdd,
+    AtomicSwap,
     IntBinary,
     IntCompare,
     IntConstant,
@@ -64,6 +65,22 @@ _ARM64_LOADS = {
     (1, False): 0x39400000,  # ldrb  w0, [x0]
     (1, True): 0x39800000,  # ldrsb x0, [x0]
 }
+def _atomic_swap_words() -> "list[int]":
+    """Put x1 in the word at x0, leaving what was there in x0.
+
+    The same exclusive pair as the add, without the add: nothing is read to
+    compute the new value, so the load is only there to take the mark that
+    the store checks. Checked against an assembler by the same test.
+    """
+
+    return [
+        0xC85FFC02,  # ldaxr x2, [x0]
+        0xC804FC01,  # stlxr w4, x1, [x0]
+        0x35FFFFC4,  # cbnz  w4, -2 instructions - back to the ldaxr
+        0xAA0203E0,  # mov   x0, x2  - what was there before
+    ]
+
+
 def _atomic_add_words() -> "list[int]":
     """Add x1 to the word at x0, leaving what was there in x0.
 
@@ -1050,6 +1067,17 @@ def encode_windows(
                 words.extend(_mov(4, 0))
                 call("WriteFile")
                 continue
+            if isinstance(operation, AtomicSwap):
+                _expression(words, operation.address, slot_base, refs)
+                words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+                _expression(words, operation.value, slot_base, refs)
+                words.append(0xAA0003E1)                # mov x1, x0
+                words.extend((0xF94003E0, 0x910043FF))  # ldr x0,[sp]; add sp,#16
+                words.extend(_atomic_swap_words())
+                words.extend(
+                    _slot_instruction(False, operation.dest_slot, slot_base)
+                )
+                continue
             if isinstance(operation, AtomicAdd):
                 _expression(words, operation.address, slot_base, refs)
                 words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
@@ -1383,6 +1411,17 @@ def _emit_operations(
             words.extend(_slot_instruction(False, operation.dest_slot, slot_base, rt=1))
             words.append(0x8B000020)  # add x0, x1, x0  (new bump)
             words.extend(_slot_instruction(False, operation.bump_slot, slot_base))
+            continue
+        if isinstance(operation, AtomicSwap):
+            _expression(words, operation.address, slot_base, refs)
+            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+            _expression(words, operation.value, slot_base, refs)
+            words.append(0xAA0003E1)                # mov x1, x0
+            words.extend((0xF94003E0, 0x910043FF))  # ldr x0,[sp]; add sp,#16
+            words.extend(_atomic_swap_words())
+            words.extend(
+                _slot_instruction(False, operation.dest_slot, slot_base)
+            )
             continue
         if isinstance(operation, AtomicAdd):
             _expression(words, operation.address, slot_base, refs)

@@ -29,6 +29,7 @@ from .ir import (
     HeapLoad,
     HeapStore,
     AtomicAdd,
+    AtomicSwap,
     IntBinary,
     IntCompare,
     IntConstant,
@@ -484,6 +485,11 @@ _LOAD_ARGUMENT = (
 #: share and one they may not.
 _LOCK_XADD = b"\xf0\x48\x0f\xc1\x01"
 
+#: `xchg [rcx], rax`. No `lock` prefix: an exchange with a memory operand is
+#: locked whether or not one is written, which is the one place on x86 where
+#: that is true and worth saying rather than leaving to be wondered about.
+_XCHG = b"\x48\x87\x01"
+
 _SPILL = b"\x48\x83\xec\x10\x48\x89\x04\x24"  # sub rsp,16; mov [rsp],rax
 # mov <reg>, [rsp + disp32] for each argument register, in order.
 #: `mov <argument register>, [rsp+disp32]`, in System V's order.
@@ -863,6 +869,18 @@ def _emit_x86_operations(
             code.extend(b"\x48\x89\x8d" + struct.pack("<i", slot_base + operation.dest_slot * 8))
             code.extend(b"\x48\x01\xc8")
             code.extend(b"\x48\x89\x85" + struct.pack("<i", slot_base + operation.bump_slot * 8))
+        elif isinstance(operation, AtomicSwap):
+            _expression(code, operation.value, slot_base, refs)
+            code.extend(_SPILL)
+            _expression(code, operation.address, slot_base, refs)
+            code.extend(b"\x48\x89\xc1")      # mov rcx, rax
+            code.extend(b"\x48\x8b\x04\x24")  # mov rax, [rsp] (value)
+            code.extend(_DROP)
+            code.extend(_XCHG)
+            code.extend(
+                b"\x48\x89\x85"
+                + struct.pack("<i", slot_base + operation.dest_slot * 8)
+            )
         elif isinstance(operation, AtomicAdd):
             # The value first and the address second, so the address is in
             # rax when the spill of the value is read back.
@@ -1338,6 +1356,19 @@ def encode_windows(
                 code.extend(b"\x4c\x8d\x4c\x24\x28")  # lea r9, [rsp+0x28]
                 code.extend(b"\x48\xc7\x44\x24\x20\x00\x00\x00\x00")
                 indirect_call("WriteFile")
+                continue
+            if isinstance(operation, AtomicSwap):
+                _expression(code, operation.value, slot_base, refs)
+                code.extend(_SPILL)
+                _expression(code, operation.address, slot_base, refs)
+                code.extend(b"\x48\x89\xc1")      # mov rcx, rax
+                code.extend(b"\x48\x8b\x04\x24")  # mov rax, [rsp] (value)
+                code.extend(_DROP)
+                code.extend(_XCHG)
+                code.extend(
+                    b"\x48\x89\x85"
+                    + struct.pack("<i", slot_base + operation.dest_slot * 8)
+                )
                 continue
             if isinstance(operation, AtomicAdd):
                 # The value first and the address second, so the address is

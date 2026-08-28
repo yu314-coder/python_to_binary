@@ -114,6 +114,7 @@ from .native.ir import (
     GlobalAddress,
     FileCall,
     AtomicAdd,
+    AtomicSwap,
     HeapInit,
     HeapLoad,
     HeapStore,
@@ -4747,8 +4748,13 @@ class Lowerer:
         self.emit(HeapInit(slot, ARENA_BYTES))
         return Value(PointerType(VOID), IntLoad(slot))
 
-    def atomic_add_builtin(self, node: Call) -> Value:
+    def atomic_add_builtin(self, node: Call, swap: bool = False) -> Value:
         """`__py2bin_atomic_add(&word, n)` - add, and answer what was there.
+
+        `__py2bin_atomic_swap(&word, v)` is the same shape and puts the value
+        there instead of adding it. Two operations and no more: an add moves
+        a bump pointer, and an exchange takes a lock. Everything else a
+        program might want is refused, and says so.
 
         The one atomic py2bin emits, and the smallest one an allocator two
         threads share can be built on: a bump pointer moved with this hands
@@ -4762,7 +4768,8 @@ class Lowerer:
 
         if len(node.arguments) != 2:
             self.error(
-                "__py2bin_atomic_add(address, value) takes two arguments",
+                f"__py2bin_atomic_{'swap' if swap else 'add'}(address, value) "
+                f"takes two arguments",
                 node.token,
             )
         address = self.rvalue(node.arguments[0])
@@ -4780,9 +4787,8 @@ class Lowerer:
                 node.arguments[1].token,
             )
         slot = self.take(8)
-        self.emit(
-            AtomicAdd(slot, address.expr, self.fit(value.expr, LONG))
-        )
+        made = AtomicSwap if swap else AtomicAdd
+        self.emit(made(slot, address.expr, self.fit(value.expr, LONG)))
         return Value(LONG, IntLoad(slot))
 
     def file_builtin(self, node: Call) -> Value:
@@ -4874,6 +4880,11 @@ class Lowerer:
             and node.name not in self.unit.functions
         ):
             return self.atomic_add_builtin(node)
+        if (
+            node.name == "__py2bin_atomic_swap"
+            and node.name not in self.unit.functions
+        ):
+            return self.atomic_add_builtin(node, swap=True)
         if node.name in _FILE_BUILTINS and node.name not in self.unit.functions:
             return self.file_builtin(node)
         if node.name in _EXIT_BUILTINS and node.name not in self.unit.functions:

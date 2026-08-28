@@ -10,10 +10,10 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,027 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 333 C and C++ programs whose output matches `clang++`, built for all
+programs; 336 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -978,6 +978,30 @@ where there is no assembler for an architecture it says so and skips, rather
 than passing on nothing. The plain `ldxr`/`stxr` were wrong too: they order
 nothing, and ARM64 does not order stores on its own, which is exactly what
 the allocator leans on when one thread maps the arena and another waits.
+
+**`<atomic>` and `<mutex>`, over those two instructions.** A load is an add of
+nothing; a store is an exchange whose answer is dropped; a mutex is that
+exchange in a loop, which is what a test-and-set lock is. The memory order a
+program passes is accepted and ignored, and the header says why rather than
+leaving it implied: both instructions are already sequentially consistent -
+`lock` on x86-64, the acquiring and releasing pair on ARM64 - so every
+operation is stronger than any order that can be asked for. A thread that
+cannot take a lock spins rather than sleeping, because there is no way here to
+ask the kernel to wait; that is written down too.
+
+**A class template may be named without its arguments.** `std::lock_guard
+lock(m);` is how C++17 writes one, and py2bin needs the arguments written down
+because it writes a copy per set of them. They are worked out from the
+constructor's parameters against the types of what is passed - the same
+reading a function template's call already gets - and written down before the
+copies are made.
+
+**`&m` on a reference gave a dereference.** `p = &m;` inside a constructor
+came out as `this->p = *m;`, the address asked for turned into the object.
+The rule that makes `x = ref` into `x = *ref` - right, because the pointer is
+how a reference is carried - ran after the `&` had been taken off, and once it
+is off there is nothing left to tell the two apart. Its own guard already
+excluded a leading `&`; it only had to run first.
 
 **Threads are refused, and the reason is the interesting part.** py2bin emits
 no atomic instruction on any target - `_Atomic` is refused in the C front end

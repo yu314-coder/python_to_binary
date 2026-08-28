@@ -6454,6 +6454,96 @@ def _rewrite_variant_alternatives(text: str) -> str:
     return "".join(out)
 
 
+#: `template <typename M> class lock_guard {` - a class template's head, with
+#: its parameters.
+_CLASS_TEMPLATE_HEAD = re.compile(
+    r"(?<![.\w>])template\s*<([^<>]*)>\s*(?:class|struct)\s+([A-Za-z_]\w*)\s*\{"
+)
+
+#: `lock_guard hold(m);` - a class template named without its arguments, which
+#: C++17 works out from what the constructor is handed.
+_DEDUCED_CLASS = re.compile(
+    r"(?<![.\w>:])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*;"
+)
+
+
+def _deduce_class_arguments(text: str) -> str:
+    """`lock_guard hold(m);` becomes `lock_guard<mutex> hold(m);`.
+
+    C++17 lets a class template be named without its arguments where the
+    constructor says what they are. py2bin writes one copy per set of
+    arguments and needs them written down, so they are worked out here and
+    written down - from the constructor's parameters against the types of
+    what is passed, which is the same reading a function template's call
+    already gets.
+
+    Only where every parameter is settled by one argument outright: a
+    constructor taking `T *` where a `T` is deduced from further in is a
+    deduction guide, and a guide is a thing this does not read.
+    """
+
+    heads: "dict[str, tuple[list[str], str]]" = {}
+    bare = _without_literals(text)
+    for head in _CLASS_TEMPLATE_HEAD.finditer(bare):
+        named = [
+            part.split()[-1]
+            for part in _split_arguments(head.group(1))
+            if part.strip() and "..." not in part
+        ]
+        if not named:
+            continue
+        try:
+            closing = _matching(bare, head.end() - 1)
+        except ValueError:
+            continue
+        heads[head.group(2)] = (named, text[head.end(): closing - 1])
+    if not heads:
+        return text
+
+    def written(match: "re.Match[str]") -> "str | None":
+        holds = heads.get(match.group(1))
+        if holds is None or match.group(1) == match.group(2):
+            return None
+        parameters, body = holds
+        given = [
+            one.strip() for one in _split_arguments(match.group(3)) if one.strip()
+        ]
+        if not given:
+            return None
+        # The constructor taking this many, and what each of its parameters
+        # is written as.
+        wanted: "list[str]" = []
+        for one in re.finditer(
+            rf"(?<![.\w>~]){re.escape(match.group(1))}\s*\(([^;{{}}()]*)\)", body
+        ):
+            parts = [
+                part.strip()
+                for part in _split_arguments(one.group(1))
+                if part.strip()
+            ]
+            if len(parts) == len(given):
+                wanted = parts
+                break
+        if not wanted:
+            return None
+        settled: "dict[str, str]" = {}
+        for spelled, value in zip(wanted, given):
+            held = _deduced_type(value, text, match.start())
+            if held is None:
+                return None
+            shape = re.sub(r"\b[A-Za-z_]\w*$", "", spelled).strip()
+            _fits_the_shape(shape, held.strip(), set(parameters), settled, True)
+        if any(one not in settled for one in parameters):
+            return None
+        spelled = ", ".join(settled[one] for one in parameters)
+        return (
+            f"{match.group(1)}<{spelled}> {match.group(2)}"
+            f"({match.group(3)});"
+        )
+
+    return _sub_code(_DEDUCED_CLASS, text, lambda m, whole: written(m))
+
+
 def _rewrite_tuple_get(text: str) -> str:
     """`get<N>(t)` becomes `(t).__N`, which is the member it names.
 
@@ -12828,6 +12918,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Before the copies are written out, because that is what takes the
     # `tuple` pattern out of the text - and the pattern is what says that a
     # `get<0>` here is this one and not a name the program has of its own.
+    # Before the copies are written out: a class named without its arguments
+    # has to have them by the time the copy is asked for.
+    text = _deduce_class_arguments(text)
     text = _rewrite_tuple_get(text)
     text = _rewrite_variant_alternatives(text)
     text = _rewrite_duration_cast(text)
@@ -13773,6 +13866,25 @@ def _deref_references(
 
     for name, held in references.items():
         if held in classes:
+            # `held_ = other;` where `other` is a reference to a class: the
+            # pointer is how the reference is carried, and what is being
+            # assigned is the object it names. Left as the pointer, this was
+            # an assignment of a `T *` to a `T`.
+            #
+            # Before the `&` is taken off below, and not after. This rule
+            # deliberately does not fire on `= &other;` - a `&` in front is
+            # excluded - but once the `&` has been removed there is nothing
+            # left to tell the two apart, so `p = &m;` became `p = *m;`: a
+            # dereference where the address was asked for.
+            body = _map_code(
+                body,
+                lambda part, n=name: re.sub(
+                    rf"(?<![=!<>+\-*/%&|^])=\s*(?<![.\w>&])"
+                    rf"{re.escape(n)}\b\s*;",
+                    f"= *{n};",
+                    part,
+                ),
+            )
             # `&r` on a reference is the address of what it names, which is
             # what the pointer already holds. Taking one of the pointer gave
             # a `T **` - which is what `this == &other` compared against.
@@ -13786,19 +13898,6 @@ def _deref_references(
                 body,
                 lambda part, n=name: re.sub(
                     rf"\b{re.escape(n)}\s*\.", f"{n}->", part
-                ),
-            )
-            # `held_ = other;` where `other` is a reference to a class: the
-            # pointer is how the reference is carried, and what is being
-            # assigned is the object it names. Left as the pointer, this was
-            # an assignment of a `T *` to a `T`.
-            body = _map_code(
-                body,
-                lambda part, n=name: re.sub(
-                    rf"(?<![=!<>+\-*/%&|^])=\s*(?<![.\w>&])"
-                    rf"{re.escape(n)}\b\s*;",
-                    f"= *{n};",
-                    part,
                 ),
             )
             continue
@@ -15130,7 +15229,7 @@ __setprecision setprecision(int n) { __setprecision made; made.__n = n; return m
 #: what is in the way is one thing and it is fixable, and a person reading
 #: the message should be told which thing.
 _NEEDS_ATOMICS = frozenset(
-    {"thread", "mutex", "atomic", "condition_variable", "future",
+    {"thread", "condition_variable", "future",
      "shared_mutex", "latch", "barrier", "semaphore", "stop_token"}
 )
 
@@ -15261,6 +15360,105 @@ public:
     variant(B v) { __1 = v; __tag = 1; }
     variant(C v) { __2 = v; __tag = 2; }
     int index() const { return __tag; }
+};
+}
+"""
+
+#: <atomic>, over the two instructions py2bin emits. Every operation here is
+#: one of them or is written from one: a load is an add of nothing, a store is
+#: an exchange whose answer is dropped.
+#:
+#: The ordering argument is accepted and ignored, which is honest rather than
+#: convenient: both instructions are sequentially consistent - `lock` on
+#: x86-64, the acquiring and releasing pair on ARM64 - so every operation is
+#: already stronger than any order a program can ask for.
+_ATOMIC_HEADER = r"""
+namespace std {
+
+typedef int memory_order;
+const int memory_order_relaxed = 0;
+const int memory_order_acquire = 2;
+const int memory_order_release = 3;
+const int memory_order_acq_rel = 4;
+const int memory_order_seq_cst = 5;
+
+template<typename T>
+class atomic {
+public:
+    long __word;
+    atomic() { __word = 0; }
+    atomic(T value) { __word = (long)value; }
+    T load() const { return (T)__py2bin_atomic_add((long *)&__word, 0); }
+    T load(memory_order o) const { return load(); }
+    void store(T value) { __py2bin_atomic_swap((long *)&__word, (long)value); }
+    void store(T value, memory_order o) { store(value); }
+    T exchange(T value) {
+        return (T)__py2bin_atomic_swap((long *)&__word, (long)value);
+    }
+    T exchange(T value, memory_order o) { return exchange(value); }
+    T fetch_add(T value) {
+        return (T)__py2bin_atomic_add((long *)&__word, (long)value);
+    }
+    T fetch_add(T value, memory_order o) { return fetch_add(value); }
+    T fetch_sub(T value) {
+        return (T)__py2bin_atomic_add((long *)&__word, -(long)value);
+    }
+    T operator=(T value) { store(value); return value; }
+    operator T() const { return load(); }
+};
+
+/* `atomic_flag` is the lock itself, and is the one thing here that is not
+   written over `atomic<T>`: it promises to be lock-free, and being an
+   exchange is how it keeps that promise. */
+class atomic_flag {
+public:
+    long __word;
+    atomic_flag() { __word = 0; }
+    int test_and_set() { return (int)__py2bin_atomic_swap(&__word, 1); }
+    int test_and_set(memory_order o) { return test_and_set(); }
+    void clear() { __py2bin_atomic_swap(&__word, 0); }
+    void clear(memory_order o) { clear(); }
+};
+}
+"""
+
+#: <mutex>, which is that flag and a loop. A thread that cannot take the lock
+#: spins rather than sleeping: py2bin has no way to ask the kernel to wait,
+#: and a spin is correct where a sleep would only be kinder. Said here rather
+#: than found by measuring.
+_MUTEX_HEADER = r"""
+#include <atomic>
+namespace std {
+class mutex {
+public:
+    long __held;
+    mutex() { __held = 0; }
+    void lock() { while (__py2bin_atomic_swap(&__held, 1) != 0) { } }
+    int try_lock() { return __py2bin_atomic_swap(&__held, 1) == 0; }
+    void unlock() { __py2bin_atomic_swap(&__held, 0); }
+};
+
+/* `recursive_mutex` is deliberately absent: telling one thread from another
+   needs a thread identity, and there are no threads yet. */
+
+template<typename M>
+class lock_guard {
+public:
+    M *__held;
+    lock_guard(M &m) { __held = &m; __held->lock(); }
+    ~lock_guard() { __held->unlock(); }
+};
+
+template<typename M>
+class unique_lock {
+public:
+    M *__held;
+    int __owns;
+    unique_lock(M &m) { __held = &m; __held->lock(); __owns = 1; }
+    ~unique_lock() { if (__owns) { __held->unlock(); } }
+    void lock() { __held->lock(); __owns = 1; }
+    void unlock() { __held->unlock(); __owns = 0; }
+    int owns_lock() const { return __owns; }
 };
 }
 """
@@ -16498,6 +16696,8 @@ _BUILTIN_CPP_HEADERS = {
     "optional": _OPTIONAL_HEADER,
     "list": _LIST_HEADER,
     "bitset": _BITSET_HEADER,
+    "atomic": _ATOMIC_HEADER,
+    "mutex": _MUTEX_HEADER,
     "variant": _VARIANT_HEADER,
     # Answered per target, so it is a function rather than a text.
     "chrono": _chrono_header,
@@ -16677,19 +16877,17 @@ def inline_local_includes(
                     raise CppTranslationError(
                         str(path),
                         _line_of(text, match.start()),
-                        f"<{named}> is not implemented, and the reason is "
-                        f"worth having rather than a place in a list. py2bin "
-                        f"emits no atomic instruction on any target - "
-                        f"`_Atomic` is refused for the same reason - and the "
-                        f"heap underneath every program is a bump pointer "
-                        f"read and written without one. Two threads "
-                        f"allocating at once would be handed the same "
-                        f"address, and a `std::string` or a `new` inside a "
-                        f"thread is an allocation. Threads on top of that "
-                        f"would not be slow or limited; they would be wrong, "
-                        f"quietly. What has to come first is an atomic "
-                        f"exchange in the instruction selector for both "
-                        f"architectures, and an allocator that uses it",
+                        f"<{named}> is not implemented yet, and what is "
+                        f"missing is worth naming. py2bin does emit an atomic "
+                        f"add now - `lock xadd` on x86-64, the "
+                        f"`ldaxr`/`stlxr` pair on ARM64 - and the allocator "
+                        f"uses it, so a heap shared between threads is no "
+                        f"longer the thing in the way. What is left is "
+                        f"starting a thread on each platform and the "
+                        f"trampoline that gets a callable to it. Until then "
+                        f"this is refused rather than half-written, because "
+                        f"a thread that runs and is subtly wrong is worse "
+                        f"than one that does not exist",
                     )
                 raise CppTranslationError(
                     str(path),

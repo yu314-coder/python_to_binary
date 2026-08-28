@@ -442,6 +442,21 @@ class AtomicAdd:
 
 
 @dataclass(frozen=True, slots=True)
+class AtomicSwap:
+    """Put ``value`` in the 64-bit word at ``address`` and store what was
+    there before into ``dest_slot`` -- as one indivisible step.
+
+    The second and last atomic py2bin emits. An add cannot write a value
+    without knowing what is there, and a lock cannot be taken without one:
+    taking it *is* writing a one and finding out whether it was already one.
+    """
+
+    dest_slot: int
+    address: IntExpression
+    value: IntExpression
+
+
+@dataclass(frozen=True, slots=True)
 class HeapStore:
     """Store the low ``size`` bytes (1, 2, 4 or 8) of ``value`` at ``address``."""
 
