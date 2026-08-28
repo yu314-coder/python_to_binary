@@ -7812,6 +7812,26 @@ _AROUND_A_NAME = re.compile(
 #: holding an operator's answer is told from one holding a call's.
 _OPERATOR_PREFIX = "__py2bin_operand_"
 
+#: What a returned value is called while the scope is taken apart around it.
+_ANSWER_PREFIX = "__py2bin_answer_"
+
+def _is_a_constant(value: str) -> bool:
+    """Whether nothing can change this between working it out and
+    handing it back.
+
+    `return 1;` needs no temporary. `return alive;` does, because a
+    destructor running in between may be exactly what alters `alive`.
+    """
+
+    spelled = value.strip()
+    if not spelled:
+        return False
+    if spelled in ("true", "false", "nullptr", "NULL"):
+        return True
+    if spelled[0] in "'\"" and spelled[-1] == spelled[0]:
+        return True
+    return bool(re.match(r"^[-+]?\d[\w.]*$", spelled))
+
 
 def _already_a_declaration(text: str, match: "re.Match[str]") -> bool:
     """Whether this call is already the whole initialiser of a declaration.
@@ -8545,6 +8565,13 @@ def _rewrite_body(
         pointers,
     )
 
+    # `string x = "ab", y = "cdef";` declares two objects, and every pass
+    # below reads a declaration as one. Read whole, the constructor call took
+    # `"ab", y = "cdef"` for its argument list and asked for a two-argument
+    # string. Split first, and each half is the declaration those passes
+    # already know.
+    body = _split_object_declarations(body, classes)
+
     # Before the declaration passes: `Node *n = new Node(3);` has to become a
     # call first, or the pointer declaration reads `new Node` as the type.
     # `new int(5)` stores as well as answers, and C has no one expression
@@ -9078,7 +9105,9 @@ def _rewrite_body(
         )
         for number, inner in enumerate(blocks)
     ]
-    body = _close_with_destructors(body, destroyed, known, classes, enclosing)
+    body = _close_with_destructors(
+        body, destroyed, known, classes, enclosing, returns, [0]
+    )
     return _restore_nested(body, rewritten_blocks)
 
 
@@ -9621,6 +9650,20 @@ def _rewrite_operators(
             # and `a + f(1)` are as ordinary as `a + b`, and a pattern that
             # only matched an identifier left them for the C compiler to
             # complain about an operator it does not have.
+            if variable in pointers:
+                # `*this == o` is the object on the left, written the way a
+                # class writes about itself: `operator!=` is nearly always
+                # `!(*this == o)`. The pointer is the address the call
+                # wants, so the dereference is the whole of the difference.
+                #
+                # First, and not after: the plain name matches inside the
+                # dereferenced form, so taken the other way round `*this ==
+                # o` became `*` followed by the call, and the star was left
+                # standing in front of an int.
+                body = _rewrite_binary_operator(
+                    body, f"*{variable}", symbol, owner, name, variable,
+                    known, pointers, classes, scope,
+                )
             body = _rewrite_binary_operator(
                 body, variable, symbol, owner, name, address, known, pointers,
                 classes, scope,
@@ -9749,6 +9792,47 @@ def _rewrite_operators(
     # callables is exactly what a program keeps one of.
     body = _rewrite_dereferenced_calls(body, classes, scope)
     return body
+
+
+#: `T a = x, b = y;` - one type and more than one thing declared with it.
+#: A statement begins at the start of a line, but also right after a `{` or
+#: a `;` - `int main() { string x = "a", y = "b";` is one line and two
+#: statements, and anchoring to the line start missed the second.
+_MANY_DECLARED = re.compile(
+    r"(?m)(?:(?<=^)|(?<=[;{]))([ \t]*)((?:const\s+)?[A-Za-z_]\w*)\s+([^;{}]*?);"
+)
+
+
+def _split_object_declarations(body: str, classes: "dict[str, Class]") -> str:
+    """`T a = x, b = y;` becomes two declarations, because it is two.
+
+    C lets one type introduce several names and so does C++, and every pass
+    that reads a declaration here reads one name. Only where the type names a
+    class: `int *p, q;` declares a pointer and an int, which C handles and
+    this must not touch.
+    """
+
+    def one(match: "re.Match[str]", whole: str) -> "str | None":
+        lead, spelled, rest = match.groups()
+        held = spelled.replace("const", "").strip()
+        if held not in classes:
+            return None
+        pieces = [
+            piece.strip()
+            for piece in _split_arguments(whole[match.start(3): match.end(3)])
+            if piece.strip()
+        ]
+        if len(pieces) < 2:
+            return None
+        # A declarator that is a pointer or an array is a different type from
+        # the one beside it, and splitting would say it was the same.
+        if any(piece.startswith(("*", "&")) for piece in pieces):
+            return None
+        return "".join(f"{lead}{spelled} {piece};\n" for piece in pieces).rstrip(
+            "\n"
+        )
+
+    return _sub_code(_MANY_DECLARED, body, one)
 
 
 def _rewrite_address_of(
@@ -10967,6 +11051,8 @@ def _close_with_destructors(
     known: "dict[str, str]",
     classes: "dict[str, Class]",
     enclosing: "list[tuple[str, str]]" = (),
+    returns: str = "",
+    counter: "list[int] | None" = None,
 ) -> str:
     """Run each destructor where the block ends - including at a `return`.
 
@@ -11024,7 +11110,34 @@ def _close_with_destructors(
                     f"return that instead",
                 )
         out.append(body[at:found.start()])
-        out.append(leaving.strip() + " " + found.group(0))
+        # The answer is worked out *before* anything is taken apart. C++
+        # evaluates the returned expression and then destroys what the scope
+        # held; written the other way round, `return alive;` in a scope whose
+        # destructor decrements `alive` answered with the count after the
+        # destructors rather than before them. It compiled and it was wrong,
+        # which is the worst way to be wrong.
+        # `static` says where the *function* lives, not what it answers. Left
+        # on, the temporary was a static local - initialised once, on the
+        # first call, and the same value ever after.
+        written = " ".join(
+            word for word in returns.split() if word not in _STORAGE
+        )
+        held = written.replace("*", " ").replace("&", " ").strip()
+        if (
+            value
+            and leaving.strip()
+            and held
+            and held not in classes
+            and not _is_a_constant(value)
+        ):
+            counter = counter if counter is not None else [0]
+            counter[0] += 1
+            spelled = f"{_ANSWER_PREFIX}{counter[0]}"
+            out.append(
+                f"{{ {written} {spelled} = {value};{leaving} return {spelled}; }}"
+            )
+        else:
+            out.append(leaving.strip() + " " + found.group(0))
         at = found.end()
     out.append(body[at:])
     body = "".join(out)
@@ -12298,6 +12411,24 @@ def _rewrite_prototypes(text: str, classes: "dict[str, Class]") -> str:
 
     return _sub_code(_PROTOTYPE, text, lambda m, whole: one(m))
 
+def _returns_a_pointer(head: str, held: str) -> str:
+    """`const T &f(` becomes `struct T *f(` - a reference is a pointer here.
+
+    The `const` goes with it: what the reference promised is that the caller
+    would not write through it, and a `const struct T *` says the same thing
+    about the pointer that stands in for it.
+    """
+
+    opened = head.rfind("(")
+    result, rest = head[:opened], head[opened:]
+    # The `&` is written against the name as often as against the type -
+    # `const string &pick` splits into `const`, `string`, `&pick` - so it
+    # comes off the name here rather than being left to become part of it.
+    name = result.split()[-1].lstrip("&*")
+    keeps = "const " if re.search(r"\bconst\b", result) else ""
+    return f"{keeps}struct {held} *{name}{rest}"
+
+
 def _rewrite_functions(
     text: str,
     classes: "dict[str, Class]",
@@ -12364,7 +12495,19 @@ def _rewrite_functions(
         spelled_result = head[:head.rfind("(")].strip() if opened >= 0 else ""
         words = spelled_result.split()
         returned = words[-2] if len(words) >= 2 else ""
-        returns_object = "*" not in spelled_result and returned in shapes
+        # `const string &longest(...)` answers a reference, which is a
+        # pointer here and not the hidden pointer a value return writes
+        # through. Read as a value return it was given both - a `__ret` it
+        # never filled and a `&` in the result type that is not C.
+        by_reference = "&" in spelled_result and returned in shapes
+        if by_reference:
+            head = _returns_a_pointer(head, returned)
+            spelled_result = head[:head.rfind("(")].strip()
+        returns_object = (
+            not by_reference
+            and "*" not in spelled_result
+            and returned in shapes
+        )
         for held, variable in copied:
             # Without the `struct`: the declaration rewriter below adds one,
             # and two is not C.
