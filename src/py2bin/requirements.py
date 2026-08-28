@@ -23,6 +23,11 @@ from pathlib import Path
 #: been checked against the project's own page rather than inferred from the
 #: name, because the failure mode of a wrong guess is downloading a stranger's
 #: package.
+#: Import names whose project is spelled differently, for a package that is
+#: *not* installed on the machine doing the build - a cross build for a
+#: machine this is not, where there is no metadata to read. Consulted after
+#: `packages_distributions`, never instead of it: a list holds the names
+#: somebody thought of, and a program imports the one they did not.
 KNOWN_PROJECTS = {
     "PIL": "pillow",
     "cv2": "opencv-python",
@@ -165,14 +170,40 @@ def required_by(unpacked: Path) -> list[str]:
     return wanted
 
 
+def publisher_of(name: str) -> "str | None":
+    """Which project publishes the module `name`, asked before it is assumed.
+
+    An installed package records the import names it provides, so the machine
+    doing the build already knows the answer for everything on it: `certifi`
+    comes from `certifi`, `PIL` from `pillow`, `yaml` from `PyYAML`. Asking
+    is right where a list is only ever nearly right - a list holds the names
+    somebody thought of, and a program imports the one they did not.
+
+    The list below is what is left: a package that is *not* installed here,
+    which is every cross build for a machine this is not. It is a hint of
+    last resort rather than the first thing consulted.
+    """
+
+    try:
+        from importlib.metadata import packages_distributions
+
+        found = packages_distributions().get(name)
+    except Exception:  # a metadata set this interpreter cannot read
+        found = None
+    if found:
+        # Sorted for a name provided by more than one distribution, so the
+        # same build says the same thing twice running.
+        return sorted(found)[0]
+    return KNOWN_PROJECTS.get(name)
+
+
 def discover(entry: Path) -> Discovered:
     """What ``entry`` needs that is neither its own nor the interpreter's."""
     entry = entry.expanduser().resolve()
     imported, local = _reachable(entry)
     standard = {name for name in imported if name in sys.stdlib_module_names}
     outside = imported - standard - local
-    projects = sorted(
-        {KNOWN_PROJECTS[name] for name in outside if name in KNOWN_PROJECTS}
-    )
-    unknown = sorted(name for name in outside if name not in KNOWN_PROJECTS)
+    named = {name: publisher_of(name) for name in outside}
+    projects = sorted({found for found in named.values() if found})
+    unknown = sorted(name for name, found in named.items() if not found)
     return Discovered(projects, unknown, sorted(local), sorted(standard))

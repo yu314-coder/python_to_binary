@@ -2101,6 +2101,24 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - which project publishes a module is asked, not remembered
+
+**A library's own files come with it, whatever they are.** py2bin knew 41
+import names whose project is spelled differently - `PIL` is `pillow`, `yaml`
+is `PyYAML` - and a module outside that list was reported as one it could not
+name a project for, so the build went on without it. `certifi` was outside
+it, which meant a program calling `certifi.where()` was bundled without
+`cacert.pem` and failed the first time it opened a connection.
+
+An installed package records the import names it provides, so the machine
+doing the build already knows. That is asked first now, and the list is what
+is left for a package that is *not* installed here - a cross build for a
+machine this is not, where there is no metadata to read.
+
+Nothing filters a package by file type. `certifi`'s `.pem`, a library's
+`.csv`, `.json`, `.dat` or `.html` all travel with it, because what is
+carried is the package and not a selection from it.
+
 ### 0.9.13 - assets are found by reading the program, not by knowing a layout
 
 **What a program opens is read out of the program.** py2bin used to look for

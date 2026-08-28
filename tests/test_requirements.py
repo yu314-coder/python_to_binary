@@ -204,3 +204,37 @@ class WheelRequirementTests(unittest.TestCase):
         from py2bin.requirements import required_by
 
         self.assertEqual(required_by(Path(tempfile.mkdtemp())), [])
+
+
+class AskedRatherThanListed(unittest.TestCase):
+    """Which project publishes a module is looked up, not remembered.
+
+    A list holds the names somebody thought of, and a program imports the
+    one they did not. `certifi` was outside the list for as long as there
+    was one, so a bundle that needed its `cacert.pem` was built without it
+    and failed the first time it opened a connection.
+    """
+
+    def test_an_installed_package_is_found_without_being_listed(self) -> None:
+        from importlib.metadata import packages_distributions
+
+        from py2bin.requirements import KNOWN_PROJECTS, publisher_of
+
+        known = packages_distributions()
+        outside = [
+            name
+            for name in known
+            if name not in KNOWN_PROJECTS and not name.startswith("_")
+        ]
+        if not outside:
+            self.skipTest("every installed import name is also in the list")
+        for name in sorted(outside)[:20]:
+            self.assertEqual(publisher_of(name), sorted(known[name])[0], name)
+
+    def test_the_list_is_the_fallback_and_not_the_first_word(self) -> None:
+        from py2bin.requirements import publisher_of
+
+        # An import name nothing installed provides falls back to the list.
+        self.assertEqual(publisher_of("PIL"), "pillow")
+        # And one nothing knows is unknown rather than guessed at.
+        self.assertIsNone(publisher_of("a_module_nobody_publishes_xyzzy"))
