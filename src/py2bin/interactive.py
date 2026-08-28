@@ -1259,6 +1259,23 @@ def _build_c(
     beside = _carry_libraries(
         program, result.artifact, target, libraries, auto_fetch
     )
+    # And whatever the sources name. A compiled program opens its files the
+    # same way a Python one does, and saying so in C++ rather than in Python
+    # does not make it somebody else's problem.
+    import shutil as _shutil
+
+    for path in _what_the_c_opens([program, *others], program.parent):
+        landing = result.artifact.parent / path.name
+        if landing.resolve() == path.resolve():
+            continue
+        say(f"  carrying {path.name}/" if path.is_dir() else f"  carrying {path.name}")
+        if landing.exists():
+            _shutil.rmtree(landing) if landing.is_dir() else landing.unlink()
+        if path.is_dir():
+            _shutil.copytree(path, landing)
+        else:
+            _shutil.copy2(path, landing)
+        beside.append(landing)
     if beside and onefile:
         # One file to send. A program that needs a second file beside it is
         # a program somebody has to be told about, and being told is the
@@ -1269,7 +1286,12 @@ def _build_c(
             result.artifact, target, [path.name for path in beside]
         )
         for path in beside:
-            path.unlink(missing_ok=True)
+            # A directory as readily as a file: what is carried is whatever
+            # the program opens, and that is usually a directory of pages.
+            if path.is_dir():
+                _shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
         say(
             f"\n  folded {', '.join(path.name for path in beside)} into the "
             f"program ({held} files, {total // 1024} KB)"
@@ -1282,6 +1304,101 @@ def _build_c(
     say(f"\n  done: {result.artifact}")
     _say_what_it_runs_on(result.artifact, target)
     return 0
+
+
+#: A string in C or C++ source, wide or narrow, with its prefix. What a
+#: program writes when it names a file.
+_A_C_LITERAL = re.compile(r'(?:L|u8|u|U)?"((?:[^"\\\n]|\\.)*)"')
+
+#: How far up from the source to look for what it names. One: a project keeps
+#: its sources in a directory and the files they open beside that directory
+#: as often as inside it, and the program says `web` either way. Not further.
+#: Every level up is a wider net over directories that have nothing to do
+#: with this program - two levels up from a source tree in a temporary
+#: directory is the temporary directory, where a name like `x` belongs to
+#: somebody else and would be carried as though it were the program's.
+_UP_FROM_SOURCE = 1
+
+
+def _what_the_c_opens(sources: "list[Path]", here: Path) -> "list[Path]":
+    """Every existing path the C or C++ sources name.
+
+    The same reading the Python side does, in the language at hand. A program
+    that writes `executablePath / L"web"` has said its pages live in a
+    directory called `web` that ends up beside the executable; where that
+    directory sits in the project is the author's business, so it is looked
+    for rather than assumed - beside the source, and above it, because
+    `src/main.cpp` opening `web` almost always means `../web`.
+    """
+
+    named: "set[str]" = set()
+    for source in sources:
+        try:
+            text = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for found in _A_C_LITERAL.finditer(_without_c_comments(text)):
+            spelled = found.group(1)
+            if not spelled or len(spelled) > 200 or "\\" in spelled:
+                continue
+            if any(piece in spelled for piece in ("%", "://", " ")):
+                continue
+            # A path that names a place on the machine rather than a file in
+            # the project. `"/tmp"` is where a program writes at run time,
+            # not something to carry - and `root / "/tmp"` is `/tmp`, so a
+            # first version of this tried to copy the whole of it into
+            # `dist/`. The corpus found that; a user would have found it as
+            # a build that never finished.
+            if spelled.startswith(("/", "\\", "~")) or spelled[1:3] in (":/", ":\\"):
+                continue
+            if spelled.strip(". ") == "":
+                continue
+            named.add(spelled)
+    roots = [here]
+    walk = here
+    for _step in range(_UP_FROM_SOURCE):
+        if (walk / ".git").exists():
+            break
+        walk = walk.parent
+        if walk == walk.parent:
+            break
+        roots.append(walk)
+    found: "set[Path]" = set()
+    settled = [root.resolve() for root in roots]
+    for spelled in named:
+        for root in roots:
+            candidate = root / spelled
+            if not candidate.exists():
+                continue
+            whole = candidate.resolve()
+            # And it has to be *in* the project. Anything a literal resolves
+            # to outside the directories being searched is somewhere else on
+            # this machine and is not this program's to carry.
+            if not any(one == whole or one in whole.parents for one in settled):
+                continue
+            if whole in settled:
+                continue
+            found.add(whole)
+            break
+    # A directory carries everything under it; a file carries the directory
+    # holding it, for the same reason a page needs its stylesheet.
+    units = {path if path.is_dir() else path.parent for path in found}
+    return sorted(
+        path
+        for path in units
+        if path.resolve() not in {r.resolve() for r in roots}
+    )
+
+
+def _without_c_comments(text: str) -> str:
+    """The source with its comments blanked, so a path in one is not read."""
+
+    return re.sub(
+        r"//[^\n]*|/\*.*?\*/",
+        lambda found: " " * len(found.group(0)),
+        text,
+        flags=re.S,
+    )
 
 
 def _carry_libraries(

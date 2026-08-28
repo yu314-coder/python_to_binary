@@ -389,3 +389,101 @@ class BuildScriptAnswersMatchTheEntryPoint(unittest.TestCase):
         script = self._script()
         self.assertIsNone(script._read_arguments(["app.py", "--target"]))
         self.assertIsNone(script._read_arguments(["--not-an-option"]))
+
+
+class WhatCSourcesOpen(unittest.TestCase):
+    """A compiled program opens files too, and says so in its own source.
+
+    `executablePath / L"web"` names a directory that ends up beside the
+    executable. Where it sits in the project is the author's business - a
+    program with its sources under `src/` keeps it beside that directory as
+    often as inside it - so it is looked for rather than assumed.
+    """
+
+    def test_a_directory_named_in_c_is_found_above_the_source(self) -> None:
+        from py2bin.interactive import _what_the_c_opens
+
+        with tempfile.TemporaryDirectory() as spelled:
+            root = Path(spelled)
+            (root / "src").mkdir()
+            (root / "web").mkdir()
+            (root / "web" / "index.html").write_text("<h1>x</h1>\n")
+            source = root / "src" / "main.cpp"
+            source.write_text(
+                '#include <filesystem>\n'
+                'int main() {\n'
+                '    auto page = std::filesystem::path("x") / L"web";\n'
+                '    return 0;\n'
+                '}\n'
+            )
+            found = _what_the_c_opens([source], source.parent)
+            self.assertEqual([path.name for path in found], ["web"])
+
+    def test_a_path_written_in_a_comment_is_not_read(self) -> None:
+        from py2bin.interactive import _what_the_c_opens
+
+        with tempfile.TemporaryDirectory() as spelled:
+            root = Path(spelled)
+            (root / "src").mkdir()
+            (root / "secret").mkdir()
+            (root / "secret" / "x.txt").write_text("x\n")
+            source = root / "src" / "main.c"
+            source.write_text(
+                '/* once this opened "secret" */\n'
+                '// and here too: "secret"\n'
+                'int main(void) { return 0; }\n'
+            )
+            self.assertEqual(_what_the_c_opens([source], source.parent), [])
+
+    def test_the_project_root_itself_is_not_carried(self) -> None:
+        from py2bin.interactive import _what_the_c_opens
+
+        with tempfile.TemporaryDirectory() as spelled:
+            root = Path(spelled)
+            (root / "src").mkdir()
+            source = root / "src" / "main.c"
+            # `"."` and `".."` name directories that hold the program.
+            source.write_text('int main(void) { return (int)sizeof("..");}\n')
+            for path in _what_the_c_opens([source], source.parent):
+                self.assertNotEqual(path.resolve(), root.resolve())
+                self.assertNotEqual(path.resolve(), (root / "src").resolve())
+
+
+class AnAbsolutePathIsNotCarried(unittest.TestCase):
+    """`"/tmp"` names a place on the machine, not a file in the project.
+
+    `Path(root) / "/tmp"` is `/tmp` - an absolute right-hand side wins - so
+    a first version of this tried to copy the whole system temporary
+    directory into `dist/`. The corpus found it; a user would have found it
+    as a build that never finished.
+    """
+
+    def test_an_absolute_literal_is_left_alone(self) -> None:
+        from py2bin.interactive import _what_the_c_opens
+
+        with tempfile.TemporaryDirectory() as spelled:
+            root = Path(spelled)
+            (root / "src").mkdir()
+            source = root / "src" / "main.c"
+            source.write_text(
+                'int main(void) {\n'
+                '    const char *a = "/tmp";\n'
+                '    const char *b = "/usr/lib";\n'
+                '    const char *c = "C:/Windows";\n'
+                '    const char *d = "~/Documents";\n'
+                '    return (int)(a[0] + b[0] + c[0] + d[0]);\n'
+                '}\n'
+            )
+            self.assertEqual(_what_the_c_opens([source], source.parent), [])
+
+    def test_a_literal_that_escapes_the_project_is_left_alone(self) -> None:
+        from py2bin.interactive import _what_the_c_opens
+
+        with tempfile.TemporaryDirectory() as spelled:
+            root = Path(spelled)
+            (root / "project" / "src").mkdir(parents=True)
+            (root / "outside").mkdir()
+            (root / "outside" / "thing.txt").write_text("x\n")
+            source = root / "project" / "src" / "main.c"
+            source.write_text('int main(void){ return sizeof("../../outside"); }\n')
+            self.assertEqual(_what_the_c_opens([source], source.parent), [])
