@@ -97,8 +97,10 @@ def main() -> int:
     read = _read_arguments(sys.argv[1:])
     if read[0] is _BAD:
         return 2
-    where, target, method, includes, fetch, defines, libraries = read
-    return ask(where, target, method, includes, fetch, defines, libraries)
+    where, target, method, includes, fetch, defines, libraries, watch = read
+    return ask(
+        where, target, method, includes, fetch, defines, libraries, watch
+    )
 
 
 #: What `_read_arguments` returns when it could not read them.
@@ -117,6 +119,7 @@ def _read_arguments(
         python3 build.py app.cpp --auto-fetch
         python3 build.py app.c --define NDEBUG -D VERSION=3
         python3 build.py app.cpp --library WebView2Loader.dll
+        python3 build.py app.py --watch
 
     Answering them on the command line is what lets a script use this same
     entry point rather than a different one - a build that is only reachable
@@ -135,6 +138,13 @@ def _read_arguments(
     has always taken these and this entry point had not, so the one thing a
     header asked for could not be given to it the documented way.
 
+    `--watch` runs the program once, here, and adds the files it opened to
+    the ones reading it found. Reading finds every branch without taking any;
+    running takes one branch and finds what only that branch knows - a path
+    read out of a config file, say. Neither is the whole answer, so this adds
+    rather than replaces. Off unless asked for: running a program may write,
+    send, or want a password, and a build should not do that unasked.
+
     `--library NAME.dll` (repeatable) names a shared library holding a
     function the program calls and never defines. With `--auto-fetch` this is
     usually not needed: the component that declared the function shipped the
@@ -148,6 +158,7 @@ def _read_arguments(
     includes: "list[str]" = []
     defines: "list[str]" = []
     libraries: "list[str]" = []
+    watch = False
     index = 0
     while index < len(given):
         piece = given[index]
@@ -157,7 +168,7 @@ def _read_arguments(
         ):
             if index + 1 >= len(given):
                 print(f"{piece} needs a value after it.")
-                return _BAD, None, None, (), False, (), ()
+                return _BAD, None, None, (), False, (), (), False
             if piece == "--target":
                 target = given[index + 1]
             elif piece == "--how":
@@ -174,6 +185,10 @@ def _read_arguments(
             fetch = True
             index += 1
             continue
+        if piece == "--watch":
+            watch = True
+            index += 1
+            continue
         if piece in ("-h", "--help"):
             print(__doc__.strip().split("\n\n")[0])
             print("\n  --target NAME    which machine, without being asked")
@@ -182,15 +197,16 @@ def _read_arguments(
             print("  --auto-fetch     download a header this cannot find here")
             print("  --define NAME    define a macro before the file is read")
             print("  --library NAME   a DLL a called function lives in")
-            return _BAD, None, None, (), False, (), ()
+            print("  --watch          run it once and note the files it opens")
+            return _BAD, None, None, (), False, (), (), False
         if piece.startswith("-"):
             print(f"{piece} is not an option this understands.")
-            return _BAD, None, None, (), False, (), ()
+            return _BAD, None, None, (), False, (), (), False
         where = piece
         index += 1
     return (
         where, target, method, tuple(includes), fetch, tuple(defines),
-        tuple(libraries),
+        tuple(libraries), watch,
     )
 
 

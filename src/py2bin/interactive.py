@@ -9,6 +9,7 @@ found or downloaded rather than typed.
 from __future__ import annotations
 
 import re
+import os
 import sys
 from pathlib import Path
 
@@ -296,6 +297,7 @@ def main(
     auto_fetch: bool = False,
     defines: "tuple[str, ...]" = (),
     libraries: "tuple[str, ...]" = (),
+    watch: bool = False,
 ) -> int:
     """The three questions, with any of them answered in advance.
 
@@ -313,6 +315,12 @@ def main(
     `libraries` names the shared libraries a function the program calls but
     never defines lives in - `WebView2Loader.dll` and the like - the way a
     build with a linker is given an import library.
+
+    `watch` runs the program once, here, and adds the files it opened to the
+    ones reading it found. It is off unless asked for: running a program is
+    not free of consequence - it may write, send, or want a password - and a
+    build that does that without being asked is a build that surprises
+    somebody.
     """
 
     # Everything is said on stdout. Some editors show only that, and an
@@ -439,7 +447,9 @@ def main(
     # Anything the program opens rather than imports. Found rather than asked
     # for: a directory of web assets beside a program is what it is, and a
     # bundle without it is a bundle that starts and then cannot draw anything.
-    carried, skipped, outside = _what_it_opens(program, here)
+    if watch:
+        say("\n  running it once to see which files it opens")
+    carried, skipped, outside = _what_it_opens(program, here, watch)
     if carried:
         say(
             "  carrying "
@@ -631,7 +641,7 @@ _MISSING_HEADER = re.compile(r"cannot find the header '([^']+)'")
 
 
 def _what_it_opens(
-    program: Path, here: Path
+    program: Path, here: Path, watch: bool = False
 ) -> "tuple[list[Path], list[Path], list[Path]]":
     """Everything the program opens rather than imports.
 
@@ -654,7 +664,12 @@ def _what_it_opens(
     """
 
     root = here.resolve()
-    named = _carry_units(_paths_the_code_names(program, here), root)
+    reached = list(_paths_the_code_names(program, here))
+    if watch:
+        # Added to what reading found, never instead of it: a run takes one
+        # path through the program and reading takes all of them.
+        reached.extend(_paths_it_opened(program, here))
+    named = _carry_units(reached, root)
     beside = [
         path
         for path in sorted(here.iterdir())
@@ -870,6 +885,127 @@ def _up(spelled: str) -> str:
     trimmed = spelled.rstrip("/")
     cut = trimmed.rfind("/")
     return trimmed[:cut] if cut > 0 else "/"
+
+
+#: How long the program is given to open its files. It is not being run to
+#: completion - it is being run until it settles, which for anything with a
+#: window is the moment the window opens and the loop it never leaves begins.
+_WATCH_SECONDS = 20.0
+
+
+def _paths_it_opened(program: Path, here: Path) -> "list[Path]":
+    """Run the program briefly and note every file it opens.
+
+    Reading the code finds what a program *can* open - every branch, without
+    taking any of them. This finds what one run *did* open, which is the one
+    thing reading cannot do: a path read out of a config file, or built from
+    an environment variable, is written down nowhere a reader can follow.
+
+    Neither is the whole answer, so this is added to the other rather than
+    used instead of it. A run takes one path through the program: the error
+    page nothing failed to reach, the locale nobody selected and the template
+    for the route nobody visited are all opened by code that did not run.
+    And in a program with a window, the pages are fetched by the engine
+    behind that window rather than by Python, so this never sees them at all.
+
+    In a thread, and a daemon one. A program with a window does not return -
+    `webview.start()` is a loop it stays in - and everything worth seeing has
+    already happened by then. The thread is left where it is and the build
+    carries on with what it recorded.
+    """
+
+    import runpy
+    import threading
+
+    opened: "list[str]" = []
+    watching = [True]
+
+    def hook(event: str, arguments) -> None:
+        if not watching[0] or event != "open" or not arguments:
+            return
+        name = arguments[0]
+        if isinstance(name, str):
+            opened.append(name)
+
+    sys.addaudithook(hook)
+
+    def run() -> None:
+        try:
+            runpy.run_path(str(program), run_name="__main__")
+        except SystemExit:
+            pass
+        except BaseException:
+            # A program that fails part way through has still said what it
+            # opened up to that point, and that is worth keeping. It is being
+            # watched, not tested.
+            pass
+
+    was = Path.cwd()
+    try:
+        os.chdir(here)
+    except OSError:
+        pass
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(_WATCH_SECONDS)
+    watching[0] = False
+    try:
+        os.chdir(was)
+    except OSError:
+        pass
+
+    # The interpreter's own files, and the packages installed beside it, are
+    # not this program's data - those travel with the packages they belong
+    # to. Everything else is kept wherever it is: a program that reads the
+    # name of its skin directory out of a file, and keeps that directory
+    # somewhere else entirely, is exactly what watching is for.
+    theirs = _not_the_programs_own()
+    found: "set[Path]" = set()
+    for name in opened:
+        try:
+            path = Path(name).resolve()
+        except (OSError, ValueError):
+            continue
+        if not path.is_file() or path == program.resolve():
+            continue
+        if path.suffix.lower() in _IS_THE_PROGRAM:
+            continue
+        if any(other == path or other in path.parents for other in theirs):
+            continue
+        found.add(path)
+    return sorted(found)
+
+
+def _not_the_programs_own() -> "list[Path]":
+    """Where Python itself and its installed packages live."""
+
+    import site
+    import sysconfig
+
+    where: "list[Path]" = []
+    for spelled in (sys.prefix, sys.base_prefix, sys.exec_prefix):
+        try:
+            where.append(Path(spelled).resolve())
+        except (OSError, ValueError):
+            continue
+    try:
+        where.extend(Path(one).resolve() for one in site.getsitepackages())
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        where.append(Path(site.getusersitepackages()).resolve())
+    except (AttributeError, OSError, ValueError, TypeError):
+        pass
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        spelled = sysconfig.get_path(key)
+        if spelled:
+            try:
+                where.append(Path(spelled).resolve())
+            except (OSError, ValueError):
+                continue
+    # And py2bin itself, which is doing the watching.
+    where.append(Path(__file__).resolve().parent.parent)
+    return where
 
 
 def _paths_the_code_names(program: Path, here: Path) -> "list[Path]":

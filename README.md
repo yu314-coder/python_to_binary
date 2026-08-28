@@ -2101,6 +2101,25 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - `--watch` runs the program once and notes what it opened
+
+Reading a program finds every branch without taking any of them. Running it
+takes one branch and finds what only that branch knows: a directory whose
+name is read out of a config file at run time is written down nowhere a
+reader can follow. `--watch` does the second and adds it to the first.
+
+Added, never instead. A run is one path through the program, so the error
+page nothing failed to reach, the locale nobody selected and the template for
+the route nobody visited are all opened by code that did not run. And in a
+program with a window the pages are fetched by the engine behind it rather
+than by Python, so watching never sees them at all - reading does.
+
+It runs in a daemon thread with a time limit, so a program that never returns
+- which is every program with a window - does not hold up the build: what it
+opened before it settled is what gets carried. Off unless asked for, because
+running a program may write, send, or want a password, and a build should not
+do that unasked.
+
 ### 0.9.13 - which project publishes a module is asked, not remembered
 
 **A library's own files come with it, whatever they are.** py2bin knew 41

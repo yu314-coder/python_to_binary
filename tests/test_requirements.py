@@ -1,6 +1,7 @@
 """Working out what a program needs, without guessing at it."""
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -238,3 +239,69 @@ class AskedRatherThanListed(unittest.TestCase):
         self.assertEqual(publisher_of("PIL"), "pillow")
         # And one nothing knows is unknown rather than guessed at.
         self.assertIsNone(publisher_of("a_module_nobody_publishes_xyzzy"))
+
+
+class WatchingAddsToReading(unittest.TestCase):
+    """Running the program finds what reading it cannot, and vice versa.
+
+    Reading finds every branch without taking any of them. Running takes one
+    branch and finds what only that branch knows - a directory whose name is
+    read out of a file at run time. Neither is the whole answer, so watching
+    adds to reading rather than replacing it.
+    """
+
+    def _project(self, where: Path) -> Path:
+        (where / "app").mkdir()
+        (where / "far" / "skin").mkdir(parents=True)
+        (where / "far" / "skin" / "index.html").write_text("<h1>x</h1>\n")
+        (where / "far" / "skin" / "site.css").write_text("body{}\n")
+        (where / "app" / "which.txt").write_text("../far/skin\n")
+        (where / "app" / "main.py").write_text(
+            "import os\n"
+            "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+            "folder = open(os.path.join(HERE, 'which.txt')).read().strip()\n"
+            "open(os.path.join(HERE, folder, 'index.html')).read()\n"
+        )
+        return where / "app" / "main.py"
+
+    def test_a_name_read_at_run_time_is_found_only_by_running(self) -> None:
+        from py2bin.interactive import _what_it_opens
+
+        with tempfile.TemporaryDirectory() as spelled:
+            program = self._project(Path(spelled))
+            here = program.parent
+            read, _skipped, _outside = _what_it_opens(program, here)
+            self.assertNotIn(
+                "skin", {path.name for path in read},
+                "reading should not find a directory named nowhere in the code",
+            )
+            both, _skipped, _outside = _what_it_opens(program, here, watch=True)
+            self.assertIn(
+                "skin", {path.name for path in both},
+                "running it should find the directory it opened",
+            )
+            # And it keeps what reading already had.
+            self.assertLessEqual({p.name for p in read}, {p.name for p in both})
+
+    def test_a_program_that_never_returns_does_not_hold_up_the_build(self) -> None:
+        from py2bin import interactive
+
+        with tempfile.TemporaryDirectory() as spelled:
+            where = Path(spelled)
+            (where / "page.html").write_text("<h1>x</h1>\n")
+            (where / "app.py").write_text(
+                "import os, time\n"
+                "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+                "open(os.path.join(HERE, 'page.html')).read()\n"
+                "while True: time.sleep(3600)\n"
+            )
+            was, interactive._WATCH_SECONDS = interactive._WATCH_SECONDS, 2.0
+            try:
+                began = time.monotonic()
+                carried, _s, _o = interactive._what_it_opens(
+                    where / "app.py", where, watch=True
+                )
+            finally:
+                interactive._WATCH_SECONDS = was
+            self.assertLess(time.monotonic() - began, 30.0)
+            self.assertIn("page.html", {path.name for path in carried})
