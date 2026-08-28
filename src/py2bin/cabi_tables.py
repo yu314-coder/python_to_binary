@@ -25,6 +25,9 @@ VETTED = [
     "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
     "exit",
     "pow", "fmod", "hypot", "atan2", "copysign", "ldexp",
+    # A monotonic clock, which is what `<chrono>` is. Reading the time is
+    # the one thing a program cannot work out for itself.
+    "clock_gettime",
     "objc_getClass", "sel_registerName", "objc_msgSend", "objc_msgSend2",
     "objc_msgSend_str", "objc_msgSend_id_id", "objc_msgSend_long",
     "objc_msgSend_bool_void", "objc_msgSend_rect", "objc_msgSend_rect_id",
@@ -153,6 +156,7 @@ _LIBC_SYMBOLS = frozenset(
         "getpid", "getppid", "getuid", "getgid", "abs", "labs", "strlen",
         "exit",
         "pow", "fmod", "hypot", "atan2", "copysign", "ldexp",
+        "clock_gettime",
     }
 )
 # Everything else exported here is a CPython runtime entry point, so the two

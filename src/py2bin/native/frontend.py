@@ -414,6 +414,9 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
 
 _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "getpid": ("getpid", ()),
+    #: `clock_gettime(which, &into)` - POSIX's monotonic clock. Windows has
+    #: no such symbol and uses QueryPerformanceCounter, which is already here.
+    "clock_gettime": ("clock_gettime", ("int", "ptr")),
     "getppid": ("getppid", ()),
     "getuid": ("getuid", ()),
     "getgid": ("getgid", ()),
@@ -600,6 +603,7 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
 
 _CABI_RESULTS: dict[str, str] = {
     "getpid": "int",
+    "clock_gettime": "int",
     "getppid": "int",
     "getuid": "int",
     "getgid": "int",
@@ -755,6 +759,7 @@ assert set(_CABI_RESULTS) == set(_CABI_SYMBOLS), "cabi result kinds are out of s
 _CABI_RESULT_WIDTH: dict[str, str] = {
     # POSIX: pid_t/uid_t/gid_t and int abs(int) are 32 bits.
     "getpid": "i32",
+    "clock_gettime": "i32",
     "getppid": "i32",
     "getuid": "u32",
     "getgid": "u32",

@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,019 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 331 C and C++ programs whose output matches `clang++`, built for all
+programs; 332 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -910,14 +910,34 @@ says which one means anything. `get<int>(v)` names an alternative by its
 type, and a type is not a place until the list it belongs to is known, so the
 place is read from where the variant was declared.
 
-**What is still missing, and why it is not a header.** `<chrono>`,
-`<thread>` and `<mutex>` need a clock and a way to start a thread. Neither is
-something a header can be written around: each is a new operation in the IR
-and a syscall or an import for every target, which is the same kind of work -
-and the same kind of risk - as the shadow space above. `printf("%*d")` takes
-its width from an argument, and py2bin reads a format while compiling by
-design; the refusal says so and says to write the number. And the pointer to
-a second base is refused rather than moved, for the reason given above.
+**`<chrono>`, over the one thing a program cannot work out for itself.** A
+monotonic clock joins the vetted adapter ABI - `clock_gettime` where there is
+one, and Windows already had its performance counter. Which of them a build
+uses is decided in Python, where the target is known, rather than with an
+`#ifdef`: the C++ translator runs before the preprocessor, so both branches
+survived and it said, correctly, that there were two definitions of one
+function. `CLOCK_MONOTONIC` is 6 on macOS and 1 on Linux, so the number is
+written out per platform rather than assumed to be one number.
+
+Three things it needed are not about time at all, and everything gets them:
+`auto x = Clock::now()` - a static member called by its class's name, which
+was neither a call on an object nor a plain one; `(b - a).count()` - a call
+on an expression rather than on a name, where the receiver has to be worked
+out before the member can be read off it; and `b - a` on two objects
+answering what that class's `operator-` declares rather than what arithmetic
+on two numbers would.
+
+It is run on one machine of the six. The Windows and Linux clocks build and
+have not executed, which is exactly the shape of the two worst mistakes on
+this page.
+
+**What is still missing.** `<thread>` and `<mutex>` need a way to start a
+thread *and* a trampoline, because `std::thread(lambda)` has to arrive at a
+plain function pointer. `printf("%*d")` takes its width from an argument
+where py2bin reads a format while compiling; the padding loops already take a
+count that is worked out at run time, but the one that pads a number fills a
+fixed buffer backwards, so a width from an argument needs a bound that is
+exactly right or it writes off the front of it.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

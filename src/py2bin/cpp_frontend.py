@@ -1190,10 +1190,22 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
     # is whichever of the two is wider - which is what C++ does with them.
     # Not the `-` of an arrow: that is a member read, handled above, and
     # splitting there left `>v` as the right-hand side.
-    binary = re.match(r"^(.+?)\s*(?:-(?!>)|[+*/%])\s*([^-+*/%]+)$", spelled)
+    binary = re.match(r"^(.+?)\s*(-(?!>)|[+*/%])\s*([^-+*/%]+)$", spelled)
     if binary is not None:
         left = _deduced_type(binary.group(1).strip(), text, before)
-        right = _deduced_type(binary.group(2).strip(), text, before)
+        # An operator on an object answers what that operator declares, and
+        # not what arithmetic on two numbers would. `b - a` on two time
+        # points is a duration, which is a class and not a wider number.
+        if left is not None:
+            owner = re.sub(
+                r"\b(?:const|struct|volatile)\b", " ", left
+            ).replace("*", " ").strip()
+            answered = _member_result(
+                text, owner, rf"operator\s*{re.escape(binary.group(2))}"
+            )
+            if answered is not None:
+                return answered
+        right = _deduced_type(binary.group(3).strip(), text, before)
         held = _wider(left, right)
         if held is not None:
             return held
@@ -1315,6 +1327,43 @@ def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
         if held is None:
             return None
         return _declared_return(text, held.replace("*", "").strip(), member.group(2))
+    # `(b - a).count()` and `f(x).m()` - a call on something that is itself
+    # an expression rather than a name. The receiver is worked out first and
+    # the member read off whatever it answered, which is the only way a chain
+    # of them can be followed at all.
+    bare = _without_literals(spelled)
+    if spelled.endswith(")"):
+        depth = 0
+        for index in range(len(bare) - 1, -1, -1):
+            piece = bare[index]
+            if piece in ")]}":
+                depth += 1
+            elif piece in "([{":
+                depth -= 1
+            elif depth == 0 and piece == ".":
+                tail = spelled[index + 1:].strip()
+                named = re.fullmatch(r"([A-Za-z_]\w*)\s*\(.*\)", tail, re.S)
+                if named is None:
+                    break
+                holder = _deduced_type(spelled[:index].strip(), text, before)
+                if holder is None:
+                    break
+                owner = re.sub(
+                    r"\b(?:const|struct|volatile)\b", " ", holder
+                ).replace("*", " ").strip()
+                answered = _declared_return(text, owner, named.group(1))
+                if answered is not None:
+                    return answered
+                break
+
+    # `steady_clock::now()` - a static member, called by its class's name.
+    # Neither a call on an object nor a plain one, and `auto` in front of it
+    # had nothing to read.
+    qualified = re.match(
+        r"^([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)\s*\(.*\)$", spelled, re.S
+    )
+    if qualified is not None:
+        return _declared_return(text, qualified.group(1), qualified.group(2))
     plain = _PLAIN_CALL.match(spelled)
     if plain is not None:
         # `Res__new(7)` - the allocator this translator writes where the
@@ -6317,6 +6366,49 @@ _TUPLE_GET = re.compile(r"(?<![.\w>])get\s*<\s*(\d+)\s*>\s*\(")
 _VARIANT_BY_TYPE = re.compile(
     r"(?<![.\w>])(get|holds_alternative)\s*<\s*([^<>()]+?)\s*>\s*\("
 )
+
+
+#: `duration_cast<microseconds>(d)` - a duration asked for in another unit.
+_DURATION_CAST = re.compile(
+    r"(?<![.\w>])duration_cast\s*<\s*([A-Za-z_][\w:]*)\s*>\s*\("
+)
+
+
+def _rewrite_duration_cast(text: str) -> str:
+    """`duration_cast<microseconds>(d)` becomes the member for that unit.
+
+    The unit is a type, and the four this ships each have a member on
+    `duration` that divides down to it. Named rather than deduced, because a
+    unit is a ratio in C++ and a ratio is not something py2bin computes with.
+    """
+
+    if "duration_cast" not in text:
+        return text
+    bare = _without_literals(text)
+    out: "list[str]" = []
+    at = 0
+    for found in _DURATION_CAST.finditer(bare):
+        if found.start() < at:
+            continue
+        unit = found.group(1).rsplit("::", 1)[-1]
+        if unit not in ("nanoseconds", "microseconds", "milliseconds", "seconds"):
+            continue
+        closing = _closing_paren(bare, found.end() - 1)
+        if closing < 0:
+            continue
+        inside = text[found.end(): closing].strip()
+        # `.count()` right after it, which is how it is nearly always
+        # written: answered outright rather than through the unit object.
+        counted = re.match(r"\s*\.\s*count\s*\(\s*\)", bare[closing + 1:])
+        out.append(text[at: found.start()])
+        if counted is not None:
+            out.append(f"({inside}).__count_{unit}()")
+            at = closing + 1 + counted.end()
+        else:
+            out.append(f"({inside}).__as_{unit}()")
+            at = closing + 1
+    out.append(text[at:])
+    return "".join(out)
 
 
 def _rewrite_variant_alternatives(text: str) -> str:
@@ -12738,6 +12830,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # `get<0>` here is this one and not a name the program has of its own.
     text = _rewrite_tuple_get(text)
     text = _rewrite_variant_alternatives(text)
+    text = _rewrite_duration_cast(text)
     text = _expand_templates(text, filename)
     # After the copies are written out, because that is what turns `sizeof(T)`
     # into `sizeof(int)` and a trait into the constant it answers.
@@ -15024,6 +15117,110 @@ __setprecision setprecision(int n) { __setprecision made; made.__n = n; return m
 }
 """
 
+#: <chrono>, over the one thing a program cannot work out for itself: what
+#: time it is. Each platform is asked its own way - `clock_gettime` where
+#: there is one, the performance counter on Windows - and the answer is
+#: nanoseconds since something, which is all a steady clock promises.
+#:
+#: `CLOCK_MONOTONIC` is 6 on macOS and 1 on Linux. It is a number in a header
+#: on each, and the number is different, so it is written out per platform
+#: rather than assumed to be the same.
+#: How each platform is asked what time it is. Written per target rather than
+#: with an `#ifdef`, because the C++ translator runs before the preprocessor
+#: and would read both branches - and two definitions of one function is not
+#: something C++ accepts, which is exactly what it said.
+#:
+#: `CLOCK_MONOTONIC` is 6 on macOS and 1 on Linux. Two numbers for one name,
+#: so the number is written out rather than assumed.
+_CLOCKS = {
+    "windows": r"""
+extern int QueryPerformanceCounter(long long *into);
+extern int QueryPerformanceFrequency(long long *into);
+static long long __py2bin_now() {
+    long long ticks;
+    long long each;
+    QueryPerformanceCounter(&ticks);
+    QueryPerformanceFrequency(&each);
+    if (each == 0LL) { return 0LL; }
+    /* Split rather than multiplied first: a counter on a machine that has
+       been up a while overflows a multiply by a billion. */
+    return (ticks / each) * 1000000000LL + ((ticks % each) * 1000000000LL) / each;
+}
+""",
+    "posix": r"""
+struct __py2bin_span { long __sec; long __nsec; };
+extern int clock_gettime(int which, struct __py2bin_span *into);
+static long long __py2bin_now() {
+    struct __py2bin_span held;
+    clock_gettime(%(monotonic)d, &held);
+    return (long long)held.__sec * 1000000000LL + (long long)held.__nsec;
+}
+""",
+}
+
+
+def _chrono_header(target: "str | None") -> str:
+    """<chrono>, over the one thing a program cannot work out for itself."""
+
+    named = (target or "").split("-", 1)[0]
+    if named == "windows":
+        clock = _CLOCKS["windows"]
+    else:
+        clock = _CLOCKS["posix"] % {"monotonic": 6 if named == "darwin" else 1}
+    return _CHRONO_HEADER.replace("/*CLOCK*/", clock)
+
+
+_CHRONO_HEADER = r"""
+namespace std {
+namespace chrono {
+
+struct nanoseconds  { long long __n; long long count() const { return __n; } };
+struct microseconds { long long __n; long long count() const { return __n; } };
+struct milliseconds { long long __n; long long count() const { return __n; } };
+struct seconds      { long long __n; long long count() const { return __n; } };
+
+/* What subtracting one time point from another answers. It holds
+   nanoseconds, and each cast divides down to the unit asked for - which is
+   what `duration_cast` means, and why it truncates. */
+struct duration {
+    long long __n;
+    long long count() const { return __n; }
+    nanoseconds __as_nanoseconds() const { nanoseconds r; r.__n = __n; return r; }
+    microseconds __as_microseconds() const { microseconds r; r.__n = __n / 1000LL; return r; }
+    milliseconds __as_milliseconds() const { milliseconds r; r.__n = __n / 1000000LL; return r; }
+    seconds __as_seconds() const { seconds r; r.__n = __n / 1000000000LL; return r; }
+    /* And the same four answering the number outright. `duration_cast<X>(d)
+       .count()` is how nearly every one of these is written, and going
+       through the unit object means answering an object by value and then
+       calling on what a call answered - two shapes that each need a name of
+       their own. This is the same arithmetic with neither. */
+    long long __count_nanoseconds() const { return __n; }
+    long long __count_microseconds() const { return __n / 1000LL; }
+    long long __count_milliseconds() const { return __n / 1000000LL; }
+    long long __count_seconds() const { return __n / 1000000000LL; }
+};
+
+struct time_point {
+    long long __n;
+    long long time_since_epoch_count() const { return __n; }
+    duration operator-(time_point o) const { duration r; r.__n = __n - o.__n; return r; }
+};
+
+/*CLOCK*/
+
+struct steady_clock {
+    static time_point now() { time_point made; made.__n = __py2bin_now(); return made; }
+};
+struct system_clock {
+    static time_point now() { time_point made; made.__n = __py2bin_now(); return made; }
+};
+struct high_resolution_clock {
+    static time_point now() { time_point made; made.__n = __py2bin_now(); return made; }
+};
+}
+}
+"""
+
 #: <variant>, as a tag and one member per alternative. Not a union: py2bin
 #: has no placement new, so every alternative exists and the tag is what says
 #: which one means anything. The difference shows only for an alternative
@@ -16293,6 +16490,8 @@ _BUILTIN_CPP_HEADERS = {
     "list": _LIST_HEADER,
     "bitset": _BITSET_HEADER,
     "variant": _VARIANT_HEADER,
+    # Answered per target, so it is a function rather than a text.
+    "chrono": _chrono_header,
     "iomanip": _IOMANIP_HEADER,
     "tuple": _TUPLE_HEADER,
     "deque": _DEQUE_HEADER,
@@ -16409,6 +16608,12 @@ def inline_local_includes(
         supplied = _BUILTIN_CPP_HEADERS.get(named) or _c_header_under(named)
         if supplied is None:
             return None
+        # One of these is written differently for each machine, because what
+        # it wraps is: the clock has a different name and a different number
+        # on each. Answered here, where the target is known - the translator
+        # runs before the preprocessor and cannot choose a branch itself.
+        if callable(supplied):
+            supplied = supplied(target)
         if named in seen_headers:
             return ""
         seen_headers.add(named)

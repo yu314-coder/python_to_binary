@@ -75,6 +75,38 @@ _libc.ldexp.restype = ctypes.c_double
 _libc.ldexp.argtypes = (ctypes.c_double, ctypes.c_int)
 
 
+class _Timespec(ctypes.Structure):
+    """What POSIX `clock_gettime` writes: whole seconds and nanoseconds."""
+
+    _fields_ = (("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long))
+
+
+_libc.clock_gettime.restype = ctypes.c_int
+_libc.clock_gettime.argtypes = (ctypes.c_int, ctypes.POINTER(_Timespec))
+
+
+def clock_gettime(which: int, into: object) -> int:
+    """POSIX ``clock_gettime``: the seconds and nanoseconds of one clock.
+
+    `into` is a writable buffer of two machine words, which is what the
+    compiled call passes and what the struct is. Given anything else - a
+    plain address, which is how the native side spells the same thing -
+    ctypes is handed it as the pointer it is.
+    """
+
+    if isinstance(into, (bytearray, memoryview)):
+        held = _Timespec()
+        answer = int(_libc.clock_gettime(int(which), ctypes.byref(held)))
+        packed = bytes(memoryview(held).cast("B"))
+        into[: len(packed)] = packed
+        return answer
+    return int(
+        _libc.clock_gettime(
+            int(which), ctypes.cast(into, ctypes.POINTER(_Timespec))
+        )
+    )
+
+
 def getpid() -> int:
     """Return the current process id (POSIX ``getpid``)."""
 
