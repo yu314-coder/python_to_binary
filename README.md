@@ -10,10 +10,11 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,005 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,006 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; eight of twenty-seven benchmark rows faster than the interpreter.
+programs; 314 C and C++ programs whose output matches `clang++`, built for all
+six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
 
@@ -753,6 +754,65 @@ general class that says no and a narrower one that says yes. `is_same`,
 `true_type`/`false_type`.
 It costs nothing at run time: the copies are made while translating and the
 answer is a constant before any code runs.
+
+**The subset was probed rather than assumed.** Forty-eight programs written
+across the corners of the language - templates, virtual dispatch, operator
+overloading, the containers, lambdas, destructors, strings, statics and
+namespaces, the heap, references, plain control flow, structs and unions,
+exceptions, conversions, the smart pointers - each built by py2bin and by
+`clang++`, run, and the two answers compared. Nineteen disagreed. Five of
+those compiled without a word and printed something else, which is the half
+worth reading first:
+
+*A `static` local was constructed on every call.* `static Counter c;` inside a
+function is built once, the first time control reaches it; this built it each
+time through, so a counter that should have answered 1, 2, 3 answered 1, 1, 1.
+The flag C++ keeps out of sight is written out now.
+
+*A destructor ran before the answer was read.* C++ works out the returned
+value and then takes the scope apart. This did it the other way round, so
+`return alive;` in a scope whose destructor decrements `alive` answered with
+the count afterwards. The value goes into a temporary first.
+
+*A temporary hoisted out of an unbraced loop body left the loop.* `for (...)
+grid[i] = Cell(i * 10);` needs somewhere to build the `Cell`, and everything
+here that needs somewhere writes it in front of the statement it found - which
+in front of a body with no braces is *above the `for`*, out of the scope, and
+out of reach of the `i` it was built from. So the braces C++ lets you leave
+out are written in, once, before any of those passes run. Nothing about the
+program changes: a block holding one statement is that statement.
+
+*`std::unique_ptr<T> b = std::move(a);` copied the pointer.* `std::move` is a
+cast and nothing survived it, so both held the same object: `a` still answered
+as though it owned one, and both destructors freed it. Building a `unique_ptr`
+from another transfers now. That is not a liberty - a program that *copies* a
+`unique_ptr` does not compile in C++ at all, so a move is the only thing it
+can ever have been.
+
+*A method answering an object, called in another method's `return`, lost the
+caller's space.* An object is answered through a pointer the caller provides;
+this emitted the call without it. It was in py2bin's own `std::string`.
+
+The rest failed loudly, which is the right way to fail but still a gap:
+`std::vector` of a plain struct could not `push_back` one; `catch (const T &e)`
+- the form C++ asks for - built a value from a cast integer, because the
+qualifier hid the class name; `friend` functions and free operators had
+nowhere to go; `template <int N>` crashed; a `const T &` parameter deduced
+nothing from a value argument, which is how nearly every such call is written;
+`Class::staticMember()` lost its class if the class also held an enum;
+`b.add('x').add('y')` - a builder, and any other chain of reference returns -
+was invisible to two passes at once, because both read the text in the
+stretches between its literals and the statement was split across two of them.
+
+Each is a program in the corpus now, so each is checked on every sweep.
+
+**A C header under its C++ name is found by rule.** `<cstdarg>` is
+`<stdarg.h>` and `<cstdio>` is `<stdio.h>`; C++ renames each C header by
+dropping the `.h` and putting a `c` in front, and says the two hold the same
+things. Which ones exist is asked of the headers py2bin's C ships rather than
+kept as a list beside them - written as a list it went stale, and a program
+including `<cstdarg>` was told py2bin does not implement it while
+`<stdarg.h>` sat in the same build.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that
