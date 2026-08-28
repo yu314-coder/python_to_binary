@@ -2410,14 +2410,14 @@ def _settled_parameters(
     closing: int,
     filename: str,
     at: int,
-) -> str:
+) -> "list[str]":
     """Give a generic lambda's `auto` parameters the types it is called with.
 
-    `[](auto a, auto b)` is a member template in C++ - one copy per set of
-    argument types. py2bin writes a lambda out as one class, so the types are
-    read from the calls instead. Where the calls disagree, that is a template
-    and this says so rather than compiling the first one and running it for
-    both.
+    `[](auto a, auto b)` is a member template in C++ - one copy for each set
+    of argument types it is used with. The sets are read from the calls,
+    because nothing else here says what they are, and one `operator()` is
+    written for each: two members of one class, told apart by what they take,
+    which is what an overload is and what a member template compiles to.
     """
 
     given: "list[list[str]]" = []
@@ -2437,21 +2437,24 @@ def _settled_parameters(
         raise CppTranslationError(
             filename, _line_of(text, at),
             "a lambda whose parameters are `auto` is a template, and py2bin "
-            "writes one copy of a lambda. Nothing here says what it is called "
-            "with, so give the parameters their types",
+            "writes a copy of it for each set of types it is called with. "
+            "Nothing here calls this one, so there is no set to write; give "
+            "the parameters their types",
         )
-    if any(one != settled[0] for one in settled[1:]):
-        raise CppTranslationError(
-            filename, _line_of(text, at),
-            "a lambda whose parameters are `auto` is called here with more "
-            "than one set of types, which is a template; py2bin writes one "
-            "copy of a lambda, so write one for each set",
-        )
-    out = []
-    for spelled, wanted in zip(_split_arguments(parameters), settled[0]):
-        spelled = spelled.strip()
-        out.append(re.sub(r"(?<![.\w>])auto\b", wanted, spelled, count=1))
-    return ", ".join(out)
+    # One copy for each set of types the calls use, which is what a member
+    # template is. Written as several `operator()` of one class, because that
+    # is how two of them are told apart in the C: by the types they take.
+    shapes: "list[str]" = []
+    for wanted in settled:
+        out = []
+        for spelled, held in zip(_split_arguments(parameters), wanted):
+            out.append(
+                re.sub(r"(?<![.\w>])auto\b", held, spelled.strip(), count=1)
+            )
+        made = ", ".join(out)
+        if made not in shapes:
+            shapes.append(made)
+    return shapes
 
 
 #: `std::function<int(int)>` - by the time this runs the `std::` is gone.
@@ -3039,10 +3042,14 @@ def _expand_lambdas(
             r"auto\s+([A-Za-z_]\w*)\s*=\s*$", text[start:found.start()]
         )
         holder = holding.group(1) if holding else f"{name}__made"
-        if re.search(r"(?<![.\w>])auto\b", parameters):
-            parameters = _settled_parameters(
+        shapes = (
+            _settled_parameters(
                 parameters, holder, text, closing, filename, found.start()
             )
+            if re.search(r"(?<![.\w>])auto\b", parameters)
+            else [parameters]
+        )
+        parameters = shapes[0]
         result = (declared or "").strip() or _lambda_result(body, parameters, text)
         held = _lambda_captures(captures, text, found.start(), filename, body)
         # A reference capture is the address, and every use inside follows it.
@@ -3062,10 +3069,15 @@ def _expand_lambdas(
             f"    {spelled} {'*' if by_reference else ''}{variable};\n"
             for variable, spelled, by_reference, _from in held
         )
+        operators = "".join(
+            f"    {(declared or '').strip() or _lambda_result(body, one, text)}"
+            f" operator()({one}) {body}\n"
+            for one in shapes
+        )
         made.append(
             f"class {name} {{\npublic:\n{members}"
             f"    {name}() {{ }}\n"
-            f"    {result} operator()({parameters}) {body}\n}};\n"
+            f"{operators}}};\n"
         )
         # Where it is used: a declaration of one, and a member per capture.
         setup = "".join(
@@ -6299,6 +6311,55 @@ def _rewrite_structured_bindings(text: str, filename: str) -> str:
 #: `std::get<0>(t)` - reading one of a tuple's members by position. The
 #: qualifier is gone by the time this runs.
 _TUPLE_GET = re.compile(r"(?<![.\w>])get\s*<\s*(\d+)\s*>\s*\(")
+
+#: `get<int>(v)` and `holds_alternative<double>(v)` - an alternative named by
+#: its type rather than by its place.
+_VARIANT_BY_TYPE = re.compile(
+    r"(?<![.\w>])(get|holds_alternative)\s*<\s*([^<>()]+?)\s*>\s*\("
+)
+
+
+def _rewrite_variant_alternatives(text: str) -> str:
+    """`get<int>(v)` becomes the member `int` is, in the variant `v` holds.
+
+    Which member that is comes from where `v` was declared: `variant<int,
+    double> v` says `int` is the first. Read there because nothing else says
+    it - a type is not a place until the list it is in is known.
+    """
+
+    if not re.search(r"(?<![.\w>])(?:class|struct)\s+variant\b", text):
+        return text
+    bare = _without_literals(text)
+    out: "list[str]" = []
+    at = 0
+    for found in _VARIANT_BY_TYPE.finditer(bare):
+        if found.start() < at:
+            continue
+        closing = _closing_paren(bare, found.end() - 1)
+        if closing < 0:
+            continue
+        inside = text[found.end(): closing].strip()
+        declared = re.search(
+            rf"(?<![.\w>])variant\s*<([^<>]*)>\s*{re.escape(inside)}\b", bare
+        )
+        if declared is None:
+            continue
+        alternatives = [
+            one.strip() for one in _split_arguments(declared.group(1)) if one.strip()
+        ]
+        wanted = found.group(2).strip()
+        if wanted not in alternatives:
+            continue
+        where = alternatives.index(wanted)
+        out.append(text[at: found.start()])
+        out.append(
+            f"(({inside}).__tag == {where})"
+            if found.group(1) == "holds_alternative"
+            else f"({inside}).__{where}"
+        )
+        at = closing + 1
+    out.append(text[at:])
+    return "".join(out)
 
 
 def _rewrite_tuple_get(text: str) -> str:
@@ -12588,6 +12649,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # `tuple` pattern out of the text - and the pattern is what says that a
     # `get<0>` here is this one and not a name the program has of its own.
     text = _rewrite_tuple_get(text)
+    text = _rewrite_variant_alternatives(text)
     text = _expand_templates(text, filename)
     # After the copies are written out, because that is what turns `sizeof(T)`
     # into `sizeof(int)` and a trait into the constant it answers.
@@ -14882,6 +14944,41 @@ __setprecision setprecision(int n) { __setprecision made; made.__n = n; return m
 }
 """
 
+#: <variant>, as a tag and one member per alternative. Not a union: py2bin
+#: has no placement new, so every alternative exists and the tag is what says
+#: which one means anything. The difference shows only for an alternative
+#: whose constructor has an effect, and is said here rather than left to be
+#: found.
+_VARIANT_HEADER = r"""
+namespace std {
+template<typename A, typename B>
+class variant {
+public:
+    int __tag;
+    A __0;
+    B __1;
+    variant() { __tag = 0; }
+    variant(A v) { __0 = v; __tag = 0; }
+    variant(B v) { __1 = v; __tag = 1; }
+    int index() const { return __tag; }
+};
+
+template<typename A, typename B, typename C>
+class variant {
+public:
+    int __tag;
+    A __0;
+    B __1;
+    C __2;
+    variant() { __tag = 0; }
+    variant(A v) { __0 = v; __tag = 0; }
+    variant(B v) { __1 = v; __tag = 1; }
+    variant(C v) { __2 = v; __tag = 2; }
+    int index() const { return __tag; }
+};
+}
+"""
+
 #: <bitset>, which is arithmetic on an unsigned long and a count that says
 #: how much of it is the set. Fixed at translation time, because the size is
 #: a template argument - which is what makes a bitset one and not a vector.
@@ -16115,6 +16212,7 @@ _BUILTIN_CPP_HEADERS = {
     "optional": _OPTIONAL_HEADER,
     "list": _LIST_HEADER,
     "bitset": _BITSET_HEADER,
+    "variant": _VARIANT_HEADER,
     "iomanip": _IOMANIP_HEADER,
     "tuple": _TUPLE_HEADER,
     "deque": _DEQUE_HEADER,

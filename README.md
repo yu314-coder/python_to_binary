@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,019 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 328 C and C++ programs whose output matches `clang++`, built for all
+programs; 330 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -891,6 +891,28 @@ It also found something py2bin's C does not do: `printf("%.*g", n, v)` -
 precision taken from an argument rather than written in the format. The
 header chooses between fixed formats instead, and `%*` is written down here
 as missing rather than worked around quietly.
+
+**A generic lambda is written once for each way it is called.** `[](auto v)`
+is a member template, and this already wrote one copy where every call agreed
+on the types. Where they did not it refused - which is most of why anyone
+writes `auto` there. It writes one `operator()` for each distinct set now:
+several members of one class, told apart by what they take, which is what a
+member template compiles to anyway.
+
+**`<variant>`**, as a tag and one member per alternative rather than as a
+union - py2bin has no placement new, so every alternative exists and the tag
+says which one means anything. `get<int>(v)` names an alternative by its
+type, and a type is not a place until the list it belongs to is known, so the
+place is read from where the variant was declared.
+
+**What is still missing, and why it is not a header.** `<chrono>`,
+`<thread>` and `<mutex>` need a clock and a way to start a thread. Neither is
+something a header can be written around: each is a new operation in the IR
+and a syscall or an import for every target, which is the same kind of work -
+and the same kind of risk - as the shadow space above. `printf("%*d")` takes
+its width from an argument, and py2bin reads a format while compiling by
+design; the refusal says so and says to write the number. And the pointer to
+a second base is refused rather than moved, for the reason given above.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that
