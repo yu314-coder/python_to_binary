@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,019 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 324 C and C++ programs whose output matches `clang++`, built for all
+programs; 328 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -863,6 +863,34 @@ checker, and a site missed there is a wrong answer rather than a failure:
 compiled. So taking a pointer or a reference to a second base is refused by
 name, with the two ways out. Inheriting behaviour and using it on the object -
 which is what a mix-in is for - works.
+
+**Four more, and one of them was recursion.** A `constexpr` function is
+answered while translating now, so `int room[fact(4)];` is a declaration
+rather than a complaint. Two things had to be right for that. The condition
+of a `?:` is worked out *first* and only the arm it chooses is then worked
+out - both arms and `n <= 1 ? 1 : n * fact(n - 1)` goes down for ever, since
+the bottom is in the arm that is taken. And the signal for "a `sizeof` this
+cannot answer" was the character `?`, which is also the first half of every
+conditional, so every conditional was refused by the check meant for
+`sizeof`.
+
+`vector<int> v = {1, 2, 3};` is the container and three `push_back`s. C++
+hands the braces to a constructor taking an `initializer_list`, which is a
+view of an array the compiler laid out and is not a thing py2bin can write -
+so the list becomes what it means. Only for a class that takes `push_back`;
+a brace list on anything else is a struct being initialised, which is C.
+
+`<bitset>` and `<iomanip>`, with the width, the fill and the precision kept
+on the stream where the standard puts them. Adding them caught a mistake
+made in the same hour: giving `operator<<` a width changed the `double` case
+from `%g` to a fixed number of decimals, which would have printed `cout <<
+1.5` as `1.500000`. C++ counts six *significant* digits, and `setprecision`
+changes that same count.
+
+It also found something py2bin's C does not do: `printf("%.*g", n, v)` -
+precision taken from an argument rather than written in the format. The
+header chooses between fixed formats instead, and `%*` is written down here
+as missing rather than worked around quietly.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

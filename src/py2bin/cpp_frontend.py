@@ -5962,7 +5962,26 @@ _SIZE_OF = {
 }
 
 
-def _folded_integer(spelled: str, text: str) -> "int | None":
+def _constexpr_bodies(text: str) -> "dict[str, tuple[list[str], str]]":
+    """Each `constexpr` function written as one `return`, by name."""
+
+    written: "dict[str, tuple[list[str], str]]" = {}
+    for found in _CONSTEXPR_FUNCTION.finditer(_without_literals(text)):
+        names = [
+            part.split()[-1].lstrip("*&")
+            for part in _split_arguments(found.group(2))
+            if part.strip() and part.strip() != "void"
+        ]
+        written[found.group(1)] = (names, found.group(3).strip())
+    return written
+
+
+def _folded_integer(
+    spelled: str,
+    text: str,
+    written: "dict[str, tuple[list[str], str]] | None" = None,
+    depth: int = 0,
+) -> "int | None":
     """Work out an integer constant expression, or answer that it cannot.
 
     Only what can be settled from the text: literals, the named constants
@@ -5979,15 +5998,25 @@ def _folded_integer(spelled: str, text: str) -> "int | None":
         return None
     # `sizeof(int)` and `sizeof(T *)`. A pointer is eight bytes on every
     # target py2bin has, whatever it points at.
+    unknown = [False]
+
     def sized(match: "re.Match[str]") -> str:
         named = re.sub(r"\b(?:const|volatile)\b", " ", match.group(1)).strip()
         named = re.sub(r"\s+", " ", named)
         if named.endswith("*"):
             return "8"
-        return str(_SIZE_OF.get(named, "?"))
+        answer = _SIZE_OF.get(named)
+        if answer is None:
+            # Said with a flag and not with a character standing in for
+            # "unknown": the character used to be `?`, which is also the
+            # first half of every conditional, so `n <= 1 ? 1 : 2` was read
+            # as a `sizeof` that could not be answered.
+            unknown[0] = True
+            return "0"
+        return str(answer)
 
     working = re.sub(r"\bsizeof\s*\(([^()]*)\)", sized, working)
-    if "?" in working:
+    if unknown[0]:
         return None
     # `is_pointer<int *>::value` - a constant that belongs to a class. The
     # copy for these arguments has been written out by now, so the class is
@@ -6016,6 +6045,68 @@ def _folded_integer(spelled: str, text: str) -> "int | None":
     )
     if "::" in working:
         return None
+    # `c ? a : b` - the condition first, and then only the arm it chooses.
+    # C++ evaluates one arm and not the other, and a recursive `constexpr`
+    # depends on it: `n <= 1 ? 1 : n * fact(n - 1)` has its bottom in the arm
+    # that is taken, and working out both went down for ever.
+    arms = _conditional_arms(working)
+    if arms is not None and depth < 64:
+        depth_of = 0
+        question = -1
+        for index, piece in enumerate(_without_literals(working)):
+            if piece in "([{":
+                depth_of += 1
+            elif piece in ")]}":
+                depth_of -= 1
+            elif depth_of == 0 and piece == "?":
+                question = index
+                break
+        if question >= 0:
+            asked = _folded_integer(working[:question], text, written, depth + 1)
+            if asked is None:
+                return None
+            return _folded_integer(
+                arms[0] if asked else arms[1], text, written, depth + 1
+            )
+
+    # A call to a `constexpr` function written as one `return`. Answering it
+    # here is what lets one call another, and itself: `fact(n - 1)` is a call
+    # in the body of the function being worked out.
+    if written and depth < 32:
+        for _round in range(64):
+            call = None
+            for found in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(", working):
+                if found.group(1) not in written:
+                    continue
+                closing = _closing_paren(working, found.end() - 1)
+                if closing < 0:
+                    continue
+                inside = working[found.end(): closing]
+                if re.search(r"[A-Za-z_]\w*\s*\(", inside):
+                    continue   # an inner call first
+                call = (found, closing, inside)
+                break
+            if call is None:
+                break
+            found, closing, inside = call
+            names, body = written[found.group(1)]
+            given = [one.strip() for one in _split_arguments(inside) if one.strip()]
+            if len(given) != len(names):
+                return None
+            values = [
+                _folded_integer(one, text, written, depth + 1) for one in given
+            ]
+            if any(one is None for one in values):
+                return None
+            filled = body
+            for named, value in zip(names, values):
+                filled = re.sub(
+                    rf"(?<![.\w>]){re.escape(named)}(?![\w])", f"({value})", filled
+                )
+            answer = _folded_integer(filled, text, written, depth + 1)
+            if answer is None:
+                return None
+            working = working[: found.start()] + str(answer) + working[closing + 1:]
     # The constants this translator wrote, which is what `Trait<T>::value`
     # became: `const int is_pointer__int__value = 0;`.
     for _round in range(8):
@@ -6053,7 +6144,7 @@ def _folded_integer(spelled: str, text: str) -> "int | None":
         ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
         ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd, ast.BitXor,
         ast.Invert, ast.Not, ast.USub, ast.UAdd, ast.And, ast.Or,
-        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.IfExp,
     )
     for node in ast.walk(tree):
         if not isinstance(node, allowed):
@@ -6240,6 +6331,145 @@ def _rewrite_tuple_get(text: str) -> str:
         at = closing + 1
     out.append(text[at:])
     return "".join(out)
+
+
+#: `constexpr int twice(int n) { return n * 2; }` - a function whose answer
+#: C++ works out while compiling. Only the single-`return` shape, which is
+#: what one written to be used as a constant almost always is.
+_CONSTEXPR_FUNCTION = re.compile(
+    r"(?<![.\w>])constexpr\s+(?:inline\s+)?[A-Za-z_][\w\s]*?"
+    r"\b([A-Za-z_]\w*)\s*\(([^()]*)\)\s*(?:const\s*)?\{\s*"
+    r"return\s+([^;{}]+);\s*\}"
+)
+
+
+def _fold_constexpr_calls(text: str) -> str:
+    """`twice(3)` becomes `6` where `twice` is `constexpr` and 3 is constant.
+
+    C++ requires the answer at compile time wherever a constant is required -
+    an array length, a `case` label - and py2bin's C requires one in the same
+    places. The word says the function can answer there, so it is asked:
+    the arguments are put in place of the parameters and the result is worked
+    out the same way any other constant expression here is.
+
+    Only where every argument is itself constant. A call with a value in it
+    is an ordinary call, and stays one - which is also what C++ does with it.
+    """
+
+    written = _constexpr_bodies(text)
+    if not written:
+        return text
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        change = None
+        for found in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(", bare):
+            name = found.group(1)
+            if name not in written:
+                continue
+            if _is_a_definition(bare, _closing_paren(bare, found.end() - 1)):
+                continue
+            closing = _closing_paren(bare, found.end() - 1)
+            if closing < 0:
+                continue
+            names, body = written[name]
+            given = [
+                one.strip()
+                for one in _split_arguments(text[found.end(): closing])
+                if one.strip()
+            ]
+            if len(given) != len(names):
+                continue
+            values = [_folded_integer(one, text, written) for one in given]
+            if any(one is None for one in values):
+                continue
+            filled = body
+            for spelled, value in zip(names, values):
+                filled = re.sub(
+                    rf"(?<![.\w>]){re.escape(spelled)}(?![\w])",
+                    f"({value})",
+                    filled,
+                )
+            answer = _folded_integer(filled, text, written)
+            if answer is None:
+                continue
+            change = (found.start(), closing + 1, str(answer))
+            break
+        if change is None:
+            return text
+        start, end, value = change
+        text = text[:start] + value + text[end:]
+    return text
+
+
+#: `vector<int> v = {1, 2, 3};` and `vector<int> v{1, 2, 3};` - a container
+#: given its contents where it is declared.
+_LIST_INITIALISED = re.compile(
+    r"(?<![.\w>])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?:=\s*)?\{"
+)
+
+
+def _takes_push_back(text: str, name: str) -> bool:
+    """Whether that class declares `push_back`, so a list can fill it."""
+
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) != name:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            return False
+        return bool(
+            re.search(r"(?<![.\w>])push_back\s*\(", text[head.end(): closing - 1])
+        )
+    return False
+
+
+def _rewrite_list_initialisers(text: str) -> str:
+    """`vector<int> v = {1, 2, 3};` becomes the object and three pushes.
+
+    C++ hands the braces to a constructor taking an `initializer_list`, which
+    is a view of an array the compiler laid out. py2bin has no such thing and
+    no way to write one - so the list becomes what it means, which is the
+    container filled one value at a time, in the order they were written.
+
+    Only for a class that takes `push_back`. A brace list on anything else is
+    a struct being initialised, and that is C already.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        change = None
+        for found in _LIST_INITIALISED.finditer(bare):
+            if not _could_start_a_declaration(bare, found.start()):
+                continue
+            if not _takes_push_back(text, found.group(1)):
+                continue
+            opening = found.end() - 1
+            try:
+                after = _matching(bare, opening)
+            except ValueError:
+                continue
+            rest = after
+            while rest < len(bare) and bare[rest] in " \t":
+                rest += 1
+            if rest >= len(bare) or bare[rest] != ";":
+                continue
+            values = [
+                one.strip()
+                for one in _split_arguments(text[opening + 1: after - 1])
+                if one.strip()
+            ]
+            held, named = found.group(1), found.group(2)
+            written = f"{held} {named}; " + " ".join(
+                f"{named}.push_back({one});" for one in values
+            )
+            change = (found.start(), rest + 1, written)
+            break
+        if change is None:
+            return text
+        start, end, written = change
+        text = text[:start] + written + text[end:]
+    return text
 
 
 def _strip_constexpr(text: str) -> str:
@@ -12315,6 +12545,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Before anything reads a declaration: a linkage specification is words
     # in front of one, and its braces are not a scope.
     text = _strip_linkage(text)
+    # Before the word is taken away, because the word is what says the
+    # function may be asked while translating.
+    text = _fold_constexpr_calls(text)
     text = _strip_constexpr(text)
     text = _lift_nested_enums(text)
     text, scoped_enums = _rewrite_cpp_spellings(text)
@@ -12362,6 +12595,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # After the copies too: what a binding is written against is often one of
     # them, and its members are not there to be read until it exists.
     text = _rewrite_structured_bindings(text, filename)
+    # After the copies, because what says a class takes `push_back` is the
+    # copy written for these arguments.
+    text = _rewrite_list_initialisers(text)
     # Again, because a member template inside a class template could not be
     # read until the class had been written out: until then its calls are on
     # objects of a type that does not exist yet. `ComPtr<T>::As` is one -
@@ -14338,17 +14574,79 @@ public:
 _IOSTREAM_HEADER = r"""
 #include <stdio.h>
 namespace std {
+/* The width and the fill are the stream's, not the value's: `setw` applies
+   to the next thing written and then goes, which is what the standard says
+   and what a program relies on when it lines a table up. */
+/* The manipulators live here, with the stream that consumes them, so that
+   `<iomanip>` is only the three functions that make one. */
+struct __setw { int __n; };
+struct __setfill { char __c; };
+struct __setprecision { int __n; };
+
 class ostream {
 public:
     int __stream;
-    ostream() { __stream = 1; }
-    ostream &operator<<(int v) { printf("%d", v); return *this; }
-    ostream &operator<<(long v) { printf("%ld", v); return *this; }
-    ostream &operator<<(unsigned int v) { printf("%u", v); return *this; }
-    ostream &operator<<(unsigned long v) { printf("%lu", v); return *this; }
-    ostream &operator<<(double v) { printf("%g", v); return *this; }
-    ostream &operator<<(char v) { printf("%c", v); return *this; }
-    ostream &operator<<(const char *v) { printf("%s", v); return *this; }
+    int __width;
+    char __fill;
+    int __precision;
+    ostream() { __stream = 1; __width = 0; __fill = ' '; __precision = 6; }
+    void __space(int written) {
+        while (written < __width) { printf("%c", __fill); written = written + 1; }
+        __width = 0;
+    }
+    int __digits(unsigned long v) {
+        int n = 1;
+        while (v >= 10UL) { v = v / 10UL; n = n + 1; }
+        return n;
+    }
+    ostream &operator<<(int v) {
+        __space(__digits((unsigned long)(v < 0 ? -v : v)) + (v < 0 ? 1 : 0));
+        printf("%d", v); return *this;
+    }
+    ostream &operator<<(long v) {
+        __space(__digits((unsigned long)(v < 0 ? -v : v)) + (v < 0 ? 1 : 0));
+        printf("%ld", v); return *this;
+    }
+    ostream &operator<<(unsigned int v) { __space(__digits(v)); printf("%u", v); return *this; }
+    ostream &operator<<(unsigned long v) { __space(__digits(v)); printf("%lu", v); return *this; }
+    /* `%g` and not `%f`: C++'s default is six *significant* digits, so
+       `cout << 1.5` is `1.5` and not `1.500000`, and `setprecision(n)`
+       changes that same count. Written as a choice between fixed formats
+       rather than as `%.*g`, because py2bin's printf takes its precision
+       from the format and not from an argument. */
+    ostream &operator<<(double v) {
+        __width = 0;
+        if (__precision == 0) { printf("%.0g", v); return *this; }
+        if (__precision == 1) { printf("%.1g", v); return *this; }
+        if (__precision == 2) { printf("%.2g", v); return *this; }
+        if (__precision == 3) { printf("%.3g", v); return *this; }
+        if (__precision == 4) { printf("%.4g", v); return *this; }
+        if (__precision == 5) { printf("%.5g", v); return *this; }
+        if (__precision == 6) { printf("%.6g", v); return *this; }
+        if (__precision == 7) { printf("%.7g", v); return *this; }
+        if (__precision == 8) { printf("%.8g", v); return *this; }
+        if (__precision == 9) { printf("%.9g", v); return *this; }
+        if (__precision == 10) { printf("%.10g", v); return *this; }
+        if (__precision == 11) { printf("%.11g", v); return *this; }
+        if (__precision == 12) { printf("%.12g", v); return *this; }
+        if (__precision == 13) { printf("%.13g", v); return *this; }
+        if (__precision == 14) { printf("%.14g", v); return *this; }
+        if (__precision == 15) { printf("%.15g", v); return *this; }
+        if (__precision == 16) { printf("%.16g", v); return *this; }
+        if (__precision == 17) { printf("%.17g", v); return *this; }
+        printf("%g", v);
+        return *this;
+    }
+    ostream &operator<<(char v) { __space(1); printf("%c", v); return *this; }
+    ostream &operator<<(const char *v) {
+        int n = 0;
+        while (v[n] != 0) { n = n + 1; }
+        __space(n);
+        printf("%s", v); return *this;
+    }
+    ostream &operator<<(__setw v) { __width = v.__n; return *this; }
+    ostream &operator<<(__setfill v) { __fill = v.__c; return *this; }
+    ostream &operator<<(__setprecision v) { __precision = v.__n; return *this; }
 };
 ostream cout;
 ostream cerr;
@@ -14569,6 +14867,60 @@ tuple<A, B> make_tuple(A a, B b) { tuple<A, B> made(a, b); return made; }
 
 template<typename A, typename B, typename C>
 tuple<A, B, C> make_tuple(A a, B b, C c) { tuple<A, B, C> made(a, b, c); return made; }
+}
+"""
+
+#: <iomanip>. Each manipulator is a small object the stream consumes, which
+#: is what one is: `setw(5)` is not a value written but a change to how the
+#: next value is.
+_IOMANIP_HEADER = r"""
+#include <iostream>
+namespace std {
+__setw setw(int n) { __setw made; made.__n = n; return made; }
+__setfill setfill(char c) { __setfill made; made.__c = c; return made; }
+__setprecision setprecision(int n) { __setprecision made; made.__n = n; return made; }
+}
+"""
+
+#: <bitset>, which is arithmetic on an unsigned long and a count that says
+#: how much of it is the set. Fixed at translation time, because the size is
+#: a template argument - which is what makes a bitset one and not a vector.
+_BITSET_HEADER = r"""
+#include <string>
+namespace std {
+template<int N>
+class bitset {
+public:
+    unsigned long __bits;
+    bitset() { __bits = 0; }
+    bitset(unsigned long value) { __bits = value & ((N >= 64) ? ~0UL : ((1UL << N) - 1UL)); }
+    int size() const { return N; }
+    int test(int at) const { return (int)((__bits >> at) & 1UL); }
+    int operator[](int at) const { return (int)((__bits >> at) & 1UL); }
+    void set(int at) { __bits = __bits | (1UL << at); }
+    void reset(int at) { __bits = __bits & ~(1UL << at); }
+    void flip(int at) { __bits = __bits ^ (1UL << at); }
+    void reset() { __bits = 0; }
+    unsigned long to_ulong() const { return __bits; }
+    int count() const {
+        int found = 0;
+        int at = 0;
+        while (at < N) { if ((__bits >> at) & 1UL) { found = found + 1; } at = at + 1; }
+        return found;
+    }
+    int any() const { return __bits != 0; }
+    int none() const { return __bits == 0; }
+    int all() const { return count() == N; }
+    string to_string() const {
+        string made;
+        int at = N;
+        while (at > 0) {
+            at = at - 1;
+            made.push_back(((__bits >> at) & 1UL) ? '1' : '0');
+        }
+        return made;
+    }
+};
 }
 """
 
@@ -15762,6 +16114,8 @@ _BUILTIN_CPP_HEADERS = {
     "utility": _UTILITY_HEADER,
     "optional": _OPTIONAL_HEADER,
     "list": _LIST_HEADER,
+    "bitset": _BITSET_HEADER,
+    "iomanip": _IOMANIP_HEADER,
     "tuple": _TUPLE_HEADER,
     "deque": _DEQUE_HEADER,
     "numeric": _NUMERIC_HEADER,
