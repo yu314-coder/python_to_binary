@@ -113,6 +113,7 @@ from .native.ir import (
     FunctionAddress,
     GlobalAddress,
     FileCall,
+    AtomicAdd,
     HeapInit,
     HeapLoad,
     HeapStore,
@@ -4746,6 +4747,44 @@ class Lowerer:
         self.emit(HeapInit(slot, ARENA_BYTES))
         return Value(PointerType(VOID), IntLoad(slot))
 
+    def atomic_add_builtin(self, node: Call) -> Value:
+        """`__py2bin_atomic_add(&word, n)` - add, and answer what was there.
+
+        The one atomic py2bin emits, and the smallest one an allocator two
+        threads share can be built on: a bump pointer moved with this hands
+        two callers two different blocks, where a read and then a write hands
+        them the same one.
+
+        It is a builtin rather than `_Atomic` on a declaration because that
+        keyword promises every operation on the type is atomic, and only this
+        one is.
+        """
+
+        if len(node.arguments) != 2:
+            self.error(
+                "__py2bin_atomic_add(address, value) takes two arguments",
+                node.token,
+            )
+        address = self.rvalue(node.arguments[0])
+        value = self.rvalue(node.arguments[1])
+        if not isinstance(address.ctype, PointerType) and not is_integer(
+            address.ctype
+        ):
+            self.error(
+                "the first argument is the address of the word to add to",
+                node.arguments[0].token,
+            )
+        if not is_integer(value.ctype):
+            self.error(
+                "the second argument is the amount to add",
+                node.arguments[1].token,
+            )
+        slot = self.take(8)
+        self.emit(
+            AtomicAdd(slot, address.expr, self.fit(value.expr, LONG))
+        )
+        return Value(LONG, IntLoad(slot))
+
     def file_builtin(self, node: Call) -> Value:
         """One file syscall, with the kernel's own answer handed back.
 
@@ -4830,6 +4869,11 @@ class Lowerer:
                 return self.math_builtin(node)
         if node.name == "__py2bin_arena" and node.name not in self.unit.functions:
             return self.arena_builtin(node)
+        if (
+            node.name == "__py2bin_atomic_add"
+            and node.name not in self.unit.functions
+        ):
+            return self.atomic_add_builtin(node)
         if node.name in _FILE_BUILTINS and node.name not in self.unit.functions:
             return self.file_builtin(node)
         if node.name in _EXIT_BUILTINS and node.name not in self.unit.functions:

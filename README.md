@@ -10,7 +10,7 @@ pip install python-to-binary
 py2bin compile-capi app.py --target darwin-arm64 -o app
 ```
 
-**Where it stands.** 2,022 tests; a 110-program corpus whose output matches
+**Where it stands.** 2,027 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
 programs; 333 C and C++ programs whose output matches `clang++`, built for all
@@ -950,6 +950,34 @@ Two things that fell out of writing it. `%*c` printed the padding and not the
 character, because the loop that pads borrows the same one-byte scratch the
 character had been put in; the character is stored after the padding now. And
 the test that said `%*` was refused is now three tests that say what it does.
+
+**py2bin emits one atomic instruction now, and the allocator uses it.**
+`__py2bin_atomic_add(&word, n)` adds and answers what was there, in a step
+nothing can see half of: `lock xadd` on x86-64, and on ARM64 the
+`ldaxr`/`stlxr` retry pair rather than the ARMv8.1 `ldaddal`, so it runs on
+every ARM64 machine py2bin targets and not only on recent ones.
+
+The bump pointer moves with it, so two callers are handed two blocks where a
+read and then a write handed them the same one. The reservation is claimed the
+same way: whoever adds one and sees a zero does the mapping, and everyone else
+waits for the end to be published, reading it atomically because that is the
+only read this compiler promises anything about.
+
+**The assembler found a bug the test could not.** The five ARM64 words were
+written by hand from the manual. Four were right. The branch at the end of the
+retry loop read back five instructions rather than three - into the middle of
+the setup - and every test passed anyway, because `stlxr` succeeds on the
+first try when nothing else is touching the word, so the retry is never taken
+without contention. It would have failed the first time two threads actually
+collided, which is the one situation the whole thing exists for.
+
+Assembling the same five instructions with `clang` and comparing found it at
+once. `tests/test_atomic_encoding.py` does that for both architectures now,
+and separately checks the branch offset and the acquire and release bits;
+where there is no assembler for an architecture it says so and skips, rather
+than passing on nothing. The plain `ldxr`/`stxr` were wrong too: they order
+nothing, and ARM64 does not order stores on its own, which is exactly what
+the allocator leans on when one thread maps the arena and another waits.
 
 **Threads are refused, and the reason is the interesting part.** py2bin emits
 no atomic instruction on any target - `_Atomic` is refused in the C front end

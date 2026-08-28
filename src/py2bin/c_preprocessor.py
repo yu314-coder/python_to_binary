@@ -2352,12 +2352,30 @@ _STDLIB_H = f"#define __PY2BIN_ARENA_BYTES {ARENA_BYTES}UL\n" + """
    has, which is the property being relied on. */
 static size_t __py2bin_heap_bump = 0;
 static size_t __py2bin_heap_end = 0;
+static size_t __py2bin_heap_claimed = 0;
 
+/* The bump moves with an atomic add, so two callers are handed two blocks
+   rather than the same one. A read and then a write is not enough: both read
+   the same address before either writes, and both get it.
+
+   The reservation is claimed the same way. Whoever adds one to the claim and
+   sees a zero does the mapping; everybody else waits for the end to be
+   published, reading it atomically because that is the only read this
+   compiler promises anything about. The add that publishes it releases, and
+   the add that reads it acquires, so the base written before the publication
+   is there for whoever sees it. */
 void *malloc(size_t __n) {
     size_t __p;
-    if (__py2bin_heap_end == 0) {
-        __py2bin_heap_bump = (size_t)__py2bin_arena();
-        __py2bin_heap_end = __py2bin_heap_bump + __PY2BIN_ARENA_BYTES;
+    if ((size_t)__py2bin_atomic_add((long *)&__py2bin_heap_end, 0) == 0) {
+        if (__py2bin_atomic_add((long *)&__py2bin_heap_claimed, 1) == 0) {
+            __py2bin_heap_bump = (size_t)__py2bin_arena();
+            __py2bin_atomic_add(
+                (long *)&__py2bin_heap_end,
+                (long)(__py2bin_heap_bump + __PY2BIN_ARENA_BYTES));
+        } else {
+            while ((size_t)__py2bin_atomic_add(
+                       (long *)&__py2bin_heap_end, 0) == 0) { }
+        }
     }
     /* Round up to 16, which is the alignment any C object may ask for, so
        every block this returns is aligned for every type. A request of zero
@@ -2366,9 +2384,13 @@ void *malloc(size_t __n) {
     if (__n == (size_t)0) __n = (size_t)16;
     /* Written as a subtraction so a size near the top of the range cannot
        wrap the sum past the end and be let through. */
-    if (__n > __py2bin_heap_end - __py2bin_heap_bump) return NULL;
-    __p = __py2bin_heap_bump;
-    __py2bin_heap_bump = __p + __n;
+    /* Taken first and checked after. The other order is a read of the bump,
+       a comparison, and then a write - and between the read and the write
+       another caller may have taken the same block. Overshooting the end
+       costs the arena nothing that was not already gone: the only way past
+       the check is that there was no room. */
+    __p = (size_t)__py2bin_atomic_add((long *)&__py2bin_heap_bump, (long)__n);
+    if (__p + __n > __py2bin_heap_end || __p + __n < __p) return NULL;
     return (void *)__p;
 }
 

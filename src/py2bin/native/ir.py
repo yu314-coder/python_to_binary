@@ -425,6 +425,23 @@ class HeapAlloc:
 
 
 @dataclass(frozen=True, slots=True)
+class AtomicAdd:
+    """Add ``value`` to the 64-bit word at ``address`` and store what was
+    there before into ``dest_slot`` -- as one indivisible step.
+
+    The only atomic operation py2bin emits, and the smallest one that lets an
+    allocator be shared: a bump pointer moved with this hands two callers two
+    different blocks, where a read followed by a write hands them the same
+    one. Every other atomic a program might want is refused, and says so,
+    rather than being approximated with this.
+    """
+
+    dest_slot: int
+    address: IntExpression
+    value: IntExpression
+
+
+@dataclass(frozen=True, slots=True)
 class HeapStore:
     """Store the low ``size`` bytes (1, 2, 4 or 8) of ``value`` at ``address``."""
 

@@ -26,6 +26,7 @@ from .ir import (
     HeapInit,
     HeapLoad,
     HeapStore,
+    AtomicAdd,
     IntBinary,
     IntCompare,
     IntConstant,
@@ -63,6 +64,39 @@ _ARM64_LOADS = {
     (1, False): 0x39400000,  # ldrb  w0, [x0]
     (1, True): 0x39800000,  # ldrsb x0, [x0]
 }
+def _atomic_add_words() -> "list[int]":
+    """Add x1 to the word at x0, leaving what was there in x0.
+
+    Written as the exclusive pair rather than as `ldaddal`, which is an
+    ARMv8.1 instruction: the pair is in the baseline, so this runs on every
+    ARM64 machine py2bin targets and not only on recent ones.
+
+    The loop is what makes it one step. `ldaxr` marks the address, `stlxr`
+    writes only if nothing has touched it since and says so in w4, and if
+    something has the whole thing is tried again.
+
+    The acquiring and releasing forms rather than the plain ones, so what a
+    thread wrote before it published a value is visible to whoever reads that
+    value after. ARM64 does not order stores on its own, and the allocator
+    below relies on exactly that ordering when one thread maps the arena and
+    another waits for it.
+
+    The five words are checked against an assembler by
+    `tests/test_atomic_encoding.py`, because they were hand-written and the
+    branch offset was wrong: it read back five instructions rather than
+    three, which is only reachable when two threads actually collide, so
+    every test that did not collide passed.
+    """
+
+    return [
+        0xC85FFC02,  # ldaxr x2, [x0]
+        0x8B010043,  # add   x3, x2, x1
+        0xC804FC03,  # stlxr w4, x3, [x0]
+        0x35FFFFA4,  # cbnz  w4, -3 instructions - back to the ldaxr
+        0xAA0203E0,  # mov   x0, x2  - what was there before
+    ]
+
+
 _ARM64_STORES = {
     8: 0xF9000020,  # str  x0, [x1]
     4: 0xB9000020,  # str  w0, [x1]
@@ -1016,6 +1050,17 @@ def encode_windows(
                 words.extend(_mov(4, 0))
                 call("WriteFile")
                 continue
+            if isinstance(operation, AtomicAdd):
+                _expression(words, operation.address, slot_base, refs)
+                words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+                _expression(words, operation.value, slot_base, refs)
+                words.append(0xAA0003E1)                # mov x1, x0
+                words.extend((0xF94003E0, 0x910043FF))  # ldr x0,[sp]; add sp,#16
+                words.extend(_atomic_add_words())
+                words.extend(
+                    _slot_instruction(False, operation.dest_slot, slot_base)
+                )
+                continue
             if isinstance(operation, HeapStore):
                 # Plain memory, not the arena: a C store through a pointer needs no
                 # mmap, so it works on Windows exactly as it does on POSIX.
@@ -1338,6 +1383,17 @@ def _emit_operations(
             words.extend(_slot_instruction(False, operation.dest_slot, slot_base, rt=1))
             words.append(0x8B000020)  # add x0, x1, x0  (new bump)
             words.extend(_slot_instruction(False, operation.bump_slot, slot_base))
+            continue
+        if isinstance(operation, AtomicAdd):
+            _expression(words, operation.address, slot_base, refs)
+            words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
+            _expression(words, operation.value, slot_base, refs)
+            words.append(0xAA0003E1)                # mov x1, x0
+            words.extend((0xF94003E0, 0x910043FF))  # ldr x0,[sp]; add sp,#16
+            words.extend(_atomic_add_words())
+            words.extend(
+                _slot_instruction(False, operation.dest_slot, slot_base)
+            )
             continue
         if isinstance(operation, HeapStore):
             _expression(words, operation.address, slot_base, refs)  # x0 = address
