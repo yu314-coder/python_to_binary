@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 345 C and C++ programs whose output matches `clang++`, built for all
+programs; 347 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -1056,6 +1056,29 @@ being "hand back the pointer you were given". The pass that hoists a temporary
 had to be told about it as well: it knew `new T(args)` was already a
 construction and not a temporary, and `new (room) T(args)` is the same thing
 wearing a different hat.
+
+**A move is a move where it can be one, and says so where it cannot.** `T &&o`
+was not read at all. It is read as `T &o` now - both spellings arrive as the
+same pointer here, and `std::move` is taken out just below, so there is one
+candidate rather than two to choose between. A class with a move constructor
+and no copy constructor gets exactly the move it asked for: the object moved
+from comes back empty, as it should.
+
+Telling `T &&o` from `a && b` is the question of whether the first word names
+a type, and nothing else - the text is otherwise identical - so the pass runs
+once the class names are known and asks.
+
+A class with *both* is refused where it is declared. Once `std::move` is gone
+the two take the same thing with nothing to tell them apart, and picking
+whichever came first is a copy where a move was asked for, or a move where a
+copy was - an object emptied that the program still meant to use. The message
+says that; the one it used to get said to cast the argument, which no cast can
+do.
+
+**`&(c ? a : b)`** is an address C++ allows and C does not: a conditional is
+an lvalue there where both arms are, and is only ever a value here. Both arms
+have addresses though, and choosing between two addresses is the same choice
+as taking the address of what was chosen, so the `&` goes to the arms.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

@@ -5997,6 +5997,38 @@ _A_PLAIN_NAME = re.compile(
 )
 
 
+#: `Buf(Buf &&o)` - a parameter taken by rvalue reference. Bounded by the
+#: punctuation of a parameter list on both sides, and the type has to be a
+#: name this file declares or a word that begins one: `f(a && b)` is written
+#: exactly the same way and is two operands, not a declaration.
+_RVALUE_PARAMETER = re.compile(
+    r"(?<=[(,])(\s*(?:const\s+)?([A-Za-z_]\w*)\s*)&&(\s*[A-Za-z_]\w*\s*)(?=[,)])"
+)
+
+
+def _rvalue_references_to_references(text: str) -> str:
+    """`T &&o` becomes `T &o`, which is what it already compiles to here.
+
+    An rvalue reference says the object it names is finished with, so what it
+    holds may be taken rather than copied. Both spellings arrive as the same
+    pointer; the difference is which constructor a call picks, and `std::move`
+    - the thing that asks for the difference - is taken out just below,
+    leaving one candidate rather than two to choose between.
+
+    So a class with a move constructor and no copy constructor gets exactly
+    the move it asked for. A class with both is refused where it is declared,
+    rather than quietly given whichever came first.
+    """
+
+    def written(match: "re.Match[str]") -> str:
+        named = match.group(2)
+        if named not in _CLASS_NAMES and named not in _TYPE_WORDS:
+            return match.group(0)
+        return f"{match.group(1)}&{match.group(3)}"
+
+    return _map_code(text, lambda part: _RVALUE_PARAMETER.sub(written, part))
+
+
 def _strip_moves(text: str) -> str:
     """`std::move(v)` becomes `(v)`.
 
@@ -10264,9 +10296,15 @@ def _rewrite_body(
         if held in classes:
             known[variable] = held
             pointers.add(variable)
-            made = f"struct {held} *{variable} = &({source.strip()});"
+            made = (
+                f"struct {held} *{variable} = "
+                f"{_address_over_a_conditional(source.strip())};"
+            )
         else:
-            made = f"{spelled} *{variable} = &({source.strip()});"
+            made = (
+                f"{spelled} *{variable} = "
+                f"{_address_over_a_conditional(source.strip())};"
+            )
         # Held aside while the uses are dereferenced: the declaration is the
         # one place the name means the pointer and not what it points at, and
         # rewriting it too gave `int *(*alias)`.
@@ -13151,6 +13189,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     _INHERITED_FROM = {
         one for m in _CLASS_HEAD.finditer(text) for one in _bases_of(m)
     }
+    # After the names are known, because telling `T &&o` from `a && b` is
+    # exactly the question of whether the first word names a type.
+    text = _rvalue_references_to_references(text)
     if throws:
         # What the pass below leaves behind is a `return`, and only the pass
         # that reads a class body knows which destructors a return has to run
@@ -13249,6 +13290,32 @@ def _translate(source: str, filename: str = "<c++>") -> str:
                     f"{name} inherits from {one}, which is not a class this "
                     f"translation unit declares",
                 )
+        # A copy constructor and a move constructor together. Both take the
+        # class by reference, and `std::move` - the one thing that says which
+        # is meant - is taken out above, because every move here is a copy.
+        # Once it is gone the two are one signature, and choosing whichever
+        # was written first would be a copy where a move was asked for or a
+        # move where a copy was: an object emptied that the program still
+        # meant to use.
+        taking = [
+            method
+            for method in found.methods
+            if method.name == "" and _arity(method.parameters) == 1
+            and _parameter_types(method.parameters) == [_type_code(name)]
+        ]
+        if len(taking) > 1:
+            raise CppTranslationError(
+                filename,
+                taking[-1].line,
+                f"{name} declares more than one constructor taking a "
+                f"{name} - a copy constructor and a move constructor. "
+                f"py2bin has no rvalue reference of its own: `std::move` is "
+                f"taken out, every move becomes the copy it would have been, "
+                f"and the two are left taking the same thing with nothing to "
+                f"tell them apart. Write whichever one this class needs, and "
+                f"if that is the move, write it as the copy constructor - "
+                f"which is what `unique_ptr` here does",
+            )
         for mixin in found.mixins:
             # A second base is a member after the first, so the address of the
             # object is not the address of it: converting a `{name} *` to a
@@ -14095,6 +14162,37 @@ def _references_to_pointers(parameters: str) -> str:
     """`Box &b` becomes `Box *b`; the callee sees a pointer either way."""
 
     return _REFERENCE.sub(lambda m: f"{m.group(1)} *{m.group(2)}", parameters)
+
+
+def _address_over_a_conditional(spelled: str) -> str:
+    """`&(c ? a : b)` becomes `(c ? &(a) : &(b))`.
+
+    C++ lets a conditional be an lvalue where both arms are, so its address
+    can be taken. C has no such thing: a conditional there is a value, and a
+    value has no address. Both arms do, though, and choosing between two
+    addresses is the same choice as taking the address of what was chosen.
+    """
+
+    arms = _conditional_arms(spelled)
+    if arms is None:
+        return f"&({spelled})"
+    depth = 0
+    question = -1
+    for index, piece in enumerate(_without_literals(spelled)):
+        if piece in "([{":
+            depth += 1
+        elif piece in ")]}":
+            depth -= 1
+        elif depth == 0 and piece == "?":
+            question = index
+            break
+    if question < 0:
+        return f"&({spelled})"
+    condition = spelled[:question].strip()
+    return (
+        f"(({condition}) ? {_address_over_a_conditional(arms[0].strip())}"
+        f" : {_address_over_a_conditional(arms[1].strip())})"
+    )
 
 
 def _deref_references(
