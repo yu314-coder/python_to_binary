@@ -1586,6 +1586,14 @@ _FINAL_OR_OVERRIDE = re.compile(
     r"(?<=\w)\s+(?:final|override)\b(?=\s*[{;:,)])"
 )
 
+#: `int safe() noexcept {` and `void go() noexcept(true) {` - a promise about
+#: what a function does not do. py2bin has no unwinder, so a function that
+#: throws is written out as a `return` either way and the promise changes
+#: nothing it emits. Taken off rather than refused: what it says is true of
+#: everything here or of nothing, and neither reading makes a difference to
+#: the code.
+_NOEXCEPT = re.compile(r"(?<![.\w>])noexcept\b(?:\s*\([^()]*\))?\s*")
+
 _FORWARD_DECLARATION = re.compile(
     r"(?m)^[ \t]*(?:class|struct|union)\s+[A-Za-z_]\w*\s*;[ \t]*$"
 )
@@ -1764,6 +1772,7 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     # check, so the word is what is lost and nothing else - but left in, it
     # reaches the C compiler as a name where a name cannot be.
     text = _map_code(text, lambda part: _FINAL_OR_OVERRIDE.sub("", part))
+    text = _map_code(text, lambda part: _NOEXCEPT.sub(" ", part))
     text = _FORWARD_DECLARATION.sub("", text)
     # `friend class X;` and `friend int f();` grant access to what is private.
     # py2bin emits a plain struct and enforces no access at all, so a friend
@@ -9869,7 +9878,13 @@ def _rewrite_temporaries(
             # `new T(args)` already allocates and constructs; the class name
             # there is not a temporary being built on the stack.
             before = body[:match.start()].rstrip()
-            if re.search(r"\bnew$", before):
+            # `new T(args)` already allocates and constructs, and so does
+            # `new (room) T(args)` - which constructs and does not allocate.
+            # The second form was not recognised, so its arguments were
+            # hoisted out and the `new` was left with a name after it.
+            if re.search(r"\bnew$", before) or re.search(
+                r"\bnew\s*\([^()]*\)$", before
+            ):
                 continue
             # `V t = V(5);` - the declaration's own object is the temporary.
             start = _statement_start(body, match.start())
@@ -10130,6 +10145,9 @@ def _rewrite_body(
     # that does both. Written out as its own statement first, so what reaches
     # the rewrite below is the storage on its own.
     body = _hoist_new_initialisers(body, classes, [0])
+    # Before the allocating form, which would otherwise read the `(room)` as
+    # the argument list of a `new` with no type after it.
+    body = _rewrite_placement_new(body, classes)
     body = _rewrite_new(body, classes, scope())
 
     # `return a + b;` where the function answers an object: given a name of
@@ -13523,6 +13541,42 @@ def _translate(source: str, filename: str = "<c++>") -> str:
 #: reads `new Row *[n]` once T has been substituted, and taken without them
 #: the `*[n]` was left behind for the C compiler to choke on.
 _NEW = re.compile(r"\bnew\s+([A-Za-z_]\w*(?:\s*\*)*)\s*(\[|\()?")
+
+#: `new (room) T(a, b)` - the one `new` that allocates nothing. The memory is
+#: already there and what is being asked for is the constructor, run on it.
+_PLACEMENT_NEW = re.compile(
+    r"\bnew\s*\(([^()]*)\)\s*([A-Za-z_]\w*)\s*\("
+)
+
+
+def _rewrite_placement_new(text: str, classes: "dict[str, Class]") -> str:
+    """`new (room) T(a)` becomes the constructor run where it was told to.
+
+    Every other `new` here obtains storage and then constructs; this one is
+    handed the storage. So it becomes the second half on its own - which is
+    what the standard's placement operator does too, its whole body being
+    `return the pointer it was given`.
+    """
+
+    bare = _without_literals(text)
+    out: "list[str]" = []
+    at = 0
+    for found in _PLACEMENT_NEW.finditer(bare):
+        if found.start() < at or found.group(2) not in classes:
+            continue
+        closing = _closing_paren(bare, found.end() - 1)
+        if closing < 0:
+            continue
+        given = text[found.end(): closing].strip()
+        out.append(text[at: found.start()])
+        out.append(
+            f"{_c_name(found.group(2), 'place')}"
+            f"((void *)({found.group(1).strip()})"
+            f"{', ' + given if given else ''})"
+        )
+        at = closing + 1
+    out.append(text[at:])
+    return "".join(out)
 #: `delete p;` and `delete[] p;`, to the end of the statement.
 #: The word boundary after `delete` is load-bearing: without it `deleteAll()`
 #: and `deleteLater` were read as a `delete` of whatever followed, and a
@@ -13698,6 +13752,44 @@ def _emit_heap_helpers(found: "Class", classes: "dict[str, Class]") -> str:
             f"static struct {name} *{_c_name(name, 'new', suffix)}({parameters}) {{\n"
             f"    struct {name} *__p = (struct {name} *)malloc({size});\n"
             f"    if (__p == 0) return 0;\n"
+            f"    {ctor}(__p{', ' + passed if passed else ''});\n"
+            f"    return __p;\n"
+            f"}}"
+        )
+
+    # And the one that is handed its storage. `new (room) T(a)` asks only for
+    # the constructor, so this is `T__new` without the malloc.
+    for constructor in constructors:
+        suffix = (
+            _suffix_of(name, constructor, classes)
+            if _has_several_constructors(name, classes)
+            else None
+        )
+        converted = _rewrite_types(
+            _references_to_pointers(constructor.parameters), classes
+        )
+        for held, variable in _by_value_objects(constructor.parameters, classes):
+            converted = re.sub(
+                rf"\bstruct\s+{re.escape(held)}\s+{re.escape(variable)}\b",
+                f"struct {held} *__by_value_{variable}",
+                converted,
+            )
+        passed = ", ".join(
+            _parameter_name(part) for part in _split_arguments(converted)
+            if part.strip()
+        )
+        head = f"void *__where{', ' + converted if converted.strip() else ''}"
+        if not found.methods:
+            made.append(
+                f"static struct {name} *{_c_name(name, 'place', suffix)}"
+                f"(void *__where) {{ return (struct {name} *)__where; }}"
+            )
+            continue
+        owner = _find_method(name, "", classes)
+        ctor = _c_name(owner or name, "", _suffix_of(name, constructor, classes))
+        made.append(
+            f"static struct {name} *{_c_name(name, 'place', suffix)}({head}) {{\n"
+            f"    struct {name} *__p = (struct {name} *)__where;\n"
             f"    {ctor}(__p{', ' + passed if passed else ''});\n"
             f"    return __p;\n"
             f"}}"
@@ -15699,6 +15791,64 @@ public:
 }
 """
 
+#: <string_view>, which is a pointer and a length and nothing else - it does
+#: not own what it looks at, which is the whole of what it is for.
+_STRING_VIEW_HEADER = r"""
+namespace std {
+class string_view {
+public:
+    const char *__at;
+    unsigned long __len;
+    string_view() { __at = 0; __len = 0; }
+    string_view(const char *text) {
+        unsigned long n = 0;
+        __at = text;
+        while (text != 0 && text[n] != 0) { n = n + 1; }
+        __len = n;
+    }
+    string_view(const char *text, unsigned long n) { __at = text; __len = n; }
+    unsigned long size() const { return __len; }
+    unsigned long length() const { return __len; }
+    int empty() const { return __len == 0; }
+    const char *data() const { return __at; }
+    char operator[](unsigned long i) const { return __at[i]; }
+    char at(unsigned long i) const { return __at[i]; }
+    char front() const { return __at[0]; }
+    char back() const { return __at[__len - 1]; }
+    string_view substr(unsigned long from, unsigned long n) const {
+        string_view made(__at + from, n);
+        return made;
+    }
+    string_view substr(unsigned long from) const {
+        string_view made(__at + from, __len - from);
+        return made;
+    }
+    int compare(string_view o) const {
+        unsigned long i = 0;
+        while (i < __len && i < o.__len) {
+            if (__at[i] != o.__at[i]) { return (int)__at[i] - (int)o.__at[i]; }
+            i = i + 1;
+        }
+        if (__len == o.__len) { return 0; }
+        return __len < o.__len ? -1 : 1;
+    }
+    int operator==(string_view o) const { return compare(o) == 0; }
+    int operator!=(string_view o) const { return compare(o) != 0; }
+};
+}
+"""
+
+#: <new>. What the header itself carries is small: `new (room) T(...)` is
+#: rewritten to the constructor run on that address, so the placement operator
+#: it would otherwise declare has nothing left to do. What is here is the two
+#: names a program including it actually writes.
+_NEW_HEADER = r"""
+namespace std {
+struct nothrow_t { int __unused; };
+struct bad_alloc { const char *what() const { return "bad_alloc"; } };
+}
+"""
+
 #: <bitset>, which is arithmetic on an unsigned long and a count that says
 #: how much of it is the set. Fixed at translation time, because the size is
 #: a template argument - which is what makes a bitset one and not a vector.
@@ -16932,6 +17082,8 @@ _BUILTIN_CPP_HEADERS = {
     "optional": _OPTIONAL_HEADER,
     "list": _LIST_HEADER,
     "bitset": _BITSET_HEADER,
+    "string_view": _STRING_VIEW_HEADER,
+    "new": _NEW_HEADER,
     "atomic": _ATOMIC_HEADER,
     "thread": _thread_header,
     "mutex": _MUTEX_HEADER,

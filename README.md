@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 340 C and C++ programs whose output matches `clang++`, built for all
+programs; 345 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -1040,6 +1040,22 @@ They are run on this machine, which is one of six. `pthread_create` is what
 POSIX targets use and `CreateThread` is what Windows targets use; the second
 has never executed. That is said here rather than left to be discovered,
 because it is exactly the shape of both Windows mistakes on this page.
+
+**`noexcept`, `alignof`, `<string_view>` and placement `new`.** The first is
+taken off: py2bin has no unwinder, a function that throws is written out as a
+`return` either way, and the promise changes nothing it emits. The second went
+into the C front end rather than being worked out in the C++ - that is where
+struct layout is known, so `_Alignof(struct S)` answers eight where `sizeof`
+answers sixteen, and plain C gets it too.
+
+`new (room) T(a)` is the one `new` that allocates nothing. Rather than declare
+the placement operator - a free `operator new`, which this subset does not
+parse - it is rewritten into what it means: the constructor run on that
+address, which is what the standard's operator does anyway, its whole body
+being "hand back the pointer you were given". The pass that hoists a temporary
+had to be told about it as well: it knew `new T(args)` was already a
+construction and not a temporary, and `new (room) T(args)` is the same thing
+wearing a different hat.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

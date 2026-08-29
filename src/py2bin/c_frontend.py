@@ -1404,6 +1404,18 @@ class SizeofType(Node):
 
 
 @dataclasses.dataclass(slots=True)
+class AlignofType(Node):
+    """`alignof(T)` - what the layout rules already work out for every type.
+
+    A separate node from `sizeof` because the two differ wherever padding
+    does: `struct { char c; double d; }` is sixteen bytes and aligns to
+    eight.
+    """
+
+    ctype: CType
+
+
+@dataclasses.dataclass(slots=True)
 class SizeofExpression(Node):
     operand: Node
 
@@ -2254,6 +2266,12 @@ class Parser:
         if token.kind == "symbol" and token.value in {"+", "-", "!", "~", "*", "&"}:
             self.take()
             return Unary(token, str(token.value), self.unary_expression())
+        if token.kind == "identifier" and token.value in ("alignof", "_Alignof"):
+            self.take()
+            self.take("(")
+            ctype = self.type_name()
+            self.take(")")
+            return AlignofType(token, ctype)
         if token.kind == "identifier" and token.value == "sizeof":
             self.take()
             if self.at("(") and self.at_type_after_parenthesis():
@@ -3113,6 +3131,8 @@ class ConstantEvaluator:
                 "array length and a 'case' label must be integers",
                 node.token,
             )
+        if isinstance(node, AlignofType):
+            return align_of(node.ctype)
         if isinstance(node, SizeofType):
             size = size_of(node.ctype)
             if size is None:
@@ -4070,6 +4090,8 @@ class Lowerer:
             return self.rvalue(node.right)
         if isinstance(node, Cast):
             return self.cast(node)
+        if isinstance(node, AlignofType):
+            return Value(ULONG, IntConstant(align_of(node.ctype)))
         if isinstance(node, SizeofType):
             size = size_of(node.ctype)
             if size is None:
