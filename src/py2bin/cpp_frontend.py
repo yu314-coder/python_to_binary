@@ -2451,20 +2451,64 @@ def _lift_nested_classes(text: str) -> str:
             outer, name = head.group(2), inner.group(2)
             spelled = f"{outer}__{name}"
             taken = text[start:end].replace(name, spelled, 1)
+            # A class inside a class *template* depends on the parameters of
+            # the one it was written in: `struct Inner { T v; };` has no `T`
+            # once it is somewhere else. So it takes them with it, and every
+            # mention of it says which arguments are meant - inside the
+            # template, its own; outside, whatever the use spelled.
+            heading = re.search(
+                r"(?<![.\w>])template\s*<([^<>]*)>\s*$", text[:head.start()]
+            )
+            named = (
+                [
+                    part.split()[-1]
+                    for part in _split_arguments(heading.group(1))
+                    if part.strip()
+                ]
+                if heading is not None
+                else []
+            )
+            if named:
+                taken = f"template <{heading.group(1)}> {taken}"
+                applied = f"{spelled}<{', '.join(named)}>"
+            else:
+                applied = spelled
             lifted.append(taken)
             text = text[:start] + text[end:]
+            # `Outer<int>::Inner` names the copy for those arguments.
+            text = _map_code(
+                text,
+                lambda part, o=outer, n=name, s=spelled: re.sub(
+                    rf"\b{re.escape(o)}\s*<([^<>]*)>\s*::\s*{re.escape(n)}\b",
+                    rf"{s}<\1>",
+                    part,
+                ),
+            )
             text = _map_code(
                 text,
                 lambda part, o=outer, n=name, s=spelled: re.sub(
                     rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", s, part
                 ),
             )
-            text = _map_code(
-                text,
-                lambda part, n=name, s=spelled: re.sub(
-                    rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, part
-                ),
-            )
+            if named:
+                # A bare `Inner` means this copy, and only inside the class it
+                # was written in - which is where the parameters have meaning.
+                closing = _matching(text, head.end() - 1)
+                inside = text[head.end(): closing]
+                inside = _map_code(
+                    inside,
+                    lambda part, n=name, s=applied: re.sub(
+                        rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*(?:::|<))", s, part
+                    ),
+                )
+                text = text[:head.end()] + inside + text[closing:]
+            else:
+                text = _map_code(
+                    text,
+                    lambda part, n=name, s=spelled: re.sub(
+                        rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, part
+                    ),
+                )
             moved = True
             break
         if not moved:
@@ -13217,12 +13261,26 @@ def _translate(source: str, filename: str = "<c++>") -> str:
                 filename, _line_of(text, opening), f"{keyword} {name} is not closed"
             ) from None
         # A `struct` with no methods is C already; leave it exactly as it is.
+        # Unless it names a base, which C has no spelling for: `struct Derived
+        # : Base { int c; };` has no methods and is not C, and left alone it
+        # reached the C compiler with the `:` still in it. One that inherits
+        # goes through the machinery that lays a base out as the first member,
+        # whether or not it declares anything of its own.
         inner = text[opening + 1: closing - 1]
-        if keyword == "struct" and "(" not in inner:
+        if keyword == "struct" and "(" not in inner and not _bases_of(head):
             # A struct with no methods is C already and is left exactly as it
             # is - but C++ lets the bare name be a type and C does not, so it
             # still needs the typedef emitted below.
             plain.append(name)
+            # Its members are read even though its body is emitted as it was
+            # written. Something deriving from it needs to know what names it
+            # brings: `d.a` where `a` belongs to a plain base has to become
+            # `d.__base.a`, and nothing can say so without the list.
+            held = Class(name)
+            for spelled, member in _struct_members(text[head.start(): closing], name):
+                held.members.append(Member(member, spelled))
+            classes[name] = held
+            continue
             # It is still an object as far as *passing* goes: py2bin's C can
             # neither pass nor answer a struct by value, and `Point add(Point
             # a, Point b)` is as ordinary in C++ as it is impossible here. So
@@ -13230,8 +13288,6 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             # need to know - and is kept out of `order`, so the body it was
             # written with is emitted rather than one rebuilt from a reading
             # that a bitfield or an array would not survive.
-            classes[name] = Class(name)
-            continue
         found = _split_members(inner, name, filename, _line_of(text, opening))
         found.base = base
         found.mixins = [one for one in mixins if one != base]
@@ -13558,6 +13614,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # carries: it is a D if that table is D's own or belongs to a class
     # derived from D. Written after the bodies, because the calls it answers
     # are in them.
+    rewritten, wanted_name = _rewrite_typeid(rewritten, classes, filename)
+    if wanted_name:
+        definitions += "\n" + _emit_type_names(order, classes)
     rewritten, asked = _rewrite_dynamic_casts(rewritten, classes, filename)
     if asked:
         definitions += "\n" + "\n".join(
@@ -13664,6 +13723,109 @@ _DYNAMIC_CAST = re.compile(r"\bdynamic_cast\s*<([^<>]+)>\s*\(")
 
 def _dynamic_cast_name(name: str) -> str:
     return f"__py2bin_as_{name}"
+
+
+#: `typeid(x)` and `typeid(T)` - what an object really is, asked at run time.
+_TYPEID = re.compile(r"(?<![.\w>])typeid\s*\(")
+
+
+def _rewrite_typeid(
+    body: str, classes: "dict[str, Class]", filename: str
+) -> "tuple[str, bool]":
+    """`typeid(a) == typeid(b)` becomes a comparison of two tables.
+
+    An object's table *is* its identity here: one exists per class, the
+    program is one translation unit, and two objects share a table exactly
+    when they are the same class. That is the same fact `dynamic_cast` is
+    answered from.
+
+    A `typeid` standing on its own is refused rather than given a number,
+    because what C++ hands back there is an object with a name on it and an
+    ordering, and neither of those is a table pointer.
+    """
+
+    wanted_name = False
+    out: "list[str]" = []
+    at = 0
+
+    def table(spelled: str, where: int) -> str:
+        held = spelled.strip()
+        if held in classes and _is_polymorphic(held, classes):
+            return f"((void *)&{_vtable_name(held)})"
+        # An expression: the table the object carries. Written through the
+        # path to whichever base holds the pointer, which is where the
+        # dispatcher reads it from too.
+        deduced = _deduced_type(held, body)
+        owner = (
+            re.sub(r"\b(?:const|struct|volatile)\b", " ", deduced or "")
+            .replace("*", " ")
+            .strip()
+        )
+        if owner in classes and _is_polymorphic(owner, classes):
+            reach = "->" if "*" in (deduced or "") else "."
+            return f"((void *)({held}){reach}{_vptr_path(owner, classes)})"
+        raise CppTranslationError(
+            filename, _line_of(body, where),
+            f"typeid({held}) - py2bin answers this from the table an object "
+            f"carries, and `{held}` is not something with one. Only a class "
+            f"with a virtual function has a table, which is also the only "
+            f"kind C++ answers about at run time",
+        )
+
+    for found in _TYPEID.finditer(body):
+        if found.start() < at:
+            continue
+        close = _closing_paren(body, found.end() - 1)
+        if close < 0:
+            continue
+        first = table(body[found.end(): close], found.start())
+        rest = body[close + 1:]
+        # `== typeid(y)` or `!= typeid(y)`, which is what a program writes.
+        paired = re.match(r"\s*(==|!=)\s*", rest)
+        after = _TYPEID.match(rest, paired.end()) if paired else None
+        if after is not None:
+            second_close = _closing_paren(rest, after.end() - 1)
+            if second_close >= 0:
+                second = table(
+                    rest[after.end(): second_close], found.start()
+                )
+                out.append(body[at: found.start()])
+                out.append(f"({first} {paired.group(1)} {second})")
+                at = close + 1 + second_close + 1
+                continue
+        # `.name()`, which is the other thing written.
+        named = re.match(r"\s*\.\s*name\s*\(\s*\)", rest)
+        if named is not None:
+            wanted_name = True
+            out.append(body[at: found.start()])
+            out.append(f"__py2bin_type_name({first})")
+            at = close + 1 + named.end()
+            continue
+        raise CppTranslationError(
+            filename, _line_of(body, found.start()),
+            "a `typeid` on its own is refused: py2bin answers one from the "
+            "table an object carries, which compares and has a name, and is "
+            "not the object with an ordering that C++ hands back. Write "
+            "`typeid(a) == typeid(b)` or `typeid(a).name()`",
+        )
+    out.append(body[at:])
+    return "".join(out), wanted_name
+
+
+def _emit_type_names(order: "list[str]", classes: "dict[str, Class]") -> str:
+    """`__py2bin_type_name(table)` - the class a table belongs to, by name."""
+
+    arms = "".join(
+        f"    if (__p == (void *)&{_vtable_name(name)}) {{ return \"{name}\"; }}\n"
+        for name in order
+        if _is_polymorphic(name, classes)
+    )
+    return (
+        f"static const char *__py2bin_type_name(void *__p) {{\n"
+        f"{arms}"
+        f"    return \"unknown\";\n"
+        f"}}"
+    )
 
 
 def _rewrite_dynamic_casts(
@@ -15947,6 +16109,96 @@ struct bad_alloc { const char *what() const { return "bad_alloc"; } };
 }
 """
 
+#: <typeinfo>. What `typeid` answers here is the table an object carries,
+#: which compares and has a name - so the header itself has nothing to hold,
+#: and the two spellings a program writes are rewritten where they stand.
+_TYPEINFO_HEADER = r"""
+namespace std {
+struct bad_typeid { const char *what() const { return "bad_typeid"; } };
+struct bad_cast { const char *what() const { return "bad_cast"; } };
+}
+"""
+
+#: <random>. `mt19937` is a named algorithm with published constants, so this
+#: is that algorithm rather than something that merely looks random: seeded
+#: the same way it answers the same numbers as any other implementation, which
+#: is the property a program using it for a reproducible run depends on.
+_RANDOM_HEADER = r"""
+namespace std {
+class mt19937 {
+public:
+    unsigned long __state[624];
+    int __at;
+    mt19937() { seed(5489UL); }
+    mt19937(unsigned long value) { seed(value); }
+    void seed(unsigned long value) {
+        int i;
+        __state[0] = value & 0xFFFFFFFFUL;
+        i = 1;
+        while (i < 624) {
+            unsigned long before = __state[i - 1] ^ (__state[i - 1] >> 30);
+            __state[i] = (1812433253UL * before + (unsigned long)i) & 0xFFFFFFFFUL;
+            i = i + 1;
+        }
+        __at = 624;
+    }
+    void __twist() {
+        int i = 0;
+        while (i < 624) {
+            unsigned long joined =
+                (__state[i] & 0x80000000UL) | (__state[(i + 1) % 624] & 0x7FFFFFFFUL);
+            unsigned long next = __state[(i + 397) % 624] ^ (joined >> 1);
+            if ((joined & 1UL) != 0UL) { next = next ^ 2567483615UL; }
+            __state[i] = next & 0xFFFFFFFFUL;
+            i = i + 1;
+        }
+        __at = 0;
+    }
+    unsigned long operator()() {
+        unsigned long v;
+        if (__at >= 624) { __twist(); }
+        v = __state[__at];
+        __at = __at + 1;
+        v = v ^ (v >> 11);
+        v = v ^ ((v << 7) & 2636928640UL);
+        v = v ^ ((v << 15) & 4022730752UL);
+        v = v ^ (v >> 18);
+        return v & 0xFFFFFFFFUL;
+    }
+    unsigned long min() const { return 0UL; }
+    unsigned long max() const { return 4294967295UL; }
+};
+
+typedef mt19937 default_random_engine;
+typedef mt19937 minstd_rand;
+
+/* Not a device: there is nothing here to ask for entropy. It is a fixed
+   sequence, and saying so is better than a name that promises otherwise. */
+class random_device {
+public:
+    mt19937 __made;
+    random_device() { }
+    unsigned long operator()() { return __made(); }
+};
+
+template<typename T>
+class uniform_int_distribution {
+public:
+    long __low;
+    long __high;
+    uniform_int_distribution() { __low = 0; __high = 2147483647L; }
+    uniform_int_distribution(T low, T high) { __low = (long)low; __high = (long)high; }
+    T operator()(mt19937 &g) {
+        unsigned long room = (unsigned long)(__high - __low) + 1UL;
+        if (room == 0UL) { return (T)g(); }
+        return (T)(__low + (long)(g() % room));
+    }
+    T min() const { return (T)__low; }
+    T max() const { return (T)__high; }
+};
+}
+"""
+
 #: <bitset>, which is arithmetic on an unsigned long and a count that says
 #: how much of it is the set. Fixed at translation time, because the size is
 #: a template argument - which is what makes a bitset one and not a vector.
@@ -17180,6 +17432,8 @@ _BUILTIN_CPP_HEADERS = {
     "optional": _OPTIONAL_HEADER,
     "list": _LIST_HEADER,
     "bitset": _BITSET_HEADER,
+    "random": _RANDOM_HEADER,
+    "typeinfo": _TYPEINFO_HEADER,
     "string_view": _STRING_VIEW_HEADER,
     "new": _NEW_HEADER,
     "atomic": _ATOMIC_HEADER,

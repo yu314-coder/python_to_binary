@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 347 C and C++ programs whose output matches `clang++`, built for all
+programs; 351 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -1079,6 +1079,38 @@ do.
 an lvalue there where both arms are, and is only ever a value here. Both arms
 have addresses though, and choosing between two addresses is the same choice
 as taking the address of what was chosen, so the `&` goes to the arms.
+
+**`struct Derived : Base { int c; };` did not compile at all.** A struct with
+no methods was taken for C already and emitted exactly as written, so the `:`
+reached the C compiler. A plain data struct that inherits is ordinary code and
+none of them worked. It went unnoticed because it is loud rather than quiet -
+and because nothing in the corpus happened to write one.
+
+Two things were needed. A struct that names a base goes through the machinery
+that lays one out, whether or not it declares anything of its own - C has no
+spelling for a base. And a plain struct's *members* are read now even though
+its body is still emitted as it was written: something deriving from it has to
+know what names it brings, or `d.a` cannot become `d.__base.a`.
+
+It was found by chasing something else. `typeid(B)` said `B` was not
+polymorphic, which was strange enough to look into.
+
+**`typeid`, from the table the object already carries.** One table exists per
+class, the program is one translation unit, and two objects share a table
+exactly when they are the same class - which is the fact `dynamic_cast` is
+answered from too. `typeid(a) == typeid(b)` and `typeid(a).name()` work; a
+`typeid` standing on its own is refused, because what C++ hands back there is
+an object with an ordering and a table pointer is not that.
+
+**A class inside a class template** takes the template's parameters with it
+when it is lifted out - `struct Inner { T v; };` has no `T` anywhere else -
+and every mention of it says which arguments are meant: inside the template
+its own, outside whatever the use spelled.
+
+**`<random>`** is the Mersenne Twister, not something that merely looks
+random. Seeded with 5489 it answers 3499211612, 581869302, 3890346734, which
+is what every other implementation answers, and is the property a program
+using it for a repeatable run depends on.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that
