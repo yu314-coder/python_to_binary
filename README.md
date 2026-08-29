@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 351 C and C++ programs whose output matches `clang++`, built for all
+programs; 352 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -1111,6 +1111,26 @@ its own, outside whatever the use spelled.
 random. Seeded with 5489 it answers 3499211612, 581869302, 3890346734, which
 is what every other implementation answers, and is the property a program
 using it for a repeatable run depends on.
+
+**A virtual base splits in two, and only one half is written.** One path to
+one is an ordinary base: the word changes nothing, and `struct Only : virtual
+Base` works exactly as it reads. Two paths to the same one is what the word is
+*for*, and is a different thing - C++ gives it a single shared subobject where
+this lays a base out as a member of what derives from it, and a member cannot
+be in two places.
+
+Sharing one needs each path to hold a pointer instead, and the most derived
+object to be the one that owns it - which means every constructor of such a
+class has to know whether it *is* the most derived, since `Mid m;` must own
+the base and `Mid` inside a `Both` must not. That is a hidden argument through
+every constructor, and it changes layout, member paths, table paths and
+`dynamic_cast` - the machinery multiple inheritance and threads both stand on.
+
+So the diamond is refused, with that as the reason rather than with the wider
+rule about a second base that happened to catch it. It is the one thing on
+this page left undone, and it is undone on purpose: a diamond that compiled
+and quietly gave two base objects where the language promises one would be
+worth less than a build that stops.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

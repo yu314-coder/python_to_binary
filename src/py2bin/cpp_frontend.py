@@ -143,6 +143,11 @@ class Method:
 class Class:
     name: str
     base: str | None = None
+    #: Which bases were written `virtual`. One path to one of these is an
+    #: ordinary base and the word means nothing; two paths to the same one
+    #: means both must reach a single shared object, which is a layout this
+    #: translator does not write.
+    virtual_bases: "set[str]" = field(default_factory=set)
     #: The bases after the first. The first is `base`, because it is at offset
     #: zero and everything that reaches through a base reaches through that
     #: one without adjusting anything; these sit after it, and reaching one
@@ -336,6 +341,32 @@ _CLASS_HEAD = re.compile(
     # and read as one with none the members of both were nowhere to be found.
     rf"(?::\s*({_ONE_BASE}(?:,\s*{_ONE_BASE})*))?\{{"
 )
+
+
+def _virtual_bases_of(head: "re.Match[str]") -> "set[str]":
+    """Which of a class head's bases were written `virtual`.
+
+    One path to a virtual base is the same object either way, so the word
+    changes nothing and is dropped. Two paths to the same one is what the
+    word is *for*, and is a different thing entirely - so which bases carried
+    it has to be remembered to tell the two apart.
+    """
+
+    spelled = head.group(3)
+    if not spelled:
+        return set()
+    found: "set[str]" = set()
+    for part in spelled.split(","):
+        words = part.split()
+        if "virtual" in words:
+            named = [
+                word
+                for word in words
+                if word not in ("public", "private", "protected", "virtual")
+            ]
+            if named:
+                found.add(named[-1])
+    return found
 
 
 def _bases_of(head: "re.Match[str]") -> "list[str]":
@@ -13291,6 +13322,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         found = _split_members(inner, name, filename, _line_of(text, opening))
         found.base = base
         found.mixins = [one for one in mixins if one != base]
+        found.virtual_bases = _virtual_bases_of(head)
         classes[name] = found
         order.append(name)
         end = closing
@@ -13371,6 +13403,39 @@ def _translate(source: str, filename: str = "<c++>") -> str:
                 f"tell them apart. Write whichever one this class needs, and "
                 f"if that is the move, write it as the copy constructor - "
                 f"which is what `unique_ptr` here does",
+            )
+        # Two paths to one virtual base - the diamond, which is the whole
+        # reason the word exists. Checked before the second-base rule below,
+        # because it is the more particular thing and deserves its own
+        # reason rather than being caught by a wider net.
+        shared = [
+            one
+            for one in _every_base(name, classes)
+            if sum(
+                1
+                for seen in [name, *_every_base(name, classes)]
+                if seen in classes
+                and one in ([classes[seen].base] + list(classes[seen].mixins))
+            )
+            > 1
+            and any(
+                one in classes[seen].virtual_bases
+                for seen in [name, *_every_base(name, classes)]
+                if seen in classes
+            )
+        ]
+        if shared:
+            raise CppTranslationError(
+                filename,
+                found.methods[0].line if found.methods else 0,
+                f"{name} reaches {shared[0]} along more than one path, and "
+                f"{shared[0]} was inherited `virtual` - so C++ gives it one "
+                f"shared subobject rather than one per path. py2bin lays a "
+                f"base out as a member of what derives from it, and a member "
+                f"cannot be in two places; sharing one needs each path to "
+                f"hold a pointer instead, and the most derived object to be "
+                f"the one that owns it. That is not written. A single path "
+                f"to a `virtual` base is an ordinary base and does work",
             )
         for mixin in found.mixins:
             # A second base is a member after the first, so the address of the
