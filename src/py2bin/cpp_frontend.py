@@ -1016,6 +1016,12 @@ def _function_definitions(text: str) -> "dict[str, tuple[str, str]]":
 #: Words that say where a function lives rather than what it answers.
 _STORAGE = frozenset({"static", "inline", "extern", "__inline", "constexpr"})
 
+#: How a function is reached, which - like how it is stored - is written
+#: where a return type goes and is not one. `virtual` is a keyword, so a
+#: reader that asks "is the first word a type?" answers no and walks past the
+#: whole function: a `throw` inside a virtual method was never rewritten.
+_DISPATCH = frozenset({"virtual", "explicit"})
+
 
 def _function_type_name(spelled: str, text: str) -> "str | None":
     """The name of the type a function's own name has, if it is one."""
@@ -1095,7 +1101,11 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # call taking it picked the wrong overload, silently, by falling back to
     # the first.
     pattern = re.compile(
-        rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*(\*?)\s*"
+        # `&` as readily as `*`: `const V &v` is a parameter as ordinary as
+        # `V *p`, and read without it the type of `v` could not be found at
+        # all - so nothing reached through it could be either, and `v.x`
+        # inside a function taking a reference had no type.
+        rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*([*&]?)\s*"
         rf"\b{re.escape(spelled)}\b\s*([=;,)\[(])"
     )
     code = _without_literals(text)
@@ -1117,7 +1127,11 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # in scope; falling back to the first anywhere when the call comes first.
     earlier = [match for match in found if before < 0 or match.start() < before]
     declared = earlier[-1] if earlier else found[0]
-    stars = declared.group(2) + ("*" if declared.group(3) == "[" else "")
+    # A reference is the object it names, not a pointer to one: `v.x` reads a
+    # member off it exactly as a value would. The `*` of a pointer is kept,
+    # because there the difference is real.
+    stars = declared.group(2).replace("&", "")
+    stars += "*" if declared.group(3) == "[" else ""
     return (declared.group(1) + " " + stars).strip()
 
 
@@ -1138,9 +1152,55 @@ def _subscript_result(text: str, owner: str) -> "str | None":
     return _member_result(text, owner, r"operator\s*\[\s*\]")
 
 
-def _member_result(text: str, owner: str, spelled: str) -> "str | None":
-    """What the member matching `spelled` on that class is declared to answer."""
+def _members_declared(inside: str) -> "list[tuple[str, str]]":
+    """Each data member a class body declares, as (name, type).
 
+    Read one declaration at a time rather than by looking for a name with a
+    type in front of it, because `int x, y;` puts the type in front of the
+    first only - and a search for the second finds no type, while a search
+    for the first finds a comma where it wanted a semicolon.
+    """
+
+    found: "list[tuple[str, str]]" = []
+    for piece in _without_literals(inside).split(";"):
+        # The braces of the body come with it, and a nested block's do too.
+        spelled = piece.strip().lstrip("{").rstrip("}").strip()
+        if not spelled or "(" in spelled or spelled.startswith(
+            ("public", "private", "protected", "typedef", "using", "friend")
+        ):
+            continue
+        head = re.match(
+            r"^((?:const\s+|volatile\s+|unsigned\s+|signed\s+|static\s+"
+            r"|struct\s+|mutable\s+)*[A-Za-z_]\w*)\s+(.+)$",
+            spelled,
+        )
+        if head is None:
+            continue
+        held = re.sub(r"\b(?:static|mutable)\b", " ", head.group(1)).strip()
+        for one in head.group(2).split(","):
+            named = re.match(r"^\s*([*&]*)\s*([A-Za-z_]\w*)", one)
+            if named is None:
+                continue
+            found.append((named.group(2), (held + " " + named.group(1)).strip()))
+    return found
+
+
+def _member_result(text: str, owner: str, spelled: str) -> "str | None":
+    """What the member matching `spelled` on that class is declared to answer.
+
+    From the text where the class body is still in it, and from what was read
+    off the class before the bodies were taken apart where it is not. A pass
+    that runs after that has no body to search, and answering "no such
+    member" there is not the same as there being none.
+    """
+
+    plain = re.match(r"^([A-Za-z_]\w*)", spelled)
+    if plain is not None and not any(
+        head.group(2) == owner for head in _CLASS_HEAD.finditer(text)
+    ):
+        for member, held in _CLASS_MEMBERS.get(owner, ()):
+            if member == plain.group(1):
+                return held
     for head in _CLASS_HEAD.finditer(text):
         if head.group(2) != owner:
             continue
@@ -1149,6 +1209,16 @@ def _member_result(text: str, owner: str, spelled: str) -> "str | None":
         except ValueError:
             return None
         inside = text[head.end() - 1: closing]
+        # `int x, y;` declares two members and the pattern below finds
+        # neither: the first is followed by a comma rather than by the end of
+        # a declaration, and the second has no type in front of it at all.
+        # So the declarations are read as declarations first, and the search
+        # is what answers for the shapes that are not one - `operator[]` and
+        # the rest.
+        if plain is not None:
+            for member, held in _members_declared(inside):
+                if member == plain.group(1):
+                    return held
         found = re.search(
             rf"(?<![.\w>])([A-Za-z_][\w\s]*?)\s*([*&]*)\s*{spelled}", inside
         )
@@ -1157,6 +1227,7 @@ def _member_result(text: str, owner: str, spelled: str) -> "str | None":
         # A reference is a name for what is there; the type is what it names.
         return (found.group(1).strip() + " " + found.group(2).replace("&", "")).strip()
     return None
+
 
 def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | None":
     """The type of something that is not a bare name.
@@ -2928,6 +2999,42 @@ def _erased_holders(text: str, name: str) -> "set[str]":
     }
 
 
+def _erased_containers(text: str, name: str) -> "set[str]":
+    """Every variable declared to hold a container of this signature.
+
+    A callable put into a `vector<function<int(int)>>` is going into one of
+    these as surely as one assigned to a variable is. Which method takes an
+    element is not asked - the container is a template, and its methods have
+    not been written out yet - so every argument of every call on the
+    variable is offered, and what the argument *is* decides.
+    """
+
+    spelled = _erased_spellings(text, name)
+    return {
+        match.group(1)
+        for match in re.finditer(
+            rf"(?<![.\w>])[A-Za-z_][\w:]*\s*<[^;{{}}]*?(?:{spelled})[^;{{}}]*?>"
+            rf"\s*&?\s*([A-Za-z_]\w*)\s*[;=,)]",
+            _without_literals(text),
+        )
+    }
+
+
+def _takes_a_call(text: str, spelled: str) -> bool:
+    """Whether this class defines `operator()` - whether it is a callable."""
+
+    match = re.search(
+        rf"\b(?:class|struct)\s+{re.escape(spelled)}\b[^{{;]*\{{", text
+    )
+    if match is None:
+        return False
+    try:
+        shut = _matching(text, match.end() - 1)
+    except ValueError:
+        return False
+    return re.search(r"\boperator\s*\(\s*\)", text[match.end(): shut - 1]) is not None
+
+
 def _erased_parameters(text: str, name: str) -> "dict[str, list[int]]":
     """Which functions take this signature, and at which positions.
 
@@ -3035,29 +3142,48 @@ def _erased_methods(text: str, name: str) -> "dict[str, list[int]]":
     return found
 
 
-def _erased_places(text: str, name: str) -> "list[tuple[int, int, list[int]]]":
+def _erased_places(
+    text: str, name: str
+) -> "list[tuple[int, int, list[int], bool]]":
     """Every call that may be handed one of these: where it starts and opens.
 
     A plain call is the name and its parentheses. A constructor is written
     three ways - `C v(x);`, `C(x)` as a temporary, and `new C(x)` - and the
     name in front of the parentheses is the class rather than the callee.
+
+    The last of each is whether the place is *certain* - whether a declared
+    parameter says this position takes one. A call on a container of them is
+    not: nothing here knows which of its arguments is an element, so every
+    argument is offered and one that is not a callable is passed over rather
+    than refused.
     """
 
     bare = _without_literals(text)
-    places: "list[tuple[int, int, list[int]]]" = []
+    places: "list[tuple[int, int, list[int], bool]]" = []
     for called, positions in _erased_parameters(text, name).items():
         for match in re.finditer(rf"(?<![.\w>]){re.escape(called)}\s*\(", bare):
-            places.append((match.start(), match.end() - 1, positions))
+            places.append((match.start(), match.end() - 1, positions, True))
     for owner, positions in _erased_constructors(text, name).items():
         for match in re.finditer(
             rf"(?<![.\w>~]){re.escape(owner)}\s*(?:[A-Za-z_]\w*\s*)?\(", bare
         ):
-            places.append((match.start(), match.end() - 1, positions))
+            places.append((match.start(), match.end() - 1, positions, True))
     for method, positions in _erased_methods(text, name).items():
         for match in re.finditer(
             rf"(?:\.|->)\s*{re.escape(method)}\s*\(", bare
         ):
-            places.append((match.start(), match.end() - 1, positions))
+            places.append((match.start(), match.end() - 1, positions, True))
+    for owner in _erased_containers(text, name):
+        for match in re.finditer(
+            rf"(?<![.\w>]){re.escape(owner)}\s*(?:\.|->)\s*[A-Za-z_]\w*\s*\(",
+            bare,
+        ):
+            opening = match.end() - 1
+            close = _closing_paren(bare, opening)
+            if close < 0:
+                continue
+            count = len(_split_arguments(bare[opening + 1: close]))
+            places.append((match.start(), opening, list(range(count)), False))
     return places
 
 
@@ -3067,8 +3193,9 @@ def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
     holders = _erased_holders(text, name)
     found: "list[str]" = []
     bare = _without_literals(text)
+    functions = _function_definitions(text)
     # Passed to a function or a constructor that takes one.
-    for _start, opening, positions in _erased_places(text, name):
+    for _start, opening, positions, certain in _erased_places(text, name):
         close = _closing_paren(bare, opening)
         if close < 0 or _is_a_definition(bare, close):
             continue
@@ -3077,8 +3204,15 @@ def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
             if index >= len(given):
                 continue
             value = given[index].strip()
-            if value.isidentifier() and value not in holders:
-                found.append(value)
+            if not value.isidentifier() or value in holders:
+                continue
+            if not certain:
+                # Nothing said this argument is one, so it has to look like
+                # one: a class with a call operator, or a function's name.
+                spelled = (_deduced_type(value, text) or "").strip()
+                if value not in functions and not _takes_a_call(text, spelled):
+                    continue
+            found.append(value)
     # `NAME f = value;` - given where it is declared.
     for match in re.finditer(
         rf"(?<![.\w>]){re.escape(name)}\s+[A-Za-z_]\w*\s*=\s*([A-Za-z_]\w*)\s*;",
@@ -3211,7 +3345,7 @@ def _erased_given(
     for _round in range(_HOIST_ROUNDS):
         changed = False
         bare = _without_literals(text)
-        for begins, opening, positions in _erased_places(text, name):
+        for begins, opening, positions, _certain in _erased_places(text, name):
             close = _closing_paren(bare, opening)
             if close < 0 or _is_a_definition(bare, close):
                 continue
@@ -5362,7 +5496,7 @@ def _every_body(text: str) -> "list[tuple[re.Match[str], int, str, str]]":
         # first word of the return type, `static` put the whole body outside
         # what this reads - so a `throw` inside a `static` function was never
         # rewritten, while the same function without the word was.
-        while head.split() and head.split()[0] in _STORAGE:
+        while head.split() and head.split()[0] in _STORAGE | _DISPATCH:
             head = head.split(None, 1)[1] if " " in head else ""
         if not head or head.split()[0] in _NOT_A_TYPE:
             continue
@@ -5388,19 +5522,23 @@ def _throwing_names(text: str) -> "set[str]":
     flag that will be zero.
     """
 
-    bodies = {
-        name: text[match.end() - 1: closing]
-        for match, closing, name, _returns in _every_body(text)
-    }
+    # Every body a name has, not the last one written. An overrider that
+    # does not throw does not stop the base it overrides from throwing, and
+    # a call through a base pointer can reach either.
+    bodies: "dict[str, list[str]]" = {}
+    for match, closing, name, _returns in _every_body(text):
+        bodies.setdefault(name, []).append(text[match.end() - 1: closing])
     throwing = {
-        name for name, body in bodies.items() if _THROW.search(_without_literals(body))
+        name
+        for name, written in bodies.items()
+        if any(_THROW.search(_without_literals(body)) for body in written)
     }
     while True:
         grown = set(throwing)
-        for name, body in bodies.items():
+        for name, written in bodies.items():
             if name in grown:
                 continue
-            code = _without_literals(body)
+            code = "\n".join(_without_literals(body) for body in written)
             if any(
                 re.search(rf"(?<![\w>]){re.escape(other)}\s*\(", code)
                 for other in throwing
@@ -5735,6 +5873,11 @@ _CONSTRUCTED = re.compile(r"^([A-Za-z_]\w*)\s*\(")
 #: The classes this file declares. Read before the exception pass, which runs
 #: before classes are taken apart and so has nothing else to ask.
 _CLASS_NAMES: "set[str]" = set()
+#: What each class declares, read before the bodies are taken apart. A pass
+#: that runs after that has no body left to read, and asking one what a
+#: member's type is got no answer at all - which is how `v->x` on a plain
+#: struct came to have no type in a body being rewritten.
+_CLASS_MEMBERS: "dict[str, list[tuple[str, str]]]" = {}
 
 #: Of those, the ones with a virtual function somewhere above them. Catching
 #: one by value slices it, which is the one thing this cannot reproduce.
@@ -5907,8 +6050,12 @@ def _throwing_calls(statement: str, throwing: "set[str]") -> "list[str]":
     at = 0
     # The receiver is part of the call: `g.check(13)` has to be lifted whole,
     # or the temporary is assigned from a method with nothing to call it on.
+    # A class qualifier is part of it too - `A::go(n)` lifted as `go(n)` puts
+    # `A::` in front of the temporary, and worse, leaves a call that named
+    # its class to be dispatched through the vtable, which in an overrider is
+    # the overrider calling itself.
     pattern = re.compile(
-        r"(?<![.\w>])((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*)([A-Za-z_]\w*)\s*\("
+        r"(?<![.\w>:])((?:[A-Za-z_]\w*\s*(?:\.|->|::)\s*)*)([A-Za-z_]\w*)\s*\("
     )
     for match in pattern.finditer(code):
         if match.start() < at:
@@ -5929,7 +6076,8 @@ _CALL_RESULT_TYPES: "dict[str, str]" = {}
 
 
 def _call_result_type(call: str, throwing: "set[str]") -> str:
-    name = call.split("(", 1)[0].strip().replace("->", ".").split(".")[-1].strip()
+    name = call.split("(", 1)[0].strip().replace("->", ".").split(".")[-1]
+    name = name.split("::")[-1].strip()
     return _CALL_RESULT_TYPES.get(name, "long")
 def _mangle_overloaded_functions(text: str, filename: str) -> str:
     """Give each free function of a shared name a name of its own.
@@ -8072,16 +8220,36 @@ def _emit_one(
         # A reference is a pointer that the language follows for you. The
         # callee hands back the address; every call site follows it.
         returns = returns.replace("&", "*")
-        body = _return_the_address(body)
+        body = _return_the_address(body, references)
     return f"static {returns} {name}({parameters}) {body}"
 
 
-def _return_the_address(body: str) -> str:
-    """`return items[i];` becomes `return &(items[i]);` for a reference."""
+def _return_the_address(body: str, references: "dict[str, str]" = {}) -> str:
+    """`return items[i];` becomes `return &(items[i]);` for a reference.
+
+    Except where what is returned is *already* a reference, and so is already
+    the address: `return o;` where `o` was declared `ostream &o` gave a `T **`
+    where a `T *` was wanted. A reference carried as a pointer is the answer
+    a reference return wants, exactly as it stands.
+    """
+
+    def written(match: "re.Match[str]") -> str:
+        value = match.group(1).strip()
+        if value in references:
+            return f"return {value};"
+        # Or something this body has already made a pointer. A reference
+        # declared inside the body - `ostream &o = *this;` - is one by the
+        # time this runs, and is not a parameter, so the list above does not
+        # have it. What the body says it is, is what it is.
+        if value.isidentifier() and re.search(
+            rf"(?<![.\w>])\*\s*{re.escape(value)}\s*[=;,)]", body
+        ):
+            return f"return {value};"
+        return f"return &({value});"
 
     return re.sub(
         r"\breturn\s+([^;]+);",
-        lambda m: f"return &({m.group(1).strip()});",
+        written,
         body,
     )
 
@@ -9806,14 +9974,16 @@ def _free_operators_as_members(text: str) -> str:
             closing = _matching(bare, opening)
         except ValueError:
             continue
-        # The left operand is the object from here on, so every mention of
-        # it in the body is a mention of the object.
-        body = re.sub(
-            rf"(?<![.\w>]){re.escape(receiver)}\b", "(*this)", text[opening:closing]
-        )
+        # The left operand keeps its name and is bound to the object, rather
+        # than every mention of it being replaced by `(*this)`. The passes
+        # that rewrite an operator or a call look for a *name* on the left,
+        # and a parenthesised dereference is not one - so `o << v.x` inside
+        # the moved body was left as C++ and reached the C compiler as a
+        # shift of a struct.
+        inner = text[opening + 1: closing - 1]
         added.setdefault(owner, []).append(
             f"{match.group(1).strip()} operator{match.group(2)}"
-            f"({parts[1]}) const {body}"
+            f"({parts[1]}) {{ {parts[0]} = *this; {inner} }}"
         )
         cuts.append((match.start(), closing))
     if not cuts:
@@ -13365,7 +13535,6 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _lift_friends(text)
     # And then back in, where a free operator names a class this file
     # declares: an operator is a member here, whichever way it was written.
-    text = _free_operators_as_members(text)
     # Before the namespace qualifiers go: what makes one of these the
     # standard `move` rather than a function the program wrote is the `std::`
     # in front of it, and that is gone three lines below.
@@ -13375,6 +13544,12 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text, namespaces = _flatten_namespaces(text, filename)
     text, aliases = _namespace_aliases(text)
     text = _strip_namespace_qualifiers(text, namespaces | aliases)
+    # After the qualifiers go, and not before. `std::ostream &operator<<(...)`
+    # is how every one of these is written outside the standard library, and
+    # a name with `std::` in front of it is not the class name this looks up -
+    # so every qualified free operator was left where it was and never became
+    # a member of anything.
+    text = _free_operators_as_members(text)
     _refuse_unsupported(text, filename)
     # Before anything reads a function's name: an overload set is several
     # functions sharing one, and every later pass assumes a name is a thing.
@@ -13495,8 +13670,15 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # read, and asked what `Res` was it answered that it was nothing at all -
     # which was true only of a file with no `throw` in it, since a file with
     # one filled these in on the way past.
-    global _CLASS_NAMES, _POLYMORPHIC, _INHERITED_FROM
+    global _CLASS_NAMES, _POLYMORPHIC, _INHERITED_FROM, _CLASS_MEMBERS
     _CLASS_NAMES = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+    _CLASS_MEMBERS = {}
+    for one in _CLASS_HEAD.finditer(text):
+        try:
+            shut = _matching(text, one.end() - 1)
+        except ValueError:
+            continue
+        _CLASS_MEMBERS[one.group(2)] = _members_declared(text[one.end(): shut - 1])
     _POLYMORPHIC = _polymorphic_names(text)
     _INHERITED_FROM = {
         one for m in _CLASS_HEAD.finditer(text) for one in _bases_of(m)
