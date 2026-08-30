@@ -869,6 +869,14 @@ a cast to a base was exactly what the translator wrote. It writes the member
 now, for a base that is not the first, and the cast only where the address
 really is the same.
 
+**And it can be polymorphic**, which was refused until recently. A virtual
+call through a second base arrives with the address of the *subobject*, and
+what the derived class wrote wants the whole object - so the table for that
+base cannot name those functions directly. Each entry the derived class
+provides is a small function that moves the pointer back and calls the real
+one, which is what a C++ compiler emits there too. The offset comes out of
+the C compiler, since C has no other way to say where a member sits.
+
 **Four more, and one of them was recursion.** A `constexpr` function is
 answered while translating now, so `int room[fact(4)];` is a declaration
 rather than a complaint. Two things had to be right for that. The condition
@@ -1131,6 +1139,48 @@ rule about a second base that happened to catch it. It is the one thing on
 this page left undone, and it is undone on purpose: a diamond that compiled
 and quietly gave two base objects where the language promises one would be
 worth less than a build that stops.
+
+**Then the gaps were closed on purpose, one at a time.** Four rounds of
+probing had left a list: eight things that refused with a message rather than
+compiling. Each turned out to be smaller than the refusal made it sound, and
+several were one bug wearing a disguise.
+
+`std::map` had no `insert`. `std::istringstream` did not exist, so a program
+could build a string and had no way to take one apart. A pointer to a member
+function is a pointer to a function whose first argument is the object -
+which is what a method already is here, once it has been taken apart - so
+`&C::get` is that function's name and `(c.*m)()` is a call through it.
+`make(9)->v` was not the smart pointer's fault at all: `*__ret = temp` on a
+class with an `operator=` left the `*` standing in front of the call it
+built, and dereferenced what the operator answered one time too many.
+
+`X::one().m()` - the singleton - was three bugs stacked. A static member that
+answers a reference was not on the list of things whose result needs a name.
+The pass that gives it one then found the call again inside the declaration it
+had just written, and hoisted it out of itself sixty-four times. And a static
+member is written out the way a method is, so the pass that dereferences a
+method's reference return reached it too, and both of them did it.
+
+A template that recurses - `Chain<N - 1>` - was substituted textually, so it
+became `Chain<3 - 1>` and then `Chain<3 - 1 - 1>`: a different name every
+round, which is why it never reached the copy written to end it. Folding a
+non-type argument to the number it is stops that, and a chain of
+`static const int`s that ask each other is folded the same way. A member
+template inside a class *template* was skipped while the class was still a
+pattern, quite rightly, and then never looked at again.
+
+Four more came out of fixing those. `std::string s; s = "a";` had never
+worked - there was no `operator=`, and adding one sent string-to-string
+assignment into it as well. What C++ does is build a temporary and assign
+that, so that is what is written now, and the pass that hoists temporaries
+takes it from there. Two passes each numbered their temporaries from one, and
+two of them in a scope is a redeclaration. A subscript on the left of an
+assignment had no type at all, because the pass that reads one looks in the
+class body and the bodies had been taken apart by then. And the first cut of
+the conversion above read the type of an *expression*, which is exactly where
+deduction is weakest: it turned `c = c / L"third";` into a `path` built from a
+`path`, which is more than one constructor. It reads a literal or a name now,
+and nothing else.
 
 **Another twelve probes, another five things.** A delegating constructor -
 `P() : P(1, 2) {}` - was read as a member initialiser and came out as
@@ -1499,19 +1549,29 @@ not special cases in the compiler:
   part, not the leak. A `vector<vector<int>>` works, and so does `g[0][1]`.
 * `<map>` and `<unordered_map>` — entries in one array, so an iterator is a
   pointer to one and `it->first` is an ordinary member read. `find`, `count`,
-  `contains`, `at`, `erase`, `operator[]`, `begin`/`end`. It searches from the
-  front, which a red-black tree would not: a program holding thousands of keys
-  will notice, and one holding dozens will not.
+  `contains`, `at`, `erase`, `insert`, `operator[]`, `begin`/`end`, and `pair`
+  and `make_pair` alongside them so a program that includes only this one has
+  what `insert` takes. Entries are kept in key order, which is what walking a
+  map means: they were kept in insertion order once, and the argument for it
+  was that a red-black tree is a performance question. Order is not - C++ says
+  an iterator visits the keys in order, and kept as they arrived a program
+  that walked one printed a different answer with nothing to say so. It still
+  searches from the front, which a tree would not: a program holding thousands
+  of keys will notice, and one holding dozens will not.
 * `<set>` and `<unordered_set>` — the same shape with nothing on the other
-  side. Insertion order is kept, which is a stronger promise than the
-  unordered ones make and a weaker one than the ordered ones do.
+  side, and in order for the same reason.
 * `<memory>` — `unique_ptr` (which frees what it holds when it goes) and
   `shared_ptr`, with `get`, `release`, `reset`, `operator->` and `operator*`.
   Not move-only and not reference counted: this subset has neither move
   semantics nor atomics, so what is here is the ownership and not the
   machinery C++ uses to enforce it.
 * `<sstream>` — `ostringstream` with one `operator<<` per type it can write,
-  and `str()`.
+  and `str()`; `istringstream` with one `operator>>` per type it can read -
+  `int`, `long`, `double` including a fraction and an exponent, `char` and a
+  word into a `string` - plus `getline`, `eof`, `fail`, and the conversion to
+  bool that makes `while (in >> n)` end. The number parsing is written out by
+  hand rather than handed to `scanf`, because py2bin's printf reads its format
+  at compile time and what is wanted here is a position that moves.
 * `<array>` — the count lives in the object rather than in the type, because
   a value template argument is not something this subset deduces.
 * `<iostream>` — `cout` with one `operator<<` per type it can print, each

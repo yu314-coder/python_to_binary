@@ -570,6 +570,11 @@ def _members_from(
 
 
 def _member_from(declaration: str, filename: str, at: int) -> Member:
+    # `mutable` says this member may be written through a const object. C has
+    # no such word, and nothing here enforces const in the first place, so it
+    # carries nothing - but left in it became part of the type, and the C
+    # compiler was handed a declaration whose type name it had never heard of.
+    declaration = re.sub(r"(?<![.\w>])mutable\s+", "", declaration)
     pointer = _FUNCTION_POINTER_MEMBER.match(declaration.strip())
     if pointer is not None:
         # Carried whole, with the name marked, so the emitter can put it back
@@ -797,6 +802,21 @@ def _closing_angle(text: str, opening: int) -> int:
             return -1
         index += 1
     return -1
+
+
+def _as_a_number(argument: str, text: str) -> str:
+    """A non-type template argument as the number it is, where it is one.
+
+    Only where it is written as an expression: a type name and a number that
+    is already one are handed back untouched, and anything this cannot work
+    out stays as it was.
+    """
+
+    spelled = argument.strip()
+    if not re.search(r"[-+*/%]", spelled):
+        return spelled
+    folded = _folded_integer(spelled, text)
+    return spelled if folded is None else str(folded)
 
 
 def _instantiated_name(name: str, arguments: "list[str]") -> str:
@@ -1122,7 +1142,14 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
         # `int a = 1, b = 2;` puts the type in front of the first declarator
         # only, so a pattern looking for one type and one name never sees the
         # rest. Read the statement instead.
-        return _declared_here(text).get(spelled)
+        written = _declared_here(text).get(spelled)
+        if written is not None:
+            return written
+        # `auto v = expr;` - `auto` is not a type, it is a promise that the
+        # expression to the right is one, so that is what is read. Without
+        # this a name declared with it had no type at all, and a
+        # capture-default could not tell its scope had even declared it.
+        return _what_auto_holds(spelled, code, text, before)
     # The declaration nearest above the call, which is the one C++ would have
     # in scope; falling back to the first anywhere when the call comes first.
     earlier = [match for match in found if before < 0 or match.start() < before]
@@ -1145,6 +1172,26 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
         return bare
     return held
 
+
+
+def _what_auto_holds(
+    spelled: str, code: str, text: str, before: int
+) -> "str | None":
+    """The type of a name declared `auto`, read off what it was given."""
+
+    chosen = None
+    for match in re.finditer(
+        rf"(?<![.\w>])auto\s*[*&]?\s*{re.escape(spelled)}\s*=([^;]*);", code
+    ):
+        if before < 0 or match.start() < before:
+            chosen = match
+    if chosen is None:
+        return None
+    value = text[chosen.start(1): chosen.end(1)].strip()
+    # `auto a = a;` does not compile, and asking would not stop.
+    if not value or re.search(rf"(?<![.\w>]){re.escape(spelled)}\b", value):
+        return None
+    return _deduced_type(value, text, chosen.start())
 
 
 #: `v.begin()` or `p->at(3)` - a call on something. The arguments do not
@@ -1312,7 +1359,13 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
     # is whichever of the two is wider - which is what C++ does with them.
     # Not the `-` of an arrow: that is a member read, handled above, and
     # splitting there left `>v` as the right-hand side.
-    binary = re.match(r"^(.+?)\s*(-(?!>)|[+*/%])\s*([^-+*/%]+)$", spelled)
+    # The right-hand side is one operand, so it holds no operator - but an
+    # arrow is not one. Written as "no `-` at all", `this->x + o->x` matched
+    # nothing and the whole expression had no type, which is what decided
+    # which constructor `V(x + o.x)` meant.
+    binary = re.match(
+        r"^(.+?)\s*(-(?!>)|[+*/%])\s*((?:[^-+*/%]|->)+)$", spelled
+    )
     if binary is not None:
         left = _deduced_type(binary.group(1).strip(), text, before)
         # An operator on an object answers what that operator declares, and
@@ -1550,7 +1603,14 @@ def _declared_return(text: str, owner: "str | None", method: str) -> "str | None
         words = head.replace("*", " * ").replace("&", " & ").split()
         if not words or words[-1] != method or len(words) < 2:
             continue
-        return " ".join(words[:-1]).replace("&", "*").strip()
+        # How it is stored is not part of what it answers - the same reading
+        # the declaration branch below already takes. Left on, `auto x =
+        # f();` where `f` is `static` declared `x` static too: built once, on
+        # the first call, and the same value ever after.
+        spelled = words[:-1]
+        while spelled and spelled[0] in _STORAGE | _DISPATCH:
+            spelled = spelled[1:]
+        return " ".join(spelled).replace("&", "*").strip()
     # A declaration says the same thing a definition does, and the methods
     # this translator emits are declared before they are defined - so a call
     # to one is often read where only the declaration is in view.
@@ -1562,6 +1622,21 @@ def _declared_return(text: str, owner: "str | None", method: str) -> "str | None
         while spelled.split() and spelled.split()[0] in _STORAGE:
             spelled = spelled.split(None, 1)[1] if " " in spelled else ""
         return f"{spelled} {match.group(2) or ''}".strip()
+    # A return type written with a template or a qualifier in it -
+    # `std::function<int(int)> adder(int n)` - is not one the scans above can
+    # see: the head they read is word characters and stars, so a `<` or a
+    # `::` ends the match before the name. Asked for one function by name,
+    # this can afford the looser reading they cannot.
+    loose = re.search(
+        rf"(?<![.\w>])((?:[A-Za-z_][\w:]*\s*<[^;{{}}]*>|[A-Za-z_][\w:]*)"
+        rf"(?:\s*[*&]+)?)\s+{re.escape(method)}\s*\([^;{{}}]*\)\s*\{{",
+        _without_literals(where),
+    )
+    if loose is not None:
+        spelled = loose.group(1).strip()
+        while spelled.split() and spelled.split()[0] in _STORAGE | _DISPATCH:
+            spelled = spelled.split(None, 1)[1] if " " in spelled else ""
+        return spelled.replace("&", "*").strip() or None
     return None
 
 def _deduce_arguments(
@@ -2466,7 +2541,16 @@ def _rewrite_static_members(text: str, filename: str) -> str:
         owner = head.group(2)
         body = text[head.end() - 1: closing]
 
+        bare = _without_literals(body)
+
         def taken(match: "re.Match[str]", o=owner) -> str:
+            if _depth_at(bare, match.start()) != 1:
+                # Inside a method body, where `static R held;` is a static
+                # *local* - which C already has, and which the pass that
+                # writes its build-once guard knows about. Read as a data
+                # member it was lifted out of the class, renamed to carry the
+                # class, and then declared nowhere at all.
+                return match.group(0)
             owners[(o, match.group(2))] = o
             if match.group(3):
                 # Given its value here, so this is where it is defined; there
@@ -2483,7 +2567,9 @@ def _rewrite_static_members(text: str, filename: str) -> str:
         # two copies of one template always both do, so that pass declines
         # and `made++` inside the constructor was left naming nothing.
         mine = [
-            one.group(2) for one in _STATIC_MEMBER.finditer(_without_literals(body))
+            one.group(2)
+            for one in _STATIC_MEMBER.finditer(bare)
+            if _depth_at(bare, one.start()) == 1
         ]
         written = _STATIC_MEMBER.sub(taken, body)
         for spelled in mine:
@@ -2547,6 +2633,13 @@ def _rewrite_static_members(text: str, filename: str) -> str:
 #: `int add(int a, int b = 10)` - a parameter with a default.
 _DEFAULTED = re.compile(r"([A-Za-z_]\w*)\s*=\s*([^,)]+)")
 
+#: A definition whose parameter list is followed by `const` or `noexcept`.
+#: The general pattern wants a brace straight after the `)`.
+_QUALIFIED_DEFINITION = re.compile(
+    r"\b([A-Za-z_][\w\s*]*?(?:&&?\s*)?)\b([A-Za-z_]\w*)\s*\(([^;{}()]*)\)"
+    r"\s*(?:const|noexcept|override|final|\s)*\{"
+)
+
 #: `class Inner {` written inside another class body.
 _NESTED_CLASS = re.compile(r"\b(class|struct)\s+([A-Za-z_]\w*)\s*\{")
 
@@ -2563,6 +2656,13 @@ def _rewrite_default_arguments(text: str) -> str:
     at = 0
     for match in _ANY_DEFINITION.finditer(text):
         head = match.group(1).strip()
+        # How it is stored is written where the return type goes and is not
+        # one. Read whole, `static int add(int a, int b = 10)` began with a
+        # word that is not a type, so its defaults were never read: the `=`
+        # stayed in the C and the calls that left the argument out stayed
+        # short.
+        while head.split() and head.split()[0] in _STORAGE | _DISPATCH:
+            head = head.split(None, 1)[1] if " " in head else ""
         if not head or head.split()[0] in _NOT_A_TYPE:
             continue
         if _depth_at(text, match.start()) != 0:
@@ -2830,7 +2930,10 @@ def _settled_parameters(
 
 
 #: `std::function<int(int)>` - by the time this runs the `std::` is gone.
-_STD_FUNCTION = re.compile(r"(?<![.\w>])function\s*<")
+#: The qualifier comes with it. Matched from `function` alone, `std::` was
+#: left standing in front of the class this becomes, and the C said
+#: `std::struct __py2bin_call_int_int`.
+_STD_FUNCTION = re.compile(r"(?<![.\w>])(?:std\s*::\s*)?function\s*<")
 
 #: How many different callables one signature may be given. A backstop: the
 #: class below holds one member per callable, and a program with more than
@@ -3230,6 +3333,24 @@ def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
         bare,
     ):
         found.append(match.group(1))
+    # `std::function<int(int)> adder(int n) { ... return f; }` - handed back
+    # from a function that answers one. Without this the class was written
+    # out with no member for the closure and the `return` gave back the
+    # lambda itself, which is a different type.
+    for match in re.finditer(
+        rf"(?<![.\w>])(?:{_erased_spellings(text, name)})\s+[A-Za-z_]\w*\s*"
+        rf"\([^;{{}}]*\)\s*\{{",
+        bare,
+    ):
+        try:
+            shut = _matching(text, match.end() - 1)
+        except ValueError:
+            continue
+        for gave in re.finditer(
+            r"\breturn\s+([A-Za-z_]\w*)\s*;", bare[match.end(): shut]
+        ):
+            if gave.group(1) not in holders:
+                found.append(gave.group(1))
     # `f = value;` - given later, to a variable or to a member.
     for match in _ERASED_ASSIGN.finditer(bare):
         target = re.sub(r"\s+", "", match.group(1)).split("->")[-1].split(".")[-1]
@@ -3335,7 +3456,65 @@ def _fill_erased(
         text = _sub_code(pattern, text, declared)
         text = _sub_code(_ERASED_ASSIGN, text, one)
         text = _erased_given(text, name, holders, places, by_value)
+        text = _erased_returned(text, name, holders, places, by_value)
         text = _erased_truth(text, holders)
+    return text
+
+
+def _erased_returned(
+    text: str,
+    name: str,
+    holders: "set[str]",
+    places: "dict[str, int]",
+    by_value: "dict[str, int]",
+) -> str:
+    """Put a callable into one of these on the way out of a function.
+
+    The same wrap `_erased_given` writes for an argument, at the other end: a
+    function that answers this signature and hands back a closure is making
+    the object C++ would have made for it.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        bare = _without_literals(text)
+        for match in re.finditer(
+            rf"(?<![.\w>])(?:{_erased_spellings(text, name)})\s+[A-Za-z_]\w*\s*"
+            rf"\([^;{{}}]*\)\s*\{{",
+            bare,
+        ):
+            try:
+                shut = _matching(text, match.end() - 1)
+            except ValueError:
+                continue
+            gave = re.search(
+                r"\breturn\s+([A-Za-z_]\w*)\s*;", bare[match.end(): shut]
+            )
+            if gave is None:
+                continue
+            value = gave.group(1)
+            if value in holders:
+                continue
+            if value in by_value:
+                which = by_value[value]
+            else:
+                spelled = _deduced_type(value, text)
+                which = places.get((spelled or "").strip())
+            if which is None:
+                continue
+            made = f"__py2bin_gave_{abs(hash((match.start(), value))) % 100000}"
+            at = match.end() + gave.start()
+            text = (
+                text[:at]
+                + f" {name} {made}; {made}.__which = {which}; "
+                f"{made}.__held{which} = {value}; return {made};"
+                + text[match.end() + gave.end():]
+            )
+            holders.add(made)
+            changed = True
+            break
+        if not changed:
+            return text
     return text
 
 
@@ -4042,6 +4221,13 @@ def _lambda_captures(
     return held
 
 
+#: `auto x = ...`, read only for the name it declares. Read as a type name
+#: `auto` is not one, so the reader of declarations passes over it - and a
+#: capture-default asking "does this scope declare that name?" was told no
+#: about every `auto` in it.
+_AUTO_NAMED = re.compile(r"(?<![.\w>])auto\s*[*&]?\s*([A-Za-z_]\w*)\s*=")
+
+
 def _captures_used(
     text: str, at: int, body: str, by_reference: bool
 ) -> "list[tuple[str, str, bool]]":
@@ -4062,11 +4248,19 @@ def _captures_used(
         name = match.group(1)
         if name in seen or name in _NOT_A_TYPE or name in _LEADS_A_TYPE:
             continue
-        # A name that is called is a function, not a capture.
+        # A name that is called is a function, not a capture - unless the
+        # scope declares it, and then it is an object with a call operator: a
+        # `std::function`, or a lambda held in `auto`. Skipped on the shape
+        # of the use alone, a closure that called another closure did not
+        # capture it, and the C named a function nothing had defined.
         after = body[match.end():].lstrip()
-        if after.startswith("("):
+        declared = set(_declared_here(scope)) | {
+            found.group(1)
+            for found in _AUTO_NAMED.finditer(_without_literals(scope))
+        }
+        if after.startswith("(") and name not in declared:
             continue
-        if name not in _declared_here(scope):
+        if name not in declared:
             continue
         found = _deduced_type(name, before)
         if found is None:
@@ -4178,6 +4372,7 @@ def _inside_a_template_pattern(text: str, at: int) -> bool:
 def _expand_member_templates(text: str, filename: str) -> str:
     """`template<typename T> T twice(T v)` written inside a class.
 
+
     C++ makes one copy per set of argument types, and so does this - read
     from the calls, because a member template has no other use. Each copy is
     an ordinary member of the class, named the way a free template's copy is,
@@ -4201,7 +4396,10 @@ def _expand_member_templates(text: str, filename: str) -> str:
         if found is None:
             return text
         rest = text[found.end():]
-        definition = _DEFINITION.match(rest)
+        # `U sumAs() const {` is a definition too. The general pattern stops
+        # at the `)` and wants a brace next, so a member template that is
+        # const read as "not a function at all" and was refused.
+        definition = _DEFINITION.match(rest) or _QUALIFIED_DEFINITION.match(rest)
         if definition is None:
             raise CppTranslationError(
                 filename,
@@ -4293,8 +4491,13 @@ def _member_copies(
     made: "dict[str, str]" = {}
     out: list[str] = []
     at = 0
+    # `v.as<int>()` as well as `v.as(x)`. Written with the argument spelled
+    # out there is nothing to deduce - and read as though the `(` came
+    # straight after the name, no call matched at all and the member was
+    # dropped as one nothing uses.
     for call in re.finditer(
-        rf"(\.|->)\s*{re.escape(name)}\s*\(", _without_literals(text)
+        rf"(\.|->)\s*{re.escape(name)}\s*(<[^;{{}}()<>]*>)?\s*\(",
+        _without_literals(text),
     ):
         if call.start() < at:
             continue
@@ -4312,8 +4515,18 @@ def _member_copies(
                 held = (_deduced_type(tail, text) or "").replace("*", "").strip()
             if held and held != holder:
                 continue
-        given = _call_arguments(text, call.end() - 1)
-        deduced = _deduce_arguments(parameters, declared, given, text, call.start())
+        if call.group(2):
+            # Spelled out, so there is nothing to work out.
+            deduced = [
+                one.strip()
+                for one in _split_arguments(call.group(2)[1:-1])
+                if one.strip()
+            ]
+        else:
+            given = _call_arguments(text, call.end() - 1)
+            deduced = _deduce_arguments(
+                parameters, declared, given, text, call.start()
+            )
         if deduced is None:
             continue
         named = _instantiated_name(name, deduced)
@@ -5220,7 +5433,10 @@ def _expand_templates(text: str, filename: str) -> str:
             if close < 0:
                 continue
             arguments = [
-                a.strip()
+                # Folded the same way the copy's own name was, or a use
+                # written `Chain<N - 1>` - which is `Chain<3 - 1>` by the
+                # time it is read - would not be sent to `Chain__2`.
+                _as_a_number(a.strip(), scope)
                 for a in _split_arguments(region[found.end(): close])
                 if a.strip()
             ]
@@ -5304,6 +5520,15 @@ def _expand_templates(text: str, filename: str) -> str:
                         (wanted_name, wanted_arguments, ([], "class", ""))
                     )
         pending = []
+        # A non-type argument that is an expression is folded to the number
+        # it is. Substituted textually, `Chain<N - 1>` becomes `Chain<3 - 1>`
+        # and then `Chain<3 - 1 - 1>` - a different name every round, so a
+        # template that recurses never reached the copy written to end it and
+        # never stopped asking for another.
+        wanted = [
+            (name, [_as_a_number(one, scope) for one in arguments], entry)
+            for name, arguments, entry in wanted
+        ]
         fresh = [
             (name, arguments, entry)
             for name, arguments, entry in wanted
@@ -7995,7 +8220,105 @@ def _emit_vtables(order: "list[str]", classes: "dict[str, Class]") -> str:
         lines.append(
             f"static void *{_vtable_name(name)}[{max(len(slots), 1)}] = {{ {held} }};"
         )
+    for name in order:
+        lines.extend(_second_base_tables(name, classes))
     return "\n".join(lines)
+
+
+def _mixin_vtable_name(name: str, mixin: str) -> str:
+    return f"{name}__vtable__{mixin}"
+
+
+def _offset_of(name: str, member: str) -> str:
+    """Where a member sits in its struct, worked out by the C compiler.
+
+    C has no other way to say it, and the pointer a second base is reached
+    through has to be moved by exactly this much.
+    """
+
+    return f"(unsigned long)&((struct {name} *)0)->{member}"
+
+
+def _second_base_tables(
+    name: str, classes: "dict[str, Class]"
+) -> "list[str]":
+    """A table for each polymorphic base after the first, and its thunks.
+
+    A second base is a member after the first, so a pointer to it is not a
+    pointer to the object. Its table therefore cannot name the derived
+    class's functions directly: they want the whole object, and what arrives
+    is the address of the subobject. Each entry the derived class provides is
+    a small function that moves the pointer back and calls the real one -
+    which is what a C++ compiler emits here too, and is why this can be
+    written at all.
+    """
+
+    found = classes.get(name)
+    if found is None or not found.mixins:
+        return []
+    lines: "list[str]" = []
+    for index, mixin in enumerate(found.mixins):
+        if not _is_polymorphic(mixin, classes):
+            continue
+        member = f"__base{index + 1}"
+        entries: "list[str]" = []
+        for key in _virtual_slots(mixin, classes):
+            # The derived class first: an override of the base's virtual is
+            # written here, and what it takes is the whole object.
+            provider = _slot_provider(name, key, classes)
+            if provider is not None:
+                method = _slot_method(provider, key, classes)
+                if method is None:
+                    entries.append("0")
+                    continue
+                # A virtual destructor's slot is spelled `~`, which is not
+                # something a C identifier may hold.
+                spelt = re.sub(r"[^A-Za-z0-9_]", "", key[0]) or "dtor"
+                thunk = f"{name}__thunk__{mixin}__{spelt}"
+                result, parameters = _c_signature(provider, method, classes)
+                spelled = [
+                    one.strip()
+                    for one in _split_arguments(parameters)
+                    if one.strip()
+                ]
+                rest = spelled[1:]
+                head = ", ".join(
+                    [f"struct {mixin} *__self"]
+                    + [f"{one} a{at}" for at, one in enumerate(rest)]
+                )
+                passed = "".join(f", a{at}" for at in range(len(rest)))
+                answer = "" if result.strip() in ("", "void") else "return "
+                symbol = _c_name(
+                    provider, key[0], _suffix_of(provider, method, classes)
+                )
+                lines.append(
+                    f"static {result} {thunk}({head}) {{ "
+                    f"{answer}{symbol}(({spelled[0]})((char *)__self - "
+                    f"{_offset_of(name, member)}){passed}); }}"
+                )
+                entries.append(f"(void *){thunk}")
+                continue
+            # Otherwise the base's own, which already takes what arrives.
+            provider = _slot_provider(mixin, key, classes)
+            if provider is None:
+                entries.append("0")
+                continue
+            method = _slot_method(provider, key, classes)
+            entries.append(
+                "(void *)"
+                + _c_name(
+                    provider,
+                    key[0],
+                    _suffix_of(provider, method, classes) if method else None,
+                )
+            )
+        slots = _virtual_slots(mixin, classes)
+        held = ", ".join(entries) or "0"
+        lines.append(
+            f"static void *{_mixin_vtable_name(name, mixin)}"
+            f"[{max(len(slots), 1)}] = {{ {held} }};"
+        )
+    return lines
 
 
 #: `Source *from` - a parameter that points at an object.
@@ -8322,6 +8645,28 @@ def _emit_one(
     return f"static {returns} {name}({parameters}) {body}"
 
 
+def _address_a_returned_object(body: str, held: str) -> str:
+    """`return o;` becomes `return &o;` where `o` is an object this body has.
+
+    Only for a bare name that is declared here as a value. An expression -
+    `return a->v < b->v ? b : a;` - is built out of things that are already
+    pointers in this C, and addressing it would give a pointer to a pointer.
+    """
+
+    def written(match: "re.Match[str]") -> str:
+        value = match.group(1).strip()
+        if not value.isidentifier():
+            return match.group(0)
+        if re.search(
+            rf"(?<![.\w>])struct\s+{re.escape(held)}\s+{re.escape(value)}\s*[;=]",
+            body,
+        ):
+            return f"return &{value};"
+        return match.group(0)
+
+    return re.sub(r"\breturn\s+([^;]+);", written, body)
+
+
 def _return_the_address(body: str, references: "dict[str, str]" = {}) -> str:
     """`return items[i];` becomes `return &(items[i]);` for a reference.
 
@@ -8639,6 +8984,16 @@ def _open_with_subobjects(
             f"this->{_vptr_path(found.name, classes)} = "
             f"{_vtable_name(found.name)};"
         )
+    # And one for each base after the first that has a table of its own. A
+    # pointer to that subobject is what a call through it is given, so what
+    # it reads has to be the table written for this class.
+    for index, mixin in enumerate(found.mixins):
+        if _is_polymorphic(mixin, classes):
+            calls.append(
+                f"this->__base{index + 1}."
+                f"{_vptr_path(mixin, classes)} = "
+                f"{_mixin_vtable_name(found.name, mixin)};"
+            )
     # Whatever the list named that is not a subobject is an ordinary member,
     # and an ordinary member is assigned to. After the constructions, because
     # one of them may be what it is assigned from.
@@ -9678,6 +10033,35 @@ def _static_value_returns(classes: "dict[str, Class]") -> "dict[str, str]":
     return found
 
 
+def _static_reference_returns(classes: "dict[str, Class]") -> "dict[str, str]":
+    """Every `static` member that answers a *reference* to an object.
+
+    The same list as above, for the other way a member hands an object back.
+    Left out of both, `Reg::one().bump()` - which is how a program writes a
+    singleton - was a method call on something that is not a name, and
+    nothing recognised it.
+    """
+
+    found: "dict[str, str]" = {}
+    for owner, holder in classes.items():
+        for method in holder.methods:
+            if not method.shared or not method.name:
+                continue
+            if not _returns_reference(method):
+                continue
+            held = re.sub(
+                r"\b(?:const|volatile|struct)\b", " ", method.returns
+            ).replace("&", " ").replace("*", " ").strip()
+            if held not in classes:
+                continue
+            found[f"{owner}::{method.name}"] = held
+            found[
+                _c_name(owner, method.name, _suffix_of(owner, method, classes))
+            ] = held
+            found.setdefault(method.name, held)
+    return found
+
+
 def _qualified_static_names(
     text: str, classes: "dict[str, Class]", order: "list[str] | None" = None
 ) -> str:
@@ -9828,6 +10212,15 @@ def _hoist_value_returns(
         (name, (held, False))
         for name, held in _static_value_returns(classes).items()
     )
+    #: A static member is written out the way a method is, so the pass that
+    #: dereferences a method's reference return reaches it too. Marked here
+    #: so this one does not do it as well: two dereferences of one pointer
+    #: is a read of whatever the object's first word happens to be.
+    by_the_other_pass = set(_static_reference_returns(classes))
+    returning.update(
+        (name, (held, True))
+        for name, held in _static_reference_returns(classes).items()
+    )
 
     def settled(text: str, match: "re.Match[str]", close: int) -> bool:
         """Whether this call still needs somewhere to write its answer."""
@@ -9846,6 +10239,24 @@ def _hoist_value_returns(
                     continue
                 if not settled(text, match, close):
                     continue
+                # Not out of a declaration this pass wrote. The temporary
+                # it makes is initialised *from* the call, so the call is
+                # still there to be found - and every round hoisted it out
+                # of the last round's declaration, until the rounds ran out.
+                begins = _statement_start(text, match.start())
+                # Where this call *is* the initialiser of one, and not
+                # merely somewhere after one in the same statement: a second
+                # call sitting beside a temporary already written is an
+                # ordinary call and still needs a name of its own.
+                if re.match(
+                    rf"\s*[A-Za-z_][\w\s*]*\s\&?{re.escape(_VALUE_PREFIX)}"
+                    # `(*` where the answer is a reference: the initialiser
+                    # reads through what the call handed back, and the call
+                    # is still in there to be found again.
+                    rf"\d+\s*=\s*(?:\(\s*\*\s*)?$",
+                    text[begins: match.start()],
+                ):
+                    continue
                 if _stands_alone(text, match, close):
                     # Nothing wants the answer, so there is nowhere it has to
                     # go. An earlier pass has usually already given a call in
@@ -9858,7 +10269,13 @@ def _hoist_value_returns(
                 # arguments; that pass knows methods only, so a free
                 # function has to say it here. Either way the binding below
                 # takes an address, and the two cancel: no copy is made.
-                return (match, close, held, by_reference, by_reference)
+                return (
+                    match,
+                    close,
+                    held,
+                    by_reference,
+                    by_reference and name not in by_the_other_pass,
+                )
         return None
 
     if not known and not returning:
@@ -10448,6 +10865,212 @@ def _rewrite_brace_temporaries(
     return text
 
 
+#: `lhs = value;` on its own, with no comparison or compound operator in it.
+_PLAIN_ASSIGNMENT = re.compile(
+    # No `\s*` after the `=`: this is matched against a copy with the
+    # literals blanked to spaces, and the value is sliced out of the real
+    # text at the same offsets - so whitespace eaten here is whitespace eaten
+    # off the front of `"a"`, and what came back was one quote character.
+    r"^\s*([^=;{}]+?)\s*(?<![=!<>+\-*/%&|^])=(?!=)(.+);\s*$", re.S
+)
+
+
+def _constructs_from(held: str, given: str, classes: "dict[str, Class]") -> bool:
+    """Whether `held` has a constructor taking one `given`."""
+
+    def plain(spelled: str) -> str:
+        spelled = re.sub(
+            r"\b(?:const|volatile|struct|class)\b", " ", spelled
+        ).replace("&", " ")
+        return re.sub(r"\s+", "", spelled)
+
+    holder = classes.get(held)
+    if holder is None:
+        return False
+    want = plain(given)
+    for method in holder.methods:
+        if method.name != "":
+            continue
+        parts = [one for one in _split_arguments(method.parameters) if one.strip()]
+        if len(parts) != 1:
+            continue
+        words = parts[0].replace("*", " * ").split()
+        if len(words) < 2:
+            continue
+        # The last word is the parameter's name, not part of its type.
+        if plain(" ".join(words[:-1])) == want:
+            return True
+    return False
+
+
+def _lvalue_class(
+    left: str, text: str, classes: "dict[str, Class]"
+) -> "str | None":
+    """The class a subscript answers, read from the classes rather than the text.
+
+    `_deduced_type` looks a subscript operator up by reading the class body,
+    and by the time this runs the bodies have been taken apart - so `s` had a
+    type and `m[3]` had none, though both are objects of a class this file
+    knows all about.
+    """
+
+    indexed = _INDEXED.match(left.strip())
+    if indexed is None:
+        return None
+    owner = _deduced_type(indexed.group(1).strip(), text) or ""
+    owner = re.sub(
+        r"\b(?:const|volatile|struct)\b", " ", owner
+    ).replace("*", " ").strip()
+    if owner not in classes:
+        return None
+    method = _method_named(owner, "op_index", classes)
+    if method is None:
+        return None
+    held = re.sub(
+        r"\b(?:const|volatile|struct)\b", " ", method.returns
+    ).replace("&", " ").replace("*", " ").strip()
+    return held or None
+
+
+#: `int (C::*m)(int) const` - a pointer to a member function.
+_MEMBER_POINTER = re.compile(
+    r"(?<![.\w>])([A-Za-z_][\w\s*]*?)\s*\(\s*([A-Za-z_]\w*)\s*::\s*\*\s*"
+    r"([A-Za-z_]\w*)\s*\)\s*\(([^)]*)\)\s*(?:const\s*)?"
+)
+
+#: `&C::method` - which one it is pointed at.
+_MEMBER_ADDRESS = re.compile(
+    r"&\s*([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)(?!\s*\()"
+)
+
+#: `(o.*m)(...)` and `(p->*m)(...)` - calling through one.
+_THROUGH_MEMBER = re.compile(
+    r"\(\s*([A-Za-z_]\w*)\s*(\.|->)\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\("
+)
+
+
+def _rewrite_member_pointers(
+    body: str, classes: "dict[str, Class]"
+) -> str:
+    """`int (C::*m)()` is a function pointer whose first argument is the object.
+
+    Which is what a method already is here: taking it apart put the object
+    in front, so a pointer to one is a pointer to a function taking a `C *`.
+    `&C::get` is that function's name, and `(c.*m)()` is a call through the
+    pointer with the object handed to it.
+    """
+
+    if not classes or "::" not in body:
+        return body
+
+    def declared(match: "re.Match[str]") -> str:
+        held, owner, name, parameters = match.groups()
+        if owner not in classes:
+            return match.group(0)
+        rest = f", {parameters.strip()}" if parameters.strip() else ""
+        return f"{held.strip()} (*{name})(struct {owner} *{rest})"
+
+    body = _map_code(body, lambda part: _MEMBER_POINTER.sub(declared, part))
+
+    def pointed(match: "re.Match[str]") -> str:
+        owner, method = match.groups()
+        if owner not in classes:
+            return match.group(0)
+        held = _find_method(owner, method, classes)
+        if held is None:
+            return match.group(0)
+        spelled = _name_for(held, method, classes)
+        # An overloaded member cannot be pointed at without saying which, and
+        # nothing here says: the type it is assigned to is what would.
+        return match.group(0) if callable(spelled) else spelled
+
+    body = _map_code(body, lambda part: _MEMBER_ADDRESS.sub(pointed, part))
+
+    if _THROUGH_MEMBER.search(_without_literals(body)) is None:
+        return body
+
+    def called(match: "re.Match[str]") -> str:
+        held, reach, name = match.groups()
+        given = held if reach == "->" else f"&{held}"
+        return f"{name}({given}, "
+
+    body = _map_code(body, lambda part: _THROUGH_MEMBER.sub(called, part))
+    # `m(&c, )` where the member takes nothing. Only here, where this pass
+    # is what wrote the comma.
+    return _map_code(body, lambda part: re.sub(r",\s*\)", ")", part))
+
+
+def _convert_assignments(
+    body: str, classes: "dict[str, Class]", text: str
+) -> str:
+    """`s = "a";` becomes `s = string("a");` - the temporary C++ builds.
+
+    Assigning something to an object of a class that has a constructor taking
+    it is a conversion: C++ builds a temporary from it and assigns that. With
+    nothing written here the C was handed a `char *` where a struct goes, and
+    `string s; s = "a";` - which is as ordinary as C++ gets - did not build.
+
+    Written as the constructor call C++ would have written, so the pass that
+    hoists temporaries takes it from here.
+    """
+
+    if not classes:
+        return body
+    out: "list[str]" = []
+    for statement in _statements(body):
+        found = _PLAIN_ASSIGNMENT.match(_without_literals(statement))
+        if found is None:
+            out.append(statement)
+            continue
+        left = statement[found.start(1): found.end(1)].strip()
+        value = statement[found.start(2): found.end(2)].strip()
+        held = _deduced_type(left, text) or _lvalue_class(left, text, classes)
+        if held is None:
+            out.append(statement)
+            continue
+        held = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", held
+        ).strip()
+        if "*" in held or held not in classes:
+            out.append(statement)
+            continue
+        # A literal or a name, and nothing else. Those are the two things
+        # `_deduced_type` reads without guessing; the type of an expression
+        # is where it is weakest, and read wrongly there this wrote a
+        # conversion C++ would never have made - `c = c / L"third";` became
+        # a `path` built from a `path`, which is more than one constructor.
+        if not (
+            value.isidentifier()
+            or any(pattern.match(value) for pattern, _named in _LITERAL_TYPES)
+        ):
+            out.append(statement)
+            continue
+        if value.startswith("__py2bin_"):
+            # A temporary this translator wrote already holds what the
+            # expression answered.
+            out.append(statement)
+            continue
+        given = _deduced_type(value, text)
+        if given is None:
+            out.append(statement)
+            continue
+        bare = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", given
+        ).replace("&", " ").strip()
+        if bare.replace("*", "").strip() == held:
+            # Already one of these, so nothing is being converted.
+            out.append(statement)
+            continue
+        if not _constructs_from(held, given, classes):
+            out.append(statement)
+            continue
+        out.append(
+            statement[: found.start(1)]
+            + f"{left} = {held}({value});"
+        )
+    return "".join(out)
+
+
 def _rewrite_temporaries(
     body: str, classes: "dict[str, Class]", counter: "list[int]"
 ) -> str:
@@ -10462,6 +11085,15 @@ def _rewrite_temporaries(
 
     if not classes:
         return body
+    # Past whatever is already here. More than one pass writes these, each
+    # with a counter of its own starting at one, and two of them in the same
+    # scope is a redeclaration - which nothing noticed until a pass that
+    # writes a temporary ran after one that had already written `_1`.
+    written = [
+        int(one.group(1)) for one in re.finditer(r"__py2bin_temp_(\d+)", body)
+    ]
+    if written:
+        counter[0] = max(counter[0], max(written))
     for _round in range(_TEMPORARY_ROUNDS):
         found = None
         for match in _TEMPORARY.finditer(body):
@@ -10639,6 +11271,14 @@ def _rewrite_body(
             raise CppTranslationError(
                 "<c++>", 0, f"{type_name} has no constructor to take arguments"
             )
+        if not arguments and variable.startswith(_VALUE_PREFIX):
+            # A temporary written to receive what a call answers with. The
+            # call fills it, and C++ builds nothing here either - so a
+            # default constructor over it is wasted work at best, and at
+            # worst a call to one the class does not have.
+            if _find_method(type_name, "~", classes):
+                destroyed.append(variable)
+            return constructed
         if owner is not None:
             given = (
                 [a.strip() for a in _split_arguments(arguments)]
@@ -10759,6 +11399,18 @@ def _rewrite_body(
     # `A(1)` to the start of the statement and leave the braces holding
     # declarations.
     body = _rewrite_object_array_values(body, classes, known)
+
+    # `int (C::*m)() const = &C::get;` and `(c.*m)()`. Before the passes
+    # that read calls, because what this leaves behind is an ordinary call
+    # through an ordinary function pointer.
+    body = _rewrite_member_pointers(body, classes)
+
+    # `s = "a";` where `s` is a class with a constructor taking a literal.
+    # C++ builds a temporary and assigns that, and writing the temporary here
+    # is what lets the pass below hoist it like any other. Before that pass,
+    # and before the subscript rewrite, so the left side is still written the
+    # way the program wrote it - `m[3]` and not a call.
+    body = _convert_assignments(body, classes, unit or body)
 
     # `V(5)` written where a value goes: C has no expression that constructs,
     # so each temporary becomes an object with a name ahead of the statement.
@@ -11287,7 +11939,10 @@ def _rewrite_body(
             [
                 *enclosing,
                 *(
-                    (name, known[name])
+                    # And which handlers are written at this level, so that a
+                    # jump to one of them knows where to stop unwinding: past
+                    # the body that holds the label it has not left.
+                    (name, known[name], _handlers_written(body))
                     for name in destroyed
                     if _built_before(body, name, number)
                 ),
@@ -11954,14 +12609,22 @@ def _rewrite_operators(
         if owner is None:
             continue
         address = variable if variable in pointers else f"&{variable}"
+        # `*p = v` as well as `p = v`. Matched from the name onwards, the
+        # star stayed where it was and the C read `* op_assign(p, &v)` - a
+        # dereference of what the operator answers, which is one too many.
+        # Taken with the name it cancels the address this would take: `&*p`
+        # is `p`.
         pattern = re.compile(
-            rf"(?<![.\w>=!<]){re.escape(variable)}\s*=(?!=)\s*([A-Za-z_]\w*)\s*;"
+            rf"(?<![.\w>=!<])(\*\s*)?{re.escape(variable)}\s*=(?!=)\s*"
+            rf"([A-Za-z_]\w*)\s*;"
         )
 
         def assigned(
-            match: "re.Match[str]", o=owner, a=address, h=holds
+            match: "re.Match[str]", o=owner, a=address, h=holds, v=variable
         ) -> str:
-            source = match.group(1)
+            if match.group(1):
+                a = v
+            source = match.group(2)
             spelled = known.get(source) or _deduced_type(source, scope or body)
             if spelled is None:
                 return match.group(0)
@@ -13358,6 +14021,12 @@ _CAST_TO_A_BASE = re.compile(
 )
 
 
+#: `(struct R *)D__new(` - a cast of what a call answers.
+_CAST_OF_A_CALL = re.compile(
+    r"\(\s*struct\s+([A-Za-z_]\w*)\s*\*\s*\)\s*([A-Za-z_]\w*)\s*\("
+)
+
+
 def _move_to_second_base(text: str, classes: "dict[str, Class]") -> str:
     """Point at the base subobject, where the base is not the first one.
 
@@ -13423,7 +14092,40 @@ def _move_to_second_base(text: str, classes: "dict[str, Class]") -> str:
 
     text = _map_code(text, lambda part: _CAST_TO_A_BASE.sub(cast, part))
     text = _map_code(text, lambda part: _TAKES_A_BASE.sub(declared, part))
-    return _map_code(text, lambda part: _ASSIGNS_A_BASE.sub(assigned, part))
+    text = _map_code(text, lambda part: _ASSIGNS_A_BASE.sub(assigned, part))
+
+    # `(struct R *)D__new()` - a cast of what a call answered, which the
+    # three above do not reach because there is no name to look the type up
+    # by. There is one to look it up *from*: this is C by now, and the
+    # function's own definition says what it returns.
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        bare = _without_literals(text)
+        for found in _CAST_OF_A_CALL.finditer(bare):
+            answered = re.search(
+                rf"(?<![.\w>])(?:struct\s+)?([A-Za-z_]\w*)\s*\*\s*"
+                rf"{re.escape(found.group(2))}\s*\(",
+                bare,
+            )
+            path = stepped(
+                answered.group(1) if answered else None, found.group(1)
+            )
+            if path is None:
+                continue
+            close = _closing_paren(bare, found.end() - 1)
+            if close < 0:
+                continue
+            call = text[found.start(2): close + 1]
+            text = (
+                text[: found.start()]
+                + f"&((struct {answered.group(1)} *)({call}))->{path}"
+                + text[close + 1:]
+            )
+            changed = True
+            break
+        if not changed:
+            break
+    return text
 
 
 def _every_base(name: str, classes: "dict[str, Class]") -> "list[str]":
@@ -13508,7 +14210,7 @@ def _close_with_destructors(
     destroyed: "list[str]",
     known: "dict[str, str]",
     classes: "dict[str, Class]",
-    enclosing: "list[tuple[str, str]]" = (),
+    enclosing: "list[tuple[str, str, frozenset]]" = (),
     returns: str = "",
     counter: "list[int] | None" = None,
 ) -> str:
@@ -13536,7 +14238,7 @@ def _close_with_destructors(
     # block does not end theirs.
     outer = "".join(
         f" {_destructor_call(held, name, classes)}"
-        for name, held in reversed(list(enclosing))
+        for name, held, _labels in reversed(list(enclosing))
     )
     # Where each one comes into existence. A `return` above a declaration
     # leaves before that object was ever built, and C++ destroys only what
@@ -13599,12 +14301,87 @@ def _close_with_destructors(
         at = found.end()
     out.append(body[at:])
     body = "".join(out)
+    body = _destroy_before_leaving(body, destroyed, known, classes, enclosing)
 
     closing = body.rfind("}")
     if closing < 0:
         return body
     # And at the end, for a path that simply falls off it.
     return body[:closing] + calls + " " + body[closing:]
+
+
+#: How the exception pass leaves a scope for a handler further out.
+_TO_A_HANDLER = re.compile(r"\bgoto\s+(__py2bin_catch_\w+)\s*;")
+
+
+def _handlers_written(body: str) -> frozenset:
+    """The handler labels this body holds, which a jump to one does not leave."""
+
+    return frozenset(
+        match.group(1) for match in _AT_A_HANDLER.finditer(body)
+    )
+
+
+#: Where the exception pass writes a handler down.
+_AT_A_HANDLER = re.compile(r"(?<![.\w>])(__py2bin_catch_\w+)\s*:")
+
+
+def _destroy_before_leaving(
+    body: str,
+    destroyed: "list[str]",
+    known: "dict[str, str]",
+    classes: "dict[str, Class]",
+    enclosing: "list[tuple[str, str, frozenset]]" = (),
+) -> str:
+    """Run the destructors on the way out to a handler, as C++ unwinding does.
+
+    A `return` is not the only way a scope ends early. An exception leaves
+    through a `goto` to its handler, and objects built above it are as dead
+    as they would be at a `return` - but the pass that reads this text looked
+    for `return` alone, so an object built inside a `try` was simply
+    abandoned: no destructor, no diagnostic, and a program that counts what
+    it has built answers one too many.
+
+    Only where the label is somewhere else. A jump to a handler written
+    *inside* this block does not leave it, and destroying here would take
+    apart an object the rest of the block still uses - and again at the end.
+    """
+
+    if not destroyed and not enclosing:
+        return body
+    here = _handlers_written(body)
+    built = {
+        name: (
+            where.start()
+            if (where := re.search(rf"(?<![.\w>]){re.escape(name)}\b", body))
+            else 0
+        )
+        for name in destroyed
+    }
+    out: "list[str]" = []
+    at = 0
+    for found in _TO_A_HANDLER.finditer(body):
+        if found.group(1) in here:
+            continue
+        already = [name for name in destroyed if built[name] < found.start()]
+        leaving = "".join(
+            f" {_destructor_call(known[name], name, classes)}"
+            for name in reversed(already)
+        )
+        # And outward, one scope at a time, as far as the scope that holds
+        # the handler - which the jump stays inside, so what that one built
+        # is still alive.
+        for name, held, labels in reversed(list(enclosing)):
+            if found.group(1) in labels:
+                break
+            leaving += f" {_destructor_call(held, name, classes)}"
+        if not leaving.strip():
+            continue
+        out.append(body[at:found.start()])
+        out.append(leaving.strip() + " " + found.group(0))
+        at = found.end()
+    out.append(body[at:])
+    return "".join(out)
 
 
 
@@ -13692,7 +14469,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # class, and every pass below looks for classes at the top level.
     text, namespaces = _flatten_namespaces(text, filename)
     text, aliases = _namespace_aliases(text)
-    text = _strip_namespace_qualifiers(text, namespaces | aliases)
+    # `std` whether or not a header in this file opened one. `<cmath>` is
+    # C's `math.h` here and declares no namespace, so nothing collected the
+    # name - and `std::sqrt(x)`, which is how C++ spells it, reached the C
+    # compiler with the `::` still in it.
+    text = _strip_namespace_qualifiers(text, namespaces | aliases | {"std"})
     # After the qualifiers go, and not before. `std::ostream &operator<<(...)`
     # is how every one of these is written outside the standard library, and
     # a name with `std::` in front of it is not the class name this looks up -
@@ -13766,6 +14547,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _rewrite_variant_alternatives(text)
     text = _rewrite_duration_cast(text)
     text = _expand_templates(text, filename)
+    # And again: a member template inside a class *template* has no calls to
+    # read while the class is still a pattern - nothing has an object of it -
+    # so it was left alone above. The copies written just now are ordinary
+    # classes, and the calls on them say which copy of the member is wanted.
+    text = _expand_member_templates(text, filename)
     # After the copies are written out, because that is what turns `sizeof(T)`
     # into `sizeof(int)` and a trait into the constant it answers.
     # Again, now that the copies exist: a `static_assert` inside a template
@@ -13912,6 +14698,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             or _REFERENCE.search(text) is not None
             or patterned
             or throws
+            # `std::sqrt(x)` is C++ spelling a C function, and the qualifier
+            # has been taken off `text` by here - but this path hands back
+            # the *source*, so without noticing it the `::` went to the C
+            # compiler in a file that had nothing else C++ about it.
+            or re.search(r"(?<![.\w>])std\s*::", source) is not None
         )
         if not plain and not namespaces and not loose:
             # Nothing C++ about this file at all: hand back what was written,
@@ -14049,16 +14840,10 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             # taken, it is not done everywhere it would have to be, and the
             # difference is a wrong answer rather than a failure. So it is
             # refused instead, by name.
-            if _is_polymorphic(mixin, classes):
-                raise CppTranslationError(
-                    filename,
-                    found.methods[0].line if found.methods else 0,
-                    f"{name} inherits from {mixin} as a second base, and "
-                    f"{mixin} has a virtual function. That needs a second "
-                    f"table and a pointer adjusted on the way into it, which "
-                    f"py2bin does not write - only the first base may be "
-                    f"polymorphic",
-                )
+            # A second base with virtuals gets a table of its own, whose
+            # entries move the pointer back to the whole object before
+            # calling what this class wrote. See `_second_base_tables`.
+            _ = mixin
 
 
     # Members defined outside their class, folded back into it.
@@ -14325,6 +15110,8 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # template writes, and when the body of `__sift_by` was rewritten the
     # comparator it would be given had no name yet. So the question is asked
     # of the finished C, where every type is written down.
+    whole = _fold_constant_definitions(whole)
+    whole = _ask_a_class_whether_it_is_true(whole, classes)
     through, through_types = _pointer_call_signatures(whole, classes)
     if through:
         whole = _address_reference_arguments(
@@ -15163,6 +15950,96 @@ _FUNCTION_TYPEDEF = re.compile(
 )
 
 
+#: `const int A = <expr>;` at file scope.
+_CONSTANT_DEFINITION = re.compile(
+    r"(?m)^[ \t]*(?:static\s+)?const\s+(?:unsigned\s+)?"
+    r"(?:int|long|short|char)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);"
+)
+
+
+def _fold_constant_definitions(whole: str) -> str:
+    """`const int A = 5 * B;` becomes `const int A = 120;`.
+
+    A `static const int` member is worked out at compile time in C++, and a
+    class template whose member asks for the one in the copy before it is how
+    a program counts at compile time. Written out as it stands, each of these
+    initialises a file-scope object from another one - which C does not let a
+    definition do, and which is the whole of what `Fact<5>::value` is.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        for found in _CONSTANT_DEFINITION.finditer(_without_literals(whole)):
+            value = whole[found.start(2): found.end(2)].strip()
+            if re.fullmatch(r"[-+]?\d+", value):
+                continue
+            folded = _folded_integer(value, whole)
+            if folded is None:
+                continue
+            whole = (
+                whole[: found.start(2)] + str(folded) + whole[found.end(2):]
+            )
+            changed = True
+            break
+        if not changed:
+            return whole
+    return whole
+
+
+#: `while (f(...))` or `if (f(...))` - a condition that is one call.
+_CONDITION_CALL = re.compile(r"(?<![.\w>])(if|while)\s*\(\s*([A-Za-z_]\w*)\s*\(")
+
+
+def _ask_a_class_whether_it_is_true(
+    whole: str, classes: "dict[str, Class]"
+) -> str:
+    """`while (in >> n)` asks the stream, not the pointer standing in for it.
+
+    An operator that answers a reference to its own class answers a pointer
+    here, and a pointer in a condition is true whenever it is not null - so
+    `while (in >> n)` never ended. C++ asks the class: it has a conversion to
+    bool, and that is what the condition means.
+
+    Only for a call to one of the class's own operators, and only where the
+    class has that conversion. A function that answers a plain pointer is
+    being tested for null, which is what the C already says.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        bare = _without_literals(whole)
+        for found in _CONDITION_CALL.finditer(bare):
+            called = found.group(2)
+            owner, mark, _rest = called.partition("__op_")
+            if not mark or owner not in classes:
+                continue
+            asked = _c_name(owner, _CONVERSION_PREFIX + "int")
+            if re.search(rf"(?<![.\w>]){re.escape(asked)}\s*\(", bare) is None:
+                continue
+            # It has to answer a reference to its own class; an operator that
+            # answers a number is already the condition it looks like.
+            if re.search(
+                rf"(?<![.\w>]){re.escape(owner)}\s*\*\s*{re.escape(called)}\s*\(",
+                bare,
+            ) is None:
+                continue
+            opening = found.end() - 1
+            close = _closing_paren(bare, opening)
+            if close < 0:
+                continue
+            begins = found.start(2)
+            whole = (
+                whole[:begins]
+                + f"{asked}({whole[begins: close + 1]})"
+                + whole[close + 1:]
+            )
+            changed = True
+            break
+        if not changed:
+            return whole
+    return whole
+
+
 def _pointer_call_signatures(
     text: str, classes: "dict[str, Class]"
 ) -> "tuple[dict[str, list[int]], dict[tuple[str, int], str]]":
@@ -15621,6 +16498,12 @@ def _rewrite_functions(
             # A reference to a number is not - `return slot[i];` *is* the
             # number, and what has to go back is where it lives.
             rewritten = _return_the_address(rewritten)
+        elif by_reference:
+            # Almost always a pointer already - but not when what is handed
+            # back is an object this body declares. `R &one() { static R
+            # held; return held; }` is how a program writes a singleton, and
+            # it answered with the object where a pointer was wanted.
+            rewritten = _address_a_returned_object(rewritten, returned)
         if copied:
             # After the body is rewritten, not before: this text is already C,
             # and a `struct V v;` put in ahead of the declaration pass reads
@@ -15726,9 +16609,13 @@ def _rewrite_declarations(text: str, classes: "dict[str, Class]") -> str:
 #: is, and a constructor still has to run for it. `extern` is deliberately
 #: not among them - that names an object defined somewhere else, and
 #: constructing it here would build it twice.
+#: The array form is written as an alternative *after* the arguments so the
+#: two groups in front of it keep their numbers: `Cell t[3](1)` is not C++,
+#: so nothing has both.
 _FILE_SCOPE_OBJECT = re.compile(
     r"(?m)^[ \t]*(?:(?:static|const|volatile|inline)[ \t]+)*"
-    r"([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*(?:\(([^;{}()]*)\))?[ \t]*;"
+    r"([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*"
+    r"(?:\(([^;{}()]*)\)|\[([^\];]*)\])?[ \t]*;"
 )
 
 
@@ -15744,7 +16631,10 @@ def _file_scope_objects(
 
     found: "dict[str, tuple[str, str]]" = {}
     for match in _FILE_SCOPE_OBJECT.finditer(text):
-        if _depth_at(text, match.start()) != 0:
+        # An array of them is not one of them: read as a lone object it was
+        # handed the address of the whole array, which is a different type
+        # and a different number of constructors.
+        if _depth_at(text, match.start()) != 0 or match.group(4) is not None:
             continue
         arguments = (match.group(3) or "").strip()
         if _looks_like_parameters(arguments, classes):
@@ -15754,6 +16644,27 @@ def _file_scope_objects(
             continue
         if match.group(1) in classes:
             found[match.group(2)] = (match.group(1), arguments)
+    return found
+
+
+def _file_scope_arrays(
+    text: str, classes: "dict[str, Class]"
+) -> "dict[str, tuple[str, str]]":
+    """Arrays of objects declared outside any function, with the class and count.
+
+    C++ default-constructs every element of one before `main`, the same as it
+    builds a lone object. Read only as a lone object, `Cell table[3];` was
+    left as three cells of zeroes: the members were whatever the loader put
+    there and the constructor's own bookkeeping - a count, a registration -
+    never happened. Nothing said so; the program ran and answered wrongly.
+    """
+
+    found: "dict[str, tuple[str, str]]" = {}
+    for match in _FILE_SCOPE_OBJECT.finditer(text):
+        if _depth_at(text, match.start()) != 0 or match.group(4) is None:
+            continue
+        if match.group(1) in classes:
+            found[match.group(2)] = (match.group(1), match.group(4).strip())
     return found
 
 
@@ -15816,6 +16727,17 @@ def _construct_before_main(text: str, made: "dict[str, str]", classes) -> str:
         calls.append(
             f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, text))}"
             f"(&{variable}{passed});"
+        )
+    for variable, (held, count) in _file_scope_arrays(text, classes).items():
+        owner = _find_method(held, "", classes)
+        if owner is None or not count:
+            continue
+        walked = f"__py2bin_i_{variable}"
+        calls.append(
+            f"{{ int {walked}; for ({walked} = 0; {walked} < {count}; "
+            f"{walked}++) "
+            f"{_c_name(owner, '', _call_suffix(owner, '', classes, [], text))}"
+            f"(&{variable}[{walked}]); }}"
         )
     if not calls:
         return text
@@ -17545,6 +18467,23 @@ public:
 _MAP_HEADER = r"""
 
 namespace std {
+/* `<map>` carries this itself: the headers here are separate texts and none
+   of them includes another, so a program that includes only `<map>` would
+   have no `pair` for `insert` to take. Written the same way `<utility>`
+   writes it, so a program that includes both gets one definition twice
+   rather than two that disagree. */
+template<typename A, typename B>
+class pair {
+public:
+    A first;
+    B second;
+    pair() { }
+    pair(A a, B b) { first = a; second = b; }
+};
+
+template<typename A, typename B>
+pair<A, B> make_pair(A a, B b) { pair<A, B> made(a, b); return made; }
+
 /* Entries in one array, so an iterator is a pointer to one and `it->first`
    and `it->second` are ordinary member reads. */
 template<typename K, typename V>
@@ -17555,9 +18494,12 @@ public:
     map_entry() { }
 };
 
-/* Searched from the front, and kept in insertion order. That is not a
-   red-black tree, and a program storing thousands of keys will notice; it is
-   the same interface, and it needs nothing this subset does not have. */
+/* Searched from the front, and kept in key order. That is not a red-black
+   tree, and a program storing thousands of keys will notice - but the order
+   is not a performance question: C++ says walking a map visits its keys in
+   order, so kept as they arrived it gave a different answer, quietly. A
+   sorted array says the same thing about order and needs nothing this
+   subset does not have. */
 template<typename K, typename V>
 class map {
 public:
@@ -17603,16 +18545,46 @@ public:
     }
     unsigned long count(K key) { return find(key) == entries + used ? 0 : 1; }
     int contains(K key) { return find(key) != entries + used; }
-    V &operator[](K key) {
+    /* The body of `operator[]`, under a name, so `insert` can reach it:
+       both of them want "the slot for this key, made if it is not there". */
+    V &__slot(K key) {
         map_entry<K, V> *found;
         found = find(key);
         if (found != entries + used) { return found->second; }
         if (used == room) {
             if (room == 0) { reserve(8); } else { reserve(room * 2); }
         }
-        entries[used].first = key;
-        used = used + 1;
-        return entries[used - 1].second;
+        /* Put where it belongs rather than at the end, which is what makes
+           walking this thing answer in key order. */
+        {
+            unsigned long __at;
+            unsigned long __back;
+            K __held;
+            __at = 0;
+            while (__at < used) {
+                __held = entries[__at].first;
+                if (key < __held) { break; }
+                __at = __at + 1;
+            }
+            __back = used;
+            while (__back > __at) {
+                entries[__back] = entries[__back - 1];
+                __back = __back - 1;
+            }
+            entries[__at].first = key;
+            used = used + 1;
+            return entries[__at].second;
+        }
+    }
+    V &operator[](K key) { return __slot(key); }
+    /* `insert` leaves a key that is already there alone - overwriting one is
+       what `operator[]` is for. What it takes is a `pair`, which is what
+       `make_pair` answers with and what C++ says this takes. */
+    void insert(pair<K, V> entry) {
+        map_entry<K, V> *found;
+        found = find(entry.first);
+        if (found != entries + used) { return; }
+        __slot(entry.first) = entry.second;
     }
     V &at(K key) { return find(key)->second; }
     void erase(K key) {
@@ -17631,7 +18603,8 @@ public:
 _SET_HEADER = r"""
 
 namespace std {
-/* The same shape as `map` with nothing on the other side. */
+/* The same shape as `map` with nothing on the other side - kept in order
+   for the same reason, and it is the whole of what `set` promises. */
 template<typename T>
 class set {
 public:
@@ -17675,11 +18648,22 @@ public:
     unsigned long count(T value) { return find(value) == items + used ? 0 : 1; }
     int contains(T value) { return find(value) != items + used; }
     void insert(T value) {
+        unsigned long at;
+        unsigned long back;
+        T held;
         if (find(value) != items + used) { return; }
         if (used == room) {
             if (room == 0) { reserve(8); } else { reserve(room * 2); }
         }
-        items[used] = value;
+        at = 0;
+        while (at < used) {
+            held = items[at];
+            if (value < held) { break; }
+            at = at + 1;
+        }
+        back = used;
+        while (back > at) { items[back] = items[back - 1]; back = back - 1; }
+        items[at] = value;
         used = used + 1;
     }
     void erase(T value) {
@@ -17767,18 +18751,172 @@ public:
     ostringstream &operator<<(long v) { held.append(to_string((int)v)); return *this; }
     ostringstream &operator<<(unsigned int v) { held.append(to_string((int)v)); return *this; }
     ostringstream &operator<<(unsigned long v) { held.append(to_string((int)v)); return *this; }
+    /* Six *significant* digits, which is what C++ prints by default and
+       what `cout` here already did - written out by hand as six decimal
+       places, this said `1.500000` where C++ says `1.5`, and where the two
+       disagreed the program still ran. */
     ostringstream &operator<<(double v) {
-        int whole;
-        int frac;
-        whole = (int)v;
-        frac = (int)((v - (double)whole) * 1000000.0);
-        if (frac < 0) { frac = -frac; }
-        held.append(to_string(whole));
-        held.push_back('.');
-        held.append(to_string(frac));
+        char __b[64];
+        snprintf(__b, 64, "%.6g", v);
+        held.append(__b);
         return *this;
     }
 };
+
+/* Reading values back out of a string. The other half of `<sstream>`, and
+   without it a program could build a string with `<<` and had no way to take
+   one apart - which is what `istringstream` is for. Written out by hand
+   rather than over `scanf`: py2bin's printf reads its format at compile
+   time, and what is wanted here is a position that moves. */
+class istringstream {
+public:
+    string held;
+    unsigned long __cursor;
+    int failed;
+    istringstream() { __cursor = 0; failed = 0; }
+    istringstream(const char *s) { held.assign(s); __cursor = 0; failed = 0; }
+    istringstream(string s) { held = s; __cursor = 0; failed = 0; }
+    string str() { return held; }
+    void str(string s) { held = s; __cursor = 0; failed = 0; }
+    int __spacing(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+    void __skip() {
+        while (__cursor < (unsigned long)held.size() && __spacing(held.at((int)__cursor))) {
+            __cursor = __cursor + 1;
+        }
+    }
+    int eof() { __skip(); return __cursor >= (unsigned long)held.size(); }
+    int fail() { return failed; }
+    /* `while (in >> n)` asks the stream whether the read worked. */
+    operator bool() { return failed == 0; }
+    int __sign() {
+        char c;
+        int negative;
+        negative = 0;
+        if (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (c == '-') { negative = 1; __cursor = __cursor + 1; }
+            else if (c == '+') { __cursor = __cursor + 1; }
+        }
+        return negative;
+    }
+    long __digits(int *any) {
+        long got;
+        char c;
+        got = 0;
+        while (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (c < '0' || c > '9') { break; }
+            got = got * 10 + (long)(c - '0');
+            __cursor = __cursor + 1;
+            *any = 1;
+        }
+        return got;
+    }
+    istringstream &operator>>(long &v) {
+        long got;
+        int any;
+        int negative;
+        __skip();
+        any = 0;
+        negative = __sign();
+        got = __digits(&any);
+        if (any == 0) { failed = 1; } else { v = negative ? -got : got; }
+        return *this;
+    }
+    istringstream &operator>>(int &v) {
+        long got;
+        int any;
+        int negative;
+        __skip();
+        any = 0;
+        negative = __sign();
+        got = __digits(&any);
+        if (any == 0) { failed = 1; } else { v = (int)(negative ? -got : got); }
+        return *this;
+    }
+    istringstream &operator>>(double &v) {
+        double got;
+        double scale;
+        double power;
+        long whole;
+        long exponent;
+        int any;
+        int negative;
+        int negative_exponent;
+        char c;
+        __skip();
+        any = 0;
+        negative = __sign();
+        whole = __digits(&any);
+        got = (double)whole;
+        if (__cursor < (unsigned long)held.size() && held.at((int)__cursor) == '.') {
+            __cursor = __cursor + 1;
+            scale = 0.1;
+            while (__cursor < (unsigned long)held.size()) {
+                c = held.at((int)__cursor);
+                if (c < '0' || c > '9') { break; }
+                got = got + scale * (double)(c - '0');
+                scale = scale * 0.1;
+                __cursor = __cursor + 1;
+                any = 1;
+            }
+        }
+        if (any && __cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (c == 'e' || c == 'E') {
+                __cursor = __cursor + 1;
+                negative_exponent = __sign();
+                exponent = __digits(&any);
+                power = 1.0;
+                while (exponent > 0) { power = power * 10.0; exponent = exponent - 1; }
+                if (negative_exponent) { got = got / power; } else { got = got * power; }
+            }
+        }
+        if (any == 0) { failed = 1; } else { v = negative ? -got : got; }
+        return *this;
+    }
+    istringstream &operator>>(char &v) {
+        __skip();
+        if (__cursor >= (unsigned long)held.size()) { failed = 1; return *this; }
+        v = held.at((int)__cursor);
+        __cursor = __cursor + 1;
+        return *this;
+    }
+    /* One word, which is what `>>` on a string means. */
+    istringstream &operator>>(string &v) {
+        char c;
+        v.clear();
+        __skip();
+        while (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (__spacing(c)) { break; }
+            v.push_back(c);
+            __cursor = __cursor + 1;
+        }
+        if (v.size() == 0) { failed = 1; }
+        return *this;
+    }
+    /* Up to the next newline, which `>>` never crosses. */
+    int __line(string &out, char stop) {
+        char c;
+        out.clear();
+        if (__cursor >= (unsigned long)held.size()) { failed = 1; return 0; }
+        while (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            __cursor = __cursor + 1;
+            if (c == stop) { return 1; }
+            out.push_back(c);
+        }
+        return 1;
+    }
+};
+
+int getline(istringstream &in, string &out) { return in.__line(out, '\n'); }
+int getline(istringstream &in, string &out, char stop) {
+    return in.__line(out, stop);
+}
 
 typedef ostringstream stringstream;
 }
@@ -18229,8 +19367,8 @@ _BUILTIN_CPP_HEADERS = {
     "string": _STRING_HEADER,
     "map": _MAP_HEADER,
     # An unordered map is the same interface with no promise about order,
-    # and this one keeps insertion order - which is a stronger promise than
-    # C++ makes, so no program that is correct against C++ can tell.
+    # and this one keeps key order - which is a stronger promise than C++
+    # makes here, so no program that is correct against C++ can tell.
     "unordered_map": _MAP_HEADER,
     "set": _SET_HEADER,
     "unordered_set": _SET_HEADER,
