@@ -1786,6 +1786,62 @@ def _tag_typedef(name: str, text: str) -> str:
 #: `using Number = int;` and `using Fn = int (*)(int);` - a typedef with the
 #: name in front. `using namespace x;` and `using B::f;` have no `=` and are
 #: not this.
+#: `template <typename T> using Row = std::vector<T>;` - another name for a
+#: template, not a template of its own.
+_ALIAS_TEMPLATE = re.compile(
+    r"(?<![.\w>])template\s*<([^<>]*)>\s*using\s+([A-Za-z_]\w*)\s*=\s*([^;]+);"
+)
+
+
+def _expand_alias_templates(text: str) -> str:
+    """`Row<int>` becomes what `Row` is another name for.
+
+    An alias template writes out no code of its own: it is a name for a
+    spelling, with holes in it. So every use is replaced by that spelling with
+    the holes filled, and the alias goes - which is what it means, and leaves
+    nothing for the pass that writes copies to be confused by.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        found = _ALIAS_TEMPLATE.search(_without_literals(text))
+        if found is None:
+            return text
+        named = [
+            part.split()[-1]
+            for part in _split_arguments(found.group(1))
+            if part.strip()
+        ]
+        alias, body = found.group(2), text[found.start(3): found.end(3)].strip()
+        text = text[: found.start()] + text[found.end():]
+        bare = _without_literals(text)
+        out: "list[str]" = []
+        at = 0
+        for use in re.finditer(rf"(?<![.\w>]){re.escape(alias)}\s*<", bare):
+            if use.start() < at:
+                continue
+            shut = _closing_angle(bare, use.end() - 1)
+            if shut < 0:
+                continue
+            given = [
+                one.strip()
+                for one in _split_arguments(text[use.end(): shut])
+                if one.strip()
+            ]
+            if len(given) != len(named):
+                continue
+            filled = body
+            for spelled, value in zip(named, given):
+                filled = re.sub(
+                    rf"(?<![.\w>]){re.escape(spelled)}\b(?!\s*::)", value, filled
+                )
+            out.append(text[at: use.start()])
+            out.append(filled)
+            at = shut + 1
+        out.append(text[at:])
+        text = "".join(out)
+    return text
+
+
 _ALIAS = re.compile(r"(?<![.\w>])using\s+([A-Za-z_]\w*)\s*=\s*([^;]+);")
 
 def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
@@ -1797,6 +1853,9 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
 
     # `using Number = int;` is a typedef written the other way round, which
     # is the only way C++11 and later spell one in new code.
+    # Before the plain alias: `template <typename T> using Row = ...;` read as
+    # one becomes `template <typename T> typedef ... Row;`, which is nothing.
+    text = _expand_alias_templates(text)
     text = _map_code(text, lambda part: _ALIAS.sub(r"typedef \2 \1;", part))
     # `class X final {` and `void f() override` say a thing may not be
     # derived from or overridden again. C++ checks that and C has nothing to
@@ -2000,6 +2059,13 @@ def _rewrite_initialiser_lists(text: str) -> str:
             if name == base:
                 assignments.append(f"{_BASE_INIT}({value});")
                 continue
+            if name == owner:
+                # `P() : P(1, 2) {}` - a constructor that hands the work to
+                # another of its own. Not a member and not the base: the name
+                # is the class's, and what it asks for is the other
+                # constructor run on this same object.
+                assignments.append(f"{_DELEGATE_INIT}({value});")
+                continue
             # Kept as a marker rather than written out as an assignment:
             # whether `b(3)` assigns to a member or constructs one depends on
             # whether `b` is of class type, and the classes have not been
@@ -2013,6 +2079,9 @@ def _rewrite_initialiser_lists(text: str) -> str:
 #: Stands in for "construct the base with these arguments" until the class
 #: table exists and the base's constructor has a name.
 _BASE_INIT = "__py2bin_base_init"
+#: And for "run another of this class's constructors on this same object",
+#: which is what a delegating constructor asks for.
+_DELEGATE_INIT = "__py2bin_delegate_init"
 #: `C(int x) : n(x)` - a member named in the initialiser list, with whatever
 #: it was given. The first argument is the member; the rest are its own.
 _MEMBER_INIT = "__py2bin_member_init"
@@ -6975,6 +7044,56 @@ def _rewrite_list_initialisers(text: str) -> str:
     return text
 
 
+#: `static_assert(cond, "why")` and its one-argument form.
+_STATIC_ASSERT = re.compile(r"(?<![.\w>])static_assert\s*\(")
+
+
+def _check_static_asserts(
+    text: str, filename: str, whatever_it_says: bool = False
+) -> str:
+    """Answer each `static_assert` while translating, and take it out.
+
+    It is a question asked of the compiler, so this is the compiler answering
+    it. One whose condition cannot be worked out is left standing rather than
+    assumed true - it then reaches the C compiler, which says it does not know
+    the name, and that is a better answer than silence.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        found = _STATIC_ASSERT.search(bare)
+        if found is None:
+            return text
+        closing = _closing_paren(bare, found.end() - 1)
+        if closing < 0:
+            return text
+        parts = _split_arguments(text[found.end(): closing])
+        answer = _folded_integer(parts[0], text) if parts else None
+        if answer is None and not whatever_it_says:
+            return text
+        if answer is None:
+            # Asked once more after the copies are written out, where
+            # `sizeof(T)` is `sizeof(int)`. Still unreadable there, it is
+            # taken out rather than left: what remains would be read as a
+            # member of the class it is written in, which it is not. Dropping
+            # a check never changes what a correct program does - it only
+            # fails to catch an incorrect one - and that is the honest cost.
+            answer = 1
+        if not answer:
+            said = parts[1].strip().strip('"') if len(parts) > 1 else ""
+            raise CppTranslationError(
+                filename, _line_of(text, found.start()),
+                f"static_assert failed{': ' + said if said else ''}",
+            )
+        ends = closing + 1
+        while ends < len(bare) and bare[ends] in " \t":
+            ends += 1
+        if ends < len(bare) and bare[ends] == ";":
+            ends += 1
+        text = text[: found.start()] + text[ends:]
+    return text
+
+
 def _strip_constexpr(text: str) -> str:
     """`constexpr T k = v;` becomes `const T k = v;`.
 
@@ -7838,6 +7957,7 @@ def _emit_one(
     if returned:
         body = _return_through_pointer(body, returned or "")
     if method.name == "":
+        body = _delegating_initialiser(body, found, classes, unit)
         body, base_arguments = _base_initialiser(body, found)
         body, member_arguments = _member_initialisers(body)
         # `int n = 7;` written on the member, put in before the subobjects so
@@ -7966,6 +8086,31 @@ def _member_initialisers(body: str) -> "tuple[str, dict[str, str]]":
             at += 1
     out.append(body[at:])
     return "".join(out), given
+
+
+def _delegating_initialiser(
+    body: str, found: Class, classes: "dict[str, Class]", scope: str
+) -> str:
+    """`P() : P(1, 2) {}` becomes the other constructor, run on this object.
+
+    C++ builds the object once and lets one constructor ask another to do it.
+    Which other one is decided the way every overloaded call here is: by what
+    it is handed.
+    """
+
+    match = re.search(rf"{_DELEGATE_INIT}\s*\(([^;]*)\);", body)
+    if match is None:
+        return body
+    given = [one.strip() for one in _split_arguments(match.group(1)) if one.strip()]
+    suffix = _call_suffix(found.name, "", classes, given, scope)
+    spelled = ", ".join(given)
+    return (
+        body[: match.start()]
+        + f"{_c_name(found.name, '', suffix)}(this"
+        + (f", {spelled}" if spelled else "")
+        + ");"
+        + body[match.end():]
+    )
 
 
 def _base_initialiser(body: str, found: Class) -> "tuple[str, str | None]":
@@ -11816,7 +11961,15 @@ def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
         if match.start() < at:
             continue
         before = bare[:match.start()].rstrip()
-        if before and (before[-1].isalnum() or before[-1] in "_)]\"'"):
+        # `!` is never a two-operand operator, so nothing in front of it can
+        # make it one: `(int)!a` and `f(x) && !a` are both the prefix. The
+        # others can - `a * p` is a multiplication and `f(x) - a` is a
+        # subtraction - so for those the character before decides. Read the
+        # same way for all of them, a cast in front of `!` stopped it being
+        # recognised at all.
+        if symbol != "!" and before and (
+            before[-1].isalnum() or before[-1] in "_)]\"'"
+        ):
             continue
         # `a && b` ends in the same character as a prefix `&`. The second of
         # a doubled symbol is part of the operator before it, not a prefix on
@@ -13161,6 +13314,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Before the word is taken away, because the word is what says the
     # function may be asked while translating.
     text = _fold_constexpr_calls(text)
+    # After the constexpr calls are answered, because a `static_assert` is
+    # usually asking about one.
+    text = _check_static_asserts(text, filename)
     text = _strip_constexpr(text)
     text = _lift_nested_enums(text)
     text, scoped_enums = _rewrite_cpp_spellings(text)
@@ -13210,6 +13366,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _expand_templates(text, filename)
     # After the copies are written out, because that is what turns `sizeof(T)`
     # into `sizeof(int)` and a trait into the constant it answers.
+    # Again, now that the copies exist: a `static_assert` inside a template
+    # asks about the type it was written for, and there is no type until here.
+    text = _check_static_asserts(text, filename, whatever_it_says=True)
     text = _rewrite_if_constexpr(text, filename)
     # After the copies too: what a binding is written against is often one of
     # them, and its members are not there to be read until it exists.
@@ -15203,6 +15362,20 @@ public:
     /* The cast is what says which overload: two `find`s take one argument,
        and the type of a call's result is what tells them apart. */
     int find(string needle) { return find((const char *)needle.c_str()); }
+    /* The last match rather than the first, which is what `rfind` is. */
+    int rfind(const char *needle) {
+        int i; int j; int found;
+        found = -1;
+        i = 0;
+        while (i < len) {
+            j = 0;
+            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) { j = j + 1; }
+            if (needle[j] == 0) { found = i; }
+            i = i + 1;
+        }
+        return found;
+    }
+    int rfind(string needle) { return rfind((const char *)needle.c_str()); }
 
     /* And each of them from a position, which is how a program walks a
        string looking for the next one of something. */
