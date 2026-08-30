@@ -13,7 +13,7 @@ py2bin compile-capi app.py --target darwin-arm64 -o app
 **Where it stands.** 2,030 tests; a 110-program corpus whose output matches
 CPython character for character; 886 of an 889-program corpus likewise, with
 the other three not comparable by anything; 1,494 of 1,500 randomly generated
-programs; 357 C and C++ programs whose output matches `clang++`, built for all
+programs; 359 C and C++ programs whose output matches `clang++`, built for all
 six targets; eight of twenty-seven benchmark rows faster than the interpreter.
 Every one of those numbers is measured, and where a number is not what it
 looks like the section that gives it says so.
@@ -1156,6 +1156,28 @@ An alias template - `template <class T> using Row = std::vector<T>;` - writes
 out no code of its own: it is a name for a spelling with holes in it. Every
 use is filled in and the alias goes, which is what it means. And
 `string::rfind`, which was simply absent.
+
+**A `const` and a non-`const` member of one name** - `int &at(int)` beside
+`const int &at(int) const` - is how every container is written, and the two
+could not be told apart: C++ picks between them by whether the object is
+const, and nothing here knows that about an object.
+
+Split on evidence rather than guessed at. Where the two bodies are the same
+text - which is what an accessor pair is - one of them is enough and the other
+goes. Where they differ, the program is relying on the choice being made, and
+it is refused with that as the reason instead of being handed whichever came
+first.
+
+**A class template's static member** - `template <class T> int
+Counter<T>::made = 0;` - is one definition in C++ and needs to be one object
+per copy here. The value goes where the member is declared, so it rides along
+with every copy: the same thing arrived at from the other side.
+
+That uncovered a second one underneath. `made++` written inside the
+constructor stayed unqualified, because the rule that qualifies a bare static
+name only fires where exactly one class has a member of that name - and two
+copies of one template always both do. It is qualified by the class whose body
+it is written in now, which is known where it is read.
 
 **A standard C++ header py2bin does not implement still says so.** One
 spelled the way only a standard header is, that py2bin does not ship and that

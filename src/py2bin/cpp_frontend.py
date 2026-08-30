@@ -137,6 +137,11 @@ class Method:
     #: Declared `static`: one function for the class rather than one per
     #: object, so it takes no `this` and is reached by the class's name.
     shared: bool = False
+    #: Declared `const` after the parameter list. C++ picks between a `const`
+    #: and a non-`const` member of the same name by the object; py2bin does
+    #: not track whether an object is const, so what this is for is telling
+    #: such a pair apart when it is read - not choosing between them.
+    readonly: bool = False
 
 
 @dataclass
@@ -611,11 +616,15 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
     if re.search(r"=\s*0\s*$", head):
         pure = True
         head = re.sub(r"=\s*0\s*$", "", head).strip()
+    # `const` after the parameter list, which is the only place it can be and
+    # still be about the object rather than about a type.
+    readonly = re.search(r"\)\s*const\s*$", head) is not None
 
     def decorated(method: Method) -> Method:
         method.virtual = virtual
         method.pure = pure
         method.shared = shared
+        method.readonly = readonly
         return method
 
     # `int operator()(int x)` has two parameter lists as far as `find` is
@@ -1793,6 +1802,56 @@ _ALIAS_TEMPLATE = re.compile(
 )
 
 
+#: `template <typename T> int Counter<T>::made = 0;` - storage for a static
+#: member of a class template, which C++ asks for once and which this needs
+#: once per copy.
+_TEMPLATE_STATIC = re.compile(
+    r"(?<![.\w>])template\s*<([^<>]*)>\s*([A-Za-z_][\w\s*]*?)\s+"
+    r"([A-Za-z_]\w*)\s*<[^<>]*>\s*::\s*([A-Za-z_]\w*)\s*(=[^;]*)?;"
+)
+
+
+def _fold_template_statics(text: str) -> str:
+    """Move a class template's static storage into the class body.
+
+    C++ wants one definition outside the template, and gives each copy its own
+    object from it. py2bin writes the copies, so the value is put where the
+    member is declared instead - it then rides along with every copy, which is
+    the same one-object-per-instantiation, arrived at from the other side.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        found = _TEMPLATE_STATIC.search(_without_literals(text))
+        if found is None:
+            return text
+        owner, member = found.group(3), found.group(4)
+        value = (text[found.start(5): found.end(5)] if found.group(5) else "= 0")
+        text = text[: found.start()] + text[found.end():]
+        head = next(
+            (
+                one
+                for one in _CLASS_HEAD.finditer(_without_literals(text))
+                if one.group(2) == owner
+            ),
+            None,
+        )
+        if head is None:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        inside = text[head.end(): closing - 1]
+        written = re.sub(
+            rf"(?<![.\w>])(static\s+[\w\s*]*?\b{re.escape(member)}\s*)(;)",
+            rf"\1{value.strip()};",
+            inside,
+            count=1,
+        )
+        text = text[: head.end()] + written + text[closing - 1:]
+    return text
+
+
 def _expand_alias_templates(text: str) -> str:
     """`Row<int>` becomes what `Row` is another name for.
 
@@ -1855,6 +1914,7 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     # is the only way C++11 and later spell one in new code.
     # Before the plain alias: `template <typename T> using Row = ...;` read as
     # one becomes `template <typename T> typedef ... Row;`, which is nothing.
+    text = _fold_template_statics(text)
     text = _expand_alias_templates(text)
     text = _map_code(text, lambda part: _ALIAS.sub(r"typedef \2 \1;", part))
     # `class X final {` and `void f() override` say a thing may not be
@@ -2335,8 +2395,26 @@ def _rewrite_static_members(text: str, filename: str) -> str:
                 )
             return ""
 
+        # The bare name, inside the class it belongs to. Done here, where the
+        # body is in hand and the class it belongs to is known, rather than
+        # by the pass below that asks which class has a member of that name -
+        # two copies of one template always both do, so that pass declines
+        # and `made++` inside the constructor was left naming nothing.
+        mine = [
+            one.group(2) for one in _STATIC_MEMBER.finditer(_without_literals(body))
+        ]
+        written = _STATIC_MEMBER.sub(taken, body)
+        for spelled in mine:
+            written = _map_code(
+                written,
+                lambda part, n=spelled, o=owner: re.sub(
+                    rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*(?:::|\())",
+                    _c_name(o, n),
+                    part,
+                ),
+            )
         out.append(text[at:head.end() - 1])
-        out.append(_STATIC_MEMBER.sub(taken, body))
+        out.append(written)
         at = closing
     out.append(text[at:])
     text = "".join(out)
@@ -13595,6 +13673,39 @@ def _translate(source: str, filename: str = "<c++>") -> str:
                 f"hold a pointer instead, and the most derived object to be "
                 f"the one that owns it. That is not written. A single path "
                 f"to a `virtual` base is an ordinary base and does work",
+            )
+        # `int &at(int)` beside `const int &at(int) const` is how every
+        # container is written. C++ picks between them by whether the object
+        # is const; py2bin does not track that, and by the time they are read
+        # the two take the same arguments and answer the same shape.
+        #
+        # Where their bodies are the same text - which is what an accessor
+        # pair is - one of them is enough and the other goes. Where they
+        # differ, that is a program relying on the choice, and it is refused
+        # rather than given whichever came first.
+        by_shape: "dict[tuple, list[Method]]" = {}
+        for method in found.methods:
+            if method.name in ("", "~"):
+                continue
+            by_shape.setdefault(
+                (method.name, tuple(_parameter_types(method.parameters))), []
+            ).append(method)
+        for (spelled, _shape), group in by_shape.items():
+            if len(group) != 2 or group[0].readonly == group[1].readonly:
+                continue
+            first, second = group
+            if re.sub(r"\s+", " ", first.body) == re.sub(r"\s+", " ", second.body):
+                found.methods.remove(second if second.readonly else first)
+                continue
+            raise CppTranslationError(
+                filename,
+                group[-1].line,
+                f"{name} declares {spelled}() twice, once `const` and once "
+                f"not, with different bodies. C++ chooses between them by "
+                f"whether the object is const and py2bin does not know that "
+                f"about an object - so with two different bodies there is "
+                f"nothing here that can choose. Where the two do the same "
+                f"thing, writing one is enough and this takes it",
             )
         for mixin in found.mixins:
             # A second base is a member after the first, so the address of the
