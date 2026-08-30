@@ -1120,25 +1120,64 @@ random. Seeded with 5489 it answers 3499211612, 581869302, 3890346734, which
 is what every other implementation answers, and is the property a program
 using it for a repeatable run depends on.
 
-**A virtual base splits in two, and only one half is written.** One path to
-one is an ordinary base: the word changes nothing, and `struct Only : virtual
-Base` works exactly as it reads. Two paths to the same one is what the word is
-*for*, and is a different thing - C++ gives it a single shared subobject where
-this lays a base out as a member of what derives from it, and a member cannot
-be in two places.
+**The diamond, which was the one thing left undone.** Two paths to one
+`virtual` base is what the word is *for*: C++ gives it a single shared
+subobject, where this had been laying a base out as a member of whatever
+derives from it - and a member cannot be in two places. It was refused for a
+while, and the refusal said what it would take. It took that.
 
-Sharing one needs each path to hold a pointer instead, and the most derived
-object to be the one that owns it - which means every constructor of such a
-class has to know whether it *is* the most derived, since `Mid m;` must own
-the base and `Mid` inside a `Both` must not. That is a hidden argument through
-every constructor, and it changes layout, member paths, table paths and
-`dynamic_cast` - the machinery multiple inheritance and threads both stand on.
+A base inherited `virtual` is held by address rather than embedded, and the
+complete object keeps the storage everything points at. What made this small
+enough to write is the spelling of the path to it: `__vbase_A[0]`. Every pass
+here reaches a base by naming the way there and then taking its address, and
+`&o.__vbase_A[0]` *is* `o.__vbase_A` - so all of them kept working with no
+change at all.
 
-So the diamond is refused, with that as the reason rather than with the wider
-rule about a second base that happened to catch it. It is the one thing on
-this page left undone, and it is undone on purpose: a diamond that compiled
-and quietly gave two base objects where the language promises one would be
-worth less than a build that stops.
+A class with a shared base gets two constructors, the way a real C++ ABI
+writes them: a complete-object one that points at its own storage, builds the
+shared base there and hands off, and a sub-object one that assumes it already
+exists. Which of the two a site wants is decided in exactly one place, and
+the complete one keeps the name every call site already spells - so nothing
+else had to learn about any of this. The shared base gets a table of its own
+whose entries move the pointer back, the same machinery a second base wanted.
+
+Three things that were not about diamonds at all fell out of writing it. A
+member of a *second* base had never been reachable by its bare name: the
+reader counted one `__base.` per level along the first chain and never looked
+at the others. The final overrider was looked for down that same first chain,
+so `struct D : B, C` where only `C` declares the method resolved to the one
+`D` was overriding rather than to the override. And a virtual call passed the
+receiver where the table expected the class that declared the slot - which
+had always worked only because that class had always been at offset zero.
+
+**A fifth round, and seven more.** With the list empty, fourteen more
+programs were written against parts of the language the earlier rounds had
+not aimed at. Seven of them found something, which is the answer to what an
+empty list is worth: it was empty because nobody was still looking.
+
+The one that mattered was arithmetic. `a + b * c` on a class came out as
+`(a + b) * c` - a wrong answer, printed without complaint. The passes that
+write an overloaded operator out take one symbol at a time, so the order they
+take them in *is* the precedence; they were sorted by the length of the
+symbol, and the one that hoists them looped over the variables outside and
+the symbols inside, which threw away even that. Both are ordered by how
+tightly each binds now.
+
+A `goto` out of a scope ran no destructors: the pass that places them knew
+about `return` and about the jumps the exception pass writes, and a jump a
+*program* wrote leaves exactly as much. `break` and `continue` take their
+scope apart too now. `const struct P *items` named a `P` that nothing could
+see, because the reader took the first word as the type and found `const`. A
+reference member came out with `&slot` as its name, so nothing matched a use
+of it. A callable put into a container *slot* was not seen going in. And a
+lambda that captured what another lambda answered got the type nothing is,
+because the classes being made are not in the text until the whole pass is
+finished.
+
+Two of the fixes bit back before the round was over, which is what the corpus
+is for: taking the parentheses off `(a + b)` also took them off `(this)` in
+an argument list and off `dynamic_cast<D*>(b)`, and a search-and-replace over
+the `<sstream>` text turned `ostringstream` into `oistringstream`.
 
 **Then the gaps were closed on purpose, one at a time.** Four rounds of
 probing had left a list: eight things that refused with a message rather than
@@ -1566,7 +1605,13 @@ not special cases in the compiler:
   semantics nor atomics, so what is here is the ownership and not the
   machinery C++ uses to enforce it.
 * `<sstream>` — `ostringstream` with one `operator<<` per type it can write,
-  and `str()`; `istringstream` with one `operator>>` per type it can read -
+  and `str()`. One further class reads *and* writes a string, and is emitted
+  twice, under `istringstream` and under `stringstream`: C++ has three of
+  these and the third does both, and a typedef onto another class is not
+  something this translator resolves - so what is repeated is the text and
+  not the name. `stringstream` had been a name for the *output* one, so a
+  program that wrote to one and then read it back was asking an object with
+  no `>>` at all. It reads with one `operator>>` per type -
   `int`, `long`, `double` including a fraction and an exponent, `char` and a
   word into a `string` - plus `getline`, `eof`, `fail`, and the conversion to
   bool that makes `while (in >> n)` end. The number parsing is written out by

@@ -101,9 +101,31 @@ _POSTFIX = {"op_inc": "op_inc_post", "op_dec": "op_dec_post"}
 
 #: Longest first, so `<=` is not read as `<`. `->` is not among them: it takes
 #: no right operand of its own, so the two-operand pass has nothing to match.
+#: How tightly each binds, tightest first. The passes that write these out
+#: take one symbol at a time, so the order they are taken in *is* the
+#: precedence: an operator written out before one that binds tighter puts the
+#: wrong pair together, and `a + b * c` came out as `(a + b) * c` - a wrong
+#: answer with nothing to say so. Sorted by length alone, `+` came before
+#: `*` because they are the same length.
+#:
+#: The compound assignments go first, before the symbol each is built from,
+#: so that the pattern for `+` cannot match the `+` inside `+=`. Where two
+#: bind equally the longer is tried first, for the same reason.
+_OPERATOR_PRECEDENCE = {
+    "+=": 0, "-=": 0,
+    "*": 1, "/": 1, "%": 1,
+    "+": 2, "-": 2,
+    "<<": 3, ">>": 3,
+    "<": 4, "<=": 4, ">": 4, ">=": 4,
+    "==": 5, "!=": 5,
+}
+
 _OPERATOR_SYMBOLS = [
     symbol
-    for symbol in sorted(_OPERATOR_NAMES, key=len, reverse=True)
+    for symbol in sorted(
+        _OPERATOR_NAMES,
+        key=lambda one: (_OPERATOR_PRECEDENCE.get(one, 9), -len(one)),
+    )
     # `&` is left out of the two-operand pass: a class that overloads it
     # overloads the *unary* one, which is what a holder does to hand out
     # somewhere to write. A binary `a & b` on two objects is not something
@@ -118,6 +140,11 @@ class Member:
     name: str
     ctype: str
     array: str = ""   # "[8]" for `int items[8]`, kept for the struct field
+    #: Declared `int &slot`. C has no reference, so it is held as a pointer
+    #: and every use of it reads through - which is what a reference is. Read
+    #: as an ordinary member the name came out as `&slot`, so nothing matched
+    #: a use of it and the struct itself was not C.
+    reference: bool = False
 
 
 @dataclass
@@ -585,7 +612,13 @@ def _member_from(declaration: str, filename: str, at: int) -> Member:
             f"{pointer.group(3)}\x00fn",
             array="",
         )
-    words = declaration.replace("*", " * ").split()
+    words = declaration.replace("*", " * ").replace("&", " & ").split()
+    if len(words) < 2:
+        raise CppTranslationError(
+            filename, at, f"cannot read the data member {declaration!r}"
+        )
+    holds = "&" in words
+    words = [one for one in words if one != "&"]
     if len(words) < 2:
         raise CppTranslationError(
             filename, at, f"cannot read the data member {declaration!r}"
@@ -599,7 +632,13 @@ def _member_from(declaration: str, filename: str, at: int) -> Member:
     if bracket >= 0:
         array = spelled[bracket:]
         spelled = spelled[:bracket]
-    return Member(name=spelled, ctype=" ".join(words[:-1]), array=array)
+    held = " ".join(words[:-1])
+    return Member(
+        name=spelled,
+        ctype=f"{held} *" if holds else held,
+        array=array,
+        reference=holds,
+    )
 
 
 def _method_from(head: str, body: str, filename: str, at: int) -> Method:
@@ -1565,6 +1604,10 @@ def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
         holder = _deduced_type(plain.group(1), text, before)
         if holder is not None and "*" not in holder:
             answered = _member_result(text, holder.strip(), r"operator\s*\(\s*\)")
+            if answered is None:
+                # A closure being expanded right now: its class is written
+                # but not yet in the text.
+                answered = _LAMBDA_RESULTS.get(holder.strip())
             if answered is not None:
                 return answered
         return _declared_return(text, None, plain.group(1))
@@ -3351,6 +3394,17 @@ def _assigned_to(text: str, name: str, filename: str) -> "list[str]":
         ):
             if gave.group(1) not in holders:
                 found.append(gave.group(1))
+    # `table[key] = value;` - into a slot of a container of them. The left
+    # side is not a name, so the assignment pass below does not see it, and
+    # the class was written out with no member for what the program put in.
+    for owner in _erased_containers(text, name):
+        for match in re.finditer(
+            rf"(?<![.\w>]){re.escape(owner)}\s*\[[^\];]*\]\s*=\s*"
+            rf"([A-Za-z_]\w*)\s*;",
+            bare,
+        ):
+            if match.group(1) not in holders:
+                found.append(match.group(1))
     # `f = value;` - given later, to a variable or to a member.
     for match in _ERASED_ASSIGN.finditer(bare):
         target = re.sub(r"\s+", "", match.group(1)).split("->")[-1].split(".")[-1]
@@ -3455,9 +3509,50 @@ def _fill_erased(
 
         text = _sub_code(pattern, text, declared)
         text = _sub_code(_ERASED_ASSIGN, text, one)
+        text = _erased_into_a_slot(text, name, holders, places, by_value)
         text = _erased_given(text, name, holders, places, by_value)
         text = _erased_returned(text, name, holders, places, by_value)
         text = _erased_truth(text, holders)
+    return text
+
+
+def _erased_into_a_slot(
+    text: str,
+    name: str,
+    holders: "set[str]",
+    places: "dict[str, int]",
+    by_value: "dict[str, int]",
+) -> str:
+    """`table[key] = f;` - the tag and the member, written on the slot.
+
+    The subscript is written twice rather than held in a temporary: a
+    container's `operator[]` answers the same slot both times, and one that
+    makes the slot on first asking has made it by the second.
+    """
+
+    def one(match: "re.Match[str]", whole: str) -> "str | None":
+        value = match.group(2)
+        if value in by_value:
+            which = by_value[value]
+        else:
+            spelled = _deduced_type(value, whole)
+            which = places.get((spelled or "").strip())
+        if which is None:
+            return None
+        # From the real text: the match is against a copy with the literals
+        # blanked, and a key written as one - `table["name"]` - came back as
+        # a subscript with nothing in it.
+        slot = whole[match.start(1): match.end(1)]
+        return (
+            f"{slot}.__which = {which}; {slot}.__held{which} = {value};"
+        )
+
+    for owner in _erased_containers(text, name):
+        pattern = re.compile(
+            rf"((?<![.\w>]){re.escape(owner)}\s*\[[^\];]*\])\s*=\s*"
+            rf"([A-Za-z_]\w*)\s*;"
+        )
+        text = _sub_code(pattern, text, one)
     return text
 
 
@@ -3696,6 +3791,12 @@ def _expand_lambdas(
             f"    {name}() {{ }}\n"
             f"{operators}}};\n"
         )
+        # What it answers, recorded now. The classes made here are put into
+        # the text only when the whole pass is done, so a lambda expanded
+        # after this one asking what a call on it gives back found no class
+        # at all - and a capture of the result got the type nothing is, which
+        # is `int`.
+        _LAMBDA_RESULTS[name] = result
         # Where it is used: a declaration of one, and a member per capture.
         setup = "".join(
             f" {holder}.{v} = {source};" for v, _s, _r, source in held
@@ -3751,6 +3852,11 @@ def _looks_like_an_index(text: str, found: "re.Match[str]") -> bool:
 _BEFORE_A_LAMBDA = frozenset(
     {"return", "case", "else", "do", "throw", "co_return", "co_yield"}
 )
+
+
+#: What each lambda's call operator answers, by the class it became. Filled
+#: while they are expanded, because that is before any of them is in the text.
+_LAMBDA_RESULTS: "dict[str, str]" = {}
 
 
 def _lambda_result(body: str, parameters: str, text: str) -> str:
@@ -7962,16 +8068,19 @@ def _this_qualified(
     """
 
     names = dict.fromkeys(owner.field_names(), "")
-    base = owner.base
-    depth = 1
-    while base and base in classes:
-        # One `__base.` per level. A name inherited through two classes lives
-        # two bases down, and a single hop named a member the middle class
-        # does not have.
+    # Every base, by the path that reaches it - not one `__base.` per level.
+    # Counting levels along the first chain alone, a name a *second* base
+    # declares was not reachable by its bare name at all, and one a shared
+    # base declares is not reached by naming a member. Nearest first, which
+    # is the order C++ looks a name up in.
+    for base in _every_base(owner.name, classes):
+        if base not in classes:
+            continue
+        path = _subobject_path(owner.name, base, classes)
+        if path is None:
+            continue
         for name in classes[base].field_names():
-            names.setdefault(name, "__base." * depth)
-        base = classes[base].base
-        depth += 1
+            names.setdefault(name, f"{path}.")
 
     def replace(match: "re.Match[str]") -> str:
         word = match.group(0)
@@ -8061,12 +8170,16 @@ def _slot_provider(
 ) -> "str | None":
     """The most derived class at or above `name` that defines this slot."""
 
-    seen = name
-    while seen and seen in classes:
+    # Every base, nearest first, and not the first chain alone: `D : B, C`
+    # where only `C` declares the method has `C`'s as its final overrider,
+    # and walking `.base` from D reached A without ever looking at C - so the
+    # table named the one D was overriding rather than the override.
+    for seen in [name, *_every_base(name, classes)]:
+        if seen not in classes:
+            continue
         for method in classes[seen].methods:
             if _slot_key(method) == key and not method.pure:
                 return seen
-        seen = classes[seen].base
     return None
 
 
@@ -8157,12 +8270,33 @@ def _vptr_path(name: str, classes: "dict[str, Class]") -> str:
     finds it.
     """
 
-    steps = []
     seen = name
     while seen and seen in classes and not _carries_vptr(seen, classes):
-        steps.append("__base")
-        seen = classes[seen].base
-    return ".".join([*steps, "__vptr"])
+        held = classes[seen]
+        for base, _step, _shared in _base_steps(held, classes):
+            if base in classes:
+                seen = base
+                break
+        else:
+            break
+    # Through whichever path names the class that declared it, which for a
+    # shared base is a pointer and not a member.
+    path = _subobject_path(name, seen, classes)
+    return "__vptr" if not path else f"{path}.__vptr"
+
+
+def _vptr_carrier(name: str, classes: "dict[str, Class]") -> str:
+    """The class whose declaration of a virtual put the table pointer there."""
+
+    seen = name
+    while seen and seen in classes and not _carries_vptr(seen, classes):
+        for base, _step, _shared in _base_steps(classes[seen], classes):
+            if base in classes:
+                seen = base
+                break
+        else:
+            break
+    return seen
 
 
 def _vtable_name(name: str) -> str:
@@ -8254,18 +8388,39 @@ def _second_base_tables(
     """
 
     found = classes.get(name)
-    if found is None or not found.mixins:
+    if found is None:
+        return []
+    reached = [
+        (mixin, f"__base{index + 1}")
+        for index, mixin in enumerate(found.mixins)
+        if mixin not in found.virtual_bases
+    ]
+    # A shared base is reached through a pointer, and what arrives at a call
+    # through it is the address of the one object everything shares. Which is
+    # not the address of this one - so it wants the same treatment a second
+    # base wants, and for the same reason.
+    reached += [
+        (shared, _vbase_storage(shared))
+        for shared in _shared_bases(name, classes)
+    ]
+    if not reached:
         return []
     lines: "list[str]" = []
-    for index, mixin in enumerate(found.mixins):
+    for mixin, member in reached:
         if not _is_polymorphic(mixin, classes):
             continue
-        member = f"__base{index + 1}"
         entries: "list[str]" = []
         for key in _virtual_slots(mixin, classes):
             # The derived class first: an override of the base's virtual is
             # written here, and what it takes is the whole object.
             provider = _slot_provider(name, key, classes)
+            if provider is not None and _subobject_path(
+                mixin, provider, classes
+            ) is not None:
+                # Except where what was found is the base's own, reached
+                # through the base itself: it already takes what arrives, and
+                # moving the pointer first would take it somewhere else.
+                provider = None
             if provider is not None:
                 method = _slot_method(provider, key, classes)
                 if method is None:
@@ -8345,14 +8500,23 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
     """The struct, and the free functions its methods become."""
 
     lines = [f"struct {found.name} {{"]
-    if found.base:
+    if found.base and found.base not in found.virtual_bases:
         # First, so a pointer to the derived object is a pointer to the base.
         lines.append(f"    struct {found.base} __base;")
     for index, mixin in enumerate(found.mixins):
+        if mixin in found.virtual_bases:
+            continue
         # After the first, which is at offset zero. Each is an ordinary member
         # and is reached by naming it, which is what a second base is: the
         # same bytes, in a place a pointer has to be moved to.
         lines.append(f"    struct {mixin} __base{index + 1};")
+    # A shared base is held by address, because one object of it is reached
+    # along every path that names it. The storage sits here too: a complete
+    # object of this class owns the one it points at, and an object of this
+    # class inside something larger points at the one *that* owns.
+    for shared in _shared_bases(found.name, classes):
+        lines.append(f"    struct {shared} *{_vbase_pointer(shared)};")
+        lines.append(f"    struct {shared} {_vbase_storage(shared)};")
     if _carries_vptr(found.name, classes):
         # Before the data, so it sits at offset zero for this class and every
         # class below it - which is what lets a base pointer find the table of
@@ -8482,6 +8646,15 @@ def _emit_one(
     found: Class, method: Method, classes: "dict[str, Class]", unit: str = ""
 ) -> str:
     name = _c_name(found.name, method.name, _suffix_of(found.name, method, classes))
+    if method.name == "" and _shared_bases(found.name, classes):
+        # A class with a shared base gets two constructors, the way a real
+        # C++ ABI writes them: this one builds everything *except* the shared
+        # base, and the wrapper written beside the class builds that first
+        # and calls this. Which one a site wants is decided by whether the
+        # object being built is the whole of what is there, and nowhere else
+        # has to know: the wrapper keeps the name every call site already
+        # spells.
+        name = f"{name}{_SUB_OBJECT_SUFFIX}"
     parameters = "" if method.shared else f"struct {found.name} *this"
     # A value return becomes the hidden pointer a compiler would pass: the
     # caller supplies the space and the callee writes through it. py2bin's C
@@ -8607,6 +8780,16 @@ def _emit_one(
         body = _delegating_initialiser(body, found, classes, unit)
         body, base_arguments = _base_initialiser(body, found)
         body, member_arguments = _member_initialisers(body)
+        # `D() : A(3)` names the shared base directly, which C++ lets the
+        # class that owns it do however far above it the base sits. Taken out
+        # here, because what builds it is the other constructor.
+        shared_arguments: "dict[str, str]" = {}
+        for shared in _shared_bases(found.name, classes):
+            written = member_arguments.pop(shared, None)
+            if written is None and shared == found.base:
+                written, base_arguments = base_arguments, ""
+            if written is not None:
+                shared_arguments[shared] = written
         # `int n = 7;` written on the member, put in before the subobjects so
         # that it ends up after them: a member of class type has to be built
         # before anything assigns to it. An initialiser list naming the same
@@ -8642,7 +8825,81 @@ def _emit_one(
         # callee hands back the address; every call site follows it.
         returns = returns.replace("&", "*")
         body = _return_the_address(body, references)
-    return f"static {returns} {name}({parameters}) {body}"
+    for member in found.members:
+        if not member.reference:
+            continue
+        if method.name == "":
+            # What is bound is the address, and a reference parameter is
+            # already one here - so the dereference the reference pass put on
+            # the value comes back off.
+            body = re.sub(
+                rf"(this->{re.escape(member.name)}\s*=\s*)\(\s*\*\s*"
+                rf"([A-Za-z_]\w*)\s*\)",
+                r"\1\2",
+                body,
+            )
+            continue
+        body = re.sub(
+            rf"(?<![.\w>])this->{re.escape(member.name)}\b(?!\s*=[^=])",
+            f"(*this->{member.name})",
+            body,
+        )
+    written = f"static {returns} {name}({parameters}) {body}"
+    if method.name == "" and _shared_bases(found.name, classes):
+        written += "\n" + _complete_constructor(
+            found, classes, name, returns, parameters, shared_arguments, scope
+        )
+    return written
+
+
+def _complete_constructor(
+    found: Class,
+    classes: "dict[str, Class]",
+    inner: str,
+    returns: str,
+    parameters: str,
+    given: "dict[str, str]",
+    scope: str,
+) -> str:
+    """The constructor a complete object of this class is built with.
+
+    It owns the shared bases: it points at its own storage for each, builds
+    them there, and then hands off to the form that builds everything else.
+    A class of this kind reached as somebody else's subobject is built with
+    that other form instead, and so the shared base is built exactly once
+    however many paths lead to it - which is the whole of what `virtual`
+    means here.
+    """
+
+    calls: "list[str]" = []
+    for shared in _shared_bases(found.name, classes):
+        pointer = _vbase_pointer(shared)
+        calls.append(f"this->{pointer} = &this->{_vbase_storage(shared)};")
+        owner = _find_method(shared, "", classes)
+        if owner is None:
+            continue
+        arguments = (given.get(shared) or "").strip()
+        spelled = (
+            [one.strip() for one in _split_arguments(arguments)]
+            if arguments
+            else []
+        )
+        calls.append(
+            f"{_c_name(owner, '', _call_suffix(owner, '', classes, spelled, scope))}"
+            f"(this->{pointer}{', ' + arguments if arguments else ''});"
+        )
+    # Forwarded by name: the parameter list is this one's too.
+    forwarded = ["this"]
+    for part in _split_arguments(parameters):
+        named = re.search(r"([A-Za-z_]\w*)\s*(?:\[\s*\d*\s*\])?$", part.strip())
+        if named is not None and named.group(1) != "this":
+            forwarded.append(named.group(1))
+    outer = inner[: -len(_SUB_OBJECT_SUFFIX)]
+    return (
+        f"static {returns} {outer}({parameters}) {{ "
+        + " ".join(calls)
+        + f" {inner}({', '.join(forwarded)}); }}"
+    )
 
 
 def _address_a_returned_object(body: str, held: str) -> str:
@@ -8730,11 +8987,11 @@ def _subobjects(found: Class, classes: "dict[str, Class]") -> "list[tuple[str, s
     """
 
     parts: list[tuple[str, str]] = []
-    if found.base and found.base in classes:
-        parts.append((found.base, "&this->__base"))
-    for index, mixin in enumerate(found.mixins):
-        if mixin in classes:
-            parts.append((mixin, f"&this->__base{index + 1}"))
+    for base, step, shared in _base_steps(found, classes):
+        # A shared base is built by whoever owns it, which is the complete
+        # object and not this class's share of it.
+        if base in classes and not shared:
+            parts.append((base, f"&this->{step}"))
     for member in found.members:
         held = member.ctype.replace("*", "").strip()
         if "*" not in member.ctype and held in classes:
@@ -8914,20 +9171,48 @@ def _open_with_subobjects(
     # hold. `Person(string n) : name(n)` picked the `const char *` one.
     reading = f"{body}\n{scope}"
     calls = []
+    #: Which of the addresses below name a base rather than a member. A base
+    #: shares this object's shared bases and is built with the form that does
+    #: not build them again; a member is a complete object of its own and is
+    #: built with the ordinary one.
+    base_addresses = {
+        f"&this->{step}" for _base, step, _shared in _base_steps(found, classes)
+    }
+
+    def built(held: str, address: str, given: "list[str]", arguments: str) -> "list[str]":
+        """The lines that build one subobject, in the order they must run."""
+
+        owner = _find_method(held, "", classes)
+        if owner is None:
+            return []
+        spelled = _c_name(
+            owner, "", _call_suffix(owner, "", classes, given, reading)
+        )
+        lines: "list[str]" = []
+        if address in base_addresses and _shared_bases(owner, classes):
+            # Told which object it is sharing before it is built, because
+            # that is what its sub-object form assumes.
+            for shared in _shared_bases(owner, classes):
+                lines.append(
+                    f"{address.lstrip('&')}.{_vbase_pointer(shared)} = "
+                    f"this->{_vbase_pointer(shared)};"
+                )
+            spelled += _SUB_OBJECT_SUFFIX
+        lines.append(
+            f"{spelled}({address}"
+            f"{', ' + arguments if arguments.strip() else ''});"
+        )
+        return lines
+
     for held, address in _subobjects(found, classes):
         if base_arguments is not None and address == "&this->__base":
             # Named in the initialiser list, so it is built with what was
             # written there rather than with nothing.
-            owner = _find_method(held, "", classes)
             given = (
                 [a.strip() for a in _split_arguments(base_arguments)]
                 if base_arguments else []
             )
-            if owner is not None:
-                calls.append(
-                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, reading))}"
-                    f"({address}{', ' + base_arguments if base_arguments else ''});"
-                )
+            calls.extend(built(held, address, given, base_arguments or ""))
             continue
         owner = _find_method(held, "", classes)
         if owner is None:
@@ -8957,10 +9242,7 @@ def _open_with_subobjects(
                     _copied_in(held, address.lstrip("&"), f"&{given[0]}", classes)
                 )
                 continue
-            calls.append(
-                f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, reading))}"
-                f"({address}{', ' + arguments if arguments.strip() else ''});"
-            )
+            calls.extend(built(held, address, given, arguments))
             continue
         if any(m.name == "" and m.parameters for m in classes[held].methods) and not any(
             m.name == "" and not m.parameters for m in classes[held].methods
@@ -8972,22 +9254,34 @@ def _open_with_subobjects(
                 f"`{found.name}() : {spelled}(...)` - give {held} a "
                 f"constructor taking nothing, or hold a pointer",
             )
-        calls.append(
-            f"{_c_name(owner, '', _call_suffix(owner, '', classes, []))}({address});"
-        )
+        calls.extend(built(held, address, [], ""))
     if _is_polymorphic(found.name, classes):
         # After the base constructor, which set the pointer to *its* table.
         # Overwriting it here is what C++ means by the object becoming its own
         # type as construction proceeds, and it is why a virtual call made
         # from a base constructor reaches the base's version.
+        carrier = _vptr_carrier(found.name, classes)
         calls.append(
             f"this->{_vptr_path(found.name, classes)} = "
-            f"{_vtable_name(found.name)};"
+            # Where the pointer lives in a base everything shares, what goes
+            # in it is the table whose entries move the pointer back here.
+            + (
+                f"{_mixin_vtable_name(found.name, carrier)};"
+                if carrier in _shared_bases(found.name, classes)
+                else f"{_vtable_name(found.name)};"
+            )
         )
     # And one for each base after the first that has a table of its own. A
     # pointer to that subobject is what a call through it is given, so what
     # it reads has to be the table written for this class.
     for index, mixin in enumerate(found.mixins):
+        if mixin in found.virtual_bases:
+            continue
+        # And not one whose pointer lives in a base everything shares: that
+        # is the one set above, and writing this class's table for the mixin
+        # into it would say the object is a mixin.
+        if _vptr_carrier(mixin, classes) in _shared_bases(found.name, classes):
+            continue
         if _is_polymorphic(mixin, classes):
             calls.append(
                 f"this->__base{index + 1}."
@@ -9167,7 +9461,7 @@ def _dispatched_here(
     def chosen(given: "list[str]"):
         through = virtual(given) if virtual is not None else ""
         if through:
-            return through, "this"
+            return through, _dispatch_receiver(static, classes, "this")
         name = direct if isinstance(direct, str) else direct(given)
         return name, ("" if shared else reached)
 
@@ -9877,14 +10171,19 @@ def _hoist_object_operators(
         return body
     for _round in range(_HOIST_ROUNDS):
         found = None
-        for variable in sorted(known, key=len, reverse=True):
-            if variable in pointers:
-                # `items + count` on a `T *` is where the pointer moves to,
-                # not the class's operator. The class it points at has one
-                # and the pointer does not.
+        # The symbol outside and the variable inside: each round writes one
+        # of these out, and which one it picks is the precedence the result
+        # is evaluated with. Asked variable-first, `a + b * c` found `a`,
+        # then the first operator written on it - so `a + b` was taken out
+        # and the answer was `(a + b) * c`, with nothing to say so.
+        for symbol in _OPERATOR_SYMBOLS:
+            if symbol in ("[]", "()", "=", "<<", ">>"):
                 continue
-            for symbol in _OPERATOR_SYMBOLS:
-                if symbol in ("[]", "()", "=", "<<", ">>"):
+            for variable in sorted(known, key=len, reverse=True):
+                if variable in pointers:
+                    # `items + count` on a `T *` is where the pointer moves
+                    # to, not the class's operator. The class it points at
+                    # has one and the pointer does not.
                     continue
                 name = _OPERATOR_NAMES[symbol]
                 owner = _find_method(known[variable], name, classes)
@@ -11773,6 +12072,23 @@ def _rewrite_body(
         # while the identical pair one brace deeper translated.
         set(referenced or ()) | set(local_references),
     )
+    # `V r = (a + b) * c;` - the pass above turns the inner operator into a
+    # temporary, and the outer one is a declaration from an operator on it.
+    # That shape is written out further up, before there was anything to be
+    # written; asked once more here, now that there is.
+    body, from_inner = _rewrite_value_operators(
+        body, classes, known, pointers, unit
+    )
+    if from_inner:
+        known.update(from_inner)
+        body = _rewrite_operators(
+            body,
+            classes,
+            known,
+            pointers,
+            scope(),
+            set(referenced or ()) | set(local_references),
+        )
     # After the operators and before the calls: `(int)a` is neither, and the
     # name it converts has to still be a name by the time this looks.
     body = _rewrite_conversions(body, classes, known, pointers)
@@ -12530,6 +12846,7 @@ def _rewrite_operators(
     pointers: "set[str]",
     scope: str = "",
     referenced: "set[str] | None" = None,
+    rounds: int = 4,
 ) -> str:
     """`a + b` becomes the call the class declared for it.
 
@@ -12545,6 +12862,22 @@ def _rewrite_operators(
 
     if not known:
         return body
+    # `(a + b) * c` - the parentheses the program wrote are still there when
+    # the inner operator has been turned into a temporary, and this pass
+    # matches a bare name on the left. Taken off only around a name this
+    # scope declares, which is where they say nothing: around anything else
+    # they may be a cast, and `(int)x` without them is not the same text.
+    for variable in known:
+        body = _map_code(
+            body,
+            # Not an argument list: a `(` with a name in front of it is a
+            # call, and `__skip(this)` with the parentheses taken off is one
+            # long identifier.
+            lambda part, v=variable: re.sub(
+                rf"(?<![\w)\]>])\(\s*{re.escape(v)}\s*\)(?!\s*\()", v, part
+            ),
+        )
+    before = body
     for symbol in _OPERATOR_SYMBOLS:
         if symbol in ("[]", "()", "="):
             continue  # spelled differently; handled below
@@ -12719,6 +13052,15 @@ def _rewrite_operators(
     # already become a call answering an address by here, and a container of
     # callables is exactly what a program keeps one of.
     body = _rewrite_dereferenced_calls(body, classes, scope)
+    # Again while it keeps finding things. The symbols are walked in a fixed
+    # order, and an operator whose left side only *becomes* an object once an
+    # earlier one has been written out is reached after its turn has passed:
+    # `(a + b) * c` had its `*` looked at before the `+` had made anything to
+    # multiply, and was left as C++.
+    if rounds > 0 and body != before:
+        return _rewrite_operators(
+            body, classes, known, pointers, scope, referenced, rounds - 1
+        )
     return body
 
 
@@ -13932,6 +14274,23 @@ def _name_for(
     )
 
 
+def _dispatch_receiver(
+    holds: str, classes: "dict[str, Class]", receiver: str
+) -> str:
+    """What a virtual call hands over, which is not always the receiver.
+
+    A table read out of a shared base holds entries that take a pointer to
+    *it* - everything that reaches it has only that in common. So a call made
+    through a class that reaches its table that way passes the shared base,
+    and not the object it was written on.
+    """
+
+    carrier = _vptr_carrier(holds, classes)
+    if carrier in _shared_bases(holds, classes):
+        return f"({receiver})->{_vbase_pointer(carrier)}"
+    return receiver
+
+
 def _dispatch(
     holds: str, method: str, classes: "dict[str, Class]", receiver: str
 ):
@@ -13954,7 +14313,14 @@ def _dispatch(
         declared = _slot_method(holds, key, classes)
         if declared is None:
             return ""
-        result, parameters = _c_signature(holds, declared, classes)
+        # Written for the class the table belongs to, which is the shared
+        # base where there is one: those entries take a pointer to it.
+        carrier = _vptr_carrier(holds, classes)
+        result, parameters = _c_signature(
+            carrier if carrier in _shared_bases(holds, classes) else holds,
+            declared,
+            classes,
+        )
         return (
             f"(({result} (*)({parameters}))(({receiver})->{path}[{slots.index(key)}]))"
         )
@@ -13986,7 +14352,7 @@ def _dispatched(
             # is handed the base subobject instead - so where the two differ,
             # the receiver differs too, and applying the base adjustment to
             # both counted it twice.
-            return through, receiver
+            return through, _dispatch_receiver(holds, classes, receiver)
         spelled = named if isinstance(named, str) else named(given)
         return (spelled, direct) if direct is not None else spelled
 
@@ -14043,7 +14409,9 @@ def _move_to_second_base(text: str, classes: "dict[str, Class]") -> str:
     do this in pieces at all.
     """
 
-    if not any(found.mixins for found in classes.values()):
+    if not any(
+        found.mixins or found.virtual_bases for found in classes.values()
+    ):
         return text
     holds: "dict[str, str]" = {}
     for found in re.finditer(
@@ -14145,6 +14513,77 @@ def _every_base(name: str, classes: "dict[str, Class]") -> "list[str]":
     return found
 
 
+#: What the constructor that does *not* build the shared bases is called.
+_SUB_OBJECT_SUFFIX = "__sub"
+
+
+def _vbase_pointer(name: str) -> str:
+    """The member holding the address of a shared base."""
+
+    return f"__vbase_{name}"
+
+
+def _vbase_storage(name: str) -> str:
+    """The member a complete object keeps that shared base in."""
+
+    return f"__vstore_{name}"
+
+
+def _base_steps(
+    found: Class, classes: "dict[str, Class]"
+) -> "list[tuple[str, str, bool]]":
+    """Each base of this class as (name, how to reach it, is it shared).
+
+    A base inherited `virtual` is not a member of what derives from it: C++
+    gives one shared subobject however many paths reach it, so what the class
+    holds is its address. Written `__vbase_A[0]`, the step still reads as a
+    member path - `&o.__vbase_A[0]` is `o.__vbase_A` - so everything that
+    reaches a base by naming the way there keeps working unchanged.
+    """
+
+    steps: "list[tuple[str, str, bool]]" = []
+    if found.base:
+        shared = found.base in found.virtual_bases
+        steps.append(
+            (
+                found.base,
+                f"{_vbase_pointer(found.base)}[0]" if shared else "__base",
+                shared,
+            )
+        )
+    for index, mixin in enumerate(found.mixins):
+        shared = mixin in found.virtual_bases
+        steps.append(
+            (
+                mixin,
+                f"{_vbase_pointer(mixin)}[0]" if shared else f"__base{index + 1}",
+                shared,
+            )
+        )
+    return steps
+
+
+def _shared_bases(name: str, classes: "dict[str, Class]") -> "list[str]":
+    """Every base reached from here that is shared, nearest first.
+
+    Its own, and the ones its bases hold: the most derived object owns the
+    storage, so it has to know about every one of them however deep the
+    class that wrote `virtual` sits.
+    """
+
+    found = classes.get(name)
+    if found is None:
+        return []
+    seen: "list[str]" = []
+    for base, _step, shared in _base_steps(found, classes):
+        if shared and base not in seen:
+            seen.append(base)
+        for deeper in _shared_bases(base, classes):
+            if deeper not in seen:
+                seen.append(deeper)
+    return seen
+
+
 def _subobject_path(
     derived: str, owner: str, classes: "dict[str, Class]"
 ) -> "str | None":
@@ -14163,11 +14602,7 @@ def _subobject_path(
     found = classes.get(derived)
     if found is None:
         return None
-    reachable = [(found.base, "__base")] + [
-        (name, f"__base{index + 1}")
-        for index, name in enumerate(found.mixins)
-    ]
-    for name, step in reachable:
+    for name, step, _shared in _base_steps(found, classes):
         if not name:
             continue
         deeper = _subobject_path(name, owner, classes)
@@ -14310,20 +14745,32 @@ def _close_with_destructors(
     return body[:closing] + calls + " " + body[closing:]
 
 
-#: How the exception pass leaves a scope for a handler further out.
-_TO_A_HANDLER = re.compile(r"\bgoto\s+(__py2bin_catch_\w+)\s*;")
+#: Any jump out of a scope, not only the one the exception pass writes. A
+#: `goto` a program wrote leaves exactly as much as one of those does.
+_TO_A_HANDLER = re.compile(r"\bgoto\s+([A-Za-z_]\w*)\s*;")
+
+#: `break` and `continue` leave the innermost loop's body. How far *out* they
+#: go is not written down anywhere a reader of this text can see, so only the
+#: scope holding one is taken apart here - which is the scope they are almost
+#: always written in.
+_LEAVES_A_LOOP = re.compile(r"\b(break|continue)\s*;")
 
 
 def _handlers_written(body: str) -> frozenset:
-    """The handler labels this body holds, which a jump to one does not leave."""
+    """The labels this body holds, which a jump to one of them does not leave."""
 
     return frozenset(
-        match.group(1) for match in _AT_A_HANDLER.finditer(body)
+        match.group(1)
+        for match in _AT_A_HANDLER.finditer(body)
+        if match.group(1) not in ("case", "default")
     )
 
 
-#: Where the exception pass writes a handler down.
-_AT_A_HANDLER = re.compile(r"(?<![.\w>])(__py2bin_catch_\w+)\s*:")
+#: Where a label is written down: at the start of a statement, and not the
+#: `:` of a `case`, of a ternary, or of a qualified name.
+_AT_A_HANDLER = re.compile(
+    r"(?:^|[;{}:])\s*([A-Za-z_]\w*)\s*:(?!:)", re.M
+)
 
 
 def _destroy_before_leaving(
@@ -14359,6 +14806,37 @@ def _destroy_before_leaving(
         for name in destroyed
     }
     out: "list[str]" = []
+    at = 0
+    leaving_here = "".join(
+        f" {_destructor_call(known[name], name, classes)}"
+        for name in reversed(destroyed)
+    )
+    for found in _LEAVES_A_LOOP.finditer(body):
+        # Only what this scope built: how far out of the loops around it the
+        # jump goes is not something this text says.
+        already = [
+            name
+            for name in destroyed
+            if (where := re.search(rf"(?<![.\w>]){re.escape(name)}\b", body))
+            and where.start() < found.start()
+        ]
+        if not already:
+            continue
+        out.append(body[at:found.start()])
+        out.append(
+            "".join(
+                f" {_destructor_call(known[name], name, classes)}"
+                for name in reversed(already)
+            ).strip()
+            + " "
+            + found.group(0)
+        )
+        at = found.end()
+    out.append(body[at:])
+    body = "".join(out)
+    _ = leaving_here
+
+    out = []
     at = 0
     for found in _TO_A_HANDLER.finditer(body):
         if found.group(1) in here:
@@ -14609,6 +15087,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     _CLASS_NAMES = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
     # A number given to a class in one file means nothing in the next.
     _THROWN_KINDS.clear()
+    _LAMBDA_RESULTS.clear()
     _CLASS_MEMBERS = {}
     for one in _CLASS_HEAD.finditer(text):
         try:
@@ -14766,38 +15245,10 @@ def _translate(source: str, filename: str = "<c++>") -> str:
                 f"which is what `unique_ptr` here does",
             )
         # Two paths to one virtual base - the diamond, which is the whole
-        # reason the word exists. Checked before the second-base rule below,
-        # because it is the more particular thing and deserves its own
-        # reason rather than being caught by a wider net.
-        shared = [
-            one
-            for one in _every_base(name, classes)
-            if sum(
-                1
-                for seen in [name, *_every_base(name, classes)]
-                if seen in classes
-                and one in ([classes[seen].base] + list(classes[seen].mixins))
-            )
-            > 1
-            and any(
-                one in classes[seen].virtual_bases
-                for seen in [name, *_every_base(name, classes)]
-                if seen in classes
-            )
-        ]
-        if shared:
-            raise CppTranslationError(
-                filename,
-                found.methods[0].line if found.methods else 0,
-                f"{name} reaches {shared[0]} along more than one path, and "
-                f"{shared[0]} was inherited `virtual` - so C++ gives it one "
-                f"shared subobject rather than one per path. py2bin lays a "
-                f"base out as a member of what derives from it, and a member "
-                f"cannot be in two places; sharing one needs each path to "
-                f"hold a pointer instead, and the most derived object to be "
-                f"the one that owns it. That is not written. A single path "
-                f"to a `virtual` base is an ordinary base and does work",
-            )
+        # reason the word exists - is no longer refused: a base inherited
+        # `virtual` is held by address rather than embedded, and the complete
+        # object owns the one everything points at. See `_base_steps` and
+        # `_complete_constructor`.
         # `int &at(int)` beside `const int &at(int) const` is how every
         # container is written. C++ picks between them by whether the object
         # is const; py2bin does not track that, and by the time they are read
@@ -16545,6 +16996,11 @@ def _parameters_of(
     arrays: set[str] = set()
     for part in head[opening + 1:].split(","):
         words = part.replace("*", " * ").split()
+        # `const struct P *items` names a P. Read as though the first word
+        # were always the type, this saw `const` - not a class - and passed
+        # the parameter over, so a method called on one was left as C++.
+        while words and words[0] in ("const", "volatile", "struct", "class"):
+            words = words[1:]
         if len(words) < 2:
             continue
         name = words[-1].strip("()")
@@ -18733,51 +19189,46 @@ public:
 }
 """
 
-_SSTREAM_HEADER = r"""
-
-namespace std {
-/* A stream that writes into a string. `<<` is what a program uses it for,
-   and each overload appends the text the value would print as. */
-class ostringstream {
+#: One class that reads *and* writes a string, written once and emitted
+#: under both names. C++ has three - `istringstream`, `ostringstream` and
+#: `stringstream` - and the third is the one that does both; a typedef onto
+#: another class is not something this translator resolves, so the text is
+#: what is repeated rather than the name.
+_READ_WRITE_STREAM = r"""class @NAME@ {
 public:
     string held;
-    ostringstream() { }
+    unsigned long __cursor;
+    int failed;
+    @NAME@() { __cursor = 0; failed = 0; }
+    @NAME@(const char *s) { held.assign(s); __cursor = 0; failed = 0; }
+    @NAME@(string s) { held = s; __cursor = 0; failed = 0; }
     string str() { return held; }
-    void clear() { held.clear(); }
-    ostringstream &operator<<(const char *s) { held.append(s); return *this; }
-    ostringstream &operator<<(string s) { held.append(s); return *this; }
-    ostringstream &operator<<(char c) { held.push_back(c); return *this; }
-    ostringstream &operator<<(int v) { held.append(to_string(v)); return *this; }
-    ostringstream &operator<<(long v) { held.append(to_string((int)v)); return *this; }
-    ostringstream &operator<<(unsigned int v) { held.append(to_string((int)v)); return *this; }
-    ostringstream &operator<<(unsigned long v) { held.append(to_string((int)v)); return *this; }
-    /* Six *significant* digits, which is what C++ prints by default and
-       what `cout` here already did - written out by hand as six decimal
-       places, this said `1.500000` where C++ says `1.5`, and where the two
-       disagreed the program still ran. */
-    ostringstream &operator<<(double v) {
+    void str(string s) { held = s; __cursor = 0; failed = 0; }
+    /* The writing side, on the same buffer. `stringstream` is a name for
+       this class rather than for the output one: it was a name for that,
+       so a program that wrote to a `stringstream` and then read it back was
+       asking an object that had no `>>` at all. */
+    @NAME@ &operator<<(const char *s) { held.append(s); return *this; }
+    @NAME@ &operator<<(string s) { held.append(s); return *this; }
+    @NAME@ &operator<<(char c) { held.push_back(c); return *this; }
+    @NAME@ &operator<<(int v) {
+        held.append(to_string(v));
+        return *this;
+    }
+    @NAME@ &operator<<(long v) {
+        held.append(to_string((int)v));
+        return *this;
+    }
+    @NAME@ &operator<<(unsigned long v) {
+        held.append(to_string((int)v));
+        return *this;
+    }
+    @NAME@ &operator<<(double v) {
         char __b[64];
         snprintf(__b, 64, "%.6g", v);
         held.append(__b);
         return *this;
     }
-};
-
-/* Reading values back out of a string. The other half of `<sstream>`, and
-   without it a program could build a string with `<<` and had no way to take
-   one apart - which is what `istringstream` is for. Written out by hand
-   rather than over `scanf`: py2bin's printf reads its format at compile
-   time, and what is wanted here is a position that moves. */
-class istringstream {
-public:
-    string held;
-    unsigned long __cursor;
-    int failed;
-    istringstream() { __cursor = 0; failed = 0; }
-    istringstream(const char *s) { held.assign(s); __cursor = 0; failed = 0; }
-    istringstream(string s) { held = s; __cursor = 0; failed = 0; }
-    string str() { return held; }
-    void str(string s) { held = s; __cursor = 0; failed = 0; }
     int __spacing(char c) {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
     }
@@ -18814,7 +19265,7 @@ public:
         }
         return got;
     }
-    istringstream &operator>>(long &v) {
+    @NAME@ &operator>>(long &v) {
         long got;
         int any;
         int negative;
@@ -18825,7 +19276,7 @@ public:
         if (any == 0) { failed = 1; } else { v = negative ? -got : got; }
         return *this;
     }
-    istringstream &operator>>(int &v) {
+    @NAME@ &operator>>(int &v) {
         long got;
         int any;
         int negative;
@@ -18836,7 +19287,7 @@ public:
         if (any == 0) { failed = 1; } else { v = (int)(negative ? -got : got); }
         return *this;
     }
-    istringstream &operator>>(double &v) {
+    @NAME@ &operator>>(double &v) {
         double got;
         double scale;
         double power;
@@ -18877,7 +19328,7 @@ public:
         if (any == 0) { failed = 1; } else { v = negative ? -got : got; }
         return *this;
     }
-    istringstream &operator>>(char &v) {
+    @NAME@ &operator>>(char &v) {
         __skip();
         if (__cursor >= (unsigned long)held.size()) { failed = 1; return *this; }
         v = held.at((int)__cursor);
@@ -18885,7 +19336,7 @@ public:
         return *this;
     }
     /* One word, which is what `>>` on a string means. */
-    istringstream &operator>>(string &v) {
+    @NAME@ &operator>>(string &v) {
         char c;
         v.clear();
         __skip();
@@ -18913,14 +19364,229 @@ public:
     }
 };
 
-int getline(istringstream &in, string &out) { return in.__line(out, '\n'); }
-int getline(istringstream &in, string &out, char stop) {
+int getline(@NAME@ &in, string &out) { return in.__line(out, '\n'); }
+int getline(@NAME@ &in, string &out, char stop) {
     return in.__line(out, stop);
 }
 
-typedef ostringstream stringstream;
-}
 """
+
+
+#: One class that reads a string *and* writes it, emitted under both
+#: names. C++ has three of these and the third does both; a typedef onto
+#: another class is not something this translator resolves, so what is
+#: repeated is the text and not the name.
+_READ_WRITE_STREAM = r"""/* Reading values back out of a string. The other half of `<sstream>`, and
+   without it a program could build a string with `<<` and had no way to take
+   one apart - which is what `@NAME@` is for. Written out by hand
+   rather than over `scanf`: py2bin's printf reads its format at compile
+   time, and what is wanted here is a position that moves. */
+class @NAME@ {
+public:
+    string held;
+    unsigned long __cursor;
+    int failed;
+    @NAME@() { __cursor = 0; failed = 0; }
+    @NAME@(const char *s) { held.assign(s); __cursor = 0; failed = 0; }
+    @NAME@(string s) { held = s; __cursor = 0; failed = 0; }
+    string str() { return held; }
+    void str(string s) { held = s; __cursor = 0; failed = 0; }
+    int __spacing(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+    void __skip() {
+        while (__cursor < (unsigned long)held.size() && __spacing(held.at((int)__cursor))) {
+            __cursor = __cursor + 1;
+        }
+    }
+    int eof() { __skip(); return __cursor >= (unsigned long)held.size(); }
+    int fail() { return failed; }
+    /* And the writing side, on the same buffer: `stringstream` is the one
+       that does both, and it is this class under another name. */
+    @NAME@ &operator<<(const char *s) { held.append(s); return *this; }
+    @NAME@ &operator<<(string s) { held.append(s); return *this; }
+    @NAME@ &operator<<(char c) { held.push_back(c); return *this; }
+    @NAME@ &operator<<(int v) { held.append(to_string(v)); return *this; }
+    @NAME@ &operator<<(long v) { held.append(to_string((int)v)); return *this; }
+    @NAME@ &operator<<(unsigned long v) {
+        held.append(to_string((int)v));
+        return *this;
+    }
+    @NAME@ &operator<<(double v) {
+        char __b[64];
+        snprintf(__b, 64, "%.6g", v);
+        held.append(__b);
+        return *this;
+    }
+    /* `while (in >> n)` asks the stream whether the read worked. */
+    operator bool() { return failed == 0; }
+    int __sign() {
+        char c;
+        int negative;
+        negative = 0;
+        if (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (c == '-') { negative = 1; __cursor = __cursor + 1; }
+            else if (c == '+') { __cursor = __cursor + 1; }
+        }
+        return negative;
+    }
+    long __digits(int *any) {
+        long got;
+        char c;
+        got = 0;
+        while (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (c < '0' || c > '9') { break; }
+            got = got * 10 + (long)(c - '0');
+            __cursor = __cursor + 1;
+            *any = 1;
+        }
+        return got;
+    }
+    @NAME@ &operator>>(long &v) {
+        long got;
+        int any;
+        int negative;
+        __skip();
+        any = 0;
+        negative = __sign();
+        got = __digits(&any);
+        if (any == 0) { failed = 1; } else { v = negative ? -got : got; }
+        return *this;
+    }
+    @NAME@ &operator>>(int &v) {
+        long got;
+        int any;
+        int negative;
+        __skip();
+        any = 0;
+        negative = __sign();
+        got = __digits(&any);
+        if (any == 0) { failed = 1; } else { v = (int)(negative ? -got : got); }
+        return *this;
+    }
+    @NAME@ &operator>>(double &v) {
+        double got;
+        double scale;
+        double power;
+        long whole;
+        long exponent;
+        int any;
+        int negative;
+        int negative_exponent;
+        char c;
+        __skip();
+        any = 0;
+        negative = __sign();
+        whole = __digits(&any);
+        got = (double)whole;
+        if (__cursor < (unsigned long)held.size() && held.at((int)__cursor) == '.') {
+            __cursor = __cursor + 1;
+            scale = 0.1;
+            while (__cursor < (unsigned long)held.size()) {
+                c = held.at((int)__cursor);
+                if (c < '0' || c > '9') { break; }
+                got = got + scale * (double)(c - '0');
+                scale = scale * 0.1;
+                __cursor = __cursor + 1;
+                any = 1;
+            }
+        }
+        if (any && __cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (c == 'e' || c == 'E') {
+                __cursor = __cursor + 1;
+                negative_exponent = __sign();
+                exponent = __digits(&any);
+                power = 1.0;
+                while (exponent > 0) { power = power * 10.0; exponent = exponent - 1; }
+                if (negative_exponent) { got = got / power; } else { got = got * power; }
+            }
+        }
+        if (any == 0) { failed = 1; } else { v = negative ? -got : got; }
+        return *this;
+    }
+    @NAME@ &operator>>(char &v) {
+        __skip();
+        if (__cursor >= (unsigned long)held.size()) { failed = 1; return *this; }
+        v = held.at((int)__cursor);
+        __cursor = __cursor + 1;
+        return *this;
+    }
+    /* One word, which is what `>>` on a string means. */
+    @NAME@ &operator>>(string &v) {
+        char c;
+        v.clear();
+        __skip();
+        while (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            if (__spacing(c)) { break; }
+            v.push_back(c);
+            __cursor = __cursor + 1;
+        }
+        if (v.size() == 0) { failed = 1; }
+        return *this;
+    }
+    /* Up to the next newline, which `>>` never crosses. */
+    int __line(string &out, char stop) {
+        char c;
+        out.clear();
+        if (__cursor >= (unsigned long)held.size()) { failed = 1; return 0; }
+        while (__cursor < (unsigned long)held.size()) {
+            c = held.at((int)__cursor);
+            __cursor = __cursor + 1;
+            if (c == stop) { return 1; }
+            out.push_back(c);
+        }
+        return 1;
+    }
+};
+
+int getline(@NAME@ &in, string &out) { return in.__line(out, '\n'); }
+int getline(@NAME@ &in, string &out, char stop) {
+    return in.__line(out, stop);
+}
+
+"""
+
+
+_SSTREAM_HEADER = (
+    r"""
+
+namespace std {
+/* A stream that writes into a string. `<<` is what a program uses it for,
+   and each overload appends the text the value would print as. */
+class ostringstream {
+public:
+    string held;
+    ostringstream() { }
+    string str() { return held; }
+    void clear() { held.clear(); }
+    ostringstream &operator<<(const char *s) { held.append(s); return *this; }
+    ostringstream &operator<<(string s) { held.append(s); return *this; }
+    ostringstream &operator<<(char c) { held.push_back(c); return *this; }
+    ostringstream &operator<<(int v) { held.append(to_string(v)); return *this; }
+    ostringstream &operator<<(long v) { held.append(to_string((int)v)); return *this; }
+    ostringstream &operator<<(unsigned int v) { held.append(to_string((int)v)); return *this; }
+    ostringstream &operator<<(unsigned long v) { held.append(to_string((int)v)); return *this; }
+    /* Six *significant* digits, which is what C++ prints by default and
+       what `cout` here already did - written out by hand as six decimal
+       places, this said `1.500000` where C++ says `1.5`, and where the two
+       disagreed the program still ran. */
+    ostringstream &operator<<(double v) {
+        char __b[64];
+        snprintf(__b, 64, "%.6g", v);
+        held.append(__b);
+        return *this;
+    }
+};
+
+"""
+    + _READ_WRITE_STREAM.replace("@NAME@", "istringstream")
+    + _READ_WRITE_STREAM.replace("@NAME@", "stringstream")
+    + "}\n"
+)
 
 _ARRAY_HEADER = r"""
 
