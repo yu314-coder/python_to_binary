@@ -1132,7 +1132,18 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # because there the difference is real.
     stars = declared.group(2).replace("&", "")
     stars += "*" if declared.group(3) == "[" else ""
-    return (declared.group(1) + " " + stars).strip()
+    held = (declared.group(1) + " " + stars).strip()
+    # `const Box &r` names a Box. Answered as `const Box`, every caller that
+    # asks "is this a class this file declares?" heard no - so `r[0]` on a
+    # const reference read as indexing a struct, and a method could not be
+    # found on one either. The qualifier is a promise about writing through
+    # it, not part of which type it is; kept where what is left is not a type
+    # this file declares, because there `const char *` is worth saying.
+    bare = re.sub(r"\b(?:const|volatile)\b", " ", held).strip()
+    bare = re.sub(r"\s+", " ", bare)
+    if bare.replace("*", "").strip() in _CLASS_NAMES:
+        return bare
+    return held
 
 
 
@@ -5442,11 +5453,27 @@ _TRY = re.compile(r"\btry\s*\{")
 _CATCH = re.compile(r"\bcatch\s*\(\s*([^)]*)\s*\)\s*\{")
 
 _THROWN = "__py2bin_thrown"
+#: Which class is in flight, as a number. A `try` with more than one handler
+#: has to pick between them, and there is nothing in the object itself to
+#: read: py2bin has no linker, so every class that is ever thrown is in front
+#: of it while it translates, and each can be given a number of its own - the
+#: same argument `dynamic_cast` and `std::function` are answered with.
+_KIND = "__py2bin_kind"
+#: The number each thrown class goes by, filled in as they are met. Reset per
+#: translation unit alongside the class names.
+_THROWN_KINDS: "dict[str, int]" = {}
+
+
+def _kind_id(named: str) -> int:
+    """The number this class is in flight under. Zero is "not a class"."""
+
+    return _THROWN_KINDS.setdefault(named, len(_THROWN_KINDS) + 1)
 _IN_FLIGHT = "__py2bin_in_flight"
 
 #: Declared once, at the top of any file that throws.
 _EXCEPTION_STATE = f"""
 static int {_THROWN} = 0;
+static int {_KIND} = 0;
 static long {_IN_FLIGHT} = 0;
 """
 
@@ -5555,7 +5582,10 @@ def _result_types(text: str) -> "dict[str, str]":
     found: dict[str, str] = {}
     for _match, _closing, name, returns in _every_body(text):
         spelled = re.sub(r"\b(static|inline|virtual|extern)\b", "", returns).strip()
-        found[name] = (spelled or "long").replace("&", "*")
+        # A constructor writes no return type, and what it answers with is
+        # the object. Read as a `long`, a lifted `T(x)` went into a temporary
+        # the width of a word and the object was cut down to fit.
+        found[name] = (spelled or name).replace("&", "*")
     return found
 
 
@@ -5733,8 +5763,29 @@ def _extract_tries(
                 "done about",
             )
         offset = closing + (len(rest) - len(rest.lstrip()))
-        handler_open = offset + catch.end() - 1
-        handler_close = _matching(body, handler_open)
+        # Every handler this try has, not the first one. A second `catch`
+        # left where it stood was not a statement any longer - the try in
+        # front of it had already become a label and a jump - and the C it
+        # was handed still said `catch`.
+        clauses: "list[tuple[str, int, int]]" = []
+        walked = offset
+        while True:
+            ahead = body[walked:]
+            more = _CATCH.match(ahead.lstrip())
+            if more is None:
+                break
+            begins = walked + (len(ahead) - len(ahead.lstrip()))
+            open_at = begins + more.end() - 1
+            try:
+                close_at = _matching(body, open_at)
+            except ValueError:
+                raise CppTranslationError(
+                    filename, _line_of(body, open_at),
+                    "a catch block is not closed",
+                ) from None
+            clauses.append((more.group(1).strip(), open_at, close_at))
+            walked = close_at
+        handler_close = walked
 
         counter[0] += 1
         number = counter[0]
@@ -5749,20 +5800,36 @@ def _extract_tries(
             filename,
             counter,
         )
-        handled = _guarded(
-            body[handler_open + 1: handler_close - 1],
-            landing,
-            throwing,
-            classes,
-            filename,
-            counter,
-        )
-        caught = _catch_binding(
-            catch.group(1).strip(), filename, body, offset, classes
-        )
+        pieces: "list[str]" = []
+        anything = False
+        for spelled, open_at, close_at in clauses:
+            handled = _guarded(
+                body[open_at + 1: close_at - 1],
+                landing,
+                throwing,
+                classes,
+                filename,
+                counter,
+            )
+            caught = _catch_binding(spelled, filename, body, open_at, classes)
+            # One handler is not a choice, and asking what is in flight would
+            # be a new way to be wrong: where the thrown type could not be
+            # read it is nothing in particular, and a lone handler has always
+            # taken whatever arrived. More than one has to be told apart.
+            if len(clauses) == 1 or spelled in ("...", ""):
+                anything = True
+                pieces.append(f"{{ {caught}{handled} }} goto {after};")
+                break
+            pieces.append(
+                f"if ({_KIND} == {_catch_kind(spelled)}) "
+                f"{{ {caught}{handled} goto {after}; }}"
+            )
+        # Nothing matched, so this try is not where it is handled: the flag
+        # goes back up and it carries on outward, which is what C++ does.
+        rest_of = "" if anything else f" {_THROWN} = 1; {landing.leave()}"
         made = (
             f"{{ {guarded} }} goto {after}; {label}: ; "
-            f"{{ {_THROWN} = 0; {caught}{handled} }} {after}: ;"
+            f"{{ {_THROWN} = 0; {' '.join(pieces)}{rest_of} }} {after}: ;"
         )
         finished.append(made)
         body = (
@@ -5770,6 +5837,16 @@ def _extract_tries(
             + (_TRY_MARK % (len(finished) - 1))
             + body[handler_close:]
         )
+
+
+def _catch_kind(spelled: str) -> int:
+    """The number a handler is looking for. Zero for anything not a class."""
+
+    bare = re.sub(
+        r"\b(?:const|volatile|struct|class)\b|[*&]", " ", spelled
+    ).split()
+    named = bare[0] if bare else ""
+    return _kind_id(named) if named in _CLASS_NAMES else 0
 
 
 def _catch_binding(
@@ -5849,7 +5926,7 @@ def _thrown(match: "re.Match[str]", landing: "_Landing", body: str) -> str:
         # constructor, which is exactly the copy that has to outlive the
         # frame - so this is written as `new` and goes through that path.
         return (
-            f"{{ {_THROWN} = 1; "
+            f"{{ {_THROWN} = 1; {_KIND} = {_kind_id(made.group(1))}; "
             f"{made.group(1)} *__py2bin_raised = new {spelled}; "
             f"{_IN_FLIGHT} = (long)__py2bin_raised; {landing.leave()} }}"
         )
@@ -5857,18 +5934,30 @@ def _thrown(match: "re.Match[str]", landing: "_Landing", body: str) -> str:
     if held is not None and held.replace("*", "").strip() in _CLASS_NAMES:
         named = held.replace("*", "").strip()
         return (
-            f"{{ {_THROWN} = 1; "
+            f"{{ {_THROWN} = 1; {_KIND} = {_kind_id(named)}; "
             f"{named} *__py2bin_raised = ({named} *)malloc(sizeof({named})); "
             f"*__py2bin_raised = {spelled}; "
             f"{_IN_FLIGHT} = (long)__py2bin_raised; {landing.leave()} }}"
         )
+    # Not a class, so nothing to tell apart by: a number in flight goes under
+    # the kind every non-class value shares.
     return (
-        f"{{ {_THROWN} = 1; {_IN_FLIGHT} = (long)({spelled}); {landing.leave()} }}"
+        f"{{ {_THROWN} = 1; {_KIND} = 0; "
+        f"{_IN_FLIGHT} = (long)({spelled}); {landing.leave()} }}"
     )
 
 
 #: `Err(1, 2)` - a temporary built where it is thrown.
 _CONSTRUCTED = re.compile(r"^([A-Za-z_]\w*)\s*\(")
+
+#: `R b(-2);` - a constructor reached by declaring what it builds. There is
+#: no call here for a reader to find: looking for `name(` it finds `b(` and
+#: asks whether `b` throws, which it does not. So a constructor that threw
+#: was stepped straight over, the statements after it ran, and no handler was
+#: reached - the program answered, and answered wrongly.
+_DECLARED_BUILT = re.compile(
+    r"^\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;\s*$"
+)
 
 #: The classes this file declares. Read before the exception pass, which runs
 #: before classes are taken apart and so has nothing else to ask.
@@ -5950,6 +6039,15 @@ def _split_statements(
 
     out: list[str] = []
     for statement in _statements(body):
+        built = _DECLARED_BUILT.match(statement)
+        if built is not None and built.group(1) in throwing:
+            # The declaration stays as it is and the test goes after it. What
+            # a leave from here skips is the destructor at the end of the
+            # block, which is right: a constructor that threw did not finish,
+            # and C++ does not destroy what was never built.
+            out.append(statement)
+            out.append(f" if ({_THROWN}) {{ {landing.leave()} }} ")
+            continue
         calls = _throwing_calls(statement, throwing)
         if not calls:
             out.append(statement)
@@ -11012,7 +11110,16 @@ def _rewrite_body(
     for spelled, holds in _declared_objects(body, classes).items():
         known.setdefault(spelled, holds)
     body = _rewrite_operators(
-        body, classes, known, pointers, scope(), referenced or set()
+        body,
+        classes,
+        known,
+        pointers,
+        scope(),
+        # This scope's own references as well as the ones it was handed. Sent
+        # down to the blocks inside it but not used here, `Box &r = b;` and
+        # `r[0]` written in the *same* scope read as pointer arithmetic,
+        # while the identical pair one brace deeper translated.
+        set(referenced or ()) | set(local_references),
     )
     # After the operators and before the calls: `(int)a` is neither, and the
     # name it converts has to still be a name by the time this looks.
@@ -12102,6 +12209,13 @@ def _rewrite_holder_operators(
             owner = _find_method(holds, name, classes)
             if owner is None:
                 continue
+            if _method_named(owner, name, classes, returns_object=True):
+                # The same as the prefix case above, and more so: postfix is
+                # the operator that *has* to answer by value.
+                body = _rewrite_value_postfix(
+                    body, variable, symbol, owner, name, address, classes
+                )
+                continue
             body = _map_code(
                 body,
                 lambda part, v=variable, s=symbol, o=owner, n=name, a=address: re.sub(
@@ -12191,6 +12305,41 @@ def _rewrite_value_prefix(
         )
 
     return _map_code(body, lambda part: pattern.sub(one, part))
+
+
+def _rewrite_value_postfix(
+    body: str,
+    variable: str,
+    symbol: str,
+    owner: str,
+    name: str,
+    address: str,
+    classes: "dict[str, Class]",
+) -> str:
+    """`V e = d++;` - the old value, which is an object, needs somewhere to go.
+
+    Postfix is the one operator that always answers by value: what it hands
+    back is the object as it was before, which cannot be a reference to
+    anything still alive. Written as though it answered in a register, the
+    call was given one argument where the C wanted two.
+    """
+
+    pattern = re.compile(
+        rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*{re.escape(variable)}\s*"
+        rf"{re.escape(symbol)}\s*;"
+    )
+
+    def one(match: "re.Match[str]") -> str:
+        held, target = match.groups()
+        if held not in classes:
+            return match.group(0)
+        return (
+            f"struct {held} {target}; "
+            f"{_c_name(owner, name)}({address}, &{target});"
+        )
+
+    return _map_code(body, lambda part: pattern.sub(one, part))
+
 
 def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
     """`*p` or `!p` becomes the call, but only where nothing is on the left.
@@ -13672,6 +13821,8 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # one filled these in on the way past.
     global _CLASS_NAMES, _POLYMORPHIC, _INHERITED_FROM, _CLASS_MEMBERS
     _CLASS_NAMES = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+    # A number given to a class in one file means nothing in the next.
+    _THROWN_KINDS.clear()
     _CLASS_MEMBERS = {}
     for one in _CLASS_HEAD.finditer(text):
         try:
@@ -14169,6 +14320,16 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             for name in [*order, *allocated]
         )
     whole = f"{head}\n{typedefs}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
+    # A call made through a variable, here rather than while each body was
+    # rewritten: the variable's type is a typedef that instantiating a
+    # template writes, and when the body of `__sift_by` was rewritten the
+    # comparator it would be given had no name yet. So the question is asked
+    # of the finished C, where every type is written down.
+    through, through_types = _pointer_call_signatures(whole, classes)
+    if through:
+        whole = _address_reference_arguments(
+            whole, through, classes, "", frozenset(), through_types
+        )
     # Last, on the C itself, because that is where every type is written out
     # and a pointer to a base can be told from a pointer to what holds it.
     return _move_to_second_base(whole, classes)
@@ -14996,12 +15157,57 @@ def _static_member_signatures(
     return found
 
 
+#: `typedef int (*Name)(params);` - a function reached through a variable.
+_FUNCTION_TYPEDEF = re.compile(
+    r"\btypedef\s+[A-Za-z_][\w\s*]*?\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(([^;]*)\)\s*;"
+)
+
+
+def _pointer_call_signatures(
+    text: str, classes: "dict[str, Class]"
+) -> "tuple[dict[str, list[int]], dict[tuple[str, int], str]]":
+    """Calls made through a variable, and which arguments of one want an address.
+
+    `f(a, b)` where `f` is a variable holding a function asks the same
+    question a call written to a name does - do the parameters take an object
+    by address? - but nothing *defines* `f`, so the pass that reads
+    definitions found no answer and handed the object over whole. A
+    comparator given to `sort` is exactly this shape, and it is how a program
+    says "call this back".
+    """
+
+    bare = _without_literals(text)
+    shapes: "dict[str, list[tuple[int, str]]]" = {}
+    for match in _FUNCTION_TYPEDEF.finditer(bare):
+        wanted: "list[tuple[int, str]]" = []
+        for index, part in enumerate(_split_arguments(match.group(2))):
+            if "*" not in part and "&" not in part:
+                continue
+            for word in part.replace("*", " ").replace("&", " ").split():
+                if word in classes:
+                    wanted.append((index, word))
+                    break
+        if wanted:
+            shapes[match.group(1)] = wanted
+    positions: "dict[str, list[int]]" = {}
+    types: "dict[tuple[str, int], str]" = {}
+    for spelled, wanted in shapes.items():
+        for match in re.finditer(
+            rf"(?<![.\w>]){re.escape(spelled)}\s+([A-Za-z_]\w*)\s*[;,)=]", bare
+        ):
+            positions[match.group(1)] = [index for index, _held in wanted]
+            for index, held in wanted:
+                types[(match.group(1), index)] = held
+    return positions, types
+
+
 def _address_reference_arguments(
     text: str,
     signatures: "dict[str, list[int]]",
     classes: "dict[str, Class]" = {},
     scope: str = "",
     already: "set[str]" = frozenset(),
+    also: "dict[tuple[str, int], str]" = {},
 ) -> str:
     """`bump(a, 9)` becomes `bump(&a, 9)` where the parameter is a reference.
 
@@ -15045,6 +15251,8 @@ def _address_reference_arguments(
                 if word in classes:
                     wanted_types[(spelled, index)] = word
                     break
+    # What a call through a variable wants, which no definition here says.
+    wanted_types.update(also)
     for name, positions in signatures.items():
         pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
         out: list[str] = []
@@ -15198,8 +15406,11 @@ def _rewrite_prototypes(text: str, classes: "dict[str, Class]") -> str:
 
     return _sub_code(_PROTOTYPE, text, lambda m, whole: one(m))
 
-def _returns_a_pointer(head: str, held: str) -> str:
+def _returns_a_pointer(head: str, held: str, is_class: bool = True) -> str:
     """`const T &f(` becomes `struct T *f(` - a reference is a pointer here.
+
+    A reference to a number becomes `int *` and not `struct int *`: what the
+    reference names decides whether the word belongs in front of it.
 
     The `const` goes with it: what the reference promised is that the caller
     would not write through it, and a `const struct T *` says the same thing
@@ -15213,7 +15424,57 @@ def _returns_a_pointer(head: str, held: str) -> str:
     # comes off the name here rather than being left to become part of it.
     name = result.split()[-1].lstrip("&*")
     keeps = "const " if re.search(r"\bconst\b", result) else ""
-    return f"{keeps}struct {held} *{name}{rest}"
+    spelled = f"struct {held}" if is_class else held
+    return f"{keeps}{spelled} *{name}{rest}"
+
+
+#: `int &at(int i) {` - a function answering a reference to something that is
+#: not a class.
+_SCALAR_REFERENCE_RESULT = re.compile(
+    r"(?<![.\w>])((?:static\s+|inline\s+|const\s+)*[A-Za-z_]\w*)\s*&\s*"
+    r"([A-Za-z_]\w*)\s*\([^;{}()]*\)\s*\{"
+)
+
+
+def _dereference_scalar_references(text: str, shapes) -> str:
+    """Read through every call to a function that answers `T &`, `T` not a class.
+
+    A reference to a class is a pointer at every call site already, because
+    what it was picked from is one. A reference to a number is not: the
+    function answers with an address and each use of it wants the number, so
+    the `*` has to be written where the call is.
+    """
+
+    named = set()
+    for match in _SCALAR_REFERENCE_RESULT.finditer(_without_literals(text)):
+        held = match.group(1).split()[-1]
+        if held not in shapes and held not in _NOT_A_TYPE:
+            named.add(match.group(2))
+    for name in named:
+        while True:
+            changed = False
+            bare = _without_literals(text)
+            for match in re.finditer(
+                rf"(?<![.\w>:]){re.escape(name)}\s*\(", bare
+            ):
+                close = _closing_paren(bare, match.end() - 1)
+                if close < 0 or _is_a_definition(bare, close):
+                    continue
+                before = text[:match.start()].rstrip()
+                # Already read through, or having its address taken rather
+                # than its answer used.
+                if before.endswith(("(*", "&")):
+                    continue
+                text = (
+                    text[:match.start()]
+                    + f"(*{text[match.start(): close + 1]})"
+                    + text[close + 1:]
+                )
+                changed = True
+                break
+            if not changed:
+                break
+    return text
 
 
 def _rewrite_functions(
@@ -15235,6 +15496,9 @@ def _rewrite_functions(
     # What may be passed by value: the classes, and the plain structs, which
     # are C already but still cannot travel in a register.
     shapes = classes if shapes is None else shapes
+    # Before any one function is rewritten: a call can stand above the
+    # definition it reaches, and by then this text has been walked past.
+    text = _dereference_scalar_references(text, shapes)
     out = []
     at = 0
     while True:
@@ -15286,9 +15550,20 @@ def _rewrite_functions(
         # pointer here and not the hidden pointer a value return writes
         # through. Read as a value return it was given both - a `__ret` it
         # never filled and a `&` in the result type that is not C.
-        by_reference = "&" in spelled_result and returned in shapes
+        # A reference to a number is a reference too. Read as though only a
+        # class could be returned by one, `int &at(int i)` kept its `&` all
+        # the way into the C, which is not C.
+        written = re.match(r"^(.*?)([A-Za-z_]\w*)$", spelled_result)
+        result_type = written.group(1) if written is not None else ""
+        by_reference = "&" in result_type
         if by_reference:
-            head = _returns_a_pointer(head, returned)
+            bare = re.sub(
+                r"\b(?:static|inline|extern|const|volatile)\b|[&*]",
+                " ",
+                result_type,
+            ).split()
+            returned = bare[-1] if bare else returned
+            head = _returns_a_pointer(head, returned, returned in shapes)
             spelled_result = head[:head.rfind("(")].strip()
         returns_object = (
             not by_reference
@@ -15340,6 +15615,12 @@ def _rewrite_functions(
             ),
             referenced=set(references),
         )
+        if by_reference and returned not in shapes:
+            # A reference to a class is a pointer already: the objects it is
+            # picked from are pointers here, so `return b;` answers with one.
+            # A reference to a number is not - `return slot[i];` *is* the
+            # number, and what has to go back is where it lives.
+            rewritten = _return_the_address(rewritten)
         if copied:
             # After the body is rewritten, not before: this text is already C,
             # and a `struct V v;` put in ahead of the declaration pass reads
