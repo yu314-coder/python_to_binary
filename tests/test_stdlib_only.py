@@ -63,6 +63,27 @@ class NoExternalToolchainTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         return sorted((root / "src" / "py2bin").rglob("*.py"))
 
+    def test_the_package_is_python_and_nothing_else(self):
+        """No file in the package that is not a module.
+
+        py2bin compiles C and C++ that it ships, and all of it - the standard
+        headers, the COM ones, the C++ library, the math functions - is a
+        string in a module. A loose `.c` file beside them was the one
+        exception, and it cost the packaging step a special case and a bug it
+        records: a wheel that packed `*.py` alone installed a py2bin that
+        could not compile anything.
+        """
+
+        root = Path(__file__).resolve().parents[1] / "src" / "py2bin"
+        strangers = sorted(
+            str(one.relative_to(root))
+            for one in root.rglob("*")
+            if one.is_file()
+            and "__pycache__" not in one.parts
+            and one.suffix != ".py"
+        )
+        self.assertEqual(strangers, [])
+
     def test_no_module_imports_a_process_spawning_module(self):
         root = Path(__file__).resolve().parents[1]
         offenders: list[str] = []

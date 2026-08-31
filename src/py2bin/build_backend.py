@@ -64,10 +64,12 @@ def build_wheel(wheel_directory: str, config_settings=None, metadata_directory=N
     rows: list[tuple[str, str, str]] = []
     files: dict[str, bytes] = {}
     source_root = root / "src"
-    # Everything in the package, not only its modules. `libm.c` is part of
-    # the compiler - it is the C the math builtins are compiled from - and a
-    # wheel that packed `*.py` alone installed a py2bin that could not compile
-    # anything, failing on a missing file at the first `compile-capi`.
+    # Everything in the package, which is Python and nothing else: the C and
+    # C++ py2bin compiles from are strings in modules rather than files beside
+    # them, so there is nothing here that a wheel could leave behind. The walk
+    # stays general anyway - it is the packaging step, and it should carry
+    # whatever the package holds rather than what it held when this was
+    # written.
     for source in sorted((source_root / "py2bin").rglob("*")):
         if not source.is_file() or "__pycache__" in source.parts:
             continue

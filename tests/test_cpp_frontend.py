@@ -1632,6 +1632,41 @@ class Corpus(unittest.TestCase):
             self.assertIn(wanted, names, f"{wanted} has gone from the corpus")
         self.assertGreater(len(names), 100)
 
+    def test_a_supplied_header_has_its_own_includes_read(self) -> None:
+        """Somebody's own `fstream` may include `<string>`, and often does.
+
+        A header spelled without an extension is a C++ one, and reading C++ is
+        what this stage is for - so it is pasted here and its own includes are
+        resolved here too. Left for the preprocessor below, the `<string>`
+        inside it reached a C compiler that ships no such header, and the
+        classes the header declared were never translated at all.
+        """
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "headers").mkdir()
+            (root / "headers" / "fstream").write_text(
+                "#include <string>\n"
+                "namespace std { class ofstream {\n"
+                "public: int written; ofstream() : written(0) {}\n"
+                "void open(const std::string &name)"
+                " { written = (int)name.size(); } }; }\n"
+            )
+            source = root / "main.cpp"
+            source.write_text(
+                "#include <fstream>\n#include <string>\n"
+                "int main() { std::ofstream f;"
+                " f.open(std::string(\"ab\")); return f.written; }\n"
+            )
+            written = translate(
+                inline_local_includes(
+                    source, (str(root / "headers"),), set(), set()
+                ),
+                str(source),
+            )
+        self.assertNotIn("#include <string>", written)
+        self.assertIn("ofstream", written)
+
     def test_the_sweep_is_where_the_readme_says(self) -> None:
         root = Path(__file__).resolve().parents[1] / "tools"
         for name in ("cpp_sweep.sh", "cpp_differential.sh"):

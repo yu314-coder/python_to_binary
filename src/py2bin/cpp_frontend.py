@@ -20800,6 +20800,28 @@ def inline_local_includes(
                     f"{', '.join(sorted(h for h in _BUILTIN_CPP_HEADERS if '.' not in h))}; "
                     f"name a directory with --include DIR to use your own.",
                 )
+            # A name with no extension is spelled the way only a C++ header
+            # is, and reading C++ is what this stage is for: somebody's own
+            # `fstream` may declare classes, and the headers *it* includes
+            # are C++ ones this stage knows and the preprocessor below does
+            # not. Left for that preprocessor, `#include <string>` written
+            # inside it arrived at a C compiler that ships no such header,
+            # and the classes it declared were never translated at all.
+            if "." not in named:
+                for folder in (Path(d) for d in include_dirs):
+                    candidate = folder / named
+                    if not candidate.is_file():
+                        continue
+                    if _CHOOSES_A_BRANCH.search(
+                        candidate.read_text(encoding="utf-8", errors="replace")
+                    ):
+                        return chosen_branch(named, candidate)
+                    if named in seen_headers:
+                        return ""
+                    seen_headers.add(named)
+                    return inline_local_includes(
+                        candidate, include_dirs, seen, seen_headers, target
+                    )
             # Angled and not one of py2bin's own. Still looked for on the
             # search path, because one that chooses a branch has to be read
             # here rather than left to the preprocessor - a program writes
