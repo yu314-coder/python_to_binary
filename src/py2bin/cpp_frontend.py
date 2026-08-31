@@ -11538,6 +11538,9 @@ def _rewrite_body(
     inherited_references: "dict[str, str] | None" = None,
     referenced: "set[str] | None" = None,
     stable: str = "",
+    #: Whether this body *is* a loop's. What `break` and `continue` leave is
+    #: the loop's body, so a scope inside one has to know how far out that is.
+    in_a_loop: bool = False,
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -12258,7 +12261,7 @@ def _rewrite_body(
                     # And which handlers are written at this level, so that a
                     # jump to one of them knows where to stop unwinding: past
                     # the body that holds the label it has not left.
-                    (name, known[name], _handlers_written(body))
+                    (name, known[name], _handlers_written(body), in_a_loop)
                     for name in destroyed
                     if _built_before(body, name, number)
                 ),
@@ -12277,11 +12280,12 @@ def _rewrite_body(
             # statement, translated two ways depending on its braces.
             referenced=set(referenced or ()) | set(local_references),
             stable=stable,
+            in_a_loop=_is_a_loop_body(body, number),
         )
         for number, inner in enumerate(blocks)
     ]
     body = _close_with_destructors(
-        body, destroyed, known, classes, enclosing, returns, [0]
+        body, destroyed, known, classes, enclosing, returns, [0], in_a_loop
     )
     return _restore_nested(body, rewritten_blocks)
 
@@ -12299,6 +12303,27 @@ def _initialiser_brace(body: str, index: int) -> bool:
 
     before = body[:index].rstrip()
     return before.endswith("=") or before.endswith(",")
+
+def _is_a_loop_body(body: str, number: int) -> bool:
+    """Whether the block that was lifted out of here is a loop's body.
+
+    Read off the text in front of the marker it left, which is where the
+    `for (...)` or `while (...)` that owns it is still written.
+    """
+
+    at = body.find(_BLOCK_MARK % number)
+    if at < 0:
+        return False
+    before = _without_literals(body[:at]).rstrip()
+    if re.search(r"(?<![.\w>])do$", before):
+        return True
+    if not before.endswith(")"):
+        return False
+    opening = _opening_paren(before, len(before) - 1)
+    if opening < 0:
+        return False
+    return re.search(r"(?<![.\w>])(for|while)\s*$", before[:opening]) is not None
+
 
 def _lift_nested(body: str) -> "tuple[str, list[str]]":
     """Take each nested block out, leaving a marker.
@@ -14645,9 +14670,10 @@ def _close_with_destructors(
     destroyed: "list[str]",
     known: "dict[str, str]",
     classes: "dict[str, Class]",
-    enclosing: "list[tuple[str, str, frozenset]]" = (),
+    enclosing: "list[tuple[str, str, frozenset, bool]]" = (),
     returns: str = "",
     counter: "list[int] | None" = None,
+    in_a_loop: bool = False,
 ) -> str:
     """Run each destructor where the block ends - including at a `return`.
 
@@ -14673,7 +14699,7 @@ def _close_with_destructors(
     # block does not end theirs.
     outer = "".join(
         f" {_destructor_call(held, name, classes)}"
-        for name, held, _labels in reversed(list(enclosing))
+        for name, held, _labels, _loop in reversed(list(enclosing))
     )
     # Where each one comes into existence. A `return` above a declaration
     # leaves before that object was ever built, and C++ destroys only what
@@ -14736,7 +14762,9 @@ def _close_with_destructors(
         at = found.end()
     out.append(body[at:])
     body = "".join(out)
-    body = _destroy_before_leaving(body, destroyed, known, classes, enclosing)
+    body = _destroy_before_leaving(
+        body, destroyed, known, classes, enclosing, in_a_loop
+    )
 
     closing = body.rfind("}")
     if closing < 0:
@@ -14778,7 +14806,8 @@ def _destroy_before_leaving(
     destroyed: "list[str]",
     known: "dict[str, str]",
     classes: "dict[str, Class]",
-    enclosing: "list[tuple[str, str, frozenset]]" = (),
+    enclosing: "list[tuple[str, str, frozenset, bool]]" = (),
+    in_a_loop: bool = False,
 ) -> str:
     """Run the destructors on the way out to a handler, as C++ unwinding does.
 
@@ -14812,25 +14841,29 @@ def _destroy_before_leaving(
         for name in reversed(destroyed)
     )
     for found in _LEAVES_A_LOOP.finditer(body):
-        # Only what this scope built: how far out of the loops around it the
-        # jump goes is not something this text says.
         already = [
             name
             for name in destroyed
             if (where := re.search(rf"(?<![.\w>]){re.escape(name)}\b", body))
             and where.start() < found.start()
         ]
-        if not already:
+        leaving = "".join(
+            f" {_destructor_call(known[name], name, classes)}"
+            for name in reversed(already)
+        )
+        # And outward as far as the loop's own body, which is what `break`
+        # and `continue` leave. Written almost always inside an `if`, so
+        # taking apart only the scope holding the jump left everything the
+        # loop itself had built - a leak, and a quiet one.
+        if not in_a_loop:
+            for name, held, _labels, loop in reversed(list(enclosing)):
+                leaving += f" {_destructor_call(held, name, classes)}"
+                if loop:
+                    break
+        if not leaving.strip():
             continue
         out.append(body[at:found.start()])
-        out.append(
-            "".join(
-                f" {_destructor_call(known[name], name, classes)}"
-                for name in reversed(already)
-            ).strip()
-            + " "
-            + found.group(0)
-        )
+        out.append(leaving.strip() + " " + found.group(0))
         at = found.end()
     out.append(body[at:])
     body = "".join(out)
@@ -14849,7 +14882,7 @@ def _destroy_before_leaving(
         # And outward, one scope at a time, as far as the scope that holds
         # the handler - which the jump stays inside, so what that one built
         # is still alive.
-        for name, held, labels in reversed(list(enclosing)):
+        for name, held, labels, _loop in reversed(list(enclosing)):
             if found.group(1) in labels:
                 break
             leaving += f" {_destructor_call(held, name, classes)}"
