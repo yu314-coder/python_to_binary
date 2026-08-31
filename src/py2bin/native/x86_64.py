@@ -745,10 +745,17 @@ def _indirect_call_x86(
     allocated = _push_arguments(code, expression.arguments, slot_base, refs)
     # The target's own cell sits just above everything the arguments allocated.
     code.extend(b"\x4c\x8b\x9c\x24" + struct.pack("<I", allocated))  # mov r11,[rsp+n]
+    # Then the call, and only afterwards the release - the same order a direct
+    # call uses, and for a reason that only shows with more arguments than
+    # there are registers: everything past the sixth is passed *in that area*,
+    # so giving it back first handed the callee whatever was below the stack
+    # pointer. Six or fewer had nothing there to lose, which is why this went
+    # unseen: a call through a table with seven arguments answered with
+    # rubbish and said nothing.
+    code.extend(b"\x41\xff\xd3")  # call r11
     if allocated:
         code.extend(b"\x48\x81\xc4" + struct.pack("<I", allocated))
     code.extend(b"\x48\x83\xc4\x10")  # add rsp, 16  (release the target cell)
-    code.extend(b"\x41\xff\xd3")  # call r11
 
 
 

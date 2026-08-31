@@ -7913,6 +7913,94 @@ def _strip_namespace_qualifiers(text: str, namespaces: "set[str]") -> str:
         )
     return text
 
+#: The spellings a generated COM header is written in. Distinctive enough
+#: that a file using one of them is COM code, which is what decides whether
+#: the rest of the table - `interface`, `PURE` - is applied at all.
+_COM_SPELLINGS = re.compile(
+    r"(?<![.\w>])(MIDL_INTERFACE|STDMETHOD|DECLSPEC_UUID|DECLSPEC_NOVTABLE"
+    r"|BEGIN_INTERFACE|__RPC_FAR|STDMETHODCALLTYPE)\b"
+)
+
+
+def _com_macros() -> "list[tuple[str, list[str], str]]":
+    """The COM spellings and what each stands for, read from py2bin's header.
+
+    Read rather than written out again: `<rpcndr.h>` is where they are
+    defined for the C that comes out of this, and two copies of a table like
+    that drift. Longest name first, so `STDMETHOD_` is not read as
+    `STDMETHOD` and `THIS_` not as `THIS`.
+    """
+
+    from . import c_preprocessor
+
+    found: "list[tuple[str, list[str], str]]" = []
+    for match in re.finditer(
+        r"^#define\s+([A-Za-z_]\w*)(\([^)]*\))?[ \t]*(.*)$",
+        c_preprocessor._RPCNDR_H,
+        re.M,
+    ):
+        name, parameters, body = match.groups()
+        if "##" in body:
+            # Token pasting, which needs the C preprocessor and not this.
+            continue
+        spelled = (
+            [one.strip() for one in parameters[1:-1].split(",") if one.strip()]
+            if parameters
+            else []
+        )
+        found.append((name, spelled, body.strip()))
+    return sorted(found, key=lambda one: len(one[0]), reverse=True)
+
+
+def _expand_com_spellings(text: str) -> str:
+    """Write out what a generated COM header's macros stand for.
+
+    Only where the file is written in them. `interface` and `PURE` are
+    ordinary words, and a program that has never heard of COM may use either
+    as a name of its own.
+    """
+
+    if _COM_SPELLINGS.search(_without_literals(text)) is None:
+        return text
+    for name, parameters, body in _com_macros():
+        if not parameters:
+            text = _map_code(
+                text,
+                lambda part, n=name, b=body: re.sub(
+                    rf"(?<![.\w>]){re.escape(n)}\b", b, part
+                ),
+            )
+            continue
+
+        def written(
+            match: "re.Match[str]", whole: str, b=body, names=parameters
+        ) -> str:
+            # The argument out of the real text: an interface's is a string
+            # of digits and dashes, and this is matched against a copy with
+            # the literals blanked.
+            given = [
+                one.strip()
+                for one in _split_arguments(whole[match.start(1): match.end(1)])
+            ]
+            out = b
+            for spelled, value in zip(names, given):
+                out = re.sub(
+                    rf"(?<![.\w>]){re.escape(spelled)}\b", value, out
+                )
+            return out
+
+        # Against the whole text and not fragment by fragment: the fragments
+        # are split at every literal, and `MIDL_INTERFACE("...")` is a name,
+        # an open parenthesis, a literal and a close - so no fragment ever
+        # held the whole of it.
+        text = _sub_code(
+            re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(([^()]*)\)"),
+            text,
+            written,
+        )
+    return text
+
+
 def _refuse_unsupported(text: str, filename: str) -> None:
     """Name the C++ this does not do, before it becomes broken C.
 
@@ -15172,6 +15260,12 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # so every qualified free operator was left where it was and never became
     # a member of anything.
     text = _free_operators_as_members(text)
+    # `MIDL_INTERFACE("...") IXMLDOMNode : public IDispatch {` is a class,
+    # and nothing here could see that: those spellings are defined for the
+    # *C* stage, which runs after this one. So a program deriving from a
+    # generated COM interface was told the interface was not a class this
+    # unit declares.
+    text = _expand_com_spellings(text)
     _refuse_unsupported(text, filename)
     # Before anything reads a function's name: an overload set is several
     # functions sharing one, and every later pass assumes a name is a thing.
@@ -20184,6 +20278,77 @@ typedef VARIANT *LPVARIANT;
 #define VT_UNKNOWN 13
 #define VT_I8 20
 #define VT_UI8 21
+
+/* What Automation calls a member by, and the locale a name is read in.
+   Both are plain numbers; the SDK gives them names and a program passes them
+   through without looking. */
+typedef long DISPID;
+typedef long MEMBERID;
+typedef unsigned long LCID;
+typedef OLECHAR *LPOLESTR;
+typedef OLECHAR *BSTR_ALIAS;
+
+/* The arguments `Invoke` is handed, laid out as the SDK lays them out: a
+   program that reads one reads these four members and nothing else. */
+typedef struct __py2bin_DISPPARAMS {
+    VARIANTARG *rgvarg;
+    DISPID *rgdispidNamedArgs;
+    unsigned int cArgs;
+    unsigned int cNamedArgs;
+} DISPPARAMS;
+
+/* What `Invoke` fills in when the call it forwards fails. */
+typedef struct __py2bin_EXCEPINFO {
+    unsigned short wCode;
+    unsigned short wReserved;
+    BSTR bstrSource;
+    BSTR bstrDescription;
+    BSTR bstrHelpFile;
+    unsigned long dwHelpContext;
+    void *pvReserved;
+    void *pfnDeferredFillIn;
+    HRESULT scode;
+} EXCEPINFO;
+
+/* Described by name only: every use of it is a pointer handed back by
+   `GetTypeInfo` and passed on, and what it points at is the type library's
+   business. A struct with no members is not C, so it has one. */
+struct ITypeInfo { int __py2bin_opaque; };
+struct ITypeLib { int __py2bin_opaque; };
+
+/* Automation's interface, which is what a generated header derives from
+   when the object is scriptable - `IXMLDOMNode`, and most of what a browser
+   control hands back. Four methods after `IUnknown`'s three, in the order
+   COM puts them: the order *is* the layout, the same way it is for
+   `IUnknown` above. */
+class IDispatch : public IUnknown {
+public:
+    virtual HRESULT GetTypeInfoCount(unsigned int *count) = 0;
+    virtual HRESULT GetTypeInfo(
+        unsigned int which, LCID locale, ITypeInfo **answered
+    ) = 0;
+    virtual HRESULT GetIDsOfNames(
+        REFIID riid,
+        LPOLESTR *names,
+        unsigned int count,
+        LCID locale,
+        DISPID *answered
+    ) = 0;
+    virtual HRESULT Invoke(
+        DISPID member,
+        REFIID riid,
+        LCID locale,
+        unsigned short flags,
+        DISPPARAMS *given,
+        VARIANT *answered,
+        EXCEPINFO *failed,
+        unsigned int *wrong
+    ) = 0;
+};
+
+#define DISPATCH_METHOD 1
+#define DISPATCH_PROPERTYGET 2
+#define DISPATCH_PROPERTYPUT 4
 
 #endif
 """

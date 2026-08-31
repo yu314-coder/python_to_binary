@@ -1150,6 +1150,28 @@ so `struct D : B, C` where only `C` declares the method resolved to the one
 receiver where the table expected the class that declared the slot - which
 had always worked only because that class had always been at offset zero.
 
+**A COM interface that would not compile, and a calling convention that was
+quietly wrong.** Reported from a real build: a program deriving from
+`IXMLDOMNode` stopped, because `MIDL_INTERFACE("...") IXMLDOMNode : public
+IDispatch` was not seen as a class at all. Those spellings are defined for
+the *C* that comes out of this, and that stage runs after the C++ one - so
+the translator never saw the `struct`. It writes them out itself now, reading
+the same table out of py2bin's own `<rpcndr.h>` rather than keeping a second
+copy to drift. `IDispatch` did not exist either, and now does: its four
+methods in COM's order, which *is* the layout, beside `DISPPARAMS`,
+`EXCEPINFO` and the rest.
+
+What that uncovered was worse than what was reported. `IDispatch::Invoke`
+takes eight arguments and an object, and a call through a table with that
+many was refused on arm64 - the direct path already passed everything past
+the eighth in memory, and the indirect one had never learned to. On x86-64 it
+was not refused. It was wrong: the argument area was given back *before* the
+call, so everything passed on the stack reached the callee as whatever lay
+below the stack pointer. Six or fewer arguments have nothing there to lose,
+which is why nothing had ever shown it - but Windows x64 hands only four in
+registers, so on that target every virtual call with five or more arguments
+had been answering with rubbish.
+
 **A sixth round, five more, and a rule about ownership.** A `vector<T>` had
 no destructor at all and `clear()` only set the count to zero, so a container
 of objects let every one of them go without running one. Fixing it needed a

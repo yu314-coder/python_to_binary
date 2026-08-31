@@ -579,22 +579,36 @@ def _indirect_call(
             "call-capable encoders are encode_darwin/encode_darwin_extern and "
             "encode_linux"
         )
-    if len(expression.arguments) > ARM64_ARGUMENT_REGISTERS:
-        raise ValueError(
-            f"ARM64 indirect calls pass at most {ARM64_ARGUMENT_REGISTERS} "
-            "arguments in registers"
-        )
+    count = len(expression.arguments)
     _expression(words, expression.target, slot_base, refs)  # target -> x0
     words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
     for argument in expression.arguments:
         _expression(words, argument, slot_base, refs)  # arg -> x0
         words.extend((_sub_sp(16), 0xF90003E0))  # str x0, [sp]
-    for index in reversed(range(len(expression.arguments))):
-        words.append(0xF94003E0 | index)  # ldr x{index}, [sp]
-        words.append(0x910043FF)  # add sp, sp, #16
-    words.append(0xF94003F0)  # ldr x16, [sp]
-    words.append(0x910043FF)  # add sp, sp, #16
+    # Cell for argument i sits at [sp + (count - 1 - i) * 16], and the
+    # target's - pushed first, so deepest - at [sp + count * 16].
+    spilled = (count + 1) * 16
+    # Past the eighth the arguments are passed in memory, exactly as a direct
+    # call passes them. Without this a call through a table was refused at
+    # nine, and `IDispatch::Invoke` takes eight and an object.
+    overflow = max(0, count - ARM64_ARGUMENT_REGISTERS)
+    area = (overflow * 8 + 15) & ~15  # AAPCS64 keeps sp 16-byte aligned
+    if area:
+        words.extend(_frame_sub(area))
+        for index in range(ARM64_ARGUMENT_REGISTERS, count):
+            source = area + (count - 1 - index) * 16
+            destination = (index - ARM64_ARGUMENT_REGISTERS) * 8
+            words.append(0xF94003E9 | ((source // 8) << 10))  # ldr x9, [sp, #src]
+            words.append(0xF90003E9 | ((destination // 8) << 10))  # str x9, [sp, #dst]
+    for index in range(min(count, ARM64_ARGUMENT_REGISTERS)):
+        offset = area + (count - 1 - index) * 16
+        words.append(0xF94003E0 | index | ((offset // 8) << 10))  # ldr xN, [sp, #off]
+    # Last, so that loading it cannot disturb an argument register: X16 is
+    # the intra-procedure scratch, which no argument occupies.
+    words.append(0xF94003F0 | (((area + count * 16) // 8) << 10))  # ldr x16
     words.append(0xD63F0200)  # blr x16
+    if area + spilled:
+        words.extend(_frame_add(area + spilled))
 
 
 def _expression(
