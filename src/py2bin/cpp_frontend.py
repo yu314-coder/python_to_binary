@@ -6484,7 +6484,9 @@ def _throwing_calls(statement: str, throwing: "set[str]") -> "list[str]":
     # its class to be dispatched through the vtable, which in an overrider is
     # the overrider calling itself.
     pattern = re.compile(
-        r"(?<![.\w>:])((?:[A-Za-z_]\w*\s*(?:\.|->|::)\s*)*)([A-Za-z_]\w*)\s*\("
+        # Not after a `~`: `items[i].~R()` runs a destructor, and read as a
+        # call to `R` it was lifted out as one that might throw.
+        r"(?<![.\w>:~])((?:[A-Za-z_]\w*\s*(?:\.|->|::)\s*)*)([A-Za-z_]\w*)\s*\("
     )
     for match in pattern.finditer(code):
         if match.start() < at:
@@ -6588,13 +6590,33 @@ def _mangle_overloaded_functions(text: str, filename: str) -> str:
         for parameters in same:
             if _parameter_types(parameters) == codes:
                 return f"{name}__{suffix_of(name, parameters)}("
-        for parameters in same:
+        # The nearest fit, not the first one written. A `char` reaches an
+        # `int` by a promotion and a `double` by a conversion between
+        # families; taken in the order they were declared, `f('a')` called
+        # whichever of the two came first in the file.
+        scored = [
+            (
+                sum(
+                    _closeness(code, declared)
+                    for declared, code in zip(
+                        _parameter_types(parameters), codes
+                    )
+                ),
+                parameters,
+            )
+            for parameters in same
             if all(
                 declared == code or declared in _PROMOTIONS.get(code, ())
                 for declared, code in zip(_parameter_types(parameters), codes)
-            ):
-                return f"{name}__{suffix_of(name, parameters)}("
-        return None
+            )
+        ]
+        if not scored:
+            return None
+        nearest = min(one for one, _p in scored)
+        best = [p for one, p in scored if one == nearest]
+        if len(best) != 1:
+            return None
+        return f"{name}__{suffix_of(name, best[0])}("
 
     # Against the whole text: `rename` reads the type of each argument out of
     # where it was declared, and handed one stretch of code at a time it was
@@ -6603,8 +6625,10 @@ def _mangle_overloaded_functions(text: str, filename: str) -> str:
     return _sub_code(_A_CALL, text, rename)
 
 
-#: A call: a name and the parenthesis that opens its arguments.
-_A_CALL = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(")
+#: A call: a name and the parenthesis that opens its arguments. Not after a
+#: `~`, where the name is a destructor being run and not a function to pick
+#: an overload of.
+_A_CALL = re.compile(r"(?<![.\w>~])([A-Za-z_]\w*)\s*\(")
 
 
 def _flatten_namespaces(text: str, filename: str) -> "tuple[str, set[str]]":
@@ -7411,14 +7435,58 @@ def _rewrite_threads(text: str, filename: str) -> str:
                 f"(*__py2bin_on)(); return 0; }}"
             )
             passed = f"(void *)(&{held})"
+        elif re.fullmatch(r"[A-Za-z_]\w*", held) and _declared_return(
+            text, None, held
+        ) is not None:
+            # `thread(add, 1000)` - a function and what to call it with. A
+            # platform hands its thread one pointer, so the arguments are put
+            # in something and that is the pointer: a small class written
+            # here, built with `new` so it outlives the statement that starts
+            # the thread. It is never freed, which is what a thread argument
+            # pack costs; py2bin's heap is an arena and gives it back at exit.
+            bound = given[1:]
+            spelled_types = [
+                _deduced_type(one, text, match.start()) for one in bound
+            ]
+            if any(one is None for one in spelled_types):
+                raise CppTranslationError(
+                    filename, _line_of(text, match.start()),
+                    f"a thread is started here on `{held}` with arguments "
+                    f"py2bin cannot read the types of. It reads a literal "
+                    f"and a variable it can see declared; give the argument "
+                    f"a variable of its own and pass that",
+                )
+            pack = f"__py2bin_thread_args_{counter}"
+            members = "".join(
+                f"    {one} a{index};\n"
+                for index, one in enumerate(spelled_types)
+            )
+            parameters = ", ".join(
+                f"{one} v{index}" for index, one in enumerate(spelled_types)
+            )
+            assigned = " ".join(
+                f"a{index} = v{index};" for index in range(len(bound))
+            )
+            passing = ", ".join(
+                f"__py2bin_a->a{index}" for index in range(len(bound))
+            )
+            made.append(
+                f"class {pack} {{\npublic:\n{members}"
+                f"    {pack}({parameters}) {{ {assigned} }}\n}};\n"
+                f"static long {entry}(void *__py2bin_given) {{ "
+                f"{pack} *__py2bin_a = ({pack} *)__py2bin_given; "
+                f"{held}({passing}); return 0; }}"
+            )
+            passed = f"(void *)(new {pack}({', '.join(bound)}))"
         else:
             raise CppTranslationError(
                 filename, _line_of(text, match.start()),
-                f"a thread is started here with {len(given)} arguments; "
-                f"py2bin writes the function a platform starts a thread at, "
-                f"and can write one for a callable on its own or for a "
-                f"member function and the object to call it on - not for "
-                f"arguments bound to it as well",
+                f"a thread is started here with {len(given)} arguments and "
+                f"py2bin cannot tell what the first of them is. It writes "
+                f"the function a platform starts a thread at, and can write "
+                f"one for a callable on its own, for a member function and "
+                f"the object to call it on, or for a function and the "
+                f"arguments bound to it",
             )
         naming = match.group(1)
         ends = match.end()
@@ -9597,6 +9665,24 @@ _PROMOTIONS = {
 }
 
 
+def _closeness(code: str, declared: str) -> int:
+    """How far a conversion is from being no conversion at all.
+
+    C++ ranks an exact match above a promotion and a promotion above a
+    conversion between families. Nothing ranked them here, so where two
+    candidates both fitted the tie was settled by which was written first.
+    """
+
+    if declared == code:
+        return 0
+    together = (
+        code in _INTEGRAL_CODES and declared in _INTEGRAL_CODES
+    ) or (
+        code in ("double", "float") and declared in ("double", "float")
+    )
+    return 1 if together else 2
+
+
 def _chosen_overload(
     set_of: "list[Method]", given: "list[str]", text: str, before: int
 ) -> "Method | None":
@@ -9626,7 +9712,27 @@ def _chosen_overload(
             for declared, code in zip(_parameter_types(m.parameters), codes)
         )
     ]
-    return near[0] if len(near) == 1 else None
+    if len(near) == 1:
+        return near[0]
+    # More than one fits, so how *well* each fits decides - which is what C++
+    # does. A `char` reaches an `int` by a promotion and a `double` by a
+    # conversion between families, and ranked as equals the tie went to
+    # whichever was written first: `f('a')` called the one taking a double.
+    scored = [
+        (
+            sum(
+                _closeness(code, declared)
+                for declared, code in zip(_parameter_types(m.parameters), codes)
+            ),
+            m,
+        )
+        for m in near
+    ]
+    if not scored:
+        return None
+    nearest = min(one for one, _m in scored)
+    best = [m for one, m in scored if one == nearest]
+    return best[0] if len(best) == 1 else None
 
 
 def _narrowed_by_what_is_known(
@@ -9641,17 +9747,24 @@ def _narrowed_by_what_is_known(
     ]
     if not known:
         return None
-    fits = []
+    scored: "list[tuple[int, Method]]" = []
     for method in candidates:
         declared = _parameter_types(method.parameters)
         if len(declared) != len(wanted):
             continue
-        if all(
+        if not all(
             declared[index] == code
             or declared[index] in _PROMOTIONS.get(code, ())
             for index, code in known
         ):
-            fits.append(method)
+            continue
+        scored.append(
+            (sum(_closeness(code, declared[index]) for index, code in known), method)
+        )
+    if not scored:
+        return None
+    nearest = min(one for one, _method in scored)
+    fits = [method for one, method in scored if one == nearest]
     return fits[0] if len(fits) == 1 else None
 
 
@@ -10976,7 +11089,8 @@ def _statement_start(body: str, at: int) -> int:
 
 
 #: `V(3)` - an object built where it is used rather than named first.
-_TEMPORARY = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(")
+#: Not after a `~`: `x.~C()` names a destructor to run, not a `C` to build.
+_TEMPORARY = re.compile(r"(?<![.\w>~])([A-Za-z_]\w*)\s*\(")
 
 
 
@@ -11713,6 +11827,11 @@ def _rewrite_body(
     # and before the subscript rewrite, so the left side is still written the
     # way the program wrote it - `m[3]` and not a call.
     body = _convert_assignments(body, classes, unit or body)
+
+    # `items[i].~T()` - where a container takes its elements apart. Before
+    # the temporaries, which otherwise read the `C()` of `~C()` as one being
+    # built and left the tilde in front of the name it gave it.
+    body = _rewrite_explicit_destructors(body, classes)
 
     # `V(5)` written where a value goes: C has no expression that constructs,
     # so each temporary becomes an object with a name ahead of the statement.
@@ -14719,17 +14838,22 @@ def _close_with_destructors(
             f" {_destructor_call(known[name], name, classes)}"
             for name in reversed(already)
         ) + outer
-        for name in already:
-            if re.search(rf"\b{re.escape(name)}\b", value):
-                raise CppTranslationError(
-                    "<c++>",
-                    0,
-                    f"this `return` uses {name}, which has a destructor. "
-                    f"Running it first would return a destroyed object and "
-                    f"running it after needs a temporary whose type this "
-                    f"translator does not know - assign to a variable and "
-                    f"return that instead",
-                )
+        # An object that is being handed back is not taken apart on the way
+        # out: what it holds now belongs to the caller. That is what C++ does
+        # with a move, and it is the only reading that is safe without one -
+        # the copy the caller gets points at the same things, so destroying
+        # them here would leave it holding what has been taken apart.
+        handed = [
+            name
+            for name in already
+            if re.search(rf"(?<![.\w>])\b{re.escape(name)}\b", value)
+        ]
+        if handed:
+            already = [name for name in already if name not in handed]
+            leaving = "".join(
+                f" {_destructor_call(known[name], name, classes)}"
+                for name in reversed(already)
+            ) + outer
         out.append(body[at:found.start()])
         # The answer is worked out *before* anything is taken apart. C++
         # evaluates the returned expression and then destroys what the scope
@@ -14797,7 +14921,11 @@ def _handlers_written(body: str) -> frozenset:
 #: Where a label is written down: at the start of a statement, and not the
 #: `:` of a `case`, of a ternary, or of a qualified name.
 _AT_A_HANDLER = re.compile(
-    r"(?:^|[;{}:])\s*([A-Za-z_]\w*)\s*:(?!:)", re.M
+    # The marker a lifted block leaves counts as something a statement may
+    # follow: written without it, a label standing after a nested block was
+    # not seen, and a `goto` to it was taken for one that leaves the scope -
+    # so everything the scope held was destroyed on the way past.
+    r"(?:^|[;{}:\x00])\s*([A-Za-z_]\w*)\s*:(?!:)", re.M
 )
 
 
@@ -15594,6 +15722,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # template writes, and when the body of `__sift_by` was rewritten the
     # comparator it would be given had no name yet. So the question is asked
     # of the finished C, where every type is written down.
+    # A method taking `const T &` where T is not a class, given a literal.
+    # Here rather than while the body was rewritten, because a constructor
+    # is not spelled with the name its call is written under until now.
+    positions, held_by = _reference_literal_parameters(classes)
+    whole = _bind_reference_literals(whole, positions, held_by)
     whole = _fold_constant_definitions(whole)
     whole = _ask_a_class_whether_it_is_true(whole, classes)
     through, through_types = _pointer_call_signatures(whole, classes)
@@ -16160,6 +16293,49 @@ def _has_several_constructors(name: str, classes: "dict[str, Class]") -> bool:
     return found is not None and len([m for m in found.methods if m.name == ""]) > 1
 
 
+#: `x.~T()` and `p->~T()` - naming a destructor to run it where it stands.
+_EXPLICIT_DESTRUCTOR = re.compile(
+    # The whole receiver, not the last name in it: a container writes
+    # `this->items[i].~T()`, and a pattern that starts at `items` leaves the
+    # `this->` in front of what it writes.
+    r"(?<![.\w>])((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*[A-Za-z_]\w*"
+    # The name may have come from a template argument and so may carry what
+    # that argument was: `vector<Shape *>` writes `~Shape *()`, and a
+    # pointer has no destructor to run.
+    r"(?:\s*\[[^\]]*\])?)\s*(\.|->)\s*~\s*([A-Za-z_]\w*)"
+    r"(\s*\*+)?\s*\(\s*\)"
+)
+
+
+def _rewrite_explicit_destructors(
+    body: str, classes: "dict[str, Class]"
+) -> str:
+    """`items[i].~T()` becomes the destructor call, or nothing.
+
+    A container takes its elements apart this way and there is no other way
+    to write it: the element's type is a template parameter, so the name of
+    the function cannot be written down until the copy exists. Where the
+    parameter turned out not to be a class the call says nothing at all,
+    which is what C++ says a pseudo-destructor call on an `int` does.
+    """
+
+    def one(match: "re.Match[str]") -> str:
+        held, reach, named, stars = match.groups()
+        if stars:
+            # A pointer. C++ lets one be named this way and does nothing,
+            # which is the whole of what it means: what a container holds is
+            # the pointer, and freeing what it points at is not its business.
+            return "(void)0"
+        if named not in classes:
+            return "(void)0"
+        if _find_method(named, "~", classes) is None:
+            return "(void)0"
+        given = held if reach == "->" else f"&{held}"
+        return f"{_c_name(named, '~')}({given})"
+
+    return _map_code(body, lambda part: _EXPLICIT_DESTRUCTOR.sub(one, part))
+
+
 def _rewrite_delete(
     body: str, classes: "dict[str, Class]", known: "dict[str, str]"
 ) -> str:
@@ -16562,6 +16738,96 @@ def _pointer_call_signatures(
     return positions, types
 
 
+def _reference_literal_parameters(
+    classes: "dict[str, Class]",
+) -> "tuple[dict[str, list[int]], dict[tuple[str, int], str]]":
+    """Which method parameters are references to something that is not a class.
+
+    Keyed by the C name a call is written with, and by the position in *that*
+    call - so one further along than the method declares, because the object
+    goes first.
+    """
+
+    positions: "dict[str, list[int]]" = {}
+    held: "dict[tuple[str, int], str]" = {}
+    for owner, holder in classes.items():
+        for method in holder.methods:
+            spelled = _c_name(
+                owner, method.name, _suffix_of(owner, method, classes)
+            )
+            at: "list[int]" = []
+            for index, part in enumerate(_split_arguments(method.parameters)):
+                words = part.replace("*", " ").replace("&", " ").split()
+                if "&" not in part or "*" in part or len(words) < 2:
+                    continue
+                if any(word in classes for word in words):
+                    continue
+                at.append(index + 1)
+                held[(spelled, index + 1)] = " ".join(
+                    one for one in words[:-1] if one != "const"
+                )
+            if at:
+                positions[spelled] = at
+    return positions, held
+
+
+def _bind_reference_literals(
+    text: str,
+    signatures: "dict[str, list[int]]",
+    bound_types: "dict[tuple[str, int], str]",
+) -> str:
+    """`Wrap<int> w(7);` where the parameter is a `const int &`.
+
+    A reference binds to an object, and a literal is not one - C++ makes a
+    temporary for it and binds to that, which is the only reason the code is
+    legal. Nothing here made one, so the call was handed a `7` where the C
+    wanted an `int *`.
+    """
+
+    if not bound_types:
+        return text
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        for name, positions in signatures.items():
+            bare = _without_literals(text)
+            for found in re.finditer(
+                rf"(?<![.\w>]){re.escape(name)}\s*\(", bare
+            ):
+                close = _closing_paren(bare, found.end() - 1)
+                if close < 0 or _is_a_definition(bare, close):
+                    continue
+                inside = text[found.end(): close]
+                parts = _split_arguments(inside) if inside.strip() else []
+                for index in positions:
+                    if index >= len(parts):
+                        continue
+                    argument = parts[index].strip()
+                    held = bound_types.get((name, index))
+                    if held is None or not argument:
+                        continue
+                    if argument.startswith("&") or _has_an_address(argument):
+                        continue
+                    made = f"__py2bin_bound_{abs(hash((found.start(), index))) % 100000}"
+                    parts[index] = f"&{made}"
+                    begins = _statement_start(text, found.start())
+                    text = (
+                        text[:begins]
+                        + f" {held} {made} = {argument}; "
+                        + text[begins: found.end()]
+                        + ", ".join(one.strip() for one in parts)
+                        + text[close:]
+                    )
+                    changed = True
+                    break
+                if changed:
+                    break
+            if changed:
+                break
+        if not changed:
+            return text
+    return text
+
+
 def _address_reference_arguments(
     text: str,
     signatures: "dict[str, list[int]]",
@@ -16581,6 +16847,8 @@ def _address_reference_arguments(
     if not signatures:
         return text
     wanted_types: "dict[tuple[str, int], str]" = {}
+    #: The same, for a reference to something that is not a class.
+    bound_types: "dict[tuple[str, int], str]" = {}
     #: How many parameters each function was written with. A call carrying one
     #: more than that has already been given the caller's space at the front,
     #: and every position the author wrote has moved along by one. Which calls
@@ -16604,6 +16872,15 @@ def _address_reference_arguments(
                 if word in classes:
                     wanted_types[(match.group(2), index)] = word
                     break
+            else:
+                # A reference to something that is not a class - `const int
+                # &v`. C++ binds one to a literal by making a temporary and
+                # binding to that; there is nowhere here for the address of
+                # a `7` to come from otherwise.
+                if "&" in part and "*" not in part and len(spelled) >= 2:
+                    bound_types[(match.group(2), index)] = " ".join(
+                        one for one in spelled[:-1] if one != "const"
+                    )
     for spelled, written in _static_member_parameters(classes).items():
         parts = _split_arguments(written)
         arity[spelled] = len([one for one in parts if one.strip()])
@@ -16614,6 +16891,9 @@ def _address_reference_arguments(
                     break
     # What a call through a variable wants, which no definition here says.
     wanted_types.update(also)
+    # A reference to something that is not a class, given something with no
+    # address: C++ makes a temporary and binds to that.
+    text = _bind_reference_literals(text, signatures, bound_types)
     for name, positions in signatures.items():
         pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
         out: list[str] = []
@@ -17556,7 +17836,19 @@ public:
     vector() { items = 0; count = 0; room = 0; }
     unsigned long size() { return count; }
     int empty() { return count == 0; }
-    void clear() { count = 0; }
+    /* Every element taken apart, which is what letting go of them means.
+       C++ destroys them when the vector goes and when it is cleared; this
+       had done neither, so a `vector<T>` of objects with a destructor let
+       them all go without running one - a leak with nothing to say so. The
+       element's type is a template parameter, so the only way to name its
+       destructor is to write the call the language provides. */
+    void clear() {
+        unsigned long i;
+        i = 0;
+        while (i < count) { items[i].~T(); i = i + 1; }
+        count = 0;
+    }
+    ~vector() { clear(); }
     void reserve(unsigned long want) {
         unsigned long i;
         T *fresh;

@@ -1150,6 +1150,37 @@ so `struct D : B, C` where only `C` declares the method resolved to the one
 receiver where the table expected the class that declared the slot - which
 had always worked only because that class had always been at offset zero.
 
+**A sixth round, five more, and a rule about ownership.** A `vector<T>` had
+no destructor at all and `clear()` only set the count to zero, so a container
+of objects let every one of them go without running one. Fixing it needed a
+small piece of the language first: `items[i].~T()` is the only way a
+container can name its element's destructor while the element type is still a
+template parameter, and three passes had to learn that `~C()` is not a `C`
+being built.
+
+Giving it one had two consequences worth stating. A `vector<Shape *>` writes
+`~Shape *()`, which does nothing - what a container holds is the pointer, and
+freeing what it points at is not its business. And returning a `vector` by
+value started being refused, because a local with a destructor cannot be
+handed back without a move. Forcing it through would be worse than refusing:
+the caller's copy points at the same elements, so destroying them on the way
+out hands back something already taken apart. So the rule is the one a move
+implements - **an object being handed back is not taken apart on the way
+out**, because what it holds now belongs to the caller.
+
+`f('a')` called the overload taking a `double` where one taking an `int` was
+there: a `char` reaches both, nothing ranked them, and the tie went to
+whichever was declared first. C++ ranks an exact match above a promotion and
+a promotion above a conversion between families, and both resolvers do now.
+A thread can be given arguments, packed into a small class the `new`
+machinery already knows how to build. A `const int &` parameter given a `7`
+gets the temporary C++ would have made for it.
+
+And one of the round-five fixes was wrong in a way only this round found: a
+label written straight after a nested block was not recognised, so the jump
+that skips past an exception handler was taken for one leaving the scope, and
+everything the scope held was destroyed on the way past.
+
 **A fifth round, and seven more.** With the list empty, fourteen more
 programs were written against parts of the language the earlier rounds had
 not aimed at. Seven of them found something, which is the answer to what an
