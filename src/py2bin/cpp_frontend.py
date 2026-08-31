@@ -9036,13 +9036,25 @@ def _return_through_pointer(body: str, held: str = "") -> str:
     if held:
         body = _EMPTY_RETURN.sub(f"return {held}();", body)
 
-    def replace(match: "re.Match[str]") -> str:
-        value = match.group(1).strip()
+    def replace_from(match: "re.Match[str]", whole: str) -> "str | None":
+        # Sliced out of the real text: the match is against a copy with the
+        # literals blanked, so the group holds spaces where one was.
+        value = whole[match.start(1): match.end(1)].strip()
         if not value:
-            return match.group(0)
+            return None
         return f"{{ *__ret = {value}; return; }}"
 
-    return _map_code(body, lambda part: re.sub(r"\breturn\b([^;]*);", replace, part))
+    # Against the whole body, not fragment by fragment: `_map_code` splits at
+    # every literal, so `return p / L"web";` was handed over as `return p / L`
+    # and `;` - two pieces, neither of which is a `return` with a `;` after
+    # it. The statement was left as it stood and the function answered
+    # nothing, though its head said it answered through a pointer.
+    return _sub_code(
+        re.compile(r"\breturn\b([^;]*);"),
+        body,
+        lambda match, whole: replace_from(match, whole),
+    )
+
 
 
 def _subobjects(found: Class, classes: "dict[str, Class]") -> "list[tuple[str, str]]":
@@ -9191,6 +9203,25 @@ def _open_with_member_values(
     spelled = " ".join(written)
     opening = body.find("{")
     return body[:opening + 1] + " " + spelled + body[opening + 1:]
+
+
+def _constructor_taking_one(
+    held: str, spelled: str, classes: "dict[str, Class]"
+) -> bool:
+    """Whether that class declares a constructor taking one of `spelled`."""
+
+    for item in classes.get(held, Class("")).methods:
+        if item.name != "" or _arity(item.parameters) != 1:
+            continue
+        words = (
+            _split_arguments(item.parameters)[0]
+            .replace("*", " ")
+            .replace("&", " ")
+            .split()
+        )
+        if spelled in words:
+            return True
+    return False
 
 
 def _constructor_taking(
@@ -10269,6 +10300,7 @@ def _hoist_object_operators(
     known: "dict[str, str]",
     counter: "list[int]",
     pointers: "set[str]" = frozenset(),
+    referenced: "set[str]" = frozenset(),
 ) -> str:
     """`b = a / "x";` becomes a temporary the operator fills, and a copy.
 
@@ -10293,10 +10325,15 @@ def _hoist_object_operators(
             if symbol in ("[]", "()", "=", "<<", ">>"):
                 continue
             for variable in sorted(known, key=len, reverse=True):
-                if variable in pointers:
+                if variable in pointers and variable not in referenced:
                     # `items + count` on a `T *` is where the pointer moves
                     # to, not the class's operator. The class it points at
                     # has one and the pointer does not.
+                    #
+                    # A *reference* is not that. `const path &p` is a pointer
+                    # here only because C has no reference, and `p / L"web"`
+                    # in the source asked the class for its operator - so
+                    # skipping it left the `/` for the C compiler.
                     continue
                 name = _OPERATOR_NAMES[symbol]
                 owner = _find_method(known[variable], name, classes)
@@ -11701,6 +11738,20 @@ def _rewrite_body(
                 if (arguments or "").strip()
                 else []
             )
+            # `path a(b);` where `b` is already one and the class wrote no
+            # copy constructor. C++ uses the one it gives every class, which
+            # here is the memberwise copy this translator does everywhere
+            # else - the same reading a member initialiser naming its own
+            # class already gets. Without it there was no constructor to
+            # choose and the overload set was reported as unreadable.
+            if len(given) == 1 and _same_class(
+                given[0], type_name, scope(), classes
+            ) and not _constructor_taking_one(type_name, type_name, classes):
+                if _find_method(type_name, "~", classes):
+                    destroyed.append(variable)
+                return constructed + " " + _copied_in(
+                    type_name, variable, f"&{given[0]}", classes
+                )
             suffix = _call_suffix(owner, "", classes, given, scope())
             passed = f", {arguments}" if arguments else ""
             call = f"{_c_name(owner, '', suffix)}(&{variable}{passed});"
@@ -11884,7 +11935,9 @@ def _rewrite_body(
     # object on the left of the operator is usually one the statement above
     # declared, and `known` holds only what came from outside.
     operands = {**hoisted, **known}
-    body = _hoist_object_operators(body, classes, operands, [0], pointers)
+    body = _hoist_object_operators(
+        body, classes, operands, [0], pointers, set(referenced or ())
+    )
     # `(a + b).c_str()` - the parentheses were the author's and what is
     # inside them is now one name. Left standing, the pass that rewrites a
     # call on an object matches a bare name and did not see this one. Only
