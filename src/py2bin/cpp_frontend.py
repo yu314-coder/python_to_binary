@@ -20800,14 +20800,19 @@ def inline_local_includes(
                     f"{', '.join(sorted(h for h in _BUILTIN_CPP_HEADERS if '.' not in h))}; "
                     f"name a directory with --include DIR to use your own.",
                 )
-            # A name with no extension is spelled the way only a C++ header
-            # is, and reading C++ is what this stage is for: somebody's own
-            # `fstream` may declare classes, and the headers *it* includes
-            # are C++ ones this stage knows and the preprocessor below does
-            # not. Left for that preprocessor, `#include <string>` written
-            # inside it arrived at a C compiler that ships no such header,
-            # and the classes it declared were never translated at all.
-            if "." not in named:
+            # Not one py2bin ships, so it is the program's own - and the
+            # program's own headers are read here, whatever they are called.
+            # The two spellings differ in *where* C looks and never in how it
+            # reads what it finds: the same header included with quotes was
+            # pasted and translated, and included with angles was handed
+            # below untouched, so a class in it reached a C compiler and the
+            # constructor was reported as a type it had never heard of.
+            #
+            # Header names with no extension are C++ ones by spelling, and
+            # their own includes are C++ headers this stage knows and the
+            # preprocessor does not - which is the other half of the same
+            # thing.
+            if True:
                 for folder in (Path(d) for d in include_dirs):
                     candidate = folder / named
                     if not candidate.is_file():
