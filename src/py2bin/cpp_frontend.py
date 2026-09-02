@@ -9799,6 +9799,35 @@ def _answer_into_the_space(body: str, answering: "list[str]") -> str:
     return "".join(out)
 
 
+def _name_the_receiver(body: str, method: str) -> str:
+    """`name().c_str()` becomes `this->name().c_str()`.
+
+    Only where something is reached on the answer, because only there does it
+    matter: a call standing on its own, or handed straight to a `return`, is
+    already written out correctly by the caller of this. Scanned rather than
+    substituted because what follows the *closing* paren is the question, and
+    the arguments in between may hold parens of their own.
+    """
+
+    bare = _without_literals(body)
+    out: "list[str]" = []
+    at = 0
+    for match in re.finditer(rf"(?<![.>\w]){re.escape(method)}\s*\(", bare):
+        if match.start() < at:
+            continue
+        close = _closing_paren(body, match.end() - 1)
+        if close < 0:
+            continue
+        after = bare[close + 1:].lstrip()
+        if not after.startswith(".") and not after.startswith("->"):
+            continue
+        out.append(body[at:match.start()])
+        out.append("this->")
+        at = match.start()
+    out.append(body[at:])
+    return "".join(out)
+
+
 def _bare_method_calls(
     body: str, owner: Class, classes: "dict[str, Class]", scope: str = ""
 ) -> str:
@@ -9808,6 +9837,24 @@ def _bare_method_calls(
     *names* at the object: a call is the name plus its argument list, and the
     object has to be threaded through as the first argument.
     """
+
+    # `name().c_str()` first, where the answer is an object and something is
+    # reached on it. The loop below writes a bare call straight out as the C
+    # call it becomes, and a value return is a hidden pointer the caller
+    # provides - so what came out was `A__name(this).c_str()`, a member
+    # reached on something that is not an expression in C at all. The pass
+    # that writes those temporaries out keys on a receiver being written,
+    # which is the whole of why `this->name().c_str()` always worked and the
+    # bare spelling did not. Giving the receiver back is enough: from there
+    # it is an ordinary method call and every pass below knows the shape.
+    for method in _reachable_methods(owner.name, classes):
+        provider = _find_method(owner.name, method, classes)
+        if provider is None:
+            continue
+        member = _method_by_name(provider, method, classes)
+        if member is None or _returns_object(member, classes) is None:
+            continue
+        body = _name_the_receiver(body, method)
 
     for method in sorted(_reachable_methods(owner.name, classes), key=len, reverse=True):
         provider = _find_method(owner.name, method, classes)

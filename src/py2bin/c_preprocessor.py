@@ -2749,10 +2749,13 @@ _OFFSETOF = (
 #: other header here does. Each is guarded: a header that defines its own
 #: first keeps it, the way `NULL` does.
 _SYS_TYPES_H = """
-#ifndef __py2bin_ssize_t_defined
-#define __py2bin_ssize_t_defined
-typedef long ssize_t;
-#endif
+/* No `ssize_t` here on purpose. It is one of the typedefs the compiler
+   settles from the target's data model - see `typedefs_for` in
+   py2bin.c_frontend - because how wide it is depends on which model is in
+   force. Written out here as well it was `long`, which is right on the LP64
+   targets and four bytes on Windows, where the model makes it eight: the two
+   answers met and `<sys/types.h>` stopped compiling for Windows altogether.
+   `size_t` is left out of this header for the same reason and always was. */
 #ifndef __py2bin_off_t_defined
 #define __py2bin_off_t_defined
 typedef long off_t;
@@ -3403,6 +3406,14 @@ typedef struct IMessageFilter IMessageFilter;
 typedef struct IMarshal IMarshal;
 
 typedef unsigned short CLIPFORMAT;
+/* The handles `STGMEDIUM` chooses between. These are declared here rather
+   than taken from <windows.h> because that header refuses a target that is
+   not Windows, and the point of these COM headers is that an interface can
+   be declared and built for six machines. Three of the five were written out
+   here already; `HBITMAP` and `HGLOBAL` were left to <windows.h>, so
+   <objidl.h> compiled on Windows and nowhere else. */
+typedef void *HBITMAP;
+typedef void *HGLOBAL;
 typedef void *HMETAFILEPICT;
 typedef void *HENHMETAFILE;
 typedef void *HMETAFILE;
