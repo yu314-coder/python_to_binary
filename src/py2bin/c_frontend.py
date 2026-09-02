@@ -7031,6 +7031,19 @@ class Lowerer:
         self.float_dispatch = self.new_label("fp_dispatch")
         self.emit(Label(self.float_entry))
         self.float_formatter()
+        # Everything the body just took has to outlive the statement emitting
+        # it. The formatter is written out once and jumped into from every
+        # conversion after it, but the slots inside it - the field padding's
+        # `negative`, `extra` and `total`, and what `put_runtime` and
+        # `pad_runtime` work in - were ordinary temporaries, reclaimed at the
+        # end of whichever statement happened to be the first to format a
+        # float. A later statement was then handed those slots for its own
+        # arguments, and jumping into the formatter wrote over them: in
+        # `printf("%.3f %.3f", x, y)` the first conversion clobbered `y`,
+        # which printed as 0.000. Only sometimes, because it takes an earlier
+        # conversion to shift the offsets far enough for the collision to
+        # land on an argument rather than on nothing.
+        self.reserved_slots = self.stack_slots
         self.emit(Jump(self.float_dispatch))
         self.emit(Label(skip))
 
