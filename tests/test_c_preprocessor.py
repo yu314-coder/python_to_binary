@@ -1534,6 +1534,32 @@ int main(void) { GUID g; g.mine = 1; return g.mine - 1; }
 """
         )
 
+    def test_sys_types_h_agrees_with_the_data_model(self):
+        """`ssize_t` is as wide as a pointer, and a Windows `long` is not.
+
+        The header wrote `typedef long ssize_t;` on every target. The
+        compiler already knows the name at the pointer's width, so on a
+        Windows target the two disagreed and including <sys/types.h> at all
+        failed with "'ssize_t' is already a different type" - the header was
+        unreachable on two of the six machines.
+        """
+
+        for target in ("windows-x86_64", "windows-arm64",
+                       "darwin-arm64", "linux-x86_64"):
+            with self.subTest(target=target):
+                self.compile_for_windows(
+                    """
+#include <sys/types.h>
+int main(void) {
+    ssize_t held = -3;
+    off_t place = 4096;
+    return (int)(held + 3) + (int)(place - 4096)
+         + (int)(sizeof(ssize_t) - sizeof(void *));
+}
+""",
+                    target,
+                )
+
     def test_a_piece_still_says_it_is_for_windows(self):
         with self.assertRaises(Exception) as caught:
             self.compile_for_windows(

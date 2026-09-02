@@ -2612,3 +2612,86 @@ class WrlCallbacks(unittest.TestCase):
                 "}\n"
             )
         self.assertIn("captures held", str(raised.exception))
+
+
+class ConditionsKeepTheirParentheses(unittest.TestCase):
+    """`if (p) { p->method(); }` - checked, then called through.
+
+    Parentheses around a bare name say nothing about the expression, so the
+    pass that rewrites operators takes them off. It has a lookbehind to keep
+    a call's argument list out of that, and the lookbehind reads one
+    character: `f(p)` has a name against the `(` and is left alone, but
+    `if (p)` has a space, so the `if`'s own parentheses were taken off too
+    and the C came out as `if p { ... }`.
+
+    Nothing about it is exotic - it is the commonest thing anyone writes with
+    a pointer - and it made py2bin's own <wrl.h> unusable, since every ComPtr
+    method guards on the pointer before calling through it.
+    """
+
+    program = (
+        "struct Counted {\n"
+        "    unsigned long refs;\n"
+        "    Counted() { refs = 1; }\n"
+        "    virtual unsigned long AddRef() { refs = refs + 1; return refs; }\n"
+        "};\n"
+    )
+
+    def test_an_if_around_a_pointer_keeps_its_parentheses(self):
+        out = translate(
+            self.program
+            + "int main() {\n"
+            "    Counted thing;\n"
+            "    Counted *p = &thing;\n"
+            "    if (p) { p->AddRef(); }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        self.assertIn("if (p)", out)
+        self.assertNotRegex(out, r"\bif\s+p\b")
+
+    def test_a_while_around_a_pointer_keeps_its_parentheses(self):
+        out = translate(
+            self.program
+            + "int main() {\n"
+            "    Counted thing;\n"
+            "    Counted *p = &thing;\n"
+            "    while (p) { p->AddRef(); p = 0; }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        self.assertIn("while (p)", out)
+        self.assertNotRegex(out, r"\bwhile\s+p\b")
+
+    def test_parentheses_that_say_nothing_still_come_off(self):
+        # The reason the pass exists: an inner operator has become a
+        # temporary and the parentheses the program wrote are still around
+        # its name, where a bare name is what the next pass matches. Asked of
+        # the helper itself, because what reaches it is text a pass above
+        # has already rewritten and no program spells it.
+        from py2bin.cpp_frontend import _strip_parentheses_around
+
+        self.assertEqual(
+            _strip_parentheses_around("r = (v) * c;", "v"), "r = v * c;"
+        )
+        self.assertEqual(
+            _strip_parentheses_around("return (v);", "v"), "return v;"
+        )
+        # And a call's argument list is still left alone, which is what the
+        # lookbehind was there for.
+        self.assertEqual(
+            _strip_parentheses_around("__skip(v);", "v"), "__skip(v);"
+        )
+
+    def test_a_comptr_guarded_on_its_pointer_translates(self):
+        # <wrl.h> itself, which is where this was found.
+        out = with_headers(
+            "#include <unknwn.h>\n"
+            "#include <wrl.h>\n"
+            "int main() {\n"
+            "    Microsoft::WRL::ComPtr<IUnknown> held;\n"
+            "    held.Reset();\n"
+            "    return held.Get() == 0 ? 0 : 1;\n"
+            "}\n"
+        )
+        self.assertNotRegex(out, r"\bif\s+this->ptr_\b")

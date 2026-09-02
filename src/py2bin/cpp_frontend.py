@@ -13390,6 +13390,33 @@ def _rewrite_conversions(
     return _map_code(body, lambda part: _A_WRITTEN_CAST.sub(written, part))
 
 
+#: `if (`, `while (`, `switch (` - a parenthesis the statement owns rather
+#: than one the program put around an expression. Written up to the `(`
+#: itself, so it is asked of the text ending at the one being looked at.
+_STATEMENTS_OWN_PARENTHESIS = re.compile(r"\b(?:if|while|switch)\s*\($")
+
+
+def _strip_parentheses_around(part: str, variable: str) -> str:
+    """`(v)` is `v`, except where those parentheses belong to a statement.
+
+    Taking them off around a name says nothing about the expression - which
+    is the point, since the pass below matches a bare name. But `if (p)` is
+    written with a space, so the lookbehind that keeps a call's argument list
+    out of this does not see the `if`, and `if p` is not C. That is how the
+    commonest thing anyone writes with a pointer - check it, then call
+    through it - stopped translating, and took `ComPtr` in <wrl.h> with it.
+    """
+
+    def one(found: "re.Match[str]") -> str:
+        if _STATEMENTS_OWN_PARENTHESIS.search(part[: found.start() + 1]):
+            return found.group(0)
+        return variable
+
+    return re.sub(
+        rf"(?<![\w)\]>])\(\s*{re.escape(variable)}\s*\)(?!\s*\()", one, part
+    )
+
+
 def _rewrite_operators(
     body: str,
     classes: "dict[str, Class]",
@@ -13424,9 +13451,7 @@ def _rewrite_operators(
             # Not an argument list: a `(` with a name in front of it is a
             # call, and `__skip(this)` with the parentheses taken off is one
             # long identifier.
-            lambda part, v=variable: re.sub(
-                rf"(?<![\w)\]>])\(\s*{re.escape(v)}\s*\)(?!\s*\()", v, part
-            ),
+            lambda part, v=variable: _strip_parentheses_around(part, v),
         )
     before = body
     for symbol in _OPERATOR_SYMBOLS:
