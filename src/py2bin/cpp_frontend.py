@@ -6310,6 +6310,57 @@ _DECLARED_BUILT = re.compile(
 #: The classes this file declares. Read before the exception pass, which runs
 #: before classes are taken apart and so has nothing else to ask.
 _CLASS_NAMES: "set[str]" = set()
+
+#: What `#pragma pack` was in force where each class was written. Read before
+#: anything moves, because the pragma says where the members of the struct
+#: *below it* sit, and both it and the struct are moved before either is
+#: written out.
+_CLASS_PACK: "dict[str, int]" = {}
+
+
+#: `#pragma pack(push, 1)`, `#pragma pack(2)`, `#pragma pack()`, `#pragma
+#: pack(pop)` - the four spellings a header uses.
+_PACK_PRAGMA = re.compile(
+    r"(?m)^[ \t]*#[ \t]*pragma[ \t]+pack[ \t]*\(([^)]*)\)"
+)
+
+
+def _pack_regions(text: str) -> "list[tuple[int, int | None]]":
+    """Where each `#pragma pack` sits and what it leaves in force after it.
+
+    A stack, because `push`/`pop` is how a header wraps one struct without
+    disturbing what the file was doing around it.
+    """
+
+    found: "list[tuple[int, int | None]]" = []
+    stack: "list[int | None]" = []
+    current: "int | None" = None
+    for match in _PACK_PRAGMA.finditer(text):
+        written = [one.strip() for one in match.group(1).split(",") if one.strip()]
+        if written and written[0] == "push":
+            stack.append(current)
+            current = int(written[1]) if len(written) > 1 and written[1].isdigit() else current
+        elif written and written[0] == "pop":
+            current = stack.pop() if stack else None
+        elif not written:
+            current = None
+        elif written[0].isdigit():
+            current = int(written[0])
+        found.append((match.end(), current))
+    return found
+
+
+def _pack_in_force(
+    regions: "list[tuple[int, int | None]]", at: int
+) -> "int | None":
+    """What `pack` was in force at that offset, if any."""
+
+    held: "int | None" = None
+    for where, value in regions:
+        if where > at:
+            break
+        held = value
+    return held
 #: What each class declares, read before the bodies are taken apart. A pass
 #: that runs after that has no body left to read, and asking one what a
 #: member's type is got no answer at all - which is how `v->x` on a plain
@@ -8672,7 +8723,14 @@ def _pointer_parameters(
 def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
     """The struct, and the free functions its methods become."""
 
-    lines = [f"struct {found.name} {{"]
+    packed = _CLASS_PACK.get(found.name)
+    lines = []
+    if packed is not None:
+        # Written around the struct rather than left where the program put
+        # it: the directive and the struct are moved apart before either is
+        # emitted, and the C compiler below reads a pragma where it stands.
+        lines.append(f"#pragma pack(push, {packed})")
+    lines.append(f"struct {found.name} {{")
     if found.base and found.base not in found.virtual_bases:
         # First, so a pointer to the derived object is a pointer to the base.
         lines.append(f"    struct {found.base} __base;")
@@ -8709,6 +8767,8 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
         # every struct holding one had the wrong size - quietly.
         lines.append("    char __empty;")
     lines.append("};")
+    if packed is not None:
+        lines.append("#pragma pack(pop)")
     return "\n".join(lines)
 
 
@@ -15417,12 +15477,22 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     _THROWN_KINDS.clear()
     _LAMBDA_RESULTS.clear()
     _CLASS_MEMBERS = {}
+    _CLASS_PACK.clear()
+    packing = _pack_regions(text)
     for one in _CLASS_HEAD.finditer(text):
         try:
             shut = _matching(text, one.end() - 1)
         except ValueError:
             continue
         _CLASS_MEMBERS[one.group(2)] = _members_declared(text[one.end(): shut - 1])
+        # What `#pragma pack` was in force where the class was *written*. The
+        # directives are moved to the top of the file and the class is
+        # emitted somewhere else again, so by the time it is written out
+        # there is nothing around it to say - and the struct came out with
+        # the padding the pragma was there to remove.
+        held = _pack_in_force(packing, one.start())
+        if held is not None:
+            _CLASS_PACK[one.group(2)] = held
     _POLYMORPHIC = _polymorphic_names(text)
     _INHERITED_FROM = {
         one for m in _CLASS_HEAD.finditer(text) for one in _bases_of(m)
@@ -15774,8 +15844,18 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # A class holding another must be defined after it: C needs the complete
     # type to lay out the field. Emitting in source order put `Car` before
     # `Engine` whenever that is how they were written.
+    # A struct with no methods is not a class here, so it is emitted from the
+    # text it was written as - and that text has been moved away from the
+    # `#pragma pack` that applied to it just as a class's has.
+    def _packed_body(body: str) -> str:
+        named = _CLASS_HEAD.search(body)
+        held = _CLASS_PACK.get(named.group(2)) if named is not None else None
+        if held is None:
+            return body
+        return f"#pragma pack(push, {held})\n{body}\n#pragma pack(pop)"
+
     declarations = "\n".join(
-        [*plain_bodies]
+        [_packed_body(one) for one in plain_bodies]
         + [
             _emit_class(classes[name], classes)
             for name in _by_dependency(order, classes)
