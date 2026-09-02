@@ -2739,6 +2739,48 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - what a conditional guarded, and a call on the implicit `this`
+
+The C++ stage moves every preprocessing directive to the top of the file it
+emits. For an `#include` that is right; for a conditional it was the one
+outcome this project calls unacceptable. The `#if` and its `#endif` went up
+while the lines they bracket stayed behind, so `#if 0` emitted an empty
+conditional above the file and three live statements in the middle of it, and
+both arms of an `#ifdef`/`#else` were compiled and both ran. A conditional is
+taken whole now. One holding nothing but directives still goes up, brackets
+and all - `#ifdef _WIN32` around an `#include` is how half the headers in the
+world open, and hoisting the `#include` *out* of its guard would have been the
+same mistake in the other direction.
+
+A method returning an object by value returns nothing in the C: the caller
+provides the space and the callee writes through a hidden pointer. The pass
+that writes the temporary out keys on a receiver being *written*, and C++ lets
+the receiver of a call on `this` go unwritten - so `name().c_str()` inside a
+method came out as `A__name(this).c_str()`, which is not C, while
+`this->name().c_str()` always worked.
+
+The pass that writes a class's operators out took the parentheses off around a
+bare name, and did not see the `if` in front of `if (p)` - so it wrote `if p`,
+which is not C either. That is the commonest thing anyone writes with a
+pointer, and it took `ComPtr` in `&lt;wrl.h&gt;` with it.
+
+A header you supply now wins over the copy py2bin ships. The C preprocessor
+always searched the given directories first; the C++ stage above it asked
+py2bin's own tables first, so a project keeping its own `vector` was compiled
+against py2bin's, silently. What stays py2bin's own is the includes written
+*inside* its own headers, so overriding one does not take the rest apart.
+
+Fifty corpus programs now each include one shipped header and use what it
+declares, built for every target. That map is what found two headers that
+compiled on five machines and not the sixth: `&lt;sys/types.h&gt;` spelled `ssize_t`
+itself while the compiler settles it from the target's data model, and they
+disagreed on Windows; `&lt;objidl.h&gt;` named two handles it never declared, so it
+built on Windows and nowhere else.
+
+And a fetch stopped at the first candidate that answered 404, because that is
+an `HTTPError` and the loops caught only py2bin's own `FetchError`. Six loops
+had it.
+
 ### 0.9.13 - four layouts that ran and answered wrongly
 
 The worst kind of bug this compiler can have is one where the program builds,
