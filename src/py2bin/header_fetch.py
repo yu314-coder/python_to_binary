@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 import struct
+import zipfile
 import urllib.parse
 from pathlib import Path
 
@@ -121,6 +122,16 @@ _MAX_PACKAGE = 96 * 1024 * 1024
 #: directory rather than the program's own, so that what was downloaded stays
 #: told apart from what was written.
 CACHE_DIRECTORY = ".py2bin-headers"
+
+
+#: What a candidate that did not answer raises. `FetchError` is py2bin's own
+#: way of saying "not here"; the rest are how the network and the archive
+#: reader say it. A guessed repository that does not exist answers 404, which
+#: urllib raises as an HTTPError - an OSError, and not a FetchError - and a
+#: package that downloads but is not an archive raises BadZipFile. Caught for
+#: `FetchError` alone, the first candidate failing that way ended the whole
+#: search, and a header one of the curated sets holds was reported missing.
+_DID_NOT_ANSWER = (FetchError, OSError, zipfile.BadZipFile)
 
 
 def _valid_name(name: str) -> str:
@@ -240,7 +251,7 @@ def fetch_header(
             return found
     try:
         packages = search_index(wanted, results=results)
-    except FetchError as error:
+    except _DID_NOT_ANSWER as error:
         packages = []
         reasons.append(f"the package index: {error}")
     for package in packages:
@@ -254,7 +265,7 @@ def fetch_header(
                 stem,
                 cache=cache,
             )
-        except FetchError as error:
+        except _DID_NOT_ANSWER as error:
             reasons.append(f"{package}: {error}")
             continue
         if found is not None:
@@ -475,7 +486,7 @@ def fetch_library(
             return found
     try:
         packages = search_index(stem, results=results)
-    except FetchError as error:
+    except _DID_NOT_ANSWER as error:
         packages = []
         reasons.append(f"the package index: {error}")
     for package in packages:
@@ -490,7 +501,7 @@ def fetch_library(
                 wanted,
                 cache=cache,
             )
-        except FetchError as error:
+        except _DID_NOT_ANSWER as error:
             reasons.append(f"{package}: {error}")
             continue
         if found is not None:
@@ -640,7 +651,7 @@ def _from_source(
         for full in search_source(wanted, results=results):
             if full not in repositories:
                 repositories.append(full)
-    except FetchError as error:
+    except _DID_NOT_ANSWER as error:
         # Not fatal any more: the sets are already on the list, and they are
         # where a platform header was always going to come from.
         reasons.append(f"the source host: {error}")
@@ -648,7 +659,7 @@ def _from_source(
         try:
             say(f"  trying {full}")
             found = _take_from_repository(full, wanted, into, say=say)
-        except FetchError as error:
+        except _DID_NOT_ANSWER as error:
             reasons.append(f"{full}: {error}")
             continue
         if found is not None:

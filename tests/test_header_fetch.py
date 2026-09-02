@@ -10,11 +10,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from py2bin import runtime_fetch
+from py2bin import header_fetch, runtime_fetch
 from py2bin.header_fetch import (
     HeaderFetchError,
     _valid_name,
@@ -38,6 +39,10 @@ class _Answers:
         self.asked.append(url)
         for prefix, payload in self.table.items():
             if url.startswith(prefix):
+                if isinstance(payload, Exception):
+                    # A canned failure: how a candidate that is not there
+                    # answers, which is not always a `FetchError`.
+                    raise payload
                 return payload
         raise runtime_fetch.FetchError(f"nothing canned for {url}")
 
@@ -223,6 +228,46 @@ class FetchFromSourceTests(unittest.TestCase):
             self.assertEqual(kept, into / "nlohmann" / "json.hpp")
             # And what it includes came with it, one directory down.
             self.assertTrue((into / "nlohmann" / "detail" / "macro.hpp").is_file())
+
+    def test_a_guess_that_answers_404_does_not_end_the_search(self):
+        """The repository read out of the include path may not exist.
+
+        `who/what.h` is asked of `who/what` first, because an include with a
+        directory in it nearly always names its own repository. When it does
+        not, the host answers 404 - which urllib raises as an HTTPError, an
+        OSError and not a `FetchError`. Only `FetchError` was caught, so that
+        first guess took every later candidate with it and a header one of
+        the curated sets holds was reported missing.
+        """
+
+        # `_TREES` is a module-level cache of file lists by repository and
+        # branch. It is what stops a build that fetches a dozen headers from
+        # one set asking a dozen times, and it also outlives a test - so a
+        # canned tree from an earlier one answers for `wine-mirror/wine` here
+        # and this passes or fails by the order the suite happens to run in.
+        header_fetch._TREES.clear()
+        missing = urllib.error.HTTPError(
+            "https://api.github.com/repos/who/what", 404, "Not Found", {}, None
+        )
+        table = {
+            "https://api.github.com/repos/who/what": missing,
+            "https://api.github.com/repos/wine-mirror/wine/git/trees": json.dumps(
+                {"tree": [{"type": "blob", "path": "include/who/what.h"}]}
+            ).encode(),
+            "https://api.github.com/repos/wine-mirror/wine": json.dumps(
+                {"default_branch": "master"}
+            ).encode(),
+            "https://raw.githubusercontent.com/wine-mirror/wine/": b"/* from the set */",
+            "https://api.github.com/search": json.dumps({"items": []}).encode(),
+        }
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work) / "headers"
+            with _Downloader(table) as asked:
+                kept = fetch_header("who/what.h", into)
+            self.assertEqual(kept.read_text(), "/* from the set */")
+        # It really did try the guess first, and really did carry on past it.
+        self.assertTrue(any("repos/who/what" in one for one in asked.asked))
+        self.assertTrue(any("wine-mirror" in one for one in asked.asked))
 
     def test_the_package_index_is_not_asked_when_the_name_names_a_repository(self):
         with tempfile.TemporaryDirectory() as work:
