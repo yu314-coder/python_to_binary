@@ -1928,12 +1928,14 @@ def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]
     out.append(text[at:])
     return "".join(out), bodies
 
-def _hoist_tagged_types(text: str) -> "tuple[str, str]":
+def _hoist_tagged_types(text: str) -> "tuple[str, list[str]]":
     """Take every top-level `enum`/`union` definition out, with its typedef.
 
-    Returns what is left and what was taken. They are put back above the
+    Returns what is left and each of the ones taken. Most go back above the
     struct definitions, because a struct holding one needs the complete type
-    and C reads a file top to bottom.
+    and C reads a file top to bottom - but one that holds a *class* needs the
+    class first, so which side of them each goes is decided where they are
+    put back rather than here.
     """
 
     taken: list[str] = []
@@ -1981,7 +1983,7 @@ def _hoist_tagged_types(text: str) -> "tuple[str, str]":
         out.append(text[at:start])
         at = end
     out.append(text[at:])
-    return "".join(out), "\n".join(taken)
+    return "".join(out), taken
 
 
 def _tag_typedef(name: str, text: str) -> str:
@@ -2829,8 +2831,7 @@ def _lift_nested_classes(text: str) -> str:
     moved out under a name that keeps that, and `Outer::Inner` follows it.
     """
 
-    lifted: list[str] = []
-    while True:
+    for _round in range(_HOIST_ROUNDS):
         moved = False
         for head in _CLASS_HEAD.finditer(text):
             try:
@@ -2849,6 +2850,13 @@ def _lift_nested_classes(text: str) -> str:
             end = inner_close
             while end < len(text) and text[end] in " \t":
                 end += 1
+            # `struct Mid { ... } m;` says two things at once: it defines
+            # the type and declares a member of it. Taken out whole, the
+            # member's name went with the type and the outer class was
+            # left holding `{ m;` - a declaration with no type, which is
+            # not C. What stays behind is the member, written with the
+            # name the type has now.
+            member = re.match(r"([A-Za-z_]\w*)\s*;", text[end:])
             if end < len(text) and text[end] == ";":
                 end += 1
             outer, name = head.group(2), inner.group(2)
@@ -2876,8 +2884,17 @@ def _lift_nested_classes(text: str) -> str:
                 applied = f"{spelled}<{', '.join(named)}>"
             else:
                 applied = spelled
-            lifted.append(taken)
-            text = text[:start] + text[end:]
+            kept = ""
+            if member is not None:
+                # The span stopped at the `}`, so the `;` that ended the
+                # declaration went with the member and not with the type.
+                taken = taken.rstrip() + ";"
+                kept = f"{spelled} {member.group(1)};"
+                end += member.end()
+            # Put back at the front rather than set aside in a list: a
+            # class nested two deep holds a class of its own, and one the
+            # loop never reads again was lifted once and left holding it.
+            text = taken + "\n" + text[:start] + kept + text[end:]
             # `Outer<int>::Inner` names the copy for those arguments.
             text = _map_code(
                 text,
@@ -2915,7 +2932,7 @@ def _lift_nested_classes(text: str) -> str:
             moved = True
             break
         if not moved:
-            return "\n".join(lifted) + ("\n" if lifted else "") + text
+            return text
 
 
 def _settled_parameters(
@@ -15735,8 +15752,21 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         remainder = re.sub(
             rf"^typedef .*\(\*{_FUNCTION_TYPE}\w+\)\(.*\);$", "", remainder, flags=re.M
         )
+    # A union holding a class needs the class first, and a class holding a
+    # union needs the union first - so which side of the class definitions
+    # each one goes is decided by what it names. Written out above them
+    # always, `union U { Inner in; };` was emitted before `Inner` existed.
+    def _names_a_class(body: str) -> bool:
+        without = _without_literals(body)
+        return any(
+            re.search(rf"(?<![.\w>]){re.escape(name)}\b", without)
+            for name in classes
+        )
+
+    tagged_after = [one for one in tagged if _names_a_class(one)]
+    tagged_before = [one for one in tagged if one not in tagged_after]
     typedefs = "\n".join(
-        [tagged] * bool(tagged)
+        tagged_before
         + [f"typedef struct {name} {name};" for name in [*order, *plain]]
         # After the structs: one of these may name a struct in its parameters.
         + function_types
@@ -15866,6 +15896,8 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             _emit_heap_helpers(classes[name], classes)
             for name in [*order, *allocated]
         )
+    if tagged_after:
+        definitions += "\n" + "\n".join(tagged_after)
     whole = f"{head}\n{typedefs}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
     # A call made through a variable, here rather than while each body was
     # rewritten: the variable's type is a typedef that instantiating a
