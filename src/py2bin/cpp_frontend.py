@@ -15441,6 +15441,13 @@ def translate(source: str, filename: str = "<c++>") -> str:
     return _fill_empty_structs(_translate(source, filename))
 
 
+#: A directive that opens a conditional region, and the one that closes it.
+#: `#else` and `#elif` need no pattern of their own: they are inside a region
+#: that is already being gathered, and a region is taken whole.
+_OPENS_A_CONDITION = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b")
+_CLOSES_A_CONDITION = re.compile(r"^\s*#\s*endif\b")
+
+
 def _translate(source: str, filename: str = "<c++>") -> str:
     """Translate the C++ subset in `source` into C.
 
@@ -15929,10 +15936,48 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Directives first. The struct and its methods are emitted above whatever
     # is left of the file, and a method that calls printf needs <stdio.h>
     # declared before it rather than wherever the author happened to write it.
+    #
+    # A conditional is the exception, and moving one was the worst thing this
+    # function did: `#if` and its `#endif` went to the top while the lines
+    # they bracket stayed behind, so an `#if 0` around three statements
+    # emitted an empty conditional above the file and three live statements
+    # in the middle of it. Both arms of an `#ifdef`/`#else` ran. Nothing
+    # said so - the program built and printed what it was never asked to.
+    #
+    # So a conditional keeps what it guards. One holding nothing but
+    # directives still goes up, brackets and all: `#ifdef _WIN32` around an
+    # `#include` is how half the headers in the world open, and hoisting the
+    # region whole is what keeps the include above the methods that need it
+    # while still letting the condition decide. Hoisting the `#include` *out*
+    # of it would be the same mistake in the other direction - the header
+    # would be read whether or not the condition held.
     directives = []
     kept_lines = []
-    for line in remainder.split("\n"):
+    lines = remainder.split("\n")
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if _OPENS_A_CONDITION.match(line):
+            region = []
+            depth = 0
+            while index < len(lines):
+                here = lines[index]
+                region.append(here)
+                index += 1
+                if _OPENS_A_CONDITION.match(here):
+                    depth += 1
+                elif _CLOSES_A_CONDITION.match(here):
+                    depth -= 1
+                    if depth == 0:
+                        break
+            guards_code = any(
+                stripped and not stripped.startswith("#")
+                for stripped in (part.strip() for part in region)
+            )
+            (kept_lines if guards_code else directives).extend(region)
+            continue
         (directives if line.lstrip().startswith("#") else kept_lines).append(line)
+        index += 1
     remainder = "\n".join(kept_lines)
 
     # Typedefs first, as forward declarations. `Vec v;` is a declaration in
