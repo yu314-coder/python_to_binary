@@ -16818,6 +16818,22 @@ def _deref_references(
                     rf"\b{re.escape(n)}\s*\.", f"{n}->", part
                 ),
             )
+            # `sizeof r` asks how big the object is, and the pointer standing
+            # in for the reference is not it. Every other use of a reference
+            # to a class wants the pointer - that is why it is left alone
+            # above - but this one wants what it points at, and left alone it
+            # answered eight for every object on a 64-bit machine. Silently:
+            # `memset(&r, 0, sizeof r)` cleared eight bytes of whatever size
+            # the object really was.
+            body = _map_code(
+                body,
+                lambda part, n=name: re.sub(
+                    rf"\bsizeof\s*(?:\(\s*{re.escape(n)}\s*\)"
+                    rf"|(?<![.\w>]){re.escape(n)}\b(?!\s*[\w(]))",
+                    f"sizeof(*{n})",
+                    part,
+                ),
+            )
             continue
         body = _map_code(
             body,
