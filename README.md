@@ -1741,6 +1741,18 @@ not special cases in the compiler:
   `<climits>`, `<cfloat>`, `<cctype>`, `<cstdio>`, `<cstdlib>`, `<cstring>`,
   `<cmath>`, `<cstdint>` as names for the C headers underneath.
 
+**Yours wins.** All of those are the fallback, not the answer: a directory
+named with `--include` is searched first, so a project that keeps its own
+`vector` — or points at an SDK holding a header of a name py2bin also has —
+is compiled against the file on disk, either spelling of the include. py2bin
+reached for its own copy first once, and a program was built against
+different macros and a different layout with nothing said about it. What is
+still py2bin's own is the includes written *inside* these headers: `<bitset>`
+is built on py2bin's `<string>` and keeps getting that one, so overriding a
+header does not take the rest of them apart. A real standard library gets
+that for free by including reserved names nobody writes; these are spelled
+the way your program spells them and cannot.
+
 ```cpp
 #include <iostream>
 int main() { std::cout << "Hello, world!" << std::endl; return 0; }

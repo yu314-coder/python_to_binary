@@ -1,0 +1,12 @@
+// A project that keeps a header of its own under a name py2bin also ships.
+// The compiler searches the directories it was given before it reaches for
+// one of its own copies, so this is the `vector` this program is built
+// against - py2bin used to hand over its own and say nothing.
+#pragma once
+
+class Reading {
+public:
+    int celsius;
+    Reading(int c) { celsius = c; }
+    int fahrenheit() const { return celsius * 9 / 5 + 32; }
+};

@@ -313,6 +313,125 @@ class SeveralFiles(unittest.TestCase):
             translate(pasted, str(source))
 
 
+class VendoredHeaders(unittest.TestCase):
+    """A header the project supplies itself beats the one py2bin ships.
+
+    py2bin carries its own text for a few dozen headers, and it used to reach
+    for that text before it looked at the search path at all. A project that
+    vendors its own `vector`, or points `--include` at an SDK holding a header
+    of a name py2bin also has, was compiled against py2bin's copy instead -
+    different macros, a different layout, and not a word said about it. A
+    compiler searches the directories it was given first and falls back to its
+    own, and so does this now.
+    """
+
+    def own(self, root: Path, named: str, text: str) -> None:
+        (root / "own").mkdir(exist_ok=True)
+        (root / "own" / named).write_text(text, encoding="utf-8")
+
+    def test_the_projects_own_vector_wins_over_py2bins(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            self.own(root, "vector", "#pragma once\nclass Marker { public: int n; };\n")
+            source = root / "main.cpp"
+            source.write_text(
+                "#include <vector>\nint main(void){ Marker m; m.n = 1; return m.n; }\n",
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(
+                source, (str(root / "own"),), set(), set()
+            )
+            self.assertIn("class Marker", pasted)
+            self.assertNotIn("class vector", pasted)
+
+    def test_the_quoted_spelling_reaches_it_too(self) -> None:
+        """Which brackets it wears says where to look, not whose copy wins."""
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            self.own(root, "vector", "#pragma once\nclass Marker { public: int n; };\n")
+            source = root / "main.cpp"
+            source.write_text(
+                '#include "vector"\nint main(void){ Marker m; m.n = 1; return m.n; }\n',
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(
+                source, (str(root / "own"),), set(), set()
+            )
+            self.assertIn("class Marker", pasted)
+            self.assertNotIn("class vector", pasted)
+
+    def test_a_c_header_under_its_cplusplus_name_too(self) -> None:
+        """`<cstring>` is answered with py2bin's `<string.h>` when nobody
+        else has one; a project that ships a `cstring` has one."""
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            self.own(root, "cstring", "#pragma once\n#define VENDORED_CSTRING 1\n")
+            source = root / "main.cpp"
+            source.write_text("#include <cstring>\nint main(void){ return 0; }\n", encoding="utf-8")
+            pasted = inline_local_includes(
+                source, (str(root / "own"),), set(), set()
+            )
+            self.assertIn("VENDORED_CSTRING", pasted)
+            self.assertNotIn("#include <string.h>", pasted)
+
+    def test_py2bins_own_headers_still_reach_each_other(self) -> None:
+        """Overriding one of them must not take the rest apart.
+
+        py2bin's <bitset> is written on top of py2bin's <string>. The include
+        that reaches for it was written inside py2bin's own header, not by the
+        program, so it keeps getting py2bin's - the way a real standard
+        library protects itself by including reserved names nobody writes.
+        Resolved against the search path instead, a project with a `string` of
+        its own would have found <bitset> broken by it.
+        """
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            self.own(root, "string", "#pragma once\nclass MyString { public: int n; };\n")
+            source = root / "main.cpp"
+            source.write_text(
+                "#include <bitset>\n#include <string>\n"
+                "int main(void){ MyString s; s.n = 1; std::bitset<8> b; return (int)b.count() + s.n; }\n",
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(
+                source, (str(root / "own"),), set(), set()
+            )
+            # Both are here: the project's own, because the program asked for
+            # it, and py2bin's, because <bitset> asked for that one.
+            self.assertIn("class MyString", pasted)
+            self.assertIn("class string {", pasted)
+            translate(pasted, str(source))
+
+    def test_a_fetched_copy_does_not_shadow_what_py2bin_ships(self) -> None:
+        """`--auto-fetch` downloads a header's neighbours along with it.
+
+        A build that once fetched anything out of a Windows set leaves that
+        set's copy of a header py2bin ships in the cache, and taking it would
+        shadow py2bin's own with one that cannot compile here - for every
+        build afterwards. A directory somebody named themselves is their own
+        choice; that one is not.
+        """
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            cache = root / ".py2bin-headers"
+            cache.mkdir()
+            (cache / "vector").write_text(
+                "#pragma once\nclass Marker { public: int n; };\n", encoding="utf-8"
+            )
+            source = root / "main.cpp"
+            source.write_text(
+                "#include <vector>\nint main(void){ std::vector<int> v; v.push_back(1); return v[0]; }\n",
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(source, (str(cache),), set(), set())
+            self.assertIn("class vector", pasted)
+            self.assertNotIn("class Marker", pasted)
+
+
 class WhereItIsWritten(unittest.TestCase):
     """`__LINE__` and `__FILE__` against the file the user opened.
 

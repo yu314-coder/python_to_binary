@@ -21066,6 +21066,22 @@ def is_cpp(path: Path) -> bool:
     return path.suffix.lower() in CPP_SUFFIXES
 
 
+def _py2bin_ships(named: str) -> bool:
+    """Whether py2bin has a copy of this header of its own to hand over.
+
+    Both tables, because both are answers to the same question: the C++ ones
+    this stage pastes, and the C ones the preprocessor below serves.
+    """
+
+    from .c_preprocessor import _BUILTIN_HEADERS
+
+    return (
+        named in _BUILTIN_CPP_HEADERS
+        or named in _BUILTIN_HEADERS
+        or _c_header_under(named) is not None
+    )
+
+
 def _somebody_supplies(named: str, include_dirs: "tuple[str, ...]") -> bool:
     """Whether anything will ever hand this header over.
 
@@ -21073,13 +21089,47 @@ def _somebody_supplies(named: str, include_dirs: "tuple[str, ...]") -> bool:
     name none of those holds is a name no pass below can answer either.
     """
 
-    from .c_preprocessor import _BUILTIN_HEADERS
-
-    if named in _BUILTIN_CPP_HEADERS or named in _BUILTIN_HEADERS:
-        return True
-    if _c_header_under(named) is not None:
+    if _py2bin_ships(named):
         return True
     return any((Path(folder) / named).is_file() for folder in include_dirs)
+
+
+def _found_on_the_path(
+    named: str, here: "Path | None", include_dirs: "tuple[str, ...]"
+) -> "Path | None":
+    """The file the search path answers this include with, if it holds one.
+
+    A compiler looks in the directories it was given before it reaches for a
+    copy of its own, so a project that vendors a header py2bin happens to
+    ship - its own `string.h`, or an SDK's `unknwn.h` - is compiled against
+    the one it wrote. py2bin preferred its own and said nothing, so a program
+    was built against different macros and a different layout than the file
+    sitting on disk beside it.
+
+    `here` is the including file's own directory, which a quoted include
+    searches first and an angled one does not.
+    """
+
+    from .c_preprocessor import _FETCHED_INTO
+
+    for folder in (
+        *(() if here is None else (here,)),
+        *(Path(item) for item in include_dirs),
+    ):
+        candidate = folder / named
+        if not candidate.is_file():
+            continue
+        # Except out of the directory `--auto-fetch` downloads into. A fetched
+        # set brings its neighbours along, so a build that once fetched
+        # anything from a Windows set left that set's `winnt.h` there, and
+        # taking it would shadow py2bin's own with a copy that cannot compile
+        # here - for every build afterwards. The preprocessor below draws the
+        # same line for the same reason. A directory somebody named
+        # themselves is their own choice and still wins.
+        if _FETCHED_INTO in candidate.parts and _py2bin_ships(named):
+            continue
+        return candidate
+    return None
 
 
 def _which_file(path: Path) -> object:
@@ -21185,10 +21235,13 @@ def inline_local_includes(
     would leave the calls alone - producing C that does not compile, blaming a
     line the user did write for a declaration they put somewhere else.
 
-    Only quoted includes are pasted. An angled one names a header py2bin
-    ships, which is C already, and the preprocessor handles it as it always
-    has. A header already pasted is skipped rather than pasted twice, which is
-    what an include guard would have done anyway.
+    Either spelling is pasted, and the two differ only in where the file is
+    looked for: quoted searches the including file's own directory first,
+    angled does not. The search path is asked before py2bin reaches for a copy
+    of its own, which is the order a compiler searches in - what py2bin ships
+    is the fallback for a header nobody else has. A header already pasted is
+    skipped rather than pasted twice, which is what an include guard would
+    have done anyway.
     """
 
     seen = set() if seen is None else seen
@@ -21224,7 +21277,7 @@ def inline_local_includes(
         # of <string> - so what is pasted is pasted again. Without it the
         # inner include survived into the C, and the compiler reported a
         # missing header the user never wrote.
-        return _ANY_INCLUDE.sub(reach, supplied)
+        return _ANY_INCLUDE.sub(lambda found: reach(found, ours=True), supplied)
 
     def chosen_branch(named: str, candidate: Path) -> str:
         """The one branch of a header that declares two, as C++ sees it."""
@@ -21243,24 +21296,70 @@ def inline_local_includes(
             seen_headers,
         )
 
-    def reach(match: "re.Match[str]") -> str:
+    def reach(match: "re.Match[str]", ours: bool = False) -> str:
         """Whatever this include names, however it is spelled.
 
-        A quoted include falls back to what py2bin ships when the local
-        search finds nothing, which is what C says.
+        The search path is looked at first and what py2bin ships is the
+        fallback, which is the order a compiler searches in: a project that
+        vendors its own copy of a header py2bin happens to ship gets the one
+        it wrote, and finds out about it either way rather than being handed
+        a different file in silence.
+
+        `ours` says the include was written inside one of py2bin's own
+        headers rather than by the program, and those keep reaching py2bin's
+        own: <bitset> is written on top of py2bin's <string>, and a project
+        that supplies a `string` of its own would otherwise have taken
+        <bitset> apart along with everything else that leans on one. A real
+        standard library is spared this because it includes reserved names
+        nobody writes - `<__fwd/string.h>` - which headers spelled the way
+        the program spells them cannot do.
         """
 
         named = match.group(1) or match.group(2)
+        angled = match.group(2) is not None
+        if ours:
+            supplied = supply(named)
+            if supplied is not None:
+                return supplied
+        # Angled, so the file's own directory is not searched - which is the
+        # rule C gives and matters here, because a fetch leaves its copy
+        # right beside the program.
+        candidate = _found_on_the_path(
+            named, None if angled else path.parent, include_dirs
+        )
+        if candidate is not None:
+            if _CHOOSES_A_BRANCH.search(
+                candidate.read_text(encoding="utf-8", errors="replace")
+            ):
+                # A header that declares one thing or another according to a
+                # macro cannot be read as it stands: this pass runs before
+                # the preprocessor and has no `#if`, so it would take both
+                # branches - and the one meant for C is written in shapes
+                # that mean something else here. `interface X { ... }` came
+                # out as `interface X = { ... };`.
+                #
+                # So the preprocessor runs first, for this header alone and
+                # with `__cplusplus` defined, and what comes back is the one
+                # branch a C++ compiler would have been handed. A generated
+                # COM header declares each interface twice and picks between
+                # them on exactly that, and a program calling one the C++ way
+                # - `view->Navigate(url)` - needs the classes.
+                return chosen_branch(named, candidate)
+            # The program's own headers are read here whatever they are
+            # called, and whichever way they are spelled. The two spellings
+            # differ in *where* C looks and never in how it reads what it
+            # finds: the same header included with quotes was pasted and
+            # translated, and included with angles was handed below
+            # untouched, so a class in it reached a C compiler and the
+            # constructor was reported as a type it had never heard of.
+            return inline_local_includes(
+                candidate, include_dirs, seen, seen_headers, target
+            )
         supplied = supply(named)
         if supplied is not None:
             return supplied
-        if match.group(2) is not None:
-            # Angled, so the file's own directory is not searched - which
-            # is the rule C gives and matters here, because a fetch leaves
-            # its copy right beside the program.
-            if "." not in named and not any(
-                (Path(folder) / named).is_file() for folder in include_dirs
-            ):
+        if angled:
+            if "." not in named:
                 # A C++ standard header, spelled the way only those are, that
                 # py2bin does not implement. Left to be fetched, what arrives
                 # is a real standard library's copy - written in namespaces,
@@ -21294,44 +21393,6 @@ def inline_local_includes(
                     f"{', '.join(sorted(h for h in _BUILTIN_CPP_HEADERS if '.' not in h))}; "
                     f"name a directory with --include DIR to use your own.",
                 )
-            # Not one py2bin ships, so it is the program's own - and the
-            # program's own headers are read here, whatever they are called.
-            # The two spellings differ in *where* C looks and never in how it
-            # reads what it finds: the same header included with quotes was
-            # pasted and translated, and included with angles was handed
-            # below untouched, so a class in it reached a C compiler and the
-            # constructor was reported as a type it had never heard of.
-            #
-            # Header names with no extension are C++ ones by spelling, and
-            # their own includes are C++ headers this stage knows and the
-            # preprocessor does not - which is the other half of the same
-            # thing.
-            if True:
-                for folder in (Path(d) for d in include_dirs):
-                    candidate = folder / named
-                    if not candidate.is_file():
-                        continue
-                    if _CHOOSES_A_BRANCH.search(
-                        candidate.read_text(encoding="utf-8", errors="replace")
-                    ):
-                        return chosen_branch(named, candidate)
-                    if named in seen_headers:
-                        return ""
-                    seen_headers.add(named)
-                    return inline_local_includes(
-                        candidate, include_dirs, seen, seen_headers, target
-                    )
-            # Angled and not one of py2bin's own. Still looked for on the
-            # search path, because one that chooses a branch has to be read
-            # here rather than left to the preprocessor - a program writes
-            # `#include <WebView2.h>` as readily as it writes the other
-            # spelling, and which one it used says nothing about that.
-            for folder in (Path(d) for d in include_dirs):
-                candidate = folder / named
-                if candidate.is_file() and _CHOOSES_A_BRANCH.search(
-                    candidate.read_text(encoding="utf-8", errors="replace")
-                ):
-                    return chosen_branch(named, candidate)
             # Nothing on the search path holds it, py2bin does not ship it,
             # and neither does the preprocessor below. Nothing later will
             # supply it either, so the program cannot build - and saying so
@@ -21345,31 +21406,6 @@ def inline_local_includes(
                     _line_of(text, match.start()),
                     f"cannot find the header {named!r}",
                 )
-            return match.group(0)
-        for folder in (path.parent, *(Path(d) for d in include_dirs)):
-            candidate = folder / named
-            if not candidate.is_file():
-                continue
-            if _CHOOSES_A_BRANCH.search(
-                candidate.read_text(encoding="utf-8", errors="replace")
-            ):
-                # A header that declares one thing or another according to a
-                # macro cannot be read as it stands: this pass runs before
-                # the preprocessor and has no `#if`, so it would take both
-                # branches - and the one meant for C is written in shapes
-                # that mean something else here. `interface X { ... }` came
-                # out as `interface X = { ... };`.
-                #
-                # So the preprocessor runs first, for this header alone and
-                # with `__cplusplus` defined, and what comes back is the one
-                # branch a C++ compiler would have been handed. A generated
-                # COM header declares each interface twice and picks between
-                # them on exactly that, and a program calling one the C++ way
-                # - `view->Navigate(url)` - needs the classes.
-                return chosen_branch(named, candidate)
-            return inline_local_includes(
-                candidate, include_dirs, seen, seen_headers, target
-            )
         # Not ours to paste; leave it for the preprocessor to fail on clearly.
         return match.group(0)
 
