@@ -2135,7 +2135,14 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     # remember which.
     text = _map_code(
         text,
-        lambda part: re.sub(r"\bnullptr\b", "0", re.sub(r"\bbool\b", "int", part)),
+        # `_Bool` and not `int`: C++'s `bool` holds 0 and 1 and is one byte,
+        # which is what `_Bool` is. Written as `int` it was a *signed* type,
+        # so `bool flag : 1;` - which is how every header writes a flag -
+        # held only 0 and -1, and a field set to `true` compared unequal to
+        # it. `sizeof` was wrong by four times as well.
+        lambda part: re.sub(
+            r"\bnullptr\b", "0", re.sub(r"\bbool\b", "_Bool", part)
+        ),
     )
     text = _map_code(
         text,
@@ -8069,6 +8076,10 @@ def _expand_com_spellings(text: str) -> str:
     return text
 
 
+#: `alignas(N)` and C11's `_Alignas(N)`, in any position.
+_ALIGNAS = re.compile(r"(?<![.\w>])(alignas|_Alignas)\s*\(")
+
+
 def _refuse_unsupported(text: str, filename: str) -> None:
     """Name the C++ this does not do, before it becomes broken C.
 
@@ -8092,6 +8103,22 @@ def _refuse_unsupported(text: str, filename: str) -> None:
                 f"C; anything that needs a real C++ compiler is refused here "
                 f"rather than mistranslated",
             )
+    # `alignas` decides where every member after it sits. py2bin implements
+    # none of its spellings, and on a *member* it was not even refused: the
+    # declaration was read as something else and the member vanished from the
+    # struct, so `struct { char head; alignas(16) char body; }` had sizeof 1
+    # where C++ says 32. A layout that runs and is wrong is the failure worth
+    # the most care, so it is refused by name.
+    for found in _ALIGNAS.finditer(_without_literals(text)):
+        raise CppTranslationError(
+            filename,
+            _line_of(text, found.start()),
+            f"`{found.group(1)}` decides where the member after it sits, and "
+            f"py2bin does not implement it. Read as an ordinary declaration "
+            f"the member was dropped from the struct altogether, which is a "
+            f"layout that runs and answers wrongly - so it is refused here "
+            f"instead",
+        )
     for header in re.finditer(r"#\s*include\s*<([^>]+)>", text):
         name = header.group(1)
         if name in _BUILTIN_CPP_HEADERS or _c_header_under(name) is not None:
@@ -16912,6 +16939,43 @@ def _fold_constant_definitions(whole: str) -> str:
 _CONDITION_CALL = re.compile(r"(?<![.\w>])(if|while)\s*\(\s*([A-Za-z_]\w*)\s*\(")
 
 
+def _conversion_for_a_condition(
+    owner: str, classes: "dict[str, Class]"
+) -> "str | None":
+    """The conversion a condition uses to ask an object whether it is true.
+
+    C++ asks for `operator bool`. What that is spelled as in the C this emits
+    is whatever `_rewrite_cpp_spellings` settled on, and spelling it a second
+    time here is what made `while (in >> n)` spin forever the day `bool`
+    stopped being written `int`: this asked for a conversion named after the
+    old spelling, did not find one, and quietly left the condition testing the
+    pointer - which is never null. So the class is asked what conversions it
+    has rather than told what to have. Any that answers a plain value is one a
+    condition can test; one that answers a pointer or another object is not.
+    """
+
+    for seen in [owner, *_every_base(owner, classes)]:
+        found = classes.get(seen)
+        if found is None:
+            continue
+        for method in found.methods:
+            if not method.name.startswith(_CONVERSION_PREFIX):
+                continue
+            if "*" in method.returns or "&" in method.returns:
+                continue
+            words = [
+                word
+                for word in re.sub(
+                    r"\b(const|volatile)\b", " ", method.returns
+                ).split()
+                if word
+            ]
+            if not words or words[-1] in classes:
+                continue
+            return method.name
+    return None
+
+
 def _ask_a_class_whether_it_is_true(
     whole: str, classes: "dict[str, Class]"
 ) -> str:
@@ -16935,7 +16999,10 @@ def _ask_a_class_whether_it_is_true(
             owner, mark, _rest = called.partition("__op_")
             if not mark or owner not in classes:
                 continue
-            asked = _c_name(owner, _CONVERSION_PREFIX + "int")
+            method = _conversion_for_a_condition(owner, classes)
+            if method is None:
+                continue
+            asked = _c_name(_find_method(owner, method, classes) or owner, method)
             if re.search(rf"(?<![.\w>]){re.escape(asked)}\s*\(", bare) is None:
                 continue
             # It has to answer a reference to its own class; an operator that

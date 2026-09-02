@@ -822,13 +822,16 @@ def lay_out(
     struct: StructType,
     members: "list[tuple[str, CType] | tuple[str, CType, int]]",
     pack: "int | None" = None,
-) -> None:
+) -> "list[tuple[str, int, int]]":
     """Assign member offsets and set the struct's size and alignment.
 
-    A member given a width is a bitfield: it is packed into a storage unit of
-    its own declared type, and the next one continues in the same unit while
-    it fits. That is what every ABI py2bin targets does, and it is the only
-    part of a bitfield's layout C says anything about beyond "it fits".
+    A member given a width is a bitfield: it takes the next free bits, and
+    starts a fresh unit only when it would otherwise cross a boundary of its
+    own declared type. Under a `#pragma pack` there is no such boundary and
+    the fields go in tight. Returns the bitfields whose bits ended up spread
+    over more bytes than their own type is wide, which only a pack can do and
+    which the caller must refuse: `load_bitfield` reads a field with a single
+    load of its declared width, and there is no such load for those.
 
     `pack` is what `#pragma pack` last said: a cap on how far any member may
     be padded forward, and on the whole struct's own alignment. It is a cap
@@ -839,10 +842,11 @@ def lay_out(
     placed: list[Member] = []
     offset = 0
     alignment = 1
-    #: Where the bitfield being filled starts, and how much of it is used.
-    unit_at = -1
-    unit_bits = 0
-    unit_size = 0
+    #: The next free bit, counted from the start of the struct, while a run of
+    #: bitfields is being placed. -1 between runs.
+    bit_at = -1
+    #: Bitfields no single load can read; see the returned value.
+    too_wide: "list[tuple[str, int, int]]" = []
     for entry in members:
         name, ctype = entry[0], entry[1]
         width = entry[2] if len(entry) > 2 else None
@@ -852,25 +856,45 @@ def lay_out(
         member_size = size_of(ctype) or 0
         alignment = max(alignment, member_alignment)
         if width is not None and not struct.is_union:
+            if bit_at < 0:
+                bit_at = offset * 8
             if width == 0:
-                # Closes whatever unit is being filled and takes no bits of
-                # its own, which is the only thing C gives a zero width to
-                # mean. It does not reserve a unit: the next field starts one.
-                offset = (offset + member_alignment - 1) & ~(member_alignment - 1)
-                unit_at, unit_bits, unit_size = -1, 0, 0
+                # Closes whatever run is being filled and takes no bits of its
+                # own, which is the only thing C gives a zero width to mean. It
+                # aligns to the declared type's own boundary, and a pack does
+                # not narrow this one the way it narrows everything else.
+                full = member_size * 8
+                if full:
+                    bit_at = (bit_at + full - 1) & ~(full - 1)
+                offset = max(offset, (bit_at + 7) // 8)
                 continue
-            if unit_at < 0 or unit_size != member_size or (
-                unit_bits + width > member_size * 8
-            ):
-                # A new storage unit: this one is full, or the first, or of a
-                # different width.
-                offset = (offset + member_alignment - 1) & ~(member_alignment - 1)
-                unit_at, unit_bits, unit_size = offset, 0, member_size
-                offset += member_size
-            placed.append(Member(name, ctype, unit_at, width, unit_bits))
-            unit_bits += width
+            # A field takes the next free bits, and only starts further along
+            # when it would otherwise cross a boundary of its own declared
+            # type. Read as "a new unit whenever the declared size differs",
+            # `unsigned char a : 3; unsigned int b : 5;` was given two separate
+            # words and came out twice the size C gives it - and every struct
+            # whose layout has to match something on disk or on a wire was
+            # quietly wrong, because each field still read back what was
+            # written to it.
+            boundary = 0 if pack is not None else member_size * 8
+            start = bit_at
+            if boundary and start // boundary != (start + width - 1) // boundary:
+                start = (start + boundary - 1) & ~(boundary - 1)
+            # The unit a load reads: the narrowest aligned run of bytes that
+            # holds the whole field. Narrowest because a wider one can reach
+            # past the end of a packed struct.
+            first, last = start // 8, (start + width - 1) // 8
+            held = 1
+            while last >= first - first % held + held:
+                held *= 2
+            if held > member_size:
+                too_wide.append((name, held, member_size))
+            unit_at = first - first % held
+            placed.append(Member(name, ctype, unit_at, width, start - unit_at * 8))
+            bit_at = start + width
+            offset = max(offset, (bit_at + 7) // 8)
             continue
-        unit_at, unit_bits, unit_size = -1, 0, 0
+        bit_at = -1
         if struct.is_union:
             placed.append(Member(name, ctype, 0, width, 0))
             offset = max(offset, member_size)
@@ -883,6 +907,7 @@ def lay_out(
     struct.members = tuple(placed)
     struct.alignment = alignment
     struct.size = (offset + alignment - 1) & ~(alignment - 1)
+    return too_wide
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1958,7 +1983,14 @@ class Parser:
             self.take(";")
         if not members:
             self.error("an empty struct has no size in C", keyword)
-        lay_out(struct, members, self.pack)
+        for field, spans, declared in lay_out(struct, members, self.pack):
+            self.error(
+                f"the bitfield {field!r} is packed across {spans} bytes but is "
+                f"declared {declared} wide, and py2bin reads a bitfield with a "
+                f"single load of its declared type. Give it a wider type, or "
+                f"order the members so it does not straddle one.",
+                keyword,
+            )
         return struct
 
     def bitfield_width(self, ctype: CType, name: str, token: Token) -> int:
