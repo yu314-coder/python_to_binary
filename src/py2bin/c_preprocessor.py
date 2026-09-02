@@ -36,7 +36,12 @@ What is accepted
   short-circuiting ``&&``, ``||`` and ``?:`` (an unevaluated operand is never
   diagnosed), and every remaining identifier replaced by ``0``;
 * ``#error message``, which fails the compilation with that message;
-* ``#pragma once``;
+* ``#pragma once``; ``#pragma pack``; and every other pragma, which is read
+  and dropped, because C says an implementation ignores a pragma it does not
+  recognise. The few that would make py2bin emit something else if it obeyed
+  are refused by name instead -- see ``_CHANGES_THE_PROGRAM``;
+* ``_Pragma("...")``, the operator spelling of ``#pragma``, which is what a
+  macro has to use because a directive is not a token;
 * the null directive ``#``;
 * the predefined macros ``__FILE__``, ``__LINE__``, ``__STDC__``,
   ``__STDC_VERSION__``, ``__STDC_HOSTED__`` (0 -- py2bin has no hosted library),
@@ -52,8 +57,9 @@ What is rejected
 ----------------
 ``#line`` (py2bin reports the line the token was really written on),
 ``#warning`` (py2bin's C compiler has no channel for a diagnostic that is not
-fatal), any ``#pragma`` other than ``once`` -- ignoring an unknown pragma is
-how a compiler silently changes an ABI, so py2bin refuses instead -- the GNU
+fatal), a ``#pragma`` that would move a struct's members, rename a definition
+or place one in a section of its own -- ignoring one of those is how a
+compiler silently changes an ABI, so py2bin refuses it by name -- the GNU
 ``, ## __VA_ARGS__`` comma-deletion extension, ``#`` and ``##`` that survive
 into the output, a ``##`` that pastes two tokens into something that is not one
 token, and any header that cannot be found. Real system headers use extensions
@@ -602,9 +608,19 @@ class Preprocessor:
         self._defaults: set[str] = set()
         #: Whether the file being read is one py2bin supplies.
         self._reading_a_builtin = False
+        #: Whether this text is C the C++ translator wrote. It matters to
+        #: `pack` alone: that translator reads a pack out of the text and
+        #: carries it with the struct, so a pack it could not read there is
+        #: one the classes have already been laid out without.
+        self.translated_cplusplus = False
         self.output: list[PPToken] = []
         self.depth = 0
         self.once: set[str] = set()
+        #: Which file each device-and-inode pair turned out to be, under the
+        #: first name that reached it. Two spellings of one file have to come
+        #: out as one origin here, or `#pragma once` cannot recognise the
+        #: second one. Kept per run: an inode is reused once its file is gone.
+        self._files_seen: dict[tuple[int, int], str] = {}
         self.expansions = 0
         self.priming = True
         self._predefine(target)
@@ -942,40 +958,43 @@ class Preprocessor:
 
     # --- #include ---
 
-    #: Pragmas that say something to a *compiler* and nothing about the
-    #: program: which warnings to show, where an editor may fold, which
-    #: library a linker should look in. None of them can change the layout or
-    #: the ABI of what follows, which is the reason the rest are refused - so
-    #: these are read and dropped rather than being refused along with them.
-    _INERT_PRAGMAS = frozenset(
-        {
-            "warning",       # MSVC: push, pop, disable, suppress
-            "region",        # editor folding
-            "endregion",
-            "message",       # a note to whoever is compiling
-            "comment",       # comment(lib, ...), which needs a linker to mean
-            "push_macro",    # saves and restores a macro this preprocessor
-            "pop_macro",     # keeps by name anyway
-            "component",
-            "function",
-            "intrinsic",
-            "auto_inline",
-            "inline_depth",
-            "inline_recursion",
-            "optimize",
-            "float_control",
-            "fenv_access",
-            "STDC",          # C99 says an implementation may ignore these
-        }
-    )
-
-    #: Pragmas whose *second* word is what says they are inert. Every
-    #: compiler that has these spells them `<who> diagnostic ...`, and which
-    #: compiler it is addressed to does not matter: a pragma about
-    #: diagnostics says nothing about the program whoever is being told.
-    #: Read this way rather than by naming the compilers, which is a thing
-    #: no module here is allowed to do.
-    _INERT_SECOND = frozenset({"diagnostic", "system_header", "poison"})
+    #: The pragmas that would make py2bin emit something else, and what each
+    #: of them would change. Everything not named here is read and dropped,
+    #: which is what C11 6.10.6 and C++ [cpp.pragma] ask for: a pragma an
+    #: implementation does not recognise is ignored. Naming the ones it did
+    #: recognise instead - and refusing the rest - was the wrong way round,
+    #: and it stopped ordinary portable source on its first line, because
+    #: the pragmas a compiler is told about are unbounded and the ones that
+    #: mean anything to *this* compiler are not.
+    #:
+    #: The question each entry answers is "what would py2bin have to emit
+    #: differently if it obeyed?" - where the members of a struct sit, which
+    #: definition a name reaches, which section something lands in. A pragma
+    #: with no answer to that is talking to a compiler about diagnostics,
+    #: folding, inlining or unrolling, and saying nothing about the program.
+    #: `pack` is absent because it is not refused: it is implemented, below.
+    _CHANGES_THE_PROGRAM = {
+        "ms_struct": "lays every struct out by another ABI's rules",
+        "align": "says where the members of a struct sit",
+        "options": "carries `align=`, which says where the members of a "
+                   "struct sit",
+        "scalar_storage_order": "stores the members of a struct in the "
+                                "other byte order",
+        "pointers_to_members": "says how wide a pointer to a member is",
+        "vtordisp": "adds a hidden field to a class with a virtual base",
+        "weak": "makes a definition weak, which says which one a call "
+                "reaches",
+        "redefine_extname": "gives a definition a different symbol name",
+        "init_seg": "sets the order objects with static storage are "
+                    "constructed in",
+        "section": "declares a section of its own for what follows",
+        "code_seg": "puts the functions that follow in a section of their own",
+        "data_seg": "puts the objects that follow in a section of their own",
+        "const_seg": "puts the constants that follow in a section of their "
+                     "own",
+        "bss_seg": "puts the zeroed objects that follow in a section of "
+                   "their own",
+    }
 
     def _why_here(self, conditions: "list[_Condition]") -> str:
         """What the chain around a `#error` asked for, and did not get.
@@ -1007,18 +1026,30 @@ class Preprocessor:
             f"is how."
         )
 
-    def _pragma(self, rest: "list[PPToken]", name_token: "PPToken") -> None:
-        """`#pragma once`, the ones that mean nothing here, and the rest.
+    def _pragma(
+        self,
+        rest: "list[PPToken]",
+        name_token: "PPToken",
+        into: "list[PPToken] | None" = None,
+    ) -> None:
+        """`#pragma once`, the few that change the program, and the rest.
 
         A pragma is where an implementation is allowed to be told anything at
-        all, so most of them are refused: one can change the layout or the ABI
-        of everything after it, and a compiler that ignored `#pragma pack`
-        would lay every struct out wrong and say nothing. The ones accepted
-        here are the ones that provably cannot - they speak to a compiler
-        about diagnostics, folding, or linking, and say nothing about the
-        program itself.
+        all, so nearly all of them say nothing to this compiler and are
+        dropped where they stand - which is what C asks for, and what every
+        other compiler does. The exceptions are the ones that would change
+        what py2bin emits if it obeyed: `pack`, which is implemented, and
+        those in `_CHANGES_THE_PROGRAM`, which are refused by name. Dropping
+        one of *those* would lay the program out differently and say nothing,
+        and that is worse than not building it.
+
+        `into` is where `pack` puts the tokens it hands the parser. It is the
+        output when a `#pragma` line is read, and the run being expanded when
+        a `_Pragma` is - a pack written that way belongs where the operator
+        was, not in front of everything gathered since the last directive.
         """
 
+        output = self.output if into is None else into
         spelled = [item.spelling for item in rest]
         if spelled == ["once"]:
             self.once.add(name_token.origin)
@@ -1038,33 +1069,122 @@ class Preprocessor:
             # `#pragma` with nothing after it. C says an implementation may
             # do what it likes, and there is nothing here to do.
             return
-        if spelled[0] in self._INERT_PRAGMAS:
-            return
-        if len(spelled) > 1 and spelled[1] in self._INERT_SECOND:
-            return
         if spelled[0] == "pack":
             # It changes how every struct after it is laid out, so it cannot
-            # be dropped the way the ones above are. It is passed on to the
-            # parser as tokens - a directive is not one, and this is the only
+            # be dropped the way the rest are. It is passed on to the parser
+            # as tokens - a directive is not one, and this is the only
             # channel there is between the two.
-            self.output.append(
+            output.append(
                 dataclasses.replace(
                     name_token, kind="identifier", spelling=_PACK_MARKER
                 )
             )
-            self.output.extend(rest[1:])
-            self.output.append(
+            output.extend(rest[1:])
+            output.append(
                 dataclasses.replace(name_token, kind="punctuator", spelling=";")
             )
             return
-        self.error(
-            f"#pragma {spelled[0]} is not implemented; py2bin refuses a pragma "
-            f"it does not know, because a pragma can change the layout or the "
-            f"ABI of everything after it. The ones it accepts are 'once' and "
-            f"those that speak only to a compiler - "
-            f"{', '.join(sorted(self._INERT_PRAGMAS))}",
-            name_token,
-        )
+        changes = self._CHANGES_THE_PROGRAM.get(spelled[0])
+        if changes is not None:
+            self.error(
+                f"#pragma {spelled[0]} is not implemented, and py2bin will "
+                f"not ignore it the way it ignores a pragma that says "
+                f"nothing to it: this one {changes}. A program built as if "
+                f"it were not there is laid out differently from the one "
+                f"that was written, and nothing would say so",
+                name_token,
+            )
+        # Everything else. Only the first word is read, because everything
+        # after it belongs to that pragma rather than to this compiler:
+        # `#pragma region section` names a region, and reading its second
+        # word as a pragma of its own would refuse a fold marker.
+        return
+
+    def _pragma_operator(
+        self,
+        pending: "collections.deque[PPToken]",
+        at: "PPToken",
+        out: "list[PPToken]",
+    ) -> None:
+        """`_Pragma("...")`, which is the only way a macro can write a pragma.
+
+        A directive is not a token, so nothing a macro expands to can be a
+        `#pragma`; C99 gave the same thing an operator spelling for exactly
+        that reason, and headers use it to wrap a pragma in a name of their
+        own. It is read here rather than beside the directives because the
+        string is usually built by `#` out of a macro's argument, and there
+        is nothing to read until the expansion has run.
+
+        Which is also why a `pack` written this way is refused in a C++
+        translation unit and only there. The C++ translator reads a pack out
+        of the text, before any macro has been replaced, so that a class can
+        carry its packing to wherever the struct is written out - and by the
+        time the string exists to be read here, the classes have been laid
+        out already. In C nothing moves and this is simply the pack.
+        """
+
+        opening = pending[0] if pending else None
+        if opening is None or opening.kind != "punctuator" or opening.spelling != "(":
+            self.error("_Pragma takes a parenthesised string literal", at)
+        pending.popleft()
+        literal = pending[0] if pending else None
+        if literal is None or literal.kind != "string":
+            self.error("_Pragma takes a string literal", at)
+        pending.popleft()
+        closing = pending[0] if pending else None
+        if closing is None or closing.kind != "punctuator" or closing.spelling != ")":
+            self.error("_Pragma is not closed with ')'", at)
+        pending.popleft()
+        written = self._destringized(literal, at)
+        if (
+            self.translated_cplusplus
+            and written
+            and written[0].spelling == "pack"
+        ):
+            self.error(
+                "a `pack` written as `_Pragma(\"pack(...)\")` is not "
+                "translated from C++; write it as `#pragma pack(...)`, which "
+                "is. The C++ translator reads a pack out of the text so a "
+                "class can carry its packing to wherever the struct ends up, "
+                "and it runs before any macro has been replaced - so the "
+                "classes above have been laid out unpacked already",
+                at,
+            )
+        self._pragma(written, at, out)
+
+    @staticmethod
+    def _destringized(literal: "PPToken", at: "PPToken") -> "list[PPToken]":
+        """The tokens `_Pragma`'s operand stands for (C11 6.10.9).
+
+        Any prefix and the quotes go, `\\"` becomes a quote and `\\\\` becomes
+        one backslash, and what is left is read as the tokens that would have
+        followed a `#pragma`. Read left to right in one pass, the way the
+        standard states it, so a backslash this produces is what the pragma
+        says and never the start of an escape the author did not write.
+
+        Every token is put back where the operator was written. What comes
+        out of here is a position inside a string nobody can point at, and a
+        `pack` handed to the parser has to say which line it came from.
+        """
+
+        spelling = literal.spelling
+        inside = spelling[spelling.index('"') + 1: spelling.rindex('"')]
+        text: "list[str]" = []
+        index = 0
+        while index < len(inside):
+            if inside[index] == "\\" and inside[index + 1: index + 2] in ('"', "\\"):
+                text.append(inside[index + 1])
+                index += 2
+                continue
+            text.append(inside[index])
+            index += 1
+        return [
+            dataclasses.replace(
+                token, line=at.line, column=at.column, origin=at.origin
+            )
+            for line in _scan("".join(text), at.origin)
+            for token in line
+        ]
 
     def _search_path(self, directory: "Path | None") -> "list[Path]":
         """Every directory an include is looked for in, nearest first.
@@ -1159,8 +1279,38 @@ class Preprocessor:
             return "".join(item.spelling for item in inner), True
         return None, False
 
+    def _origin_of(self, path: Path) -> str:
+        """What this file is called here, whatever the include spelled.
+
+        `#pragma once` has to decide whether the path in hand names a file
+        already read, and comparing the spelled path cannot answer that. The
+        filesystem this is running on is case-insensitive, so `Foo.h` and
+        `foo.h` are one file under two names - and a header read twice is a
+        wall of duplicate definitions, which is the one thing `#pragma once`
+        exists to prevent. A symlink is the same question wearing a different
+        hat, and `resolve()` alone answers only that half of it.
+
+        So the filesystem is asked instead of the string: the device and inode
+        a stat reports are what makes two paths one file. The first spelling
+        that reached the file is the name every later one answers to, and it
+        is a real path, so a diagnostic still points at something that exists.
+        """
+
+        settled = str(path.resolve())
+        try:
+            status = path.stat()
+        except OSError:
+            return settled
+        if not status.st_ino:
+            # A filesystem that does not number its files. There is nothing
+            # left to compare but the path, and `resolve()` has at least
+            # followed the symlinks and dropped the `./` and the doubled
+            # slashes from it.
+            return settled
+        return self._files_seen.setdefault((status.st_dev, status.st_ino), settled)
+
     def _read(self, path: Path, at: PPToken) -> None:
-        resolved = str(path.resolve())
+        resolved = self._origin_of(path)
         if resolved in self.once:
             # _enter would notice too; catching it here means a header that
             # said '#pragma once' is not even read a second time.
@@ -1258,6 +1408,9 @@ class Preprocessor:
                 continue
             macro = self.macros.get(token.spelling)
             if macro is None:
+                if token.spelling == "_Pragma":
+                    self._pragma_operator(pending, token, out)
+                    continue
                 out.append(token)
                 continue
             self.expansions += 1
@@ -3974,10 +4127,12 @@ def preprocess(
     target: str | None = None,
     include_dirs: tuple[str, ...] = (),
     defines: tuple[str, ...] = (),
+    cplusplus: bool = False,
 ) -> list[Token]:
     """Preprocess C source text and return the tokens the C parser reads."""
 
     engine = Preprocessor(include_dirs, target)
+    engine.translated_cplusplus = cplusplus
     if defines:
         text = []
         for item in defines:

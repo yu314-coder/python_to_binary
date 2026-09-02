@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from py2bin.c_frontend import CCompileError
+from py2bin.c_native import compile_c_native
 from py2bin.cpp_frontend import (
     CppTranslationError,
     inline_local_includes,
@@ -184,6 +186,22 @@ class Refusals(unittest.TestCase):
         )
         self.assertIn("this->newest = 1", out)
 
+    def test_the_pragma_operator_is_left_for_the_preprocessor(self) -> None:
+        """`_Pragma` is a directive in disguise, not C++ this translates.
+
+        The preprocessor runs after this and reads it. What matters here is
+        that nothing on the way past rewrites it, because the string it
+        carries is a directive and not an expression.
+        """
+
+        out = translate(
+            '#define HINT(x) _Pragma(#x)\nHINT(acme unroll)\n'
+            '_Pragma("acme hint")\nint main(void){ return 0; }\n',
+            "t.cpp",
+        )
+        self.assertIn('_Pragma(#x)', out)
+        self.assertIn('_Pragma("acme hint")', out)
+
 
 class SeveralFiles(unittest.TestCase):
     def test_a_class_from_a_shared_header_is_emitted_once(self) -> None:
@@ -207,6 +225,168 @@ class SeveralFiles(unittest.TestCase):
             out = translate_unity((second, first))
             self.assertEqual(out.count("struct K {"), 1)
             self.assertEqual(out.count("static void K__ctor"), 1)
+
+    def test_one_file_spelled_two_ways_is_pasted_once(self) -> None:
+        """`"Foo.h"` and `"foo.h"` are one file where case does not count.
+
+        The pasted-once check compared the settled path, which says nothing
+        about case, so both includes were read and the translator was handed
+        two copies of every class in the header. That came out as `two
+        definitions of foo_value() take the same arguments`, pointing at the
+        header rather than at the second include - and an include guard did
+        not save it, because this pass runs before the preprocessor and has
+        no `#ifndef`.
+        """
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "Foo.h").write_text(
+                "#pragma once\nclass Foo { public: int n; Foo(){n=1;} };\n"
+                "inline int foo_value(Foo f) { return f.n; }\n",
+                encoding="utf-8",
+            )
+            if not (root / "foo.h").is_file():
+                self.skipTest("this filesystem tells Foo.h and foo.h apart")
+            source = root / "main.cpp"
+            source.write_text(
+                '#include "Foo.h"\n#include "foo.h"\n'
+                "int main(void){ Foo f; return foo_value(f); }\n",
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(source, [], set(), set())
+            self.assertEqual(pasted.count("class Foo"), 1)
+            # And the whole way through: two copies of a free function is
+            # what the translator refused, and the message named the header.
+            translate(pasted, str(source))
+
+    def test_a_header_reached_through_a_symlink_is_pasted_once(self) -> None:
+        """The other half of the same question: two names, one file.
+
+        A settled path does follow a symlink, so this one worked already -
+        it is here so that asking the filesystem for identity keeps answering
+        it, whichever way the identity is asked for.
+        """
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "real.hpp").write_text(
+                "#pragma once\nclass R { public: int n; R(){n=2;} };\n"
+                "inline int r_value(R r) { return r.n; }\n",
+                encoding="utf-8",
+            )
+            try:
+                (root / "alias.hpp").symlink_to("real.hpp")
+            except (OSError, NotImplementedError):
+                self.skipTest("this filesystem has no symlinks")
+            source = root / "main.cpp"
+            source.write_text(
+                '#include "real.hpp"\n#include "./alias.hpp"\n'
+                "int main(void){ R r; return r_value(r); }\n",
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(source, [], set(), set())
+            self.assertEqual(pasted.count("class R"), 1)
+            translate(pasted, str(source))
+
+    def test_the_same_header_quoted_and_angled_is_pasted_once(self) -> None:
+        """Which brackets an include wears says where to look, not what.
+
+        Found on the search path either way, it is the same file, and pasting
+        it a second time would define the class twice.
+        """
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "shared.hpp").write_text(
+                "#pragma once\nclass S { public: int n; S(){n=3;} };\n"
+                "inline int s_value(S s) { return s.n; }\n",
+                encoding="utf-8",
+            )
+            source = root / "main.cpp"
+            source.write_text(
+                '#include "shared.hpp"\n#include <shared.hpp>\n'
+                "int main(void){ S s; return s_value(s); }\n",
+                encoding="utf-8",
+            )
+            pasted = inline_local_includes(source, (str(root),), set(), set())
+            self.assertEqual(pasted.count("class S"), 1)
+            translate(pasted, str(source))
+
+
+class WhereItIsWritten(unittest.TestCase):
+    """`__LINE__` and `__FILE__` against the file the user opened.
+
+    The preprocessor runs after the paste and after the classes have been
+    rewritten, so by then the line a token sits on is a line of the joined
+    unit and the only file name left is the one the build started from.
+    Both are answered while each file is still its own text.
+    """
+
+    def test_a_header_answers_its_own_line_and_its_own_name(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            header = root / "k.hpp"
+            header.write_text(
+                "#pragma once\n"
+                "// a line\n"
+                "inline int written_at(void){ return __LINE__; }\n"
+                "inline const char *written_in(void){ return __FILE__; }\n",
+                encoding="utf-8",
+            )
+            entry = root / "main.cpp"
+            entry.write_text(
+                '#include "k.hpp"\n'
+                "int main(void){ return written_at() + __LINE__; }\n",
+                encoding="utf-8",
+            )
+            out = inline_local_includes(entry, (), set(), set())
+            self.assertIn("return 3; }", out)
+            self.assertIn(f'return "{header}"; }}', out)
+            self.assertIn("written_at() + 2;", out)
+
+    def test_the_class_rewriting_does_not_move_it(self) -> None:
+        """A method body is hoisted out of its class and lands elsewhere.
+
+        Answered before that happens, so the number goes with the statement
+        rather than staying behind at the line the statement left.
+        """
+
+        out = with_headers(
+            "class K {\npublic:\n int asked(){ return __LINE__; }\n};\n"
+            "int main(void){ K k; return k.asked(); }\n"
+        )
+        self.assertIn("return 3;", out)
+        self.assertNotIn("__LINE__", out)
+
+    def test_a_literal_that_spells_one_is_left_alone(self) -> None:
+        out = with_headers('const char *s = "__LINE__ __FILE__";\n')
+        self.assertIn('"__LINE__ __FILE__"', out)
+
+    def test_a_macro_body_that_names_one_is_left_for_the_preprocessor(self) -> None:
+        """Its value is the line of the *call*, which nothing here can know.
+
+        Calls are expanded by the preprocessor, long after this text has been
+        rewritten, so the line it reports is one in the translated unit and
+        not the one the macro was called on. That is imprecise and it is left
+        that way on purpose: the number goes in a log message, and refusing
+        to build every program that owns a LOG macro is a worse answer than
+        an approximate line in one. What is written in code, below, is exact.
+        """
+
+        with tempfile.TemporaryDirectory() as scratch:
+            entry = Path(scratch) / "main.cpp"
+            entry.write_text(
+                "#include <cstdio>\n"
+                "\n"
+                '#define WHERE() printf("%d\\n", __LINE__)\n'
+                "int main(void){ WHERE(); return 0; }\n",
+                encoding="utf-8",
+            )
+            out = inline_local_includes(entry, (), set(), set())
+            # Untouched in the directive, so the preprocessor still has one
+            # to answer; the call site keeps naming the macro either way.
+            self.assertIn("__LINE__", out)
+            self.assertIn("WHERE()", out)
 
 
 class Naming(unittest.TestCase):
@@ -560,6 +740,72 @@ int main(void) { Plain p; p.f = 9; K k; return p.f + k.n; }
         self.assertIn("struct Plain { int f; };", out)
 
 
+class OpaqueTypes(unittest.TestCase):
+    """A name declared here and defined somewhere this file never sees.
+
+    The PIMPL spelling, and every C handle a header hands out. Only pointers
+    to it are ever written, which is all C++ asks for - and all C asks for
+    too, once it has been told the name is a type at all.
+    """
+
+    def test_a_type_never_defined_here_keeps_its_name(self) -> None:
+        """`Session *inside;` reached the C front end as a declaration of
+        nothing, because the forward declaration that named the type had been
+        dropped along with the ones that had a body below them."""
+
+        out = translate(
+            "class Session;\n"
+            "struct Door { Session *inside; int tag; };\n"
+            "int main(void) { Door d; d.inside = 0; d.tag = 1; return d.tag; }\n",
+            "d.cpp",
+        )
+        self.assertIn("typedef struct Session Session;", out)
+        self.assertNotIn("struct Session {", out)
+
+    def test_a_forward_declaration_of_a_class_defined_here_still_goes(self) -> None:
+        """The typedefs this emits already name it, so the line has no work."""
+
+        out = translate(
+            "class Later;\n"
+            "class Later { public: int v; Later() { v = 4; } };\n"
+            "int main(void) { Later l; return l.v; }\n",
+            "l.cpp",
+        )
+        self.assertEqual(out.count("typedef struct Later Later;"), 1)
+
+    def test_a_forward_declared_union_keeps_the_word_union(self) -> None:
+        out = translate(
+            "union Cell;\n"
+            "struct Slot { Cell *held; };\n"
+            "int main(void) { Slot s; s.held = 0; return 0; }\n",
+            "c.cpp",
+        )
+        self.assertIn("typedef union Cell Cell;", out)
+
+    def test_taking_it_apart_is_refused_rather_than_guessed(self) -> None:
+        """Naming the type is not the same as knowing its shape. A `sizeof`
+        or a member reach the C front end, which has the answer already."""
+
+        with tempfile.TemporaryDirectory() as scratch:
+            for body, complaint in (
+                ("int main(void) { return (int)sizeof(Impl); }", "complete type"),
+                ("int peek(Impl *p) { return p->v; }\n"
+                 "int main(void) { return peek(0); }", "incomplete"),
+                ("int main(void) { Impl one; return (int)(long)&one; }",
+                 "incomplete"),
+            ):
+                source = Path(scratch) / "o.cpp"
+                source.write_text(f"struct Impl;\n{body}\n", encoding="utf-8")
+                with self.subTest(body=body):
+                    with self.assertRaisesRegex(CCompileError, complaint):
+                        compile_c_native(
+                            source,
+                            Path(scratch) / "o.bin",
+                            target="darwin-arm64",
+                            clean=True,
+                        )
+
+
 class AgainstARealCompiler(unittest.TestCase):
     """Each of these was found by building the same C++ with clang++ too.
 
@@ -735,6 +981,51 @@ class Namespaces(unittest.TestCase):
                 "int main(void) { return a::helper(); }\n",
                 "c.cpp",
             )
+
+    def test_two_namespaces_with_a_variable_of_one_name_are_refused(self) -> None:
+        """The one clash the C front end below cannot see for itself.
+
+        `int count;` in one and `int count = 5;` in the other are two
+        variables in C++ and, once the wrappers are gone, a tentative
+        definition and its definition in C - which is one variable. The
+        program built and wrote both namespaces' state into the same word.
+        """
+
+        with self.assertRaisesRegex(CppTranslationError, "both declare 'count'"):
+            translate(
+                "namespace a { int count; }\n"
+                "namespace b { int count = 5; }\n"
+                "int main(void) { a::count = 1; return a::count + b::count; }\n",
+                "v.cpp",
+            )
+
+    def test_a_variable_clashing_with_one_outside_is_refused(self) -> None:
+        with self.assertRaisesRegex(
+            CppTranslationError, "outside every namespace"
+        ):
+            translate(
+                "int count;\n"
+                "namespace a { int count = 5; }\n"
+                "int main(void) { count = 1; return count + a::count; }\n",
+                "g.cpp",
+            )
+
+    def test_a_local_inside_one_is_not_the_namespaces_own_name(self) -> None:
+        """What a function calls its locals is nobody else's business.
+
+        Read together with the namespace's own declarations, two namespaces
+        whose functions each had an `int n;` looked like a clash, and a
+        program clang++ builds was refused.
+        """
+
+        out = translate(
+            "namespace a { int base = 1; int one(void) { int n = 2; return n; } }\n"
+            "namespace b { int other = 3; int two(void) { int n = 4; return n; } }\n"
+            "int main(void) { return a::one() + b::two() + a::base + b::other; }\n",
+            "n.cpp",
+        )
+        self.assertIn("int base = 1;", out)
+        self.assertIn("int other = 3;", out)
 
     def test_an_out_of_line_member_is_not_a_namespace_qualifier(self) -> None:
         """`::` spells both, and stripping the wrong one loses the method."""

@@ -1436,6 +1436,7 @@ def compile_c_native(
                         include_dirs=include_dirs,
                         defines=defines,
                         libraries=libraries,
+                        cplusplus=translated is not None,
                     )
                 )[0]
                 for architecture in UNIVERSAL_SLICES
@@ -1455,6 +1456,7 @@ def compile_c_native(
                 include_dirs=include_dirs,
                 defines=defines,
                 libraries=libraries,
+                cplusplus=translated is not None,
             )
         )
         module.windowed = windowed

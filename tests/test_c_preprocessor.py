@@ -17,7 +17,7 @@ from pathlib import Path
 
 from py2bin.c_frontend import CCompileError, compile_c_to_ir
 from py2bin.c_native import compile_c_native
-from py2bin.c_preprocessor import preprocess
+from py2bin.c_preprocessor import PPToken, Preprocessor, preprocess
 
 
 _HOST_IS_DARWIN_ARM64 = (
@@ -69,6 +69,29 @@ class PreprocessorTestCase(unittest.TestCase):
             defines=defines,
         )
         return artifact
+
+    def scratch(self) -> Path:
+        """An empty directory for a test that lays out its own files.
+
+        `build` writes the headers from a dict, which cannot say how a file
+        got where it is - and a symlink, or a second spelling of a name this
+        filesystem already answers to, is exactly that question.
+        """
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name).resolve()
+
+    def run_in(self, root: Path, source: str, stdout: str | None = None) -> None:
+        entry = root / "program.c"
+        entry.write_text(source, encoding="utf-8")
+        artifact = root / "program.bin"
+        compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        result = subprocess.run([str(artifact)], capture_output=True, text=True)
+        if stdout is not None:
+            self.assertEqual(result.stdout, stdout)
 
     def run_c(self, source: str, stdout: str | None = None, **options) -> None:
         artifact = self.build(source, **options)
@@ -630,6 +653,55 @@ int main(void) {
             stdout="13\n",
         )
 
+    def test_pragma_once_holds_when_one_file_is_spelled_two_ways(self):
+        """`"Once.h"` and `"once.h"` name one file where case does not count.
+
+        The header read twice was remembered by its settled path, and a
+        settled path keeps whatever case was written - so on this filesystem
+        `#pragma once` saw two files, read both, and the C front end reported
+        `onced` defined twice in a header that defines it once.
+        """
+
+        root = self.scratch()
+        (root / "Once.h").write_text(
+            "#pragma once\nstatic int onced(int n) { return n + 10; }\n",
+            encoding="utf-8",
+        )
+        if not (root / "once.h").is_file():
+            self.skipTest("this filesystem tells Once.h and once.h apart")
+        self.run_in(
+            root,
+            '#include <stdio.h>\n#include "Once.h"\n#include "once.h"\n'
+            'int main(void) { printf("%d\\n", onced(3)); return 0; }\n',
+            stdout="13\n",
+        )
+
+    def test_pragma_once_holds_through_a_symlink_and_a_dotted_path(self):
+        """Two more spellings of one file, and the same question about them.
+
+        A settled path already answers these, and they are here so that the
+        move to asking the filesystem for identity keeps answering them.
+        """
+
+        root = self.scratch()
+        (root / "sub").mkdir()
+        (root / "sub" / "once.h").write_text(
+            "#pragma once\nstatic int onced(int n) { return n + 10; }\n",
+            encoding="utf-8",
+        )
+        try:
+            (root / "alias.h").symlink_to(Path("sub") / "once.h")
+        except (OSError, NotImplementedError):
+            self.skipTest("this filesystem has no symlinks")
+        self.run_in(
+            root,
+            "#include <stdio.h>\n"
+            '#include "sub/once.h"\n#include "./sub//once.h"\n'
+            '#include "alias.h"\n'
+            'int main(void) { printf("%d\\n", onced(3)); return 0; }\n',
+            stdout="13\n",
+        )
+
     def test_a_header_name_may_come_from_a_macro(self):
         self.run_c(
             """
@@ -784,13 +856,31 @@ class RejectionTests(PreprocessorTestCase):
             "#warning hmm\nint main(void) { return 0; }\n", "#warning is not implemented"
         )
         self.reject(
-            "#pragma unheard_of\nint main(void) { return 0; }\n",
-            "#pragma unheard_of is not implemented",
-        )
-        self.reject(
             "#unheard_of\nint main(void) { return 0; }\n",
             "unknown preprocessing directive",
         )
+
+    def test_a_pragma_that_would_move_a_member_is_refused_by_name(self):
+        """The ones ignoring would get wrong, rather than the ones it knows.
+
+        C says an implementation ignores a pragma it does not recognise, and
+        py2bin does - but not these. Each of them says where a member sits,
+        which definition a name reaches, or which section something lands
+        in, and a program built as if it were not written is a different
+        program with nothing to say so.
+        """
+
+        for spelled, changes in (
+            ("#pragma ms_struct on", "another ABI's rules"),
+            ("#pragma pointers_to_members(full_generality)", "pointer to a member"),
+            ("#pragma scalar_storage_order big-endian", "other byte order"),
+            ("#pragma weak helper", "makes a definition weak"),
+            ("#pragma data_seg(\".shared\")", "section of their own"),
+        ):
+            with self.subTest(spelled=spelled):
+                self.reject(
+                    f"{spelled}\nint main(void) {{ return 0; }}\n", changes
+                )
 
     def test_an_error_says_which_branches_it_fell_through(self):
         """A header that stops at the end of a chain is saying what it wanted.
@@ -848,21 +938,31 @@ class RejectionTests(PreprocessorTestCase):
                 self.assertTrue(any(token.value == "main" for token in tokens))
 
     def test_a_pragma_that_says_nothing_about_the_program_is_accepted(self):
-        """Diagnostics, folding, linking: none of them change the C.
+        """Diagnostics, folding, linking, and whatever else: none change the C.
 
-        The reason the rest are refused is that a pragma can change the
-        layout or the ABI of what follows it. These provably cannot, and
-        refusing them stopped ordinary headers on their first line.
+        C says an implementation ignores a pragma it does not recognise, and
+        the set of pragmas a compiler can be told about is unbounded, so this
+        is the default and not the exception. Naming the ones py2bin knew and
+        refusing the rest stopped ordinary portable source on its first line
+        - `#pragma unroll`, `#pragma ivdep` and every vendor's own hint.
+
+        `#pragma region section` is here because the second word of a pragma
+        belongs to that pragma: reading it as a name of its own would refuse
+        a fold marker for being called `section`.
         """
 
         for spelled in (
             "#pragma warning( disable: 4049 )",
             "#pragma region setup",
+            "#pragma region section",
             "#pragma endregion",
             "#pragma GCC diagnostic ignored \"-Wunused\"",
             "#pragma clang diagnostic push",
             "#pragma comment(lib, \"user32.lib\")",
             "#pragma message(\"building\")",
+            "#pragma unroll 4",
+            "#pragma ivdep",
+            "#pragma acme vectorize always",
             "#pragma",
         ):
             with self.subTest(spelled=spelled):
@@ -876,6 +976,120 @@ class RejectionTests(PreprocessorTestCase):
                         if isinstance(token.value, str)
                     ),
                 )
+
+    def test_the_pragma_operator_is_read_where_the_macros_are(self):
+        """`_Pragma("...")` is the only way a macro can write a pragma.
+
+        A directive is not a token, so nothing a macro expands to can be a
+        `#pragma`; C99 gave the same thing an operator spelling for that
+        reason. It is read during macro replacement because the string is
+        usually built by `#` out of the macro's own argument, and there is
+        nothing to read until then.
+        """
+
+        self.assertEqual(
+            expand(
+                '#define DO_PRAGMA(x) _Pragma(#x)\n'
+                'DO_PRAGMA(GCC diagnostic ignored "-Wunused")\n'
+                '_Pragma("acme hint")\n'
+                "int main(void) { return 0; }\n"
+            ),
+            "int main ( void ) { return 0 ; }",
+        )
+
+    def test_the_pragma_operator_undoes_the_escapes_in_its_string(self):
+        """C11 6.10.9: the prefix and quotes go, `\\"` becomes a quote and
+        `\\\\` becomes one backslash, and what is left is read as the tokens
+        that would have followed a `#pragma`.
+        """
+
+        at = PPToken("identifier", "_Pragma", 1, 1, "t.c", False)
+        literal = PPToken("string", r'L"message(\"a\\b\")"', 1, 9, "t.c", False)
+        self.assertEqual(
+            [one.spelling for one in Preprocessor._destringized(literal, at)],
+            ["message", "(", r'"a\b"', ")"],
+        )
+        # And put back where the operator was written, because the position
+        # inside a string is one nobody can point at.
+        self.assertEqual(
+            {(one.line, one.column) for one in Preprocessor._destringized(literal, at)},
+            {(1, 1)},
+        )
+
+    def test_a_pack_written_as_the_operator_still_packs(self):
+        """The one pragma that means something here, spelled the macro way.
+
+        A header that wants a packed struct behind a name of its own has no
+        other way to write it, and reading the operator and then dropping
+        what it said would lay the struct out with the padding the pragma
+        was there to remove.
+        """
+
+        self.run_c(
+            """
+#include <stdio.h>
+#define BEGIN_PACKED _Pragma("pack(push, 1)")
+#define END_PACKED   _Pragma("pack(pop)")
+
+BEGIN_PACKED
+struct Wire { char tag; int value; };
+END_PACKED
+struct Loose { char tag; int value; };
+
+int main(void) {
+    printf("%d %d\\n", (int)sizeof(struct Wire), (int)sizeof(struct Loose));
+    return 0;
+}
+""",
+            stdout="5 8\n",
+        )
+
+    def test_a_pack_written_as_the_operator_is_refused_out_of_cpp(self):
+        """The same pack, refused when the C came from the C++ translator.
+
+        That translator reads a pack out of the text - before any macro has
+        been replaced - so a class can carry its packing to wherever the
+        struct is written out, and both the class and the pragma above it
+        move. By the time the string exists to be read here the classes have
+        been laid out, unpacked, and honouring the pack now would pack
+        whatever happened to land below instead. It printed `8 8` where
+        clang++ printed `5 8` and said nothing.
+
+        Only out of C++: in C nothing moves, and the test above builds and
+        runs exactly this program.
+        """
+
+        for spelled in (
+            '_Pragma("pack(push, 1)")\n',
+            '#define PACKED _Pragma("pack(1)")\nPACKED\n',
+            '#define DO_PRAGMA(x) _Pragma(#x)\nDO_PRAGMA(pack(1))\n',
+        ):
+            with self.subTest(spelled=spelled):
+                with self.assertRaises(CCompileError) as caught:
+                    compile_c_to_ir(
+                        f"{spelled}struct W {{ char a; int b; }};\n"
+                        "int main(void) { return 0; }\n",
+                        "t.cpp",
+                        "darwin-arm64",
+                        cplusplus=True,
+                    )
+                self.assertIn("write it as `#pragma pack", str(caught.exception))
+
+    def test_the_operator_carries_the_same_refusals_the_directive_does(self):
+        self.reject(
+            '_Pragma("ms_struct on")\nint main(void) { return 0; }\n',
+            "another ABI's rules",
+        )
+
+    def test_the_operator_needs_a_parenthesised_string(self):
+        self.reject(
+            "_Pragma(hint)\nint main(void) { return 0; }\n",
+            "_Pragma takes a string literal",
+        )
+        self.reject(
+            '_Pragma "hint"\nint main(void) { return 0; }\n',
+            "_Pragma takes a parenthesised string literal",
+        )
 
     def test_error_stops_the_compilation_with_its_message(self):
         self.reject(

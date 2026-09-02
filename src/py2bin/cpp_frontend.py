@@ -1818,8 +1818,6 @@ _LAMBDA = re.compile(
 #: `friend class X;` or `friend int peek(X &);` - an access grant.
 _FRIEND = re.compile(r"\bfriend\b[^;{}]*;")
 
-#: `class B;` - a forward declaration. The typedefs this emits already name
-#: every class before any body, so there is nothing left for one to do.
 #: `class X final {`, `void f() override {`, `void f() final;`. Both words
 #: are checks C++ makes and C cannot, so both go.
 _FINAL_OR_OVERRIDE = re.compile(
@@ -1834,9 +1832,43 @@ _FINAL_OR_OVERRIDE = re.compile(
 #: the code.
 _NOEXCEPT = re.compile(r"(?<![.\w>])noexcept\b(?:\s*\([^()]*\))?\s*")
 
+#: `class B;` - a forward declaration, on a line of its own.
 _FORWARD_DECLARATION = re.compile(
-    r"(?m)^[ \t]*(?:class|struct|union)\s+[A-Za-z_]\w*\s*;[ \t]*$"
+    r"(?m)^[ \t]*(class|struct|union)\s+([A-Za-z_]\w*)\s*;[ \t]*$"
 )
+
+
+def _rewrite_forward_declarations(text: str) -> str:
+    """Drop each forward declaration, unless nothing here defines the name.
+
+    `class B;` above the body of `B` says nothing C needs: the typedefs this
+    file emits already name every class before any body, so the line has
+    nothing left to do and goes.
+
+    A name that is never defined here is the other half of the same spelling,
+    and it does have work to do. `struct Impl;` with the body in a file this
+    one is not compiled with - or nowhere at all, which is how an opaque
+    handle is written - is the only thing that tells C the name is a type.
+    Dropped along with the rest, `Impl *p;` reached the C front end as a
+    declaration of nothing and was refused, in a program clang++ builds
+    without a word. So it becomes what C spells the same thought with: a
+    typedef of a tag with no members, which a pointer may point at and
+    nothing may take apart or measure.
+    """
+
+    defined = {head.group(2) for head in _CLASS_HEAD.finditer(text)}
+    defined.update(one.group(2) for one in _TAGGED_TYPE.finditer(text))
+
+    def taken(match: "re.Match[str]") -> str:
+        if match.group(2) in defined or _depth_at(text, match.start()) != 0:
+            return ""
+        # C has one keyword for both of C++'s, and the tag names the same
+        # incomplete type either way.
+        kind = "struct" if match.group(1) == "class" else match.group(1)
+        return f"typedef {kind} {match.group(2)} {match.group(2)};"
+
+    return _FORWARD_DECLARATION.sub(taken, text)
+
 
 #: `static_cast<int>(x)` and the rest. C has one cast and it is spelled with
 #: parentheses; these say *which* conversion is meant, which C++ checks and C
@@ -2125,7 +2157,7 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     # reaches the C compiler as a name where a name cannot be.
     text = _map_code(text, lambda part: _FINAL_OR_OVERRIDE.sub("", part))
     text = _map_code(text, lambda part: _NOEXCEPT.sub(" ", part))
-    text = _FORWARD_DECLARATION.sub("", text)
+    text = _rewrite_forward_declarations(text)
     # `friend class X;` and `friend int f();` grant access to what is private.
     # py2bin emits a plain struct and enforces no access at all, so a friend
     # declaration asks for something already given and has nothing to become.
@@ -6719,10 +6751,18 @@ def _flatten_namespaces(text: str, filename: str) -> "tuple[str, set[str]]":
     declare `helper` are two different functions in C++ and one name in C. So
     the names each one declares are collected, and a clash is refused by name
     rather than resolved by whichever came last.
+
+    The file outside every namespace is the other side of the same question,
+    and only for objects. A class or a function written both there and inside
+    one is a redefinition by the time the C front end reads it, and is
+    refused with its own line. An object is not: C lets `int count;` stand
+    beside `int count = 5;` and means one variable by it, so a global and a
+    namespace's own would have been folded together in silence.
     """
 
     known: set[str] = set()
     declared: dict[str, str] = {}
+    outside = _namespace_objects(_without_nested(text))
 
     while True:
         found = _NAMESPACE.search(text)
@@ -6748,7 +6788,18 @@ def _flatten_namespaces(text: str, filename: str) -> "tuple[str, set[str]]":
             # names belong to that one, and counting them here made
             # `namespace outer { namespace inner { class Deep ... } }` look
             # like two namespaces declaring the same class.
-            for spelled in _declared_names(_without_nested(inner)):
+            body = _without_nested(inner)
+            mine = _namespace_objects(body)
+            for spelled in sorted(mine & outside):
+                raise CppTranslationError(
+                    filename, _line_of(text, opening),
+                    f"namespace {name} declares {spelled!r}, and so does the "
+                    f"file outside every namespace. py2bin compiles one "
+                    f"translation unit and has no linker, so a namespace is "
+                    f"flattened away - and C reads the two declarations that "
+                    f"leaves as one variable rather than two. Rename one",
+                )
+            for spelled in sorted(_declared_names(body) | mine):
                 if spelled in declared and declared[spelled] != name:
                     raise CppTranslationError(
                         filename, _line_of(text, opening),
@@ -6804,6 +6855,67 @@ def _declared_names(body: str) -> "set[str]":
         if spelled and spelled not in _NOT_A_TYPE:
             found.add(spelled)
     return found
+
+
+def _namespace_objects(body: str) -> "set[str]":
+    """The objects written straight into a namespace body, or into the file.
+
+    Every braced body goes first. What is inside a function is that
+    function's own, and reading the two together made a local `int tmp;`
+    look like a name the namespace itself had put out - so two namespaces
+    whose functions each had one would have been called a clash.
+
+    Anything with parentheses in it is a function and not an object, which is
+    how C++ tells the same two apart. Functions are already counted by
+    `_declared_names`; this is here because an object is the one collision
+    the C front end below cannot see. Two classes or two functions of one
+    name are a redefinition there and are refused with their own line, but
+    C's tentative definitions quietly make `int count;` in one namespace and
+    `int count = 5;` in another into a single variable.
+    """
+
+    found: "set[str]" = set()
+    for statement in _statements(_without_bodies(_without_literals(body))):
+        cleaned = statement.strip().rstrip(";").strip()
+        if not cleaned or "(" in cleaned:
+            continue
+        match = _DECLARATION_STATEMENT.match(cleaned)
+        if match is None or match.group(1).split()[-1] in _NOT_A_TYPE:
+            continue
+        for part in _split_arguments(match.group(2)):
+            declarator = _DECLARATOR.match(part)
+            if declarator is not None:
+                found.add(declarator.group(2))
+    return found
+
+
+def _without_bodies(text: str) -> str:
+    """The text with every braced body blanked, the heads left where they are.
+
+    Not `_without_class_bodies`, which keeps a function's: what this is for
+    is the one level a namespace writes its own declarations at, and a body
+    of any kind is a level below that.
+    """
+
+    out: list[str] = []
+    at = 0
+    depth = 0
+    start = 0
+    for brace in _A_BRACE.finditer(text):
+        if brace.group(0) == "{":
+            if depth == 0:
+                start = brace.start()
+            depth += 1
+            continue
+        if depth == 0:
+            continue
+        depth -= 1
+        if depth == 0:
+            out.append(text[at:start])
+            out.append(" ")
+            at = brace.end()
+    out.append(text[at:])
+    return "".join(out)
 
 
 def _without_class_bodies(text: str) -> str:
@@ -20878,10 +20990,98 @@ def _somebody_supplies(named: str, include_dirs: "tuple[str, ...]") -> bool:
     return any((Path(folder) / named).is_file() for folder in include_dirs)
 
 
+def _which_file(path: Path) -> object:
+    """What makes two include paths the same file, asked of the filesystem.
+
+    A header is pasted once per translation unit, so this pass has to know
+    when two spellings reach one file. The path alone does not say: the
+    filesystem here is case-insensitive, so `Foo.h` and `foo.h` are one file
+    under two names, and pasting it twice hands the translator two copies of
+    every class in it - which comes out as `two definitions of ... take the
+    same arguments`, blaming the header rather than the second include.
+    `resolve()` settles symlinks and `./` and doubled slashes and stops there.
+
+    So the file is stat'ed and identified the way the filesystem identifies
+    it, by device and inode.
+    """
+
+    try:
+        status = path.stat()
+    except OSError:
+        return path.resolve()
+    if not status.st_ino:
+        # A filesystem that does not number its files; the settled path is
+        # all there is left to go on.
+        return path.resolve()
+    return (status.st_dev, status.st_ino)
+
+#: The two macros whose value is *where they are written*. Every other
+#: predefined macro means the same wherever it stands, which is why the
+#: preprocessor can answer those and not these.
+_POSITION_MACROS = re.compile(r"(?<![\w$])(__LINE__|__FILE__)(?![\w$])")
+
+
+def _answer_position_macros(text: str, path: Path) -> str:
+    """Say where each `__LINE__` and `__FILE__` in this file is written.
+
+    The preprocessor answers these for a C program and gets them right, but
+    it never sees a C++ one as the user wrote it: by the time it runs, every
+    header has been pasted in above and every class has been rewritten into
+    structs and free functions, which moves the line a token sits on and
+    leaves one file name for the whole unit. So `__LINE__` reported an offset
+    into text nobody wrote and `__FILE__` named the file the build started
+    from however deep in a header the macro stood.
+
+    Here, each file is still its own text, so the answer is exact - and once
+    it is a number and a string, nothing below can move it.
+
+    Only what is written in code can be answered this way. A `#define` whose
+    body names one of them means the line of the *call*, and calls are
+    expanded by the preprocessor far below this - so that is refused by name
+    rather than answered with a line the caller is not on.
+    """
+
+    if "__LINE__" not in text and "__FILE__" not in text:
+        return text
+    spelling = str(path).replace("\\", "\\\\").replace('"', '\\"')
+    out: list[str] = []
+    at = 0
+    for kind, written in _split_literals(text):
+        part = written
+        if kind == "literal" and part.startswith("#"):
+            # `_split_literals` hands a preprocessing directive over whole,
+            # continuation lines and all, which is exactly the region whose
+            # value is decided somewhere else.
+            # Left exactly as written, for the preprocessor to answer later.
+            # It will answer with a line in the translated unit rather than
+            # the one the macro was called on, which is wrong - but it is a
+            # number that goes in a log message, and refusing to build every
+            # program that owns a LOG macro is a worse answer than an
+            # imprecise line in one. Code gets the exact answer above; this
+            # is no worse than it was.
+            pass
+        elif kind == "code":
+            start = at
+
+            def answer(match: "re.Match[str]") -> str:
+                if match.group(1) == "__LINE__":
+                    return str(_line_of(text, start + match.start()))
+                return f'"{spelling}"'
+
+            part = _POSITION_MACROS.sub(answer, part)
+        out.append(part)
+        # Along the text as it was written, not as it comes out: a `__LINE__`
+        # answered with a four-digit number is longer than the name it
+        # replaced, and every line asked for after it would have been read
+        # off the wrong offset.
+        at += len(written)
+    return "".join(out)
+
+
 def inline_local_includes(
     path: Path,
     include_dirs: "tuple[str, ...]" = (),
-    seen: "set[Path] | None" = None,
+    seen: "set[object] | None" = None,
     seen_headers: "set[str] | None" = None,
     target: "str | None" = None,
 ) -> str:
@@ -20903,11 +21103,15 @@ def inline_local_includes(
     # One copy of a supplied header per translation unit, whatever how many
     # files ask for it - the same job an include guard does.
     seen_headers = set() if seen_headers is None else seen_headers
-    settled = path.resolve()
+    settled = _which_file(path)
     if settled in seen:
         return ""
     seen.add(settled)
     text = path.read_text(encoding="utf-8", errors="replace")
+    # Before a single include is pasted, while the offsets in this text are
+    # still offsets into the file the user opened. Nothing below moves a line,
+    # so the includes are found on the lines they were written on either way.
+    text = _answer_position_macros(text, path)
 
     def supply(named: str) -> "str | None":
         """One of py2bin's own C++ headers, pasted once per unit."""

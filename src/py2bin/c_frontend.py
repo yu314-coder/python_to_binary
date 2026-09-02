@@ -8137,11 +8137,18 @@ def compile_c_to_ir(
     include_dirs: tuple[str, ...] = (),
     defines: tuple[str, ...] = (),
     libraries: tuple[str, ...] = (),
+    cplusplus: bool = False,
 ) -> Module:
     """Compile C source text to a py2bin native IR module.
 
     ``include_dirs`` is the ``-I`` search path the preprocessor uses, and
     ``defines`` the ``-D`` macros (``NAME`` or ``NAME=value``) it starts with.
+
+    ``cplusplus`` says this text is C the C++ translator wrote rather than C
+    somebody wrote. It changes nothing about the language; it is how the
+    preprocessor knows that the pack the classes were laid out with was read
+    out of the C++ before any macro was replaced, and so that a pack reaching
+    it from a `_Pragma` is one those classes never saw.
 
     ``libraries`` names the shared libraries a function this program calls but
     never defines may be found in - what a build with a linker would name as
@@ -8161,6 +8168,7 @@ def compile_c_to_ir(
         target=target,
         include_dirs=include_dirs,
         defines=defines,
+        cplusplus=cplusplus,
     )
     parser = Parser(tokens, filename, target)
     parser.libraries = _libraries_named(libraries)
