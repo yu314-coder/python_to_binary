@@ -2578,6 +2578,18 @@ long labs(long __value) { return __value < 0 ? -__value : __value; }
 #: what every real header does.
 _NULL = "#ifndef NULL\n#define NULL ((void *)0)\n#endif\n"
 
+#: `offsetof`, which is the standard way a program asks where a member sits -
+#: and the standard way a program checks that a header's layout is what it
+#: expects. Written as the expansion every implementation writes, because C
+#: gives no other way to say it: the address of a member of the object at
+#: address zero *is* the offset. Guarded like `NULL`, so a header that
+#: defines its own keeps it.
+_OFFSETOF = (
+    "#ifndef offsetof\n"
+    "#define offsetof(TYPE, MEMBER) ((unsigned long)&((TYPE *)0)->MEMBER)\n"
+    "#endif\n"
+)
+
 #: The types a header reaches for when it wants the ones a platform is
 #: expected to have. py2bin has no system to take them from, so it says what
 #: they are for the target it is building for - which is the same thing every
@@ -3539,7 +3551,7 @@ _BUILTIN_HEADERS = {
     "py2bin_fs.h": _PY2BIN_FS_H,
     "assert.h": _ASSERT_H,
     "float.h": _FLOAT_H,
-    "stddef.h": _NULL,
+    "stddef.h": _NULL + _OFFSETOF,
     # A `va_list` is a pointer to the cells the call wrote its extra arguments
     # into, and the four names that walk one are compiled rather than called -
     # so this header is the typedef and nothing else.

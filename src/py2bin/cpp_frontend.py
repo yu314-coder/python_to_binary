@@ -8687,7 +8687,10 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
         lines.append(f"    {member.ctype} {member.name}{member.array};")
     if not found.members and not found.base and not found.mixins:
         # C has no empty struct; give it something so the type exists.
-        lines.append("    int __empty;")
+        # A byte, not an int. C++ says an empty class has size 1 and
+        # alignment 1; given four, an array of them had the wrong stride and
+        # every struct holding one had the wrong size - quietly.
+        lines.append("    char __empty;")
     lines.append("};")
     return "\n".join(lines)
 
@@ -15211,7 +15214,7 @@ def _fill_empty_structs(text: str) -> str:
     return _map_code(
         text,
         lambda part: _AN_EMPTY_STRUCT.sub(
-            lambda m: f"{m.group(1)} {m.group(2)} {{ int __empty; }}", part
+            lambda m: f"{m.group(1)} {m.group(2)} {{ char __empty; }}", part
         ),
     )
 

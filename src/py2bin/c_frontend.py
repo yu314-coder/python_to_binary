@@ -1079,7 +1079,13 @@ _TYPE_KEYWORDS = frozenset(
 # in addressable stack memory that is loaded and stored on each access, which
 # is what ``volatile`` asks for. ``_Atomic`` is deliberately absent: accepting
 # it would promise an atomicity this backend does not emit.
-_QUALIFIERS = frozenset({"const", "volatile", "restrict"})
+#: `__restrict` and `__restrict__` are how a header spells C99's `restrict`
+#: for a compiler that predates it, and headers still write them. A qualifier
+#: rather than a specifier, because that is where they are written: after the
+#: `*` of a pointer, which is where a specifier is never looked for.
+_QUALIFIERS = frozenset(
+    {"const", "volatile", "restrict", "__restrict", "__restrict__"}
+)
 
 _SPECIFIER_COMBINATIONS: dict[tuple[str, ...], CType] = {
     ("void",): VOID,
@@ -1615,8 +1621,27 @@ _UNSUPPORTED_KEYWORDS = {
 #: platform header writes every small function, so a fetched SDK header set
 #: stopped at its first one.
 _IGNORED_SPECIFIERS = frozenset(
-    {"inline", "__inline", "__inline__", "__forceinline"}
+    {
+        "inline", "__inline", "__inline__", "__forceinline",
+        # How a call is made, which py2bin decides for itself from the
+        # target - so each of these says nothing here and is read and
+        # dropped. A platform header writes one on nearly every prototype,
+        # and refusing them stopped a header at its first line.
+        "__cdecl", "_cdecl", "__stdcall", "_stdcall", "__fastcall",
+        "_fastcall", "__thiscall", "__vectorcall", "__clrcall",
+        # A promise the author makes to the compiler about aliasing. C99
+        # spells it `restrict`, which is already read and dropped; these are
+        # the spellings a header uses to say the same thing before C99.
+        "__restrict", "__restrict__",
+    }
 )
+
+#: What an `__attribute__` may say that changes where a member sits. Refused
+#: by name rather than dropped, for the reason `__declspec(align)` is: a
+#: struct laid out differently from the one written runs and is wrong, and
+#: nothing says so. Everything else an attribute says - that a function is
+#: unused, deprecated, noreturn, visible - changes no byte py2bin emits.
+_LAYOUT_ATTRIBUTES = frozenset({"packed", "aligned", "__packed__", "__aligned__"})
 
 
 
@@ -1757,6 +1782,8 @@ class Parser:
         """
 
         keyword = self.take()  # 'enum'
+        # As for `struct`: a decoration may sit between the keyword and the tag.
+        self.skip_decorations()
         tag: str | None = None
         if self.token.kind == "identifier" and self.token.value not in _RESERVED:
             tag = str(self.take().value)
@@ -1831,6 +1858,11 @@ class Parser:
         """
 
         keyword = self.take()  # 'struct' or 'union'
+        # `struct __attribute__((packed)) T` and `struct __declspec(align(8))
+        # T` - which is where both compilers write the one that decides
+        # layout. Read as part of the specifier list only, the decoration was
+        # taken for the tag and the real tag became a syntax error.
+        self.skip_decorations()
         tag: str | None = None
         if self.token.kind == "identifier" and self.token.value not in _RESERVED:
             tag = str(self.take().value)
@@ -1973,8 +2005,8 @@ class Parser:
             if name in _IGNORED_SPECIFIERS:
                 self.index += 1
                 continue
-            if name == "__declspec":
-                self.skip_declspec()
+            if name in ("__declspec", "__attribute__", "__attribute"):
+                self.skip_decorations()
                 continue
             if name in _UNSUPPORTED_KEYWORDS:
                 self.error(_UNSUPPORTED_KEYWORDS[name])
@@ -2057,6 +2089,61 @@ class Parser:
             self.index += 1
             if depth == 0:
                 return
+
+    def skip_attribute(self) -> None:
+        """Read `__attribute__((...))` and drop it - except where it decides layout.
+
+        The same rule `__declspec` gets, and for the same reason. Almost
+        everything written in one is about how a function may be called or
+        warned about, none of which changes a byte emitted here. `packed` and
+        `aligned` do change where every member after them sits, so they are
+        refused by name: a struct built to a different shape than the one
+        written would run and be wrong, with nothing to say so.
+        """
+
+        keyword = self.take()  # '__attribute__'
+        if not self.at("("):
+            self.error("__attribute__ takes a parenthesised list", keyword)
+        depth = 0
+        while True:
+            if self.token.kind == "eof":
+                self.error("unterminated __attribute__", keyword)
+            if self.at("("):
+                depth += 1
+            elif self.at(")"):
+                depth -= 1
+            elif (
+                self.token.kind == "identifier"
+                and self.token.value in _LAYOUT_ATTRIBUTES
+            ):
+                self.error(
+                    f"__attribute__(({self.token.value})) decides where every "
+                    f"member after it sits, and py2bin does not implement it. "
+                    f"Dropping it would build a struct of a different shape "
+                    f"than the one written, so it is refused instead",
+                    self.token,
+                )
+            self.index += 1
+            if depth == 0:
+                return
+
+    def skip_decorations(self) -> None:
+        """Every `__declspec` and `__attribute__` written here, in a row.
+
+        They are written in more places than a specifier list: after the
+        `struct` keyword and before the tag, which is where MSVC and GCC
+        both put the one that decides layout, and after a declarator.
+        """
+
+        while self.token.kind == "identifier" and self.token.value in (
+            "__declspec",
+            "__attribute__",
+            "__attribute",
+        ):
+            if self.token.value == "__declspec":
+                self.skip_declspec()
+            else:
+                self.skip_attribute()
 
     def pointer_suffix(self, base: CType) -> CType:
         while True:
@@ -2521,8 +2608,18 @@ class Parser:
         # it and where the type reader would otherwise refuse it.
         stored = False
         while self.token.kind == "identifier" and (
-            self.token.value == "static" or self.token.value in _IGNORED_SPECIFIERS
+            self.token.value == "static"
+            or self.token.value in _IGNORED_SPECIFIERS
+            # A decoration may come before the storage class as readily as
+            # after it: `__attribute__((unused)) static int f(void)` is how
+            # GCC's own headers write one, and read as though the storage
+            # class had to be first, the `static` after it was reported as
+            # being somewhere C does not put it.
+            or self.token.value in ("__declspec", "__attribute__", "__attribute")
         ):
+            if self.token.value in ("__declspec", "__attribute__", "__attribute"):
+                self.skip_decorations()
+                continue
             stored = stored or self.token.value == "static"
             self.index += 1
         base = self.type_specifier()
@@ -2715,6 +2812,28 @@ class Parser:
         """
 
         index = self.index + 1
+        # Past any decoration written between the keyword and the tag, which
+        # is where both compilers put the one that decides layout. Counted as
+        # though it were the tag, `struct __declspec(novtable) Q { ... };`
+        # looked like `struct TAG NAME` and the `;` after the body was
+        # reported as a missing name.
+        while (
+            index < len(self.tokens)
+            and self.tokens[index].kind == "identifier"
+            and self.tokens[index].value
+            in ("__declspec", "__attribute__", "__attribute")
+        ):
+            index += 1
+            depth = 0
+            while index < len(self.tokens):
+                value = self.tokens[index].value
+                if value == "(":
+                    depth += 1
+                elif value == ")":
+                    depth -= 1
+                index += 1
+                if depth == 0:
+                    break
         if (
             index < len(self.tokens)
             and self.tokens[index].kind == "identifier"
@@ -2747,8 +2866,18 @@ class Parser:
         """
 
         while self.token.kind == "identifier" and (
-            self.token.value == "static" or self.token.value in _IGNORED_SPECIFIERS
+            self.token.value == "static"
+            or self.token.value in _IGNORED_SPECIFIERS
+            # A decoration may come before the storage class as readily as
+            # after it: `__attribute__((unused)) static int f(void)` is how
+            # GCC's own headers write one, and read as though the storage
+            # class had to be first, the `static` after it was reported as
+            # being somewhere C does not put it.
+            or self.token.value in ("__declspec", "__attribute__", "__attribute")
         ):
+            if self.token.value in ("__declspec", "__attribute__", "__attribute"):
+                self.skip_decorations()
+                continue
             self.take()
         base = self.type_specifier()
         if self.at_function_declarator():
