@@ -507,30 +507,49 @@ frame is what makes it work the same whether the callee was inlined or really
 called, and it means a `va_list` can be handed on to another function, which is
 how every logging helper in C is written.
 
-**`#pragma`.** `once` is honoured, and so is every pragma that provably says
-nothing about the program: `warning`, `region`, `message`, `comment`, and any
-whose second word is `diagnostic` or `system_header` — which is how every
-compiler that has them spells them, and which one it is addressed to does not
-matter. Refusing those stopped ordinary headers on
-their first line — `WebView2.h` begins with `#pragma warning( disable: 4049 )`
-— and none of them can change what the C means.
+**`#pragma`.** C says an implementation ignores a pragma it does not
+recognise, and py2bin now does: `once` is honoured, `pack` is implemented,
+and everything else is read and dropped. It used to be the other way round —
+an allowlist of pragmas that were tolerated and a hard error for the rest —
+which stopped ordinary headers on their first line, `WebView2.h` beginning
+with `#pragma warning( disable: 4049 )`. The set of pragmas a compiler can be
+handed is unbounded; the set that means anything here is not.
 
-`#pragma pack` *can*, so it is implemented rather than ignored: a cap on how
-far a member may be padded forward and on the struct's own alignment, with
-`push`, `pop`, a bare `pack()` to go back to the ABI's answer, and a refusal
-for a width that is not a power of two. A compiler that ignored it would give
-every struct after it the wrong offsets and say nothing, which is why the
-other pragmas are still refused by name rather than skipped.
+The exception is a pragma that would make py2bin emit something *else* if it
+obeyed, and those are refused by name with the sentence saying what honouring
+one would have changed: the ones that lay a struct out by another ABI's rules
+(`ms_struct`, `align`, `scalar_storage_order`), rename a definition (`weak`,
+`redefine_extname`), or place one in a section of its own (`section`,
+`code_seg`, `init_seg`). Ignoring one of those is how a compiler silently
+changes an ABI.
 
-**Bitfields** are laid out, read and written: `unsigned int flags : 3;` packs
-into a storage unit of its declared type and the next field continues in the
-same unit while it fits, which is what every ABI py2bin targets does. A read
-shifts down and masks, and a signed field gets back the sign its own width
-carries — three bits holding -1 read as -1 and not as 7. A write is a
+`#pragma pack` is implemented rather than ignored for the same reason: a cap
+on how far a member may be padded forward and on the struct's own alignment,
+with `push`, `pop`, a bare `pack()` to go back to the ABI's answer, and a
+refusal for a width that is not a power of two.
+
+`_Pragma("...")`, the operator spelling, is expanded too — a macro has to use
+it, because a directive is not a token.
+
+**Bitfields** are laid out, read and written. A field takes the next free
+bits and moves on only when it would otherwise cross a boundary of its *own*
+declared type, so `unsigned char a : 3; unsigned int b : 5;` is four bytes
+with both fields in the first one — not the eight it used to be, when a
+neighbour of a different declared width started a fresh unit. Under a
+`#pragma pack` there is no such boundary and the fields go in tight. Sixty
+shapes are checked against clang byte for byte, which is the only test that
+sees this: each field still read back whatever was written to it, so nothing
+but the bytes said the struct was laid out differently.
+
+A read shifts down and masks, and a signed field gets back the sign its own
+width carries — three bits holding -1 read as -1 and not as 7. A write is a
 read-modify-write, so the fields beside it keep their values. `: 0` closes the
-unit without taking any of it, an unnamed field pads without being reachable,
-and `&f.a` is refused with the reason, because a bitfield has no address of
-its own.
+unit without taking any of it, and aligns to the declared type's own boundary
+even under a pack. An unnamed field pads without being reachable, and `&f.a`
+is refused with the reason, because a bitfield has no address of its own. A
+packed field whose bits end up spread wider than its own type is refused by
+name: a field is read with one load of its declared width, and there is no
+such load for those.
 
 **Braced initialisers** work for whatever they nest: `struct P a = {1, 2}`, a
 struct inside a struct, an array of structs, a two-dimensional array, a string
@@ -2707,6 +2726,36 @@ runtime and library adapters.
 
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
+
+### 0.9.13 - four layouts that ran and answered wrongly
+
+The worst kind of bug this compiler can have is one where the program builds,
+runs, prints something, and is wrong — and all four of these were that.
+
+A bitfield started a fresh storage unit whenever its *declared type* differed
+from its neighbour's, where C asks only that a field not cross a boundary of
+its own type. `unsigned char a : 3; unsigned int b : 5;` came out eight bytes
+where it is four, and of sixty shapes checked against clang, fifty-three put
+their fields in different bytes. `#pragma pack` never reached bitfields at
+all. Every field still read back what was written to it, which is exactly why
+this survived: only a struct that has to match something on a disk or a wire
+would have noticed, and by then it is data that is wrong.
+
+C++'s `bool` was written out as `int`, so `bool flag : 1;` — how every header
+writes a flag — was a *signed* one-bit field holding 0 and -1, and a field set
+to `true` compared unequal to `true`. `sizeof(bool)` was four.
+
+`sizeof r` where `r` is a reference to a class answered how wide a pointer is,
+because a reference is carried as one here. `memset(&r, 0, sizeof r)` cleared
+eight bytes of an object of whatever size it really was.
+
+`alignas(16)` on a member was neither implemented nor refused: read as an
+ordinary declaration the member vanished from the struct, so a struct that
+C++ says is 32 bytes had `sizeof` 1. It is refused by name now.
+
+The rule these follow: a construct that changes what a program means or how
+its memory is laid out is either implemented or refused by name. Building
+something quietly different is the one outcome not worth having.
 
 ### 0.9.13 - a C or C++ program that needs a library is still one file
 
