@@ -2739,6 +2739,49 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the core of a platform SDK, written here; every kind of header, checked
+
+py2bin refused a fetched platform header with words to the effect of "a
+published copy is written for a compiler that is GCC or MSVC". Measured against
+a real published set - mingw-w64, 1598 headers, with clang as the arbiter of
+which are self-consistent - almost none of what stopped them was a compiler
+extension. It was a word the header py2bin *replaced* would have defined
+(`WINBOOL`, `__C89_NAMELESS`, `LCID`, `DECLARE_HANDLE`, `VOID`), or an ordinary
+C construct py2bin refused (`typedef unsigned short wchar_t;`, a multi-character
+constant, `#warning`). py2bin's own `<windows.h>` now defines the core's own
+spellings, ships `<vadefs.h>` and `<winapifamily.h>`, reads `<_mingw.h>`, and
+checks the layouts it writes against clang rather than reciting them. Of that
+set, 331 headers parsed before and 565 do now. Two that parsed only because of
+the removed `<wingdi.h>` pull (`dimm.h`, `usp10.h`, both wanting GDI types)
+include it themselves now, as a program does.
+
+Three things in that work were wrong on arrival and were put right before it
+landed. A macro the program defined before one of py2bin's headers was kept
+over py2bin's - so `#define EOF 0` and then `<stdio.h>` left EOF at 0, and a
+`DECLARE_HANDLE` spelled before `<windows.h>` made `HKL` and `HFONT` four-byte
+ints where the platform has pointers, silently. C says the last definition wins
+and the compiler says so; that is what happens now. A pull of `<wingdi.h>`
+guarded on `__has_include` fired for any directory holding that one file, and a
+package brings it along without its neighbours often enough that a hello-world
+stopped on a header nobody fetched; py2bin writes the two GDI shapes its own
+headers lean on instead. And `extern int x = 5;` got its explanation back.
+
+An anonymous `typedef struct { ... } counter;` - the way nearly every C header
+names a type - was left below the classes, so a class holding a `counter` was
+emitted first and named a type C had not reached. The tagged spelling had always
+worked, which made it look like an include problem. It is hoisted with the rest.
+
+Every way a header can reach the build is now a program the sweep runs: a
+header in a subdirectory including a sibling relative to itself, a C header
+wrapped in `extern "C"` with its implementation beside it, a header-only
+template used from a `.cpp`, and the same header offered dead under `#if 0` and
+then live - beside the projects, the fifty single-header programs, and the
+tests that already covered quoted and angled lookup, `#pragma once` through
+symlinks and two spellings of one file, a project's own `vector` beating
+py2bin's, and fetched-against-shipped precedence. 2124 tests, 519
+programs against clang++, 7 projects, 3156 builds across six
+targets.
+
 ### 0.9.13 - three that built, ran, and answered wrongly
 
 `printf("%.3f %.3f", x, y)` printed `1.750 0.000`. The floating formatter is
