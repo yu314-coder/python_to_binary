@@ -3101,11 +3101,23 @@ class Parser:
                 )
 
     def extern_prototype(self) -> None:
-        """``extern TYPE name(TYPE, ...);`` bound to py2bin's vetted adapter ABI.
+        """``extern TYPE name(TYPE, ...);`` -- a declaration, and only that.
 
-        Writing the prototype out is what removes the need for a preprocessor:
-        the source states the exact ABI it uses, and the compiler checks that
-        statement against the table it will actually emit a call for.
+        Where the name is one py2bin's adapter ABI vets, the prototype is
+        bound to that ABI here: writing it out is what removes the need for a
+        preprocessor, since the source states the exact ABI it uses and the
+        compiler checks that statement against the table it will actually
+        emit a call for.
+
+        Every other prototype is an ordinary forward declaration and is read
+        as one. Whether the symbol exists is not a question this line can
+        answer, and it used to be answered here anyway, out of the vetted
+        table: `extern int helper(int);` was refused outright because
+        'helper' was not a name py2bin had heard of, even with the definition
+        of `helper` thirty lines further down the same file. The question is
+        settled later by whoever can settle it -- the definition in this
+        unit, the library `--library` named, or the diagnostic at a call that
+        finds neither.
         """
 
         result = self.pointer_suffix(self.type_specifier())
@@ -3115,11 +3127,19 @@ class Parser:
             self.error(
                 f"'extern {name}' declares an object defined in another "
                 "translation unit; py2bin compiles exactly one translation unit "
-                "and has no linker, so only 'extern' function prototypes bound "
-                "to the vetted adapter ABI are accepted. Drop the 'extern' to "
-                "define the object here.",
+                "and has no linker, so only 'extern' function prototypes are "
+                "accepted. Drop the 'extern' to define the object here.",
                 name_token,
             )
+        if name not in _CABI_SYMBOLS:
+            # `extern` adds nothing to a function declaration that C does not
+            # already give it, so hand the rest to the path a prototype
+            # written without the keyword takes. That path knows about a
+            # repeated declaration, about a definition following it, and about
+            # a body arriving right here, which `extern int f(void) { ... }`
+            # is entitled to have.
+            self.function_definition(result, name_token)
+            return
         self.take("(")
         declared: list[CType] = []
         if not self.accept(")"):

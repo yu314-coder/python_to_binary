@@ -203,6 +203,124 @@ class Refusals(unittest.TestCase):
         self.assertIn('_Pragma("acme hint")', out)
 
 
+class MacrosBeforeThePreprocessor(unittest.TestCase):
+    """A class written with `#define`s, translated in front of them.
+
+    This stage runs before the preprocessor, so a base, a member's type or a
+    whole member spelled with a macro is still the macro's own name when the
+    classes are taken apart. Read as ordinary words some of them went quietly
+    wrong: a name standing where a member goes was swallowed into the return
+    type of the method after it and the members it declares left the struct,
+    which is a `sizeof` that runs and answers wrongly. What each directive
+    says is read off the directive itself here, and where that cannot settle
+    it - a macro taking arguments, or written two ways - it is refused by
+    name.
+    """
+
+    def _refused(self, source: str) -> str:
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(source, "t.cpp")
+        return str(caught.exception)
+
+    def test_members_declared_by_a_macro_stay_in_the_struct(self) -> None:
+        out = translate(
+            "#define FIELDS int a; int b;\n"
+            "struct P { FIELDS int get() { return a + b; } };\n"
+            "int main(void){ P p; p.a = 1; p.b = 2; return p.get(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("int a;", out)
+        self.assertIn("int b;", out)
+        self.assertIn("this->a + this->b", out)
+
+    def test_a_macro_standing_for_virtual_still_gets_a_slot(self) -> None:
+        out = translate(
+            "#define VIRT virtual\n"
+            "struct Base { virtual ~Base() {} VIRT int who() { return 1; } };\n"
+            "struct Derived : Base { int who() { return 2; } };\n"
+            "int main(void){ Derived d; Base *p = &d; return p->who(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("Derived__who", out)
+        self.assertIn("(void *)Derived__who", out)
+
+    def test_a_base_named_by_a_macro_is_the_class_it_names(self) -> None:
+        out = translate(
+            "#define BASE Animal\n"
+            "struct Animal { int legs; Animal() { legs = 4; } };\n"
+            "struct Dog : BASE { int b; Dog() { b = 9; } };\n"
+            "int main(void){ Dog d; return d.legs + d.b; }\n",
+            "t.cpp",
+        )
+        self.assertIn("struct Animal __base;", out)
+
+    def test_a_member_typed_by_a_macro_is_constructed(self) -> None:
+        out = translate(
+            "#define ELEM Res\n"
+            "struct Res { int v; Res() { v = 5; } };\n"
+            "struct Box { ELEM r; int peek() { return r.v; } };\n"
+            "int main(void){ Box b; return b.peek(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("Res r;", out)
+        self.assertIn("Res__ctor(&this->r)", out)
+
+    def test_a_method_a_macro_names_is_a_method(self) -> None:
+        out = translate(
+            "#define GETTER int get() { return v; }\n"
+            "struct P { int v; GETTER };\n"
+            "int main(void){ P p; p.v = 5; return p.get(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("P__get", out)
+
+    def test_an_array_bound_is_left_for_the_preprocessor(self) -> None:
+        # Nothing here needs to know what `N` is: the bound decides the
+        # layout, and the layout is settled by the C compiler, which reads
+        # this after the preprocessor has.
+        out = translate(
+            "#define N 4\n"
+            "struct P { int a[N]; int first() { return a[0]; } };\n"
+            "int main(void){ P p; p.a[0] = 1; return p.first(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("int a[N];", out)
+
+    def test_a_macro_taking_arguments_where_a_member_goes(self) -> None:
+        said = self._refused(
+            "#define PTR(T) T *\n"
+            "struct P { PTR(int) q; int got() { return q != 0; } };\n"
+            "int main(void){ P p; return p.got(); }\n"
+        )
+        self.assertIn("PTR", said)
+        self.assertIn("before it runs the preprocessor", said)
+
+    def test_a_macro_written_two_ways_where_a_member_goes(self) -> None:
+        said = self._refused(
+            "#ifdef WIDE\n#define ELEM long\n#else\n#define ELEM int\n#endif\n"
+            "struct P { ELEM v; int got() { return v; } };\n"
+            "int main(void){ P p; p.v = 1; return p.got(); }\n"
+        )
+        self.assertIn("ELEM", said)
+
+    def test_a_class_named_by_a_macro(self) -> None:
+        said = self._refused(
+            "#define CLS Foo\n"
+            "class CLS { public: int v; CLS() { v = 3; } int get() { return v; } };\n"
+            "int main(void){ Foo f; return f.get(); }\n"
+        )
+        self.assertIn("CLS", said)
+
+    def test_a_macro_between_the_keyword_and_the_body(self) -> None:
+        said = self._refused(
+            "#define EXPORTED\n"
+            "struct Animal { int a; Animal() { a = 7; } };\n"
+            "struct EXPORTED Dog : public Animal { int b; Dog() { b = 9; } };\n"
+            "int main(void){ Dog d; return d.a + d.b; }\n"
+        )
+        self.assertIn("EXPORTED", said)
+
+
 class SeveralFiles(unittest.TestCase):
     def test_a_class_from_a_shared_header_is_emitted_once(self) -> None:
         """Translated per file, the struct appeared once per includer.
@@ -213,9 +331,13 @@ class SeveralFiles(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
+            # The guard is `K_HPP` and not `K`: a guard sharing the class's
+            # name defines the name away, and clang++ reads this header as an
+            # anonymous class and no `K` at all. It passed here only because
+            # this stage is in front of the preprocessor.
             (root / "k.hpp").write_text(
-                "#ifndef K\n#define K\nclass K {\npublic:\n int n;\n K(){n=1;}\n"
-                " int get(){return n;}\n};\n#endif\n",
+                "#ifndef K_HPP\n#define K_HPP\nclass K {\npublic:\n int n;\n"
+                " K(){n=1;}\n int get(){return n;}\n};\n#endif\n",
                 encoding="utf-8",
             )
             first = root / "a.cpp"

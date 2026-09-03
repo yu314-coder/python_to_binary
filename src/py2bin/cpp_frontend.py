@@ -375,6 +375,121 @@ _CLASS_HEAD = re.compile(
 )
 
 
+#: One identifier and nothing else.
+_A_NAME = re.compile(r"[A-Za-z_]\w*")
+
+#: What this file's own `#define` lines say, for the few places below that
+#: have to know what a name is before the preprocessor has run. Filled once
+#: per translation and empty otherwise, so a file that defines nothing goes
+#: through exactly as it did.
+_MACROS_HERE: "dict[str, str]" = {}
+
+#: Every name the file `#define`s - the ones above and the ones nothing here
+#: can answer for, which are the ones that take arguments, are written twice,
+#: or are `#undef`ed later. A name in this set and not in the table is one to
+#: refuse by name: read as an ordinary word it is swallowed into whatever
+#: declaration follows it.
+_MACRO_NAMES: "set[str]" = set()
+
+
+def _read_macros(text: str) -> None:
+    """Note what this file's `#define` lines say, without running them.
+
+    The C++ stage is in front of the preprocessor, so a class that spells a
+    base, a member's type or a whole member with a macro still has the
+    macro's own name written there when the classes are taken apart. This
+    reads the directives straight: a name defined once, never `#undef`ed and
+    taking no arguments stands for one text everywhere and can be answered.
+    Anything else stands for different text in different places and is only
+    worth knowing about so that it can be refused by name rather than guessed
+    at - which is what running the preprocessor first would settle, and this
+    stage does not run it.
+    """
+
+    _MACROS_HERE.clear()
+    _MACRO_NAMES.clear()
+    stands: "dict[str, str]" = {}
+    unsettled: "set[str]" = set()
+    for kind, part in _split_literals(text):
+        # A directive is one of the pieces `_split_literals` keeps whole, so
+        # a `class` written inside a macro body is not read as a class and a
+        # `#define` written inside a string is not read as a definition.
+        if kind != "literal" or not part.startswith("#"):
+            continue
+        undone = re.match(r"#\s*undef\s+([A-Za-z_]\w*)", part)
+        if undone is not None:
+            unsettled.add(undone.group(1))
+            continue
+        written = re.match(
+            r"#\s*define\s+([A-Za-z_]\w*)(\(?)[ \t]*(.*)$", part, re.S
+        )
+        if written is None:
+            continue
+        name = written.group(1)
+        if name in _MACRO_NAMES:
+            unsettled.add(name)
+        _MACRO_NAMES.add(name)
+        if written.group(2) or "\\" in part:
+            # Arguments, or a body carried on the lines below it. Either one
+            # needs the preprocessor proper, which this is not.
+            unsettled.add(name)
+            continue
+        stands[name] = written.group(3).strip()
+    for name, body in stands.items():
+        if name in unsettled:
+            continue
+        if re.search(rf"(?<![.\w]){re.escape(name)}\b", body) is not None:
+            # A macro naming itself is expanded once and no further. That is
+            # the preprocessor's rule and there is nothing here that keeps
+            # it, so the name is left for the preprocessor to settle.
+            continue
+        _MACROS_HERE[name] = body
+
+
+def _plainly_c(inner: str) -> bool:
+    """Whether a struct body has no method written anywhere in it.
+
+    Asked of what the macros in it stand for and not of the text as written:
+    a body whose only method arrives through a `#define` has no parenthesis
+    in it at all, and taken for C already it went out untouched - which put a
+    method inside a C struct once the preprocessor caught up. A name this
+    file defines and this stage cannot settle counts as a method too, so the
+    reader below reaches it and refuses it by name.
+    """
+
+    if "(" in inner:
+        return False
+    if not _MACRO_NAMES:
+        return True
+    written = inner
+    for word in set(_A_NAME.findall(inner)):
+        if word not in _MACRO_NAMES:
+            continue
+        stands = _MACROS_HERE.get(word)
+        if stands is None:
+            return False
+        written = re.sub(
+            rf"(?<![.\w]){re.escape(word)}\b", lambda _, s=stands: s, written
+        )
+    return "(" not in written
+
+
+def _base_named(word: str) -> str:
+    """The class a base clause names, with a one-word macro answered.
+
+    `struct Dog : BASE` derives from whatever `BASE` stands for, and the
+    preprocessor that would have written the real name there runs after this.
+    Only a macro standing for a single name is answered: one standing for
+    `public Animal`, or for anything this file spells more than one way, is
+    left alone and reported by the check that no such class is declared.
+    """
+
+    stands = _MACROS_HERE.get(word)
+    if stands is not None and _A_NAME.fullmatch(stands):
+        return stands
+    return word
+
+
 def _virtual_bases_of(head: "re.Match[str]") -> "set[str]":
     """Which of a class head's bases were written `virtual`.
 
@@ -397,7 +512,7 @@ def _virtual_bases_of(head: "re.Match[str]") -> "set[str]":
                 if word not in ("public", "private", "protected", "virtual")
             ]
             if named:
-                found.add(named[-1])
+                found.add(_base_named(named[-1]))
     return found
 
 
@@ -420,7 +535,7 @@ def _bases_of(head: "re.Match[str]") -> "list[str]":
             if word not in ("public", "private", "protected", "virtual")
         ]
         if words:
-            found.append(words[-1])
+            found.append(_base_named(words[-1]))
     return found
 
 #: `struct is_pointer<T *> {` - a class template written again for a shape of
@@ -450,15 +565,82 @@ def _member_value(declaration: str) -> "tuple[str, tuple[str, str] | None]":
         return declaration, None
     return f"{found.group(1)}{found.group(2)}", (found.group(2), spelled)
 
+def _macro_written_out(
+    body: str,
+    spelled: "re.Match[str]",
+    opened: "set[str]",
+    owner: str,
+    filename: str,
+    at: int,
+) -> str:
+    """What a macro standing where a class member goes writes in its place."""
+
+    name = spelled.group()
+    stands = _MACROS_HERE.get(name)
+    if stands is None:
+        raise CppTranslationError(
+            filename,
+            at,
+            f"{owner} writes `{name}` where a member goes, and `{name}` is a "
+            f"macro this file spells more than one way - it takes arguments, "
+            f"or is defined twice, or is `#undef`ed later. py2bin translates "
+            f"C++ into C before it runs the preprocessor, so nothing here can "
+            f"say which text `{name}` stands for at this point; read as an "
+            f"ordinary word it is swallowed into the declaration after it and "
+            f"whatever it declares leaves the struct silently. Write the "
+            f"member out, or give `{name}` one unconditional definition",
+        )
+    if name in opened:
+        raise CppTranslationError(
+            filename,
+            at,
+            f"{owner} writes `{name}` where a member goes, and following what "
+            f"`{name}` stands for leads back to `{name}`. The preprocessor "
+            f"stops expanding a macro that reaches itself and runs after this "
+            f"stage, so the class is refused here rather than read wrongly",
+        )
+    if stands.count("{") != stands.count("}"):
+        raise CppTranslationError(
+            filename,
+            at,
+            f"{owner} writes `{name}` where a member goes, and `{name}` opens "
+            f"or shuts a brace it does not match. Where a class body ends is "
+            f"what says which members are in it, and that is read here, "
+            f"before the preprocessor has run - so a macro that moves the "
+            f"closing brace is refused rather than guessed at",
+        )
+    opened.add(name)
+    return f"{body[:spelled.start()]}{stands}{body[spelled.end():]}"
+
+
 def _split_members(body: str, name: str, filename: str, at: int) -> Class:
     """Read a class body into its data members and its member functions."""
 
     found = Class(name)
     index = 0
+    #: The macros already written out where the reader now stands, so a pair
+    #: that name each other is reported instead of expanded forever.
+    opened: "set[str]" = set()
+    settled = -1
     while index < len(body):
         char = body[index]
         if char in " \t\n;":
             index += 1
+            continue
+        # A name this file `#define`s, written where a member goes. The
+        # translation happens ahead of the preprocessor, so the macro's own
+        # name is what stands here - and read as an ordinary word it was
+        # swallowed into the return type of whatever came after it, which
+        # took every member it declares out of the struct without a word
+        # said. `sizeof` then answered 1 for a class of two ints.
+        spelled = _A_NAME.match(body, index) if _MACRO_NAMES else None
+        if spelled is not None and spelled.group() in _MACRO_NAMES:
+            if index != settled:
+                opened = set()
+                settled = index
+            body = _macro_written_out(
+                body, spelled, opened, name, filename, at
+            )
             continue
         # An access specifier changes nothing about the layout this emits.
         access = re.match(r"(public|private|protected)\s*:", body[index:])
@@ -8192,6 +8374,54 @@ def _expand_com_spellings(text: str) -> str:
 _ALIGNAS = re.compile(r"(?<![.\w>])(alignas|_Alignas)\s*\(")
 
 
+#: `class Foo`, `struct DLLEXPORT Foo : public Bar`, and everything else that
+#: stands between the keyword and the body. Deliberately looser than
+#: `_CLASS_HEAD`: the point is to catch the heads that one cannot read.
+_ANY_CLASS_HEAD = re.compile(r"\b(class|struct)\s+([A-Za-z_]\w*)([^;{()=]*)\{")
+
+
+def _refuse_macro_class_heads(text: str, filename: str) -> None:
+    """Name the class heads a macro makes unreadable at this stage.
+
+    A class's own name, and the words between it and its body, decide what is
+    declared and what it derives from. Both are read here, in front of the
+    preprocessor - so a head written with a macro is read as something else
+    entirely: `struct EXPORTED Dog : public Animal` matched no class at all
+    and Dog left the output without a word, and a class named by a macro was
+    emitted under the macro's name while every use of it kept the real one.
+    Where the head still reads - `struct Dog : BASE`, whose base is a macro
+    standing for one name - it is left to the base reader, which answers it.
+    """
+
+    plain = _without_literals(text)
+    for head in _ANY_CLASS_HEAD.finditer(plain):
+        if head.group(2) in _MACRO_NAMES:
+            raise CppTranslationError(
+                filename,
+                _line_of(text, head.start()),
+                f"this {head.group(1)} is named by `{head.group(2)}`, which "
+                f"this file `#define`s. py2bin translates C++ into C before "
+                f"it runs the preprocessor, so the class comes out under the "
+                f"macro's name while everything that uses it keeps the name "
+                f"the macro stands for. Write the {head.group(1)}'s real name "
+                f"here",
+            )
+        if _CLASS_HEAD.match(plain, head.start()):
+            continue
+        for word in _A_NAME.findall(head.group(3)):
+            if word in _MACRO_NAMES:
+                raise CppTranslationError(
+                    filename,
+                    _line_of(text, head.start()),
+                    f"`{word}` is a macro standing between {head.group(1)} "
+                    f"{head.group(2)} and its body, and py2bin reads a class "
+                    f"head before the preprocessor has run. Read as it is "
+                    f"written the head names no class at all, and everything "
+                    f"{head.group(2)} declares would leave the output "
+                    f"silently - so it is refused here instead",
+                )
+
+
 def _refuse_unsupported(text: str, filename: str) -> None:
     """Name the C++ this does not do, before it becomes broken C.
 
@@ -15565,6 +15795,13 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # unit declares.
     text = _expand_com_spellings(text)
     _refuse_unsupported(text, filename)
+    # After the COM spellings are written out, so the macros a generated
+    # header defines for the C stage are gone before this reads what is left.
+    # Everything below that has to know a name - which class a base clause
+    # points at, what a member's type is - asks this, because the
+    # preprocessor that would have settled it runs after all of it.
+    _read_macros(text)
+    _refuse_macro_class_heads(text, filename)
     # Before anything reads a function's name: an overload set is several
     # functions sharing one, and every later pass assumes a name is a thing.
     # Before names are read: a template has no name until it is written out,
@@ -15749,7 +15986,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         # goes through the machinery that lays a base out as the first member,
         # whether or not it declares anything of its own.
         inner = text[opening + 1: closing - 1]
-        if keyword == "struct" and "(" not in inner and not _bases_of(head):
+        if keyword == "struct" and _plainly_c(inner) and not _bases_of(head):
             # A struct with no methods is C already and is left exactly as it
             # is - but C++ lets the bare name be a type and C does not, so it
             # still needs the typedef emitted below.

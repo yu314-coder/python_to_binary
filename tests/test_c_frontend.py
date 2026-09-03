@@ -1908,6 +1908,97 @@ class RejectionTests(CProgramTestCase):
         )
 
 
+class ExternDeclarationTests(CProgramTestCase):
+    """`extern` on a function says nothing C has not already said.
+
+    The keyword names the linkage a file-scope function has anyway, so a
+    prototype carrying it is a forward declaration and nothing more. The
+    front end used to read it as a claim about py2bin's vetted adapter ABI
+    and refuse every name that was not in that table, which put a hand-written
+    `extern int helper(int);` out of reach even with the definition of
+    `helper` in the same file.
+    """
+
+    def test_a_forward_declaration_may_spell_its_linkage(self):
+        self.run_c(
+            _STDIO
+            + """
+extern int helper(int);
+extern long long widen(int, int);
+
+int main(void) {
+    printf("%d %lld\\n", helper(20), widen(3, 4));
+    return 0;
+}
+
+int helper(int x) { return x * 2 + 1; }
+long long widen(int a, int b) { return (long long) a * 1000000000LL + b; }
+""",
+            stdout="41 3000000004\n",
+            status=0,
+        )
+
+    def test_a_declaration_carrying_a_body_is_a_definition(self):
+        self.run_c(
+            _STDIO
+            + """
+extern int twice(int x) { return x * 2; }
+
+int main(void) { printf("%d\\n", twice(21)); return 0; }
+""",
+            stdout="42\n",
+            status=0,
+        )
+
+    def test_the_vetted_adapter_abi_still_checks_the_shape(self):
+        # A name py2bin does know the ABI of keeps its check: the call is
+        # lowered against the vetted signature, so a prototype disagreeing with
+        # it would read as if the compiler were going to emit something else.
+        self.reject(
+            "extern long long getpid(int);\nint main(void) { return 0; }\n",
+            "vetted adapter ABI takes 0",
+        )
+        self.reject(
+            "extern double getpid(void);\nint main(void) { return 0; }\n",
+            "vetted adapter ABI returns 'int'",
+        )
+
+    def test_an_undefined_extern_is_reported_at_the_call(self):
+        # Whether the symbol exists is answered by whoever can answer it, and
+        # here nobody can: no definition below, and no library named.
+        self.reject(
+            "extern int nowhere(int);\nint main(void) { return nowhere(1); }\n",
+            "declared but never defined",
+        )
+
+    def test_an_undefined_extern_nobody_calls_is_not_an_error(self):
+        self.run_c(
+            "extern int nowhere(int);\nint main(void) { return 7; }\n", status=7
+        )
+
+    def test_a_redeclaration_still_has_to_agree(self):
+        self.reject(
+            "extern int f(int);\n"
+            "long long f(int x) { return x; }\n"
+            "int main(void) { return (int) f(1); }\n",
+            "declared to return",
+        )
+
+    def test_a_named_library_binds_an_extern_prototype(self):
+        # The other answer to whether the symbol exists: the program says which
+        # component ships it, and the declaration becomes an import.
+        module = compile_c_to_ir(
+            "extern int SomeVendorEntry(int);\n"
+            "int main(void) { return SomeVendorEntry(3); }\n",
+            "vendor.c",
+            "windows-x86_64",
+            libraries=("vendor.dll",),
+        )
+        self.assertEqual(
+            module.symbol_libraries, {"SomeVendorEntry": "vendor.dll"}
+        )
+
+
 class ConstantFoldingTests(CProgramTestCase):
     """A folded constant must equal what the same expression computes at runtime.
 
