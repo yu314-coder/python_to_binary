@@ -1209,6 +1209,39 @@ int main(void) { Plain p; p.f = 9; K k; return p.f + k.n; }
         self.assertIn("typedef struct Plain Plain;", out)
         self.assertIn("struct Plain { int f; };", out)
 
+    def test_a_struct_holding_a_class_is_emitted_after_it(self) -> None:
+        """`struct Config { string name; };` is not plainly C after all.
+
+        A body with no method of its own went out above the classes exactly as
+        written, so one holding a class named a type C had not reached yet and
+        the member had an incomplete type. Holding a class is not C anyway:
+        that member has to be constructed and destroyed, and neither happens
+        to a struct emitted untouched.
+        """
+
+        source = """class Res { public: int n; Res() { n = 1; } ~Res() { n = 0; } };
+struct Holder { Res r; };
+int main(void) { Holder h; return h.r.n; }
+"""
+        out = translate(source, "h.cpp")
+        self.assertLess(out.index("struct Res {"), out.index("struct Holder {"))
+        self.assertIn("Res__dtor(&this->r)", out)
+
+    def test_a_struct_holding_a_class_by_pointer_stays_plain(self) -> None:
+        """A pointer needs no complete type, so nothing has moved.
+
+        Two structs that name each other can only do it through pointers, and
+        reading the body for the name alone would have taken the second one
+        out of C for a member C is perfectly happy with.
+        """
+
+        source = """class Res { public: int n; Res() { n = 1; } ~Res() { n = 0; } };
+struct Ref { Res *held; int tag; };
+int main(void) { Res r; Ref f; f.held = &r; f.tag = 2; return f.held->n; }
+"""
+        out = translate(source, "r.cpp")
+        self.assertIn("struct Ref { Res *held; int tag; };", out)
+
 
 class OpaqueTypes(unittest.TestCase):
     """A name declared here and defined somewhere this file never sees.
@@ -1956,6 +1989,24 @@ class Destructors(unittest.TestCase):
         body = out[out.index("int f("):]
         first = body[: body.index("return 1;")]
         self.assertIn("R__dtor(&r);", first)
+
+    def test_an_aggregate_initialiser_is_still_an_object(self) -> None:
+        """`Pair p = { { 5 }, 7 };` needs no rewriting, and got none.
+
+        Being rewritten is how every other declaration form ended up on the
+        list the scope destroys on the way out. C spells an aggregate the
+        same way C++ does, so this one went past untouched - and the member
+        with the destructor was simply abandoned.
+        """
+
+        out = translate(
+            "class Res { public: int n; ~Res() { n = 0; } };\n"
+            "struct Pair { Res r; int tag; };\n"
+            "int main(void) { Pair p = { { 5 }, 7 }; int k = p.tag;"
+            " return k; }\n",
+            "p.cpp",
+        )
+        self.assertIn("Pair__dtor(&p); return", out)
 
 
 class ThrownObjects(unittest.TestCase):

@@ -491,6 +491,35 @@ def _plainly_c(inner: str) -> bool:
     return "(" not in written
 
 
+def _holds_a_class(inner: str, known: "list[str]") -> bool:
+    """Whether a struct body declares a member that is one of those classes.
+
+    A body with no method of its own is C already and is emitted exactly as
+    written, above the classes - which is the wrong side of a class it holds,
+    and the C stage answered that the member had an incomplete type. So
+    `struct Config { string name; };` never built, which is an ordinary thing
+    to write. Holding a class is not plainly C anyway: the member has to be
+    constructed and destroyed, and neither happens to a struct that went out
+    untouched.
+
+    A pointer or a reference to one is not holding it - C needs no complete
+    type for either, and two structs naming each other through pointers are
+    the reason the distinction has to be drawn here rather than by searching
+    the body for the name.
+    """
+
+    if not known:
+        return False
+    wanted = set(known)
+    for _member, spelled in _members_declared(inner):
+        if "*" in spelled or "&" in spelled:
+            continue
+        words = re.sub(r"\b(?:const|volatile|struct)\b", " ", spelled).split()
+        if len(words) == 1 and words[0] in wanted:
+            return True
+    return False
+
+
 def _base_named(word: str) -> str:
     """The class a base clause names, with a one-word macro answered.
 
@@ -10652,6 +10681,15 @@ _OBJECT_ARRAY = re.compile(
 _ANY_INIT = re.compile(
     r"(?<!struct )(?<![.\w>])\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=[^=][^;]*;"
 )
+#: `Holder h = { { 5 }, 7 };` - an aggregate initialiser, which C spells the
+#: same way and so is the one declaration form nothing here has to rewrite.
+#: Being rewritten is how every other one got onto the list the scope
+#: destroys on the way out, so this one went past unnoticed and a member with
+#: a destructor was never taken apart. Not an array: `A xs[3] = {...}` builds
+#: each element where it stands and has a pass of its own.
+_BRACE_VALUE_INIT = re.compile(
+    r"(?<!struct )(?<![.\w>])\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*\{"
+)
 #: `Shape *all[3];` - an array of pointers, which is how a program holds a
 #: mixture of things that share a base.
 _POINTER_ARRAY = re.compile(
@@ -12864,6 +12902,37 @@ def _rewrite_body(
 
     body = _map_code(body, lambda part: _COPY_INIT.sub(copy_initialise, part))
 
+    def note_aggregate(match: "re.Match[str]") -> str:
+        """`Holder h = { { 5 }, 7 };` is C already and is left as written.
+
+        Which is why nothing had registered it: every other declaration form
+        is rewritten above, and being rewritten is what put the object on the
+        list this scope takes apart on the way out. An aggregate needed no
+        rewriting, so it went past silently and a member with a destructor
+        was never destroyed.
+        """
+
+        type_name, variable = match.group(1), match.group(2)
+        if type_name not in classes or variable in destroyed:
+            return match.group(0)
+        before = _without_literals(match.string[: match.start()])
+        if before.count("(") > before.count(")"):
+            # Inside parentheses, which for a declaration means the head of a
+            # `for`. That object belongs to the loop and not to the scope
+            # around it, and registered here its destructor was written at the
+            # enclosing brace - against a name that is not in scope there, so
+            # a program that built stopped building.
+            return match.group(0)
+        known[variable] = type_name
+        # A static outlives this scope, exactly as it does for the form
+        # above, so the scope must not take it apart on the way out.
+        once = _AFTER_STATIC.search(match.string[: match.start()]) is not None
+        if not once and _find_method(type_name, "~", classes):
+            destroyed.append(variable)
+        return match.group(0)
+
+    body = _map_code(body, lambda part: _BRACE_VALUE_INIT.sub(note_aggregate, part))
+
     def declare_pointer(match: "re.Match[str]") -> str:
         type_name, variable = match.groups()
         if type_name not in classes:
@@ -13178,6 +13247,15 @@ def _rewrite_body(
         )
         for number, inner in enumerate(blocks)
     ]
+    # In the order they were declared, whatever order the passes above
+    # happened to register them in. Objects are taken apart in reverse of
+    # this, so a list that is not in declaration order destroys them in the
+    # wrong one: the passes run one construct at a time, so every aggregate
+    # was appended after every ordinary object however they were interleaved
+    # in the source. `P a = {1}; R b(2); P c = {3};` came apart c, a, b where
+    # C++ says c, b, a - and an object whose destructor reads one declared
+    # before it saw a value already destroyed, which is silent.
+    destroyed.sort(key=lambda name: _declared_at(body, name))
     body = _close_with_destructors(
         body, destroyed, known, classes, enclosing, returns, [0], in_a_loop
     )
@@ -13264,6 +13342,17 @@ def _lift_nested(body: str) -> "tuple[str, list[str]]":
         out.append(body[index])
         index += 1
     return "".join(out), blocks
+
+
+def _declared_at(body: str, name: str) -> int:
+    """Where this object first appears, which is where it was declared.
+
+    The same reading `_built_before` does, and for the same reason: a name is
+    mentioned first where it is brought into being.
+    """
+
+    where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", body)
+    return where.start() if where is not None else 0
 
 
 def _built_before(body: str, name: str, block: int) -> bool:
@@ -16469,9 +16558,19 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         # : Base { int c; };` has no methods and is not C, and left alone it
         # reached the C compiler with the `:` still in it. One that inherits
         # goes through the machinery that lays a base out as the first member,
-        # whether or not it declares anything of its own.
+        # whether or not it declares anything of its own. Nor if it holds a
+        # class: that member has to be constructed and destroyed, and a plain
+        # struct is emitted above the very class it holds. The classes already
+        # read are the ones to ask, and they are all of them there is to ask
+        # about - a member held by value needs a complete type, so whatever it
+        # names was declared further up the file than this.
         inner = text[opening + 1: closing - 1]
-        if keyword == "struct" and _plainly_c(inner) and not _bases_of(head):
+        if (
+            keyword == "struct"
+            and _plainly_c(inner)
+            and not _bases_of(head)
+            and not _holds_a_class(inner, order)
+        ):
             # A struct with no methods is C already and is left exactly as it
             # is - but C++ lets the bare name be a type and C does not, so it
             # still needs the typedef emitted below.
