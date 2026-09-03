@@ -410,12 +410,25 @@ def _read_macros(text: str) -> None:
     _MACRO_NAMES.clear()
     stands: "dict[str, str]" = {}
     unsettled: "set[str]" = set()
+    #: How deep inside `#if`/`#endif` the reader stands. A `#define` under one
+    #: only says what it says if that branch is taken, and which branch is
+    #: taken is the preprocessor's answer and not this stage's. Taken at face
+    #: value, `#ifdef _WIN32 / #define BASE WinThing / #endif` would name a
+    #: base class on a machine that never compiles that branch - and unlike
+    #: every other shape here that would be silent, because the name resolves
+    #: to a real class and the program builds. Whether a directive sits
+    #: between the two is answered by reading, which is all this needs.
+    inside = 0
     for kind, part in _split_literals(text):
         # A directive is one of the pieces `_split_literals` keeps whole, so
         # a `class` written inside a macro body is not read as a class and a
         # `#define` written inside a string is not read as a definition.
         if kind != "literal" or not part.startswith("#"):
             continue
+        if _OPENS_A_CONDITION.match(part):
+            inside += 1
+        elif _CLOSES_A_CONDITION.match(part):
+            inside = max(0, inside - 1)
         undone = re.match(r"#\s*undef\s+([A-Za-z_]\w*)", part)
         if undone is not None:
             unsettled.add(undone.group(1))
@@ -432,6 +445,10 @@ def _read_macros(text: str) -> None:
         if written.group(2) or "\\" in part:
             # Arguments, or a body carried on the lines below it. Either one
             # needs the preprocessor proper, which this is not.
+            unsettled.add(name)
+            continue
+        if inside:
+            # Recorded so a use of it is refused by name, never resolved.
             unsettled.add(name)
             continue
         stands[name] = written.group(3).strip()
