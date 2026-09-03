@@ -491,8 +491,10 @@ class Lexer:
         if self.index < len(self.source) and self.source[self.index] == "'":
             self.error("empty character constant", line, column)
         value, is_byte = self.escape("character")
+        if self.index < len(self.source) and self.source[self.index] != "'":
+            return self.several_characters(value, is_byte, kind, line, column)
         if self.index >= len(self.source) or self.advance() != "'":
-            self.error("multi-character constants are not supported", line, column)
+            self.error("unterminated character constant", line, column)
         if kind:
             # A wide character constant is the code point, not a byte, and it
             # is not sign-adjusted: `L'\u00e9'` is 233 and not -23.
@@ -515,6 +517,49 @@ class Lexer:
         # in this dialect, so \xFF is -1 exactly as it is on Apple's ABI.
         if value >= 0x80:
             value -= 0x100
+        return Token("integer", value, line, column, "")
+
+    def several_characters(
+        self, first: int, is_byte: bool, kind: str, line: int, column: int
+    ) -> Token:
+        """`'MJPG'` - a character constant holding more than one character.
+
+        C says the value is implementation-defined and leaves it there, so
+        what it means is whatever the compilers agree on: each character goes
+        into the next byte down, the low four are what is kept, and the type
+        is `int`. GCC, clang and MSVC all do that, which is why a four
+        character code written this way is the same number everywhere and why
+        a platform header is willing to write one - a media set names its
+        formats with nothing else.
+
+        A wide one is refused rather than guessed at: what a compiler puts in
+        a `wchar_t` here is neither agreed nor written down.
+        """
+
+        if kind:
+            self.error(
+                f"{kind}'...' holds one character, and this has more than one",
+                line,
+                column,
+            )
+        value = 0
+        held = [(first, is_byte)]
+        while self.index < len(self.source) and self.source[self.index] != "'":
+            held.append(self.escape("character"))
+        if self.index >= len(self.source):
+            self.error("unterminated character constant", line, column)
+        self.advance()  # closing quote
+        for character, was_byte in held:
+            if not was_byte and character > 0x7F:
+                self.error(
+                    "a character constant is bytes, and this character is not "
+                    "one; put it in a string, where it is UTF-8",
+                    line,
+                    column,
+                )
+            value = ((value << 8) | (character & 0xFF)) & 0xFFFFFFFF
+        if value >= 1 << 31:
+            value -= 1 << 32
         return Token("integer", value, line, column, "")
 
     def string(self, kind: str = "") -> Token:
@@ -983,6 +1028,18 @@ WCHAR_WIDE = IntegerType("wchar_t", 4, True, 3)
 
 def wchar_for(target: str) -> IntegerType:
     return WCHAR_NARROW if target.startswith("windows-") else WCHAR_WIDE
+
+
+#: The three C spells as typedefs a platform supplies and py2bin has as
+#: keywords. A header may write its own definition of any of them - a C
+#: runtime's does - and what that definition has to agree with is here.
+#: `wchar_t` maps to nothing because its width is the target's answer, which
+#: only :func:`wchar_for` knows.
+_PLATFORM_TYPE_NAMES = {
+    "wchar_t": None,
+    "char16_t": CHAR16,
+    "char32_t": CHAR32,
+}
 
 
 #: What each prefix means, except `L`, whose answer the target decides.
@@ -1576,6 +1633,11 @@ class TranslationUnit:
     library_symbols: dict[str, tuple[str, tuple[str, ...], str]] = (
         dataclasses.field(default_factory=dict)
     )
+    #: A file-scope object the program declares `extern` and nothing here
+    #: defines. Kept rather than refused where it is written, so that the
+    #: refusal can happen where the name is read instead - which for most of
+    #: these is nowhere at all.
+    declared_elsewhere: dict[str, CType] = dataclasses.field(default_factory=dict)
 
 
 # --- parser ------------------------------------------------------------------
@@ -1727,6 +1789,7 @@ class Parser:
         self.enum_tags: dict[str, CType] = {}
         self.enumerators: dict[str, int] = {}
         self.globals: dict[str, GlobalObject] = {}
+        self.declared_elsewhere: dict[str, CType] = {}
         # Set by declarator() to the token its name came from, so a caller that
         # needs to point an error at the name does not have to guess.
         self.declared_token: Token = self.tokens[0]
@@ -1863,6 +1926,14 @@ class Parser:
         base = self.type_specifier()
         while True:
             name_token = self.token
+            if (
+                name_token.kind == "identifier"
+                and str(name_token.value) in _PLATFORM_TYPE_NAMES
+            ):
+                self.platform_type_redeclared(base, name_token)
+                if not self.accept(","):
+                    break
+                continue
             ctype, name = self.declarator(base)
             if not name:
                 self.error("a typedef needs a name", keyword)
@@ -1873,6 +1944,40 @@ class Parser:
             if not self.accept(","):
                 break
         self.take(";")
+
+    def platform_type_redeclared(self, ctype: CType, name_token: Token) -> None:
+        """Read ``typedef unsigned short wchar_t;`` and check it agrees.
+
+        C spells these three as typedefs a platform supplies rather than as
+        keywords, so a library header is entitled to supply its own - and a
+        published C runtime does, in the one file every other header of the
+        set includes. py2bin has them as keywords, which is what makes a wide
+        literal come out the right width without a header being read at all,
+        so there is nothing here to record: the name already means this.
+
+        What is worth checking is whether it means the *same* thing. A header
+        that made ``wchar_t`` four bytes where py2bin makes it two would be
+        describing a different program from the one that gets compiled, and
+        nothing downstream would notice - so that is refused by name, and the
+        agreeing case is read and dropped.
+        """
+
+        name = str(name_token.value)
+        mine = wchar_for(self.target) if name == "wchar_t" else _PLATFORM_TYPE_NAMES[name]
+        self.index += 1
+        if not isinstance(ctype, IntegerType) or (
+            ctype.size,
+            ctype.signed,
+        ) != (mine.size, mine.signed):
+            self.error(
+                f"this definition gives {name!r} the type {ctype}, and here it "
+                f"is {mine.size} bytes and "
+                f"{'signed' if mine.signed else 'unsigned'}. py2bin takes the "
+                f"width of {name!r} from the target rather than from a header, "
+                f"so a definition that disagrees would describe a different "
+                f"program from the one that is compiled",
+                name_token,
+            )
 
     def struct_specifier(self, is_union: bool) -> "StructType":
         """Parse ``struct``/``union`` with an optional tag and optional body.
@@ -2048,6 +2153,15 @@ class Parser:
                 self.index += 1
                 continue
             if name in _TYPE_KEYWORDS:
+                if words and name in _PLATFORM_TYPE_NAMES:
+                    # `typedef unsigned short wchar_t;`, which is what a C
+                    # library header writes: C has no `wchar_t` keyword, only
+                    # a typedef the platform supplies, and a header that
+                    # supplies its own is writing ordinary C. Nothing
+                    # combines with a word already gathered - there is no
+                    # `unsigned short wchar_t` type - so the name here is the
+                    # one being declared, and it is left for the declarator.
+                    break
                 words.append(name)
                 self.index += 1
                 continue
@@ -2181,9 +2295,28 @@ class Parser:
 
     def pointer_suffix(self, base: CType) -> CType:
         while True:
+            # And before the `*` as well as after it: `int (__cdecl *_PIFV)
+            # (void)` is how a C runtime spells a function pointer, and the
+            # word stood exactly where the name being declared would be.
+            while (
+                self.token.kind == "identifier"
+                and self.token.value in _IGNORED_SPECIFIERS
+            ):
+                self.index += 1
             if self.accept("*"):
                 base = PointerType(base)
-                while self.token.kind == "identifier" and self.token.value in _QUALIFIERS:
+                # A qualifier here belongs to the pointer, and a convention
+                # here belongs to the function whose name is about to follow:
+                # `void * __cdecl memcpy(...)` is how a C runtime writes every
+                # one of its declarations, and py2bin dropped the convention
+                # only where a *specifier* may stand - which is before the
+                # `*`, not after it. So the word was read as the name and the
+                # real name as a syntax error, in the one file every other
+                # header of the set includes.
+                while self.token.kind == "identifier" and (
+                    self.token.value in _QUALIFIERS
+                    or self.token.value in _IGNORED_SPECIFIERS
+                ):
                     self.index += 1
                 continue
             return base
@@ -2796,6 +2929,7 @@ class Parser:
             self.enumerators,
             self.globals,
             self.library_symbols,
+            self.declared_elsewhere,
         )
 
     def names_called(self) -> "set[str]":
@@ -2982,7 +3116,11 @@ class Parser:
         while index < len(self.tokens):
             token = self.tokens[index]
             if token.value == "*" or (
-                token.kind == "identifier" and token.value in _QUALIFIERS
+                token.kind == "identifier"
+                and (
+                    token.value in _QUALIFIERS
+                    or token.value in _IGNORED_SPECIFIERS
+                )
             ):
                 index += 1
                 continue
@@ -3082,6 +3220,20 @@ class Parser:
                     if self.accept(")"):
                         break
                     self.take(",")
+        if name in self.externs and name in _CABI_SYMBOLS and self.at(";"):
+            # The same function declared twice, which C allows outright. The
+            # first was py2bin's own header binding the name to the ABI it
+            # emits a call for; the second is a platform set declaring its own
+            # entry point, and a program that includes <fileapi.h> after
+            # <windows.h> gets exactly that. It is checked against the same
+            # table the first was, so a header that disagrees about what the
+            # function takes is still refused - by the disagreement, and not
+            # by having been written down twice.
+            self.check_vetted_abi(
+                name, result, [held for held, _spelled in parameters], name_token
+            )
+            self.take(";")
+            return
         if name in self.externs or name in self.globals:
             self.error(f"{name!r} is already declared", name_token)
         previous = self.functions.get(name)
@@ -3175,17 +3327,13 @@ class Parser:
         finds neither.
         """
 
-        result = self.pointer_suffix(self.type_specifier())
+        base = self.type_specifier()
+        result = self.pointer_suffix(base)
         name_token = self.identifier()
         name = str(name_token.value)
         if not self.at("("):
-            self.error(
-                f"'extern {name}' declares an object defined in another "
-                "translation unit; py2bin compiles exactly one translation unit "
-                "and has no linker, so only 'extern' function prototypes are "
-                "accepted. Drop the 'extern' to define the object here.",
-                name_token,
-            )
+            self.extern_object(base, result, name)
+            return
         if name not in _CABI_SYMBOLS:
             # `extern` adds nothing to a function declaration that C does not
             # already give it, so hand the rest to the path a prototype
@@ -3216,6 +3364,61 @@ class Parser:
                 f"choose one of {', '.join(sorted(_CABI_SYMBOLS))}",
                 name_token,
             )
+        self.check_vetted_abi(name, result, declared, name_token)
+        if name in self.functions or name in self.externs:
+            self.error(f"{name!r} is already declared", name_token)
+        self.externs[name] = result
+
+    def extern_object(self, base: CType, ctype: CType, name: str) -> None:
+        """``extern GUID IID_IThing;`` -- an object defined somewhere else.
+
+        py2bin compiles one translation unit and has no linker, so nothing
+        can ever give this name a value. That used to be said here, at the
+        declaration, and here is the wrong place for it: a generated COM
+        header ends every interface it declares with a pair of RPC
+        interface-spec handles that a program calling that interface in its
+        own process never names, so 55 of the 1350 headers in one published
+        set stopped on a line whose only effect on them was to be read.
+
+        So the name is written down and nothing is reserved for it, and the
+        refusal happens where the program actually reads it -- see
+        ``Lowerer.defined_nowhere``. Nothing is quietly given a value: a name
+        with no storage cannot be loaded from by accident.
+        """
+
+        self.declared_elsewhere.setdefault(name, self.declarator_suffix(ctype))
+        if self.at("="):
+            # `extern int x = 5;` is a definition, whatever the keyword says,
+            # and this path reserves no storage for anything. Left to fall
+            # through it stopped on a bare "expected ';'", which pointed at
+            # the wrong thing; the sentence the declaration used to get is
+            # the right one.
+            self.error(
+                f"'extern {name}' with an initializer is a definition; py2bin "
+                f"reserves no storage for a name declared 'extern', so drop "
+                f"the 'extern' to define the object here",
+                self.token,
+            )
+        while self.accept(","):
+            more, spelled = self.declarator(base)
+            if spelled:
+                self.declared_elsewhere.setdefault(spelled, more)
+        self.take(";")
+
+    def check_vetted_abi(
+        self,
+        name: str,
+        result: CType,
+        declared: "list[CType]",
+        name_token: Token,
+    ) -> None:
+        """Check a prototype against the ABI py2bin will actually emit a call for.
+
+        The source states the exact ABI it uses and this compares that
+        statement with the table, which is what removes the need to trust a
+        header.
+        """
+
         _symbol, signature = _CABI_SYMBOLS[name]
         if len(declared) != len(signature):
             self.error(
@@ -3236,9 +3439,6 @@ class Parser:
                 f"adapter ABI returns {_CABI_RESULTS[name]!r}",
                 name_token,
             )
-        if name in self.functions or name in self.externs:
-            self.error(f"{name!r} is already declared", name_token)
-        self.externs[name] = result
 
 
 def _abi_kind(held: CType, result: bool = False) -> "str | None":
@@ -4177,6 +4377,25 @@ class Lowerer:
             return Value(ctype, BitsFloat(HeapLoad(address, size, False), size))
         return Value(ctype, HeapLoad(address, size, is_signed(ctype)))
 
+    def defined_nowhere(self, name: str, token: Token) -> None:
+        """Say so where a name declared in another unit is actually read.
+
+        The declaration itself is not the place: a generated COM header ends
+        every interface with a pair of RPC interface-spec handles that a
+        program calling that interface in its own process never names, and
+        refusing them where they are written stopped the header. Refusing
+        them here says the same thing at the only point where it matters.
+        """
+
+        if name in self.unit.declared_elsewhere:
+            self.error(
+                f"{name!r} is declared in another translation unit and defined "
+                f"in none. py2bin compiles exactly one and has no linker, so "
+                f"nothing can give this name a value; define it here, or reach "
+                f"what holds it through the library that exports it",
+                token,
+            )
+
     def lvalue(self, node: Node) -> tuple[CType, IntExpression]:
         if isinstance(node, Identifier):
             local = self.lookup(node.name)
@@ -4188,6 +4407,7 @@ class Lowerer:
                     # but '&' and a call both want exactly this pair, and every
                     # other use goes through load(), which decays it.
                     return self.function_designator(node.name, node.token)
+                self.defined_nowhere(node.name, node.token)
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )
@@ -4357,6 +4577,7 @@ class Lowerer:
                 if node.name in self.unit.functions:
                     ctype, address = self.function_designator(node.name, node.token)
                     return self.load(ctype, address)
+                self.defined_nowhere(node.name, node.token)
                 self.error(
                     f"{node.name!r} is not a declared local or parameter", node.token
                 )

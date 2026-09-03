@@ -853,12 +853,25 @@ class RejectionTests(PreprocessorTestCase):
     def test_directives_it_does_not_implement(self):
         self.reject("#line 5\nint main(void) { return 0; }\n", "#line is not implemented")
         self.reject(
-            "#warning hmm\nint main(void) { return 0; }\n", "#warning is not implemented"
-        )
-        self.reject(
             "#unheard_of\nint main(void) { return 0; }\n",
             "unknown preprocessing directive",
         )
+
+    def test_a_warning_is_reported_and_the_build_carries_on(self):
+        """Refusing it stopped a build over the one directive whose whole
+        purpose is not to stop one - and a published header set writes one at
+        the top of each header it has superseded, so nine of the 1350 headers
+        in one of them stopped there and nowhere else."""
+
+        import contextlib
+        import io
+
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            self.assertEqual(
+                expand("#warning this header moved\nkept\n"), "kept"
+            )
+        self.assertIn("warning: t.c:1:2: this header moved", said.getvalue())
 
     def test_a_pragma_that_would_move_a_member_is_refused_by_name(self):
         """The ones ignoring would get wrong, rather than the ones it knows.
@@ -1387,6 +1400,60 @@ int main(void) {
 """
         )
 
+    def test_a_fetched_header_is_written_in_the_sets_own_spellings(self):
+        """A fetched set reaches the core through <windef.h> or
+        <minwindef.h> - which are py2bin's <windows.h> - and then writes the
+        rest of itself in the words that core would have given it: WINBOOL
+        for a BOOL, VOID for void, __C89_NAMELESS before an anonymous member,
+        WINBASEAPI before an import, DECLARE_HANDLE for a handle. Each was a
+        name nothing had defined, and the parser stopped on it as if it were
+        a type. Over one published set of 1350 headers, WINBOOL alone is
+        where 290 of them stopped and `__C89_NAMELESS` another 137.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            where = Path(directory)
+            (where / "vendor.h").write_text(
+                """
+#include <minwindef.h>
+
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+DECLARE_HANDLE(HTHING);
+
+typedef struct _THING {
+    WINBOOL live;
+    LCID locale;
+    __C89_NAMELESS union {
+        DWORD whole;
+        WORD half[2];
+    } u;
+} THING, *PTHING;
+
+WINBASEAPI VOID WINAPI ThingReset(HTHING handle);
+
+FORCEINLINE WINBOOL ThingLive(const THING *thing) { return thing->live; }
+#endif
+""",
+                newline="\n",
+            )
+            (where / "piece.c").write_text(
+                """
+#include "vendor.h"
+int main(void) {
+    THING thing;
+    HTHING handle = (HTHING)0;
+    thing.live = TRUE;
+    thing.locale = 1033;
+    thing.u.whole = 0x00020001;
+    return (int)(ThingLive(&thing) + thing.u.half[1] + (handle != 0)) - 3;
+}
+""",
+                newline="\n",
+            )
+            compile_c_native(
+                where / "piece.c", where / "piece.exe", target="windows-x86_64"
+            )
+
     def test_what_py2bin_supplies_is_a_default(self):
         """py2bin's own header says what `S_OK` is so a program that never
         reaches a platform set still has it. A program that does reach one
@@ -1403,6 +1470,89 @@ int main(void) {
 int main(void) { return (int)(E_OUTOFMEMORY == E_OUTOFMEMORY) - 1; }
 """
         )
+
+    def test_a_default_loses_whichever_order_the_two_arrive_in(self):
+        """A set reaches py2bin's <windows.h> through one of its own headers
+        as often as the other way round: <apisetcconv.h> defines WINBASEAPI
+        as DECLSPEC_IMPORT and then includes a piece of <windows.h>, which is
+        py2bin's - and py2bin's, defining it as nothing, reported a clash
+        against the set's own word for its own thing."""
+
+        self.compile_for_windows(
+            """
+#define WINAPI __stdcall
+#define WINBASEAPI __declspec(dllimport)
+#include <windows.h>
+WINBASEAPI DWORD WINAPI TheirOwnEntryPoint(void);
+int main(void) { return 0; }
+"""
+        )
+
+    def test_a_set_may_declare_an_entry_point_py2bin_declares_too(self):
+        """C allows a function to be declared twice, and a program that
+        includes <windows.h> and then a piece of a fetched set gets exactly
+        that: py2bin's header bound `CloseHandle` to the ABI it emits a call
+        for, and <handleapi.h> declares the same function again. The second
+        declaration is checked against the same table rather than refused for
+        existing - and one that disagrees is still refused, by the
+        disagreement."""
+
+        self.compile_for_windows(
+            """
+#include <windows.h>
+WINBASEAPI BOOL WINAPI CloseHandle(HANDLE hObject);
+WINBASEAPI BOOL WINAPI SetConsoleCP(UINT wCodePageID);
+int main(void) { return 0; }
+"""
+        )
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "#include <windows.h>\n"
+                "BOOL WINAPI CloseHandle(HANDLE a, HANDLE b);\n"
+                "int main(void) { return 0; }\n",
+                "reject.c",
+                "windows-x86_64",
+            )
+        self.assertRegex(str(caught.exception), "vetted adapter ABI takes")
+
+    def test_the_structs_this_header_adds_are_laid_out_as_windows_lays_them(self):
+        """Every number here was checked against the published headers rather
+        than remembered: `OVERLAPPED` is 32 bytes because the union is one
+        name for two DWORDs and another for a pointer over the same eight,
+        and moving `hEvent` off 24 would hand the kernel a different struct
+        from the one it fills in."""
+
+        from py2bin.c_frontend import Parser
+        from py2bin.c_preprocessor import preprocess
+
+        for target in ("windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                parser = Parser(
+                    list(preprocess("#include <windows.h>\n", "t.c", target=target)),
+                    "t.c",
+                    target,
+                )
+                parser.translation_unit()
+                for tag, size in (
+                    ("_SECURITY_ATTRIBUTES", 24),
+                    ("_OVERLAPPED", 32),
+                    ("_SYSTEMTIME", 16),
+                    ("_LIST_ENTRY", 16),
+                    ("tagPOINTS", 4),
+                    ("tagSIZE", 8),
+                    ("_RECTL", 16),
+                ):
+                    self.assertEqual(parser.struct_tags[tag].size, size, tag)
+                overlapped = parser.struct_tags["_OVERLAPPED"]
+                for name, offset in (
+                    ("Internal", 0),
+                    ("InternalHigh", 8),
+                    ("Offset", 16),
+                    ("OffsetHigh", 20),
+                    ("Pointer", 16),
+                    ("hEvent", 24),
+                ):
+                    self.assertEqual(overlapped.member(name).offset, offset, name)
 
     def test_two_definitions_of_a_macro_nobody_supplied_still_clash(self):
         self.reject(

@@ -2156,11 +2156,22 @@ _TAGGED_TYPE = re.compile(r"\b(enum|union)\s+([A-Za-z_]\w*)\s*\{")
 _A_TYPEDEF_OF_AN_ENUM = re.compile(r"\btypedef\s+enum\b")
 
 _HOISTED_TO_THE_TOP = re.compile(
-    _CLASS_HEAD.pattern + r"|(?P<typedef>(?m:^)[ \t]*typedef[^;{}]*;)"
+    _CLASS_HEAD.pattern
+    + r"|(?P<typedef>(?m:^)[ \t]*typedef[^;{}]*;)"
+    # `typedef struct { ... } counter;` - a body with no tag, which is how
+    # nearly every C header names a type. It matched neither branch above: the
+    # struct one wants a name after the keyword and the typedef one wants no
+    # body at all. So it stayed where it was written, below the classes, and
+    # a class holding a `counter` was emitted first and named a type C had not
+    # reached. The tagged spelling of the same thing had always worked, which
+    # is what made this look like an include problem rather than a hoist one.
+    + r"|(?P<anonymous>\btypedef\s+(?:struct|union)\s*\{)"
 )
 
 
-def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]]":
+def _hoist_plain_structs(
+    text: str, plain: "list[str]", known: "list[str]" = ()
+) -> "tuple[str, list[str]]":
     """Take each plain struct's body out, to be emitted above the classes.
 
     A `struct` with no methods is C already and is left exactly as written -
@@ -2186,6 +2197,24 @@ def _hoist_plain_structs(text: str, plain: "list[str]") -> "tuple[str, list[str]
             bodies.append(head.group(0))
             out.append(text[at:head.start()])
             at = head.end()
+            continue
+        if head.group("anonymous") is not None:
+            if _depth_at(text, head.start()) != 0:
+                continue
+            try:
+                closing = _matching(text, head.end() - 1)
+            except ValueError:
+                continue
+            # One holding a class is not C already and has to come after the
+            # class it holds, which is the plain struct's rule too; it is left
+            # where it was, and gets today's answer.
+            if _holds_a_class(text[head.end(): closing - 1], list(known)):
+                continue
+            end = text.find(";", closing)
+            end = closing if end < 0 else end + 1
+            bodies.append(text[head.start():end])
+            out.append(text[at:head.start()])
+            at = end
             continue
         if head.group(2) not in wanted:
             continue
@@ -16897,7 +16926,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # the class named a type C had not seen yet. The bodies of those go up
     # too, in the order they were written, so one holding another still comes
     # after it.
-    remainder, plain_bodies = _hoist_plain_structs(remainder, plain)
+    remainder, plain_bodies = _hoist_plain_structs(remainder, plain, order)
     # The name a function's own type was given goes up with the rest of them:
     # a template copy taking one is emitted above whatever is left of the
     # file, and the typedef was still down where the function was defined.

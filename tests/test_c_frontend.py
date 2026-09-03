@@ -1339,6 +1339,28 @@ int main(void) {
 
 
 class FunctionTests(CProgramTestCase):
+    def test_a_convention_may_stand_between_the_star_and_the_name(self):
+        """`void * __cdecl memcpy(...)` is how a published C runtime writes
+        every declaration it has, and py2bin dropped a convention only where a
+        specifier may stand - before the `*`, not after it. So the word was
+        read as the name being declared and the real name became a syntax
+        error, in the one file the rest of such a set includes."""
+
+        self.run_c(
+            _STDIO
+            + """
+void * __cdecl give(void *p);
+void * __cdecl give(void *p) { return p; }
+char * __stdcall second(char *s) { return s + 1; }
+int main(void) {
+    int n = 7;
+    printf("%d %c\\n", *(int *)give(&n), *second("hi"));
+    return 0;
+}
+""",
+            stdout="7 i\n",
+        )
+
     def test_functions_are_inlined_including_nested_calls(self):
         self.run_c(
             _STDIO
@@ -1776,9 +1798,22 @@ class RejectionTests(CProgramTestCase):
         )
         self.reject("void v;\nint main(void) { return 0; }\n", "cannot have type void")
 
-    def test_an_extern_object_is_refused_with_a_clear_message(self):
+    def test_an_extern_object_is_refused_where_it_is_read(self):
+        """Not where it is declared. py2bin has one translation unit and no
+        linker, so nothing can give such a name a value - but the declaration
+        by itself emits nothing, and a generated COM header ends every
+        interface it declares with a pair of these that a program calling
+        that interface in its own process never names. Refusing them where
+        they are written stopped 55 of the 1350 headers in one published set
+        on a line whose only effect on them was to be read."""
+
+        self.build("extern int errno;\nint main(void) { return 0; }\n")
         self.reject(
-            "extern int errno;\nint main(void) { return 0; }\n",
+            "extern int errno;\nint main(void) { return errno; }\n",
+            "no linker",
+        )
+        self.reject(
+            "extern int errno;\nint main(void) { errno = 1; return 0; }\n",
             "no linker",
         )
 
@@ -4620,6 +4655,76 @@ class WideAndUnicodeLiterals(unittest.TestCase):
             _STDIO + 'int main(void) { const char *s = "\\xFF\\u00ff"; return 0; }\n'
         )
         self.assertIn(b"\xff" + "ÿ".encode("utf-8") + b"\0", out)
+
+    def test_a_character_constant_may_hold_several(self) -> None:
+        """`'MJPG'` is how a media header names a format, and C leaves the
+        value implementation-defined - so what it means is what every
+        compiler does with it: each character into the next byte down, the
+        low four kept, type int. Every number below was worked out from that
+        rule; 'abcde' keeps 'bcde' and '\\xff\\xff\\xff\\xff' is -1 because the
+        type is signed.
+        """
+
+        for spelled, value in (
+            ("'ab'", 24930),
+            ("'abcd'", 1633837924),
+            ("'\\x01\\x02'", 258),
+            ("'abcde'", 1650680933),
+            ("'\\xff\\xff\\xff\\xff'", -1),
+        ):
+            with self.subTest(spelled=spelled):
+                module = compile_c_to_ir(
+                    f"int main(void) {{ return {spelled} == ({value}) ? 0 : 1; }}\n",
+                    "t.c",
+                    "darwin-arm64",
+                )
+                self.assertTrue(module.operations)
+
+    def test_a_wide_constant_still_holds_one_character(self) -> None:
+        """What a compiler puts in a `wchar_t` for `L'ab'` is neither agreed
+        nor written down, so it is refused rather than guessed at."""
+
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "int main(void) { return L'ab'; }\n", "t.c", "darwin-arm64"
+            )
+        self.assertRegex(str(caught.exception), r"holds one character")
+
+    def test_a_header_may_define_wchar_t_where_it_agrees(self) -> None:
+        """C has no `wchar_t` keyword - it has a typedef the platform gives.
+
+        A published C runtime supplies its own in the one file the rest of
+        the set includes, and py2bin read the two words as one specifier and
+        stopped at `unsigned short wchar_t`. 62 of the 1350 headers in one
+        published Windows set stop there and nowhere else.
+        """
+
+        for target, spelled in (
+            ("windows-x86_64", "unsigned short"),
+            ("linux-x86_64", "int"),
+        ):
+            with self.subTest(target=target):
+                module = compile_c_to_ir(
+                    f"typedef {spelled} wchar_t;\n"
+                    "int main(void) { wchar_t w = L'A'; return (int)w - 65; }\n",
+                    "t.c",
+                    target,
+                )
+                self.assertTrue(module.operations)
+
+    def test_a_definition_of_wchar_t_that_disagrees_is_refused(self) -> None:
+        """Because the width is the target's answer, not the header's: a
+        wide literal is already encoded to it, and taking the header's word
+        for a different one would describe a program nobody compiled."""
+
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "typedef int wchar_t;\nint main(void) { return 0; }\n",
+                "t.c",
+                "windows-x86_64",
+            )
+        self.assertRegex(str(caught.exception), r"gives 'wchar_t' the type int")
+        self.assertRegex(str(caught.exception), r"2 bytes and unsigned")
 
 
 class ExitBuiltins(unittest.TestCase):

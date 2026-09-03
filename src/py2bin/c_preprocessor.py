@@ -51,13 +51,14 @@ What is accepted
   ``__DATE__`` and ``__TIME__`` are the fixed ``"Jan  1 1970"`` and
   ``"00:00:00"``: C11 6.10.8.1 allows an implementation-defined constant when
   the date of translation is not available, and py2bin would rather compile the
-  same source to the same bytes than read the clock.
+  same source to the same bytes than read the clock;
+* ``#warning``, whose text goes to standard error and whose whole purpose is
+  not to stop the compilation -- so it does not.
 
 What is rejected
 ----------------
 ``#line`` (py2bin reports the line the token was really written on),
-``#warning`` (py2bin's C compiler has no channel for a diagnostic that is not
-fatal), a ``#pragma`` that would move a struct's members, rename a definition
+a ``#pragma`` that would move a struct's members, rename a definition
 or place one in a section of its own -- ignoring one of those is how a
 compiler silently changes an ABI, so py2bin refuses it by name -- the GNU
 ``, ## __VA_ARGS__`` comma-deletion extension, ``#`` and ``##`` that survive
@@ -76,6 +77,7 @@ import pathlib
 import collections
 import dataclasses
 import re
+import sys
 from pathlib import Path
 
 from .c_frontend import ARENA_BYTES, CCompileError, Lexer, Token
@@ -666,6 +668,25 @@ class Preprocessor:
             # than anything that pointed at the cause.
             text.extend(_PLATFORM_MACROS.get(system, ()))
             text.extend(_MACHINE_MACROS.get(machine, ()))
+            # What a compiler tells a header about its own data model, in the
+            # spelling GCC and clang settled on. These say nothing about
+            # which compiler is reading - a header that writes
+            # `__UINTPTR_TYPE__` in a prototype wants a type name and not an
+            # extension - and a published C runtime does write one, in the
+            # file the rest of the set includes. Windows is LLP64, so the
+            # pointer-wide integer there is `long long` and not `long`.
+            if machine in ("arm64", "x86_64"):
+                wide = "long long" if system == "windows" else "long"
+                text.extend(
+                    (
+                        f"#define __SIZE_TYPE__ unsigned {wide}",
+                        f"#define __PTRDIFF_TYPE__ {wide}",
+                        f"#define __INTPTR_TYPE__ {wide}",
+                        f"#define __UINTPTR_TYPE__ unsigned {wide}",
+                        "#define __WCHAR_TYPE__ "
+                        + ("unsigned short" if system == "windows" else "int"),
+                    )
+                )
         self._file("\n".join(text) + "\n", origin, None)
 
     # --- running over a file ---
@@ -803,11 +824,21 @@ class Preprocessor:
                 name_token,
             )
         if name == "warning":
-            self.error(
-                "#warning is not implemented; py2bin's C compiler has no channel "
-                "for a diagnostic that does not stop the compilation",
-                name_token,
+            # A `#warning` exists in order not to stop a compilation, so
+            # stopping one is the one response to it that cannot be right.
+            # Every compiler reports it and carries on, and C23 wrote that
+            # down; a published set puts one at the top of each header it has
+            # superseded, so refusing it stopped nine of the 1350 headers in
+            # one of them over a line that changes nothing emitted. Written
+            # where a compiler writes a diagnostic, there being no other
+            # channel out of here.
+            spelled = _respaced(rest)
+            print(
+                f"py2bin: warning: {name_token.origin}:{name_token.line}:"
+                f"{name_token.column}: {spelled}",
+                file=sys.stderr,
             )
+            return
         self.error(f"unknown preprocessing directive #{name}", name_token)
 
     # --- #define ---
@@ -887,6 +918,30 @@ class Preprocessor:
             # neither is wrong, so this is not a mistake to report.
             if name in self._defaults:
                 self._defaults.discard(name)
+                self.macros[name] = macro
+                return
+            if self._reading_a_builtin:
+                # A program, or a header on its path, defined this name and
+                # then reached one of py2bin's own headers that defines it
+                # too: <apisetcconv.h> writes WINBASEAPI and then includes a
+                # piece of <windows.h>, which is py2bin's. C's answer is that
+                # the last definition wins and the compiler says so, and that
+                # is what every compiler does. Keeping the *first* instead -
+                # which is what this branch did - was a quiet disagreement
+                # with all of them: `#define EOF 0` and then <stdio.h> left
+                # EOF at 0 where clang says -1, and a DECLARE_HANDLE spelled
+                # by the program before <windows.h> made HKL and HFONT
+                # four-byte ints where the platform has eight-byte pointers.
+                # Nothing was said, and the program ran. So the last one wins
+                # here as well, with the diagnostic clang gives.
+                print(
+                    f"py2bin: warning: {name_token.origin}:{name_token.line}:"
+                    f"{name_token.column}: macro {name!r} redefined; the "
+                    f"earlier definition at {existing.token.origin}:"
+                    f"{existing.token.line}:{existing.token.column} is replaced",
+                    file=sys.stderr,
+                )
+                self._defaults.add(name)
                 self.macros[name] = macro
                 return
             self.error(
@@ -1259,8 +1314,10 @@ class Preprocessor:
             "the program is searched anyway.\n"
             "  py2bin ships the standard headers "
             f"({', '.join(sorted(_BUILTIN_HEADERS))}) and has no system include "
-            "path: a platform SDK header is written in compiler extensions this "
-            "C compiler does not implement, so finding one would not help",
+            "path. The core of a platform SDK is among them, written by py2bin "
+            "rather than taken from a set that asks which compiler is reading "
+            "it; the rest of a set can be brought down with --auto-fetch and "
+            "compiles against that core",
             at,
         )
 
@@ -1835,12 +1892,39 @@ _WINDOWS_H = """
 or windows-arm64, or guard the include with #ifdef _WIN32
 #endif
 
+/* How a published Windows set spells the things it asks of a compiler:
+   `__C89_NAMELESS` before an anonymous member, `__LONG32` where a long has
+   to stay 32 bits wide, `__MINGW_EXTENSION` before a declaration only some
+   compilers take. A fetched set's own headers reach the core through
+   <windef.h> or <minwindef.h>, which are this file - and the file they
+   would have read those from is the one py2bin replaced, so each of them
+   stopped on the first such word as if it were a type name. py2bin ships
+   _mingw.h, so this resolves whether or not anything has been fetched. */
+#include <_mingw.h>
+/* The set's own <windows.h> reads <stdarg.h> on its first page, and the
+   headers below it take that for granted: a console or string function that
+   takes a `va_list` names the type without asking anyone for it. */
+#include <stdarg.h>
+/* Which slice of the API this program is being built for.
+   `#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)` opens a great many
+   of a set's headers, and with nothing to expand it that line is not an
+   expression at all. */
+#include <winapifamily.h>
+
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
 #define WINAPI
 #define APIENTRY
 #define CALLBACK
+/* The rest of the set's names for how a call is made. py2bin has one
+   convention per target and decides it itself, so each of these says
+   nothing here - but a declaration that spells one and finds it undefined
+   reads as two names in a row, and stops. */
+#define CDECL
+#define WINAPIV
+#define PASCAL
+#define APIPRIVATE
 #define CONST const
 #define FALSE 0
 #define TRUE 1
@@ -1849,7 +1933,11 @@ or windows-arm64, or guard the include with #ifdef _WIN32
 typedef int BOOL;
 typedef unsigned char BYTE;
 typedef unsigned short WORD;
-typedef unsigned int DWORD;
+/* `unsigned long`, which on Windows is four bytes - the set spells it that
+   way and then says `typedef DWORD ULONG;` in a second header, and with
+   `unsigned int` here those two were the same width under different names
+   and the second was reported as a clash. */
+typedef unsigned long DWORD;
 typedef unsigned int UINT;
 typedef int INT;
 typedef long LONG;
@@ -1903,6 +1991,14 @@ typedef const char *PCSTR;
 typedef struct _LARGE_INTEGER { LONGLONG QuadPart; } LARGE_INTEGER;
 typedef struct _ULARGE_INTEGER { ULONGLONG QuadPart; } ULARGE_INTEGER;
 typedef struct _LUID { DWORD LowPart; LONG HighPart; } LUID;
+/* The guards go with the definitions. A set writes its own copy of a
+   handful of these small structs in whichever of its headers needs one, each
+   behind `#ifndef _FILETIME_` - which is how the set keeps from defining it
+   twice itself, and is what tells a second copy to stand down. py2bin
+   supplies the struct, so py2bin supplies the guard: without it 12 of the
+   1350 headers in one set defined `_FILETIME` a second time and were refused
+   for it. */
+#define _FILETIME_
 typedef struct _FILETIME {
     DWORD dwLowDateTime;
     DWORD dwHighDateTime;
@@ -1926,6 +2022,190 @@ typedef const wchar_t *LPCWSTR;
 typedef DWORD *LPDWORD;
 typedef WORD *LPWORD;
 typedef BOOL *LPBOOL;
+
+/* The rest of a published set's own spellings for what is already above.
+   Each of these is one line in <winnt.h>, <windef.h> or <minwindef.h> - the
+   headers this file stands in for - and a header that names one is not
+   asking for anything py2bin cannot compile: it is calling a type by the
+   name the set gave it. Measured over a published set of 1350 headers,
+   `WINBOOL` alone is where 290 of them stopped. */
+typedef int WINBOOL;
+#define VOID void
+typedef DWORD LCID;
+typedef WORD LANGID;
+typedef DWORD ACCESS_MASK;
+typedef DWORD COLORREF;
+typedef COLORREF *LPCOLORREF;
+/* A security identifier is variable-length and always reached through a
+   pointer; the set says so itself, and gives the pointer no more type than
+   this. */
+typedef PVOID PSID;
+typedef CHAR *PCHAR;
+typedef UCHAR *PUCHAR;
+typedef SHORT *PSHORT;
+typedef USHORT *PUSHORT;
+typedef INT *PINT;
+typedef UINT *PUINT;
+typedef LONG *PLONG;
+typedef ULONG *PULONG;
+typedef WORD *PWORD;
+typedef DWORD *PDWORD;
+typedef BOOL *PBOOL;
+typedef FLOAT *PFLOAT;
+typedef INT *LPINT;
+typedef UINT *LPUINT;
+typedef LONG *LPLONG;
+typedef ULONG *LPULONG;
+typedef CHAR *PSZ;
+typedef HANDLE *PHANDLE;
+typedef HANDLE *LPHANDLE;
+typedef HANDLE *SPHANDLE;
+typedef HANDLE GLOBALHANDLE;
+typedef HANDLE LOCALHANDLE;
+typedef HKEY *PHKEY;
+typedef int HFILE;
+typedef struct _SYSTEMTIME {
+    WORD wYear;
+    WORD wMonth;
+    WORD wDayOfWeek;
+    WORD wDay;
+    WORD wHour;
+    WORD wMinute;
+    WORD wSecond;
+    WORD wMilliseconds;
+} SYSTEMTIME, *PSYSTEMTIME, *LPSYSTEMTIME;
+#define _SYSTEMTIME_
+typedef struct _LIST_ENTRY {
+    struct _LIST_ENTRY *Flink;
+    struct _LIST_ENTRY *Blink;
+} LIST_ENTRY, *PLIST_ENTRY;
+
+/* A handle is a pointer the program never looks inside, and the set writes
+   every one of them with this. It gives each its own struct type only under
+   STRICT, which is a promise about type checking rather than about layout:
+   either way what the program holds is one pointer. */
+#define DECLARE_HANDLE(name) typedef HANDLE name
+#define ANYSIZE_ARRAY 1
+/* What is left of the 16-bit memory models. Every set still writes them on
+   a pointer here and there, in both cases, and every set defines all four to
+   nothing. */
+#define FAR
+#define NEAR
+#define far
+#define near
+#define FIELD_OFFSET(type, field) ((LONG)(LONG_PTR)&(((type *)0)->field))
+
+/* What a set writes in front of a function the loader binds. Each names the
+   library the declaration came from and each expands to `dllimport` where a
+   compiler has it; py2bin binds an import by finding the name in a DLL's own
+   export table, so none of them has anything to say here. */
+#define WINBASEAPI
+#define WINUSERAPI
+#define WINGDIAPI
+#define WINADVAPI
+#define WINCOMMCTRLAPI
+#define NTSYSAPI
+#define NTSYSCALLAPI
+#define NTAPI
+/* A function the set writes out in the header itself rather than importing.
+   `static` because py2bin compiles one translation unit: that is what a
+   definition in a header has to be to belong to it. */
+#define FORCEINLINE static __inline
+#define DECLSPEC_SELECTANY
+#define DECLSPEC_NORETURN
+#define DECLSPEC_NOTHROW
+#define DECLSPEC_NOINLINE
+#define DECLSPEC_DEPRECATED
+#define DECLSPEC_CACHEALIGN
+/* Not defined away, on purpose. This one decides where a member sits, and a
+   struct laid out differently from the one written runs and is wrong with
+   nothing said - so it is left spelled as the `__declspec` it is, and the
+   refusal a program gets names alignment rather than the macro. */
+#define DECLSPEC_ALIGN(bytes) __declspec(align(bytes))
+
+/* Narrow or wide, decided by UNICODE exactly as the replaced header decides
+   it. `TEXT()` has to put an L in front of a literal in the wide case, which
+   is a paste and so needs the second macro to expand its argument first. */
+#ifdef UNICODE
+typedef WCHAR TCHAR;
+#define __TEXT(quoted) L##quoted
+#else
+typedef char TCHAR;
+#define __TEXT(quoted) quoted
+#endif
+typedef TCHAR *PTSTR;
+typedef TCHAR *LPTSTR;
+typedef const TCHAR *PCTSTR;
+typedef const TCHAR *LPCTSTR;
+#define TEXT(quoted) __TEXT(quoted)
+
+/* The rest of the handles <windef.h> and <minwindef.h> declare, in the
+   spelling they declare them with. Each is a pointer nothing looks inside,
+   and a header that names one wants a parameter type. */
+DECLARE_HANDLE(HHOOK);
+DECLARE_HANDLE(HACCEL);
+DECLARE_HANDLE(HCOLORSPACE);
+DECLARE_HANDLE(HGLRC);
+DECLARE_HANDLE(HDESK);
+DECLARE_HANDLE(HENHMETAFILE);
+DECLARE_HANDLE(HMETAFILE);
+DECLARE_HANDLE(HFONT);
+DECLARE_HANDLE(HPALETTE);
+DECLARE_HANDLE(HPEN);
+DECLARE_HANDLE(HMONITOR);
+#define HMONITOR_DECLARED 1
+DECLARE_HANDLE(HWINEVENTHOOK);
+DECLARE_HANDLE(HKL);
+DECLARE_HANDLE(HRSRC);
+DECLARE_HANDLE(HTASK);
+DECLARE_HANDLE(HWINSTA);
+typedef void *HGDIOBJ;
+
+/* And the rest of the spellings for what is already here. `PWCHAR` is a
+   wide string the program may write into; `DWORDLONG` is the set's name for
+   the 64-bit unsigned it already has; a security descriptor and a security
+   identifier are variable-length and reached through a pointer the set gives
+   no more type than this. */
+typedef WCHAR *PWCHAR;
+typedef WCHAR *LPWCH;
+typedef const WCHAR *LPCWCH;
+typedef ULONGLONG DWORDLONG;
+typedef DWORDLONG *PDWORDLONG;
+typedef DWORD SECURITY_INFORMATION;
+typedef DWORD *PSECURITY_INFORMATION;
+typedef PVOID PSECURITY_DESCRIPTOR;
+typedef ULONG_PTR KAFFINITY;
+typedef DWORD FOURCC;
+typedef FILETIME *PFILETIME;
+typedef FILETIME *LPFILETIME;
+typedef SYSTEMTIME *LPSYSTEMTIME;
+typedef LUID *PLUID;
+typedef LARGE_INTEGER *PLARGE_INTEGER;
+typedef ULARGE_INTEGER *PULARGE_INTEGER;
+/* Two structs from <minwinbase.h> that a header names in a prototype far
+   more often than a program fills one in. Both are laid out as the platform
+   lays them: three fields and a pointer that has to be eight-aligned, so
+   `SECURITY_ATTRIBUTES` is 24 bytes; and in `OVERLAPPED` the union is one
+   name for the pair of DWORDs and another for a pointer over the same eight
+   bytes, which is what makes it 32. */
+typedef struct _SECURITY_ATTRIBUTES {
+    DWORD nLength;
+    LPVOID lpSecurityDescriptor;
+    BOOL bInheritHandle;
+} SECURITY_ATTRIBUTES, *PSECURITY_ATTRIBUTES, *LPSECURITY_ATTRIBUTES;
+#define _SECURITY_ATTRIBUTES_
+typedef struct _OVERLAPPED {
+    ULONG_PTR Internal;
+    ULONG_PTR InternalHigh;
+    union {
+        struct {
+            DWORD Offset;
+            DWORD OffsetHigh;
+        } DUMMYSTRUCTNAME;
+        PVOID Pointer;
+    } DUMMYUNIONNAME;
+    HANDLE hEvent;
+} OVERLAPPED, *LPOVERLAPPED;
 
 #define INVALID_HANDLE_VALUE ((HANDLE)-1)
 #define STD_INPUT_HANDLE ((DWORD)-10)
@@ -2005,6 +2285,10 @@ extern BOOL SetWindowPos(HWND, HWND, int, int, int, int, UINT);
    pointer. This is how a vendor component is reached - WebView2Loader.dll
    is one - without naming anybody's product in py2bin's import table. */
 typedef int (*FARPROC)(void);
+/* The set's other two names for the same thing, from when they were not the
+   same thing. */
+typedef FARPROC NEARPROC;
+typedef FARPROC PROC;
 extern HMODULE LoadLibraryW(LPCWSTR);
 extern HMODULE LoadLibraryA(LPCSTR);
 extern BOOL FreeLibrary(HMODULE);
@@ -2085,10 +2369,26 @@ typedef unsigned short ATOM;
 
 typedef struct tagPOINT { LONG x; LONG y; } POINT;
 typedef struct tagRECT { LONG left; LONG top; LONG right; LONG bottom; } RECT;
+/* And the pointer spellings of both, and the two the set writes with a
+   trailing L - the same fields, under the names a header that came from an
+   .idl uses. */
+typedef RECT *PRECT;
+typedef RECT *LPRECT;
+typedef const RECT *LPCRECT;
+typedef POINT *PPOINT;
+typedef POINT *LPPOINT;
+typedef struct _RECTL { LONG left; LONG top; LONG right; LONG bottom; }
+    RECTL, *PRECTL, *LPRECTL;
+typedef const RECTL *LPCRECTL;
+typedef struct _POINTL { LONG x; LONG y; } POINTL, *PPOINTL;
+typedef struct tagPOINTS { SHORT x; SHORT y; } POINTS, *PPOINTS, *LPPOINTS;
+typedef struct tagSIZE { LONG cx; LONG cy; } SIZE, *PSIZE, *LPSIZE;
+typedef SIZE SIZEL;
+typedef SIZE *PSIZEL, *LPSIZEL;
 typedef struct tagMSG {
     HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
     DWORD time; POINT pt;
-} MSG;
+} MSG, *PMSG, *LPMSG;
 
 /* The window procedure a program writes, and the loader calls back into. */
 typedef LRESULT (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);
@@ -2197,6 +2497,35 @@ extern UINT GetDpiForWindow(HWND);
 #define IDI_APPLICATION ((LPCWSTR)32512)
 #define COLOR_WINDOW 5
 #define PM_REMOVE 0x0001
+
+/* The two GDI shapes py2bin's own headers lean on, written here rather than
+   pulled in: <oleidl.h> names LOGPALETTE in a prototype and takes it for
+   granted. The pull this stood in for - `#if __has_include(<wingdi.h>)` -
+   fired for any directory holding a wingdi.h at all, and a package brings
+   that file along without its neighbours as often as not, so a hello-world
+   that never named it stopped on a header wingdi.h includes and nobody had
+   fetched. A program that wants the rest of GDI includes <wingdi.h> itself.
+   Guarded with the names the published header guards them with, so that
+   header stands down instead of defining them a second time. Sizes and
+   offsets checked against clang on four targets: 4 and 8 bytes, aligned to
+   1 and 2. */
+#ifndef _PALETTEENTRY_DEFINED
+#define _PALETTEENTRY_DEFINED
+typedef struct tagPALETTEENTRY {
+    BYTE peRed;
+    BYTE peGreen;
+    BYTE peBlue;
+    BYTE peFlags;
+} PALETTEENTRY, *PPALETTEENTRY, *LPPALETTEENTRY;
+#endif
+#ifndef _LOGPALETTE_DEFINED
+#define _LOGPALETTE_DEFINED
+typedef struct tagLOGPALETTE {
+    WORD palVersion;
+    WORD palNumEntries;
+    PALETTEENTRY palPalEntry[1];
+} LOGPALETTE, *PLOGPALETTE, *NPLOGPALETTE, *LPLOGPALETTE;
+#endif
 """
 
 #: The platform half of <filesystem>, in C. It lives here rather than in the
@@ -2843,12 +3172,27 @@ _WTYPES_H = """
    and its own way back here is closed by the guard above. Whatever a header
    includes may include it back, so what it needs first has to be first. */
 typedef long HRESULT;
+/* The rest of the spellings <wtypesbase.h> and <wtypes.h> give: a status
+   code, the tag of a VARIANT, the id of a method on a dispatch interface,
+   and the id of a property. Each is one of the integers above under the name
+   an .idl gave it. */
+typedef long SCODE;
+typedef SCODE *PSCODE;
+typedef unsigned short VARTYPE;
+typedef long DISPID;
+typedef long MEMBERID;
+typedef unsigned long PROPID;
 typedef unsigned short VARIANT_BOOL;
 typedef const wchar_t *LPCOLESTR;
 typedef wchar_t *LPOLESTR;
 typedef wchar_t OLECHAR;
 typedef wchar_t *BSTR;
 typedef double DATE;
+/* The guard the set writes around its own copy, which every header that has
+   one writes: py2bin supplies the struct, so it supplies the guard too, and
+   a set's copy stands down rather than being reported as a second
+   definition. */
+#define GUID_DEFINED
 typedef struct _GUID {
     unsigned int Data1;
     unsigned short Data2;
@@ -2861,6 +3205,15 @@ typedef GUID CLSID;
 typedef const GUID *REFGUID;
 typedef const GUID *REFIID;
 typedef const GUID *REFCLSID;
+/* The pointer spellings <guiddef.h> gives, which is this file under the
+   name a set asks for. A header taking a GUID it may write into says LPGUID
+   and one that only reads says LPCGUID; both are how the set writes what is
+   above, and a header that used either stopped as if it were a type nobody
+   had declared. */
+typedef GUID *LPGUID;
+typedef const GUID *LPCGUID;
+typedef IID *LPIID;
+typedef CLSID *LPCLSID;
 
 #ifdef _WIN32
 #include <windows.h>
@@ -2975,6 +3328,15 @@ typedef RPC_MESSAGE *PRPC_MESSAGE;
 typedef long RPC_STATUS;
 typedef void *RPC_BINDING_HANDLE;
 typedef void *handle_t;
+/* What <rpcdce.h> gives a generated header, which asks for <rpc.h> and gets
+   this file. An interface handle is the address of the description MIDL
+   wrote for that interface and is only ever passed along, so the set gives
+   it no more type than a pointer either. */
+typedef void *RPC_IF_HANDLE;
+/* An .idl says `boolean` and `byte` where C says how wide, and MIDL passes
+   both straight through into the header it generates. */
+typedef unsigned char boolean;
+typedef unsigned char byte;
 
 /* What a generated header puts before a vtable pointer. `const` in the SDK,
    because the table is never written; the spelling is all that differs. */
@@ -2982,6 +3344,8 @@ typedef void *handle_t;
 
 #define __RPC_STUB
 #define __RPC_FAR
+#define __RPC_API
+#define __RPC_USER
 #define RPC_ENTRY
 #define STDMETHODCALLTYPE
 #define STDMETHODVCALLTYPE
@@ -3045,6 +3409,67 @@ extern void *CoTaskMemAlloc(SIZE_T bytes);
 #: everything in it.
 _PART_OF_WINDOWS_H = "#include <windows.h>\n"
 
+#: How a published C runtime asks for the varargs machinery, which py2bin has
+#: under C's own names. `_ADDRESSOF` is there because the C++ half of that
+#: header takes the address through a `reinterpret_cast`; in C it is `&`.
+_VADEFS_H = """
+#ifndef __py2bin_vadefs_h
+#define __py2bin_vadefs_h
+#define _INC_VADEFS
+#include <stdarg.h>
+#define _VA_LIST_DEFINED
+#define _crt_va_start(list, last) va_start(list, last)
+#define _crt_va_arg(list, type) va_arg(list, type)
+#define _crt_va_end(list) va_end(list)
+#define _crt_va_copy(to, from) va_copy(to, from)
+#define _ADDRESSOF(v) (&(v))
+#endif
+"""
+
+#: Which slice of the Windows API a program is being built against. Every set
+#: has this file and every set agrees on what the numbers are; what differs is
+#: only which one the build picks, and a build that picks none stops at the
+#: first `#if WINAPI_FAMILY_PARTITION(...)` - a line that is not an expression
+#: until something defines the macro. py2bin's answer is the desktop, which is
+#: what every set defaults to and what a program compiled to a .exe is; a
+#: program that wants another says so with `-D WINAPI_FAMILY=...`, which the
+#: guards below leave alone.
+_WINAPIFAMILY_H = """
+#ifndef __py2bin_winapifamily_h
+#define __py2bin_winapifamily_h
+#define WINAPI_FAMILY_PC_APP 2
+#define WINAPI_FAMILY_PHONE_APP 3
+#define WINAPI_FAMILY_SYSTEM 4
+#define WINAPI_FAMILY_SERVER 5
+#define WINAPI_FAMILY_DESKTOP_APP 100
+#define WINAPI_FAMILY_APP WINAPI_FAMILY_PC_APP
+#ifndef WINAPI_FAMILY
+#define WINAPI_FAMILY WINAPI_FAMILY_DESKTOP_APP
+#endif
+#ifndef WINAPI_PARTITION_DESKTOP
+#define WINAPI_PARTITION_DESKTOP (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP)
+#endif
+#ifndef WINAPI_PARTITION_APP
+#define WINAPI_PARTITION_APP (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP || \\
+                              WINAPI_FAMILY == WINAPI_FAMILY_PC_APP || \\
+                              WINAPI_FAMILY == WINAPI_FAMILY_PHONE_APP)
+#endif
+#ifndef WINAPI_PARTITION_PC_APP
+#define WINAPI_PARTITION_PC_APP (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP || \\
+                                 WINAPI_FAMILY == WINAPI_FAMILY_PC_APP)
+#endif
+#ifndef WINAPI_PARTITION_PHONE_APP
+#define WINAPI_PARTITION_PHONE_APP (WINAPI_FAMILY == WINAPI_FAMILY_PHONE_APP)
+#endif
+#ifndef WINAPI_PARTITION_SYSTEM
+#define WINAPI_PARTITION_SYSTEM (WINAPI_FAMILY == WINAPI_FAMILY_SYSTEM || \\
+                                 WINAPI_FAMILY == WINAPI_FAMILY_SERVER)
+#endif
+#define WINAPI_PARTITION_PHONE WINAPI_PARTITION_PHONE_APP
+#define WINAPI_FAMILY_PARTITION(slice) slice
+#endif
+"""
+
 _MINGW_H = """
 #ifndef __py2bin_mingw_h
 #define __py2bin_mingw_h
@@ -3077,6 +3502,22 @@ _MINGW_H = """
 #define __MINGW_ATTRIB_NONNULL(x)
 #define __MINGW_ATTRIB_DEPRECATED
 #define __MINGW_ATTRIB_DEPRECATED_MSG(x)
+#define __MINGW_ATTRIB_DEPRECATED_MSVC2005
+#define __MINGW_ASM_CRT_CALL(x)
+#define __MINGW_SELECTANY
+/* Asked in an `#if`, so leaving it undefined is not the same as answering
+   no: an undefined name with an argument list after it is not an expression
+   at all. py2bin is neither of those compilers, and says so. */
+#define __MINGW_GNUC_PREREQ(major, minor) 0
+#define __MINGW_MSC_PREREQ(major, minor) 0
+#define __MINGW_FORTIFY_LEVEL 0
+/* What a header puts on a printf-shaped function so a compiler can check the
+   format string against the arguments. py2bin checks its own printf calls
+   from the format string itself, and takes nothing from these. */
+#define __MINGW_GNU_PRINTF(fmt, args)
+#define __MINGW_GNU_SCANF(fmt, args)
+#define __MINGW_MS_PRINTF(fmt, args)
+#define __MINGW_MS_SCANF(fmt, args)
 #define __MINGW_ATTRIB_DEPRECATED_STR(x)
 #define __MINGW_ATTRIB_DEPRECATED_SEC_WARN
 #define __MINGW_ATTRIB_NO_OPTIMIZE
@@ -3160,6 +3601,33 @@ _MINGW_H = """
 #define __C89_NAMELESS
 #define __C89_NAMELESSSTRUCTNAME
 #define __C89_NAMELESSUNIONNAME
+
+/* How the set writes "the narrow one or the wide one, whichever this build
+   asked for". It keeps these in `_mingw_unicode.h`, which its own <windef.h>
+   includes - and <windef.h> here is py2bin's <windows.h>, so a header that
+   declared its types with `__MINGW_TYPEDEF_AW(MCI_OPEN_PARMS)` found nothing
+   to expand it. UNICODE decides, the way it decides TCHAR. */
+#ifndef _INC_CRT_UNICODE_MACROS
+#ifdef UNICODE
+#define _INC_CRT_UNICODE_MACROS 1
+#define __MINGW_NAME_AW(func) func##W
+#define __MINGW_NAME_AW_EXT(func, ext) func##W##ext
+#define __MINGW_NAME_UAW(func) func##_W
+#define __MINGW_NAME_UAW_EXT(func, ext) func##_W_##ext
+#define __MINGW_STRING_AW(str) L##str
+#define __MINGW_PROCNAMEEXT_AW "W"
+#else
+#define _INC_CRT_UNICODE_MACROS 2
+#define __MINGW_NAME_AW(func) func##A
+#define __MINGW_NAME_AW_EXT(func, ext) func##A##ext
+#define __MINGW_NAME_UAW(func) func##_A
+#define __MINGW_NAME_UAW_EXT(func, ext) func##_A_##ext
+#define __MINGW_STRING_AW(str) str
+#define __MINGW_PROCNAMEEXT_AW "A"
+#endif
+#define __MINGW_TYPEDEF_AW(type) typedef __MINGW_NAME_AW(type) type;
+#define __MINGW_TYPEDEF_UAW(type) typedef __MINGW_NAME_UAW(type) type;
+#endif
 
 #define __CRT_STRINGIZE(x) #x
 #define _CRT_STRINGIZE(x) __CRT_STRINGIZE(x)
@@ -3288,6 +3756,60 @@ _OBJIDL_H = """
 #ifndef __cplusplus
 typedef struct IStream IStream;
 typedef struct ISequentialStream ISequentialStream;
+/* The other interfaces this header forward-declares, and the names the set
+   spells a pointer to each of them with. Declared and not defined, which is
+   what the set's own `#ifndef __IDataObject_FWD_DEFINED__` blocks do: a
+   neighbouring header names these in a prototype far more often than
+   anything calls one, and a pointer to an incomplete struct is a complete
+   type. A program that does call one needs the vtable, and the header that
+   declares that interface properly is the one to bring it - so this is
+   honest about the difference rather than inventing a table whose slot
+   order nothing here could check. */
+typedef struct IDataObject IDataObject;
+typedef struct IAdviseSink IAdviseSink;
+typedef struct IBindCtx IBindCtx;
+typedef struct IMoniker IMoniker;
+typedef struct IStorage IStorage;
+typedef struct ILockBytes ILockBytes;
+typedef struct IPersist IPersist;
+typedef struct IPersistStream IPersistStream;
+typedef struct IPersistFile IPersistFile;
+typedef struct IPersistStorage IPersistStorage;
+typedef struct IRunningObjectTable IRunningObjectTable;
+typedef struct IRootStorage IRootStorage;
+typedef struct IMalloc IMalloc;
+typedef struct IMarshal IMarshal;
+typedef struct IMessageFilter IMessageFilter;
+typedef struct IEnumUnknown IEnumUnknown;
+typedef struct IEnumString IEnumString;
+typedef struct IEnumMoniker IEnumMoniker;
+typedef struct IEnumFORMATETC IEnumFORMATETC;
+typedef struct IEnumSTATDATA IEnumSTATDATA;
+typedef struct IEnumSTATSTG IEnumSTATSTG;
+typedef struct IDataAdviseHolder IDataAdviseHolder;
+typedef IDataObject *LPDATAOBJECT;
+typedef IAdviseSink *LPADVISESINK;
+typedef IBindCtx *LPBC;
+typedef IBindCtx *LPBINDCTX;
+typedef IMoniker *LPMONIKER;
+typedef IStorage *LPSTORAGE;
+typedef ILockBytes *LPLOCKBYTES;
+typedef IPersist *LPPERSIST;
+typedef IPersistStream *LPPERSISTSTREAM;
+typedef IPersistFile *LPPERSISTFILE;
+typedef IPersistStorage *LPPERSISTSTORAGE;
+typedef IRunningObjectTable *LPRUNNINGOBJECTTABLE;
+typedef IRootStorage *LPROOTSTORAGE;
+typedef IMalloc *LPMALLOC;
+typedef IMarshal *LPMARSHAL;
+typedef IMessageFilter *LPMESSAGEFILTER;
+typedef IEnumUnknown *LPENUMUNKNOWN;
+typedef IEnumString *LPENUMSTRING;
+typedef IEnumMoniker *LPENUMMONIKER;
+typedef IEnumFORMATETC *LPENUMFORMATETC;
+typedef IEnumSTATDATA *LPENUMSTATDATA;
+typedef IEnumSTATSTG *LPENUMSTATSTG;
+typedef IStream *LPSTREAM;
 #endif
 
 typedef struct __py2bin_STATSTG {
@@ -3671,6 +4193,10 @@ _BUILTIN_HEADERS = {
     # generated by a configure step, and what it holds is a description of
     # the compiler reading it - which py2bin is the one that knows.
     "_mingw.h": _MINGW_H,
+    # Which slice of the API this build wants, which is a decision rather
+    # than a description of a machine - so py2bin makes it, the way it makes
+    # the one _mingw.h holds.
+    "winapifamily.h": _WINAPIFAMILY_H,
     # The same header under the name a generated one asks for.
     "guiddef.h": "#include <wtypes.h>\n",
     "unknwn.h": _UNKNWN_H,
@@ -3720,6 +4246,17 @@ _BUILTIN_HEADERS = {
     # into, and the four names that walk one are compiled rather than called -
     # so this header is the typedef and nothing else.
     "stdarg.h": "typedef char *va_list;\n",
+    # What a published C runtime asks for varargs with, and the one place in
+    # such a set that says outright it does not know this compiler:
+    #
+    #   vadefs.h:27: #error VARARGS not implemented for this compiler
+    #
+    # It is written as a choice between two - `__builtin_va_list` for GCC,
+    # `char *` plus pointer arithmetic for MSVC - and the second of those is
+    # the shape py2bin already has. So this is py2bin's answer to the same
+    # question, under the name the set asks it by, and the four `_crt_va_`
+    # names hand straight back to the four the compiler implements.
+    "vadefs.h": _VADEFS_H,
     # wchar_t, char16_t and char32_t are keywords in py2bin's C, the way they
     # are in C++, so these headers have no typedefs to give. What they do
     # bring is the handful of functions that go with them, written in C.
