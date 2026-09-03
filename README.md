@@ -2739,6 +2739,16 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an object given its value where it is declared
+
+`std::string dir = "x";` at file scope matched none of the shapes the
+file-scope reader knew and reached the C as a struct with a string initialiser;
+`std::string name = "x";` on a member was written into the constructor as a
+plain assignment of a `char *` into a struct. Both are the construction C++
+says they are now, chosen by the value's type. 2124 tests, 524
+programs against clang++, 9 projects, 3186 builds across six
+targets.
+
 ### 0.9.13 - two paths compared, and what a class was said to hold
 
 py2bin's `path` had only `/`, so `a == b` on two paths was refused as a
