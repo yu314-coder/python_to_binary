@@ -2739,6 +2739,16 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an overload chosen by what a method answers
+
+`path(transferDirectory.c_str())` was refused: three constructors take one
+argument, and the chooser could not tell which. It had read the receiver and
+then asked what `string::c_str` answers by finding the class body in the text -
+which, by the time an overload is being chosen, has been taken apart. The
+methods are still declared above the call under the names the translator gives
+them, so that is what it reads now. 2124 tests, 522 programs against
+clang++, 9 projects, 3174 builds across six targets.
+
 ### 0.9.13 - a header of your own that asks for a C++ header
 
 A project's own `<fstream>` on the search path, with an `#else` in it, asked for
