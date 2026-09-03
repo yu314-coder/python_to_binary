@@ -1891,11 +1891,21 @@ def _declared_return(text: str, owner: "str | None", method: str) -> "str | None
                 found = head
                 break
         if found is None:
-            return None
-        try:
-            where = text[found.end() - 1: _matching(text, found.end() - 1)]
-        except ValueError:
-            return None
+            # The class has been taken apart by now and its body is gone
+            # from the text - but its methods have not gone anywhere: each
+            # is declared, under the name this translator gives it, above
+            # the code that calls it. So the same scans below read the
+            # emitted spelling instead. Asked what `dir.c_str()` was while
+            # choosing among path's constructors, this answered nothing,
+            # and a call on any method of any class was refused with "cast
+            # the argument to the type of the one you want" - for an
+            # argument whose type was written out one screen up.
+            method = _c_name(owner, method)
+        else:
+            try:
+                where = text[found.end() - 1: _matching(text, found.end() - 1)]
+            except ValueError:
+                return None
     for match in _ANY_DEFINITION.finditer(where):
         head = match.group(1).strip()
         words = head.replace("*", " * ").replace("&", " & ").split()
