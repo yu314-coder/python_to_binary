@@ -1504,6 +1504,35 @@ def _subscript_result(text: str, owner: str) -> "str | None":
     return _member_result(text, owner, r"operator\s*\[\s*\]")
 
 
+def _bodies_as_separators(text: str) -> str:
+    """Every braced body at the top level replaced by a `;`.
+
+    For reading declarations out of a class body: a method defined there ends
+    in `}` with no `;` after it, so a body blanked to nothing left the method's
+    head running into whatever was declared next.
+    """
+
+    out: list[str] = []
+    at = 0
+    depth = 0
+    start = 0
+    for brace in _A_BRACE.finditer(text):
+        if brace.group(0) == "{":
+            if depth == 0:
+                start = brace.start()
+            depth += 1
+            continue
+        if depth == 0:
+            continue
+        depth -= 1
+        if depth == 0:
+            out.append(text[at:start])
+            out.append(";")
+            at = brace.end()
+    out.append(text[at:])
+    return "".join(out)
+
+
 def _members_declared(inside: str) -> "list[tuple[str, str]]":
     """Each data member a class body declares, as (name, type).
 
@@ -1514,11 +1543,25 @@ def _members_declared(inside: str) -> "list[tuple[str, str]]":
     """
 
     found: "list[tuple[str, str]]" = []
+    # The methods' bodies come off first. Read whole, every `int i;` inside a
+    # method was recorded as a member of the class, and `return out;` as a
+    # member named `out` of type `return` - so what `_CLASS_MEMBERS` said a
+    # class held was mostly its methods' locals. Each body becomes a `;` and
+    # not a blank: a method defined in the class ends with `}` and no `;`, so
+    # blanked to nothing its head ran into the member declared after it -
+    # `int get()   string s` - and that member was skipped with the head.
+    inside = _bodies_as_separators(inside)
     for piece in _without_literals(inside).split(";"):
         # The braces of the body come with it, and a nested block's do too.
         spelled = piece.strip().lstrip("{").rstrip("}").strip()
+        # An access label shares its piece with the member written after it,
+        # and skipping the piece for the label dropped that member: `text`,
+        # the first thing under path's `public:`, was not a member of path,
+        # so `o.text` had no type and no overload could be chosen for it.
+        # `buf`, the first thing under string's, went the same way.
+        spelled = re.sub(r"^(?:(?:public|private|protected)\s*:\s*)+", "", spelled)
         if not spelled or "(" in spelled or spelled.startswith(
-            ("public", "private", "protected", "typedef", "using", "friend")
+            ("typedef", "using", "friend")
         ):
             continue
         head = re.match(
@@ -1529,6 +1572,11 @@ def _members_declared(inside: str) -> "list[tuple[str, str]]":
         if head is None:
             continue
         held = re.sub(r"\b(?:static|mutable)\b", " ", head.group(1)).strip()
+        if held in ("struct", "class", "union", "enum"):
+            # `struct Inner { ... };` - a type declared inside the class, whose
+            # body has just been taken off. What is left reads as a member
+            # named `Inner` of type `struct`, which it is not.
+            continue
         for one in head.group(2).split(","):
             named = re.match(r"^\s*([*&]*)\s*([A-Za-z_]\w*)", one)
             if named is None:
@@ -20604,6 +20652,17 @@ public:
         text.assign(__narrow);
     }
     const char *c_str() { return text.c_str(); }
+    /* C++17 compares two paths as paths, and this one had only `/`: `a == b`
+       on two of them reached the C as a comparison of two structs, which C
+       refuses - and a program checking whether the file it was handed is the
+       one it already holds stopped there. The text is what this path is,
+       so the text is what is compared, the way `/` is what joins it. */
+    int operator==(path o) { return text == o.text; }
+    int operator!=(path o) { return text != o.text; }
+    int operator<(path o) { return text < o.text; }
+    int operator<=(path o) { return text <= o.text; }
+    int operator>(path o) { return text > o.text; }
+    int operator>=(path o) { return text >= o.text; }
     std::string string() { return text; }
     std::wstring wstring() {
         wchar_t __wide[520];
