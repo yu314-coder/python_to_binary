@@ -2739,6 +2739,30 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a header of your own that asks for a C++ header
+
+A project's own `<fstream>` on the search path, with an `#else` in it, asked for
+`<filesystem>` and was refused with a list of every C header py2bin ships. A
+header with a branch is read ahead of the translator by the C preprocessor, so
+that the arm a C++ compiler takes is the one the translator is handed - and
+that run could serve py2bin's C headers and not its C++ ones. It hands those
+back to the translator now.
+
+Three older things came out of reproducing it. A header that guards itself and
+answers an object by value lost its `#ifndef` and kept its `#endif`: the head
+of a function was found by walking back to the last `;` or `}`, which a
+directive has neither of, so the guard was rebuilt away with the head - py2bin's
+own `<string>` did this inside every guarded header that included it. The
+pattern that reads a definition crossed a newline and could begin on the last
+word of a `#define`; it reads a literal-blanked copy now, where a directive is a
+literal. And a program's own `#ifdef __cplusplus` took the arm meant for C,
+hoisting a `typedef int Tag;` above the class the other arm declared; the
+translator answers that one name in its bare spellings, and the C run defines it
+in the unit's own text and not inside py2bin's C headers.
+
+2124 tests, 521 programs against clang++, 9 projects with
+headers of their own, 3168 builds across six targets.
+
 ### 0.9.13 - the core of a platform SDK, written here; every kind of header, checked
 
 py2bin refused a fetched platform header with words to the effect of "a
