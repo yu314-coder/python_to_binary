@@ -9277,6 +9277,13 @@ def _emit_one(
         # has to know: the wrapper keeps the name every call site already
         # spells.
         name = f"{name}{_SUB_OBJECT_SUFFIX}"
+    if method.name == "~" and _shared_bases(found.name, classes):
+        # And two destructors, for the same reason read backwards: this one
+        # takes apart everything except the shared bases, and the wrapper
+        # beside it destroys those afterwards. Which one runs is again decided
+        # by whether the object is the whole of what is there - a base
+        # subobject is taken apart with this form and leaves them alone.
+        name = f"{name}{_SUB_OBJECT_SUFFIX}"
     parameters = "" if method.shared else f"struct {found.name} *this"
     # A value return becomes the hidden pointer a compiler would pass: the
     # caller supplies the space and the callee writes through it. py2bin's C
@@ -9471,6 +9478,10 @@ def _emit_one(
         written += "\n" + _complete_constructor(
             found, classes, name, returns, parameters, shared_arguments, scope
         )
+    if method.name == "~" and _shared_bases(found.name, classes):
+        written += "\n" + _complete_destructor(
+            found, classes, name, returns, parameters
+        )
     return written
 
 
@@ -9521,6 +9532,37 @@ def _complete_constructor(
         f"static {returns} {outer}({parameters}) {{ "
         + " ".join(calls)
         + f" {inner}({', '.join(forwarded)}); }}"
+    )
+
+
+def _complete_destructor(
+    found: Class,
+    classes: "dict[str, Class]",
+    inner: str,
+    returns: str,
+    parameters: str,
+) -> str:
+    """The destructor a complete object of this class is taken apart with.
+
+    The mirror of `_complete_constructor`: the shared bases belong to
+    whichever object is the whole of what is there, so they are destroyed
+    here and nowhere else, after everything held above them and in the
+    reverse of the order that one built them. Reached as somebody else's base
+    this class is taken apart with the other form, and so a shared base is
+    destroyed exactly once however many paths lead to it - which is the same
+    thing `virtual` says on the way up.
+    """
+
+    calls: "list[str]" = []
+    for shared in reversed(_shared_bases(found.name, classes)):
+        calls.extend(
+            _destroy_a_base(shared, f"this->{_vbase_pointer(shared)}[0]", classes)
+        )
+    outer = inner[: -len(_SUB_OBJECT_SUFFIX)]
+    return (
+        f"static {returns} {outer}({parameters}) {{ {inner}(this); "
+        + " ".join(calls)
+        + " }"
     )
 
 
@@ -9951,12 +9993,69 @@ def _open_with_subobjects(
     return body[:opening + 1] + " " + " ".join(calls) + body[opening + 1:]
 
 
-def _close_with_subobjects(body: str, found: Class, classes: "dict[str, Class]") -> str:
-    calls = []
+def _take_apart(
+    found: Class, path: str, classes: "dict[str, Class]"
+) -> "list[str]":
+    """The calls that destroy what an object of this class holds, in reverse.
+
+    A member is a whole object of its own, so it is destroyed the way any
+    object is. A base is not: it is a part of this one, it shares this one's
+    shared bases, and the destructor that runs over it is the base-subobject
+    form - which is the distinction `_destroy_a_base` below is about.
+    """
+
+    #: Which of the addresses `_subobjects` answers with name a base rather
+    #: than a member, the same question `_open_with_subobjects` asks.
+    bases = {
+        step for _base, step, shared in _base_steps(found, classes) if not shared
+    }
+    calls: "list[str]" = []
     for held, address in reversed(_subobjects(found, classes)):
-        owner = _find_method(held, "~", classes)
-        if owner is not None:
-            calls.append(f"{_c_name(owner, '~')}({address});")
+        step = address[len("&this->"):]
+        if step in bases:
+            calls.extend(_destroy_a_base(held, f"{path}{step}", classes))
+            continue
+        written = _destructor_call(held, f"{path}{step}", classes)
+        if written:
+            calls.append(written)
+    return calls
+
+
+def _destroy_a_base(
+    held: str, path: str, classes: "dict[str, Class]"
+) -> "list[str]":
+    """Take a base subobject apart, without reaching outside it.
+
+    What used to stand here was the destructor `_find_method` answers with,
+    called with the *subobject's* address - and where the destructor was one
+    the base inherits those are two different types: `A__dtor(&this->__base)`
+    handing a `struct B *` to a function that wants a `struct A *`. Worse
+    where the class that provides it is a shared base, because then the call
+    is not only mistyped but a second destruction of an object the complete
+    object destroys itself.
+
+    So the base's own destructor is called when it has one, and otherwise
+    this looks at what the base holds and destroys that instead - which is
+    what C++ does with a class that declares no destructor, and reaches every
+    part of the subobject without ever leaving it.
+    """
+
+    inner = classes.get(held)
+    if inner is None:
+        return []
+    if any(method.name == "~" for method in inner.methods):
+        name = _c_name(held, "~")
+        if _shared_bases(held, classes):
+            # As somebody else's base, so the shared bases stay where they
+            # are: the whole object destroys those, once, however many paths
+            # reach them.
+            name += _SUB_OBJECT_SUFFIX
+        return [f"{name}(&{path});"]
+    return _take_apart(inner, f"{path}.", classes)
+
+
+def _close_with_subobjects(body: str, found: Class, classes: "dict[str, Class]") -> str:
+    calls = _take_apart(found, "this->", classes)
     if not calls:
         return body
     closing = body.rfind("}")
@@ -16423,25 +16522,20 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             # exactly as it found it rather than trading one failure for a
             # worse-explained one.
             continue
-        if any(shared for _base, _step, shared in _base_steps(found, classes)):
-            # A shared base is destroyed once, by the complete object, and
-            # deciding which object that is is the whole difficulty of a
-            # diamond. Left alone here rather than guessed at.
-            continue
         wants = [
             held for held, _address in _subobjects(found, classes)
             if _find_method(held, "~", classes) is not None
         ]
         if not wants:
             continue
-        if any(_find_method(held, "~", classes) != held for held in wants):
-            # The subobject's destructor is one it inherits, and
-            # `_close_with_subobjects` writes the call as the *provider's*
-            # name against the *subobject's* address - which is a `B *` handed
-            # to `A__dtor()`. True of a destructor somebody wrote as well, but
-            # only ever reached when they did; synthesising one here would
-            # make the compiler emit it for programs that build today.
-            continue
+        # A shared base and a subobject whose destructor is inherited were
+        # both left alone here, because what fills the body in used to write
+        # the call as the *provider's* name against the *subobject's*
+        # address - a `struct B *` handed to `A__dtor()`, and for a shared
+        # base a second destruction of something the complete object destroys
+        # itself. Both are now written the way C++ means them: the base's own
+        # destructor where it has one, whatever it holds where it has not,
+        # and the shared bases once, at the end, by the whole object.
         inherited = _find_method(found.base, "~", classes) if found.base else None
         over = (
             _method_by_name(inherited, "~", classes) if inherited else None
