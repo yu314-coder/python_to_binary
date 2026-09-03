@@ -70,7 +70,46 @@ def _zip_of(files: dict) -> bytes:
     return buffer.getvalue()
 
 
-class HeaderNameTests(unittest.TestCase):
+#: What the module's own tables and caches held when it was imported, taken by
+#: asking the module rather than by naming them one at a time - a cache added
+#: later is then covered without anybody remembering to come back here. The
+#: dunders are left alone: `__builtins__` is a dict too, and is not this
+#: module's to put back.
+_AS_IMPORTED = {
+    name: holder.copy()
+    for name, holder in vars(header_fetch).items()
+    if not name.startswith("__") and isinstance(holder, (dict, set, list))
+}
+
+
+def _as_it_was_imported():
+    """Put every module-level table and cache back to what it held at import."""
+
+    for name, contents in _AS_IMPORTED.items():
+        holder = getattr(header_fetch, name)
+        holder.clear()
+        if isinstance(holder, list):
+            holder.extend(contents)
+        else:
+            holder.update(contents)
+
+
+class _Fetching(unittest.TestCase):
+    """A test that starts, and leaves, the module's state as it was imported.
+
+    `_TREES` and `_BRANCHES` are keyed by repository and live as long as the
+    process, which is the whole point of them: a build fetching a dozen headers
+    from one set asks for its file list once rather than a dozen times. Between
+    tests it means a tree canned by one answers for another that names the same
+    repository, and a test passes on its own and fails in the full module.
+    """
+
+    def setUp(self):
+        self.addCleanup(_as_it_was_imported)
+        _as_it_was_imported()
+
+
+class HeaderNameTests(_Fetching):
     def test_a_name_that_could_escape_the_directory_is_refused(self):
         for spelled in ("../secret.h", "/etc/passwd", "a/../../b.h", ""):
             with self.subTest(spelled=spelled):
@@ -92,7 +131,7 @@ class HeaderNameTests(unittest.TestCase):
         self.assertEqual(_valid_name(r"nlohmann\json.hpp"), "nlohmann/json.hpp")
 
 
-class MissingHeaderTests(unittest.TestCase):
+class MissingHeaderTests(_Fetching):
     def test_the_name_is_read_back_out_of_the_refusal(self):
         message = "x.cpp:2:2: cannot find the header 'WebView2.h'. py2bin looked in:"
         self.assertEqual(_header_that_is_missing(message), "WebView2.h")
@@ -101,7 +140,7 @@ class MissingHeaderTests(unittest.TestCase):
         self.assertIsNone(_header_that_is_missing("x.c:1:1: expected a ';'"))
 
 
-class SearchTests(unittest.TestCase):
+class SearchTests(_Fetching):
     def test_the_package_index_is_asked_for_the_stem(self):
         answer = json.dumps({"data": [{"id": "Microsoft.Web.WebView2"}]}).encode()
         with _Downloader({"https://azuresearch": answer}) as asked:
@@ -127,7 +166,7 @@ class SearchTests(unittest.TestCase):
                 search_index("thing.h")
 
 
-class FetchFromAPackageTests(unittest.TestCase):
+class FetchFromAPackageTests(_Fetching):
     def test_the_header_and_its_neighbours_are_kept(self):
         package = _zip_of(
             {
@@ -186,7 +225,7 @@ class FetchFromAPackageTests(unittest.TestCase):
         self.assertIn("Thing: holds no Thing.h", str(refused.exception))
 
 
-class FetchFromSourceTests(unittest.TestCase):
+class FetchFromSourceTests(_Fetching):
     #: A name with a directory in it names its own repository, so the source
     #: host is asked first and the package index is never reached.
     _TREE = json.dumps(
@@ -240,12 +279,6 @@ class FetchFromSourceTests(unittest.TestCase):
         the curated sets holds was reported missing.
         """
 
-        # `_TREES` is a module-level cache of file lists by repository and
-        # branch. It is what stops a build that fetches a dozen headers from
-        # one set asking a dozen times, and it also outlives a test - so a
-        # canned tree from an earlier one answers for `wine-mirror/wine` here
-        # and this passes or fails by the order the suite happens to run in.
-        header_fetch._TREES.clear()
         missing = urllib.error.HTTPError(
             "https://api.github.com/repos/who/what", 404, "Not Found", {}, None
         )
@@ -293,7 +326,27 @@ class FetchFromSourceTests(unittest.TestCase):
         self.assertIn("who/what: holds no who/what.hpp", str(refused.exception))
 
 
-class CollectionTests(unittest.TestCase):
+class CarriedOverTests(_Fetching):
+    """Nothing one test cans is left to answer for the next one."""
+
+    def test_a_file_list_from_an_earlier_test_does_not_answer_here(self):
+        """Two tests here name `wine-mirror/wine` and can different trees.
+
+        Whichever ran first used to fill `_TREES` for both, so the second
+        failed for a reason that had nothing to do with what it tested - and
+        passed again as soon as it was run on its own.
+        """
+
+        header_fetch._BRANCHES["wine-mirror/wine"] = "master"
+        header_fetch._TREES[("wine-mirror/wine", "master")] = ["README.md"]
+        ran = unittest.TestResult()
+        FetchFromSourceTests(
+            "test_a_guess_that_answers_404_does_not_end_the_search"
+        ).run(ran)
+        self.assertEqual([text for _which, text in ran.errors + ran.failures], [])
+
+
+class CollectionTests(_Fetching):
     """A platform header is in a *set*, never in a repository named after it."""
 
     _TREE = json.dumps(
@@ -380,7 +433,7 @@ class CollectionTests(unittest.TestCase):
             self.assertIn("py2bin ships", str(caught.exception))
 
 
-class FetchFromAUrlTests(unittest.TestCase):
+class FetchFromAUrlTests(_Fetching):
     def test_a_header_named_outright_is_written_where_it_was_asked_for(self):
         with tempfile.TemporaryDirectory() as work:
             into = Path(work) / "headers"
