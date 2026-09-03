@@ -16396,6 +16396,60 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             )
             classes[name].defaults[method.name] = values
 
+    # A destructor C++ writes and nobody else does. `struct Box { Res r; };`
+    # has one whose whole job is to take `r` apart, and py2bin emitted none at
+    # all unless somebody wrote `~Box`, so a member holding a count, a buffer
+    # or a handle was never released: the object left scope and its member's
+    # destructor simply never ran. Silently - the program builds and runs and
+    # the count is just wrong, which is why a corpus of programs that print
+    # what they compute never caught it.
+    #
+    # Written here, where every member's type is known at last, and written
+    # empty: `_close_with_subobjects` fills in the calls, in reverse order,
+    # exactly as it does for a destructor somebody did write. Marked virtual
+    # when it overrides one, because `delete` through a base pointer has to
+    # reach it.
+    for name in list(classes):
+        found = classes[name]
+        if any(method.name == "~" for method in found.methods):
+            continue
+        if not found.methods:
+            # A body with no method of its own went out as a plain C struct,
+            # above the classes and without any of its methods written. Given
+            # a destructor here it would be *called* at scope exit and never
+            # defined. That shape does not build today anyway - a plain struct
+            # holding a class is emitted before the class it holds, and the C
+            # stage says the member has an incomplete type - so this leaves it
+            # exactly as it found it rather than trading one failure for a
+            # worse-explained one.
+            continue
+        if any(shared for _base, _step, shared in _base_steps(found, classes)):
+            # A shared base is destroyed once, by the complete object, and
+            # deciding which object that is is the whole difficulty of a
+            # diamond. Left alone here rather than guessed at.
+            continue
+        wants = [
+            held for held, _address in _subobjects(found, classes)
+            if _find_method(held, "~", classes) is not None
+        ]
+        if not wants:
+            continue
+        if any(_find_method(held, "~", classes) != held for held in wants):
+            # The subobject's destructor is one it inherits, and
+            # `_close_with_subobjects` writes the call as the *provider's*
+            # name against the *subobject's* address - which is a `B *` handed
+            # to `A__dtor()`. True of a destructor somebody wrote as well, but
+            # only ever reached when they did; synthesising one here would
+            # make the compiler emit it for programs that build today.
+            continue
+        inherited = _find_method(found.base, "~", classes) if found.base else None
+        over = (
+            _method_by_name(inherited, "~", classes) if inherited else None
+        )
+        found.methods.append(
+            Method("~", "void", "", "{ }", 0, virtual=bool(over and over.virtual))
+        )
+
     remainder = _qualified_static_names(remainder, classes, order)
 
     # `R r = make(4);` - a free function returning a class hands it back the
