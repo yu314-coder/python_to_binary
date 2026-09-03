@@ -3881,9 +3881,14 @@ def _fill_erased(
     """Rewrite each place a callable goes in: the tag, and the member."""
 
     for name, entries in held.items():
+        holders = _erased_holders(text, name)
+        # Asked whether it holds anything even when nothing in the program
+        # gives it anything: `if (onMessage)` on an optional callback that no
+        # caller set answers no. Skipped with the rest of the filling, it
+        # reached the C as a struct in a condition and was refused.
+        text = _erased_truth(text, holders)
         if not entries:
             continue
-        holders = _erased_holders(text, name)
         places = {what: index for index, (what, _fn) in enumerate(entries, 1)}
         by_value = {
             what: index for index, (what, is_fn) in enumerate(entries, 1) if is_fn
@@ -3934,7 +3939,6 @@ def _fill_erased(
         text = _erased_into_a_slot(text, name, holders, places, by_value)
         text = _erased_given(text, name, holders, places, by_value)
         text = _erased_returned(text, name, holders, places, by_value)
-        text = _erased_truth(text, holders)
     return text
 
 
@@ -4098,9 +4102,35 @@ def _erased_given(
 #: anything before it calls it. C++ answers with a conversion to `bool`; this
 #: subset has no conversion operator, so the two spellings that matter are
 #: read here and the tag is what they become.
+#: The name may close the condition, or be one operand of it (`cb && ready`),
+#: or be what a `?:` asks (`cb ? cb(x) : x`); what follows it says which.
 _ERASED_TRUTH = re.compile(
-    r"(?<![.\w>])(!?)\s*((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*[A-Za-z_]\w*)\s*\)"
+    r"(?<![.\w>])(!?)\s*((?:[A-Za-z_]\w*\s*(?:\.|->)\s*)*[A-Za-z_]\w*)"
+    r"\s*(\)|&&|\|\||\?(?!\?))"
 )
+
+
+def _in_a_condition(before: str) -> bool:
+    """Whether `before` ends inside the parentheses of an `if` or a `while`.
+
+    Walked back to the parenthesis that is still open there, and read for
+    the keyword in front of it. `if (cb && ready)` puts `cb` after `if (` and
+    `ready` after `&& `; both are in the condition, and neither is anywhere
+    else a bare name could stand for the object itself.
+    """
+
+    depth = 0
+    for index in range(len(before) - 1, -1, -1):
+        char = before[index]
+        if char == ")":
+            depth += 1
+        elif char == "(":
+            if depth == 0:
+                return re.search(r"\b(?:if|while)\s*$", before[:index]) is not None
+            depth -= 1
+        elif char in ";{}":
+            return False
+    return False
 
 
 def _erased_truth(text: str, holders: "set[str]") -> str:
@@ -4113,13 +4143,23 @@ def _erased_truth(text: str, holders: "set[str]") -> str:
         spelled = re.sub(r"\s+", "", match.group(2))
         if spelled.split("->")[-1].split(".")[-1] not in holders:
             return None
-        # Only in a condition: `if (cb)` and `while (cb)`. Anywhere else a
-        # bare name is the object itself and means what it says.
+        # Only in a condition: `if (cb)`, `while (cb)`, an operand of one,
+        # or what a `?:` asks. Anywhere else a bare name is the object itself
+        # and means what it says.
         before = whole[:match.start()].rstrip()
-        if not re.search(r"\b(?:if|while)\s*\($", before):
+        after = match.group(3)
+        if after == "?":
+            # `x = cb ? ... : ...`, `return cb ? ...`, `f(cb ? ...`: the name
+            # is what the `?:` asks. Anything else in front is not a test.
+            if not re.search(r"(?:[=(,]|\breturn|&&|\|\|)\s*$", before):
+                return None
+        elif not (
+            re.search(r"\b(?:if|while)\s*\($", before)
+            or (re.search(r"(?:&&|\|\||\()\s*$", before) and _in_a_condition(before))
+        ):
             return None
         compared = "==" if match.group(1) else "!="
-        return f"{match.group(2)}.__which {compared} 0)"
+        return f"{match.group(2)}.__which {compared} 0 {after}"
 
     return _sub_code(_ERASED_TRUTH, text, one)
 

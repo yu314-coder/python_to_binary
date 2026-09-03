@@ -2739,6 +2739,17 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a callback nobody set
+
+A class keeping an optional callback asks `if (onMessage)` before calling it.
+py2bin rewrote that test only while filling the holders of a signature some
+lambda had been assigned to, so a signature no lambda in the program ever
+filled was skipped whole and the test reached the C as a struct in a
+condition. The holder is asked whether it holds anything either way now, and
+in the other spellings a program writes the question: `cb ? cb(x) : x`, and
+`cb && ready` inside an `if`. 2124 tests, 532 programs against clang++, 9
+projects, 3234 builds across six targets.
+
 ### 0.9.13 - a break that destroyed the whole function, and members of members
 
 `break` and `continue` ran the destructors of everything the enclosing
