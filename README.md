@@ -2739,6 +2739,42 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - three that built, ran, and answered wrongly
+
+`printf("%.3f %.3f", x, y)` printed `1.750 0.000`. The floating formatter is
+written out once and entered by a jump from every conversion after it, but the
+slots inside its body were ordinary temporaries - reclaimed at the end of
+whichever statement first formatted a float, then handed to a later statement
+for its own arguments. Jumping in wrote over them, so the first conversion of a
+printf destroyed the argument of the second. It took an earlier conversion to
+show, because that is what shifts the offsets far enough for the collision to
+land on an argument rather than on nothing; eleven of the thirteen lines of the
+regression added with it were wrong.
+
+A class holding another was never taken apart. C++ writes a destructor for a
+class that does not declare one, whose whole job is to destroy the members, and
+py2bin emitted none unless somebody wrote `~Box` by hand - so a member holding a
+count, a buffer or a handle was simply never released. It is written now, and
+deliberately not written where it cannot be got right: a shared base is
+destroyed once by the complete object, and a subobject whose destructor is
+inherited is reached by a call this translator writes against the wrong address.
+
+A macro standing where a member declaration goes was read as part of the next
+method's return type, so `#define FIELDS int a; int b;` gave the struct a
+`sizeof` of 1 where C++ says 8, and a member whose type was a macro naming a
+class never had its constructor run. The C++ stage reads what a file's own
+`#define` lines say now, without running them, and answers only a name defined
+once and never `#undef`ed. One defined inside an `#if` is refused rather than
+resolved: which branch is taken is the preprocessor's answer, and taking it at
+face value would have named a real class on a machine that never compiles that
+branch - the one shape here that would have been silent.
+
+And `extern int helper(int);` - the most ordinary declaration in C - was refused
+unless the name was one of 197 py2bin had heard of, even with the definition of
+`helper` in the same file. An `extern` on a function names the linkage it has
+anyway; whether the symbol exists is a question three later mechanisms already
+answer.
+
 ### 0.9.13 - what a conditional guarded, and a call on the implicit `this`
 
 The C++ stage moves every preprocessing directive to the top of the file it
