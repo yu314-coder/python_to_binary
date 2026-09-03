@@ -2739,6 +2739,17 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - two paths compared, and what a class was said to hold
+
+py2bin's `path` had only `/`, so `a == b` on two paths was refused as a
+comparison of two structs. It has the six comparisons now. Writing them found
+that the table of a class's members was mostly its methods' locals: the body
+was split on `;` whole, and an access label shares its piece with the member
+after it, so the first member under every `public:` was dropped - `path`'s
+`text`, `string`'s `buf` - and `o.text` had no type. 2124 tests, 523
+programs against clang++, 9 projects, 3180 builds across six
+targets.
+
 ### 0.9.13 - an overload chosen by what a method answers
 
 `path(transferDirectory.c_str())` was refused: three constructors take one
