@@ -1448,6 +1448,14 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # in scope; falling back to the first anywhere when the call comes first.
     earlier = [match for match in found if before < 0 or match.start() < before]
     declared = earlier[-1] if earlier else found[0]
+    # C++ never declares `this`; the one declaration of it written as a
+    # statement is the translator's, saying whose method the body in view is.
+    # It answers over any `struct X *this` parameter of a method elsewhere in
+    # the file, whatever the position asked about.
+    if spelled == "this":
+        written = [match for match in found if match.group(3) == ";"]
+        if written:
+            declared = written[-1]
     # A reference is the object it names, not a pointer to one: `v.x` reads a
     # member off it exactly as a value would. The `*` of a pointer is kept,
     # because there the difference is real.
@@ -1578,10 +1586,16 @@ def _members_declared(inside: str) -> "list[tuple[str, str]]":
             # named `Inner` of type `struct`, which it is not.
             continue
         for one in head.group(2).split(","):
-            named = re.match(r"^\s*([*&]*)\s*([A-Za-z_]\w*)", one)
+            # An array member is recorded as a pointer to its element:
+            # `wchar_t buf[256]` handed to a call is a `wchar_t *`, which is
+            # what the deduction reading this table wants, and an array of
+            # objects is not an object - `b.items[0]` is the array indexed,
+            # not a subscript operator on a member.
+            named = re.match(r"^\s*([*&]*)\s*([A-Za-z_]\w*)\s*(\[?)", one)
             if named is None:
                 continue
-            found.append((named.group(2), (held + " " + named.group(1)).strip()))
+            stars = named.group(1) + ("*" if named.group(3) else "")
+            found.append((named.group(2), (held + " " + stars).strip()))
     return found
 
 
@@ -2734,7 +2748,12 @@ _MEMBER_INIT = "__py2bin_member_init"
 #: `auto &x`, not `auto & x`. Read as its own piece, or the pattern needed
 #: whitespace that nobody writes and matched nothing.
 _RANGE_FOR = re.compile(
-    r"\bfor\s*\(\s*([A-Za-z_][\w\s]*?)\s*([*&]*)\s*([A-Za-z_]\w*)\s*:\s*([^)]+)\)"
+    # The colon is the range's, not half of a `::`: the type group is lazy,
+    # and `for (string::iterator it = s.begin(); ...)` read as `s`, `tring`
+    # and a range beginning `:iterator` - a loop over a string's characters
+    # where the program wrote an ordinary iterator loop.
+    r"\bfor\s*\(\s*([A-Za-z_][\w\s]*?)\s*([*&]*)\s*([A-Za-z_]\w*)\s*"
+    r"(?<!:):(?!:)\s*([^)]+)\)"
 )
 
 #: `static int count;` written inside a class.
@@ -9563,8 +9582,12 @@ def _emit_one(
         # by the type of what it passes, a parameter is declared in the head
         # rather than in the body being read, and the reader takes the
         # declaration nearest above the use. Both spellings, so that whichever
-        # name the body has reached by now is found.
-        unit=f"{scope}\n{parameters};",
+        # name the body has reached by now is found. And `this`, declared the
+        # way the reader finds a declaration: a method body says `this->base`,
+        # and asked what `this` is with nothing to go on the reader took the
+        # first `this` in the file - a method of some other class, whose
+        # members are not these.
+        unit=f"{scope}\n{parameters}; struct {found.name} *this;",
         stable=scope,
         returns=method.returns,
         referenced=set(references),
@@ -10721,6 +10744,24 @@ def _call_suffix(
         # mistake said in the same place.
         return str(len(given))
     spelled = ", ".join(given)
+    wanted = [_deduced_type(value, text, before) for value in given]
+    if all(item is not None for item in wanted):
+        # The types were read; it is the overloads that have no answer for
+        # them. Saying so - and what they take - is the difference between
+        # a program that casts an argument and one that adds the form it
+        # needs, where the old message pointed only at the first.
+        takes = "; ".join(
+            f"({m.parameters.strip()})"
+            for m in set_of
+            if _arity(m.parameters) == len(given)
+        )
+        raise CppTranslationError(
+            "<c++>", 0,
+            f"more than one {method or owner}() takes {len(given)} argument(s) "
+            f"- {takes} - and none of them is the one for `{spelled}`, which "
+            f"is ({', '.join(wanted)}). Cast the argument to the type of the "
+            f"one you want, or add a form that takes what it is",
+        )
     raise CppTranslationError(
         "<c++>", 0,
         f"more than one {method or owner}() takes {len(given)} argument(s), "
@@ -10813,9 +10854,12 @@ _CONVERTING_INIT = re.compile(
 
 #: `Vec c = a.add(b);` - a declaration whose value comes from a method that
 #: returns an object. The space is the caller's to provide.
+#: The receiver may be a member of another object - `b.s.name()`, or
+#: `this->s.name()` inside a method - and is found under that spelling.
 _VALUE_INIT = re.compile(
     r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
-    r"([A-Za-z_]\w*)\s*(\.|->)\s*([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;"
+    r"((?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*?)"
+    r"\s*(\.|->)\s*([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;"
 )
 
 #: `Vec bank[3];` - an array of objects, each of which C++ default-constructs.
@@ -11179,7 +11223,13 @@ _ASSIGNED_FROM_NEW = re.compile(
 
 
 #: `a.b()` or `p->b()` - a call on something, with what follows left alone.
-_CALL_ON = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*(\.|->)\s*([A-Za-z_]\w*)\s*\(")
+#: The something may be a member of another object - `b.s.name()`, or
+#: `this->s.name()` inside a method - taken shortest first, so `a.b()` is
+#: still a call on `a` and only `a.b.c()` is a call on `a.b`.
+_CALL_ON = re.compile(
+    r"(?<![.\w>])((?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*?)"
+    r"\s*(\.|->)\s*([A-Za-z_]\w*)\s*\("
+)
 
 
 def _declared_objects(
@@ -11228,6 +11278,10 @@ def _hoist_object_operators(
         return body
     for _round in range(_HOIST_ROUNDS):
         found = None
+        # A member of a known object is an operand too: `b.name + "#"`, and
+        # the answer of that used as a receiver. Looked up here alongside the
+        # variables; `known` itself is the caller's and gains the temporaries.
+        reach = {**known, **_member_paths(known, pointers, classes)}
         # The symbol outside and the variable inside: each round writes one
         # of these out, and which one it picks is the precedence the result
         # is evaluated with. Asked variable-first, `a + b * c` found `a`,
@@ -11236,7 +11290,7 @@ def _hoist_object_operators(
         for symbol in _OPERATOR_SYMBOLS:
             if symbol in ("[]", "()", "=", "<<", ">>"):
                 continue
-            for variable in sorted(known, key=len, reverse=True):
+            for variable in sorted(reach, key=len, reverse=True):
                 if variable in pointers and variable not in referenced:
                     # `items + count` on a `T *` is where the pointer moves
                     # to, not the class's operator. The class it points at
@@ -11248,7 +11302,7 @@ def _hoist_object_operators(
                     # skipping it left the `/` for the C compiler.
                     continue
                 name = _OPERATOR_NAMES[symbol]
-                owner = _find_method(known[variable], name, classes)
+                owner = _find_method(reach[variable], name, classes)
                 if owner is None:
                     continue
                 held = _method_named_returning(owner, name, classes)
@@ -11641,11 +11695,19 @@ def _hoist_value_returns(
 
     if not known and not returning:
         return body
+    # A member of a known object is a receiver too, under either spelling:
+    # which one the text uses says whether the object was reached through a
+    # pointer, and this pass is not told which names are pointers.
+    paths = {
+        **_member_paths(known, set(), classes),
+        **_member_paths(known, set(known), classes),
+    }
     for _round in range(_HOIST_ROUNDS):
         found = None
         for match in _CALL_ON.finditer(body):
             receiver, _reach, method = match.groups()
-            holds = known.get(receiver)
+            receiver = re.sub(r"\s+", "", receiver)
+            holds = known.get(receiver) or paths.get(receiver)
             if holds is None:
                 continue
             owner = _find_method(holds, method, classes)
@@ -12939,9 +13001,21 @@ def _rewrite_body(
 
     def declare_from_call(match: "re.Match[str]") -> str:
         type_name, variable, receiver, access, method, arguments = match.groups()
-        if type_name not in classes or receiver not in known:
+        # One call and nothing after it. The argument span runs to the `;`,
+        # so `x = r.m() / y.n();` matched with `) / y.n(` as the arguments and
+        # was written as a call with an argument list that closed early. If
+        # the span closes the call's own parenthesis, it is not one call.
+        depth = 0
+        for piece in _without_literals(arguments):
+            depth += piece == "("
+            depth -= piece == ")"
+            if depth < 0:
+                return match.group(0)
+        receiver = re.sub(r"\s+", "", receiver)
+        reachable = {**known, **_member_paths(known, pointers, classes)}
+        if type_name not in classes or receiver not in reachable:
             return match.group(0)
-        holds = known[receiver]
+        holds = reachable[receiver]
         owner = _find_method(holds, method, classes)
         if owner is None:
             return match.group(0)
@@ -13131,8 +13205,10 @@ def _rewrite_body(
     # `v[i].get()` where `v[i]` is what an index operator returns. Before the
     # operator pass, which turns the subscript itself into a call and leaves
     # the method on an expression no later pass recognises as a receiver.
-    for variable in sorted(known, key=len, reverse=True):
-        owner = _find_method(known[variable], "op_index", classes)
+    # A member of a known object is a receiver too: `b.v[i].get()`.
+    indexed = {**known, **_member_paths(known, pointers, classes)}
+    for variable in sorted(indexed, key=len, reverse=True):
+        owner = _find_method(indexed[variable], "op_index", classes)
         if owner is None:
             continue
         element = _method_by_name(owner, "op_index", classes)
@@ -13277,33 +13353,43 @@ def _rewrite_body(
                 body,
             )
 
-    # A member that is a pointer to a class is a receiver in its own right:
-    # `a.next->get()` is a call on whatever `next` points at. Without this the
-    # chain stopped at the first hop and the compiler reported a struct with
-    # no member called `get`.
-    for variable in sorted(known, key=len, reverse=True):
-        access = "->" if variable in pointers else "."
-        for member, prefix in _reachable_members(classes[known[variable]], classes):
-            held = member.ctype.replace("*", "").strip()
-            if "*" not in member.ctype or held not in classes:
-                continue
-            reached = f"{variable}{access}{prefix}{member.name}"
-            known.setdefault(reached, held)
-            pointers.add(reached)
+    # Both loops below name the members of every known object - and what
+    # they name is an object with members of its own. `b.settings.title`
+    # is reached from `b.settings`, which is reached from `b`, so they run
+    # again over what they added until a round adds nothing. Bounded, so
+    # a class holding one of itself by mistake cannot run this forever.
+    for _hop in range(6):
+        before = len(known)
+        # A member that is a pointer to a class is a receiver in its own right:
+        # `a.next->get()` is a call on whatever `next` points at. Without this the
+        # chain stopped at the first hop and the compiler reported a struct with
+        # no member called `get`.
+        for variable in sorted(known, key=len, reverse=True):
+            access = "->" if variable in pointers else "."
+            for member, prefix in _reachable_members(classes[known[variable]], classes):
+                held = member.ctype.replace("*", "").strip()
+                if "*" not in member.ctype or held not in classes:
+                    continue
+                reached = f"{variable}{access}{prefix}{member.name}"
+                known.setdefault(reached, held)
+                pointers.add(reached)
 
-    # `b.inner.get()` - a member that is a class, reached from outside. The
-    # address is `&b.inner`, and without it the call looked for a field named
-    # after the method.
-    for variable in sorted(known, key=len, reverse=True):
-        access = "->" if variable in pointers else "."
-        for member, prefix in _reachable_members(classes[known[variable]], classes):
-            held = member.ctype.replace("*", "").strip()
-            if "*" in member.ctype or held not in classes:
-                continue
-            reached = f"{variable}{access}{prefix}{member.name}"
-            if reached not in known:
-                known[reached] = held
-                (receivers := dict(receivers or {}))[reached] = f"&{reached}"
+        # `b.inner.get()` - a member that is a class, reached from outside. The
+        # address is `&b.inner`, and without it the call looked for a field named
+        # after the method.
+        for variable in sorted(known, key=len, reverse=True):
+            access = "->" if variable in pointers else "."
+            for member, prefix in _reachable_members(classes[known[variable]], classes):
+                held = member.ctype.replace("*", "").strip()
+                if "*" in member.ctype or held not in classes:
+                    continue
+                reached = f"{variable}{access}{prefix}{member.name}"
+                if reached not in known:
+                    known[reached] = held
+                    (receivers := dict(receivers or {}))[reached] = f"&{reached}"
+
+        if len(known) == before:
+            break
 
     given = dict(receivers or {})
     for variable in sorted(known, key=len, reverse=True):
@@ -13372,6 +13458,13 @@ def _rewrite_body(
             # nothing had declared.
             [
                 *enclosing,
+                # A loop's body is a boundary a `break` does not cross, even
+                # one that declares nothing. The boundary used to be implied
+                # by the objects the body declared, so `for (...) { if (x)
+                # break; }` had none, and the `break` destroyed everything
+                # the enclosing function had built - a vector declared before
+                # the loop read as empty afterwards.
+                *([("", "", frozenset(), True)] if in_a_loop else []),
                 *(
                     # And which handlers are written at this level, so that a
                     # jump to one of them knows where to stop unwinding: past
@@ -13429,10 +13522,13 @@ def _initialiser_brace(body: str, index: int) -> bool:
     return before.endswith("=") or before.endswith(",")
 
 def _is_a_loop_body(body: str, number: int) -> bool:
-    """Whether the block that was lifted out of here is a loop's body.
+    """Whether the lifted block is a body that `break` leaves: a loop's, or a switch's.
 
     Read off the text in front of the marker it left, which is where the
-    `for (...)` or `while (...)` that owns it is still written.
+    `for (...)`, `while (...)` or `switch (...)` that owns it is still
+    written. Not knowing `switch`, a `break` out of one destroyed every
+    object of the enclosing function - a vector declared before the switch
+    read as empty afterwards.
     """
 
     at = body.find(_BLOCK_MARK % number)
@@ -13446,7 +13542,13 @@ def _is_a_loop_body(body: str, number: int) -> bool:
     opening = _opening_paren(before, len(before) - 1)
     if opening < 0:
         return False
-    return re.search(r"(?<![.\w>])(for|while)\s*$", before[:opening]) is not None
+    # A `switch` too: `break` leaves it, and what it declared dies there.
+    # (A `continue` inside a switch inside a loop leaves both; the loop's
+    # own objects between the two are the one case this does not reach.)
+    return (
+        re.search(r"(?<![.\w>])(for|while|switch)\s*$", before[:opening])
+        is not None
+    )
 
 
 def _lift_nested(body: str) -> "tuple[str, list[str]]":
@@ -13556,6 +13658,8 @@ def _rewrite_value_operators(
     # not be told which was meant. The body comes first and the file after
     # it, so the offsets below still point where they did.
     reading = body if not scope else f"{body}\n{scope}"
+    # The operands may be members of known objects: `string t = b.name + x;`.
+    reachable = {**known, **_member_paths(known, pointers, classes)}
 
     added: dict[str, str] = {}
     for symbol in _OPERATOR_SYMBOLS:
@@ -13578,7 +13682,8 @@ def _rewrite_value_operators(
         # a class is `this->name + other` by the time this runs.
         pattern = re.compile(
             rf"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
-            rf"((?:this\s*->\s*)?[A-Za-z_]\w*)\s*{re.escape(symbol)}"
+            rf"((?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)"
+            rf"\s*{re.escape(symbol)}"
         )
         bare = _without_literals(body)
         out: list[str] = []
@@ -13587,6 +13692,7 @@ def _rewrite_value_operators(
             if match.start() < at:
                 continue
             type_name, variable, left = match.groups()
+            left = re.sub(r"\s+", "", left)
             # Not a longer operator that starts with this one, the way `+` is
             # the front of `+=` and `<` of `<=`.
             after = body[match.end():]
@@ -13594,9 +13700,9 @@ def _rewrite_value_operators(
                 continue
             if symbol in ("<", ">") and after[:1] == symbol:
                 continue
-            if type_name not in classes or left not in known:
+            if type_name not in classes or left not in reachable:
                 continue
-            owner = _find_method(known[left], name, classes)
+            owner = _find_method(reachable[left], name, classes)
             if owner is None or not _method_named(owner, name, classes, True):
                 continue
             end = _one_operand(body, match.end())
@@ -13608,7 +13714,9 @@ def _rewrite_value_operators(
             added[variable] = type_name
             address = left if left in pointers else f"&{left}"
             passed = (
-                f"&{right}" if right in known and right not in pointers else right
+                f"&{right}"
+                if right in reachable and right not in pointers
+                else right
             )
             suffix = _call_suffix(
                 owner, name, classes, [right], reading, match.start()
@@ -14019,10 +14127,29 @@ def _strip_parentheses_around(part: str, variable: str) -> str:
     def one(found: "re.Match[str]") -> str:
         if _STATEMENTS_OWN_PARENTHESIS.search(part[: found.start() + 1]):
             return found.group(0)
+        before = part[: found.start()].rstrip()
+        if before.endswith(")"):
+            # `(int)(v).size()` is a cast of what follows, and `(v)` there is
+            # still `v`; `f(x)(v)` is a call on what `f` answered, and its
+            # argument list stays. A type in the parentheses tells them apart.
+            opening = _opening_paren(before, len(before) - 1)
+            inside = before[opening + 1: -1].strip() if opening >= 0 else ""
+            # A plain type only - `int`, `unsigned char`, `Base *`. A call
+            # through an object's table is written `((T (*)(A *))(p))(this)`,
+            # and what is in front of `(this)` there names a type too, but
+            # holds a parenthesis: it is the function, and `(this)` its
+            # argument list.
+            if (
+                opening < 0
+                or any(c in inside for c in "()[].")
+                or "->" in inside
+                or not _names_a_type(inside)
+            ):
+                return found.group(0)
         return variable
 
     return re.sub(
-        rf"(?<![\w)\]>])\(\s*{re.escape(variable)}\s*\)(?!\s*\()", one, part
+        rf"(?<![\w\]>])\(\s*{re.escape(variable)}\s*\)(?!\s*\()", one, part
     )
 
 
@@ -14049,6 +14176,10 @@ def _rewrite_operators(
 
     if not known:
         return body
+    # A member of a known object is an operand as a variable is: `s.title +=
+    # "!"`, and `b.settings.title == "x"` further down. Matched by name below,
+    # so each is given the name it is reached by.
+    known = {**known, **_member_paths(known, pointers, classes)}
     # `(a + b) * c` - the parentheses the program wrote are still there when
     # the inner operator has been turned into a temporary, and this pass
     # matches a bare name on the left. Taken off only around a name this
@@ -14211,8 +14342,10 @@ def _rewrite_operators(
     # than routed through the array rewriter: that one turns `bank[i].m()`
     # into a call on an element, and this turns the subscript itself into the
     # call - the index is an argument, not part of the receiver.
-    for variable in sorted(known, key=len, reverse=True):
-        owner = _find_method(known[variable], "op_index", classes)
+    # `b.v[i]` and `p->v[i]`: a member of a known object, indexed from outside.
+    indexed = {**known, **_member_paths(known, pointers, classes)}
+    for variable in sorted(indexed, key=len, reverse=True):
+        owner = _find_method(indexed[variable], "op_index", classes)
         if owner is None:
             continue
         if variable in pointers and variable not in (referenced or set()):
@@ -14226,7 +14359,7 @@ def _rewrite_operators(
             # asked the container for its element.
             continue
         body = _rewrite_subscripts(
-            body, variable, known[variable], classes, variable in pointers
+            body, variable, indexed[variable], classes, variable in pointers
         )
 
     # `*p`, `p->m()` and `!p`, where `p` is a holder standing in for what it
@@ -14568,6 +14701,50 @@ def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
         at = match.end()
     out.append(body[at:])
     return "".join(out)
+
+
+def _member_paths(
+    known: "dict[str, str]", pointers: "set[str]", classes: "dict[str, Class]"
+) -> "dict[str, str]":
+    """`b.v` and `p->v`, for every object held by value in a known object.
+
+    The passes that rewrite a subscript, or a method call whose answer is an
+    object, find their receiver by name - and `b.v[0]` or `b.s.name()` has no
+    name of its own: the receiver is a member of another object. So `b.v[0]`
+    reached the C compiler as a subscript on a struct, which read it as
+    pointer arithmetic and refused, and `b.s.name()` was called without the
+    space its answer is written to. A member of an object of a known class is
+    known too - the class said what it holds - and here each one that is an
+    object is given the name it is reached by, so those passes treat it as
+    they would a variable. A pointer or reference member is left out: what it
+    points at is reached differently, and this only answers for a member held
+    by value.
+    """
+
+    paths: dict[str, str] = {}
+    frontier = dict(known)
+    # Down as far as the members go, a hop at a time: `b.settings.title` is
+    # a member of a member, and a program that keeps its settings in one
+    # object and that object in another writes exactly that. Bounded, so a
+    # class holding one of itself by mistake cannot run this forever.
+    for _hop in range(6):
+        fresh: dict[str, str] = {}
+        for variable, held in frontier.items():
+            for member, spelled in _CLASS_MEMBERS.get(held, ()):
+                if "*" in spelled or "&" in spelled:
+                    continue
+                kind = _class_named(spelled)
+                if kind not in classes:
+                    continue
+                reach = "->" if variable in pointers else "."
+                path = f"{variable}{reach}{member}"
+                if path not in known and path not in paths:
+                    fresh[path] = kind
+        if not fresh:
+            break
+        paths.update(fresh)
+        frontier = fresh
+    return paths
 
 
 def _rewrite_subscripts(
@@ -15860,6 +16037,7 @@ def _close_with_destructors(
     outer = "".join(
         f" {_destructor_call(held, name, classes)}"
         for name, held, _labels, _loop in reversed(list(enclosing))
+        if name  # not a loop boundary, which a `return` crosses
     )
     # Where each one comes into existence. A `return` above a declaration
     # leaves before that object was ever built, and C++ destroys only what
@@ -16026,7 +16204,8 @@ def _destroy_before_leaving(
         # loop itself had built - a leak, and a quiet one.
         if not in_a_loop:
             for name, held, _labels, loop in reversed(list(enclosing)):
-                leaving += f" {_destructor_call(held, name, classes)}"
+                if name:
+                    leaving += f" {_destructor_call(held, name, classes)}"
                 if loop:
                     break
         if not leaving.strip():
@@ -16054,6 +16233,8 @@ def _destroy_before_leaving(
         for name, held, labels, _loop in reversed(list(enclosing)):
             if found.group(1) in labels:
                 break
+            if not name:
+                continue  # a loop boundary; a jump to a handler crosses it
             leaving += f" {_destructor_call(held, name, classes)}"
         if not leaving.strip():
             continue
@@ -19244,6 +19425,24 @@ public:
         while (i < count && i < 255) { buf[i] = fill; i = i + 1; }
         buf[i] = 0; len = i;
     }
+    /* `string(first, last)` - the characters between two iterators, which
+       are pointers here. From a range of its own width, and from a range of
+       the other: `std::wstring(s.begin(), s.end())` is how a program widens
+       a narrow string, and the narrow one back is how it returns. */
+    string(const char *first, const char *last) {
+        int i; i = 0;
+        while (first + i < last && i < 255) { buf[i] = first[i]; i = i + 1; }
+        buf[i] = 0; len = i;
+    }
+    string(const wchar_t *first, const wchar_t *last) {
+        int i; i = 0;
+        while (first + i < last && i < 255) { buf[i] = (char)first[i]; i = i + 1; }
+        buf[i] = 0; len = i;
+    }
+    typedef char *iterator;
+    typedef char *const_iterator;
+    char *begin() { return buf; }
+    char *end() { return buf + len; }
     /* Writable, which is the point: a C interface handed this fills it in,
        and `resize` afterwards says how much of it was filled. */
     char *data() { return buf; }
@@ -19387,6 +19586,14 @@ public:
         return r;
     }
     int operator==(const char *s) { return compare(s) == 0; }
+    int operator!=(const char *s) { return compare(s) != 0; }
+    int rfind(char c) {
+        int i; int found;
+        found = -1;
+        i = 0;
+        while (i < len) { if (buf[i] == c) { found = i; } i = i + 1; }
+        return found;
+    }
     int operator==(string o) {
         int i;
         if (len != o.len) { return 0; }
@@ -19459,6 +19666,24 @@ public:
         while (i < count && i < 255) { buf[i] = fill; i = i + 1; }
         buf[i] = 0; len = i;
     }
+    /* `wstring(first, last)` - the characters between two iterators, which
+       are pointers here. From a range of its own width, and from a range of
+       the other: `std::wstring(s.begin(), s.end())` is how a program widens
+       a narrow string, and the narrow one back is how it returns. */
+    wstring(const wchar_t *first, const wchar_t *last) {
+        int i; i = 0;
+        while (first + i < last && i < 255) { buf[i] = first[i]; i = i + 1; }
+        buf[i] = 0; len = i;
+    }
+    wstring(const char *first, const char *last) {
+        int i; i = 0;
+        while (first + i < last && i < 255) { buf[i] = (wchar_t)first[i]; i = i + 1; }
+        buf[i] = 0; len = i;
+    }
+    typedef wchar_t *iterator;
+    typedef wchar_t *const_iterator;
+    wchar_t *begin() { return buf; }
+    wchar_t *end() { return buf + len; }
     void assign(const wchar_t *s) {
         int i; i = 0;
         while (s[i] != 0 && i < 255) { buf[i] = s[i]; i = i + 1; }
@@ -19498,6 +19723,117 @@ public:
     }
     wstring operator+(wstring o) {
         wstring made; made.assign(buf); made.append(o.buf); return made;
+    }
+    /* What `string` has and this did not, the same bodies a character
+       wider: `w[i]` on a wide string reached the C as a subscript on a
+       struct, and a program narrowing one character at a time was refused. */
+    static const int npos = -1;
+    wchar_t &operator[](int i) { return buf[i]; }
+    int compare(const wchar_t *s) {
+        int i;
+        i = 0;
+        while (buf[i] != 0 && buf[i] == s[i]) { i = i + 1; }
+        return (int)buf[i] - (int)s[i];
+    }
+    int operator==(const wchar_t *s) { return compare(s) == 0; }
+    int operator!=(const wchar_t *s) { return compare(s) != 0; }
+    int operator==(wstring o) {
+        int i;
+        if (len != o.len) { return 0; }
+        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 0; } }
+        return 1;
+    }
+    int operator!=(wstring o) {
+        int i;
+        if (len != o.len) { return 1; }
+        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 1; } }
+        return 0;
+    }
+    int operator<(wstring o) { return compare(o.c_str()) < 0; }
+    int operator>(wstring o) { return compare(o.c_str()) > 0; }
+    int operator<=(wstring o) { return compare(o.c_str()) <= 0; }
+    int operator>=(wstring o) { return compare(o.c_str()) >= 0; }
+    int find(wchar_t c) {
+        int i;
+        i = 0;
+        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
+        return -1;
+    }
+    int find(wchar_t c, int from) {
+        int i;
+        i = from;
+        if (i < 0) { i = 0; }
+        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
+        return -1;
+    }
+    int find(const wchar_t *needle) {
+        int i; int j;
+        if (needle[0] == 0) { return 0; }
+        i = 0;
+        while (i < len) {
+            j = 0;
+            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
+                j = j + 1;
+            }
+            if (needle[j] == 0) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    int find(const wchar_t *needle, int from) {
+        int i; int j;
+        i = from;
+        if (i < 0) { i = 0; }
+        if (needle[0] == 0) { return i <= len ? i : -1; }
+        while (i < len) {
+            j = 0;
+            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
+                j = j + 1;
+            }
+            if (needle[j] == 0) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    int find(wstring needle) { return find((const wchar_t *)needle.c_str()); }
+    int find(wstring needle, int from) {
+        return find((const wchar_t *)needle.c_str(), from);
+    }
+    int rfind(wchar_t c) {
+        int i; int found;
+        found = -1;
+        i = 0;
+        while (i < len) { if (buf[i] == c) { found = i; } i = i + 1; }
+        return found;
+    }
+    int rfind(const wchar_t *needle) {
+        int i; int j; int found;
+        found = -1;
+        i = 0;
+        while (i < len) {
+            j = 0;
+            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) { j = j + 1; }
+            if (needle[j] == 0) { found = i; }
+            i = i + 1;
+        }
+        return found;
+    }
+    int rfind(wstring needle) { return rfind((const wchar_t *)needle.c_str()); }
+    wstring substr(int from, int count) {
+        wstring out;
+        int i;
+        i = 0;
+        while (i < count && from + i < len) {
+            out.push_back(buf[from + i]);
+            i = i + 1;
+        }
+        return out;
+    }
+    wstring substr(int from) { return substr(from, len - from); }
+    void append(wstring o) {
+        int j; j = 0;
+        while (j < o.len && len + j < 255) { buf[len + j] = o.buf[j]; j = j + 1; }
+        len = len + j; buf[len] = 0;
     }
 };
 
@@ -20694,6 +21030,10 @@ public:
         __py2bin_fs_narrow(s.c_str(), __narrow, 520);
         text.assign(__narrow);
     }
+    /* From a narrow string: `path(settings.directory)` where the directory is
+       a std::string, which is how a program that reads its settings into
+       strings makes paths of them. */
+    path(const std::string &s) { text = s; }
     const char *c_str() { return text.c_str(); }
     /* C++17 compares two paths as paths, and this one had only `/`: `a == b`
        on two of them reached the C as a comparison of two structs, which C
@@ -20754,6 +21094,35 @@ public:
             }
         }
         joined.__add_text(__narrow);
+        return joined;
+    }
+
+    /* Joined with a std::string, and with another path: `root / leaf` where
+       `leaf` came out of a string, and `dir / entry.filename()`. */
+    path operator/(const std::string &piece) {
+        path joined;
+        int i;
+        i = 0;
+        while (i < this->__size()) { joined.__add(this->__at(i)); i = i + 1; }
+        if (joined.__size() > 0) {
+            if (joined.text.at(joined.__size() - 1) != '/') {
+                joined.__add_text("/");
+            }
+        }
+        joined.__add_text(piece.c_str());
+        return joined;
+    }
+    path operator/(path piece) {
+        path joined;
+        int i;
+        i = 0;
+        while (i < this->__size()) { joined.__add(this->__at(i)); i = i + 1; }
+        if (joined.__size() > 0) {
+            if (joined.text.at(joined.__size() - 1) != '/') {
+                joined.__add_text("/");
+            }
+        }
+        joined.__add_text(piece.c_str());
         return joined;
     }
 

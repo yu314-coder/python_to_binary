@@ -2739,6 +2739,30 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a break that destroyed the whole function, and members of members
+
+`break` and `continue` ran the destructors of everything the enclosing
+function had built, not only what the loop declared: the loop boundary was
+implied by the objects a loop body declared, so `for (...) { if (x) break; }`
+had none, and a vector declared before the loop read as empty afterwards -
+silently. A `switch` was not a boundary at all. The boundary is explicit now.
+Found by building a program shaped like a real sidecar bridge: a settings
+object inside a bridge object, wide strings, a lambda in a `std::function`
+member, a map of routes, a `switch` on an enum class. Everything reached
+through a member of another object now translates where a local did:
+`b.v[0]`, `b.m["k"] = 1`, `b.s.name() + "!"`, `settings.root() / leaf`,
+`s.title += "!"`, and the same two and three members down. `this->x` is typed
+by the class whose method is being read, not by the first `this` in the file.
+py2bin's `wstring` gained what `string` had - indexing, the comparisons,
+`find`, `rfind`, `substr`, `append` - and both gained iterators and a
+constructor from two of them, so `std::wstring(s.begin(), s.end())` widens and
+`std::string(w.begin(), w.end())` narrows; `path` takes a `std::string` and
+joins with one and with a `path`; `string::iterator` no longer reads as a
+range-for. An array member is a pointer to its element where a value is
+wanted. When no overload takes what an argument is, the refusal now says what
+the argument is and what the forms take. 2124 tests, 531 programs against
+clang++, 9 projects, 3228 builds across six targets.
+
 ### 0.9.13 - an object given its value where it is declared
 
 `std::string dir = "x";` at file scope matched none of the shapes the
