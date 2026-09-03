@@ -9256,17 +9256,25 @@ def _returns_object(method: Method, classes: "dict[str, Class]") -> str | None:
 def _by_value_objects(
     parameters: str, classes: "dict[str, Class]"
 ) -> "list[tuple[str, str]]":
-    """Parameters taken by value whose type is a class, as (class, name)."""
+    """Parameters taken by value whose type is a class, as (class, name).
+
+    `struct Point p` and `const Point p` name a Point as surely as `Point p`
+    does. Read as though the type were always one word, neither was seen, so
+    the parameter kept its struct type into the C - where a struct cannot be
+    passed - and the call was refused with a message about the argument's
+    type rather than about the spelling nobody had taught this pass.
+    """
 
     taken = []
     for part in parameters.split(","):
         if "*" in part or "&" in part:
             continue
         words = part.split()
+        while words and words[0] in ("const", "volatile", "struct", "class"):
+            words = words[1:]
         if len(words) == 2 and words[0] in classes and words[1].isidentifier():
             taken.append((words[0], words[1]))
     return taken
-
 
 
 def _copy_constructor(held: str, classes: "dict[str, Class]") -> "str | None":
@@ -10621,8 +10629,11 @@ _OBJECT_POINTER = re.compile(
 #: The right side is an object, not only a name: `T held = *first;` and
 #: `T held = base[root];` are how a container's own code takes a copy, and
 #: neither is a bare identifier.
+#: The `struct` an author may write in front of the type is swallowed here
+#: rather than left standing: the rewrite below spells one of its own, and
+#: `struct Point b = a;` came out as `struct struct Point b;`.
 _COPY_INIT = re.compile(
-    r"\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
+    r"\b(?:struct|class)?\s*\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
     r"(\*?\s*(?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*\[[^\]]*\])?)\s*;"
 )
 
@@ -18354,7 +18365,19 @@ def _address_reference_arguments(
                     continue
                 index = index + shift
                 argument = parts[index].strip()
-                if argument.startswith("&") or not _has_an_address(argument):
+                if argument.startswith("&"):
+                    continue
+                # `sum(*q)` hands over the object q points at, and `&*q` is
+                # the address of it - the star and the `&` cancel. Read as an
+                # expression with no address of its own, it was left exactly
+                # as written and a struct reached the C front end where a
+                # pointer was wanted. Written with the `&` rather than as the
+                # bare `q`, because this pass runs again over what it wrote
+                # and only the `&` says the address has already been taken.
+                if argument.startswith("*") and _has_an_address(argument[1:]):
+                    parts[index] = f"&{argument}"
+                    continue
+                if not _has_an_address(argument):
                     continue
                 # A reference this body already carries as a pointer is the
                 # address; taking one of it gave a `T **`.
@@ -18468,10 +18491,20 @@ def _rewrite_prototypes(text: str, classes: "dict[str, Class]") -> str:
             return None
         # Every word of it has to be able to be part of a type. `return f(x);`
         # and `else g(y);` are statements that read like declarations.
-        if name in _NOT_A_TYPE or any(
-            word in _NOT_A_TYPE for word in held.split()
+        # The words a declaration is allowed to begin with come off first:
+        # `static` and the `struct` of an elaborated name are both words this
+        # pass refuses as types, so `static struct Point add(Point, Point);`
+        # was passed over whole - and kept its struct return while the
+        # definition below became a hidden pointer, which the compiler then
+        # reported as the two disagreeing about what the function answers.
+        naming = held.split()
+        while naming[1:] and naming[0] in (
+            "static", "inline", "extern", "const", "volatile", "struct", "class"
         ):
+            naming = naming[1:]
+        if name in _NOT_A_TYPE or any(word in _NOT_A_TYPE for word in naming):
             return None
+        answered = naming[0] if len(naming) == 1 else held
         # Without the `struct`, here and below: the declaration rewriter adds
         # one further down, and two is not C.
         inside = _references_to_pointers(parameters)
@@ -18482,9 +18515,20 @@ def _rewrite_prototypes(text: str, classes: "dict[str, Class]") -> str:
                 inside,
                 count=1,
             )
-        if not stars and held in classes:
-            comma = ", " if inside.strip() else ""
-            return f"void {name}({held} *__ret{comma}{inside});"
+        # An object built from a constructor - `Point origin(1, 2);` - reads
+        # exactly like a prototype, and only what stands between the
+        # parentheses tells the two apart. Asked only where a word had to be
+        # taken off the front to see the type at all, so that a spelling that
+        # already reached here is answered exactly as it was before.
+        if not stars and answered in classes and (
+            answered == held or _looks_like_parameters(parameters, classes)
+        ):
+            # `Point make(void);` takes nothing, and a hidden pointer written
+            # in front of that word left `(struct Point *__ret, void)` behind
+            # - a parameter of type void, which is not C.
+            nothing = inside.strip() in ("", "void")
+            comma = "" if nothing else ", "
+            return f"void {name}({answered} *__ret{comma}{'' if nothing else inside});"
         if inside.strip() == parameters.strip():
             return None
         return f"{held} {stars}{name}({inside});"
@@ -18665,11 +18709,19 @@ def _rewrite_functions(
                 count=1,
             )
         if returns_object:
+            # `Point make(void) {` takes nothing, and the hidden pointer is
+            # something: written in front of a `void` that is still there,
+            # the head became `(struct Point *__ret, void)` - a parameter of
+            # type void, which is what the compiler reported.
+            tail = head[head.rfind("(") + 1:]
+            nothing = inside.strip() in ("", "void")
+            if nothing:
+                tail = tail[tail.find(")"):]
             head = (
                 f"\nvoid {words[-1]}"
                 # Without the `struct`: the declaration rewriter adds one.
-                f"({returned} *__ret{',' if inside.strip() else ''}"
-                f"{head[head.rfind('(') + 1:]}"
+                f"({returned} *__ret{'' if nothing else ','}"
+                f"{tail}"
             )
         known, pointers, indexed = _parameters_of(head, classes)
         # A file-scope object is in scope in every function, and nothing in

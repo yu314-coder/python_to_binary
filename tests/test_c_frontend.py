@@ -3383,6 +3383,142 @@ int main(void) {
         )
 
 
+class AggregateByValueTests(CProgramTestCase):
+    """An aggregate passed and answered by value.
+
+    py2bin links nothing it did not compile, so what a call looks like on the
+    wire is its own choice rather than the platform's: an aggregate travels as
+    the address of the object and the callee makes the copy, and a function
+    answering one is given the caller's room in a hidden first argument. What
+    that has to agree with is C's *meaning* -- the callee has its own object,
+    the caller's is untouched -- and the layout, which is the platform's and
+    is settled elsewhere.
+    """
+
+    def test_a_struct_argument_is_a_copy_the_callee_owns(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { int x; int y; };
+static int wreck(struct P p) { p.x = 99; p.y = 99; return p.x + p.y; }
+int main(void) {
+    struct P v; v.x = 1; v.y = 2;
+    printf("%d %d %d\\n", wreck(v), v.x, v.y);
+    return 0;
+}
+""",
+            stdout="198 1 2\n",
+        )
+
+    def test_a_struct_is_answered_by_value(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { int x; int y; };
+static struct P add(struct P a, struct P b) {
+    struct P r; r.x = a.x + b.x; r.y = a.y + b.y; return r;
+}
+int main(void) {
+    struct P a; a.x = 1; a.y = 2;
+    struct P b; b.x = 30; b.y = 40;
+    struct P c = add(a, b);
+    c = add(c, c);
+    printf("%d %d\\n", c.x, c.y);
+    return 0;
+}
+""",
+            stdout="62 84\n",
+        )
+
+    def test_a_member_is_read_out_of_an_answer_nobody_keeps(self):
+        # C11 6.5.2.3p3 asks only that the left of a `.` have struct type, and
+        # a call is never an lvalue.
+        self.run_c(
+            _STDIO
+            + """
+struct P { int x; int y; };
+static struct P mk(int n) { struct P r; r.x = n; r.y = n * 2; return r; }
+int main(void) { printf("%d %d\\n", mk(3).x, mk(5).y); return 0; }
+""",
+            stdout="3 10\n",
+        )
+
+    def test_writing_to_a_member_of_an_answer_is_refused(self):
+        # The object it belongs to stops existing at the end of the
+        # expression, which is why C makes the whole thing a value.
+        self.reject(
+            _STDIO
+            + "struct P { int x; };\n"
+            "static struct P mk(void) { struct P r; r.x = 1; return r; }\n"
+            "int main(void) { mk().x = 2; return 0; }\n",
+            "not an lvalue",
+        )
+
+    def test_the_shapes_the_platform_abis_class_apart_all_travel(self):
+        # Two eightbytes of integer, two of float, one mixed, and one past the
+        # size where every ABI gives up and uses memory: py2bin passes all
+        # four the same way, and this says each still means what C says.
+        self.run_c(
+            _STDIO
+            + """
+struct Wide { long a; long b; };
+struct Doubles { double a; double b; };
+struct Mixed { int n; double d; };
+struct Big { int v[16]; };
+static struct Wide wide(void) { struct Wide r; r.a = 5; r.b = 6; return r; }
+static struct Doubles pair(void) { struct Doubles r; r.a = 1.5; r.b = 2.25; return r; }
+static struct Mixed mixed(void) { struct Mixed r; r.n = 7; r.d = 0.5; return r; }
+static struct Big big(void) {
+    struct Big r; int i;
+    for (i = 0; i < 16; i++) { r.v[i] = i; }
+    return r;
+}
+static long total(struct Wide w, struct Doubles d, struct Mixed m, struct Big b) {
+    return w.a + w.b + (long)(d.a + d.b) + m.n + (long)m.d + b.v[15];
+}
+int main(void) {
+    printf("%ld\\n", total(wide(), pair(), mixed(), big()));
+    return 0;
+}
+""",
+            stdout="36\n",
+        )
+
+    def test_an_aggregate_reaches_a_function_pointer_the_same_way(self):
+        self.run_c(
+            _STDIO
+            + """
+struct P { int x; int y; };
+static struct P swap(struct P p) { struct P r; r.x = p.y; r.y = p.x; return r; }
+int main(void) {
+    struct P (*through)(struct P) = swap;
+    struct P v; v.x = 3; v.y = 4;
+    struct P r = through(v);
+    printf("%d %d\\n", r.x, r.y);
+    return 0;
+}
+""",
+            stdout="4 3\n",
+        )
+
+    def test_an_import_may_not_take_one_by_value(self):
+        # The one boundary where py2bin's convention and the platform's both
+        # matter: somebody else's library was built to the platform ABI and
+        # reads the object's own words, not the address py2bin hands over.
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "struct P { int x; int y; };\n"
+                "int vendor(struct P p);\n"
+                "int main(void) { struct P a; a.x = 1; a.y = 2;"
+                " return vendor(a); }\n",
+                "reject.c",
+                "windows-x86_64",
+                libraries=("vendor.dll",),
+            )
+        self.assertRegex(str(caught.exception), "by value")
+        self.assertRegex(str(caught.exception), "vendor.dll")
+
+
 class EnumAndTypedefTests(CProgramTestCase):
     """enum constants and typedef names."""
 

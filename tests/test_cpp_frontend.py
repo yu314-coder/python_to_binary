@@ -1242,6 +1242,66 @@ int main(void) { Res r; Ref f; f.held = &r; f.tag = 2; return f.held->n; }
         out = translate(source, "r.cpp")
         self.assertIn("struct Ref { Res *held; int tag; };", out)
 
+    def test_the_struct_keyword_still_names_an_object_taken_by_value(self) -> None:
+        """`struct Point p` and `const Point p` name a Point too.
+
+        Read as though a type were always one word, neither reached the pass
+        that turns a by-value object into the pointer it travels as, so the
+        parameter kept its struct type and the call was refused with a
+        message about the argument rather than about the spelling.
+        """
+
+        out = translate(
+            "struct Point { int x; int y; };\n"
+            "static int sum(struct Point a, const Point b) {"
+            " return a.x + b.y; }\n"
+            "int main() { Point p; p.x = 1; p.y = 2; return sum(p, p); }\n",
+            "k.cpp",
+        )
+        self.assertIn("__by_value_a", out)
+        self.assertIn("__by_value_b", out)
+        self.assertIn("sum(&p, &p)", out)
+
+    def test_a_value_return_from_a_function_taking_nothing(self) -> None:
+        """`Point make(void)` says it takes nothing, and the hidden pointer
+        written in front of that word left `(struct Point *__ret, void)` -
+        a parameter of type void, which is not C."""
+
+        out = translate(
+            "struct Point { int x; int y; };\n"
+            "static Point make(void) { Point r; r.x = 1; r.y = 2; return r; }\n"
+            "int main() { Point p = make(); return p.x; }\n",
+            "v.cpp",
+        )
+        self.assertIn("void make(struct Point *__ret)", out)
+        self.assertNotIn("__ret,void", out.replace(" ", ""))
+
+    def test_a_prototype_says_what_the_definition_says(self) -> None:
+        """A prototype spelled with `static`, or with the `struct` keyword,
+        was passed over - so it kept its struct return while the definition
+        became a hidden pointer, and the two disagreed."""
+
+        out = translate(
+            "struct Point { int x; int y; };\n"
+            "static struct Point make(void);\n"
+            "int main() { Point p = make(); return p.x; }\n"
+            "static struct Point make(void) { Point r; r.x = 1; r.y = 2; return r; }\n",
+            "p.cpp",
+        )
+        self.assertIn("void make(struct Point *__ret);", out)
+
+    def test_a_copy_spelled_with_the_struct_keyword(self) -> None:
+        """The rewrite spells a `struct` of its own, so one the author had
+        already written came out as `struct struct Point b;`."""
+
+        out = translate(
+            "struct Point { int x; int y; };\n"
+            "int main() { Point a; a.x = 1; a.y = 2;"
+            " struct Point b = a; return b.x; }\n",
+            "c.cpp",
+        )
+        self.assertNotIn("struct struct", out)
+
 
 class OpaqueTypes(unittest.TestCase):
     """A name declared here and defined somewhere this file never sees.

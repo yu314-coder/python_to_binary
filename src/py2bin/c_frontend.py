@@ -1712,6 +1712,8 @@ class Parser:
         self.symbol_libraries: dict[str, str] = {}
         #: The shape of a call to each, read off the prototype.
         self.library_symbols: "dict[str, tuple[str, tuple[str, ...], str]]" = {}
+        #: Every name this unit calls, worked out once when first asked.
+        self._names_called: "set[str] | None" = None
         #: What `#pragma pack` last said, and what `push` saved. None is the
         #: ABI's own answer, which is what a file without one gets.
         self.pack: "int | None" = None
@@ -2796,6 +2798,33 @@ class Parser:
             self.library_symbols,
         )
 
+    def names_called(self) -> "set[str]":
+        """Every function name this unit actually calls, found once.
+
+        Read off the bodies rather than tracked as they are parsed, because
+        a call may be written above the declaration it names and C does not
+        mind.
+        """
+
+        if self._names_called is None:
+            found: "set[str]" = set()
+            seen: "list[object]" = [
+                function.body
+                for function in self.functions.values()
+                if function.body is not None
+            ]
+            while seen:
+                node = seen.pop()
+                if isinstance(node, Call):
+                    found.add(node.name)
+                if dataclasses.is_dataclass(node):
+                    for field in dataclasses.fields(node):
+                        seen.append(getattr(node, field.name))
+                elif isinstance(node, (list, tuple)):
+                    seen.extend(node)
+            self._names_called = found
+        return self._names_called
+
     def bind_libraries(self) -> None:
         """Bind each undefined function a named library is claimed to hold.
 
@@ -2815,6 +2844,32 @@ class Parser:
             library = self.library_for(name)
             if library is None:
                 continue
+            # An aggregate by value is the one shape where py2bin's own call
+            # convention and the platform's disagree and both sides are real:
+            # py2bin hands over an address because it links nothing it did not
+            # compile, while somebody else's shipped library was built to the
+            # platform ABI and expects the object's own words in registers.
+            # Left to fall through, this became "declared but never defined",
+            # which points at the wrong thing entirely.
+            travelling = [held for held, _spelled in function.parameters]
+            travelling.append(function.result)
+            aggregate = next(
+                (held for held in travelling if isinstance(held, StructType)), None
+            )
+            if aggregate is not None and name in self.names_called():
+                # Only where something calls it. A vendor's header declares
+                # every entry point the library has and a program uses a
+                # handful, so refusing at the declaration turned one unused
+                # prototype into a whole build that would not run - and there
+                # is nothing wrong with declaring a function nobody calls.
+                self.error(
+                    f"{name}() is an import from {library}, and it passes or "
+                    f"answers {aggregate} by value; py2bin passes an aggregate "
+                    "as the address of the object, which is not what a library "
+                    "built to this platform's own ABI reads. Declare the import "
+                    "with a pointer parameter, or wrap it on the other side",
+                    function.token,
+                )
             kinds = tuple(
                 _abi_kind(held) for held, _spelled in function.parameters
             )
@@ -3683,6 +3738,44 @@ _VARIADIC_BUILTINS = frozenset({"va_start", "va_arg", "va_end", "va_copy"})
 #: arguments were written. Named so no program can collide with it.
 _VARIADIC_PARAMETER = "__py2bin_va_area"
 
+#: The hidden parameter a function answering a struct or a union is given:
+#: where the caller wants the answer written. Every parameter travels in one
+#: word, and an aggregate does not fit in one - so what travels is its
+#: address, and the copy C promises happens at one end or the other.
+_RESULT_POINTER = "__py2bin_result_area"
+
+
+def _reaches_an_answer(node: Node) -> bool:
+    """Whether this names part of a value a call has just answered.
+
+    The object such a member belongs to stops existing at the end of the
+    expression, so C makes the whole thing a value and not an lvalue.
+    """
+
+    while True:
+        if isinstance(node, MemberAccess) and not node.through_pointer:
+            node = node.base
+        elif isinstance(node, Index):
+            # `answers().xs[1]` reaches into the answer the same way `.x`
+            # does. Walking only member access let a subscript on top of one
+            # past the guard below, so `arr().v[0] = 9` was accepted - which
+            # C does not allow, and which writes into a slot released at the
+            # end of the expression.
+            node = node.base
+        else:
+            return isinstance(node, Call)
+
+
+def _by_value_parameter(name: str) -> str:
+    """The hidden pointer standing in for an aggregate parameter.
+
+    The name the program wrote goes to the copy made on entry, because that
+    is the object the body may write to; the address it was copied from is
+    reachable only under this name, which no program can collide with.
+    """
+
+    return f"__py2bin_by_value_{name}"
+
 #: Bytes of frame the floating formatter needs. The digit array holds the EXACT
 #: decimal expansion of a double: 767 digits for the smallest subnormal (its
 #: mantissa times 5**1074), plus one the final rounding carry can add.
@@ -4140,7 +4233,7 @@ class Lowerer:
                 owner = pointer.ctype.target
                 address = pointer.expr
             else:
-                owner, address = self.lvalue(node.base)
+                owner, address = self.member_owner(node.base)
             if not isinstance(owner, StructType):
                 self.error(
                     f"{'->' if node.through_pointer else '.'} needs a struct or "
@@ -4168,6 +4261,26 @@ class Lowerer:
                 "add", address, IntConstant(member.offset)
             )
         self.error("this expression is not an lvalue", node.token)
+
+    def member_owner(self, base: Node) -> "tuple[CType, IntExpression]":
+        """Where the object on the left of a `.` lives.
+
+        Usually an lvalue - but C11 6.5.2.3p3 asks only that the operand have
+        struct or union type, and `make().x` is how a program reads one field
+        out of an answer it does not keep. A call is never an lvalue, so
+        reading it as one refused the whole expression; an aggregate value is
+        carried as the address of the object here, which is the same address a
+        named object would have offered.
+        """
+
+        if isinstance(base, Call):
+            value = self.rvalue(base)
+            if not isinstance(value.ctype, StructType):
+                self.error(
+                    f"'.' needs a struct or union, not {value.ctype}", base.token
+                )
+            return value.ctype, value.expr
+        return self.lvalue(base)
 
     def stabilize(self, expression: IntExpression) -> IntExpression:
         """Pin a value in a slot when re-emitting it would repeat a call."""
@@ -4345,6 +4458,18 @@ class Lowerer:
     def unary(self, node: Unary) -> Value:
         if node.operator == "&":
             self.packed = None
+            if _reaches_an_answer(node.operand):
+                # The object a call answered stops existing at the end of the
+                # expression, so C makes the whole thing a value. Reading it
+                # is fine; taking its address hands back a pointer into a slot
+                # the next statement is free to reuse, and `int *p =
+                # &make(11).x;` did exactly that - clang refuses it outright.
+                self.error(
+                    "the result of a call is not an lvalue in C, so its "
+                    "address cannot be taken; keep the answer in an object "
+                    "first",
+                    node.token,
+                )
             ctype, address = self.lvalue(node.operand)
             if self.packed is not None:
                 self.error(
@@ -4391,6 +4516,16 @@ class Lowerer:
         return Value(ctype, self.fit(IntUnary("invert", expression), ctype))
 
     def increment(self, node: IncDec) -> Value:
+        if _reaches_an_answer(node.operand):
+            # Same rule as assignment: `make(3).x++` writes through a value,
+            # which C does not have. The read is accepted, so the write has to
+            # be turned away by name.
+            self.error(
+                "the result of a call is not an lvalue in C, so nothing can "
+                "be incremented through it; keep the answer in an object "
+                "first",
+                node.token,
+            )
         ctype, address = self.lvalue(node.operand)
         if isinstance(ctype, ArrayType):
             self.error("an array cannot be incremented", node.token)
@@ -4740,8 +4875,21 @@ class Lowerer:
                 f"this assignment needs {ctype}, but this is {source.ctype}",
                 node.token,
             )
+        return Value(ctype, self.copy_bytes(ctype, address, source.expr))
+
+    def copy_bytes(
+        self, ctype: "StructType", address: IntExpression, source: IntExpression
+    ) -> IntExpression:
+        """Copy an object's bytes to another address, and answer where.
+
+        Split out from the assignment above because passing an aggregate to a
+        function and answering with one are the same copy under different
+        names - the object is at an address, and its bytes have to end up at
+        another one.
+        """
+
         destination = self.stabilize(address)
-        origin = self.stabilize(source.expr)
+        origin = self.stabilize(source)
         remaining = ctype.size
         offset = 0
         while remaining:
@@ -4761,7 +4909,7 @@ class Lowerer:
             )
             offset += unit
             remaining -= unit
-        return Value(ctype, destination)
+        return destination
 
     def load_bitfield(self, member: Member, address: IntExpression) -> Value:
         """Read the bits this member owns out of the unit it shares.
@@ -4827,6 +4975,15 @@ class Lowerer:
 
     def assignment(self, node: Assignment) -> Value:
         self.packed = None
+        if _reaches_an_answer(node.target):
+            # Reading `make().x` is C; writing to it is not, and now that the
+            # read is accepted the write has to be turned away by name rather
+            # than by the member access failing to find an lvalue.
+            self.error(
+                "the result of a call is not an lvalue in C, so nothing can be "
+                "assigned through it; keep the answer in an object first",
+                node.token,
+            )
         ctype, address = self.lvalue(node.target)
         if self.packed is not None:
             return self.assign_bitfield(node, self.packed, address)
@@ -5167,7 +5324,11 @@ class Lowerer:
                 token,
             )
         limit = self.argument_limit()
-        if len(signature.parameters) > limit:
+        # The same hidden argument a direct call to such a function gets: the
+        # signature is what both sides agree on, so a pointer to a function
+        # answering an aggregate is called exactly as its name would be.
+        answers = isinstance(signature.result, StructType)
+        if len(signature.parameters) + (1 if answers else 0) > limit:
             self.error(
                 f"{signature} takes {len(signature.parameters)} parameters; "
                 f"py2bin's call ABI passes at most {limit} arguments "
@@ -5184,24 +5345,32 @@ class Lowerer:
         # emit stores, and re-emitting the target expression after them would
         # both repeat any call inside it and let it read the wrong memory.
         address = self.materialize(pointer.expr)
-        prepared = [
-            self.stored_bits(
-                self.assign_convert(
-                    self.rvalue(argument),
+        prepared = []
+        for position, (argument, parameter) in enumerate(
+            zip(arguments, signature.parameters), 1
+        ):
+            what = f"argument {position} of a call through {ctype}"
+            if isinstance(parameter, StructType):
+                prepared.append(self.aggregate_argument(argument, parameter, what))
+                continue
+            prepared.append(
+                self.stored_bits(
+                    self.assign_convert(
+                        self.rvalue(argument), parameter, argument.token, what
+                    ),
                     parameter,
-                    argument.token,
-                    f"argument {position} of a call through {ctype}",
-                ),
-                parameter,
+                )
             )
-            for position, (argument, parameter) in enumerate(
-                zip(arguments, signature.parameters), 1
-            )
-        ]
+        room = None
+        if answers:
+            room = self.take(signature.result.size)
+            prepared.insert(0, SlotAddress(room))
         slot = self.new_temp()
         self.emit(Store(slot, IndirectCall(address, tuple(prepared))))
         if isinstance(signature.result, VoidType):
             return Value(VOID, IntConstant(0))
+        if room is not None:
+            return Value(signature.result, SlotAddress(room))
         return Value(
             signature.result, self.from_bits(IntLoad(slot), signature.result)
         )
@@ -5429,11 +5598,17 @@ class Lowerer:
         for position, (argument, (parameter_type, _name)) in enumerate(
             zip(node.arguments, function.parameters), 1
         ):
+            what = f"argument {position} of {function.name}()"
+            if isinstance(parameter_type, StructType):
+                prepared.append(
+                    self.aggregate_argument(argument, parameter_type, what)
+                )
+                continue
             converted = self.assign_convert(
                 self.rvalue(argument),
                 parameter_type,
                 argument.token,
-                f"argument {position} of {function.name}()",
+                what,
             )
             prepared.append(self.stored_bits(converted, parameter_type))
         if area is not None:
@@ -5442,6 +5617,29 @@ class Lowerer:
             # was inlined into this frame or called into one of its own.
             prepared.append(area)
         return prepared
+
+    def aggregate_argument(
+        self, argument: Node, wanted: "StructType", what: str
+    ) -> IntExpression:
+        """A struct or union handed over by value: the address of the object.
+
+        py2bin links nothing it did not compile, so what a call looks like on
+        the wire is py2bin's own choice rather than the platform's. An
+        aggregate is bigger than the one word a parameter travels in, so what
+        travels is where it lives and the callee makes the copy on entry -
+        which is where C's promise that the callee has its own object is kept.
+        Copying here as well would be a second copy nobody reads.
+        """
+
+        value = self.rvalue(argument)
+        if not isinstance(value.ctype, StructType) or value.ctype is not wanted:
+            self.error(
+                f"{what} needs {wanted}, but this is {value.ctype}", argument.token
+            )
+        # Pinned, because the address is written into the call and everything
+        # downstream may read that expression again: an argument reached
+        # through a call of its own would otherwise make the call twice.
+        return self.materialize(value.expr)
 
     # --- real calls --------------------------------------------------------
     #
@@ -5452,7 +5650,10 @@ class Lowerer:
 
     def direct_call(self, function: Function, node: Call) -> Value:
         limit = self.argument_limit()
-        if len(function.parameters) > limit:
+        # A function answering an aggregate is given one argument more than it
+        # was written with: the room to write the answer into.
+        answers = isinstance(function.result, StructType)
+        if len(function.parameters) + (1 if answers else 0) > limit:
             self.error(
                 f"{function.name}() takes {len(function.parameters)} parameters; "
                 f"py2bin's call ABI passes at most {limit} arguments "
@@ -5460,6 +5661,12 @@ class Lowerer:
                 node.token,
             )
         prepared = self.prepare_arguments(function, node)
+        room = None
+        if answers:
+            # The caller's room, not the callee's: what the callee holds ends
+            # with its frame, and the value has to outlive the call.
+            room = self.take(function.result.size)
+            prepared.insert(0, SlotAddress(room))
         self.lower_callee(function)
         call = IRCall(function.name, tuple(prepared))
         # Pin the result in a slot at once. Everything downstream may re-read a
@@ -5470,9 +5677,57 @@ class Lowerer:
         self.emit(Store(slot, call))
         if isinstance(function.result, VoidType):
             return Value(VOID, IntConstant(0))
+        if room is not None:
+            # An aggregate is carried as the address of the object, and the
+            # callee has already written it there.
+            return Value(function.result, SlotAddress(room))
         # A floating result came back as its bit pattern in the integer result
         # register, the mirror image of how prepare_arguments passed one in.
         return Value(function.result, self.from_bits(IntLoad(slot), function.result))
+
+    def declare_parameters(
+        self, function: Function
+    ) -> "list[tuple[Local, str, StructType]]":
+        """One slot per parameter, and the aggregates still to be copied.
+
+        A parameter travels in one word. An aggregate does not fit in one, so
+        its slot holds the address the caller handed over and the name the
+        program wrote is given to a local of its own - which is where the copy
+        goes, once every parameter has the slot the ABI put it in.
+        """
+
+        copied: "list[tuple[Local, str, StructType]]" = []
+        for parameter_type, name in function.parameters:
+            if isinstance(parameter_type, StructType):
+                passed = self.declare(
+                    _by_value_parameter(name),
+                    PointerType(parameter_type),
+                    function.token,
+                )
+                copied.append((passed, name, parameter_type))
+            else:
+                passed = self.declare(name, parameter_type, function.token)
+            if passed.slot != self.stack_slots - 1:
+                raise AssertionError("a parameter must occupy exactly one stack slot")
+        return copied
+
+    def copy_aggregates_in(
+        self, function: Function, copied: "list[tuple[Local, str, StructType]]"
+    ) -> None:
+        """The copy C promises the callee its own aggregate parameter is.
+
+        After every parameter slot is settled, because these locals are not
+        parameters: they live wherever the frame has room, and the body writes
+        to them exactly as it would to any object of its own.
+        """
+
+        for passed, name, parameter_type in copied:
+            local = self.declare(name, parameter_type, function.token)
+            self.copy_bytes(
+                parameter_type,
+                SlotAddress(local.slot),
+                self.load(passed.ctype, SlotAddress(passed.slot)).expr,
+            )
 
     def lower_callee(self, function: Function) -> None:
         """Lower ``function`` into its own IR body, once.
@@ -5521,17 +5776,24 @@ class Lowerer:
         self.switches = []
         self.functions = []
         try:
-            for parameter_type, name in function.parameters:
-                local = self.declare(name, parameter_type, function.token)
-                if local.slot != self.stack_slots - 1:
-                    raise AssertionError(
-                        "a parameter must occupy exactly one stack slot"
-                    )
+            answers = isinstance(function.result, StructType)
+            if answers:
+                # Ahead of everything the program wrote, because the call site
+                # writes it there: the room the answer is copied into.
+                self.declare(
+                    _RESULT_POINTER, PointerType(function.result), function.token
+                )
+            copied = self.declare_parameters(function)
             if function.variadic:
                 self.declare(_VARIADIC_PARAMETER, PointerType(CHAR), function.token)
-            wanted = len(function.parameters) + (1 if function.variadic else 0)
+            wanted = (
+                (1 if answers else 0)
+                + len(function.parameters)
+                + (1 if function.variadic else 0)
+            )
             if self.stack_slots != wanted:
                 raise AssertionError("parameter slots must be slots 0..n-1")
+            self.copy_aggregates_in(function, copied)
             context = FunctionContext(
                 function,
                 None,
@@ -5548,14 +5810,16 @@ class Lowerer:
             # nothing is left to run off the end of the body into.
             self.emit(
                 IRReturn(
-                    None if isinstance(function.result, VoidType) else IntConstant(0)
+                    None
+                    if isinstance(function.result, (VoidType, StructType))
+                    else IntConstant(0)
                 )
             )
             # After the return, so nothing can fall into it.
             self.emit_float_dispatch()
             body = IRFunction(
                 function.name,
-                len(function.parameters) + (1 if function.variadic else 0),
+                wanted,
                 self.peak_slots,
                 self.operations,
             )
@@ -5597,13 +5861,31 @@ class Lowerer:
             wanted.append((PointerType(CHAR), _VARIADIC_PARAMETER))
         for (parameter_type, name), expression in zip(wanted, prepared):
             local = self.declare(name, parameter_type, node.token)
+            if isinstance(parameter_type, StructType):
+                # What arrived is the address of the caller's object; the copy
+                # C promises is made here, exactly as a real call makes it on
+                # entry to its own frame.
+                self.copy_bytes(
+                    parameter_type, SlotAddress(local.slot), expression
+                )
+                continue
             self.emit(
                 HeapStore(
                     SlotAddress(local.slot), expression, size_of(parameter_type)
                 )
             )
+        room = None
+        if isinstance(function.result, StructType):
+            # The room for the answer belongs to this frame either way when
+            # the body is spliced into it; the hidden name is what 'return'
+            # finds, so the two paths write the answer the same way.
+            room = self.take(function.result.size)
+            held = self.declare(
+                _RESULT_POINTER, PointerType(function.result), node.token
+            )
+            self.emit(HeapStore(SlotAddress(held.slot), SlotAddress(room), 8))
         result_slot = None
-        if not isinstance(function.result, VoidType):
+        if not isinstance(function.result, (VoidType, StructType)):
             result_slot = self.new_temp()
             self.emit(Store(result_slot, IntConstant(0)))
         return_label = self.new_label(f"return_{function.name}")
@@ -5622,6 +5904,8 @@ class Lowerer:
         self.check_labels(context)
         self.emit(Label(return_label))
         self.scopes.pop()
+        if room is not None:
+            return Value(function.result, SlotAddress(room))
         if result_slot is None:
             return Value(VOID, IntConstant(0))
         return Value(function.result, self.from_bits(IntLoad(result_slot), function.result))
@@ -5801,6 +6085,20 @@ class Lowerer:
                     )
                 initializer = items[0]
             value = self.rvalue(initializer)
+            if isinstance(ctype, StructType):
+                # `struct P c = add(a, b);` initialises from another object of
+                # the same type, which is the same copy an assignment makes.
+                # Read as a scalar it went looking for a word to store, and
+                # reported the initializer as a value of a type it could not
+                # take.
+                if not isinstance(value.ctype, StructType) or value.ctype is not ctype:
+                    self.error(
+                        f"the initializer for {name!r} needs {ctype}, but this "
+                        f"is {value.ctype}",
+                        node.token,
+                    )
+                self.copy_bytes(ctype, self.address_of(local), value.expr)
+                continue
             stored = self.assign_convert(
                 value, ctype, node.token, f"the initializer for {name!r}"
             )
@@ -6370,6 +6668,9 @@ class Lowerer:
             )
         value = self.rvalue(node.value)
         result = context.function.result
+        if isinstance(result, StructType):
+            self.return_aggregate(context, result, value, node)
+            return
         stored = self.assign_convert(value, result, node.token, "this 'return'")
         if context.is_main:
             self.emit(ExitValue(stored))
@@ -6383,6 +6684,38 @@ class Lowerer:
             return
         assert context.result_slot is not None
         self.emit(Store(context.result_slot, stored))
+        self.emit(Jump(context.return_label))
+
+    def return_aggregate(
+        self,
+        context: FunctionContext,
+        result: "StructType",
+        value: Value,
+        node: Return,
+    ) -> None:
+        """Write the answer into the room the caller passed the address of.
+
+        The object being returned lives in this frame and this frame is about
+        to end, so the copy has to happen before the return rather than at the
+        call site: by the time the caller could read it there is nothing left
+        to read.
+        """
+
+        if not isinstance(value.ctype, StructType) or value.ctype is not result:
+            self.error(
+                f"this 'return' needs {result}, but this is {value.ctype}",
+                node.token,
+            )
+        held = self.lookup(_RESULT_POINTER)
+        assert held is not None
+        self.copy_bytes(
+            result,
+            self.load(held.ctype, SlotAddress(held.slot)).expr,
+            value.expr,
+        )
+        if context.call_body:
+            self.emit(IRReturn(None))
+            return
         self.emit(Jump(context.return_label))
 
     # --- printf ---
