@@ -9591,7 +9591,7 @@ def _emit_one(
         # member is applied by the pass below and overwrites this, which is
         # the order C++ gives the two.
         body = _open_with_member_values(
-            body, found, classes, member_arguments
+            body, found, classes, member_arguments, unit
         )
         body = _open_with_subobjects(
             body, found, classes, base_arguments, member_arguments, scope
@@ -9924,6 +9924,7 @@ def _open_with_member_values(
     found: Class,
     classes: "dict[str, Class]",
     named: "dict[str, str] | None" = None,
+    unit: str = "",
 ) -> str:
     """Assign what each member was given where it was declared.
 
@@ -9946,6 +9947,39 @@ def _open_with_member_values(
     written = []
     for name, value in values:
         if not value.startswith("{"):
+            member = held.get(name)
+            kind = member.ctype.replace("*", "").strip() if member is not None else ""
+            # What the value *is* decides how it is put there. An object of
+            # the member's own class is copied - `stem = transferDirectory`
+            # is a struct assignment in C, and this class has no copy
+            # constructor to call, because copying is not something the
+            # translator asks a class to do. Anything else - a literal, a
+            # value of another type - is a construction from it.
+            deduced = _deduced_type(value, f"{unit}\n{body}") if kind in classes else None
+            same = deduced is not None and re.sub(
+                r"\b(?:const|struct|volatile)\b", " ", deduced
+            ).replace("&", " ").strip() == kind
+            if (
+                member is not None
+                and "*" not in member.ctype
+                and not member.array
+                and kind in classes
+                and not same
+                and _constructor_taking(kind, 1, classes)
+            ):
+                # `std::string name = "x";` on the member itself. Written as
+                # an assignment it reached the C as one - `this->name = "x"`,
+                # a `char *` stored into a struct - because this runs after
+                # the body has been rewritten and nothing below converts it.
+                # C++ calls it what it is, a construction from the value,
+                # and so does this: the member's class chooses among its
+                # one-argument constructors by the value's type.
+                owner = _find_method(kind, "", classes) or kind
+                suffix = _call_suffix(owner, "", classes, [value], body)
+                written.append(
+                    f"{_c_name(owner, '', suffix)}(&this->{name}, {value});"
+                )
+                continue
             written.append(f"this->{name} = {value};")
             continue
         # A brace list is not an expression in C, so it cannot be assigned.
@@ -19027,7 +19061,11 @@ def _rewrite_declarations(text: str, classes: "dict[str, Class]") -> str:
 _FILE_SCOPE_OBJECT = re.compile(
     r"(?m)^[ \t]*(?:(?:static|const|volatile|inline)[ \t]+)*"
     r"([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*"
-    r"(?:\(([^;{}()]*)\)|\[([^\];]*)\])?[ \t]*;"
+    # `G g(7);`, `G table[3];` - or `G g = 7;`, which C++ reads as the same
+    # construction spelled with an `=`. Unread, a file-scope `std::string
+    # name = "x";` was not an object this file builds at all: it reached the
+    # C as `struct string name = "x";`, which C refuses.
+    r"(?:\(([^;{}()]*)\)|\[([^\];]*)\]|=[ \t]*([^;]*))?[ \t]*;"
 )
 
 
@@ -19048,8 +19086,8 @@ def _file_scope_objects(
         # and a different number of constructors.
         if _depth_at(text, match.start()) != 0 or match.group(4) is not None:
             continue
-        arguments = (match.group(3) or "").strip()
-        if _looks_like_parameters(arguments, classes):
+        arguments = (match.group(3) or match.group(5) or "").strip()
+        if match.group(3) is not None and _looks_like_parameters(arguments, classes):
             # `string shout(string s);` is a function this file declares, not
             # an object it builds. C++ has the same ambiguity and resolves it
             # the same way: what can be read as a declaration is one.
@@ -19120,7 +19158,12 @@ def _construct_before_main(text: str, made: "dict[str, str]", classes) -> str:
         _FILE_SCOPE_OBJECT,
         text,
         lambda match, whole: (
-            None
+            # `= value` comes off the same way `(args)` does: the value moves
+            # to the constructor call below and the declaration keeps the
+            # object alone.
+            f"{whole[match.start(): match.end(2)]};"
+            if match.group(5) is not None and match.group(2) in made
+            else None
             if not match.group(3) or match.group(2) not in made
             else f"{whole[match.start(): match.start(3) - 1].rstrip()};"
         ),
