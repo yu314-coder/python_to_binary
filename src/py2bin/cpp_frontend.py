@@ -659,6 +659,28 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
                 body, spelled, opened, name, filename, at
             )
             continue
+        # A conditional written where a member goes. This class is being
+        # taken apart and rebuilt as a struct, and the directive is not part
+        # of any declaration - so it was swallowed into the one after it and
+        # the `#endif` came out standing in the middle of the emitted C.
+        # Which members a class has decides how big it is and where every one
+        # of them sits, and this stage runs before the preprocessor and
+        # cannot answer the condition, so it is refused rather than laid out
+        # one way here and used another below.
+        if char == "#" and _A_CONDITION.match(body, index):
+            spelled = body[index:].split("\n")[0].strip()
+            raise CppTranslationError(
+                filename,
+                at + body.count("\n", 0, index),
+                f"{name} declares a member under `{spelled}`, and py2bin "
+                f"reads a class apart before the preprocessor has run. Which "
+                f"members a class has is what says how big it is and where "
+                f"each of them sits, and nothing here can answer that "
+                f"condition - so it is refused rather than laid out one way "
+                f"and used another. A `struct` with no methods is emitted "
+                f"exactly as it was written and keeps its conditionals, and "
+                f"so does the inside of a method body",
+            )
         # An access specifier changes nothing about the layout this emits.
         access = re.match(r"(public|private|protected)\s*:", body[index:])
         if access:
@@ -15865,6 +15887,342 @@ def translate(source: str, filename: str = "<c++>") -> str:
 _OPENS_A_CONDITION = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b")
 _CLOSES_A_CONDITION = re.compile(r"^\s*#\s*endif\b")
 
+#: The middle of a conditional: an arm after the one the `#if` opened.
+_ANOTHER_ARM = re.compile(r"^\s*#\s*(?:else|elif)\b")
+
+#: `#else` on its own, which has no condition to read.
+_THE_LAST_ARM = re.compile(r"^\s*#\s*else\b")
+
+#: Any of them, wherever it stands. Used to ask where a class sits rather
+#: than to run anything.
+_A_CONDITION = re.compile(
+    r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|else|elif|endif)\b", re.M
+)
+
+#: A condition that is a number and nothing else. `#if 0` is how a program
+#: stops compiling a region and `#if 1` is how it turns one back on, and both
+#: are settled by reading them. Anything with a name in it is not: what the
+#: name stands for is the preprocessor's answer and it runs after this stage.
+_CONSTANT_CONDITION = re.compile(
+    r"^\s*#\s*(?:if|elif)\s+\(*\s*(0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*\)*\s*\Z"
+)
+
+#: What a region is emptied with: everything but the line breaks, so the text
+#: that follows keeps the line number it was written on.
+_NOT_A_NEWLINE = re.compile(r"[^\n]")
+
+
+@dataclass
+class _Arm:
+    """One arm of a conditional: the text between two of its directives."""
+
+    start: int
+    end: int
+    #: The `#if`, `#elif` or `#else` that introduces this arm, and - on the
+    #: last arm of the region only - the `#endif` that closes it.
+    opens: "tuple[int, int]"
+    closes: "tuple[int, int] | None"
+    #: Which conditional this belongs to, and its place among that
+    #: conditional's arms - so two things can be asked whether one `#if`
+    #: chooses between them.
+    group: int
+    which: int
+    #: The `#if` that opened the conditional, so a refusal can name it: what
+    #: was written, and where. Not which *line* it was written on - counting
+    #: the newlines in front of every directive made reading a file quadratic
+    #: in the number of conditionals in it, and a project's headers have
+    #: thousands. A refusal works that out for the one it is naming.
+    opening: str
+    began: int
+    #: Whether the preprocessor is certain to skip this arm.
+    dead: bool
+    #: Whether every arm of this conditional could be read either way, which
+    #: is what says the conditional itself has nothing left to decide.
+    settled: bool
+
+
+def _as_c_reads_it(spelled: str) -> "int | None":
+    """An integer constant's value, read the way C reads it.
+
+    `int(spelled, 0)` is not that. Python wants `0o10` where C writes `010`,
+    so every octal constant a header writes raised out of here - and what
+    reached the user was the bare text of a Python exception, `invalid
+    literal for int() with base 0`, on a program clang compiles. `08` is a
+    number in neither language, and is unreadable here rather than an error.
+    """
+
+    if spelled[:2] in ("0x", "0X"):
+        return int(spelled[2:], 16)
+    if spelled.startswith("0") and spelled != "0":
+        try:
+            return int(spelled, 8)
+        except ValueError:
+            return None
+    return int(spelled)
+
+
+def _constant_arm(directive: str) -> "bool | None":
+    """Whether this `#if` or `#elif` takes its arm, where that is readable.
+
+    `None` where it is not, which is every condition naming anything at all.
+    That is the same rule `_read_macros` keeps and for the same reason: this
+    stage runs in front of the preprocessor, and answering a condition it
+    cannot see the macros for would pick a branch on one machine that a real
+    build picks differently on another - silently, because both branches are
+    real code and the program builds either way.
+    """
+
+    found = _CONSTANT_CONDITION.match(directive.strip())
+    if found is None:
+        return None
+    value = _as_c_reads_it(found.group(1))
+    return None if value is None else value != 0
+
+
+def _directive_arms(text: str) -> "list[_Arm]":
+    """Every arm of every conditional region in this text.
+
+    The C++ stage cannot say which arm a build takes. What it can say is
+    where the arms are, and that is enough for the two things below: to empty
+    the ones no build takes, and to tell a class written twice under one
+    `#ifdef` from a class written twice outright.
+    """
+
+    arms: "list[_Arm]" = []
+    #: One entry per conditional still open: the arms read so far, what they
+    #: came to - `taken` once one of them is certainly the one compiled,
+    #: `dead` while every one so far is certainly skipped, and `open` as soon
+    #: as one cannot be read either way - and whether every one of them was
+    #: readable at all.
+    reading: "list[list]" = []
+    groups = 0
+    at = 0
+    for kind, part in _split_literals(text):
+        start, at = at, at + len(part)
+        if kind != "literal" or not part.startswith("#"):
+            continue
+        if _OPENS_A_CONDITION.match(part):
+            groups += 1
+            taken = _constant_arm(part)
+            reading.append([
+                [_Arm(
+                    at, len(text), (start, at), None, groups, 0,
+                    part.strip().split("\n")[0].strip(), start,
+                    taken is False, False,
+                )],
+                "open" if taken is None else ("taken" if taken else "dead"),
+                taken is not None,
+            ])
+            continue
+        if not reading:
+            # An `#endif` with no `#if` above it, or an `#else` inside a
+            # header whose opening directive was in a file pasted before it.
+            continue
+        held = reading[-1]
+        if _ANOTHER_ARM.match(part):
+            last = held[0][-1]
+            last.end = start
+            if held[1] == "dead":
+                # Every arm before this one is certainly skipped, so `#else`
+                # is certainly the arm compiled and `#elif` is decided by its
+                # own condition alone.
+                taken = True if _THE_LAST_ARM.match(part) else _constant_arm(part)
+                held[1] = "open" if taken is None else ("taken" if taken else "dead")
+            elif held[1] == "taken":
+                taken = False
+            else:
+                taken = None
+            held[2] = held[2] and taken is not None
+            held[0].append(_Arm(
+                at, len(text), (start, at), None, last.group, last.which + 1,
+                last.opening, last.began, taken is False, False,
+            ))
+            continue
+        if _CLOSES_A_CONDITION.match(part):
+            region, _state, settled = reading.pop()
+            region[-1].end = start
+            region[-1].closes = (start, at)
+            for one in region:
+                one.settled = settled
+            arms.extend(region)
+    # A conditional the file never closed. Its last arm runs to the end of
+    # the text, which is what it was given when it was opened, and nothing
+    # about it is settled: there is no `#endif` to say where it stops.
+    for region, _state, _settled in reading:
+        arms.extend(region)
+    return arms
+
+
+def _blank_dead_arms(text: str) -> str:
+    """Empty the arms of a conditional the preprocessor is certain to skip.
+
+    `#if 0` is how a program stops compiling a region, and what is inside one
+    is not part of the program at all. Every pass below reads the text as it
+    stands, because the preprocessor runs after all of them - so a class
+    written inside an `#if 0` was lifted out and emitted anyway, and where a
+    live class of the same name replaced it the C compiler reported a
+    duplicate under a mangled name nobody wrote.
+
+    Blanked rather than cut, so every line keeps the number it was written
+    on. Where one arm could not be read the directives are left standing and
+    only the dead arms are emptied: the preprocessor reaches the same answer
+    afterwards, and choosing for it is not this stage's business. Where every
+    arm could be read the conditional has nothing left to decide, so the
+    `#if` and its `#endif` go with the arms they were choosing between -
+    which is what lets a class body hold an `#if 0`. Left there, the `#endif`
+    stood where a member goes and the class could not be read at all.
+    """
+
+    spans: "list[tuple[int, int]]" = []
+    for arm in _directive_arms(text):
+        if arm.dead:
+            spans.append((arm.start, arm.end))
+        if arm.settled:
+            spans.append(arm.opens)
+            if arm.closes is not None:
+                spans.append(arm.closes)
+    if not spans:
+        return text
+    # Cut into slices rather than walked letter by letter: a translation
+    # unit with a project's headers pasted into it is megabytes, and every
+    # `#if 1` in one of them brings this pass here.
+    spans.sort()
+    kept: "list[str]" = []
+    at = 0
+    for start, end in spans:
+        if end <= at:
+            # Wholly inside a span already emptied - a conditional written
+            # inside an arm nothing compiles.
+            continue
+        kept.append(text[at: max(at, start)])
+        kept.append(_NOT_A_NEWLINE.sub(" ", text[max(at, start): end]))
+        at = end
+    kept.append(text[at:])
+    return "".join(kept)
+
+
+def _conditionals_only(text: str) -> str:
+    """The text with everything but the conditional directives blanked.
+
+    `_without_literals` blanks a directive too, which is right for a pass
+    reading code and wrong for one whose whole question is which conditional
+    a class sits in. The strings still go, because a `class` written inside
+    one is not a class, and so does a `#define` body, because a class head
+    the preprocessor writes out is not one this stage may read.
+    """
+
+    return "".join(
+        part
+        if kind == "code" or (part.startswith("#") and _A_CONDITION.match(part))
+        else _NOT_A_NEWLINE.sub(" ", part)
+        for kind, part in _split_literals(text)
+    )
+
+
+def _chose_between(arms: "list[_Arm]", first: int, second: int) -> "_Arm | None":
+    """The innermost conditional holding these two places in different arms."""
+
+    def holding(where: int) -> "dict[int, _Arm]":
+        return {one.group: one for one in arms if one.start <= where < one.end}
+
+    here, there = holding(first), holding(second)
+    shared = [
+        here[group]
+        for group in here
+        if group in there and here[group].which != there[group].which
+    ]
+    return max(shared, key=lambda one: one.start) if shared else None
+
+
+#: The base clause and nothing else: names, the words C++ lets stand in front
+#: of one, and the commas between them.
+_ONLY_A_BASE_CLAUSE = re.compile(r"^[\s:,\w]*$")
+
+
+def _refuse_classes_chosen_by_a_condition(text: str, filename: str) -> None:
+    """Name the class an `#ifdef` picks between two definitions of.
+
+    A class is lifted out of the text and emitted above the rest of the file,
+    and the lifting happens before the directives are read - so both arms of
+
+        #ifdef PICK_BIG
+        struct Thing { int value() { return 100; } };
+        #else
+        struct Thing { int value() { return 1; } };
+        #endif
+
+    were lifted, both were emitted, and the C compiler reported
+    `Thing__value` twice under a name the author never wrote.
+
+    Choosing between them here is not something this stage can do. Which arm
+    a build takes is the preprocessor's answer and the preprocessor runs
+    after this; keeping both would mean a class table holding two classes of
+    one name, which every pass below is written on the assumption cannot
+    happen. So it is refused, by name, and the refusal says which `#if` did
+    the choosing - which is the part the old message got wrong.
+
+    The head split across a conditional is the same difficulty one line
+    higher up, and worse for being quiet: a head this cannot read matches no
+    class at all, so the class and every method it declares left the output
+    without a word said.
+    """
+
+    plain = _conditionals_only(text)
+    for head in _ANY_CLASS_HEAD.finditer(plain):
+        keyword, name, between = head.groups()
+        split = _A_CONDITION.search(between)
+        if split is None:
+            continue
+        if not _ONLY_A_BASE_CLAUSE.match(_A_CONDITION.sub("", between)):
+            # Not a head at all: `template <class T>` reads as one to this
+            # pattern, and what follows the name there is a template
+            # argument list rather than a base.
+            continue
+        raise CppTranslationError(
+            filename,
+            _line_of(text, head.start()),
+            f"the head of {keyword} {name} is split by "
+            f"`{between[split.start():].splitlines()[0].strip()}`, and py2bin "
+            f"reads a class head before the preprocessor has run. Read as it "
+            f"is written the head names no class at all, so {name} and every "
+            f"method it declares left the output without a word said - which "
+            f"is why it is refused here instead. A base this stage has to "
+            f"pick between is one it cannot pick: naming the base with a "
+            f"macro defined under the same condition is refused for the same "
+            f"reason. Write one head",
+        )
+    seen: "dict[str, int]" = {}
+    #: The arms of the file, read only once a class has been found twice:
+    #: most files have no such class, and reading them costs a pass over the
+    #: whole unit.
+    arms: "list[_Arm] | None" = None
+    for head in _CLASS_HEAD.finditer(plain):
+        keyword, name = head.group(1), head.group(2)
+        earlier = seen.setdefault(name, head.start())
+        if earlier == head.start():
+            continue
+        if arms is None:
+            arms = _directive_arms(plain)
+        chose = _chose_between(arms, earlier, head.start())
+        if chose is None:
+            # Defined twice with no conditional between them. That is a
+            # program with two of the same class in it however it is read,
+            # and the C compiler below names both - so it is left to say so.
+            continue
+        raise CppTranslationError(
+            filename,
+            _line_of(text, head.start()),
+            f"{keyword} {name} is defined twice, once in each arm of the "
+            f"`{chose.opening}` on line {_line_of(text, chose.began)}. py2bin "
+            f"translates C++ into C before it runs the preprocessor, so it "
+            f"reads both definitions and has nothing to choose between them "
+            f"with - and emitting both means the struct, and every method it "
+            f"declares, defined twice. Write one {keyword} {name} with the "
+            f"`#if` inside it: a directive inside a method body is left where "
+            f"it stands, and so is one between the members of a `struct` that "
+            f"declares no method, and the preprocessor still picks in both",
+        )
+
 
 def _translate(source: str, filename: str = "<c++>") -> str:
     """Translate the C++ subset in `source` into C.
@@ -15874,6 +16232,12 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     """
 
     text = _strip_comments(source)
+    # Before anything reads the text at all. What is inside an `#if 0` is not
+    # part of the program, and every pass below reads the text as written -
+    # so a class in one was lifted out and emitted, a construct this subset
+    # refuses was refused out of code nobody compiles, and a `#define` in one
+    # was noted as a name the file defines.
+    text = _blank_dead_arms(text)
     # Before any pass that writes a declaration out: C++ lets a loop or a
     # branch take one statement without braces, and that statement is still
     # a scope. A declaration written in front of an unbraced body lands
@@ -15918,6 +16282,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # preprocessor that would have settled it runs after all of it.
     _read_macros(text)
     _refuse_macro_class_heads(text, filename)
+    # After it, so a head a macro makes unreadable keeps the message written
+    # for that, and before the templates and the lambdas are written out: the
+    # classes those leave behind are py2bin's own and are never two of a name,
+    # while the ones the author wrote are what a conditional chooses between.
+    _refuse_classes_chosen_by_a_condition(text, filename)
     # Before anything reads a function's name: an overload set is several
     # functions sharing one, and every later pass assumes a name is a thing.
     # Before names are read: a template has no name until it is written out,
@@ -21680,6 +22049,16 @@ def inline_local_includes(
         return ""
     seen.add(settled)
     text = path.read_text(encoding="utf-8", errors="replace")
+    # What no build compiles is not part of this file, and that has to be
+    # settled before the includes are read rather than after. An `#include`
+    # inside an `#if 0` was pasted anyway - and, being the first mention of
+    # that header, it was the one that counted: the live include below it was
+    # dropped as already seen, and the pass that empties dead arms then erased
+    # the copy that had been pasted. The header went missing from a program
+    # that names it twice, once dead and once not, which is how a file offers
+    # a header conditionally and then uses it.
+    # Line for line, so nothing after this moves.
+    text = _blank_dead_arms(text)
     # Before a single include is pasted, while the offsets in this text are
     # still offsets into the file the user opened. Nothing below moves a line,
     # so the includes are found on the lines they were written on either way.

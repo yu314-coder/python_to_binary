@@ -321,6 +321,235 @@ class MacrosBeforeThePreprocessor(unittest.TestCase):
         self.assertIn("EXPORTED", said)
 
 
+class ClassesChosenByACondition(unittest.TestCase):
+    """A class body is lifted out before the directives around it are read.
+
+    So an `#ifdef`/`#else` picking between two definitions of one class
+    handed both to the emitter, and the C compiler below reported a mangled
+    name nobody wrote. Half of this a reader can settle: what is inside an
+    `#if 0` is not part of the program, so those arms are emptied before
+    anything reads them. The other half - which arm an `#ifdef` takes - is
+    the preprocessor's answer and the preprocessor runs after this stage, so
+    it is refused by name and the refusal says which `#if` did the choosing.
+    """
+
+    def _refused(self, source: str) -> str:
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(source, "t.cpp")
+        return str(caught.exception)
+
+    def test_two_definitions_under_one_ifdef_name_the_conditional(self) -> None:
+        said = self._refused(
+            "#ifdef PICK_BIG\n"
+            "struct Thing { int value() { return 100; } };\n"
+            "#else\n"
+            "struct Thing { int value() { return 1; } };\n"
+            "#endif\n"
+            "int main(void){ Thing t; return t.value(); }\n"
+        )
+        self.assertIn("#ifdef PICK_BIG", said)
+        self.assertIn("struct Thing is defined twice", said)
+        # The old message blamed the name py2bin made up for the method.
+        self.assertNotIn("Thing__value", said)
+
+    def test_a_plain_struct_chosen_by_a_condition_is_named_too(self) -> None:
+        """No methods, so nothing is mangled - but two bodies is still two."""
+
+        said = self._refused(
+            "#ifdef WIDE\n"
+            "struct Pt { int x; int y; int z; };\n"
+            "#else\n"
+            "struct Pt { int x; int y; };\n"
+            "#endif\n"
+            "int main(void){ Pt p; p.x = 1; return p.x; }\n"
+        )
+        self.assertIn("#ifdef WIDE", said)
+        self.assertIn("struct Pt is defined twice", said)
+
+    def test_two_definitions_with_no_conditional_are_left_to_the_c(self) -> None:
+        """Not this refusal's business: the C below reports both of them.
+
+        The refusal is scoped to the shape a conditional makes, which is the
+        one whose message pointed at the wrong thing. A class simply written
+        twice is a program with two of the same class in it however it is
+        read, and taking that diagnostic over here would be widening a
+        refusal for no gain.
+        """
+
+        out = translate(
+            "struct Thing { int value() { return 100; } };\n"
+            "struct Thing { int value() { return 1; } };\n"
+            "int main(void){ Thing t; return t.value(); }\n",
+            "t.cpp",
+        )
+        self.assertEqual(out.count("static int Thing__value"), 2)
+
+    def test_a_class_inside_if_zero_is_not_there_at_all(self) -> None:
+        out = translate(
+            "#if 0\n"
+            "struct Thing { int value() { return 7; } };\n"
+            "#endif\n"
+            "struct Thing { int value() { return 42; } };\n"
+            "int main(void){ Thing t; return t.value(); }\n",
+            "t.cpp",
+        )
+        self.assertEqual(out.count("Thing__value"), 2)   # defined, and called
+        self.assertIn("return 42", out)
+        self.assertNotIn("return 7", out)
+
+    def test_the_arm_an_if_zero_leaves_live_is_the_one_emitted(self) -> None:
+        out = translate(
+            "#if 0\nstruct T { int v() { return 7; } };\n"
+            "#else\nstruct T { int v() { return 8; } };\n#endif\n"
+            "#if 1\nstruct U { int v() { return 9; } };\n"
+            "#else\nstruct U { int v() { return 10; } };\n#endif\n"
+            "int main(void){ T t; U u; return t.v() + u.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("return 8", out)
+        self.assertIn("return 9", out)
+        self.assertNotIn("return 7", out)
+        self.assertNotIn("return 10", out)
+
+    def test_an_elif_after_a_dead_arm_is_read_on_its_own(self) -> None:
+        out = translate(
+            "#if 0\nstruct T { int v() { return 1; } };\n"
+            "#elif 1\nstruct T { int v() { return 2; } };\n"
+            "#else\nstruct T { int v() { return 3; } };\n#endif\n"
+            "int main(void){ T t; return t.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("return 2", out)
+        self.assertNotIn("return 1", out)
+        self.assertNotIn("return 3", out)
+
+    def test_a_conditional_buried_in_a_dead_arm_is_never_asked(self) -> None:
+        """The pair inside an `#if 0` would be refused if it were read."""
+
+        out = translate(
+            "#if 0\n"
+            "#ifdef WHATEVER\nstruct B { int v() { return 1; } };\n"
+            "#else\nstruct B { int v() { return 2; } };\n#endif\n"
+            "#endif\n"
+            "struct Live { int v() { return 3; } };\n"
+            "int main(void){ Live l; return l.v(); }\n",
+            "t.cpp",
+        )
+        self.assertNotIn("B__v", out)
+        self.assertIn("Live__v", out)
+
+    def test_a_condition_naming_anything_is_left_alone(self) -> None:
+        """Only a number is readable here. `#if VERSION > 2` is not.
+
+        Answering one this stage cannot see the macros for would pick a
+        branch here that a real build picks differently, silently - both
+        branches being real code that builds either way.
+        """
+
+        out = translate(
+            "#define VERSION 3\n"
+            "#if VERSION > 2\nstruct T { int v() { return 5; } };\n#endif\n"
+            "int main(void){ T t; return t.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("return 5", out)
+
+    def test_a_member_chosen_by_a_condition_is_refused_by_name(self) -> None:
+        """Which members a class has is what says how big it is."""
+
+        said = self._refused(
+            "struct Box {\n int a;\n#ifdef WITH_EXTRA\n int b;\n#endif\n"
+            " int total() { return a; }\n};\n"
+            "int main(void){ Box b; b.a = 1; return b.total(); }\n"
+        )
+        self.assertIn("#ifdef WITH_EXTRA", said)
+        self.assertIn("Box declares a member under", said)
+
+    def test_an_if_zero_inside_a_class_body_leaves_nothing_behind(self) -> None:
+        """Every arm readable, so the `#if` and its `#endif` go too.
+
+        Left standing, the `#endif` sat where a member goes: the directive
+        was swallowed into the declaration after it and the emitted C had
+        `static #endif int S__live(...)` in it.
+        """
+
+        out = translate(
+            "struct S {\n int a;\n#if 0\n int dead;\n"
+            " int gone() { return dead; }\n#endif\n"
+            " int live() { return a + 1; }\n};\n"
+            "int main(void){ S s; s.a = 4; return s.live(); }\n",
+            "t.cpp",
+        )
+        self.assertNotIn("#if", out)
+        self.assertNotIn("#endif", out)
+        self.assertNotIn("S__gone", out)
+        self.assertIn("this->a + 1", out)
+
+    def test_a_member_chosen_by_a_condition_survives_a_plain_struct(self) -> None:
+        """It is emitted as it was written, so the preprocessor still picks."""
+
+        out = translate(
+            "struct Box {\n int a;\n#ifdef WITH_EXTRA\n int b;\n#endif\n};\n"
+            "int main(void){ Box b; b.a = 1; return b.a; }\n",
+            "t.cpp",
+        )
+        self.assertIn("#ifdef WITH_EXTRA", out)
+        self.assertIn("int b;", out)
+
+    def test_a_base_chosen_by_a_condition_is_refused_by_name(self) -> None:
+        """It used to leave the output without a word said."""
+
+        said = self._refused(
+            "struct A { int who() { return 1; } };\n"
+            "struct B { int who() { return 2; } };\n"
+            "struct D :\n#ifdef PICK_A\n A\n#else\n B\n#endif\n"
+            "{ int mine() { return 10; } };\n"
+            "int main(void){ D d; return d.who() + d.mine(); }\n"
+        )
+        self.assertIn("the head of struct D is split by", said)
+        self.assertIn("#ifdef PICK_A", said)
+
+    def test_a_template_head_is_not_read_as_a_split_one(self) -> None:
+        """`template <class T>` matches the loose head pattern too.
+
+        Read as a class head it is called `T`, and a conditional written
+        anywhere after it would have been reported against that name.
+        """
+
+        out = translate(
+            "#ifdef NOPE\n#define UNUSED 1\n#endif\n"
+            "template <class T>\nstruct Box { T v; T get() { return v; } };\n"
+            "int main(void){ Box<int> b; b.v = 4; return b.get(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("Box__int", out)
+
+    def test_a_method_body_chosen_by_a_condition_is_left_alone(self) -> None:
+        """A directive inside a body is not this stage's to answer."""
+
+        out = translate(
+            "struct T {\n int v() {\n#ifdef PICK_BIG\n return 100;\n"
+            "#else\n return 1;\n#endif\n }\n};\n"
+            "int main(void){ T t; return t.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("#ifdef PICK_BIG", out)
+        self.assertIn("return 100", out)
+        self.assertIn("return 1", out)
+
+    def test_a_class_under_an_include_guard_is_still_one_class(self) -> None:
+        """The commonest conditional of all, and nothing to refuse in it."""
+
+        out = translate(
+            "#ifndef K_HPP\n#define K_HPP\n"
+            "class K { public: int n; K(){n=1;} int get(){return n;} };\n"
+            "#endif\n"
+            "int main(void){ K k; return k.get(); }\n",
+            "t.cpp",
+        )
+        self.assertEqual(out.count("struct K {"), 1)
+
+
 class SeveralFiles(unittest.TestCase):
     def test_a_class_from_a_shared_header_is_emitted_once(self) -> None:
         """Translated per file, the struct appeared once per includer.
