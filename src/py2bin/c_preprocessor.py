@@ -346,6 +346,7 @@ def as_cplusplus(
     target: "str | None",
     supplied: "set[str]",
     already: "set[str]",
+    cplusplus: "frozenset[str]" = frozenset(),
 ) -> str:
     """One header, preprocessed as a C++ compiler would see it.
 
@@ -363,6 +364,7 @@ def as_cplusplus(
     """
 
     engine = Preprocessor(include_dirs, target)
+    engine.cplusplus_supplies = cplusplus
     engine.run(
         "#define __cplusplus 201703L\n#define __py2bin_translating 1\n",
         "<c++>",
@@ -407,7 +409,12 @@ def as_cplusplus(
     # Dropped without asking, a generated header named a type nothing had
     # declared: `EventRegistrationToken` is in one of them and appears in
     # two thousand of its own signatures.
-    asked = "".join(f"#include <{name}>\n" for name in sorted(dropped))
+    # And the C++ ones this run met and could not answer, asked the same
+    # way. The caller tells the two apart by the table each name is in.
+    asked = "".join(
+        f"#include <{name}>\n"
+        for name in sorted(dropped | engine.left_to_cplusplus)
+    )
     return asked + _as_written(
         [
             item
@@ -610,6 +617,13 @@ class Preprocessor:
         self._defaults: set[str] = set()
         #: Whether the file being read is one py2bin supplies.
         self._reading_a_builtin = False
+        #: Headers the C++ stage supplies and this run cannot - <string>,
+        #: <filesystem> and the rest of the C++ standard library py2bin
+        #: writes. Empty except when a single header is being read ahead of
+        #: the translator, which is the only run that can hand them back.
+        self.cplusplus_supplies: "frozenset[str]" = frozenset()
+        #: The ones such a run met, to be asked of the C++ stage afterwards.
+        self.left_to_cplusplus: "set[str]" = set()
         #: Whether this text is C the C++ translator wrote. It matters to
         #: `pack` alone: that translator reads a pack out of the text and
         #: carries it with the struct, so a pack it could not read there is
@@ -1293,10 +1307,30 @@ class Preprocessor:
             self._builtins_read.add(name)
             was = self._reading_a_builtin
             self._reading_a_builtin = True
+            # py2bin's own C headers were written as C. Two of them carry a
+            # C++ arm behind `#ifdef __cplusplus` - a table of function
+            # pointers on one side and classes on the other - and the C run
+            # has to be handed the table, whatever the program's own text was
+            # allowed to see. Reading one is synchronous, so the name is
+            # simply absent for the duration and back afterwards.
+            saw_cplusplus = self.macros.pop("__cplusplus", None)
             try:
                 self._enter(builtin, f"<{name}>", None, at)
             finally:
                 self._reading_a_builtin = was
+                if saw_cplusplus is not None:
+                    self.macros["__cplusplus"] = saw_cplusplus
+            return
+        if name in self.cplusplus_supplies:
+            # Not this run's to answer. A header with an `#else` in it is read
+            # here ahead of the C++ translator, so that the branch a C++
+            # compiler takes is the one it is handed - and a project's own
+            # <fstream> on the search path did exactly that and then asked
+            # for <filesystem>, which only the translator has. Refused here,
+            # it said "cannot find the header" and listed every C header
+            # py2bin ships, none of which was the one asked for. Noted
+            # instead, and asked of the stage that has it.
+            self.left_to_cplusplus.add(name)
             return
         # Deduped and one per line: the list repeated itself where two search
         # roots coincided, and a wall of comma-separated paths is hard to read
@@ -4681,6 +4715,16 @@ def preprocess(
 
     engine = Preprocessor(include_dirs, target)
     engine.translated_cplusplus = cplusplus
+    if cplusplus:
+        # This text was C++ and its conditionals were written for a C++
+        # compiler, where `__cplusplus` is defined. Left undefined here, a
+        # program's own `#ifdef __cplusplus` took the arm meant for C: the
+        # class in the first arm had already been lifted out and written as
+        # a struct, and then the `typedef int Tag;` in the `#else` arm was
+        # read as well - "'Tag' is already a different type" - or a function
+        # defined under the guard simply went missing at its call. Inside
+        # py2bin's own C headers it stays undefined; see where one is read.
+        engine.run("#define __cplusplus 201703L\n", "<c++>", None)
     if defines:
         text = []
         for item in defines:

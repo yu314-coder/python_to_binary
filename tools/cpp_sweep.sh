@@ -109,6 +109,13 @@ run_projects() {
       for header in $(find "$dir" -name '*.h' -o -name '*.hpp'); do
         includes="$includes -I$(dirname "$header")"
       done
+      # And the directories py2bin searches on its own beside the program,
+      # so the reference sees the same files: a project's own <fstream> has
+      # no suffix for the loop above to find, and without this the reference
+      # took the system one and there was nothing to compare against.
+      for conventional in include inc headers; do
+        [ -d "$dir/$conventional" ] && includes="$includes -I$dir/$conventional"
+      done
       # shellcheck disable=SC2086
       clang++ -std=c++17 -w $includes -o "$WORK/ref_$name" "$@" 2>/dev/null \
         && want=$("$WORK/ref_$name" 2>&1)

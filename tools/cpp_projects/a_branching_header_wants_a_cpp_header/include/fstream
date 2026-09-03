@@ -1,0 +1,12 @@
+/* A project's own <fstream> on the search path, shaped the way a portable
+   header is: one arm per platform, and a C++ standard header asked for in
+   both. Read ahead of the translator because of the #else, and the run that
+   reads it could not answer <filesystem>. */
+#pragma once
+#ifdef _WIN32
+#include <string>
+#else
+#include <string>
+#endif
+#include <filesystem>
+namespace mini { inline std::string name_of(const std::filesystem::path &p) { return p.filename().string(); } }

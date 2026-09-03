@@ -1,0 +1,7 @@
+#pragma once
+#ifdef __cplusplus
+#include <string>
+
+#include <filesystem>
+namespace mini { inline std::string name_of(const std::filesystem::path &p) { return p.filename().string(); } }
+#endif

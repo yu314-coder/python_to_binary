@@ -1307,7 +1307,12 @@ def _function_definitions(text: str) -> "dict[str, tuple[str, str]]":
     """Each function defined at the top level, as name -> (returns, parameters)."""
 
     found: "dict[str, tuple[str, str]]" = {}
-    for match in _DEFINITION.finditer(text):
+    # Over a copy with the literals blanked - and a preprocessing directive
+    # counts as one there. This pattern's type group, `[\w\s*]*?`, crosses a
+    # newline, so scanned raw it began on the last word of a `#define G`
+    # above a definition and read `define G\nstring` as the return type.
+    # Anything done from that start touches the directive.
+    for match in _DEFINITION.finditer(_without_literals(text)):
         if _depth_at(text, match.end() - 1) != 0:
             continue
         returns = match.group(1).strip()
@@ -3536,7 +3541,12 @@ def _erased_parameters(text: str, name: str) -> "dict[str, list[int]]":
     """
 
     found: "dict[str, list[int]]" = {}
-    for match in _DEFINITION.finditer(text):
+    # Over a copy with the literals blanked - and a preprocessing directive
+    # counts as one there. This pattern's type group, `[\w\s*]*?`, crosses a
+    # newline, so scanned raw it began on the last word of a `#define G`
+    # above a definition and read `define G\nstring` as the return type.
+    # Anything done from that start touches the directive.
+    for match in _DEFINITION.finditer(_without_literals(text)):
         if _depth_at(text, match.end() - 1) != 0:
             continue
         at = [
@@ -6905,7 +6915,12 @@ def _mangle_overloaded_functions(text: str, filename: str) -> str:
     """
 
     definitions: dict[str, list[str]] = {}
-    for match in _DEFINITION.finditer(text):
+    # Over a copy with the literals blanked - and a preprocessing directive
+    # counts as one there. This pattern's type group, `[\w\s*]*?`, crosses a
+    # newline, so scanned raw it began on the last word of a `#define G`
+    # above a definition and read `define G\nstring` as the return type.
+    # Anything done from that start touches the directive.
+    for match in _DEFINITION.finditer(_without_literals(text)):
         if _depth_at(text, match.end() - 1) != 0:
             continue
         name = match.group(2)
@@ -6939,7 +6954,12 @@ def _mangle_overloaded_functions(text: str, filename: str) -> str:
     # The definitions first, so a call is rewritten against names that exist.
     out: list[str] = []
     at = 0
-    for match in _DEFINITION.finditer(text):
+    # Over a copy with the literals blanked - and a preprocessing directive
+    # counts as one there. This pattern's type group, `[\w\s*]*?`, crosses a
+    # newline, so scanned raw it began on the last word of a `#define G`
+    # above a definition and read `define G\nstring` as the return type.
+    # Anything done from that start touches the directive.
+    for match in _DEFINITION.finditer(_without_literals(text)):
         if _depth_at(text, match.end() - 1) != 0 or match.start() < at:
             continue
         name = match.group(2)
@@ -16032,6 +16052,17 @@ _A_CONDITION = re.compile(
 #: stops compiling a region and `#if 1` is how it turns one back on, and both
 #: are settled by reading them. Anything with a name in it is not: what the
 #: name stands for is the preprocessor's answer and it runs after this stage.
+#: `#ifdef __cplusplus`, `#ifndef __cplusplus`, `#if defined(__cplusplus)` and
+#: `#if !defined(__cplusplus)` - and nothing more on the line. `no` is set
+#: for the two spellings that are true when the name is *not* defined.
+_ASKS_IF_CPLUSPLUS = re.compile(
+    r"^\s*#\s*(?:"
+    r"if(?P<no>n)?def\s+__cplusplus"
+    r"|(?:if|elif)\s+(?P<no2>!\s*)?defined\s*\(?\s*__cplusplus\s*\)?"
+    r")\s*\Z"
+)
+
+
 _CONSTANT_CONDITION = re.compile(
     r"^\s*#\s*(?:if|elif)\s+\(*\s*(0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*\)*\s*\Z"
 )
@@ -16101,6 +16132,18 @@ def _constant_arm(directive: str) -> "bool | None":
     real code and the program builds either way.
     """
 
+    asked = _ASKS_IF_CPLUSPLUS.match(directive.strip())
+    if asked is not None:
+        # The one name this stage can answer, because this stage is the C++
+        # compiler for this text: a C++ compiler defines `__cplusplus`, and
+        # what was written under `#ifdef __cplusplus` is the code that was
+        # meant to reach here. Left unread, the `#else` arm - `typedef int
+        # Tag;`, written for a C compiler - was hoisted to the top of the
+        # unit above the class the other arm declared, and the build stopped
+        # on a name that was already a different type. Only the bare
+        # spellings: a condition that combines it with anything else is
+        # still one this stage cannot see the rest of.
+        return asked.group("no") is None and asked.group("no2") is None
     found = _CONSTANT_CONDITION.match(directive.strip())
     if found is None:
         return None
@@ -18006,7 +18049,12 @@ def _function_signatures(text: str, classes: "dict[str, Class]" = {}) -> "dict[s
     """
 
     found: dict[str, list[int]] = {}
-    for match in _DEFINITION.finditer(text):
+    # Over a copy with the literals blanked - and a preprocessing directive
+    # counts as one there. This pattern's type group, `[\w\s*]*?`, crosses a
+    # newline, so scanned raw it began on the last word of a `#define G`
+    # above a definition and read `define G\nstring` as the return type.
+    # Anything done from that start touches the directive.
+    for match in _DEFINITION.finditer(_without_literals(text)):
         if _depth_at(text, match.end() - 1) != 0:
             continue
         name = match.group(2)
@@ -18680,6 +18728,18 @@ def _rewrite_functions(
         # first function after it returned an object by value.
         bare = _without_literals(head)
         cut = max(bare.rfind(";"), bare.rfind("}")) + 1
+        # A preprocessing directive ends with neither, and it is blanked in
+        # `bare` besides, so the search above walked straight over one. The
+        # head of a function does not begin above a directive: `#ifndef G`
+        # and `#define G` stood over `Box make(int)` and were rebuilt away
+        # with it, the guard's `#endif` was left on its own, and the build
+        # stopped there. Every header that guards itself and answers an
+        # object did this - py2bin's own <string> among them.
+        offset = 0
+        for kind, part in _split_literals(head):
+            if kind == "literal" and part.lstrip().startswith("#"):
+                cut = max(cut, offset + len(part))
+            offset += len(part)
         lead, head = head[:cut], head[cut:]
         opened = head.rfind("(")
         references = (
@@ -22273,14 +22333,29 @@ def inline_local_includes(
         seen_headers.add(named)
         from .c_preprocessor import as_cplusplus
 
-        return as_cplusplus(
+        chosen = as_cplusplus(
             named,
             candidate.parent,
             include_dirs,
             target,
             _SUPPLIED_BY_A_BRANCH,
             seen_headers,
+            frozenset(_BUILTIN_CPP_HEADERS),
         )
+        # What that run could not answer comes back as `#include` lines at
+        # the top: py2bin's C headers, which the outer run reads, and py2bin's
+        # C++ ones, which only this stage has. A project's own <fstream> on
+        # the search path, read ahead of the translator because it has an
+        # `#else` in it, asked for <filesystem> - and was refused with a list
+        # of every C header py2bin ships. The C++ ones are pasted here, once
+        # per unit as always; a name `supply` does not know is left as it is.
+
+        def answered(found: "re.Match[str]") -> str:
+            spelled = found.group(1) or found.group(2)
+            pasted = supply(spelled)
+            return found.group(0) if pasted is None else pasted
+
+        return _ANY_INCLUDE.sub(answered, chosen)
 
     def reach(match: "re.Match[str]", ours: bool = False) -> str:
         """Whatever this include names, however it is spelled.
