@@ -867,6 +867,8 @@ def lay_out(
     struct: StructType,
     members: "list[tuple[str, CType] | tuple[str, CType, int]]",
     pack: "int | None" = None,
+    alignments: "dict[str, int] | None" = None,
+    at_least: int = 1,
 ) -> "list[tuple[str, int, int]]":
     """Assign member offsets and set the struct's size and alignment.
 
@@ -898,6 +900,9 @@ def lay_out(
         member_alignment = align_of(ctype)
         if pack is not None:
             member_alignment = min(member_alignment, pack)
+        # `__declspec(align(N))` / `__attribute__((aligned(N)))` on the
+        # member: it can only widen. Both compilers let it win over a pack.
+        member_alignment = max(member_alignment, (alignments or {}).get(name, 0))
         member_size = size_of(ctype) or 0
         alignment = max(alignment, member_alignment)
         if width is not None and not struct.is_union:
@@ -950,6 +955,9 @@ def lay_out(
         offset += member_size
     # Tail padding keeps an array of this type aligned.
     struct.members = tuple(placed)
+    # `struct __declspec(align(16)) T` / `struct __attribute__((aligned(16)))
+    # T`: the whole object is at least that aligned, and padded to it.
+    alignment = max(alignment, at_least)
     struct.alignment = alignment
     struct.size = (offset + alignment - 1) & ~(alignment - 1)
     return too_wide
@@ -1783,6 +1791,11 @@ class Parser:
         # struct/union tags are shared across the translation unit, so a
         # tag mentioned inside its own body refers to the same type.
         self.struct_tags: dict[str, StructType] = {}
+        #: The strictest `__declspec(align(N))` / `__attribute__((aligned(N)))`
+        #: read since a struct or one of its members last took it. A member
+        #: starts at a multiple of the larger of its own alignment and this;
+        #: a struct is padded to at least this.
+        self.requested_alignment: int = 0
         # Copied per parse: a typedef in one translation unit must not
         # leak into the next compilation in the same process.
         self.typedefs: dict[str, CType] = typedefs_for(target)
@@ -1995,6 +2008,8 @@ class Parser:
         # layout. Read as part of the specifier list only, the decoration was
         # taken for the tag and the real tag became a syntax error.
         self.skip_decorations()
+        whole_alignment = self.requested_alignment
+        self.requested_alignment = 0
         tag: str | None = None
         if self.token.kind == "identifier" and self.token.value not in _RESERVED:
             tag = str(self.take().value)
@@ -2018,11 +2033,13 @@ class Parser:
             self.error(f"{struct} is defined twice", keyword)
         self.take("{")
         members: "list[tuple[str, CType] | tuple[str, CType, int]]" = []
+        alignments: dict[str, int] = {}
         seen: set[str] = set()
         while not self.accept("}"):
             if self.token.kind == "eof":
                 self.error("unterminated struct body", keyword)
             member_start = self.token
+            self.requested_alignment = 0
             base = self.type_specifier()
             if self.at(";") and isinstance(base, StructType) and base.name is None:
                 # `union { ... };` with no name of its own. Laid out as one
@@ -2085,12 +2102,17 @@ class Parser:
                     )
                 seen.add(member_name)
                 members.append((member_name, ctype))
+                if self.requested_alignment:
+                    alignments[member_name] = self.requested_alignment
                 if not self.accept(","):
                     break
             self.take(";")
+        self.requested_alignment = 0
         if not members:
             self.error("an empty struct has no size in C", keyword)
-        for field, spans, declared in lay_out(struct, members, self.pack):
+        for field, spans, declared in lay_out(
+            struct, members, self.pack, alignments, whole_alignment
+        ):
             self.error(
                 f"the bitfield {field!r} is packed across {spans} bytes but is "
                 f"declared {declared} wide, and py2bin reads a bitfield with a "
@@ -2227,13 +2249,9 @@ class Parser:
             elif self.at(")"):
                 depth -= 1
             elif self.token.kind == "identifier" and self.token.value == "align":
-                self.error(
-                    "__declspec(align) decides where every member after it "
-                    "sits, and py2bin does not implement it. Dropping it "
-                    "would build a struct of a different shape than the one "
-                    "written, so it is refused instead",
-                    self.token,
-                )
+                # `align(8)` decides where every member after it sits, so it
+                # is kept and honoured where the struct is laid out.
+                self.note_alignment(self.token)
             self.index += 1
             if depth == 0:
                 return
@@ -2260,6 +2278,14 @@ class Parser:
                 depth += 1
             elif self.at(")"):
                 depth -= 1
+            elif self.token.kind == "identifier" and self.token.value in (
+                "aligned",
+                "__aligned__",
+            ):
+                # `aligned(16)`, or bare `aligned` for the widest alignment
+                # any type has here, which is 16 on every target py2bin
+                # builds for. Kept and honoured where the struct is laid out.
+                self.note_alignment(self.token, default=16)
             elif (
                 self.token.kind == "identifier"
                 and self.token.value in _LAYOUT_ATTRIBUTES
@@ -2274,6 +2300,28 @@ class Parser:
             self.index += 1
             if depth == 0:
                 return
+
+    def note_alignment(self, keyword: Token, default: int = 0) -> None:
+        """`align(N)` or `aligned(N)`: remember the strictest asked for so far.
+
+        Only the keyword is read here; the caller's scan moves over the
+        parentheses as it does for every other decoration.
+        """
+
+        asked = default
+        if self.peek().kind == "symbol" and self.peek().value == "(":
+            number = self.peek(2)
+            if number.kind != "integer":
+                self.error(
+                    f"{keyword.value} wants a number of bytes", number
+                )
+            value = number.value
+            asked = value if isinstance(value, int) else int(str(value), 0)
+        if asked <= 0 or asked & (asked - 1):
+            self.error(
+                f"{keyword.value}({asked}) is not a power of two", keyword
+            )
+        self.requested_alignment = max(self.requested_alignment, asked)
 
     def skip_decorations(self) -> None:
         """Every `__declspec` and `__attribute__` written here, in a row.

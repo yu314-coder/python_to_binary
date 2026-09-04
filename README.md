@@ -2739,6 +2739,31 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a socket header included twice, and the shape of what it declares
+
+`#include <winsock2.h>` and then `<ws2tcpip.h>`, which includes the first:
+both branch on `__cplusplus`, so each was preprocessed alone before it was
+pasted, and the run for the second expanded the first again inside it. The
+unit held `WSAECOMPARATOR` twice, and the C compiler said "duplicate
+enumerator 'COMP_EQUAL'". That run now reads a header the C++ stage already
+pasted for its macros only and drops what it declares, and reports the ones it
+did expand so a later direct include is skipped in turn. Behind that error
+stood everything a socket header declares. `__declspec(align(8))` and
+`__attribute__((aligned(N)))` are laid out rather than refused - a member
+starts at the next multiple of the larger of its own alignment and the one
+asked for, and a struct is padded to the strictest - checked against clang on
+eight shapes in both spellings. A decoration's parentheses, and a `sizeof` in
+an array bound, no longer make a struct a class. Hoisted enums, unions, plain
+structs and typedefs go out in the order they were written, which is valid C
+whenever the C++ was (a union of plain structs held by a later plain struct
+had no order both groups could satisfy); an anonymous `typedef enum` is
+hoisted at all. `typedef struct Counter { ... } Counter_t, *PCounter;` keeps
+its aliases, which now name the class everywhere. `__extension__` is nothing
+here, as it is to GCC, and Wine's `WINELIB_NAME_AW` stands beside mingw's
+`__MINGW_NAME_AW`, since the header index serves Wine's winsock. An include
+written in a comment is no longer taken for one. 2124 tests, 539 programs
+against clang++, 11 projects, 3276 builds across six targets.
+
 ### 0.9.13 - a local seen from the block below, and a literal holding a brace
 
 `text.find(quotedKey)` inside an `if` chooses among the forms of `find` by

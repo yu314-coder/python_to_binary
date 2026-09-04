@@ -474,6 +474,11 @@ def _plainly_c(inner: str) -> bool:
     reader below reaches it and refuses it by name.
     """
 
+    # A decoration's parentheses are not a method's: `long long
+    # __declspec(align(8)) __ss_align;` is a member, and <ws2def.h> writes
+    # one. Taken for a method, the struct became a class and was lifted
+    # away, leaving its typedef's aliases with nothing in front of them.
+    inner = _without_bounds(_without_decorations(inner))
     if "(" in inner:
         return False
     if not _MACRO_NAMES:
@@ -659,6 +664,46 @@ def _macro_written_out(
     return f"{body[:spelled.start()]}{stands}{body[spelled.end():]}"
 
 
+def _without_bounds(declaration: str) -> str:
+    """Array bounds emptied: `pad[((sizeof(long long)) - 2)]` becomes `pad[]`.
+
+    A bound is a constant expression and may hold parentheses; it cannot hold
+    a method. Asked "is there a parenthesis in here?" of the text as written,
+    a struct whose padding was sized with `sizeof` was taken for a class.
+    """
+
+    while True:
+        emptied = re.sub(r"\[[^\[\]]*\]", "[]", declaration)
+        if emptied == declaration:
+            return emptied
+        declaration = emptied
+
+
+def _without_decorations(declaration: str) -> str:
+    """`__declspec(...)` and `__attribute__((...))` taken off a declaration."""
+
+    out: list[str] = []
+    index = 0
+    for found in re.finditer(r"\b(?:__declspec|__attribute__|__attribute)\s*\(", declaration):
+        if found.start() < index:
+            continue
+        depth = 0
+        end = found.end() - 1
+        while end < len(declaration):
+            if declaration[end] == "(":
+                depth += 1
+            elif declaration[end] == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        out.append(declaration[index:found.start()])
+        index = end
+    out.append(declaration[index:])
+    return " ".join("".join(out).split())
+
+
 def _split_members(body: str, name: str, filename: str, at: int) -> Class:
     """Read a class body into its data members and its member functions."""
 
@@ -767,8 +812,13 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
             break
         declaration = body[index:statement_end].strip()
         if declaration:
-            if "(" in declaration and not _FUNCTION_POINTER_MEMBER.match(
-                declaration
+            # A decoration's parentheses are not a method's: `long long
+            # __declspec(align(8)) __ss_align;` is how <ws2def.h> writes a
+            # member, and read as a method it made the struct a class - which
+            # was lifted away, leaving `typedef ALIASES;` behind.
+            undecorated = _without_bounds(_without_decorations(declaration))
+            if "(" in undecorated and not _FUNCTION_POINTER_MEMBER.match(
+                undecorated
             ):
                 # A member function declared here and defined outside. Told
                 # apart from `int (*op)(int);` by where the name sits: a
@@ -2253,7 +2303,10 @@ _HOISTED_TO_THE_TOP = re.compile(
     # a class holding a `counter` was emitted first and named a type C had not
     # reached. The tagged spelling of the same thing had always worked, which
     # is what made this look like an include problem rather than a hoist one.
-    + r"|(?P<anonymous>\btypedef\s+(?:struct|union)\s*\{)"
+    # And `typedef enum { ... } kind_t;` - hoisted by neither this nor the
+    # tagged-type hoist, which wants a tag, so it stayed below the classes
+    # and a plain struct holding a `kind_t` was emitted first.
+    + r"|(?P<anonymous>\btypedef\s+(?:struct|union|enum)\s*\{)"
 )
 
 
@@ -16831,6 +16884,59 @@ def _refuse_classes_chosen_by_a_condition(text: str, filename: str) -> None:
         )
 
 
+#: `typedef struct Name Alias, *PAlias;` and `typedef Name Alias;` - other
+#: names for a class, as C-style C++ writes them.
+_CLASS_ALIAS = re.compile(
+    r"(?m)^[ \t]*typedef\s+(?:struct|class)?\s*([A-Za-z_]\w*)\s+([^;{}()]+);"
+)
+
+
+def _resolve_class_aliases(
+    text: str, classes: "dict[str, Class]", order: "list[str]"
+) -> str:
+    """Every alias of a class replaced by the class's name, in the text and in the classes.
+
+    A pointer alias becomes `Name *`, so `PCounter p = &c;` is a pointer
+    declaration like any other. The typedef itself goes: the C is given
+    `typedef struct Name Name;` for every class anyway, and with the aliases
+    gone from the program nothing asks for them.
+    """
+
+    aliases: dict[str, str] = {}
+
+    def taken(match: "re.Match[str]", whole: str) -> "str | None":
+        named = match.group(1)
+        if named not in order:
+            return None
+        for piece in whole[match.start(2): match.end(2)].split(","):
+            stars = piece.count("*")
+            alias = re.sub(r"[\s*]", "", piece)
+            if alias and alias != named and alias.isidentifier():
+                aliases[alias] = named + " *" * stars
+        return ""
+
+    text = _sub_code(_CLASS_ALIAS, text, taken)
+    if not aliases:
+        return text
+
+    def spelled_out(part: str) -> str:
+        for alias, spelled in aliases.items():
+            part = re.sub(rf"(?<![.\w>]){re.escape(alias)}\b", spelled, part)
+        return part
+
+    text = _map_code(text, spelled_out)
+    for held in classes.values():
+        for method in held.methods:
+            method.returns = spelled_out(method.returns)
+            method.parameters = spelled_out(method.parameters)
+            method.body = _map_code(method.body, spelled_out)
+        for member in held.members:
+            member.ctype = spelled_out(member.ctype)
+    for owner, rows in list(_CLASS_MEMBERS.items()):
+        _CLASS_MEMBERS[owner] = [(member, spelled_out(kind)) for member, kind in rows]
+    return text
+
+
 def _translate(source: str, filename: str = "<c++>") -> str:
     """Translate the C++ subset in `source` into C.
 
@@ -17118,6 +17224,22 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         end = closing
         while end < len(text) and text[end] in " \t":
             end += 1
+        before = text[:head.start()].rstrip()
+        if before.endswith("typedef"):
+            # `typedef struct Counter { ... } Counter_t, *PCounter;` - the
+            # class goes out with the others, and what stays is the typedef
+            # of its tag: `typedef struct Counter Counter_t, *PCounter;`.
+            # Cut as a bare class was, the aliases were left with nothing in
+            # front of them.
+            semicolon = text.find(";", closing)
+            aliases = text[closing:semicolon].strip() if semicolon >= 0 else ""
+            begins = len(before) - len("typedef")
+            pieces.append((
+                begins,
+                semicolon + 1 if semicolon >= 0 else end,
+                f"typedef struct {name} {aliases};" if aliases else "",
+            ))
+            continue
         if end < len(text) and text[end] == ";":
             end += 1
         pieces.append((head.start(), end, ""))
@@ -17343,6 +17465,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         at = max(at, end)
     kept.append(text[at:])
     remainder = "".join(kept)
+    # `typedef struct Counter { ... } Counter_t, *PCounter;` - the class has
+    # other names now, and every use of one is the class: `Counter_t c;
+    # c.bump()` is a call on a Counter. Read under the alias, it was a
+    # variable of a type no pass knew, and the call went to the C compiler.
+    remainder = _resolve_class_aliases(remainder, classes, order)
 
     # Directives first. The struct and its methods are emitted above whatever
     # is left of the file, and a method that calls printf needs <stdio.h>
@@ -17390,6 +17517,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         (directives if line.lstrip().startswith("#") else kept_lines).append(line)
         index += 1
     remainder = "\n".join(kept_lines)
+    # As written, before anything is hoisted out of it: the hoisted C types
+    # go back out in this order, which is valid C whenever the C++ was.
+    written_order = remainder
 
     # Typedefs first, as forward declarations. `Vec v;` is a declaration in
     # C++ and a syntax error in C, which wants `struct Vec v;` - and a class
@@ -17422,17 +17552,21 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # each one goes is decided by what it names. Written out above them
     # always, `union U { Inner in; };` was emitted before `Inner` existed.
     def _names_a_class(body: str) -> bool:
+        # A class proper, not a plain struct: those are registered in
+        # `classes` too, for their members' sake, but are emitted with the
+        # tagged types in source order - and a union of plain structs held
+        # by a later plain struct (<winsock2.h>'s INTERFACE_INFO) was parked
+        # after the classes for naming one.
         without = _without_literals(body)
         return any(
             re.search(rf"(?<![.\w>]){re.escape(name)}\b", without)
-            for name in classes
+            for name in order
         )
 
     tagged_after = [one for one in tagged if _names_a_class(one)]
     tagged_before = [one for one in tagged if one not in tagged_after]
     typedefs = "\n".join(
-        tagged_before
-        + [f"typedef struct {name} {name};" for name in [*order, *plain]]
+        [f"typedef struct {name} {name};" for name in [*order, *plain]]
         # After the structs: one of these may name a struct in its parameters.
         + function_types
     )
@@ -17449,8 +17583,20 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             return body
         return f"#pragma pack(push, {held})\n{body}\n#pragma pack(pop)"
 
+    # The enums, unions, plain structs and typedefs go out in the order they
+    # were written. Grouped by kind - the tagged ones first, the plain structs
+    # after - each group named types from the other: <ws2ipdef.h>'s union of
+    # socket addresses holds plain structs, and <winsock2.h>'s INTERFACE_INFO
+    # struct holds that union. The source order satisfies both, since C++
+    # wants a complete type before a member of it too.
+    def _where_written(body: str) -> int:
+        return written_order.find(body)
+
     declarations = "\n".join(
-        [_packed_body(one) for one in plain_bodies]
+        [
+            _packed_body(one)
+            for one in sorted(plain_bodies + tagged_before, key=_where_written)
+        ]
         + [
             _emit_class(classes[name], classes)
             for name in _by_dependency(order, classes)
@@ -22717,8 +22863,11 @@ _LOCAL_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$', re.M
 #: An include of either spelling. Which one it is stopped mattering once a
 #: quoted include had to fall back to what py2bin ships and an angled one had
 #: to reach the project's own headers - both of which C already says.
+#: Anchored to the start of a line, where a directive has to be: a comment
+#: that mentions `#include <winsock2.h>` in passing was read as the include
+#: itself, and the build stopped to look for a header nobody asked for.
 _ANY_INCLUDE = re.compile(
-    r'#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)'
+    r'^[ \t]*#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)', re.M
 )
 
 def _line_of(text: str, index: int) -> int:

@@ -365,6 +365,8 @@ def as_cplusplus(
 
     engine = Preprocessor(include_dirs, target)
     engine.cplusplus_supplies = cplusplus
+    # Everything pasted so far, except the header this run is for.
+    engine.already_pasted = set(already) - {named}
     engine.run(
         "#define __cplusplus 201703L\n#define __py2bin_translating 1\n",
         "<c++>",
@@ -404,6 +406,8 @@ def as_cplusplus(
     dropped = ours - kept - pasted
     supplied.update(kept)
     already.update(kept)
+    # The search-path headers this run expanded are in the unit now too.
+    already.update(engine.search_path_read)
     # The dropped ones are asked for by name, so the other run reads them -
     # at the top, where it puts every directive, which is above every use.
     # Dropped without asking, a generated header named a type nothing had
@@ -420,6 +424,7 @@ def as_cplusplus(
             item
             for item in engine.output
             if item.origin.strip("<>") not in dropped | pasted
+            and item.origin not in engine.pasted_origins
         ]
     )
 
@@ -622,6 +627,14 @@ class Preprocessor:
         #: writes. Empty except when a single header is being read ahead of
         #: the translator, which is the only run that can hand them back.
         self.cplusplus_supplies: "frozenset[str]" = frozenset()
+        #: Search-path headers the C++ stage has already pasted into the unit.
+        #: A run that reads one branching header alone must not expand them
+        #: again, or the unit holds two copies; and the ones it does expand
+        #: are reported in `search_path_read`, so a later direct include of
+        #: one of them is skipped in turn.
+        self.already_pasted: "set[str]" = set()
+        self.search_path_read: "set[str]" = set()
+        self.pasted_origins: "set[str]" = set()
         #: The ones such a run met, to be asked of the C++ stage afterwards.
         self.left_to_cplusplus: "set[str]" = set()
         #: Whether this text is C the C++ translator wrote. It matters to
@@ -660,6 +673,10 @@ class Preprocessor:
             "#define __STDC_VERSION__ 201112L",
             "#define __STDC_HOSTED__ 0",
             "#define __py2bin__ 1",
+            # GCC's `__extension__` marks a construct as deliberately beyond
+            # the standard and changes nothing else; mingw's headers write it
+            # in front of `__int64`. Nothing here needs to hear it.
+            "#define __extension__",
             # C11 6.10.8.1 lets an implementation supply a fixed date and time
             # when the real ones are not available, and py2bin says they are
             # not: a compiler that read the clock would give a different binary
@@ -1294,6 +1311,20 @@ class Preprocessor:
             # named with -I is somebody's own choice and still wins.
             if builtin is not None and _FETCHED_INTO in candidate.parts:
                 continue
+            if builtin is None:
+                # A header the C++ stage pasted already is read for its
+                # macros - the header being read alone here is written in
+                # them - and what it declares is dropped from this run's
+                # output, the way py2bin's own headers are treated. A fetched
+                # <ws2tcpip.h> asked for <winsock2.h>, which the program had
+                # included directly and which was already in the unit, so
+                # its enum arrived twice and the C compiler said so.
+                lowered = name.lower()
+                if name in self.already_pasted or any(
+                    lowered == other.lower() for other in self.already_pasted
+                ):
+                    self.pasted_origins.add(self._origin_of(candidate))
+                self.search_path_read.add(name)
             self._read(candidate, at)
             return
         if builtin is not None:
@@ -3646,6 +3677,7 @@ _MINGW_H = """
 #define _INC_CRT_UNICODE_MACROS 1
 #define __MINGW_NAME_AW(func) func##W
 #define __MINGW_NAME_AW_EXT(func, ext) func##W##ext
+#define WINELIB_NAME_AW(func) func##W
 #define __MINGW_NAME_UAW(func) func##_W
 #define __MINGW_NAME_UAW_EXT(func, ext) func##_W_##ext
 #define __MINGW_STRING_AW(str) L##str
@@ -3654,12 +3686,14 @@ _MINGW_H = """
 #define _INC_CRT_UNICODE_MACROS 2
 #define __MINGW_NAME_AW(func) func##A
 #define __MINGW_NAME_AW_EXT(func, ext) func##A##ext
+#define WINELIB_NAME_AW(func) func##A
 #define __MINGW_NAME_UAW(func) func##_A
 #define __MINGW_NAME_UAW_EXT(func, ext) func##_A_##ext
 #define __MINGW_STRING_AW(str) str
 #define __MINGW_PROCNAMEEXT_AW "A"
 #endif
 #define __MINGW_TYPEDEF_AW(type) typedef __MINGW_NAME_AW(type) type;
+#define DECL_WINELIB_TYPE_AW(type) typedef WINELIB_NAME_AW(type) type;
 #define __MINGW_TYPEDEF_UAW(type) typedef __MINGW_NAME_UAW(type) type;
 #endif
 
