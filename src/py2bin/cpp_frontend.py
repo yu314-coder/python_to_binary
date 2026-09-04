@@ -8073,7 +8073,52 @@ def _rewrite_threads(text: str, filename: str) -> str:
         entry = f"{_THREAD_ENTRY_PREFIX}{counter}"
         held = given[0]
         member = re.match(r"^&\s*([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)$", held)
-        if member is not None and len(given) == 2:
+
+        def packed(on_type: str, on_value: str, bound: "list[str]", call: str) -> str:
+            """A class holding the object and the bound arguments, a trampoline
+            reading them back, and what the thread is handed: `new` of it."""
+
+            spelled_types = [_deduced_type(one, text, match.start()) for one in bound]
+            if any(one is None for one in spelled_types):
+                raise CppTranslationError(
+                    filename, _line_of(text, match.start()),
+                    f"a thread is started here on `{held}` with arguments "
+                    f"py2bin cannot read the types of. It reads a literal "
+                    f"and a variable it can see declared; give the argument "
+                    f"a variable of its own and pass that",
+                )
+            pack = f"__py2bin_thread_args_{counter}"
+            members = f"    {on_type} on;\n" + "".join(
+                f"    {one} a{index};\n" for index, one in enumerate(spelled_types)
+            )
+            parameters = ", ".join(
+                [f"{on_type} v_on"] + [f"{one} v{index}" for index, one in enumerate(spelled_types)]
+            )
+            assigned = "on = v_on; " + " ".join(f"a{index} = v{index};" for index in range(len(bound)))
+            passing = ", ".join(f"__py2bin_a->a{index}" for index in range(len(bound)))
+            made.append(
+                f"class {pack} {{\npublic:\n{members}"
+                f"    {pack}({parameters}) {{ {assigned} }}\n}};\n"
+                f"static long {entry}(void *__py2bin_given) {{ "
+                f"{pack} *__py2bin_a = ({pack} *)__py2bin_given; "
+                # Through a plain local, as the branches below write the
+                # call: a call on `(*__py2bin_a->on)` is not one the pass
+                # that rewrites calls on callable objects recognises.
+                f"{on_type} __py2bin_on_{counter} = __py2bin_a->on; "
+                f"{call.format(passing=passing, on=f'__py2bin_on_{counter}')}; return 0; }}"
+            )
+            return f"(void *)(new {pack}({', '.join([on_value, *bound])}))"
+
+        if member is not None and len(given) > 2:
+            # `thread t(&Bridge::run, this, 80);` - the member, the object
+            # to call it on, and what to call it with. The object is held
+            # by address, as `this` and `&bridge` already are.
+            owner, method = member.group(1), member.group(2)
+            on = given[1]
+            on_type = _deduced_type(on, text, match.start()) or ""
+            on_value = on if "*" in on_type or on == "this" else f"&{on}"
+            passed = packed(f"{owner} *", on_value, given[2:], f"{{on}}->{method}({{passing}})")
+        elif member is not None and len(given) == 2:
             # `thread(&Host::run, this)` - a member function and the object
             # to call it on. The object is the argument, and the trampoline
             # is the call.
@@ -8087,6 +8132,31 @@ def _rewrite_threads(text: str, filename: str) -> str:
                 f"__py2bin_on->{method}(); return 0; }}"
             )
             passed = f"(void *)({given[1]})"
+        elif len(given) > 1 and (
+            not re.fullmatch(r"[A-Za-z_]\w*", held)
+            or (
+                _declared_return(text, None, held) is None
+                and _deduced_type(held, text, match.start()) is not None
+            )
+        ):
+            # `thread t(work, 6, 7);` where `work` is a lambda or any object
+            # with a call operator, and arguments to call it with. Held by
+            # address, as a callable on its own already is.
+            holds = _deduced_type(held, text, match.start())
+            owner = (
+                re.sub(r"\b(?:const|struct|volatile)\b", " ", holds or "")
+                .replace("*", " ")
+                .strip()
+            )
+            if not owner:
+                raise CppTranslationError(
+                    filename, _line_of(text, match.start()),
+                    f"a thread is started here on `{held}`, and py2bin "
+                    f"cannot read what that is. It writes the function the "
+                    f"platform starts a thread at, and needs the type to "
+                    f"know what that function should call",
+                )
+            passed = packed(f"{owner} *", f"&{held}", given[1:], "(*{on})({passing})")
         elif len(given) == 1:
             # Anything callable held in a name: the object is what the
             # trampoline calls, and it is the argument too.
@@ -8562,6 +8632,7 @@ def _strip_linkage(text: str) -> str:
             # `extern "C" void f(void);` - one declaration, and only the
             # words in front of it go.
             text = text[:found.start()] + text[found.end():]
+            at = found.start()
             continue
         at = found.end() + opening
         try:
@@ -8574,6 +8645,11 @@ def _strip_linkage(text: str) -> str:
             + text[at + 1: closing - 1]
             + text[closing:]
         )
+        # And searched again from where the words were: the text is shorter
+        # now, and resuming past the old `{` skipped a block that began right
+        # after the one just taken out - OpenSSL's headers open three in a
+        # row, and the second reached the C compiler.
+        at = found.start()
 
 
 def _strip_namespace_qualifiers(text: str, namespaces: "set[str]") -> str:
@@ -15103,7 +15179,11 @@ def _rewrite_dereferenced_calls(
         if end < 0:
             continue
         inner = body[begins: found.start() + 1]
-        held = (_deduced_type(inner, f"{body}\n{scope}") or "").strip()
+        # From where the call stands: asked with no position, the reader
+        # answered with the *last* declaration of that name anywhere in the
+        # unit, and two functions each holding a `__py2bin_on` of a different
+        # callable's class called the second one's operator from both.
+        held = (_deduced_type(inner, f"{body}\n{scope}", begins) or "").strip()
         held = held.replace("const", "").replace("struct", "").strip()
         spelled = held.replace("*", "").strip()
         owner = _find_method(spelled, "op_call", classes) if spelled in classes else None
@@ -20264,6 +20344,259 @@ public:
 #: type it can print, which is how the real one is put together too; each
 #: hands the stream back so the next `<<` in the chain has something to be
 #: called on. The output goes through printf, which py2bin implements itself.
+_FSTREAM_HEADER = r"""
+#include <stdio.h>
+#include <string>
+#include <iostream>
+#include <filesystem>
+namespace std {
+/* The open-mode and seek-direction constants a program spells as
+   `std::ios::binary` and `std::ios::end`. */
+class ios {
+public:
+    static const int in = 1;
+    static const int out = 2;
+    static const int binary = 4;
+    static const int app = 8;
+    static const int trunc = 16;
+    static const int ate = 32;
+    static const int beg = 0;
+    static const int cur = 1;
+    static const int end = 2;
+};
+typedef ios ios_base;
+/* A file read as a stream, over the file helpers <filesystem> brought in:
+   py2bin's string holds 255 characters, and a file read into one would
+   have been cut there without a word. Read a block at a time into a buffer
+   and handed out a character at a time; a line longer than the string
+   holds is cut at 255, which is what `getline` into py2bin's string does
+   everywhere. */
+class ifstream {
+public:
+    long long __handle;
+    int failed;
+    long __got;
+    char __buf[512];
+    int __at;
+    int __end;
+    void __start(const char *where) {
+        __handle = __py2bin_file_open(where, 0, 0);
+        failed = __handle < 0;
+        __got = 0; __at = 0; __end = 0;
+    }
+    ifstream() { __handle = -1; failed = 1; __got = 0; __at = 0; __end = 0; }
+    ifstream(const char *where) { __start(where); }
+    ifstream(const char *where, int mode) { __start(where); }
+    ifstream(string where) { __start(where.c_str()); }
+    ifstream(string where, int mode) { __start(where.c_str()); }
+    ifstream(path where) { __start(where.c_str()); }
+    ifstream(path where, int mode) { __start(where.c_str()); }
+    ~ifstream() { close(); }
+    void open(const char *where) { close(); __start(where); }
+    void open(const char *where, int mode) { close(); __start(where); }
+    void open(string where) { close(); __start(where.c_str()); }
+    void open(string where, int mode) { close(); __start(where.c_str()); }
+    int is_open() { return __handle >= 0; }
+    void close() { if (__handle >= 0) { __py2bin_file_close(__handle); __handle = -1; } }
+    int good() { return failed == 0 && __handle >= 0; }
+    int fail() { return failed != 0; }
+    int bad() { return failed != 0; }
+    operator bool() { return failed == 0 && __handle >= 0; }
+    int operator!() { return failed != 0 || __handle < 0; }
+    void clear() { failed = 0; }
+    int __fill() {
+        long n;
+        if (__handle < 0) { return 0; }
+        n = __py2bin_file_read(__handle, __buf, 512);
+        if (n <= 0) { __at = 0; __end = 0; return 0; }
+        __end = (int)n; __at = 0;
+        return 1;
+    }
+    int __get() {
+        int c;
+        if (__at >= __end) { if (!__fill()) { return -1; } }
+        c = (int)(unsigned char)__buf[__at];
+        __at = __at + 1;
+        return c;
+    }
+    void __unget() { if (__at > 0) { __at = __at - 1; } }
+    int __spacing(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+    /* Numbers read by hand, as the string streams read them: py2bin's C
+       library has no atoi or atof. */
+    long __to_long(string &w) {
+        long got;
+        int i;
+        int negative;
+        got = 0; i = 0; negative = 0;
+        if (w.size() > 0 && (w.at(0) == '-' || w.at(0) == '+')) { negative = w.at(0) == '-'; i = 1; }
+        while (i < w.size() && w.at(i) >= '0' && w.at(i) <= '9') { got = got * 10 + (long)(w.at(i) - '0'); i = i + 1; }
+        return negative ? -got : got;
+    }
+    double __to_double(string &w) {
+        double got;
+        double scale;
+        int i;
+        int negative;
+        int exponent;
+        int exponent_negative;
+        got = 0.0; scale = 0.1; i = 0; negative = 0;
+        if (w.size() > 0 && (w.at(0) == '-' || w.at(0) == '+')) { negative = w.at(0) == '-'; i = 1; }
+        while (i < w.size() && w.at(i) >= '0' && w.at(i) <= '9') { got = got * 10.0 + (double)(w.at(i) - '0'); i = i + 1; }
+        if (i < w.size() && w.at(i) == '.') {
+            i = i + 1;
+            while (i < w.size() && w.at(i) >= '0' && w.at(i) <= '9') { got = got + (double)(w.at(i) - '0') * scale; scale = scale * 0.1; i = i + 1; }
+        }
+        if (i < w.size() && (w.at(i) == 'e' || w.at(i) == 'E')) {
+            i = i + 1; exponent = 0; exponent_negative = 0;
+            if (i < w.size() && (w.at(i) == '-' || w.at(i) == '+')) { exponent_negative = w.at(i) == '-'; i = i + 1; }
+            while (i < w.size() && w.at(i) >= '0' && w.at(i) <= '9') { exponent = exponent * 10 + (w.at(i) - '0'); i = i + 1; }
+            while (exponent > 0) { got = exponent_negative ? got / 10.0 : got * 10.0; exponent = exponent - 1; }
+        }
+        return negative ? -got : got;
+    }
+    void __skip() {
+        int c;
+        c = __get();
+        while (c >= 0 && __spacing(c)) { c = __get(); }
+        if (c >= 0) { __unget(); }
+    }
+    int get() { int c; c = __get(); if (c < 0) { failed = 1; return EOF; } return c; }
+    int peek() { int c; c = __get(); if (c < 0) { return EOF; } __unget(); return c; }
+    int eof() { int c; c = __get(); if (c < 0) { return 1; } __unget(); return 0; }
+    ifstream &read(char *into, long count) {
+        long done;
+        long n;
+        done = 0;
+        while (done < count) {
+            if (__at >= __end) { if (!__fill()) { break; } }
+            n = __end - __at;
+            if (n > count - done) { n = count - done; }
+            while (n > 0) { into[done] = __buf[__at]; __at = __at + 1; done = done + 1; n = n - 1; }
+        }
+        __got = done;
+        if (done < count) { failed = 1; }
+        return *this;
+    }
+    long gcount() { return __got; }
+    ifstream &seekg(long offset) {
+        __at = 0; __end = 0;
+        if (__handle >= 0) { __py2bin_file_seek(__handle, offset, 0); }
+        return *this;
+    }
+    ifstream &seekg(long offset, int whence) {
+        long ahead;
+        ahead = __end - __at;
+        __at = 0; __end = 0;
+        if (__handle >= 0) { __py2bin_file_seek(__handle, whence == 1 ? offset - ahead : offset, whence); }
+        return *this;
+    }
+    long tellg() {
+        if (__handle < 0) { return -1L; }
+        return __py2bin_file_seek(__handle, 0, 1) - (long)(__end - __at);
+    }
+    int __line(string &out, char stop) {
+        int c;
+        out.clear();
+        c = __get();
+        if (c < 0) { failed = 1; return 0; }
+        while (c >= 0 && c != (int)stop) {
+            if (c != '\r' || stop != '\n') { out.push_back((char)c); }
+            c = __get();
+        }
+        return 1;
+    }
+    ifstream &operator>>(string &word) {
+        int c;
+        word.clear();
+        __skip();
+        c = __get();
+        if (c < 0) { failed = 1; return *this; }
+        while (c >= 0 && !__spacing(c)) { word.push_back((char)c); c = __get(); }
+        if (c >= 0) { __unget(); }
+        return *this;
+    }
+    ifstream &operator>>(long &value) {
+        string word;
+        *this >> word;
+        if (failed == 0) { value = __to_long(word); }
+        return *this;
+    }
+    ifstream &operator>>(int &value) {
+        string word;
+        *this >> word;
+        if (failed == 0) { value = (int)__to_long(word); }
+        return *this;
+    }
+    ifstream &operator>>(unsigned int &value) {
+        string word;
+        *this >> word;
+        if (failed == 0) { value = (unsigned int)__to_long(word); }
+        return *this;
+    }
+    ifstream &operator>>(double &value) {
+        string word;
+        *this >> word;
+        if (failed == 0) { value = __to_double(word); }
+        return *this;
+    }
+    ifstream &operator>>(char &value) {
+        int c;
+        __skip();
+        c = get();
+        if (c != EOF) { value = (char)c; }
+        return *this;
+    }
+};
+int getline(ifstream &in, string &out) { return in.__line(out, '\n'); }
+int getline(ifstream &in, string &out, char stop) { return in.__line(out, stop); }
+/* A file written as a stream: `out << "x" << 42 << "\n"`. Opened afresh,
+   or for appending under `ios::app`; text and binary are the same bytes
+   here. */
+class ofstream {
+public:
+    long long __handle;
+    int failed;
+    void __start(const char *where, int mode) {
+        __handle = __py2bin_file_open(where, 1, (mode & 8) != 0);
+        failed = __handle < 0;
+    }
+    void __put(const char *data, long count) {
+        if (__handle >= 0) { __py2bin_file_write(__handle, data, count); }
+    }
+    long __length(const char *s) { long n; n = 0; while (s[n] != 0) { n = n + 1; } return n; }
+    ofstream() { __handle = -1; failed = 1; }
+    ofstream(const char *where) { __start(where, 0); }
+    ofstream(const char *where, int mode) { __start(where, mode); }
+    ofstream(string where) { __start(where.c_str(), 0); }
+    ofstream(string where, int mode) { __start(where.c_str(), mode); }
+    ofstream(path where) { __start(where.c_str(), 0); }
+    ofstream(path where, int mode) { __start(where.c_str(), mode); }
+    ~ofstream() { close(); }
+    void open(const char *where) { close(); __start(where, 0); }
+    void open(const char *where, int mode) { close(); __start(where, mode); }
+    void open(string where) { close(); __start(where.c_str(), 0); }
+    void open(string where, int mode) { close(); __start(where.c_str(), mode); }
+    int is_open() { return __handle >= 0; }
+    void close() { if (__handle >= 0) { __py2bin_file_close(__handle); __handle = -1; } }
+    void flush() { }
+    int good() { return failed == 0 && __handle >= 0; }
+    int fail() { return failed != 0; }
+    operator bool() { return failed == 0 && __handle >= 0; }
+    int operator!() { return failed != 0 || __handle < 0; }
+    ofstream &write(const char *data, long count) { __put(data, count); return *this; }
+    ofstream &put(char c) { __put(&c, 1); return *this; }
+    ofstream &operator<<(const char *s) { __put(s, __length(s)); return *this; }
+    ofstream &operator<<(string s) { __put(s.c_str(), (long)s.size()); return *this; }
+    ofstream &operator<<(char c) { __put(&c, 1); return *this; }
+    ofstream &operator<<(int v) { char __b[32]; snprintf(__b, 32, "%d", v); __put(__b, __length(__b)); return *this; }
+    ofstream &operator<<(long v) { char __b[32]; snprintf(__b, 32, "%ld", v); __put(__b, __length(__b)); return *this; }
+    ofstream &operator<<(unsigned int v) { char __b[32]; snprintf(__b, 32, "%u", v); __put(__b, __length(__b)); return *this; }
+    ofstream &operator<<(unsigned long v) { char __b[32]; snprintf(__b, 32, "%lu", v); __put(__b, __length(__b)); return *this; }
+    ofstream &operator<<(double v) { char __b[64]; snprintf(__b, 64, "%.6g", v); __put(__b, __length(__b)); return *this; }
+};
+}
+"""
+
 _IOSTREAM_HEADER = r"""
 #include <stdio.h>
 namespace std {
@@ -22655,6 +22988,7 @@ _BUILTIN_CPP_HEADERS = {
     "array": _ARRAY_HEADER,
     "vector": _VECTOR_HEADER,
     "iostream": _IOSTREAM_HEADER,
+    "fstream": _FSTREAM_HEADER,
     "algorithm": _ALGORITHM_HEADER,
     "utility": _UTILITY_HEADER,
     "optional": _OPTIONAL_HEADER,

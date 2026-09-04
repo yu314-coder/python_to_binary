@@ -2712,6 +2712,49 @@ int __py2bin_fs_widen(const char *__narrow, wchar_t *__into, int __room) {
     return __got - 1;
 }
 
+/* Files as <fstream> opens them: for reading, for writing afresh, or for
+   appending. A handle is sixty-four bits here, so it is carried in one. */
+#ifndef GENERIC_WRITE
+#define GENERIC_WRITE 0x40000000
+#endif
+#ifndef CREATE_ALWAYS
+#define CREATE_ALWAYS 2
+#endif
+#ifndef OPEN_ALWAYS
+#define OPEN_ALWAYS 4
+#endif
+#ifndef FILE_END
+#define FILE_END 2
+#endif
+long long __py2bin_file_open(const char *__p, int __writing, int __append) {
+    void *__h;
+    if (__writing) {
+        __h = CreateFileA(__p, GENERIC_WRITE, FILE_SHARE_READ, 0,
+                          __append ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        if (__h != INVALID_HANDLE_VALUE && __append) { SetFilePointer(__h, 0, 0, FILE_END); }
+    } else {
+        __h = CreateFileA(__p, GENERIC_READ, FILE_SHARE_READ, 0,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    }
+    if (__h == INVALID_HANDLE_VALUE) { return -1; }
+    return (long long)__h;
+}
+long __py2bin_file_read(long long __h, void *__into, long __n) {
+    unsigned int __got;
+    __got = 0;
+    if (!ReadFile((void *)__h, __into, (unsigned int)__n, &__got, 0)) { return -1; }
+    return (long)__got;
+}
+long __py2bin_file_write(long long __h, const void *__from, long __n) {
+    unsigned int __put;
+    __put = 0;
+    if (!WriteFile((void *)__h, __from, (unsigned int)__n, &__put, 0)) { return -1; }
+    return (long)__put;
+}
+long __py2bin_file_seek(long long __h, long __off, int __whence) {
+    return (long)SetFilePointer((void *)__h, __off, 0, (unsigned int)__whence);
+}
+void __py2bin_file_close(long long __h) { CloseHandle((void *)__h); }
 #else
 
 int __py2bin_fs_exists(const char *__p) {
@@ -2829,6 +2872,31 @@ int __py2bin_fs_widen(const char *__narrow, wchar_t *__into, int __room) {
     return __out;
 }
 
+/* Files as <fstream> opens them, over the system calls. The open flags are
+   the platform's: Darwin and Linux number O_CREAT, O_TRUNC and O_APPEND
+   differently, and the target says which this is. */
+long long __py2bin_file_open(const char *__p, int __writing, int __append) {
+    int __flags;
+    long __fd;
+#ifdef __py2bin_darwin__
+    __flags = __writing ? (1 | 0x200 | (__append ? 8 : 0x400)) : 0;
+#else
+    __flags = __writing ? (1 | 0x40 | (__append ? 0x400 : 0x200)) : 0;
+#endif
+    __fd = __py2bin_open(__p, __flags, 420);
+    if (__fd < 0) { return -1; }
+    return (long long)__fd;
+}
+long __py2bin_file_read(long long __h, void *__into, long __n) {
+    return (long)__py2bin_read((int)__h, __into, __n);
+}
+long __py2bin_file_write(long long __h, const void *__from, long __n) {
+    return (long)__py2bin_write((int)__h, __from, __n);
+}
+long __py2bin_file_seek(long long __h, long __off, int __whence) {
+    return (long)__py2bin_lseek((int)__h, __off, __whence);
+}
+void __py2bin_file_close(long long __h) { __py2bin_close((int)__h); }
 #endif
 """
 

@@ -2739,6 +2739,28 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - files as streams, a thread given arguments, and three linkage blocks
+
+<fstream> is shipped: ifstream and ofstream over file helpers beside the
+<filesystem> ones - kernel32 on Windows, the open, read, write and lseek
+system calls elsewhere, with Darwin's and Linux's open flags told apart by the
+target - reading a block at a time into a buffer, since py2bin's string holds
+255 characters and a file read into one would have been cut without a word.
+`std::thread t(&Bridge::run, this, 80)` and a lambda started with arguments
+are written out now, the object or callable held by address and the arguments
+packed beside it; before, only a callable on its own, a member and its object,
+or a free function with arguments were. A call through a pointer to a callable
+read the callable's class from the last declaration of that name anywhere in
+the unit, so two threads each started with its own lambda both ran the second
+lambda's operator; the reader is asked from where the call stands now, and the
+nearest declaration before it answers. The strip that takes `extern "C" { }`
+apart searched on from past where the brace had been, in text that was
+shorter now, so of three blocks in a row - OpenSSL's headers open them so -
+the second reached the C compiler. OpenSSL's headers now read as far as a
+function returning a function pointer, a C declarator form the C stage does
+not implement yet. 2127 tests, 543 programs against clang++, 11 projects,
+3300 builds across six targets.
+
 ### 0.9.13 - what a fetched SDK header expects of the core it is built on
 
 `FMTID` in <propidl.h> was the first of a series: every fetched SDK header
