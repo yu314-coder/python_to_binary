@@ -2571,6 +2571,16 @@ def _rewrite_cpp_spellings(text: str) -> "tuple[str, set[str]]":
     text = _fold_template_statics(text)
     text = _expand_alias_templates(text)
     text = _map_code(text, lambda part: _ALIAS.sub(r"typedef \2 \1;", part))
+    # `typedef class DOMDocument DOMDocument;` - how a generated header names
+    # a coclass. A class is a struct here, and C has no `class`.
+    text = _map_code(
+        text,
+        lambda part: re.sub(
+            r"\btypedef\s+class\s+([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*;",
+            r"typedef struct \1 \2;",
+            part,
+        ),
+    )
     # `class X final {` and `void f() override` say a thing may not be
     # derived from or overridden again. C++ checks that and C has nothing to
     # check, so the word is what is lost and nothing else - but left in, it
@@ -22397,188 +22407,8 @@ public:
 };
 """
 
-_OBJIDL_HEADER = r"""
-
-/* The COM interfaces a program is handed rather than ones it writes. Like
-   <unknwn.h>, no implementation publishes this as a file: it is generated
-   from an .idl at build time, and the vendor's ships inside a toolchain.
-   Written here as the classes it describes, at the slots it puts them.
-
-   Only what a caller reaches for. A generated header that names IStream in
-   a signature needs the type to exist with the right table; the rest of the
-   .idl would be an ABI written from memory, which is the one thing worth
-   less than nothing here. */
-#ifndef __py2bin_objidl_h
-#define __py2bin_objidl_h
-#include <unknwn.h>
-
-/* The eight-byte integer the SDK spells as a one-member union. Written as
-   the integer it is, deliberately: a struct passed BY VALUE through a
-   foreign vtable is the one thing py2bin cannot spell, and IStream::Seek
-   takes one. On both Windows machines an eight-byte struct travels in the
-   same register as an eight-byte integer, so the bits and the ABI are the
-   same either way, and this way it can be called. */
-typedef long long __py2bin_LARGE;
-typedef unsigned long long __py2bin_ULARGE;
-
-typedef struct __py2bin_STATSTG {
-    wchar_t *pwcsName;
-    unsigned long type;
-    __py2bin_ULARGE cbSize;
-    unsigned long mtime_low, mtime_high;
-    unsigned long ctime_low, ctime_high;
-    unsigned long atime_low, atime_high;
-    unsigned long grfMode;
-    unsigned long grfLocksSupported;
-    GUID clsid;
-    unsigned long grfStateBits;
-    unsigned long reserved;
-} STATSTG;
-
-/* Slots 3 and 4, after IUnknown's three. */
-class ISequentialStream : public IUnknown {
-public:
-    virtual HRESULT Read(void *pv, unsigned long cb, unsigned long *read) = 0;
-    virtual HRESULT Write(const void *pv, unsigned long cb,
-                          unsigned long *written) = 0;
-};
-
-/* Slots 5 through 13, in the order the .idl declares them. */
-class IStream : public ISequentialStream {
-public:
-    virtual HRESULT Seek(__py2bin_LARGE move, unsigned long origin,
-                         __py2bin_ULARGE *position) = 0;
-    virtual HRESULT SetSize(__py2bin_ULARGE size) = 0;
-    virtual HRESULT CopyTo(IStream *other, __py2bin_ULARGE cb,
-                           __py2bin_ULARGE *read, __py2bin_ULARGE *written) = 0;
-    virtual HRESULT Commit(unsigned long flags) = 0;
-    virtual HRESULT Revert() = 0;
-    virtual HRESULT LockRegion(__py2bin_ULARGE offset, __py2bin_ULARGE cb,
-                               unsigned long type) = 0;
-    virtual HRESULT UnlockRegion(__py2bin_ULARGE offset, __py2bin_ULARGE cb,
-                                 unsigned long type) = 0;
-    virtual HRESULT Stat(STATSTG *out, unsigned long flag) = 0;
-    virtual HRESULT Clone(IStream **out) = 0;
-};
-
-#define STREAM_SEEK_SET 0
-#define STREAM_SEEK_CUR 1
-#define STREAM_SEEK_END 2
-
-#endif
-"""
 
 
-_OAIDL_HEADER = r"""
-
-/* What Automation passes a value in. Sixteen bytes on both Windows
-   machines: a two-byte tag, six the SDK reserves, and eight of value -
-   which is what every member of that union is, or fits in. Written as the
-   layout rather than as the union, because the union's members are a
-   hundred names for the same eight bytes and the layout is the part that
-   has to be right. */
-#ifndef __py2bin_oaidl_h
-#define __py2bin_oaidl_h
-#include <unknwn.h>
-
-typedef unsigned short VARTYPE;
-
-typedef struct __py2bin_VARIANT {
-    VARTYPE vt;
-    unsigned short wReserved1;
-    unsigned short wReserved2;
-    unsigned short wReserved3;
-    long long value;
-} VARIANT;
-typedef VARIANT VARIANTARG;
-typedef VARIANT *LPVARIANT;
-
-#define VT_EMPTY 0
-#define VT_NULL 1
-#define VT_I2 2
-#define VT_I4 3
-#define VT_R4 4
-#define VT_R8 5
-#define VT_BSTR 8
-#define VT_DISPATCH 9
-#define VT_BOOL 11
-#define VT_UNKNOWN 13
-#define VT_I8 20
-#define VT_UI8 21
-
-/* What Automation calls a member by, and the locale a name is read in.
-   Both are plain numbers; the SDK gives them names and a program passes them
-   through without looking. */
-typedef long DISPID;
-typedef long MEMBERID;
-typedef unsigned long LCID;
-typedef OLECHAR *LPOLESTR;
-typedef OLECHAR *BSTR_ALIAS;
-
-/* The arguments `Invoke` is handed, laid out as the SDK lays them out: a
-   program that reads one reads these four members and nothing else. */
-typedef struct __py2bin_DISPPARAMS {
-    VARIANTARG *rgvarg;
-    DISPID *rgdispidNamedArgs;
-    unsigned int cArgs;
-    unsigned int cNamedArgs;
-} DISPPARAMS;
-
-/* What `Invoke` fills in when the call it forwards fails. */
-typedef struct __py2bin_EXCEPINFO {
-    unsigned short wCode;
-    unsigned short wReserved;
-    BSTR bstrSource;
-    BSTR bstrDescription;
-    BSTR bstrHelpFile;
-    unsigned long dwHelpContext;
-    void *pvReserved;
-    void *pfnDeferredFillIn;
-    HRESULT scode;
-} EXCEPINFO;
-
-/* Described by name only: every use of it is a pointer handed back by
-   `GetTypeInfo` and passed on, and what it points at is the type library's
-   business. A struct with no members is not C, so it has one. */
-struct ITypeInfo { int __py2bin_opaque; };
-struct ITypeLib { int __py2bin_opaque; };
-
-/* Automation's interface, which is what a generated header derives from
-   when the object is scriptable - `IXMLDOMNode`, and most of what a browser
-   control hands back. Four methods after `IUnknown`'s three, in the order
-   COM puts them: the order *is* the layout, the same way it is for
-   `IUnknown` above. */
-class IDispatch : public IUnknown {
-public:
-    virtual HRESULT GetTypeInfoCount(unsigned int *count) = 0;
-    virtual HRESULT GetTypeInfo(
-        unsigned int which, LCID locale, ITypeInfo **answered
-    ) = 0;
-    virtual HRESULT GetIDsOfNames(
-        REFIID riid,
-        LPOLESTR *names,
-        unsigned int count,
-        LCID locale,
-        DISPID *answered
-    ) = 0;
-    virtual HRESULT Invoke(
-        DISPID member,
-        REFIID riid,
-        LCID locale,
-        unsigned short flags,
-        DISPPARAMS *given,
-        VARIANT *answered,
-        EXCEPINFO *failed,
-        unsigned int *wrong
-    ) = 0;
-};
-
-#define DISPATCH_METHOD 1
-#define DISPATCH_PROPERTYGET 2
-#define DISPATCH_PROPERTYPUT 4
-
-#endif
-"""
 
 
 _EVENTTOKEN_HEADER = r"""
@@ -22787,6 +22617,14 @@ public:
 #endif
 """
 
+def _c_preprocessor_header(named: str) -> str:
+    """One of the C stage's own Windows headers, used by this stage as well."""
+
+    from . import c_preprocessor
+
+    return getattr(c_preprocessor, named)
+
+
 _BUILTIN_CPP_HEADERS = {
     # COM's root, which no implementation publishes as a file.
     "unknwn.h": _UNKNWN_HEADER,
@@ -22796,8 +22634,12 @@ _BUILTIN_CPP_HEADERS = {
     # And the interfaces a generated header names in its signatures. Same
     # reason and same shape: the classes they are, at the slots the .idl
     # puts them at.
-    "objidl.h": _OBJIDL_HEADER,
-    "oaidl.h": _OAIDL_HEADER,
+    # The C stage's own <objidl.h>: it carries the C++ spelling of every
+    # interface in an `#ifdef __cplusplus` arm, and the plain structs and
+    # forward declarations a fetched header wants besides. One text, so the
+    # two stages cannot disagree about what the header declares.
+    "objidl.h": _c_preprocessor_header("_OBJIDL_H"),
+    "oaidl.h": _c_preprocessor_header("_OAIDL_H"),
     "EventToken.h": _EVENTTOKEN_HEADER,
     "eventtoken.h": _EVENTTOKEN_HEADER,
     "string": _STRING_HEADER,

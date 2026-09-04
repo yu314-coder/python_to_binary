@@ -1980,7 +1980,19 @@ class Parser:
                 self.error("a typedef needs a name", keyword)
             existing = self.typedefs.get(name)
             if existing is not None and existing != ctype:
-                if _same_shape(existing, ctype):
+                # `typedef struct _BLOB {...} BLOB, *LPBLOB;` after <wtypes.h>'s
+                # own: the second declarator is a pointer to the same shape,
+                # and the base is rebound to the type already there so every
+                # declarator after the first builds on it.
+                if (
+                    isinstance(existing, PointerType)
+                    and isinstance(ctype, PointerType)
+                    and _same_shape(existing.target, ctype.target)
+                ):
+                    ctype = existing
+                elif _same_shape(existing, ctype):
+                    if base is ctype:
+                        base = existing
                     # Two spellings of one struct: a WebView2 shim's `typedef
                     # struct __webview2_rect { long left; ... } RECT;` beside
                     # <windows.h>'s `tagRECT`. Same members, same offsets,
@@ -1992,7 +2004,7 @@ class Parser:
                     if isinstance(ctype, StructType) and ctype.name:
                         self.struct_tags[ctype.name] = existing
                     ctype = existing
-                else:
+                elif existing != ctype:
                     self.error(
                         f"{name!r} is already a different type", name_token
                     )

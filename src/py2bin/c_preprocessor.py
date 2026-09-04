@@ -338,6 +338,12 @@ def _as_written(tokens: "list[PPToken]") -> str:
 #: translator has to see one to lay out anything derived from it.
 _DECLARES_INTERFACES = frozenset({"unknwn.h", "objidl.h", "oaidl.h"})
 
+#: Of those, the ones a branching header's run hands to the C++ stage to
+#: paste its own spelling of - a class the translator can derive from -
+#: rather than emitting the C shape read here. The C++ stage's <objidl.h>
+#: is this file's own text, so nothing is lost in the hand-over.
+_HANDED_TO_CPLUSPLUS = frozenset({"unknwn.h", "objidl.h", "oaidl.h"})
+
 
 def as_cplusplus(
     named: str,
@@ -405,7 +411,8 @@ def as_cplusplus(
     kept = (ours & _DECLARES_INTERFACES) - pasted
     dropped = ours - kept - pasted
     supplied.update(kept)
-    already.update(kept)
+    handed = kept & _HANDED_TO_CPLUSPLUS
+    already.update(kept - handed)
     # The search-path headers this run expanded are in the unit now too.
     already.update(engine.search_path_read)
     # The dropped ones are asked for by name, so the other run reads them -
@@ -417,13 +424,19 @@ def as_cplusplus(
     # way. The caller tells the two apart by the table each name is in.
     asked = "".join(
         f"#include <{name}>\n"
-        for name in sorted(dropped | engine.left_to_cplusplus)
+        # And the ones that declare COM interfaces: read here for their
+        # macros, then handed to the C++ stage to paste its own spelling of,
+        # ahead of this header. What this run emitted for them was the C
+        # shape - a table of function pointers - and the translator reading
+        # `IXMLDOMNode : public IDispatch` after it found no class of that
+        # name unless the program had happened to include <oaidl.h> itself.
+        for name in sorted(dropped | handed | engine.left_to_cplusplus)
     )
     return asked + _as_written(
         [
             item
             for item in engine.output
-            if item.origin.strip("<>") not in dropped | pasted
+            if item.origin.strip("<>") not in dropped | pasted | handed
             and item.origin not in engine.pasted_origins
         ]
     )
@@ -1970,6 +1983,10 @@ or windows-arm64, or guard the include with #ifdef _WIN32
    headers below it take that for granted: a console or string function that
    takes a `va_list` names the type without asking anyone for it. */
 #include <stdarg.h>
+/* The SDK's <winnt.h> includes <string.h> and <ctype.h>, and headers built on
+   it lean on that: <propidl.h>'s PropVariantInit is memset. */
+#include <string.h>
+#include <ctype.h>
 /* Which slice of the API this program is being built for.
    `#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)` opens a great many
    of a set's headers, and with nothing to expand it that line is not an
@@ -2576,6 +2593,48 @@ extern UINT GetDpiForWindow(HWND);
    1 and 2. */
 #ifndef _PALETTEENTRY_DEFINED
 #define _PALETTEENTRY_DEFINED
+typedef void *HFONT;
+typedef void *HPALETTE;
+/* GDI's font description and text metrics, laid out as <wingdi.h> lays them:
+   LOGFONTW is 92 bytes and TEXTMETRICW 60, and <ocidl.h>'s IFont hands
+   both back. */
+/* The face-name length <wingdi.h> defines; a header carrying its own
+   fallback LOGFONT (<shtypes.h> does) tests for it. */
+#define LF_FACESIZE 32
+#define LF_FULLFACESIZE 64
+typedef struct tagLOGFONTA {
+    LONG lfHeight; LONG lfWidth; LONG lfEscapement; LONG lfOrientation; LONG lfWeight;
+    BYTE lfItalic; BYTE lfUnderline; BYTE lfStrikeOut; BYTE lfCharSet;
+    BYTE lfOutPrecision; BYTE lfClipPrecision; BYTE lfQuality; BYTE lfPitchAndFamily;
+    CHAR lfFaceName[LF_FACESIZE];
+} LOGFONTA, *PLOGFONTA, *LPLOGFONTA;
+typedef struct tagLOGFONTW {
+    LONG lfHeight; LONG lfWidth; LONG lfEscapement; LONG lfOrientation; LONG lfWeight;
+    BYTE lfItalic; BYTE lfUnderline; BYTE lfStrikeOut; BYTE lfCharSet;
+    BYTE lfOutPrecision; BYTE lfClipPrecision; BYTE lfQuality; BYTE lfPitchAndFamily;
+    WCHAR lfFaceName[LF_FACESIZE];
+} LOGFONTW, *PLOGFONTW, *LPLOGFONTW;
+typedef struct tagTEXTMETRICA {
+    LONG tmHeight; LONG tmAscent; LONG tmDescent; LONG tmInternalLeading; LONG tmExternalLeading;
+    LONG tmAveCharWidth; LONG tmMaxCharWidth; LONG tmWeight; LONG tmOverhang;
+    LONG tmDigitizedAspectX; LONG tmDigitizedAspectY;
+    BYTE tmFirstChar; BYTE tmLastChar; BYTE tmDefaultChar; BYTE tmBreakChar;
+    BYTE tmItalic; BYTE tmUnderlined; BYTE tmStruckOut; BYTE tmPitchAndFamily; BYTE tmCharSet;
+} TEXTMETRICA, *PTEXTMETRICA, *LPTEXTMETRICA;
+typedef struct tagTEXTMETRICW {
+    LONG tmHeight; LONG tmAscent; LONG tmDescent; LONG tmInternalLeading; LONG tmExternalLeading;
+    LONG tmAveCharWidth; LONG tmMaxCharWidth; LONG tmWeight; LONG tmOverhang;
+    LONG tmDigitizedAspectX; LONG tmDigitizedAspectY;
+    WCHAR tmFirstChar; WCHAR tmLastChar; WCHAR tmDefaultChar; WCHAR tmBreakChar;
+    BYTE tmItalic; BYTE tmUnderlined; BYTE tmStruckOut; BYTE tmPitchAndFamily; BYTE tmCharSet;
+} TEXTMETRICW, *PTEXTMETRICW, *LPTEXTMETRICW;
+#ifdef UNICODE
+typedef LOGFONTW LOGFONT;
+typedef TEXTMETRICW TEXTMETRIC;
+#else
+typedef LOGFONTA LOGFONT;
+typedef TEXTMETRICA TEXTMETRIC;
+#endif
 typedef struct tagPALETTEENTRY {
     BYTE peRed;
     BYTE peGreen;
@@ -3270,6 +3329,9 @@ typedef GUID CLSID;
 typedef const GUID *REFGUID;
 typedef const GUID *REFIID;
 typedef const GUID *REFCLSID;
+typedef GUID FMTID;
+typedef const GUID *REFFMTID;
+typedef GUID *LPFMTID;
 /* The pointer spellings <guiddef.h> gives, which is this file under the
    name a set asks for. A header taking a GUID it may write into says LPGUID
    and one that only reads says LPCGUID; both are how the set writes what is
@@ -3296,6 +3358,8 @@ typedef const char *LPCSTR;
 typedef wchar_t *LPWSTR;
 typedef const wchar_t *LPCWSTR;
 typedef unsigned long long SIZE_T;
+typedef struct _LARGE_INTEGER { long long QuadPart; } LARGE_INTEGER;
+typedef struct _ULARGE_INTEGER { unsigned long long QuadPart; } ULARGE_INTEGER;
 #endif
 
 
@@ -3307,6 +3371,57 @@ typedef unsigned long long SIZE_T;
    always lives here: there is no other file for it to clash with, and a
    declaration with no definition anywhere would be a name nothing could
    resolve, py2bin having no linker either. */
+typedef BSTR *LPBSTR;
+/* The aggregate automation types <wtypes.h> declares, laid out as the SDK
+   lays them: CY and DECIMAL are 8 and 16 bytes, BLOB and CLIPDATA hold a
+   count and a pointer, SAFEARRAY is 32 bytes on x64. <propidl.h>'s
+   PROPVARIANT is a union of every one of them. */
+typedef union tagCY {
+    struct { unsigned long Lo; long Hi; };
+    long long int64;
+} CY, *LPCY;
+typedef struct tagDEC {
+    unsigned short wReserved;
+    union { struct { unsigned char scale; unsigned char sign; }; unsigned short signscale; };
+    unsigned long Hi32;
+    union { struct { unsigned long Lo32; unsigned long Mid32; }; unsigned long long Lo64; };
+} DECIMAL, *LPDECIMAL;
+typedef struct tagBLOB { unsigned long cbSize; unsigned char *pBlobData; } BLOB, *LPBLOB;
+/* The guards the SDK's <wtypes.h> defines for these, so a header that
+   carries its own copy - <ws2def.h> does - skips it. */
+#define __BLOB_T_DEFINED
+#define _tagBLOB_DEFINED
+#define _BLOB_DEFINED
+#define _LPBLOB_DEFINED
+typedef struct tagBSTRBLOB { unsigned long cbSize; unsigned char *pData; } BSTRBLOB, *LPBSTRBLOB;
+typedef struct tagCLIPDATA { unsigned long cbSize; long ulClipFmt; unsigned char *pClipData; } CLIPDATA;
+typedef struct tagSAFEARRAYBOUND { unsigned long cElements; long lLbound; } SAFEARRAYBOUND, *LPSAFEARRAYBOUND;
+typedef struct tagSAFEARRAY {
+    unsigned short cDims;
+    unsigned short fFeatures;
+    unsigned long cbElements;
+    unsigned long cLocks;
+    void * pvData;
+    SAFEARRAYBOUND rgsabound[1];
+} SAFEARRAY, *LPSAFEARRAY;
+/* The RPC wire shapes <wtypes.h> declares and <oleidl.h> and <ocidl.h> name
+   in their remote variants: a count and the data, laid out as the SDK lays
+   them. */
+/* A property's identity: the GUID of its set and a number in it; twenty
+   bytes, aligned to four. <propsys.h> and <propkey.h> speak in these. */
+typedef struct _tagpropertykey { GUID fmtid; unsigned int pid; } PROPERTYKEY;
+typedef const PROPERTYKEY *REFPROPERTYKEY;
+typedef long long hyper;
+typedef unsigned long long MIDL_uhyper;
+typedef struct _BYTE_BLOB { unsigned long clSize; unsigned char abData[1]; } BYTE_BLOB, *UP_BYTE_BLOB;
+typedef struct _WORD_BLOB { unsigned long clSize; unsigned short asData[1]; } WORD_BLOB, *UP_WORD_BLOB;
+typedef struct _DWORD_BLOB { unsigned long clSize; unsigned long alData[1]; } DWORD_BLOB, *UP_DWORD_BLOB;
+typedef struct _FLAGGED_BYTE_BLOB { unsigned long fFlags; unsigned long clSize; unsigned char abData[1]; } FLAGGED_BYTE_BLOB, *UP_FLAGGED_BYTE_BLOB;
+typedef struct _FLAGGED_WORD_BLOB { unsigned long fFlags; unsigned long clSize; unsigned short asData[1]; } FLAGGED_WORD_BLOB, *UP_FLAGGED_WORD_BLOB;
+typedef struct _BYTE_SIZEDARR { unsigned long clSize; unsigned char *pData; } BYTE_SIZEDARR;
+typedef struct _SHORT_SIZEDARR { unsigned long clSize; unsigned short *pData; } WORD_SIZEDARR;
+typedef struct _LONG_SIZEDARR { unsigned long clSize; unsigned long *pData; } DWORD_SIZEDARR;
+typedef struct _HYPER_SIZEDARR { unsigned long clSize; hyper *pData; } HYPER_SIZEDARR;
 #define DEFINE_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \\
     const GUID name = {l, w1, w2, {b1, b2, b3, b4, b5, b6, b7, b8}}
 #define DEFINE_OLEGUID(name, l, w1, w2) \\
@@ -3736,6 +3851,7 @@ _OAIDL_H = """
 #ifndef __py2bin_oaidl_h
 #define __py2bin_oaidl_h
 #include <wtypes.h>
+#include <unknwn.h>
 /* What Automation passes a value in. Sixteen bytes on both Windows
    machines: a two-byte tag, six the SDK reserves, and eight of value -
    which is what every member of that union is, or fits in. Written as the
@@ -3743,12 +3859,40 @@ _OAIDL_H = """
    hundred names for the same eight bytes and the layout is the part that
    has to be right. */
 typedef unsigned short VARTYPE;
-typedef struct __py2bin_VARIANT {
-    VARTYPE vt;
-    unsigned short wReserved1;
-    unsigned short wReserved2;
-    unsigned short wReserved3;
-    long long value;
+typedef struct IDispatch IDispatch;
+typedef struct IRecordInfo IRecordInfo;
+/* What Automation passes a value in, laid out as the SDK lays it: a two-byte
+   tag, six reserved, then sixteen bytes of value - the record pair is the
+   widest member - so twenty-four on both 64-bit Windows machines. The union
+   is written out, since a program reads `lVal` or `bstrVal` by name, and
+   `rgvarg[1]` is twenty-four bytes along. */
+typedef struct tagVARIANT {
+    union {
+        struct {
+            VARTYPE vt;
+            unsigned short wReserved1;
+            unsigned short wReserved2;
+            unsigned short wReserved3;
+            union {
+                long long llVal; long lVal; unsigned char bVal; short iVal;
+                float fltVal; double dblVal; VARIANT_BOOL boolVal; SCODE scode;
+                CY cyVal; DATE date; BSTR bstrVal; IUnknown *punkVal;
+                IDispatch *pdispVal; SAFEARRAY *parray; unsigned char *pbVal;
+                short *piVal; long *plVal; long long *pllVal; float *pfltVal;
+                double *pdblVal; VARIANT_BOOL *pboolVal; SCODE *pscode;
+                CY *pcyVal; DATE *pdate; BSTR *pbstrVal; IUnknown **ppunkVal;
+                IDispatch **ppdispVal; SAFEARRAY **pparray;
+                struct tagVARIANT *pvarVal; void *byref; char cVal;
+                unsigned short uiVal; unsigned long ulVal;
+                unsigned long long ullVal; int intVal; unsigned int uintVal;
+                DECIMAL *pdecVal; char *pcVal; unsigned short *puiVal;
+                unsigned long *pulVal; unsigned long long *pullVal;
+                int *pintVal; unsigned int *puintVal;
+                struct { void *pvRecord; IRecordInfo *pRecInfo; };
+            };
+        };
+        DECIMAL decVal;
+    };
 } VARIANT;
 typedef VARIANT VARIANTARG;
 typedef VARIANT *LPVARIANT;
@@ -3764,6 +3908,67 @@ typedef VARIANT *LPVARIANT;
 #define VT_UNKNOWN 13
 #define VT_I8 20
 #define VT_UI8 21
+typedef DWORD LCID;
+typedef long MEMBERID;
+/* The arguments `Invoke` is handed, and what it fills in on failure: twenty-
+   four and sixty-four bytes on x64. */
+typedef struct __py2bin_DISPPARAMS {
+    VARIANTARG *rgvarg;
+    DISPID *rgdispidNamedArgs;
+    unsigned int cArgs;
+    unsigned int cNamedArgs;
+} DISPPARAMS;
+typedef struct __py2bin_EXCEPINFO {
+    unsigned short wCode;
+    unsigned short wReserved;
+    BSTR bstrSource;
+    BSTR bstrDescription;
+    BSTR bstrHelpFile;
+    unsigned long dwHelpContext;
+    void *pvReserved;
+    void *pfnDeferredFillIn;
+    HRESULT scode;
+} EXCEPINFO;
+typedef struct ITypeInfo ITypeInfo;
+typedef struct ITypeLib ITypeLib;
+/* Automation's interface: four methods after IUnknown's three, in COM's
+   order - the order is the layout. Both shapes, chosen as <unknwn.h>
+   chooses: the class for the translator, the table for C. IErrorLog and
+   IPropertyBag beside it, which <ocidl.h>'s IPersistPropertyBag takes. */
+#ifdef __cplusplus
+class IDispatch : public IUnknown {
+public:
+    virtual HRESULT GetTypeInfoCount(unsigned int *count) = 0;
+    virtual HRESULT GetTypeInfo(unsigned int which, LCID locale, ITypeInfo **answered) = 0;
+    virtual HRESULT GetIDsOfNames(REFIID riid, LPOLESTR *names, unsigned int count, LCID locale, DISPID *answered) = 0;
+    virtual HRESULT Invoke(DISPID member, REFIID riid, LCID locale, unsigned short flags, DISPPARAMS *given, VARIANT *answered, EXCEPINFO *failed, unsigned int *wrong) = 0;
+};
+class IErrorLog : public IUnknown {
+public:
+    virtual HRESULT AddError(LPCOLESTR name, EXCEPINFO *failed) = 0;
+};
+class IPropertyBag : public IUnknown {
+public:
+    virtual HRESULT Read(LPCOLESTR name, VARIANT *value, IErrorLog *log) = 0;
+    virtual HRESULT Write(LPCOLESTR name, VARIANT *value) = 0;
+};
+#else
+typedef struct IDispatchVtbl {
+    HRESULT (*QueryInterface)(IDispatch *, REFIID, void **);
+    unsigned long (*AddRef)(IDispatch *);
+    unsigned long (*Release)(IDispatch *);
+    HRESULT (*GetTypeInfoCount)(IDispatch *, unsigned int *);
+    HRESULT (*GetTypeInfo)(IDispatch *, unsigned int, LCID, ITypeInfo **);
+    HRESULT (*GetIDsOfNames)(IDispatch *, REFIID, LPOLESTR *, unsigned int, LCID, DISPID *);
+    HRESULT (*Invoke)(IDispatch *, DISPID, REFIID, LCID, unsigned short, DISPPARAMS *, VARIANT *, EXCEPINFO *, unsigned int *);
+} IDispatchVtbl;
+struct IDispatch { const IDispatchVtbl *lpVtbl; };
+typedef struct IErrorLog IErrorLog;
+typedef struct IPropertyBag IPropertyBag;
+#endif
+#define DISPATCH_METHOD 1
+#define DISPATCH_PROPERTYGET 2
+#define DISPATCH_PROPERTYPUT 4
 #endif
 """
 
@@ -3994,6 +4199,89 @@ typedef struct IRunningObjectTable IRunningObjectTable;
 typedef struct IPersist IPersist;
 typedef struct IMessageFilter IMessageFilter;
 typedef struct IMarshal IMarshal;
+/* The factory a COM class is created through: two methods after IUnknown's
+   three, in COM's order. <ocidl.h>'s IClassFactory2 derives from it. */
+#ifdef __cplusplus
+class IClassFactory : public IUnknown {
+public:
+    virtual HRESULT CreateInstance(IUnknown *outer, REFIID riid, void **object) = 0;
+    virtual HRESULT LockServer(BOOL lock) = 0;
+};
+#else
+typedef struct IClassFactoryVtbl {
+    HRESULT (*QueryInterface)(IClassFactory *, REFIID, void **);
+    unsigned long (*AddRef)(IClassFactory *);
+    unsigned long (*Release)(IClassFactory *);
+    HRESULT (*CreateInstance)(IClassFactory *, IUnknown *, REFIID, void **);
+    HRESULT (*LockServer)(IClassFactory *, BOOL);
+} IClassFactoryVtbl;
+struct IClassFactory { const IClassFactoryVtbl *lpVtbl; };
+#endif
+/* The interfaces the rest of the SDK derives from - <ocidl.h>'s
+   IPersistMemory is an IPersist - written for the translator; C keeps the
+   forward declarations above, as it always has. Each method list is COM's,
+   in COM's order. */
+#ifdef __cplusplus
+class IPersist : public IUnknown {
+public:
+    virtual HRESULT GetClassID(CLSID *id) = 0;
+};
+class IPersistStream : public IPersist {
+public:
+    virtual HRESULT IsDirty() = 0;
+    virtual HRESULT Load(IStream *from) = 0;
+    virtual HRESULT Save(IStream *to, BOOL clear) = 0;
+    virtual HRESULT GetSizeMax(ULARGE_INTEGER *size) = 0;
+};
+class IPersistFile : public IPersist {
+public:
+    virtual HRESULT IsDirty() = 0;
+    virtual HRESULT Load(LPCOLESTR name, DWORD mode) = 0;
+    virtual HRESULT Save(LPCOLESTR name, BOOL remember) = 0;
+    virtual HRESULT SaveCompleted(LPCOLESTR name) = 0;
+    virtual HRESULT GetCurFile(LPOLESTR *name) = 0;
+};
+class IPersistStorage : public IPersist {
+public:
+    virtual HRESULT IsDirty() = 0;
+    virtual HRESULT InitNew(IStorage *in) = 0;
+    virtual HRESULT Load(IStorage *from) = 0;
+    virtual HRESULT Save(IStorage *to, BOOL same) = 0;
+    virtual HRESULT SaveCompleted(IStorage *now) = 0;
+    virtual HRESULT HandsOffStorage() = 0;
+};
+class IEnumUnknown : public IUnknown {
+public:
+    virtual HRESULT Next(unsigned long wanted, IUnknown **out, unsigned long *got) = 0;
+    virtual HRESULT Skip(unsigned long count) = 0;
+    virtual HRESULT Reset() = 0;
+    virtual HRESULT Clone(IEnumUnknown **out) = 0;
+};
+class IEnumString : public IUnknown {
+public:
+    virtual HRESULT Next(unsigned long wanted, LPOLESTR *out, unsigned long *got) = 0;
+    virtual HRESULT Skip(unsigned long count) = 0;
+    virtual HRESULT Reset() = 0;
+    virtual HRESULT Clone(IEnumString **out) = 0;
+};
+class IMalloc : public IUnknown {
+public:
+    virtual void *Alloc(SIZE_T size) = 0;
+    virtual void *Realloc(void *block, SIZE_T size) = 0;
+    virtual void Free(void *block) = 0;
+    virtual SIZE_T GetSize(void *block) = 0;
+    virtual int DidAlloc(void *block) = 0;
+    virtual void HeapMinimize() = 0;
+};
+class IAdviseSink : public IUnknown {
+public:
+    virtual void OnDataChange(FORMATETC *format, STGMEDIUM *medium) = 0;
+    virtual void OnViewChange(DWORD aspect, LONG index) = 0;
+    virtual void OnRename(IMoniker *moniker) = 0;
+    virtual void OnSave() = 0;
+    virtual void OnClose() = 0;
+};
+#endif
 
 typedef unsigned short CLIPFORMAT;
 /* The handles `STGMEDIUM` chooses between. These are declared here rather

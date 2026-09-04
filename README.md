@@ -2739,6 +2739,28 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - what a fetched SDK header expects of the core it is built on
+
+`FMTID` in <propidl.h> was the first of a series: every fetched SDK header
+leans on the core py2bin ships in place of <windows.h>, <wtypes.h>, <objidl.h>
+and <oaidl.h>, and the core was written for what the corpus had needed.
+<wtypes.h> now declares the automation aggregates - CY, DECIMAL, BLOB,
+CLIPDATA, SAFEARRAY - and the RPC wire shapes, at the SDK's sizes; VARIANT is
+its real twenty-four bytes with its members by name, where it had been a
+sixteen-byte layout that would have read `rgvarg[1]` from the middle of the
+first argument; DISPPARAMS and EXCEPINFO are laid out beside it. <windows.h>
+includes <string.h> and <ctype.h> as the SDK's <winnt.h> does, and declares
+the GDI font types. The two stages share one text for <objidl.h> and
+<oaidl.h>, so the C++ spelling of IDispatch, IClassFactory, IPersist and its
+descendants, IEnumUnknown, IEnumString, IMalloc, IAdviseSink, IErrorLog and
+IPropertyBag is there for a generated header to derive from - and a branching
+header's own preprocessor run hands those headers back to the C++ stage
+rather than emitting the C tables, which is why <msxml.h>'s `IXMLDOMNode :
+public IDispatch` could not find its base. `typedef class X X;` is a struct
+typedef, and a typedef to a pointer to a same-shape struct is accepted as its
+struct is. 2127 tests, 540 programs against clang++, 11 projects, 3282 builds
+across six targets.
+
 ### 0.9.13 - a second spelling of the same struct
 
 A WebView2 shim writes `typedef struct __webview2_rect { long left; ... }

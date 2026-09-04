@@ -1308,11 +1308,11 @@ int main(void) {
     VARIANT value;
     EventRegistrationToken token;
     value.vt = VT_I8;
-    value.value = 7;
+    value.llVal = 7;
     token.value = 3;
     if (stream != (IStream *)0) { stream->lpVtbl->Release(stream); }
     if (root != (IUnknown *)0) { root->lpVtbl->AddRef(root); }
-    return (int)(value.value + token.value) - 10;
+    return (int)(value.llVal + token.value) - 10;
 }
 """
         )
@@ -1638,6 +1638,54 @@ int main(void) { return 0; }
                 ):
                     self.assertEqual(medium.member(name).offset, offset, name)
 
+
+    def test_automation_types_are_laid_out_as_the_sdk_lays_them(self):
+        """VARIANT is twenty-four bytes on 64-bit Windows, not sixteen.
+
+        `Invoke` reads `rgvarg[1]` twenty-four bytes along; written as a tag
+        and eight bytes of value it was sixteen, and the second argument was
+        read from the middle of the first. CY, DECIMAL, BLOB, CLIPDATA and
+        SAFEARRAY are the shapes <wtypes.h> gives them."""
+
+        from py2bin.c_frontend import Parser
+        from py2bin.c_preprocessor import preprocess
+
+        source = "#include <windows.h>\n#include <oaidl.h>\nint main(void){return 0;}\n"
+        for target in ("windows-x86_64", "windows-arm64"):
+            with self.subTest(target=target):
+                parser = Parser(
+                    list(preprocess(source, "t.c", target=target)), "t.c", target
+                )
+                parser.translation_unit()
+                for tag, size in (
+                    ("tagVARIANT", 24),
+                    ("__py2bin_DISPPARAMS", 24),
+                    ("__py2bin_EXCEPINFO", 64),
+                    ("tagCY", 8),
+                    ("tagDEC", 16),
+                    ("tagBLOB", 16),
+                    ("tagCLIPDATA", 16),
+                    ("tagSAFEARRAYBOUND", 8),
+                    ("tagSAFEARRAY", 32),
+                ):
+                    self.assertEqual(parser.struct_tags[tag].size, size, tag)
+                variant = parser.struct_tags["tagVARIANT"]
+                # Reached through the unnamed union and struct, as the SDK
+                # spells them without NONAMELESSUNION.
+                for name, offset in (
+                    ("vt", 0),
+                    ("lVal", 8),
+                    ("bstrVal", 8),
+                    ("pvRecord", 8),
+                    ("pRecInfo", 16),
+                    ("decVal", 0),
+                ):
+                    self.assertEqual(variant.member(name).offset, offset, name)
+                given = parser.struct_tags["__py2bin_DISPPARAMS"]
+                self.assertEqual(given.member("cArgs").offset, 16)
+                self.assertEqual(given.member("cNamedArgs").offset, 20)
+                failed = parser.struct_tags["__py2bin_EXCEPINFO"]
+                self.assertEqual(failed.member("scode").offset, 56)
     def test_a_generated_header_can_be_read_the_cpp_way(self):
         """MIDL declares each interface twice and picks with
 
