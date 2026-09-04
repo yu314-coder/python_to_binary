@@ -1303,6 +1303,34 @@ def usual_conversions(left: IntegerType, right: IntegerType) -> IntegerType:
     return _UNSIGNED_COUNTERPART[signed]
 
 
+def _same_shape(left: CType, right: CType) -> bool:
+    """Two complete structs (or unions) that differ in their tag alone.
+
+    Every member has the same name, type, offset and bitfield placement, and
+    the whole has the same size and alignment - so a program reading either
+    reads the same bytes under the same names.
+    """
+
+    if not (isinstance(left, StructType) and isinstance(right, StructType)):
+        return False
+    if left.is_union != right.is_union or left.members is None or right.members is None:
+        return False
+    if (
+        left.size != right.size
+        or left.alignment != right.alignment
+        or len(left.members) != len(right.members)
+    ):
+        return False
+    return all(
+        mine.name == theirs.name
+        and mine.offset == theirs.offset
+        and mine.width == theirs.width
+        and mine.bit == theirs.bit
+        and (mine.ctype == theirs.ctype or _same_shape(mine.ctype, theirs.ctype))
+        for mine, theirs in zip(left.members, right.members)
+    )
+
+
 def compatible(left: CType, right: CType) -> bool:
     """Assignment compatibility for pointers, ignoring qualifiers."""
 
@@ -1952,7 +1980,22 @@ class Parser:
                 self.error("a typedef needs a name", keyword)
             existing = self.typedefs.get(name)
             if existing is not None and existing != ctype:
-                self.error(f"{name!r} is already a different type", name_token)
+                if _same_shape(existing, ctype):
+                    # Two spellings of one struct: a WebView2 shim's `typedef
+                    # struct __webview2_rect { long left; ... } RECT;` beside
+                    # <windows.h>'s `tagRECT`. Same members, same offsets,
+                    # same size - the tag is the whole of the difference, so
+                    # the new tag becomes another name for the type already
+                    # there, and a pointer to either is a pointer to both.
+                    # A struct of a different shape is still refused: that
+                    # one would lay the program out two ways.
+                    if isinstance(ctype, StructType) and ctype.name:
+                        self.struct_tags[ctype.name] = existing
+                    ctype = existing
+                else:
+                    self.error(
+                        f"{name!r} is already a different type", name_token
+                    )
             self.typedefs[name] = ctype
             if not self.accept(","):
                 break

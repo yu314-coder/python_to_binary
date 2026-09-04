@@ -2739,6 +2739,20 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a second spelling of the same struct
+
+A WebView2 shim writes `typedef struct __webview2_rect { long left; ... }
+RECT;` and py2bin's <windows.h> writes `typedef struct tagRECT { LONG left;
+... } RECT;` - the same members at the same offsets, and the tag the whole of
+the difference. C says two types, and py2bin said "'RECT' is already a
+different type". A typedef redeclared to a struct of the same shape - every
+member the same name, type, offset and bitfield placement, the whole the same
+size and alignment - is taken as another name for the type already there
+now, and a pointer to either tag is a pointer to both. A struct of another
+shape is refused as before: that one would lay the program out two ways.
+2126 tests, 539 programs against clang++, 11 projects, 3276 builds across
+six targets.
+
 ### 0.9.13 - a socket header included twice, and the shape of what it declares
 
 `#include <winsock2.h>` and then `<ws2tcpip.h>`, which includes the first:

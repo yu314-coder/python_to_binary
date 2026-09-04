@@ -1616,6 +1616,30 @@ class RejectionTests(CProgramTestCase):
             "already a different type",
         )
 
+    def test_a_struct_typedef_of_the_same_shape_is_a_second_spelling(self):
+        # A WebView2 shim's `typedef struct __webview2_rect {...} RECT;` beside
+        # <windows.h>'s `typedef struct tagRECT {...} RECT;`: the same members
+        # at the same offsets, so the second is another name for the first and
+        # a pointer to either tag is a pointer to both.
+        self.run_c(
+            "#include <stdio.h>\n"
+            "typedef struct tagRECT { long left; long top; long right; long bottom; } RECT;\n"
+            "typedef struct __shim_rect { long left; long top; long right; long bottom; } RECT;\n"
+            "static long width(struct __shim_rect *r) { return r->right - r->left; }\n"
+            "int main(void) { RECT r; struct tagRECT *p = &r; r.left = 3; r.right = 10;\n"
+            "  printf(\"%ld %ld %d\\n\", width(p), width(&r),\n"
+            "    (int)(sizeof(struct __shim_rect) == sizeof(RECT))); return 0; }\n",
+            stdout="7 7 1\n",
+        )
+
+    def test_a_struct_typedef_of_another_shape_is_still_refused(self):
+        self.reject(
+            "typedef struct tagRECT { long left; long top; long right; long bottom; } RECT;\n"
+            "typedef struct other { int left; int top; } RECT;\n"
+            "int main(void) { return 0; }\n",
+            "already a different type",
+        )
+
     def test_incomplete_struct_use_is_refused(self):
         # A tag with no body may only be pointed at; its layout is unknown.
         self.reject(
