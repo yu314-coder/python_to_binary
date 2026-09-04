@@ -2739,6 +2739,22 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a local seen from the block below, and a literal holding a brace
+
+`text.find(quotedKey)` inside an `if` chooses among the forms of `find` by
+the type of `quotedKey`, declared in the body around the block. A block was
+handed that body's objects by name but not its text, and the reader that
+types an argument reads text - so the choice could not be made, and a real
+program was refused with "cannot tell which is meant by `quotedKey`". A scope
+now declares every object it knows where the reader looks, after its own
+text and before the file's. And a string literal that holds a brace, a
+semicolon or a quote - `"{\"k\": 1}"`, which is how a program speaks JSON -
+no longer stops the pattern reading `T name(args);`, nor cuts a class member
+at the brace inside its initialiser; `string s = raw;` from a `const char *`
+is the construction it is; and `"<" + key` - a literal on the left of an
+object - is given a name of the object's class first. 2124 tests, 534
+programs against clang++, 9 projects, 3246 builds across six targets.
+
 ### 0.9.13 - a program squared
 
 Naming the members of members made a 900-line program take two minutes to

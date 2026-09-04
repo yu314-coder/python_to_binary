@@ -664,11 +664,22 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
 
     found = Class(name)
     index = 0
+    # Structure is read off a copy with the literals blanked: `std::string
+    # text = "{\"k\": 1}";` holds a brace and a semicolon, and read raw the
+    # member was cut at the brace and handed to the method reader.
+    bare = _without_literals(body)
+    blanked_of = body
     #: The macros already written out where the reader now stands, so a pair
     #: that name each other is reported instead of expanded forever.
     opened: "set[str]" = set()
     settled = -1
     while index < len(body):
+        # A macro written out below rewrites `body`, and the blanked copy has
+        # to follow it: read against a stale one, the offsets pointed into
+        # the old text and a member was cut in the wrong place.
+        if body is not blanked_of:
+            bare = _without_literals(body)
+            blanked_of = body
         char = body[index]
         if char in " \t\n;":
             index += 1
@@ -715,8 +726,8 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
         if access:
             index += access.end()
             continue
-        statement_end = body.find(";", index)
-        brace = body.find("{", index)
+        statement_end = bare.find(";", index)
+        brace = bare.find("{", index)
         if brace >= 0 and (statement_end < 0 or brace < statement_end):
             head = body[index:brace].strip()
             close = _matching(body, brace)
@@ -725,7 +736,7 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
                 # declared, and the value is a brace list. The brace opens a
                 # value and not a body, and read as a body it asked what the
                 # member returns.
-                semicolon = body.find(";", close)
+                semicolon = bare.find(";", close)
                 if semicolon < 0:
                     break
                 declaration, given = _member_value(
@@ -746,7 +757,7 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
                 found.members.append(
                     _tagged_member(body, brace, close, head, filename, at + index)
                 )
-                index = body.find(";", close) + 1
+                index = bare.find(";", close) + 1
                 continue
             method = _method_from(head, body[brace:close], filename, at + index)
             found.methods.append(method)
@@ -11296,6 +11307,56 @@ def _declared_objects(
 
 
 
+def _literal_before_an_object(
+    body: str,
+    reach: "dict[str, str]",
+    classes: "dict[str, Class]",
+    counter: "list[int]",
+    known: "dict[str, str]",
+) -> "tuple[str, bool]":
+    """`"<" + key` - a literal on the left, an object on the right.
+
+    C++ finds `operator+(const char *, const string &)`; this subset has only
+    the class's own `operator+`, whose receiver is the object, and `"<" +
+    key` is not `key + "<"`. So the literal is given a name of the object's
+    class first - `string __py2bin_operand_1 = "<";` - and the round after
+    this finds an object on the left as usual. One at a time, like the rest
+    of the hoisting, so each temporary lands at the start of its statement.
+    """
+
+    offset = 0
+    for kind, part in _split_literals(body):
+        if kind == "literal" and part.rstrip().endswith('"') and '"' in part[:2]:
+            after = re.match(
+                r"\s*\+(?!=)\s*((?:this\s*->\s*)?[A-Za-z_]\w*"
+                r"(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\b",
+                body[offset + len(part):],
+            )
+            if after is not None:
+                name = re.sub(r"\s+", "", after.group(1))
+                held = reach.get(name)
+                if (
+                    held is not None
+                    and _find_method(held, "op_add", classes) is not None
+                    and _find_method(held, "", classes) is not None
+                ):
+                    counter[0] += 1
+                    made = f"{_OPERATOR_PREFIX}{counter[0]}"
+                    known[made] = held
+                    begins = _statement_start(body, offset)
+                    while begins < len(body) and body[begins] in " \t\n":
+                        begins += 1
+                    return (
+                        body[:begins]
+                        + f"{held} {made} = {part}; "
+                        + body[begins:offset]
+                        + made
+                        + body[offset + len(part):]
+                    ), True
+        offset += len(part)
+    return body, False
+
+
 def _hoist_object_operators(
     body: str,
     classes: "dict[str, Class]",
@@ -11322,6 +11383,9 @@ def _hoist_object_operators(
         # the answer of that used as a receiver. Looked up here alongside the
         # variables; `known` itself is the caller's and gains the temporaries.
         reach = {**known, **_member_paths(known, pointers, classes, body)}
+        body, named = _literal_before_an_object(body, reach, classes, counter, known)
+        if named:
+            continue
         # The symbol outside and the variable inside: each round writes one
         # of these out, and which one it picks is the precedence the result
         # is evaluated with. Asked variable-first, `a + b * c` found `a`,
@@ -12721,10 +12785,16 @@ def _rewrite_body(
     pointers = set(pointers)
     destroyed: list[str] = []
 
-    def declare(match: "re.Match[str]") -> str:
+    def declare(match: "re.Match[str]", whole: str) -> "str | None":
+        # Matched against a copy with the literals blanked: `string t("{");`
+        # holds a brace, and matched raw the pattern stopped at it and the
+        # declaration reached the C as C++. The arguments are sliced from the
+        # real text, since that is where the literal is.
         type_name, variable, _parens, arguments = match.groups()
+        if arguments is not None:
+            arguments = whole[match.start(4): match.end(4)]
         if type_name not in classes:
-            return match.group(0)
+            return None
         known[variable] = type_name
         constructed = f"struct {type_name} {variable};"
         # `static Counter c;` inside a function is built the first time the
@@ -12732,7 +12802,7 @@ def _rewrite_body(
         # flag C++ keeps out of sight is written out here. Read from the text
         # in front of the declaration, because `static` is a storage class
         # and the pattern matches the type onwards.
-        once = _AFTER_STATIC.search(match.string[: match.start()]) is not None
+        once = _AFTER_STATIC.search(whole[: match.start()]) is not None
         owner = _find_method(type_name, "", classes)
         if owner is None and arguments:
             raise CppTranslationError(
@@ -12836,7 +12906,19 @@ def _rewrite_body(
         first, because a local of the same name is the one in view.
         """
 
-        return body if not unit else f"{body}\n{unit}"
+        # And every object this scope knows, written as the declaration the
+        # reader looks for. A block is handed the locals of the body around
+        # it in `known`, but the reader that types an argument reads text,
+        # and the outer body's text is not in the block's: `string q = ...;`
+        # above an `if` was invisible inside it, and `text.find(q)` could not
+        # choose between the forms of `find`. After this body's own text and
+        # before the file's, which is the order C++ looks in.
+        declared = " ".join(
+            f"struct {held} {'*' if name in pointers else ''}{name};"
+            for name, held in known.items()
+            if held in classes and re.fullmatch(r"[A-Za-z_]\w*", name)
+        )
+        return f"{body}\n{declared}" if not unit else f"{body}\n{declared}\n{unit}"
 
     # `&held` where the class overloads it. First of everything, because
     # every pass below writes `&` in front of a receiver of its own and by
@@ -13096,8 +13178,19 @@ def _rewrite_body(
         # left standing reads as a variable being copied from. Every wide
         # literal in the program looked like that.
         spelled = whole[match.start():match.end()].strip()
-        if _COPY_INIT.fullmatch(spelled) or _VALUE_INIT.fullmatch(spelled):
+        if _VALUE_INIT.fullmatch(spelled):
             return None
+        if _COPY_INIT.fullmatch(spelled):
+            # `T a = b;` is a copy when `b` is a T - and a construction when
+            # it is anything else with a type: `string s = raw;` where `raw`
+            # is a `const char *` names the constructor that takes one. Left
+            # for the copy pass, the C got `struct string s = raw;`.
+            source_type = (
+                known.get(value)
+                or (_deduced_type(value, scope()) or "").replace("*", "").strip()
+            )
+            if not source_type or source_type == type_name:
+                return None
         # `C c = C(...)` and `C c = make()` both hand back a C already.
         if re.match(rf"^{re.escape(type_name)}\s*\(", value):
             return None
@@ -13129,7 +13222,7 @@ def _rewrite_body(
     body = _sub_code(_CONVERTING_INIT, body, convert_initialiser)
     body = _split_object_declarators(body, classes)
     body = _OBJECT_ARRAY.sub(declare_array, body)
-    body = _OBJECT.sub(declare, body)
+    body = _sub_code(_OBJECT, body, declare)
     def copy_initialise(match: "re.Match[str]") -> str:
         """`T b = a;` - a declaration whose value is another object.
 
