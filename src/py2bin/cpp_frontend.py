@@ -11321,7 +11321,7 @@ def _hoist_object_operators(
         # A member of a known object is an operand too: `b.name + "#"`, and
         # the answer of that used as a receiver. Looked up here alongside the
         # variables; `known` itself is the caller's and gains the temporaries.
-        reach = {**known, **_member_paths(known, pointers, classes)}
+        reach = {**known, **_member_paths(known, pointers, classes, body)}
         # The symbol outside and the variable inside: each round writes one
         # of these out, and which one it picks is the precedence the result
         # is evaluated with. Asked variable-first, `a + b * c` found `a`,
@@ -11739,8 +11739,8 @@ def _hoist_value_returns(
     # which one the text uses says whether the object was reached through a
     # pointer, and this pass is not told which names are pointers.
     paths = {
-        **_member_paths(known, set(), classes),
-        **_member_paths(known, set(known), classes),
+        **_member_paths(known, set(), classes, body),
+        **_member_paths(known, set(known), classes, body),
     }
     for _round in range(_HOIST_ROUNDS):
         found = None
@@ -13052,7 +13052,7 @@ def _rewrite_body(
             if depth < 0:
                 return match.group(0)
         receiver = re.sub(r"\s+", "", receiver)
-        reachable = {**known, **_member_paths(known, pointers, classes)}
+        reachable = {**known, **_member_paths(known, pointers, classes, body)}
         if type_name not in classes or receiver not in reachable:
             return match.group(0)
         holds = reachable[receiver]
@@ -13246,7 +13246,7 @@ def _rewrite_body(
     # operator pass, which turns the subscript itself into a call and leaves
     # the method on an expression no later pass recognises as a receiver.
     # A member of a known object is a receiver too: `b.v[i].get()`.
-    indexed = {**known, **_member_paths(known, pointers, classes)}
+    indexed = {**known, **_member_paths(known, pointers, classes, body)}
     for variable in sorted(indexed, key=len, reverse=True):
         owner = _find_method(indexed[variable], "op_index", classes)
         if owner is None:
@@ -13377,6 +13377,11 @@ def _rewrite_body(
                 variable,
             )
 
+    # Only what the body spells, in each of the three loops below: a member
+    # the text never reaches is never named, and never walked by the passes
+    # after these - which, for every member of every known object at every
+    # hop, was the program squared.
+    spelled_here = re.sub(r"\s*(->|\.)\s*", r"\1", body)
     # An inherited *member* reached from outside the class: `d.v` where `v`
     # lives in the base is `d.__base.v` in C. Methods were followed up the
     # chain from the start; fields were not, and the compiler reported a
@@ -13384,9 +13389,13 @@ def _rewrite_body(
     for variable in sorted(known, key=len, reverse=True):
         holds = known[variable]
         access = "->" if variable in pointers else "."
+        if f"{variable}{access}" not in spelled_here:
+            continue
         for member, prefix in _reachable_members(classes[holds], classes):
             if not prefix:
                 continue  # its own field; the name is already right
+            if f"{variable}{access}{member.name}" not in spelled_here:
+                continue
             body = re.sub(
                 rf"\b{re.escape(variable)}{re.escape(access)}{re.escape(member.name)}\b",
                 f"{variable}{access}{prefix}{member.name}",
@@ -13398,6 +13407,7 @@ def _rewrite_body(
     # is reached from `b.settings`, which is reached from `b`, so they run
     # again over what they added until a round adds nothing. Bounded, so
     # a class holding one of itself by mistake cannot run this forever.
+    receivers = dict(receivers or {})
     for _hop in range(6):
         before = len(known)
         # A member that is a pointer to a class is a receiver in its own right:
@@ -13406,11 +13416,15 @@ def _rewrite_body(
         # no member called `get`.
         for variable in sorted(known, key=len, reverse=True):
             access = "->" if variable in pointers else "."
+            if f"{variable}{access}" not in spelled_here:
+                continue
             for member, prefix in _reachable_members(classes[known[variable]], classes):
                 held = member.ctype.replace("*", "").strip()
                 if "*" not in member.ctype or held not in classes:
                     continue
                 reached = f"{variable}{access}{prefix}{member.name}"
+                if reached not in spelled_here:
+                    continue
                 known.setdefault(reached, held)
                 pointers.add(reached)
 
@@ -13419,14 +13433,18 @@ def _rewrite_body(
         # after the method.
         for variable in sorted(known, key=len, reverse=True):
             access = "->" if variable in pointers else "."
+            if f"{variable}{access}" not in spelled_here:
+                continue
             for member, prefix in _reachable_members(classes[known[variable]], classes):
                 held = member.ctype.replace("*", "").strip()
                 if "*" in member.ctype or held not in classes:
                     continue
                 reached = f"{variable}{access}{prefix}{member.name}"
+                if reached not in spelled_here:
+                    continue
                 if reached not in known:
                     known[reached] = held
-                    (receivers := dict(receivers or {}))[reached] = f"&{reached}"
+                    receivers[reached] = f"&{reached}"
 
         if len(known) == before:
             break
@@ -13699,7 +13717,7 @@ def _rewrite_value_operators(
     # it, so the offsets below still point where they did.
     reading = body if not scope else f"{body}\n{scope}"
     # The operands may be members of known objects: `string t = b.name + x;`.
-    reachable = {**known, **_member_paths(known, pointers, classes)}
+    reachable = {**known, **_member_paths(known, pointers, classes, body)}
 
     added: dict[str, str] = {}
     for symbol in _OPERATOR_SYMBOLS:
@@ -14219,7 +14237,7 @@ def _rewrite_operators(
     # A member of a known object is an operand as a variable is: `s.title +=
     # "!"`, and `b.settings.title == "x"` further down. Matched by name below,
     # so each is given the name it is reached by.
-    known = {**known, **_member_paths(known, pointers, classes)}
+    known = {**known, **_member_paths(known, pointers, classes, body)}
     # `(a + b) * c` - the parentheses the program wrote are still there when
     # the inner operator has been turned into a temporary, and this pass
     # matches a bare name on the left. Taken off only around a name this
@@ -14383,7 +14401,7 @@ def _rewrite_operators(
     # into a call on an element, and this turns the subscript itself into the
     # call - the index is an argument, not part of the receiver.
     # `b.v[i]` and `p->v[i]`: a member of a known object, indexed from outside.
-    indexed = {**known, **_member_paths(known, pointers, classes)}
+    indexed = {**known, **_member_paths(known, pointers, classes, body)}
     for variable in sorted(indexed, key=len, reverse=True):
         owner = _find_method(indexed[variable], "op_index", classes)
         if owner is None:
@@ -14744,7 +14762,10 @@ def _rewrite_prefix(body: str, variable: str, symbol: str, call: str) -> str:
 
 
 def _member_paths(
-    known: "dict[str, str]", pointers: "set[str]", classes: "dict[str, Class]"
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    classes: "dict[str, Class]",
+    within: str = "",
 ) -> "dict[str, str]":
     """`b.v` and `p->v`, for every object held by value in a known object.
 
@@ -14763,6 +14784,12 @@ def _member_paths(
 
     paths: dict[str, str] = {}
     frontier = dict(known)
+    # Only the paths the text in hand actually spells. Every member of every
+    # known object, and every member of those, grows with the program
+    # squared, and every pass after this walks the names it is given times
+    # the methods of their class: named for all of them, a 900-line program
+    # took two minutes to translate where it had taken sixteen seconds.
+    mentioned = re.sub(r"\s*(->|\.)\s*", r"\1", within) if within else ""
     # Down as far as the members go, a hop at a time: `b.settings.title` is
     # a member of a member, and a program that keeps its settings in one
     # object and that object in another writes exactly that. Bounded, so a
@@ -14778,6 +14805,8 @@ def _member_paths(
                     continue
                 reach = "->" if variable in pointers else "."
                 path = f"{variable}{reach}{member}"
+                if within and path not in mentioned:
+                    continue
                 if path not in known and path not in paths:
                     fresh[path] = kind
         if not fresh:

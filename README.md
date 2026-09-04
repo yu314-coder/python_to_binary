@@ -2739,6 +2739,20 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a program squared
+
+Naming the members of members made a 900-line program take two minutes to
+translate where it had taken sixteen seconds: every member of every known
+object, and every member of those, was named whether or not the body ever
+reached it, and every pass after that walked the names it was given times the
+methods of their class - 2.7 million calls of one rewriter. Only the paths the
+text in hand actually spells are named now. Same output, sixteen seconds
+again; a C++ build of a real program that was interrupted for taking too long
+is what found it. `tools/cpp_stress.py` writes such a program and times its
+translation, since the corpus of small programs cannot see this class of
+regression. 2124 tests, 532 programs against clang++, 9 projects, 3234 builds
+across six targets.
+
 ### 0.9.13 - a callback nobody set
 
 A class keeping an optional callback asks `if (onMessage)` before calling it.
