@@ -264,6 +264,31 @@ def fetch_header(
         if already.is_file():
             return already
     reasons: "list[str]" = []
+    # Where this component came from last time, before any search. A header
+    # set is taken as far as the header asked for reaches, so a sibling the
+    # first one did not include is not here yet - and `openssl/hmac.h`, next
+    # to the `openssl/evp.h` just fetched, went back to the index and was
+    # offered a Blake2 package and an HMAC middleware for ASP.NET. Whatever
+    # holds the component holds the rest of it.
+    origin = _origin_of(into, wanted)
+    if origin is not None:
+        kind, where = origin
+        say(f"  {wanted} is part of {_component_of(wanted)}, which came from {where}")
+        found = None
+        try:
+            if kind == "source":
+                found = _take_from_repository(where, wanted, into, say=say)
+            else:
+                package, _, version = where.rpartition(" ")
+                found = _take_headers(
+                    _package_url(package, version), where, into, stem, cache=cache
+                )
+        except _DID_NOT_ANSWER as error:
+            reasons.append(f"{where}: {error}")
+        if found is not None:
+            say(f"  {wanted} came from {where}")
+            return found
+        reasons.append(f"{where}, which holds the rest of it: holds no {wanted}")
     # Which index to ask first. A name with a directory in it, or one spelled
     # the way only C++ spells a header, belongs to a library published as
     # source; a bare `.h` is what a vendor SDK ships in a package. Asking the
@@ -296,6 +321,7 @@ def fetch_header(
             continue
         if found is not None:
             say(f"  {stem} came from the package {package} {version}")
+            _remember_origin(into, wanted, "package", f"{package} {version}")
             return found
         reasons.append(f"{package}: holds no {stem}")
     if not source_first:
@@ -791,6 +817,61 @@ def _member_bytes(url: str, label: str, member: "_Member", limit: int) -> bytes:
     return data
 
 
+#: Where each component kept here came from, one `name<TAB>kind<TAB>where`
+#: line each. Written beside the headers rather than held in memory: a build
+#: is one process, and the next one asks for the header the last one did not
+#: reach.
+_ORIGINS = ".origins"
+
+
+def _component_of(wanted: str) -> str:
+    """What a header is a part of, as the include spells it.
+
+    `openssl/hmac.h` is part of `openssl` and `zlib.h` is part of `zlib` -
+    the same reading `components_fetched` gives what is already here.
+    """
+
+    holder, _, spelled = wanted.rpartition("/")
+    return holder or re.sub(r"\.(h|hpp|hxx|hh)$", "", spelled, flags=re.I)
+
+
+def _origin_of(into: Path, wanted: str) -> "tuple[str, str] | None":
+    """Where this header's component came from before, if it came from here."""
+
+    note = Path(into) / _ORIGINS
+    if not note.is_file():
+        return None
+    component = _component_of(wanted)
+    try:
+        lines = note.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        pieces = line.split("\t")
+        if len(pieces) == 3 and pieces[0] == component:
+            return pieces[1], pieces[2]
+    return None
+
+
+def _remember_origin(into: Path, wanted: str, kind: str, where: str) -> None:
+    """Write down what supplied this component, for the header asked next."""
+
+    component = _component_of(wanted)
+    note = Path(into) / _ORIGINS
+    try:
+        held = note.read_text().splitlines() if note.is_file() else []
+        if any(line.split("\t")[:1] == [component] for line in held):
+            return
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(
+            "\n".join(held + [f"{component}\t{kind}\t{where}"]) + "\n",
+            newline="\n",
+        )
+    except OSError:
+        # A cache that cannot be written is not a build that cannot run.
+        pass
+
+
 def components_fetched(into: Path) -> "list[str]":
     """What the headers kept in `into` are about, as the includes spelled it.
 
@@ -961,6 +1042,7 @@ def _from_source(
             continue
         if found is not None:
             say(f"  {wanted} came from {full}")
+            _remember_origin(into, wanted, "source", full)
             if full in _COLLECTIONS:
                 # Its neighbours are there too, so ask it first next time.
                 _COLLECTIONS.remove(full)

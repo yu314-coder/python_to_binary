@@ -2739,6 +2739,71 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a real Windows project, built from its own repository
+
+The SidecarBridge Windows companion - a WebView2 shell over an encrypted
+socket transport, four sources and thirty headers - was fetched from its own
+repository and built with py2bin, and each error it stopped at was fixed
+here. What that found, in the order it found it:
+
+A fetched header set is taken as far as the header asked for reaches, so
+`openssl/hmac.h` beside the `openssl/evp.h` just fetched was not there yet -
+and the search for it started again at the index, which offered a Blake2
+package and an HMAC middleware for ASP.NET. Where a component came from is
+written down beside the headers now, and the sibling is asked of that.
+
+`<iterator>` is shipped: `size`, `empty`, `data`, `begin` and `end` over a
+plain array, `distance`, `advance`, `next`, `prev` and `back_inserter` over
+the pointers this subset's iterators are. Writing it needed the template form
+the standard library asks a length with - `long size(T (&a)[N])`, an array
+taken by reference with its bound deduced - which the reader had never seen a
+function in, and which a plain `C &c` must decline for an array or the
+container form wins and asks an array for a `size()`.
+
+`std::make_shared` and `make_unique` are shipped, and `auto session =
+make_shared<Session>()` is read: a thread handed that session could not say
+what it was being given, because the copy of the template it answers with had
+not been written yet. `std::to_wstring` is shipped. `std::string` takes a
+range of bytes - a `vector<uint8_t>`, which is what arrives over a socket -
+and a path takes a wide string on its right.
+
+A conversion operator is read by the grammar rather than by a list of type
+names: `operator uintptr_t() const`, which is what `std::atomic<T>` becomes
+when a program holds a socket in one, was refused as an operator nobody had
+heard of because <cstdint> belongs to the C stage and its names never reach
+the C++ one. Those names are asked of the C stage now wherever a type is
+weighed, so an `int64_t` written to a stream reaches the form for `long
+long` - which the shipped streams now have, along with every other width.
+Given only `int`, `to_string` printed the bottom half of a file offset and
+the program carried on. A literal is sized by its suffix and its value for
+the same reason.
+
+A lambda with a capture-default captures what the enclosing function was
+given, not only what the body declares - and a name the lambda is given
+itself is not a capture at all. `&r` on a reference to something that is not
+a class is the pointer it already is. A brace initialiser on a parameter,
+`const string &digest = {}`, is a value: zero for a number, an object at file
+scope for a class - and the brace of one is not the brace that opens a body,
+which is what the class reader had taken it for.
+
+Which overload a call means is decided from what the body knows the argument
+to be, not from a search through every header the file pastes in. `offset`,
+an `int64_t` the lambda was given, was answered with a struct field of that
+name in a Windows header; `token`, a string, with a WebView2 struct. A class
+reference passed where a value is taken is that object. A bare call to the
+class's own method, written to a stream, is given its receiver so the value
+it answers gets somewhere to live.
+
+And one bug worth naming on its own: a static member's bare name was rewritten
+across the whole file rather than inside the class that declares it. It had
+never bitten because no shipped class had a static named like an ordinary
+local - until `<fstream>` arrived with `ios::out`, and every local called
+`out` in every unrelated program became a file-mode constant of a type it
+never had.
+
+2184 tests, 560 programs against clang++, 11 projects, 3402 builds across six
+targets.
+
 ### 0.9.13 - a member given a value in braces, and four other things a class body holds
 
 `std::atomic<bool> running_{false};` stopped a build with "cannot read the

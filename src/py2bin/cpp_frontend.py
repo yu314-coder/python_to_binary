@@ -1002,6 +1002,30 @@ def _without_decorations(declaration: str) -> str:
     return " ".join("".join(out).split())
 
 
+def _brace_outside_parentheses(bare: str, index: int) -> int:
+    """The first `{` from here that no parameter list holds, or -1.
+
+    A default argument may be a brace - `const string &digest = {}` - and it
+    is written inside the parentheses of the member it belongs to. Taken for
+    the brace that opens a body, the member's head was everything up to the
+    middle of its own parameter list, and what came out was a data member
+    named after one of the parameters holding the rest of the declaration as
+    its type.
+    """
+
+    depth = 0
+    while index < len(bare):
+        piece = bare[index]
+        if piece == "(":
+            depth += 1
+        elif piece == ")":
+            depth -= 1
+        elif piece == "{" and depth <= 0:
+            return index
+        index += 1
+    return -1
+
+
 def _split_members(body: str, name: str, filename: str, at: int) -> Class:
     """Read a class body into its data members and its member functions."""
 
@@ -1096,7 +1120,7 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
             index += access.end()
             continue
         statement_end = bare.find(";", index)
-        brace = bare.find("{", index)
+        brace = _brace_outside_parentheses(bare, index)
         if brace >= 0 and (statement_end < 0 or brace < statement_end):
             head = body[index:brace].strip()
             close = _matching(body, brace)
@@ -1482,7 +1506,19 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
             conversion = re.sub(
                 r"\s+", " ", before[at + len("operator"):]
             ).strip()
-            if not returns and not parameters and _names_a_type(conversion):
+            # A name here is a type because the grammar leaves nothing else
+            # it could be: `operator` followed by an identifier is a
+            # conversion, and every operator that is not one is spelled with
+            # symbols. Asked instead whether the name was one this stage had
+            # seen declared, `operator uintptr_t() const` - which is what
+            # `std::atomic<T>` becomes when a program holds a socket in one -
+            # was refused as an operator nobody had heard of, because
+            # <cstdint> is the C stage's and its names never reach here.
+            if (
+                not returns
+                and not parameters
+                and (_names_a_type(conversion) or _SPELLS_A_TYPE.match(conversion))
+            ):
                 return decorated(
                     Method(
                         f"{_CONVERSION_PREFIX}{_type_code(conversion)}",
@@ -1754,6 +1790,17 @@ def _expanded_pack(body: str, name: str, arguments: "list[str]") -> str:
 
 #: What a literal is. `1` is an int, `1.0` a double, `"s"` a `const char *`.
 _LITERAL_TYPES = (
+    # The suffix first, and the size after it: `5000000000LL` is a `long
+    # long` and `12345678901234ULL` an unsigned one, and read as `int` both
+    # were handed to the form of `to_string` that takes an int - which took
+    # the bottom half and printed a number the program never held. A decimal
+    # too large for an int is a `long long` in C++ whether or not it says so.
+    (re.compile(r"^[+-]?\d+(?:[uU][lL]{1,2}|[lL]{1,2}[uU])$"), "unsigned long long"),
+    (re.compile(r"^[+-]?\d+[lL]{1,2}$"), "long long"),
+    (re.compile(r"^[+-]?\d+[uU]$"), "unsigned int"),
+    (re.compile(r"^[+-]?0[xX][0-9a-fA-F]+(?:[uU][lL]{1,2}|[lL]{1,2}[uU])$"), "unsigned long long"),
+    (re.compile(r"^[+-]?0[xX][0-9a-fA-F]+[lL]{1,2}$"), "long long"),
+    (re.compile(r"^[+-]?0[xX][0-9a-fA-F]+[uU]$"), "unsigned int"),
     (re.compile(r"^[+-]?\d+[uUlL]*$"), "int"),
     (re.compile(r"^[+-]?0[xX][0-9a-fA-F]+[uUlL]*$"), "int"),
     (re.compile(r"^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?[fF]?$"), "double"),
@@ -2120,6 +2167,24 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     """
 
     spelled = expression.strip()
+    # `(x)` is `x`. A pass of this translator writes its own temporaries and
+    # hands them on in parentheses - `directory / (__py2bin_operand_6)` - and
+    # a name inside them was looked up as though it were an expression, which
+    # it is not: nothing could be told about a variable declared on the line
+    # above. Taken off first, before a literal is read, since a literal in
+    # parentheses is that literal too.
+    while (
+        spelled.startswith("(")
+        and _closing_paren(spelled, 0) == len(spelled) - 1
+        and spelled[1:-1].strip()
+    ):
+        spelled = spelled[1:-1].strip()
+    # A decimal with no suffix is an `int` if one holds it and the next type
+    # up if not, which is what C++ says and what decides whether
+    # `to_string(3000000000)` prints the number or the bottom half of it.
+    plain = re.fullmatch(r"[+-]?\d+", spelled)
+    if plain is not None:
+        return "int" if -2147483648 <= int(spelled) <= 2147483647 else "long long"
     for pattern, named in _LITERAL_TYPES:
         if pattern.match(spelled):
             return named
@@ -2204,6 +2269,54 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
 
 
 
+#: `make_shared<Session>()` - a call on a template, spelled with the argument
+#: rather than deduced from what it is handed.
+_A_SPELLED_TEMPLATE_CALL = re.compile(
+    r"^([A-Za-z_]\w*)\s*<([^<>]*)>\s*\(.*\)$", re.S
+)
+
+
+def _what_a_template_call_answers(value: str, text: str) -> "str | None":
+    """What `make_shared<Session>()` gives back, before it is written out.
+
+    Read off the pattern's own result type with the arguments put in, because
+    the copy does not exist yet: threads are given their trampolines before
+    the templates are expanded, and `auto session = make_shared<Session>();`
+    beside a thread that is handed `session` had no type at all - so the
+    thread was refused for an argument the program had spelled out plainly.
+    """
+
+    call = _A_SPELLED_TEMPLATE_CALL.match(value.strip())
+    if call is None:
+        return None
+    name = call.group(1)
+    arguments = [a.strip() for a in _split_arguments(call.group(2)) if a.strip()]
+    if not arguments:
+        return None
+    for clause in _TEMPLATE.finditer(text):
+        parameters = _template_parameters(clause.group(1))
+        # As many as were spelled, or more: `make_shared<Session>(a, b)`
+        # spells the one parameter that cannot be deduced and leaves the
+        # argument types to be read from the arguments.
+        if not parameters or len(parameters) < len(arguments):
+            continue
+        rest = text[clause.end():]
+        declared = _DEFINITION.match(rest) or _TEMPLATED_RESULT.match(rest)
+        if declared is None or declared.group(2) != name:
+            continue
+        answered = declared.group(1).strip()
+        for (held, _is_type, _pack), given in zip(parameters, arguments):
+            answered = re.sub(rf"(?<![.\w>]){re.escape(held)}\b", given, answered)
+        shaped = re.match(r"^([A-Za-z_]\w*)\s*<([^<>]*)>\s*([*&]*)$", answered)
+        if shaped is None:
+            return answered or None
+        inside = [a.strip() for a in _split_arguments(shaped.group(2)) if a.strip()]
+        return (
+            _instantiated_name(shaped.group(1), inside) + " " + shaped.group(3)
+        ).strip()
+    return None
+
+
 def _what_auto_holds(
     spelled: str, code: str, text: str, before: int
 ) -> "str | None":
@@ -2221,6 +2334,9 @@ def _what_auto_holds(
     # `auto a = a;` does not compile, and asking would not stop.
     if not value or re.search(rf"(?<![.\w>]){re.escape(spelled)}\b", value):
         return None
+    answered = _what_a_template_call_answers(value, text)
+    if answered is not None:
+        return answered
     return _deduced_type(value, text, chosen.start())
 
 
@@ -2388,6 +2504,33 @@ def _member_result(text: str, owner: str, spelled: str) -> "str | None":
     return None
 
 
+def _walked_pointer(spelled: str) -> "str | None":
+    """`p + 1` or `p - n`: what stands to the left of the last top-level move.
+
+    Only `+` and `-`, and only where the right side has no `+` or `-` of its
+    own to make the reading ambiguous. None where the expression is not one
+    of those, which is every other expression.
+    """
+
+    depth = 0
+    at = -1
+    for index, piece in enumerate(_without_literals(spelled)):
+        if piece in "([":
+            depth += 1
+        elif piece in ")]":
+            depth -= 1
+        elif piece in "+-" and depth == 0 and index > 0:
+            before_it = spelled[index - 1]
+            after_it = spelled[index + 1] if index + 1 < len(spelled) else ""
+            if before_it in "+-=<>!*/%&|^" or after_it in "+-=>":
+                return None  # `++`, `->`, `+=`, or a sign of its own
+            at = index
+    if at < 0:
+        return None
+    left = spelled[:at].strip()
+    return left or None
+
+
 def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | None":
     """The type of something that is not a bare name.
 
@@ -2407,6 +2550,16 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
         if held is None or "*" not in held:
             return None
         return held[::-1].replace("*", "", 1)[::-1].strip()
+    # `first + 1` and `last - 1` - an iterator walked along. In this subset
+    # an iterator is a pointer, and a pointer plus a whole number is that
+    # same pointer moved: `string(hello.begin() + 1, hello.end())` is how a
+    # program takes all but the first character, and read as nothing at all
+    # it could not say which `string` was being built.
+    walked = _walked_pointer(spelled)
+    if walked is not None:
+        held = _deduced_type(walked, text, before)
+        if held is not None and "*" in held:
+            return held
     dispatched = _DISPATCHED.match(spelled)
     if dispatched is not None:
         # A virtual call, as this translator writes one: a read from the
@@ -2520,7 +2673,15 @@ def _wider(left: "str | None", right: "str | None") -> "str | None":
 _DISPATCHED = re.compile(r"^\(\(\s*(.+?)\s*\(\s*\*\s*\)\s*\(", re.S)
 
 #: `(int)x`, `(const char *)p` - a cast, which says what something is.
-_CAST = re.compile(r"^\(\s*((?:const\s+)?[A-Za-z_]\w*(?:\s*\*)*)\s*\)\s*(.+)$", re.S)
+#: `(long long)v`, `(unsigned long)n`, `(const char *)p` - a type is more
+#: than one word as often as not, and read as one `(long long)v` was not a
+#: cast at all: what it answers could not be told, and a call whose overload
+#: turns on it was refused with the cast written right there.
+_CAST = re.compile(
+    r"^\(\s*((?:(?:const|volatile)\s+)*(?:(?:unsigned|signed|long|short)\s+)*"
+    r"[A-Za-z_]\w*(?:\s*\*)*)\s*\)\s*(.+)$",
+    re.S,
+)
 #: What the pass that hoists a value return calls what it writes. Read back
 #: by the caller, which has to know these are objects of the scope.
 _VALUE_PREFIX = "__py2bin_value_"
@@ -2585,7 +2746,15 @@ def _names_a_type(spelled: str) -> bool:
     words = spelled.replace("const", "").split()
     if not words:
         return False
-    return words[0] in _TYPE_WORDS or words[0] in _CLASS_NAMES
+    return (
+        words[0] in _TYPE_WORDS
+        or words[0] in _CLASS_NAMES
+        or words[0] in _TYPEDEF_NAMES
+        # And the fixed-width names, which the C stage settles and which no
+        # C++ header of py2bin's declares: `(int64_t)offset` is a cast, and
+        # read as anything else its type could not be told at all.
+        or words[0] in _fixed_width_types()
+    )
 
 
 def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
@@ -2792,6 +2961,24 @@ def _deduce_arguments(
     # deduces nothing.
     shaped = {name for name, _is_type, _pack in parameters}
     for part, argument in zip(wanted, given):
+        array = _AN_ARRAY_REFERENCE.match(part.strip())
+        if array is not None:
+            # `T (&a)[N]` given `wchar_t buffer[256]`: the element type is
+            # what the argument holds, and the bound is the one it was
+            # declared with. Both are written down where the array is
+            # declared, which is the only place either is written at all -
+            # an array handed to a function is a pointer and has forgotten.
+            held = (array.group(1) or "").strip()
+            bound = array.group(3).strip()
+            element = _deduced_type(argument, text, before)
+            length = _array_bound(argument, text, before)
+            if element is None or length is None:
+                return None
+            if held in names:
+                found.setdefault(held, element.replace("*", "").strip())
+            if bound in shaped and bound not in names:
+                found.setdefault(bound, length)
+            continue
         stars = part.count("*")
         words = part.replace("*", " * ").replace("&", " ").split()
         if len(words) < 2:
@@ -2818,6 +3005,18 @@ def _deduce_arguments(
             continue
         if named in found:
             continue
+        if (
+            not stars
+            and "&" in part
+            and _array_bound(argument, text, before) is not None
+        ):
+            # `C &c` given an array. C++ deduces C as the array type, bound
+            # and all, and this subset has no way to write that down - which
+            # is exactly why the standard library declares a second one
+            # taking `T (&a)[N]`. Declining here is what lets that one be
+            # chosen: taken, `std::size(buffer)` asked the array for a
+            # `size()` it does not have.
+            return None
         deduced = _deduced_type(argument, text, before)
         if deduced is None:
             return None
@@ -3753,6 +3952,31 @@ def _is_a_template_pattern(text: str, at: int) -> bool:
     return bool(re.search(r"\btemplate$", before))
 
 
+#: `void Owner::name(...) {` - a method of that class written outside it.
+def _within_out_of_line_methods(text: str, owner: str, rewrite) -> str:
+    """Apply `rewrite` to the body of each `Owner::name(...) { ... }` here."""
+
+    bare = _without_literals(text)
+    out: "list[str]" = []
+    at = 0
+    for head in re.finditer(
+        rf"(?<![.\w>]){re.escape(owner)}\s*::\s*~?[A-Za-z_]\w*\s*\([^;{{}}]*\)"
+        rf"\s*(?:const\s*)?(?::[^;{{}}]*)?\{{",
+        bare,
+    ):
+        if head.start() < at:
+            continue
+        try:
+            closing = _matching(bare, head.end() - 1)
+        except ValueError:
+            continue
+        out.append(text[at: head.end() - 1])
+        out.append(rewrite(text[head.end() - 1: closing + 1]))
+        at = closing + 1
+    out.append(text[at:])
+    return "".join(out)
+
+
 def _rewrite_static_members(text: str, filename: str) -> str:
     """A static member is one object for the class, so it becomes one object.
 
@@ -3851,11 +4075,18 @@ def _rewrite_static_members(text: str, filename: str) -> str:
                 rf"\b{re.escape(o)}\s*::\s*{re.escape(n)}\b", s, part
             ),
         )
-    # A bare mention of one - `count` written inside its own class - only
-    # where exactly one class has a member of that name. Where two do, the
-    # bare name is whichever class the mention is inside, which this pass
-    # cannot see once the bodies have been taken apart; `C::count` is written
-    # out and is unambiguous either way.
+    # A bare mention of one, written where C++ resolves it that way: inside
+    # the class's own body - done above, where the body was in hand - and
+    # inside a method of that class defined outside it, `void C::f() { count
+    # ++; }`. Only there.
+    #
+    # Over the whole file it renamed every mention of the word anywhere, and
+    # the moment a shipped header declared `class ios` with a static `out`,
+    # every local called `out` in every unrelated function became
+    # `ios__out` - a variable of a type it never had, in a program that
+    # mentions neither `ios` nor a file. What made it survive this long is
+    # that no class py2bin ships had a static member named like an ordinary
+    # local.
     once = [
         (owner, name)
         for (owner, name) in owners
@@ -3863,10 +4094,14 @@ def _rewrite_static_members(text: str, filename: str) -> str:
     ]
     for (owner, name) in once:
         spelled = _c_name(owner, name)
-        text = _map_code(
+        text = _within_out_of_line_methods(
             text,
-            lambda part, n=name, s=spelled: re.sub(
-                rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, part
+            owner,
+            lambda part, n=name, s=spelled: _map_code(
+                part,
+                lambda piece, m=n, t=s: re.sub(
+                    rf"(?<![.\w>:]){re.escape(m)}\b(?!\s*::)", t, piece
+                ),
             ),
         )
     return text
@@ -3883,6 +4118,75 @@ _QUALIFIED_DEFINITION = re.compile(
 
 #: `class Inner {` written inside another class body.
 _NESTED_CLASS = re.compile(r"\b(class|struct)\s+([A-Za-z_]\w*)\s*\{")
+
+
+#: `const string &digest = {}` - a parameter whose default is a value of its
+#: own type, built from nothing.
+_BRACE_DEFAULT = re.compile(r"=\s*\{\s*\}")
+
+
+def _brace_defaults_as_values(text: str, numbered: "list[int]") -> str:
+    """`= {}` on a parameter, written as something C can be given.
+
+    C++ builds a fresh object of the parameter's type for each call that
+    leaves it out. For a number or a pointer that object is a zero, which is
+    what goes in. For a class it is an object, and an object cannot be
+    written inside a call - so one is declared at file scope, built once by
+    the same pass that builds every other object declared there, and its
+    address is what the call is given. Nothing writes to it: a defaulted
+    argument is read by the function that took it and then forgotten, which
+    is what makes one object enough for every call.
+
+    Left as written, `{}` reached the C stage inside an argument list and
+    was reported as an expression that is not one.
+    """
+
+    bare = _without_literals(text)
+    globals_written: "list[str]" = []
+    out: "list[str]" = []
+    at = 0
+    for found in _BRACE_DEFAULT.finditer(bare):
+        if _depth_of_parentheses(bare, found.start()) < 1:
+            continue  # not inside a parameter list
+        opening = max(
+            bare.rfind(",", 0, found.start()), bare.rfind("(", 0, found.start())
+        )
+        if opening < 0:
+            continue
+        spelled = text[opening + 1: found.start()].strip()
+        held = re.sub(r"\b(?:const|volatile)\b", " ", spelled)
+        held = held.replace("&", " ").strip()
+        words = held.split()
+        # The last word is the parameter's name; what is in front is its type.
+        kind = " ".join(words[:-1]).strip() if len(words) > 1 else ""
+        if not kind:
+            continue
+        out.append(text[at: found.start()])
+        if "*" in kind or all(word in _TYPE_WORDS for word in kind.split()):
+            out.append("= 0")
+        else:
+            numbered[0] += 1
+            name = f"__py2bin_default_{numbered[0]}"
+            globals_written.append(f"static {kind} {name};")
+            out.append(f"= {name}")
+        at = found.end()
+    if not globals_written and at == 0:
+        return text
+    out.append(text[at:])
+    written = "\n".join(globals_written)
+    return (written + "\n" if written else "") + "".join(out)
+
+
+def _depth_of_parentheses(bare: str, at: int) -> int:
+    """How many parameter lists or calls are open where this stands."""
+
+    depth = 0
+    for piece in bare[:at]:
+        if piece == "(":
+            depth += 1
+        elif piece == ")":
+            depth -= 1
+    return depth
 
 
 def _rewrite_default_arguments(text: str) -> str:
@@ -5021,7 +5325,9 @@ def _expand_lambdas(
         )
         parameters = shapes[0]
         result = (declared or "").strip() or _lambda_result(body, parameters, text)
-        held = _lambda_captures(captures, text, found.start(), filename, body)
+        held = _lambda_captures(
+            captures, text, found.start(), filename, body, parameters
+        )
         # A reference capture is the address, and every use inside follows it.
         classes = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
         owner = next((s.strip() for v, s, _r, _f in held if v == _SELF), None)
@@ -5036,7 +5342,14 @@ def _expand_lambdas(
             {name: None for name in classes},
         )
         members = "".join(
-            f"    {spelled} {'*' if by_reference else ''}{variable};\n"
+            # Without the qualifier: a closure's members are this
+            # translator's own, nothing here enforces const, and every
+            # lookup that asks what class a member holds reads the words as
+            # written - so `const string *message` was a member of no class
+            # at all, and the call on it went to the C compiler as
+            # `message->size()`.
+            f"    {re.sub(r'\b(?:const|volatile)\b', ' ', spelled).strip()} "
+            f"{'*' if by_reference else ''}{variable};\n"
             for variable, spelled, by_reference, _from in held
         )
         operators = "".join(
@@ -5522,7 +5835,12 @@ def _names_of_class(text: str, owner: str) -> "set[str]":
     return set()
 
 def _lambda_captures(
-    captures: str, text: str, at: int, filename: str, body: str = ""
+    captures: str,
+    text: str,
+    at: int,
+    filename: str,
+    body: str = "",
+    parameters: str = "",
 ) -> "list[tuple[str, str, bool]]":
     """Each captured name, the type it is held as, and whether by reference.
 
@@ -5537,7 +5855,9 @@ def _lambda_captures(
     if not spelled:
         return []
     if spelled in ("=", "&"):
-        held = _captures_used(text, at, body, by_reference=spelled == "&")
+        held = _captures_used(
+            text, at, body, by_reference=spelled == "&", taken=parameters
+        )
         # `[=]` and `[&]` written inside a member function capture `this` as
         # well, and C++ resolves a bare member name through it. Without this
         # the body named a method that exists on no class the closure knows.
@@ -5593,7 +5913,7 @@ _AUTO_NAMED = re.compile(r"(?<![.\w>])auto\s*[*&]?\s*([A-Za-z_]\w*)\s*=")
 
 
 def _captures_used(
-    text: str, at: int, body: str, by_reference: bool
+    text: str, at: int, body: str, by_reference: bool, taken: str = ""
 ) -> "list[tuple[str, str, bool]]":
     """What `[=]` or `[&]` captures: whatever the body uses and the scope has.
 
@@ -5604,13 +5924,31 @@ def _captures_used(
     """
 
     before = text[:at]
+    # The lambda's own parameters are not captures: a name it is given hides
+    # whatever the scope around it calls the same thing, and capturing that
+    # one made a member of it - which is not what the body meant by the name,
+    # and the closure was built from an object that had never been named.
+    its_own = {
+        found.group(1)
+        for part in _split_arguments(_without_literals(taken))
+        for found in [re.search(r"([A-Za-z_]\w*)\s*$", part.strip())]
+        if found is not None
+    }
     start = _enclosing_body_start(before)
     scope = before[start:]
+    # The names the enclosing function was given, which are as much a part of
+    # the scope as anything declared inside it. Read from the head, since the
+    # body starts after it: a `[&]` lambda inside `handle(const string
+    # &message, int &counter)` captured neither, and the C it became named
+    # both as though they were globals - which nothing had declared.
+    parameters = _enclosing_parameter_names(before, start)
     held: "list[tuple[str, str, bool, str]]" = []
     seen: "set[str]" = set()
     for match in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)", _without_literals(body)):
         name = match.group(1)
         if name in seen or name in _NOT_A_TYPE or name in _LEADS_A_TYPE:
+            continue
+        if name in its_own:
             continue
         # A name that is called is a function, not a capture - unless the
         # scope declares it, and then it is an object with a call operator: a
@@ -5618,7 +5956,7 @@ def _captures_used(
         # of the use alone, a closure that called another closure did not
         # capture it, and the C named a function nothing had defined.
         after = body[match.end():].lstrip()
-        declared = set(_declared_here(scope)) | {
+        declared = set(_declared_here(scope)) | set(parameters) | {
             found.group(1)
             for found in _AUTO_NAMED.finditer(_without_literals(scope))
         }
@@ -5634,6 +5972,43 @@ def _captures_used(
             (name, found, by_reference, f"&{name}" if by_reference else name)
         )
     return held
+
+
+def _enclosing_parameter_names(before: str, start: int) -> "dict[str, bool]":
+    """The names the function whose body starts at `start` was given.
+
+    Each with whether it was declared a reference, because one already holds
+    an address: capturing it by reference is passing what it holds, and
+    taking its address again made a pointer to a pointer that the C compiler
+    would not take - `[&]` inside `handle(int &counter)` said so.
+
+    Read off the head between its parentheses. A parameter is written like a
+    declaration with the name last, so the last word of each is what it is
+    called - and one written with no name at all contributes none.
+    """
+
+    head = _without_literals(before[:start]).rstrip()
+    # `const`, `noexcept` and a trailing return may stand between the
+    # parameter list and the brace.
+    shut = head.rfind(")")
+    if shut < 0:
+        return set()
+    opening = _opening_paren(head, shut)
+    if opening < 0:
+        return set()
+    found: "dict[str, bool]" = {}
+    for part in _split_arguments(head[opening + 1: shut]):
+        spelled = re.sub(r"=[^,]*$", "", part).strip()
+        # An array bound or a default value is not the name.
+        spelled = re.sub(r"\[[^\]]*\]\s*$", "", spelled).strip()
+        named = re.search(r"([A-Za-z_]\w*)\s*$", spelled)
+        if named is None or named.group(1) in _NOT_A_TYPE:
+            continue
+        if named.start(1) == 0:
+            # One word only: a type with no name, `void f(int)`.
+            continue
+        found[named.group(1)] = "&" in spelled[: named.start(1)]
+    return found
 
 
 def _enclosing_body_start(before: str) -> int:
@@ -6585,7 +6960,11 @@ def _expand_templates(text: str, filename: str) -> str:
             )
             cut.append((match.start(), match.end() + closing))
             continue
-        definition = _DEFINITION.match(rest) or _TEMPLATED_RESULT.match(rest)
+        definition = (
+            _DEFINITION.match(rest)
+            or _TEMPLATED_RESULT.match(rest)
+            or _ARRAY_REF_DEFINITION.match(rest)
+        )
         if definition is None:
             raise CppTranslationError(
                 filename,
@@ -6770,8 +7149,10 @@ def _expand_templates(text: str, filename: str) -> str:
         if kind == "guarded":
             read = _guarded_definition(pattern_text)
             return None if read is None else read["parameters"]
-        declared = _DEFINITION.match(pattern_text) or _TEMPLATED_RESULT.match(
-            pattern_text
+        declared = (
+            _DEFINITION.match(pattern_text)
+            or _TEMPLATED_RESULT.match(pattern_text)
+            or _ARRAY_REF_DEFINITION.match(pattern_text)
         )
         return None if declared is None else declared.group(3)
 
@@ -6963,6 +7344,7 @@ def _expand_templates(text: str, filename: str) -> str:
                 pattern, parameters, arguments
             )
             if kind == "function":
+                copy = _array_reference_as_a_pointer(copy)
                 # Only the name in the head. A function template may call
                 # itself, and a recursive call is not a call to this copy:
                 # `total(rest...)` inside the copy for three arguments is a
@@ -7553,9 +7935,24 @@ _DECLARED_BUILT = re.compile(
     r"^\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;\s*$"
 )
 
+#: `uintptr_t`, `unsigned long`, `const char *` - a name, or a few words and
+#: some stars, and nothing else. What a conversion operator is named by.
+_SPELLS_A_TYPE = re.compile(
+    r"^\s*(?:(?:const|volatile|unsigned|signed|long|short|struct)\s+)*"
+    r"[A-Za-z_]\w*\s*[*&]*\s*(?:const\s*)?$"
+)
+
 #: The classes this file declares. Read before the exception pass, which runs
 #: before classes are taken apart and so has nothing else to ask.
 _CLASS_NAMES: "set[str]" = set()
+
+#: The names this file typedefs. A conversion operator is named by the type
+#: it answers - `operator uintptr_t() const`, which is what `std::atomic<T>`
+#: becomes once T is one - and a name is a type here if the file said so.
+#: Read from the file rather than from a list of the ones a standard header
+#: happens to define, which would be right until the first program that
+#: writes its own.
+_TYPEDEF_NAMES: "set[str]" = set()
 
 #: What `#pragma pack` was in force where each class was written. Read before
 #: anything moves, because the pragma says where the members of the struct
@@ -8821,7 +9218,9 @@ def _rewrite_threads(text: str, filename: str) -> str:
             parameters = ", ".join(
                 [f"{on_type} v_on"] + [f"{one} v{index}" for index, one in enumerate(spelled_types)]
             )
-            assigned = "on = v_on; " + " ".join(f"a{index} = v{index};" for index in range(len(bound)))
+            assigned = "on = v_on; " + " ".join(
+                f"a{index} = v{index};" for index in range(len(bound))
+            )
             passing = ", ".join(f"__py2bin_a->a{index}" for index in range(len(bound)))
             made.append(
                 f"class {pack} {{\npublic:\n{members}"
@@ -9800,13 +10199,16 @@ def _this_qualified(
 
     def replace(match: "re.Match[str]") -> str:
         word = match.group(0)
-        if word not in names or word in hidden:
-            return word
         start = match.start()
         # Not after `.` or `->`, which already name an object, and not a
-        # member of some other struct.
-        before = body[:start].rstrip()
+        # member of some other struct. Read from the piece this match was
+        # found in - `_map_code` hands each stretch of code separately, and
+        # an index into one of those is not an index into the whole body.
+        seen = match.string
+        before = seen[:start].rstrip()
         if before.endswith(".") or before.endswith("->"):
+            return word
+        if word not in names or word in hidden:
             return word
         return f"this->{names[word]}{word}"
 
@@ -10531,6 +10933,7 @@ def _emit_one(
         stable=scope,
         returns=method.returns,
         referenced=set(references),
+        parameters=parameters,
     )
     if returned:
         body = _return_through_pointer(body, returned or "")
@@ -11565,11 +11968,20 @@ def _answer_into_the_space(body: str, answering: "list[str]") -> str:
 def _name_the_receiver(body: str, method: str) -> str:
     """`name().c_str()` becomes `this->name().c_str()`.
 
-    Only where something is reached on the answer, because only there does it
-    matter: a call standing on its own, or handed straight to a `return`, is
-    already written out correctly by the caller of this. Scanned rather than
-    substituted because what follows the *closing* paren is the question, and
-    the arguments in between may hold parens of their own.
+    Only where the answer is used as an object: something reached on it, or
+    written to a stream. A call standing on its own, or handed straight to a
+    `return`, is already written out correctly by the caller of this.
+
+    The stream is the same problem in another spelling. `out << code()`
+    consumes the answer exactly as `code().size()` does, and left bare the
+    call was never given the hidden pointer a value return is written
+    through - so the C compiler was handed a call with one argument to a
+    function taking two, in a program whose only unusual feature is that it
+    left `this->` off.
+
+    Scanned rather than substituted because what follows the *closing* paren
+    is the question, and the arguments in between may hold parens of their
+    own.
     """
 
     bare = _without_literals(body)
@@ -11582,7 +11994,7 @@ def _name_the_receiver(body: str, method: str) -> str:
         if close < 0:
             continue
         after = bare[close + 1:].lstrip()
-        if not after.startswith(".") and not after.startswith("->"):
+        if not after.startswith((".", "->", "<<", ">>")):
             continue
         out.append(body[at:match.start()])
         out.append("this->")
@@ -11733,7 +12145,59 @@ def _type_code(spelled: str) -> str:
     cleaned = re.sub(r"\b(const|volatile)\b", " ", spelled)
     cleaned = cleaned.replace("*", " p ").replace("&", " ")
     words = [word for word in cleaned.split() if word]
-    return "_".join(words) or "void"
+    # `int64_t` is `long long` and `uint8_t` is `unsigned char`, and which is
+    # which depends on the machine - so it is asked of the C stage, which
+    # settles those names for the target and is the only place they are
+    # settled at all. Coded as the name itself, `payload << offset` on an
+    # `int64_t` matched no `operator<<` in the shipped stream: not the one
+    # for `long`, which is what it is, nor any other, and a program that
+    # writes a file offset to a stream is ordinary.
+    # Word by word, since a fixed-width name may stand beside a star or a
+    # qualifier: `uint8_t *` is `unsigned char *`, and looked up whole it
+    # was nothing at all - so a range of bytes matched no form of `string`
+    # while the very same range spelled `unsigned char *` matched one.
+    table = _fixed_width_types()
+    spread: "list[str]" = []
+    for word in words:
+        held = table.get(word)
+        spread.extend(held.split() if held is not None else [word])
+    return "_".join(spread) or "void"
+
+
+def _fixed_width_types() -> "dict[str, str]":
+    """What each of C's fixed-width names stands for on this target.
+
+    Read from the C stage's own table rather than written out again here:
+    two lists of the same thing are one edit away from disagreeing, and the
+    C stage is where a size is decided.
+    """
+
+    global _FIXED_WIDTH
+    if _FIXED_WIDTH is None:
+        from .c_frontend import _TYPEDEFS
+
+        _FIXED_WIDTH = {
+            name: str(held)
+            for name, held in _TYPEDEFS.items()
+            if str(held) != name
+        }
+    return _FIXED_WIDTH
+
+
+#: Filled the first time a type is coded, from the C stage.
+_FIXED_WIDTH: "dict[str, str] | None" = None
+
+
+def _without_a_class_star(code: str) -> str:
+    """`string_p` becomes `string` where the name is a class of this file.
+
+    Only for a class: `char_p` is a pointer to characters and means exactly
+    that, and turning it into `char` would make `write(s)` on a string
+    literal call the one taking a single character.
+    """
+
+    held = code[: -len("_p")] if code.endswith("_p") else ""
+    return held if held and held in _CLASS_NAMES else code
 
 
 def _parameter_types(parameters: str) -> "list[str]":
@@ -11847,11 +12311,21 @@ def _chosen_overload(
         # decides nothing and does not have to.
         return _narrowed_by_what_is_known(candidates, wanted)
     codes = [_type_code(item) for item in wanted]
+    # A reference to a class is a pointer by the time a call is read, and a
+    # method taking that class by value is the one it means: an object of a
+    # class travels by address here whichever way it was declared. Without
+    # this, `out.append(a)` on a `const string &a` matched neither the form
+    # taking a `string` nor the one taking a `const char *`, and every
+    # program that passes on a string parameter it was given stopped.
+    plain = [_without_a_class_star(code) for code in codes]
     exact = [
-        m for m in candidates if _parameter_types(m.parameters) == codes
+        m
+        for m in candidates
+        if _parameter_types(m.parameters) in (codes, plain)
     ]
     if len(exact) == 1:
         return exact[0]
+    codes = plain if plain != codes and not exact else codes
     near = [
         m
         for m in candidates
@@ -12894,7 +13368,13 @@ def _hoist_value_returns(
 
         for name, (held, by_reference) in returning.items():
             for match in re.finditer(
-                rf"(?<![.\w>:]){re.escape(name)}\s*\(", text
+                # `this->` in front counts as the same call: a bare call to
+                # the class's own method is written that way now, and a
+                # pattern that refused anything after `>` stopped seeing it -
+                # so `__slot(key) = value` inside the shipped map was no
+                # longer hoisted into the reference it answers, and the
+                # assignment went to the C compiler as one to a pointer.
+                rf"(?<![.\w>:])(?:this->)?{re.escape(name)}\s*\(", text
             ):
                 close = _closing_paren(text, match.end() - 1)
                 if close < 0 or _is_a_definition(text, close):
@@ -13910,6 +14390,11 @@ def _rewrite_body(
     inherited_references: "dict[str, str] | None" = None,
     referenced: "set[str] | None" = None,
     stable: str = "",
+    #: The parameter list of the function this body belongs to, so a name it
+    #: was given can be typed. `known` holds what the body declares, and a
+    #: parameter is declared above it - which is text no reader inside the
+    #: body can see.
+    parameters: str = "",
     #: What this body *is*, if a jump leaves it: `_A_LOOP` for a while, for
     #: or do body, `_A_SWITCH` for a switch's, `""` for any other block. What
     #: `break` and `continue` leave is the innermost loop's body - or, for
@@ -13982,7 +14467,18 @@ def _rewrite_body(
                 return constructed + " " + _copied_in(
                     type_name, variable, f"&{given[0]}", classes
                 )
-            suffix = _call_suffix(owner, "", classes, given, scope())
+            suffix = _call_suffix(
+                owner,
+                "",
+                classes,
+                [
+                    _asked_as(
+                        one, known, _declared_parameters(parameters), classes, owner
+                    )
+                    for one in given
+                ],
+                scope(),
+            )
             passed = f", {arguments}" if arguments else ""
             call = f"{_c_name(owner, '', suffix)}(&{variable}{passed});"
             if once:
@@ -14297,7 +14793,7 @@ def _rewrite_body(
         # what a by-value return is once the ABI is written out.
         return (
             f"struct {type_name} {variable}; "
-            f"{_c_name(owner, method, _call_suffix(owner, method, classes, [a.strip() for a in _split_arguments(fixed)] if fixed.strip() else [], scope()))}"
+            f"{_c_name(owner, method, _call_suffix(owner, method, classes, [_asked_as(a, known, _declared_parameters(parameters), classes, owner if not method else '') for a in _split_arguments(fixed)] if fixed.strip() else [], scope()))}"
             f"({address}, &{variable}{passed});"
         )
 
@@ -14478,7 +14974,7 @@ def _rewrite_body(
     # before the ordinary call rewriting, which would otherwise turn
     # `V c = a.plus(b);` into an assignment from a function that returns void.
     body, from_operators = _rewrite_value_operators(
-        body, classes, known, pointers, unit
+        body, classes, known, pointers, unit, _declared_parameters(parameters)
     )
     known.update(from_operators)
     # `v[i].get()` where `v[i]` is what an index operator returns. Before the
@@ -14520,7 +15016,14 @@ def _rewrite_body(
                 pattern,
                 _dispatched(held, method, classes, reached, provider, scope())
                 if indirect
-                else _name_for(provider, method, classes, scope()),
+                else _name_for(
+                    provider,
+                    method,
+                    classes,
+                    scope(),
+                    known=known,
+                    given_as=_declared_parameters(parameters),
+                ),
                 variable,
                 reached,
             )
@@ -14712,7 +15215,15 @@ def _rewrite_body(
                 # The object's own address for a virtual call, the base
                 # subobject's for a direct one.
                 _dispatched(
-                    holds, method, classes, address, owner, scope(), reached
+                    holds,
+                    method,
+                    classes,
+                    address,
+                    owner,
+                    scope(),
+                    reached,
+                    known=known,
+                    given_as=_declared_parameters(parameters),
                 ),
                 reached,
             )
@@ -14737,7 +15248,9 @@ def _rewrite_body(
     # back the stream as an address and the next call takes it as its
     # receiver, so following the reference in between would leave a struct
     # where a pointer is wanted.
-    body = _rewrite_stream_chains(body, classes, known, pointers, scope())
+    body = _rewrite_stream_chains(
+        body, classes, known, pointers, scope(), _declared_parameters(parameters)
+    )
 
     # Now that this scope is known, each block is rewritten inside it.
     rewritten_blocks = [
@@ -14965,6 +15478,7 @@ def _rewrite_value_operators(
     known: "dict[str, str]",
     pointers: "set[str]",
     scope: str = "",
+    given_as: "dict[str, str] | None" = None,
 ) -> "tuple[str, dict[str, str]]":
     """`V c = a + b;` - an operator answering an object, given somewhere to put it."""
 
@@ -15035,7 +15549,12 @@ def _rewrite_value_operators(
                 else right
             )
             suffix = _call_suffix(
-                owner, name, classes, [right], reading, match.start()
+                owner,
+                name,
+                classes,
+                [_asked_as(right, known, given_as, classes)],
+                reading,
+                match.start(),
             )
             out.append(body[at:match.start()])
             out.append(
@@ -15051,12 +15570,80 @@ def _rewrite_value_operators(
 _STREAM_CHAIN = re.compile(r"(?<![.\w>])([A-Za-z_]\w*)\s*(<<|>>)")
 
 
+def _asked_as(
+    operand: str,
+    known: "dict[str, str] | None" = None,
+    given_as: "dict[str, str] | None" = None,
+    classes: "dict[str, Class] | None" = None,
+    owner: str = "",
+) -> str:
+    """The operand with its type written in front, where the type is known.
+
+    An overload is chosen by what the argument is, and the reader that works
+    that out searches text - so a name the body was given, or one this
+    translator declared a line above, was looked for through every header
+    the file pastes in. `key`, a `string` parameter, was answered with a
+    Windows typedef of the same name, and the `+` beside it had no form
+    that took one. What the body already knows is said outright instead;
+    the cast is for the reader and never reaches the output.
+    """
+
+    spelled = operand.strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*", spelled):
+        answered = _what_a_member_call_answers(spelled, classes or {})
+        return f"({answered}){spelled}" if answered else operand
+    held = (known or {}).get(spelled) or (given_as or {}).get(spelled)
+    if not held:
+        return operand
+    # Not where what it holds is the very class being built: `path(out)` on
+    # a `path` is a copy, which no constructor is written for and which the
+    # pass below turns into an assignment. Said outright it became a call
+    # nothing takes, and a copy that had always worked stopped.
+    if owner and re.sub(r"\b(?:const|volatile)\b", " ", held).replace("&", " ").strip() == owner:
+        return operand
+    return f"({held}){spelled}"
+
+
+def _what_a_member_call_answers(
+    operand: str, classes: "dict[str, Class]"
+) -> str:
+    """The result type of `Owner__member(...)`, read from the class."""
+
+    called = re.match(r"^([A-Za-z_]\w*)__([A-Za-z_]\w*)\s*\(", operand.strip())
+    if called is None:
+        return ""
+    owner = classes.get(called.group(1))
+    if owner is None:
+        return ""
+    for method in owner.methods:
+        if method.name == called.group(2) and method.returns:
+            return method.returns.strip()
+    return ""
+
+
+def _declared_parameters(parameters: str) -> "dict[str, str]":
+    """Each parameter of a function, by name, with the type it was given."""
+
+    found: "dict[str, str]" = {}
+    for part in _split_arguments(parameters):
+        spelled = re.sub(r"=[^,]*$", "", part).strip()
+        spelled = re.sub(r"\[[^\]]*\]\s*$", " *", spelled).strip()
+        named = re.search(r"([A-Za-z_]\w*)\s*$", spelled)
+        if named is None or named.start(1) == 0:
+            continue
+        held = spelled[: named.start(1)].strip()
+        if held:
+            found[named.group(1)] = held
+    return found
+
+
 def _rewrite_stream_chains(
     body: str,
     classes: "dict[str, Class]",
     known: "dict[str, str]",
     pointers: "set[str]",
     scope: str = "",
+    given_as: "dict[str, str] | None" = None,
 ) -> str:
     """`out << a << b` becomes one call wrapped around another.
 
@@ -15093,9 +15680,16 @@ def _rewrite_stream_chains(
             owner = _find_method(holds, name, classes)
             if owner is None:
                 break
+            # What the function being rewritten declared this to be, said
+            # where the overload is chosen. Left to be read out of the whole
+            # unit, a name the enclosing function had - `offset`, an
+            # `int64_t` parameter of the lambda writing it - was looked for
+            # among three quarters of a million characters of pasted headers,
+            # and a struct field of the same name in one of them answered.
+            asked = _asked_as(operand, known, given_as, classes)
             picked = _chosen_overload(
                 _overload_set(owner, name, classes),
-                [operand],
+                [asked],
                 scope or body,
                 found.start(),
             )
@@ -15103,7 +15697,7 @@ def _rewrite_stream_chains(
                 owner,
                 name,
                 _call_suffix(
-                    owner, name, classes, [operand], scope or body, found.start()
+                    owner, name, classes, [asked], scope or body, found.start()
                 ),
             )
             if picked is not None and not operand.startswith("&"):
@@ -15115,9 +15709,14 @@ def _rewrite_stream_chains(
                     and len(words) == 2
                     and words[0] in classes
                 )
-                if (by_value or _REFERENCE.search(declared)) and _has_an_address(
-                    operand
+                if (
+                    (by_value or _REFERENCE.search(declared))
+                    and _has_an_address(operand)
+                    and operand.strip() not in pointers
                 ):
+                    # Not one that is an address already: a reference
+                    # parameter reaches here as the pointer it became, and
+                    # taking its address again handed the stream a `T **`.
                     operand = f"&{operand}"
             # Each call hands back the stream, as the address its reference
             # became, so the next one takes it as the receiver directly.
@@ -15228,7 +15827,13 @@ def _rewrite_indexed_operator(
             # An element of an array of objects, or any other object: the
             # call takes its address, the way every receiver here does.
             passed = f"&{right}"
-        suffix = _call_suffix(owner, name, classes, [right], f"{body}\n{scope}")
+        suffix = _call_suffix(
+            owner,
+            name,
+            classes,
+            [_asked_as(right, known, None, classes)],
+            f"{body}\n{scope}",
+        )
         out.append(body[at:found.start()])
         out.append(
             f"{_c_name(owner, name, suffix)}"
@@ -16957,13 +17562,30 @@ def _name_for(
     classes: "dict[str, Class]",
     text: str = "",
     before: int = -1,
+    known: "dict[str, str] | None" = None,
+    given_as: "dict[str, str] | None" = None,
 ):
-    """A name if that member is alone, otherwise a chooser reading the call."""
+    """A name if that member is alone, otherwise a chooser reading the call.
+
+    The chooser is told what the body knows each name to be, because reading
+    it out of the text means searching every header the file pastes in:
+    `text.find(token, start + 1)` on a `string token` was answered with a
+    WebView2 struct of that name, and no `find` takes one.
+    """
 
     if not _overloaded(owner, method, classes):
         return _c_name(owner, method)
     return lambda given: _c_name(
-        owner, method, _call_suffix(owner, method, classes, given, text, before)
+        owner,
+        method,
+        _call_suffix(
+            owner,
+            method,
+            classes,
+            [_asked_as(one, known, given_as, classes) for one in given],
+            text,
+            before,
+        ),
     )
 
 
@@ -17029,11 +17651,15 @@ def _dispatched(
     static: str,
     text: str = "",
     direct: "str | None" = None,
+    known: "dict[str, str] | None" = None,
+    given_as: "dict[str, str] | None" = None,
 ):
     """`_dispatch` where it applies, otherwise the direct name."""
 
     virtual = _dispatch(holds, method, classes, receiver)
-    named = _name_for(static, method, classes, text)
+    named = _name_for(
+        static, method, classes, text, known=known, given_as=given_as
+    )
     if virtual is None:
         return named
 
@@ -18156,6 +18782,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _rewrite_brace_initialisers(text)
     text = _rewrite_static_members(text, filename)
     text = _lift_nested_classes(text)
+    text = _brace_defaults_as_values(text, [0])
     text = _rewrite_default_arguments(text)
     text = _rewrite_range_for(text, [0])
     # After the spellings, because the body a callback carries has `nullptr`
@@ -18251,7 +18878,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # which was true only of a file with no `throw` in it, since a file with
     # one filled these in on the way past.
     global _CLASS_NAMES, _POLYMORPHIC, _INHERITED_FROM, _CLASS_MEMBERS
+    global _TYPEDEF_NAMES
     _CLASS_NAMES = {m.group(2) for m in _CLASS_HEAD.finditer(text)}
+    _TYPEDEF_NAMES = set(_typedef_names_declared(text))
     # A number given to a class in one file means nothing in the next.
     _THROWN_KINDS.clear()
     _LAMBDA_RESULTS.clear()
@@ -19604,9 +20233,13 @@ _FUNCTION_HEAD = re.compile(r"\)\s*\{")
 # `b->v`, and `n = n + 1` on an `int &n` is `(*n) = (*n) + 1`. Call sites take
 # the address, which is what the caller was doing all along without saying so.
 
-#: `Box &b` or `const int & n` in a parameter list or a declaration.
+#: `Box &b`, `const int & n`, or `T *&where` in a parameter list or a
+#: declaration. A reference to a pointer is one too - `std::advance(p, 3)`
+#: moves the caller's own pointer, so what the callee holds is the address of
+#: it - and read without the star the C stage was handed a `&` it has no
+#: meaning for.
 _REFERENCE = re.compile(
-    r"\b((?:const\s+)?[A-Za-z_]\w*)\s*&\s*([A-Za-z_]\w*)"
+    r"\b((?:const\s+)?[A-Za-z_]\w*(?:\s*\*)*)\s*&\s*([A-Za-z_]\w*)"
 )
 
 
@@ -19684,6 +20317,12 @@ def _deref_references(
     """
 
     for name, held in references.items():
+        # `const string &` and `string &` name the same class. Asked with the
+        # qualifier still on it, a `const` reference to a class was taken for
+        # a reference to something else and dereferenced at every use, so
+        # `message.size()` became `(*message).size()` - a call on a struct
+        # value, which the C stage does not have.
+        held = re.sub(r"\b(?:const|volatile)\b", " ", held or "").strip()
         if held in classes:
             # `held_ = other;` where `other` is a reference to a class: the
             # pointer is how the reference is carried, and what is being
@@ -19736,10 +20375,22 @@ def _deref_references(
                 ),
             )
             continue
+        # `&r` on a reference to anything else, exactly as on a reference
+        # to a class above: the address of what it names is what the pointer
+        # already holds. Left with its `&`, a name that had become a pointer
+        # gave a `T **` - which is what `[&]` capturing an `int &` parameter
+        # handed the closure - and taken off before the dereference below,
+        # the name that was left was dereferenced like any other use. So
+        # both are decided in one pass, each occurrence by what stands in
+        # front of it.
         body = _map_code(
             body,
             lambda part, n=name: re.sub(
-                rf"(?<![.\w>&]){re.escape(n)}\b(?!\s*[\w(])", f"(*{n})", part
+                rf"(&\s*)?(?<![.\w>]){re.escape(n)}\b(?!\s*[\w(])",
+                lambda found, held=name: (
+                    held if found.group(1) else f"(*{held})"
+                ),
+                part,
             ),
         )
     return body
@@ -19757,6 +20408,80 @@ _TEMPLATED_RESULT = re.compile(
 )
 
 _DEFINITION = re.compile(r"\b([A-Za-z_][\w\s*]*?(?:&&?\s*)?)\b([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*\{")
+
+#: `long size(T (&a)[N])` - a function taking an array by reference, which is
+#: how the standard library asks for one whose length it wants to know:
+#: `std::size`, `std::begin` and `std::end` over a plain array are all this
+#: shape. The parentheses in the parameter belong to the declarator, so the
+#: ordinary pattern - which allows none - never saw a function here at all.
+_ARRAY_REF_DEFINITION = re.compile(
+    r"\b([A-Za-z_][\w\s*]*?(?:&&?\s*)?)\b([A-Za-z_]\w*)\s*"
+    r"\(([^;{}]*\(\s*&\s*[A-Za-z_]\w*\s*\)\s*\[[^\]]*\][^;{}]*)\)\s*\{"
+)
+
+#: One parameter of that shape: the element type, the name, and the bound.
+_AN_ARRAY_REFERENCE = re.compile(
+    r"^(.*?)\(\s*&\s*([A-Za-z_]\w*)\s*\)\s*\[([^\]]*)\]\s*$", re.S
+)
+
+
+#: `wchar_t buffer[256]` - an array declared with its bound, wherever it is
+#: written. The bound is what `std::size` answers, and the declaration is the
+#: only place it survives: passed to a function the array is a pointer.
+_DECLARED_WITH_A_BOUND = (
+    r"(?<![.\w>])(?:[A-Za-z_]\w*\s+)*[A-Za-z_]\w*[\s*]+{name}\s*\[\s*([^\]]+?)\s*\]"
+)
+
+
+def _array_bound(spelled: str, text: str, before: int = -1) -> "str | None":
+    """How many elements the array named here was declared to hold.
+
+    The nearest declaration above the point asked from, so a name declared
+    once in each of two functions answers with its own. None where the name
+    is not an array declared in this text - a pointer has no bound, and
+    answering one for it would be a number nobody wrote.
+    """
+
+    name = spelled.strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*", name):
+        return None
+    where = _without_literals(text)
+    if before >= 0:
+        where = where[:before]
+    found = None
+    for match in re.finditer(
+        _DECLARED_WITH_A_BOUND.format(name=re.escape(name)), where
+    ):
+        found = match
+    if found is None:
+        return None
+    bound = found.group(1).strip()
+    return bound or None
+
+
+def _array_reference_as_a_pointer(copy: str) -> str:
+    """`long size(wchar_t (&a)[256])` written the way C takes an array.
+
+    C has no reference and no array parameter: what is passed is the address
+    of the first element. The bound has already been substituted into the
+    body, which is where it was wanted - this only fixes the head, which
+    would otherwise be a declarator C does not have.
+    """
+
+    head = _ARRAY_REF_DEFINITION.match(copy)
+    if head is None:
+        return copy
+    written = []
+    for part in _split_arguments(head.group(3)):
+        array = _AN_ARRAY_REFERENCE.match(part.strip())
+        if array is None:
+            written.append(part.strip())
+            continue
+        held = (array.group(1) or "").strip()
+        written.append(f"{held} *{array.group(2)}".strip())
+    return (
+        copy[: head.start(3)] + ", ".join(written) + copy[head.end(3):]
+    )
 
 
 def _function_signatures(text: str, classes: "dict[str, Class]" = {}) -> "dict[str, list[int]]":
@@ -20551,6 +21276,9 @@ def _rewrite_functions(
             if opened >= 0 else unit,
             stable=unit,
             pointer_arrays=indexed,
+            parameters=(
+                head[head.rfind("(") + 1: head.rfind(")")] if opened >= 0 else ""
+            ),
             # `S *pick` splits into the type `S *` and the name `pick`;
             # splitting on whitespace put the star with the name and lost it.
             returns=(
@@ -20880,6 +21608,15 @@ public:
         while (first + i < last && i < 255) { buf[i] = first[i]; i = i + 1; }
         buf[i] = 0; len = i;
     }
+    /* Bytes, which is what a program reading a socket or a file has: a
+       `vector<uint8_t>` hands back `unsigned char *`, and a string built
+       from that range is how the text inside a frame is read out. Without
+       this form the range had to be `char *` exactly, and nothing that
+       arrives over a wire is. */
+    string(unsigned char *first, unsigned char *last) {
+        len = 0; buf[0] = 0;
+        while (first != last) { push_back((char)*first); first = first + 1; }
+    }
     string(const wchar_t *first, const wchar_t *last) {
         int i; i = 0;
         while (first + i < last && i < 255) { buf[i] = (char)first[i]; i = i + 1; }
@@ -21062,21 +21799,70 @@ public:
     }
 };
 
-string to_string(int value) {
+/* One for each width C++ has one for, so every call matches exactly: given
+   only the widest, `to_string(n)` on an `int` could reach the signed one or
+   the unsigned one and neither was nearer, which is a refusal where C++ has
+   an answer. Each is the same digits, written once below. */
+string to_string(int value) { return __py2bin_signed_digits((long long)value); }
+string to_string(long value) { return __py2bin_signed_digits((long long)value); }
+string to_string(long long value) { return __py2bin_signed_digits((long long)value); }
+string to_string(unsigned int value) { return __py2bin_unsigned_digits((unsigned long long)value); }
+string to_string(unsigned long value) { return __py2bin_unsigned_digits((unsigned long long)value); }
+string to_string(unsigned long long value) { return __py2bin_unsigned_digits((unsigned long long)value); }
+
+string __py2bin_signed_digits(long long value) {
     string out;
     char digits[24];
     int at;
     int negative;
-    unsigned int left;
+    unsigned long long left;
     at = 0;
     negative = value < 0;
-    left = negative ? (unsigned int)(-value) : (unsigned int)value;
+    left = negative ? (unsigned long long)(-value) : (unsigned long long)value;
     if (left == 0) { digits[at] = '0'; at = at + 1; }
     while (left > 0) { digits[at] = (char)('0' + (left % 10)); left = left / 10; at = at + 1; }
     if (negative) { out.push_back('-'); }
     while (at > 0) { at = at - 1; out.push_back(digits[at]); }
     return out;
 }
+
+string __py2bin_unsigned_digits(unsigned long long value) {
+    string out;
+    char digits[24];
+    int at;
+    at = 0;
+    if (value == 0) { digits[at] = '0'; at = at + 1; }
+    while (value > 0) { digits[at] = (char)('0' + (value % 10)); value = value / 10; at = at + 1; }
+    while (at > 0) { at = at - 1; out.push_back(digits[at]); }
+    return out;
+}
+
+/* The same digits as a wide string, which is what a program on Windows
+   passes to the platform: `title + to_wstring(n)`. Without it the call named
+   a function nothing declared, and what it answered could not be told - so
+   the `+` beside it had no form to choose either. */
+wstring to_wstring(long long value) {
+    string narrow = __py2bin_signed_digits(value);
+    wstring out;
+    int i;
+    i = 0;
+    while (i < narrow.size()) { out.push_back((wchar_t)narrow.at(i)); i = i + 1; }
+    return out;
+}
+
+wstring to_wstring(unsigned long long value) {
+    string narrow = __py2bin_unsigned_digits(value);
+    wstring out;
+    int i;
+    i = 0;
+    while (i < narrow.size()) { out.push_back((wchar_t)narrow.at(i)); i = i + 1; }
+    return out;
+}
+
+wstring to_wstring(int value) { return to_wstring((long long)value); }
+wstring to_wstring(long value) { return to_wstring((long long)value); }
+wstring to_wstring(unsigned int value) { return to_wstring((unsigned long long)value); }
+wstring to_wstring(unsigned long value) { return to_wstring((unsigned long long)value); }
 
 int stoi(string text) {
     int i; int sign; int value;
@@ -22648,6 +23434,58 @@ optional<T> make_optional(T value) { optional<T> made(value); return made; }
 
 #: <numeric>, which is `accumulate` and little else that a program without
 #: iterators of its own can use.
+#: <iterator>. An iterator in this subset is a pointer - `vector`'s `begin()`
+#: hands one back and so does an array - so what this header holds is what a
+#: program asks of an iterator when it does not care which container it came
+#: from. `size`, `begin`, `end` and `data` come in two shapes each: one over
+#: a container, which asks it, and one over a plain array, which reads the
+#: bound off the declaration and needs no object at all.
+_ITERATOR_HEADER = r"""
+namespace std {
+
+template<typename C> long size(C &c) { return (long)c.size(); }
+template<typename T, int N> long size(T (&a)[N]) { return (long)N; }
+
+template<typename C> int empty(C &c) { return c.size() == 0; }
+template<typename T, int N> int empty(T (&a)[N]) { return N == 0; }
+
+/* Over a plain array only. What a container hands back is spelled with its
+   own element type - `vector<T>::begin()` answers a `T *` - and this subset
+   has no way to name that from the container alone, so `std::begin(v)` on a
+   container is not written here rather than written wrongly: a container is
+   asked directly, `v.begin()`, which is what a program writes anyway. */
+template<typename T, int N> T *data(T (&a)[N]) { return &a[0]; }
+template<typename T, int N> T *begin(T (&a)[N]) { return &a[0]; }
+template<typename T, int N> T *end(T (&a)[N]) { return &a[0] + N; }
+
+/* The distance between two iterators, and the moves between them. Over
+   pointers, which is what every iterator here is, both are arithmetic. */
+template<typename T> long distance(T *first, T *last) { return (long)(last - first); }
+template<typename T> void advance(T *&where, long by) { where = where + by; }
+template<typename T> T *next(T *where) { return where + 1; }
+template<typename T> T *next(T *where, long by) { return where + by; }
+template<typename T> T *prev(T *where) { return where - 1; }
+template<typename T> T *prev(T *where, long by) { return where - by; }
+
+/* `back_inserter(v)` written to is a `push_back` on v. It carries the
+   container by address; the assignment through it is what `copy` and the
+   others do with what they are given. */
+template<typename C>
+class back_insert_iterator {
+public:
+    C *held;
+    back_insert_iterator(C &c) { held = &c; }
+    void operator=(int value) { held->push_back(value); }
+    back_insert_iterator<C> &operator*() { return *this; }
+    back_insert_iterator<C> &operator++() { return *this; }
+};
+
+template<typename C>
+back_insert_iterator<C> back_inserter(C &c) { return back_insert_iterator<C>(c); }
+
+}
+"""
+
 _NUMERIC_HEADER = r"""
 namespace std {
 template<typename T>
@@ -22818,6 +23656,25 @@ public:
             }
         }
         joined.__add_text(piece.c_str());
+        return joined;
+    }
+    /* A wide string, which is what a program on Windows has after asking
+       the platform for a name: `directory / (title + L".log")` is an
+       ordinary line, and with only the narrow form and the wide *literal*
+       one it matched neither. The characters are narrowed as `string`
+       already narrows them. */
+    path operator/(const std::wstring &piece) {
+        path joined;
+        int i;
+        i = 0;
+        while (i < this->__size()) { joined.__add(this->__at(i)); i = i + 1; }
+        if (joined.__size() > 0) {
+            if (joined.text.at(joined.__size() - 1) != '/') {
+                joined.__add_text("/");
+            }
+        }
+        i = 0;
+        while (i < piece.size()) { joined.__add((char)piece.at(i)); i = i + 1; }
         return joined;
     }
     path operator/(path piece) {
@@ -23285,6 +24142,16 @@ public:
     int operator!=(T *p) { return raw != p; }
     void reset(T *p) { raw = p; }
 };
+
+/* `make_shared<T>(...)` and `make_unique<T>(...)` - the holder built around
+   a new object in one step, which is how a program that never writes `new`
+   asks for one. The arguments go to T's own constructor. */
+template<typename T> shared_ptr<T> make_shared() { shared_ptr<T> made(new T()); return made; }
+template<typename T, typename A> shared_ptr<T> make_shared(A a) { shared_ptr<T> made(new T(a)); return made; }
+template<typename T, typename A, typename B> shared_ptr<T> make_shared(A a, B b) { shared_ptr<T> made(new T(a, b)); return made; }
+template<typename T> unique_ptr<T> make_unique() { unique_ptr<T> made(new T()); return made; }
+template<typename T, typename A> unique_ptr<T> make_unique(A a) { unique_ptr<T> made(new T(a)); return made; }
+template<typename T, typename A, typename B> unique_ptr<T> make_unique(A a, B b) { unique_ptr<T> made(new T(a, b)); return made; }
 }
 """
 
@@ -23311,15 +24178,27 @@ public:
     @NAME@ &operator<<(string s) { held.append(s); return *this; }
     @NAME@ &operator<<(char c) { held.push_back(c); return *this; }
     @NAME@ &operator<<(int v) {
-        held.append(to_string(v));
+        held.append(to_string((long long)v));
         return *this;
     }
     @NAME@ &operator<<(long v) {
-        held.append(to_string((int)v));
+        held.append(to_string((long long)v));
         return *this;
     }
+    @NAME@ &operator<<(long long v) {
+        held.append(to_string((long long)v));
+        return *this;
+    }
+    /* A width a file offset or a size is held in. Written through `int`,
+       every one of them printed the bottom half of itself and the program
+       carried on: a file longer than two gigabytes reported a negative
+       offset, and nothing said so. */
     @NAME@ &operator<<(unsigned long v) {
-        held.append(to_string((int)v));
+        held.append(to_string((unsigned long long)v));
+        return *this;
+    }
+    @NAME@ &operator<<(unsigned long long v) {
+        held.append(to_string((unsigned long long)v));
         return *this;
     }
     @NAME@ &operator<<(double v) {
@@ -23505,10 +24384,12 @@ public:
     @NAME@ &operator<<(const char *s) { held.append(s); return *this; }
     @NAME@ &operator<<(string s) { held.append(s); return *this; }
     @NAME@ &operator<<(char c) { held.push_back(c); return *this; }
-    @NAME@ &operator<<(int v) { held.append(to_string(v)); return *this; }
-    @NAME@ &operator<<(long v) { held.append(to_string((int)v)); return *this; }
+    @NAME@ &operator<<(int v) { held.append(to_string((long long)v)); return *this; }
+    @NAME@ &operator<<(long v) { held.append(to_string((long long)v)); return *this; }
+    @NAME@ &operator<<(long long v) { held.append(to_string((long long)v)); return *this; }
+    @NAME@ &operator<<(unsigned long long v) { held.append(to_string((unsigned long long)v)); return *this; }
     @NAME@ &operator<<(unsigned long v) {
-        held.append(to_string((int)v));
+        held.append(to_string((unsigned long long)v));
         return *this;
     }
     @NAME@ &operator<<(double v) {
@@ -23665,10 +24546,12 @@ public:
     ostringstream &operator<<(const char *s) { held.append(s); return *this; }
     ostringstream &operator<<(string s) { held.append(s); return *this; }
     ostringstream &operator<<(char c) { held.push_back(c); return *this; }
-    ostringstream &operator<<(int v) { held.append(to_string(v)); return *this; }
-    ostringstream &operator<<(long v) { held.append(to_string((int)v)); return *this; }
-    ostringstream &operator<<(unsigned int v) { held.append(to_string((int)v)); return *this; }
-    ostringstream &operator<<(unsigned long v) { held.append(to_string((int)v)); return *this; }
+    ostringstream &operator<<(int v) { held.append(to_string((long long)v)); return *this; }
+    ostringstream &operator<<(long v) { held.append(to_string((long long)v)); return *this; }
+    ostringstream &operator<<(long long v) { held.append(to_string((long long)v)); return *this; }
+    ostringstream &operator<<(unsigned int v) { held.append(to_string((unsigned long long)v)); return *this; }
+    ostringstream &operator<<(unsigned long v) { held.append(to_string((unsigned long long)v)); return *this; }
+    ostringstream &operator<<(unsigned long long v) { held.append(to_string((unsigned long long)v)); return *this; }
     /* Six *significant* digits, which is what C++ prints by default and
        what `cout` here already did - written out by hand as six decimal
        places, this said `1.500000` where C++ says `1.5`, and where the two
@@ -24065,6 +24948,7 @@ _BUILTIN_CPP_HEADERS = {
     "tuple": _TUPLE_HEADER,
     "deque": _DEQUE_HEADER,
     "numeric": _NUMERIC_HEADER,
+    "iterator": _ITERATOR_HEADER,
     "stdexcept": _STDEXCEPT_HEADER,
     "filesystem": _FILESYSTEM_HEADER,
     "functional": _FUNCTIONAL_HEADER,
