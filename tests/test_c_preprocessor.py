@@ -541,6 +541,27 @@ class ConditionalTests(PreprocessorTestCase):
         # A constant expression may contain anything in a branch it does not
         # take, so the division by zero here must not be reported.
         self.assertEqual(expand("#if 0 && 1 / 0\na\n#else\nb\n#endif\n"), "b")
+
+    def test_prose_in_a_skipped_group_is_not_lexed_as_code(self) -> None:
+        """A skipped group is read for its directives and for nothing else.
+
+        `this doesn't compile` under an `#if 0` is how a header explains
+        what it switched off, and the apostrophe was reported as an
+        unterminated character constant before the conditional was even
+        read. clang reads a quote nothing on its line closes as a stray
+        character and moves on; in a group that is compiled it is still the
+        error it always was, reported where it stands.
+        """
+
+        self.assertEqual(
+            expand("#if 0\nThis block doesn't compile.\n\"nor this\n#endif\nz\n"),
+            "z",
+        )
+        self.assertEqual(
+            expand("#ifdef NEVER\nIt isn't compiled either.\n#endif\nz\n"), "z"
+        )
+        self.reject("int main(void) { char c = 'a; return 0; }\n", "unterminated character constant")
+        self.reject('int main(void) { const char *s = "a; return 0; }\n', "unterminated string literal")
         self.assertEqual(expand("#if 1 || 1 / 0\na\n#endif\n"), "a")
         self.assertEqual(expand("#if 1 ? 2 : 1 / 0\na\n#endif\n"), "a")
 

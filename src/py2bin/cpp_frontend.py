@@ -204,8 +204,279 @@ class Class:
         return {method.name for method in self.methods if method.name}
 
 
+#: Where a raw string literal opens: an encoding prefix if there is one, the
+#: `R`, the quote, a delimiter of up to sixteen characters - none of them a
+#: space, a parenthesis, a backslash or a line break - and the parenthesis.
+#: The prefix has to start a token: `FOOR"("` is a name and then a string.
+_RAW_STRING_OPENING = re.compile(r'(?<![\w$])(u8|L|u|U)?R"([^\s()\\]{0,16})\(')
+
+#: Where the next thing `_cook_source` has to read for itself begins: a raw
+#: string, a comment, a quote, or a `#` that may open a directive. Everything
+#: between two of these is passed through in one piece.
+_LEXICAL_START = re.compile(
+    r'(?<![\w$])(?:u8|L|u|U)?R"[^\s()\\]{0,16}\(|//|/\*|["\']|#'
+)
+
+#: The same, inside a directive: a continuation and the line break that ends
+#: the directive matter there too.
+_DIRECTIVE_ITEM = re.compile(
+    r'\\\n|(?<![\w$])(?:u8|L|u|U)?R"[^\s()\\]{0,16}\(|//|/\*|["\']|\n'
+)
+
+#: The state of a conditional after an arm whose condition read `taken`, in
+#: the words `_directive_arms` uses for the same thing.
+_ARM_STATE = {None: "open", True: "taken", False: "dead"}
+
+
+def _past_literal(text: str, index: int) -> int:
+    """Just past the literal whose quote is at `index`.
+
+    A literal ends on the line it opened on: a line break inside one is not
+    C++, and reading on across it is how one apostrophe in prose swallowed
+    an `#endif` and everything below. Where nothing on the line closes the
+    quote it is a stray character, one wide, which is how clang reads it.
+    """
+
+    quote = text[index]
+    at = index + 1
+    length = len(text)
+    while at < length:
+        char = text[at]
+        if char == "\\":
+            at += 2
+            continue
+        if char == quote:
+            return at + 1
+        if char == "\n":
+            break
+        at += 1
+    return index + 1
+
+
+def _cooked_raw_string(prefix: str, body: str, in_directive: bool) -> str:
+    """The ordinary literal that spells the same bytes as a raw one.
+
+    The line breaks the raw string held come back after the literal, so
+    nothing below it moves a line - as line breaks in code, where they are
+    whitespace, and as continuations inside a directive, which a line break
+    would otherwise end.
+    """
+
+    escaped = (
+        body.replace("\r\n", "\n")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+    breaks = body.count("\n")
+    return f'{prefix}"{escaped}"' + ("\\\n" if in_directive else "\n") * breaks
+
+
+def _read_directive(text: str, index: int) -> "tuple[int, str, str]":
+    """The directive whose `#` is at `index`: where it ends, its spelling
+    with any raw string in it cooked, and that spelling with its comments
+    and continuations taken out, for reading what it asks.
+
+    A block comment may run across lines inside a directive and the
+    directive goes on after it, which `_after_directive` does not know; a
+    raw string may too, and is cooked to one line here with continuations
+    standing in for the breaks it held.
+    """
+
+    spelled: list[str] = []
+    clean: list[str] = []
+    at = index
+    length = len(text)
+    while at < length:
+        found = _DIRECTIVE_ITEM.search(text, at)
+        if found is None:
+            spelled.append(text[at:])
+            clean.append(text[at:])
+            at = length
+            break
+        spelled.append(text[at:found.start()])
+        clean.append(text[at:found.start()])
+        at = found.start()
+        piece = found.group()
+        if piece == "\n":
+            break
+        if piece == "\\\n":
+            spelled.append(piece)
+            clean.append(" ")
+            at += 2
+            continue
+        if piece == "//":
+            end = text.find("\n", at)
+            end = length if end < 0 else end
+            spelled.append(text[at:end])
+            clean.append(" ")
+            at = end
+            continue
+        if piece == "/*":
+            end = text.find("*/", at + 2)
+            end = length if end < 0 else end + 2
+            spelled.append(text[at:end])
+            clean.append(" ")
+            at = end
+            continue
+        if piece in ('"', "'"):
+            end = _past_literal(text, at)
+            spelled.append(text[at:end])
+            clean.append(text[at:end])
+            at = end
+            continue
+        opening = _RAW_STRING_OPENING.match(text, at)
+        closing = ")" + opening.group(2) + '"'
+        close = text.find(closing, opening.end())
+        if close < 0:
+            # Nothing closes it, so it is a name and then a quote.
+            at = opening.end() - len(opening.group(2)) - 1
+            spelled.append(text[opening.start():at])
+            clean.append(text[opening.start():at])
+            continue
+        cooked = _cooked_raw_string(
+            opening.group(1) or "", text[opening.end():close], True
+        )
+        spelled.append(cooked)
+        clean.append(cooked)
+        at = close + len(closing)
+    return at, "".join(spelled), "".join(clean)
+
+
+def _cook_source(text: str) -> str:
+    """The text as the readers below can read it: raw strings written as
+    ordinary literals, and every arm no build takes emptied.
+
+    Before anything else - before the comments go. Every reader in this
+    stage blanks the literals first so a brace or a `#` inside one is not
+    read as code, and each of them takes a quote to open a literal that runs
+    to the next quote. Two things a file may hold break that. A raw string -
+    `R"(a "b" c)"` - holds quotes that are not its ends, so it was read as
+    two literals with code between them, and reached the C stage as two. And
+    the prose a header writes inside an `#if 0` - `this doesn't compile` -
+    holds an apostrophe that opens a character constant nothing closes,
+    which ran on across the `#endif`: the conditional was never seen to
+    close, its arm was taken to run to the end of the file, and everything
+    below it went dark.
+
+    A raw string becomes the ordinary literal spelling the same bytes, with
+    the line breaks it held put back after it so nothing below moves a
+    line. A skipped arm is emptied of everything but its line breaks and the
+    conditional directives in it, which is what the preprocessor does with
+    one: it reads a skipped group for its directives and for nothing else.
+    Reading it the way clang does - a quote nothing on its line closes is a
+    stray character, a comment is a comment, a raw string is a raw string -
+    is what finds the `#endif` where clang finds it. Which arms are dead is
+    the one rule `_directive_arms` has, `_constant_arm`, so the two agree.
+    """
+
+    out: list[str] = []
+    #: The conditionals open here, innermost last: the state of the group
+    #: as `_directive_arms` keeps it, whether the arm being read is one no
+    #: build takes, and whether the whole conditional sits inside one.
+    groups: "list[list]" = []
+    dead = False
+    index = 0
+    length = len(text)
+
+    def put(piece: str) -> None:
+        out.append(_NOT_A_NEWLINE.sub(" ", piece) if dead else piece)
+
+    while index < length:
+        found = _LEXICAL_START.search(text, index)
+        if found is None:
+            put(text[index:])
+            break
+        if found.start() > index:
+            put(text[index:found.start()])
+        index = found.start()
+        piece = found.group()
+        if piece == "#":
+            if not _opens_a_line(text, index):
+                put(piece)
+                index += 1
+                continue
+            end, spelled, clean = _read_directive(text, index)
+            if _A_CONDITION.match(clean):
+                # Kept whatever arm it stands in: the nesting is what says
+                # where the arm ends, here and in `_directive_arms` after.
+                out.append(spelled)
+                if _OPENS_A_CONDITION.match(clean):
+                    taken = None if dead else _constant_arm(clean)
+                    groups.append([_ARM_STATE[taken], taken is False, dead])
+                elif groups and _ANOTHER_ARM.match(clean):
+                    group = groups[-1]
+                    if group[2]:
+                        pass
+                    elif group[0] == "dead":
+                        taken = (
+                            True
+                            if _THE_LAST_ARM.match(clean)
+                            else _constant_arm(clean)
+                        )
+                        group[0], group[1] = _ARM_STATE[taken], taken is False
+                    else:
+                        group[1] = group[0] == "taken"
+                elif groups and _CLOSES_A_CONDITION.match(clean):
+                    groups.pop()
+                dead = any(group[1] or group[2] for group in groups)
+            elif dead:
+                # An `#include` or a `#define` in an arm nothing compiles
+                # does nothing, and pasting or noting it would be doing
+                # something.
+                out.append(_NOT_A_NEWLINE.sub(" ", text[index:end]))
+            else:
+                out.append(spelled)
+            index = end
+            continue
+        if piece == "//":
+            end = text.find("\n", index)
+            end = length if end < 0 else end
+            put(text[index:end])
+            index = end
+            continue
+        if piece == "/*":
+            end = text.find("*/", index + 2)
+            end = length if end < 0 else end + 2
+            put(text[index:end])
+            index = end
+            continue
+        if piece in ('"', "'"):
+            end = _past_literal(text, index)
+            put(text[index:end])
+            index = end
+            continue
+        # A raw string. Its delimiter says what closes it, and until that is
+        # found nothing inside it - a quote, a `#endif` at the start of a
+        # line - is anything but text.
+        opening = _RAW_STRING_OPENING.match(text, index)
+        closing = ")" + opening.group(2) + '"'
+        close = text.find(closing, opening.end())
+        if close < 0:
+            # Nothing closes it, so it is a name and then a quote, read as
+            # any other.
+            end = opening.end() - len(opening.group(2)) - 1
+            put(text[index:end])
+            index = end
+            continue
+        end = close + len(closing)
+        if dead:
+            put(text[index:end])
+        else:
+            out.append(
+                _cooked_raw_string(
+                    opening.group(1) or "", text[opening.end():close], False
+                )
+            )
+        index = end
+    return "".join(out)
+
+
 def _strip_comments(text: str) -> str:
-    """Blank comments out, keeping every newline so line numbers survive."""
+    """Blank comments out, keeping every newline so line numbers survive.
+
+    A literal ends on its own line: see `_past_literal`.
+    """
 
     out = []
     index = 0
@@ -217,6 +488,8 @@ def _strip_comments(text: str) -> str:
             out.append(char)
             index += 1
             while index < length:
+                if text[index] == "\n":
+                    break
                 out.append(text[index])
                 if text[index] == "\\" and index + 1 < length:
                     out.append(text[index + 1])
@@ -309,6 +582,9 @@ def _map_code(text: str, change) -> str:
             literal = [prefix, char]
             index += 1
             while index < length:
+                # A literal ends on its own line: see `_past_literal`.
+                if text[index] == "\n":
+                    break
                 if text[index] == "\\" and index + 1 < length:
                     literal.append(text[index:index + 2])
                     index += 2
@@ -341,7 +617,7 @@ def _matching(text: str, opening: int) -> int:
         if piece in "\"'":
             quote = piece
             index += 1
-            while index < len(text) and text[index] != quote:
+            while index < len(text) and text[index] not in (quote, "\n"):
                 index += 2 if text[index] == "\\" else 1
             index += 1
             continue
@@ -598,23 +874,45 @@ _SPECIALISED_HEAD = re.compile(
 
 
 
-#: `int n = 7;` written on the member itself. Only the `=` form: `Point p{1,
-#: 2};` means the member's own constructor with those arguments, which is a
-#: different thing from an assignment and is left to be reported rather than
-#: turned into one.
-_MEMBER_VALUE = re.compile(r"^(.*?[\s*&])([A-Za-z_]\w*)\s*=\s*(.+)$", re.S)
+#: `int n = 7;` written on the member itself, and `int a[3] = {4, 5, 6};` -
+#: the bounds sit between the name and the `=`, and without room for them the
+#: array was read as three members called `{4`, `5` and `6}`. The brace form
+#: `Point p{1, 2};` is read where the class body is walked, since the brace
+#: is found there before the `;` is.
+_MEMBER_VALUE = re.compile(
+    r"^(.*?[\s*&])([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)*)=\s*(.+)$", re.S
+)
+
+#: `int (*op)(int) = nullptr` - a pointer to a function given a value where
+#: it is declared. Its name is inside the parentheses, where the shape above
+#: does not look; the value is whatever follows the last `)`.
+_POINTER_MEMBER_VALUE = re.compile(r"^(.*\))\s*=\s*(.+)$", re.S)
 
 
 def _member_value(declaration: str) -> "tuple[str, tuple[str, str] | None]":
     """Split `int n = 7` into the declaration and what to assign, if anything."""
 
-    found = _MEMBER_VALUE.match(declaration.strip())
+    written = declaration.strip()
+    found = _MEMBER_VALUE.match(written)
     if found is None:
-        return declaration, None
-    spelled = found.group(3).strip()
+        if not _DECLARATOR_SHAPED.match(_without_bounds(_without_decorations(written))):
+            return declaration, None
+        pointer = _POINTER_MEMBER_VALUE.match(written)
+        named = (
+            _FUNCTION_POINTER_NAME.search(pointer.group(1))
+            if pointer is not None
+            else None
+        )
+        if pointer is None or named is None or not pointer.group(2).strip():
+            return declaration, None
+        return pointer.group(1).strip(), (named.group(2), pointer.group(2).strip())
+    spelled = found.group(4).strip()
     if not spelled:
         return declaration, None
-    return f"{found.group(1)}{found.group(2)}", (found.group(2), spelled)
+    return (
+        f"{found.group(1)}{found.group(2)}{found.group(3).strip()}",
+        (found.group(2), spelled),
+    )
 
 def _macro_written_out(
     body: str,
@@ -752,19 +1050,45 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
         # of them sits, and this stage runs before the preprocessor and
         # cannot answer the condition, so it is refused rather than laid out
         # one way here and used another below.
-        if char == "#" and _A_CONDITION.match(body, index):
+        #
+        # A directive is one wherever the `#` stands on its line - `    #ifdef`
+        # is as much one as `#ifdef` - so the test is that nothing but blanks
+        # stands before it, and not a pattern anchored to the start of a line
+        # that the indented spelling slipped past on its way to a C error
+        # about a `#` in the middle of a declaration.
+        if char == "#" and _opens_a_line(body, index):
             spelled = body[index:].split("\n")[0].strip()
+            where = at + body.count("\n", 0, index)
+            if _A_CONDITION.match(spelled):
+                raise CppTranslationError(
+                    filename,
+                    where,
+                    f"{name} declares a member under `{spelled}`, and py2bin "
+                    f"reads a class apart before the preprocessor has run. "
+                    f"Which members a class has is what says how big it is "
+                    f"and where each of them sits, and nothing here can "
+                    f"answer that condition - so it is refused rather than "
+                    f"laid out one way and used another. A `struct` with no "
+                    f"methods is emitted exactly as it was written and keeps "
+                    f"its conditionals, and so does the inside of a method "
+                    f"body",
+                )
+            # Any other directive where a member goes - a `#define`, a
+            # `#pragma` - is not part of any declaration either, and read as
+            # one it was swallowed into the member after it and reached the C
+            # compiler in the middle of a declaration, which reported a `#`
+            # on a line nobody wrote.
             raise CppTranslationError(
                 filename,
-                at + body.count("\n", 0, index),
-                f"{name} declares a member under `{spelled}`, and py2bin "
-                f"reads a class apart before the preprocessor has run. Which "
-                f"members a class has is what says how big it is and where "
-                f"each of them sits, and nothing here can answer that "
-                f"condition - so it is refused rather than laid out one way "
-                f"and used another. A `struct` with no methods is emitted "
-                f"exactly as it was written and keeps its conditionals, and "
-                f"so does the inside of a method body",
+                where,
+                f"{name} holds `{spelled}` where a member goes, and py2bin "
+                f"reads a class apart before the preprocessor has run - so "
+                f"the directive would be read as part of the member after "
+                f"it. Moving it out of the class is not this stage's to do: "
+                f"a `#define` means something different above the class "
+                f"than inside it. A `struct` with no methods is emitted "
+                f"exactly as it was written and keeps its directives, and so "
+                f"does the inside of a method body",
             )
         # An access specifier changes nothing about the layout this emits.
         access = re.match(r"(public|private|protected)\s*:", body[index:])
@@ -803,6 +1127,33 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
                     _tagged_member(body, brace, close, head, filename, at + index)
                 )
                 index = bare.find(";", close) + 1
+                continue
+            braced = _braced_member(head)
+            if braced is not None:
+                # `std::atomic<bool> running_{false};`, `int n_{7};`, `Foo
+                # *next_{nullptr};`, `std::vector<int> v_{};` - C++11's brace
+                # initialiser on a data member. The brace opens a value and
+                # not a body: handed to the method reader, it asked what the
+                # member returns and stopped with "cannot read the member".
+                # Recorded the way `int n = 7;` is, as a value every
+                # constructor applies; what the value *means* - a constructor
+                # call, an assignment, a zero, an initializer_list - is
+                # decided where it is written into the constructor, by the
+                # member's type, which is not known here.
+                rest = re.match(r"\s*;", body[close:])
+                if rest is None:
+                    after = body[close:].lstrip().split("\n")[0][:24]
+                    raise CppTranslationError(
+                        filename,
+                        at + body.count("\n", 0, index),
+                        f"{name} declares `{head}{body[brace:close]}` and "
+                        f"follows it with `{after}` where `;` goes. A brace "
+                        f"initialiser on a data member is read one member "
+                        f"to a statement; write `int x{{1}}, y{{2}};` as two",
+                    )
+                found.member_values.append((braced, body[brace:close].strip()))
+                found.members.extend(_members_from(head, filename, at + index))
+                index = close + rest.end()
                 continue
             method = _method_from(head, body[brace:close], filename, at + index)
             found.methods.append(method)
@@ -879,6 +1230,50 @@ _NAME_HERE = "\x01"
 #: `union {`, `struct {`, `enum {` written where a member goes - with or
 #: without a tag. The body is the type's, not a function's.
 _TAGGED_MEMBER = re.compile(r"^(?:struct|union|enum)\b\s*[A-Za-z_]?\w*\s*$")
+
+#: `int n_`, `Point p_`, `Foo *next_`, `int a_[3]`, `atomic__Bool running_` -
+#: what stands before a brace initialiser on a data member: a type, one
+#: name, and the bounds if it is an array.
+_BRACED_MEMBER_HEAD = re.compile(
+    r"^(.*?[\s*&])([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)*)$", re.S
+)
+
+#: Words a data member's declaration cannot begin with. `class Inner` before
+#: a brace is a nested class, `typedef struct` a type, `template` a member
+#: template, `static` a member with no object - and none of them is a value.
+_NOT_A_MEMBER_HEAD = frozenset(
+    "class typedef using friend template namespace operator return "
+    "static static_assert".split()
+)
+
+
+def _braced_member(head: str) -> "str | None":
+    """The member `T name{...}` declares, or None where the head is not that.
+
+    A method's head carries a parameter list and a nested type's ends in its
+    tag; a member's is a type followed by one name and nothing else - or a
+    pointer to a function, with the name inside its parentheses.
+    """
+
+    undecorated = _without_bounds(_without_decorations(head))
+    words = undecorated.replace("*", " ").replace("&", " ").split()
+    if len(words) < 2 or words[0] in _NOT_A_MEMBER_HEAD:
+        return None
+    if words[0] in ("struct", "union", "enum") and len(words) < 3:
+        return None
+    if words[-2] in ("struct", "class", "union", "enum"):
+        # `enum class Color`, `class Inner`: what follows is a body.
+        return None
+    if re.search(r"(?<!:):(?!:)", undecorated):
+        # A base clause, a bitfield or an enum's underlying type.
+        return None
+    if "(" in undecorated:
+        if not _DECLARATOR_SHAPED.match(undecorated):
+            return None
+        named = _FUNCTION_POINTER_NAME.search(head)
+        return None if named is None else named.group(2)
+    found = _BRACED_MEMBER_HEAD.match(head.strip())
+    return None if found is None else found.group(2)
 
 
 def _tagged_member(
@@ -1512,7 +1907,208 @@ def _name_function_types(text: str, classes: "dict[str, Class] | None" = None) -
         )
     if not typedefs:
         return text
-    return "\n".join(typedefs) + "\n" + text
+    # Written at the top of the file, `typedef Op (*__py2bin_fn_pick)(int
+    # w);` named `Op` above the typedef that declares it, and the C compiler
+    # refused the file at a line the author never wrote. Each goes after the
+    # last typedef it names instead; see `_placed_after_what_they_name`.
+    return _moved_below_their_types(
+        _placed_after_what_they_name(
+            text, {line.split("(*")[1].split(")")[0]: line for line in typedefs}
+        )
+    )
+
+
+#: A typedef this stage writes for a function's own type, and the name it
+#: declares. Only this stage writes a name spelled so.
+_WRITTEN_FUNCTION_TYPE = re.compile(
+    r"^[ \t]*typedef\b[^;\n]*\(\s*\*\s*(__py2bin_fn_\w+)\s*\)[^;\n]*;",
+    re.M,
+)
+
+
+def _moved_below_their_types(text: str) -> str:
+    """Move a piece this stage wrote below the typedef it names.
+
+    Templates are expanded before a function's own type is named, and each
+    pass places what it writes after the author's declarations it names -
+    neither can see the other's. So a copy of a template taking
+    `__py2bin_fn_pick` stood above the `typedef Op (*__py2bin_fn_pick)(int
+    w);` that declares it, and the C stage refused the file at a line nobody
+    wrote: "expected a type name, found '__py2bin_fn_pick'". The copy goes
+    below its typedef, which is the one place both are well formed - the
+    typedef itself cannot go higher, since it names a typedef of the
+    author's.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        moved = None
+        for found in _WRITTEN_FUNCTION_TYPE.finditer(bare):
+            used = bare.find(found.group(1))
+            if used < 0 or used >= found.start():
+                continue
+            start = bare.rfind("\n", 0, used) + 1
+            brace = bare.find("{", used)
+            semicolon = bare.find(";", used)
+            if brace >= 0 and (semicolon < 0 or brace < semicolon):
+                try:
+                    end = _matching(bare, brace) + 1
+                except ValueError:
+                    continue
+            elif semicolon >= 0:
+                end = semicolon + 1
+            else:
+                continue
+            if end > found.start():
+                # The use is inside the typedef's own statement, or the
+                # piece already spans it; moving it would say nothing.
+                continue
+            moved = (start, end, found.end())
+            break
+        if moved is None:
+            return text
+        start, end, below = moved
+        piece = text[start:end]
+        text = text[:start] + text[end:below] + "\n" + piece + "\n" + text[below:]
+    return text
+
+
+def _placed_after_what_they_name(text: str, pieces: "dict[str, str]") -> str:
+    """Write each piece into `text` after the last top-level typedef it names.
+
+    The pieces are declarations this translator writes - a template copy, the
+    typedef of a function's own type - keyed by the name each declares.
+    Written at the top of the file, one that named a typedef of the author's
+    named it before the file declared it: `typedef Op (*__py2bin_fn_pick)(int
+    w);`, or `int call__Op(Op f) { ... }`, above `typedef int (*Op)(int, int);`
+    - well formed C++ in, and C the C compiler refused at a line nobody wrote.
+
+    C++ has settled the order already: whatever a declaration names was
+    declared above the point it was written for, so a piece spelled with the
+    same words is well formed anywhere after the last typedef among them. It
+    goes there, directly after that typedef. A piece naming another piece goes
+    no earlier than that one, so two copies keep the order they were written
+    in whatever else moves. One naming no typedef of this file's goes to the
+    top, which is where every one of them went before.
+    """
+
+    if not pieces:
+        return text
+    declared = _typedef_names_declared(text)
+    words_of = {
+        name: set(re.findall(r"[A-Za-z_]\w*", _without_literals(piece)))
+        for name, piece in pieces.items()
+    }
+    after: "dict[str, int]" = {}
+
+    def _after(name: str, asking: "frozenset[str]") -> int:
+        if name in after:
+            return after[name]
+        words = words_of[name]
+        at = max((declared[word] for word in words if word in declared), default=0)
+        for other in words:
+            # Two copies that name each other are mutually recursive functions;
+            # neither can go after the other, and both stay where they are.
+            if other in pieces and other != name and other not in asking:
+                at = max(at, _after(other, asking | {name}))
+        after[name] = at
+        return at
+
+    for name in pieces:
+        _after(name, frozenset({name}))
+    on_top = [piece for name, piece in pieces.items() if not after[name]]
+    placed = sorted(
+        ((after[name], piece) for name, piece in pieces.items() if after[name]),
+        key=lambda one: one[0],
+    )
+    if placed:
+        out: "list[str]" = []
+        at = 0
+        # The offsets were read from a blanked copy of `text`, which is the
+        # same length, so they hold here. Each piece starts a line of its own
+        # and what followed the typedef on its line starts another.
+        for offset, piece in placed:
+            out.append(text[at:offset])
+            out.append(f"\n{piece}\n")
+            at = offset
+        out.append(text[at:])
+        text = "".join(out)
+    if on_top:
+        text = "\n".join(on_top) + "\n" + text
+    return text
+
+
+def _typedef_names_declared(text: str) -> "dict[str, int]":
+    """Each name a top-level `typedef` declares, and the offset just past it.
+
+    Read statement by statement from a copy with the literals blanked, and
+    only outside every brace: a typedef inside a class body belongs to the
+    class, and one inside a function is in scope nowhere else. `typedef
+    struct { ... } Colour, *PColour;` declares the names after its body, so a
+    body is walked past and the piece after it read. The first declaration
+    of a name is the one kept - C++ declares before it uses, so that is the
+    point after which the name means something.
+    """
+
+    found: "dict[str, int]" = {}
+    code = _without_literals(text)
+    # One entry per open brace: whether the brace counts. A namespace or an
+    # `extern "C"` block (its literal blanked by now) is transparent - what
+    # it holds is at the top level for this purpose.
+    opened: "list[bool]" = []
+    body_of: "str | None" = None
+    at = 0
+    for piece in _statements(code):
+        end = at + len(piece)
+        stripped = piece.strip()
+        shallow = not any(opened)
+        if shallow and stripped.startswith("typedef"):
+            if stripped.endswith(";"):
+                for name in _typedef_declarators(stripped[len("typedef"):-1]):
+                    found.setdefault(name, end)
+            elif stripped.endswith("{"):
+                body_of = stripped
+        elif shallow and body_of is not None and stripped.endswith(";"):
+            # `} Colour, *PColour;` - what follows a typedef's body.
+            for name in _typedef_declarators(stripped[:-1]):
+                found.setdefault(name, end)
+            body_of = None
+        if stripped.endswith("{"):
+            head = stripped[:-1].strip()
+            opened.append(
+                re.match(r"(?:inline\s+)?namespace\b", head) is None
+                and re.fullmatch(r"extern\s*", head) is None
+            )
+        elif stripped.endswith("}") and opened:
+            opened.pop()
+        at = end
+    return found
+
+
+def _typedef_declarators(spelled: str) -> "list[str]":
+    """The names a typedef's declarator list gives: `int (*Op)(int), *POp`."""
+
+    names: "list[str]" = []
+    for part in _split_arguments(_without_decorations(spelled)):
+        # A pointer to a function or to an array: the name sits after the
+        # `*` inside the parentheses, `(*Op)(int, int)` or `(*Row)[3]` - a
+        # calling convention may stand before the star, a qualifier after.
+        nested = re.search(
+            r"\(\s*(?:[A-Za-z_]\w*\s+)*\*+\s*(?:(?:const|volatile)\s+)*"
+            r"([A-Za-z_]\w*)\s*[)\[]",
+            part,
+        )
+        if nested is None:
+            # `int (Fn)(int)` - a function type, its name in parentheses.
+            nested = re.search(r"\(\s*([A-Za-z_]\w*)\s*\)\s*[(\[]", part)
+        if nested is not None:
+            names.append(nested.group(1))
+            continue
+        # Otherwise the last word, before any array bound.
+        words = re.findall(r"[A-Za-z_]\w*", re.sub(r"\[[^\]]*\]", " ", part))
+        if words and words[-1] not in _NOT_A_TYPE:
+            names.append(words[-1])
+    return names
 
 def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     """What type an argument has, as far as this can tell without a type system.
@@ -1700,9 +2296,26 @@ def _members_declared(inside: str) -> "list[tuple[str, str]]":
         # so `o.text` had no type and no overload could be chosen for it.
         # `buf`, the first thing under string's, went the same way.
         spelled = re.sub(r"^(?:(?:public|private|protected)\s*:\s*)+", "", spelled)
-        if not spelled or "(" in spelled or spelled.startswith(
-            ("typedef", "using", "friend")
-        ):
+        if not spelled or spelled.startswith(("typedef", "using", "friend")):
+            continue
+        if "(" in spelled:
+            # `int (*op)(int);` - a pointer to a function, its name inside
+            # the parentheses. Skipped along with the methods, whose
+            # parenthesis it shares, the member was missing from this table,
+            # so nothing could say what `o.op` held. A method's first
+            # parenthesis opens its parameters; a declarator's opens with a
+            # `*` or another parenthesis, which is what tells the two apart
+            # everywhere else a member is read. Carried as C spells the type
+            # with the name taken out: `int (*)(int)`.
+            undecorated = _without_bounds(_without_decorations(spelled))
+            if not _DECLARATOR_SHAPED.match(undecorated):
+                continue
+            plain = undecorated.split("=", 1)[0].strip()
+            named = _FUNCTION_POINTER_NAME.search(plain)
+            if named is None:
+                continue
+            carried = plain[: named.start(2)] + plain[named.end(2):]
+            found.append((named.group(2), " ".join(carried.split())))
             continue
         head = re.match(
             r"^((?:const\s+|volatile\s+|unsigned\s+|signed\s+|static\s+"
@@ -3036,10 +3649,22 @@ def _rewrite_brace_initialisers(text: str) -> str:
         for head in _CLASS_HEAD.finditer(text)
         if _has_a_constructor(text, head)
     }
+    # Where a `{` opens directly inside a class body, the declaration it
+    # ends is a data member's: `std::string name_{"x"};`. What that means
+    # turns on the member's type - a constructor call, a value, a zero - and
+    # the class reader is what knows the types. Rewritten here the way a
+    # local is, `string name_{"x"}` became `string name_("x");`, which the
+    # reader took for a method called `name_` - and the member left the
+    # struct without a word said. So a member of a class with a constructor
+    # is left as written for the reader; the rest are written into the
+    # `= {...}` form the reader already takes off a member.
+    members = _member_level_braces(_without_literals(text))
 
     def one(match: "re.Match[str]", whole: str) -> "str | None":
         held, star, name, bounds = match.groups()[:4]
         if held in _NOT_A_TYPE or star:
+            return None
+        if match.start(5) - 1 in members:
             return None
         # From the real text: a literal inside the braces is blanked in the
         # copy the match was found against, and `char s[3]{'h', 'i'}` would
@@ -3071,6 +3696,32 @@ def _has_a_constructor(text: str, head: "re.Match[str]") -> bool:
         return False
     body = text[head.end() - 1: closing]
     return re.search(rf"(?<![.\w>~]){re.escape(head.group(2))}\s*\(", body) is not None
+
+
+def _member_level_braces(bare: str) -> "set[int]":
+    """Where a `{` opens directly inside a class body, on the blanked text.
+
+    Those are a member's braces - an initialiser's, a method body's, a nested
+    type's - and not a local's inside some method. Each class body is walked
+    once from its own head, so a nested class's members count as its own.
+    """
+
+    found: "set[int]" = set()
+    for head in _CLASS_HEAD.finditer(bare):
+        depth = 0
+        index = head.end() - 1
+        while index < len(bare):
+            char = bare[index]
+            if char == "{":
+                depth += 1
+                if depth == 2:
+                    found.add(index)
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+    return found
 
 def _is_a_template_pattern(text: str, at: int) -> bool:
     """Whether the class starting at `at` is written `template <...> class`.
@@ -6361,7 +7012,12 @@ def _expand_templates(text: str, filename: str) -> str:
             "per use and this one never stops asking for another",
         )
 
-    return "\n".join(made.values()) + "\n" + text
+    if not made:
+        return "\n" + text
+    # Not at the top of the file: a copy of `call` taking `Op` - or taking
+    # the type given to a function that answers one - names a typedef the
+    # author wrote further down, and C wants the typedef first.
+    return _placed_after_what_they_name(text, made)
 
 
 #: How many times expansion may go round. A template naming another needs one
@@ -8551,9 +9207,18 @@ def _rewrite_list_initialisers(text: str) -> str:
 
     for _round in range(_HOIST_ROUNDS):
         bare = _without_literals(text)
+        # A member's braces are not a local's. `std::vector<int> v_{1, 2};`
+        # written where a member goes cannot become `v_; v_.push_back(1);` -
+        # there is no place in a class body for a statement, and read back
+        # the push was a member function declared to return nothing and the
+        # member itself was gone. The class reader takes the braces off the
+        # member and the constructor is where the pushes go.
+        members = _member_level_braces(bare)
         change = None
         for found in _LIST_INITIALISED.finditer(bare):
             if not _could_start_a_declaration(bare, found.start()):
+                continue
+            if found.end() - 1 in members:
                 continue
             if not _takes_push_back(text, found.group(1)):
                 continue
@@ -9035,6 +9700,9 @@ def _split_literals(text: str) -> "list[tuple[str, str]]":
             literal = [prefix, char]
             index += 1
             while index < length:
+                # A literal ends on its own line: see `_past_literal`.
+                if text[index] == "\n":
+                    break
                 if text[index] == "\\" and index + 1 < length:
                     literal.append(text[index:index + 2])
                     index += 2
@@ -9764,9 +10432,17 @@ def _emit_one(
             )
         parameters += ", " + spelled
     references = _reference_parameters(method.parameters, classes)
-    body = _this_qualified(
-        method.body, found, classes, _shadowing(method.body, method.parameters)
-    )
+    body = method.body
+    #: A brace initialiser on a member of class type, and what its list
+    #: means - which ones this constructor builds and with what, and which
+    #: are an initializer_list to fill in once built. Read once, here, off
+    #: the members the initialiser list does not name.
+    braced: "dict[str, tuple[str, list[str]]]" = {}
+    if method.name == "":
+        listed = set(re.findall(rf"{_MEMBER_INIT}\s*\(\s*([A-Za-z_]\w*)", body))
+        braced = _braced_meanings(found, classes, listed, f"{unit}\n{body}")
+        body = _with_list_members(body, braced)
+    body = _this_qualified(body, found, classes, _shadowing(body, method.parameters))
     if references:
         body = _deref_references(body, references, classes)
     # Before the base-call pass, which reads `Owner::name` as an explicit call
@@ -9862,6 +10538,20 @@ def _emit_one(
         body = _delegating_initialiser(body, found, classes, unit)
         body, base_arguments = _base_initialiser(body, found)
         body, member_arguments = _member_initialisers(body)
+        # `std::atomic<bool> running_{false};` - a member of class type
+        # given braces where it is declared is that class's constructor,
+        # called with what is inside them: `: running_(false)`, as if the
+        # list had said so. The list's own entries are read first and win,
+        # which is the order C++ gives the two.
+        for spelled, (meaning, arguments) in braced.items():
+            if spelled in member_arguments:
+                continue
+            if meaning == "construct":
+                member_arguments[spelled] = ", ".join(arguments)
+            elif meaning == "copy":
+                member_arguments[spelled] = arguments[0]
+            else:
+                member_arguments[spelled] = ""
         # `D() : A(3)` names the shared base directly, which C++ lets the
         # class that owns it do however far above it the base sits. Taken out
         # here, because what builds it is the other constructor.
@@ -10233,8 +10923,25 @@ def _open_with_member_values(
     held = {member.name: member for member in found.members}
     written = []
     for name, value in values:
+        member = held.get(name)
+        # A member declared above may stand in the value - `int b = a + 1;`
+        # - and the pass that points bare names at `this` read the body,
+        # not this: the value was taken off its declaration before it ran.
+        value = _this_qualified(value, found, classes)
+        if member is not None and member.array:
+            written.append(_array_member_filled(member, value, found, classes))
+            continue
+        if member is not None and member.reference:
+            raise CppTranslationError(
+                "<c++>", 0,
+                f"{found.name} gives the reference member `{name}` a value "
+                f"where it is declared. A reference is held as a pointer to "
+                f"what it names, and the value written there is what it "
+                f"names, not where - so it is refused rather than stored as "
+                f"an address. Bind it in the initialiser list: "
+                f"`{found.name}() : {name}(...)`",
+            )
         if not value.startswith("{"):
-            member = held.get(name)
             kind = member.ctype.replace("*", "").strip() if member is not None else ""
             # What the value *is* decides how it is put there. An object of
             # the member's own class is copied - `stem = transferDirectory`
@@ -10271,14 +10978,32 @@ def _open_with_member_values(
             continue
         # A brace list is not an expression in C, so it cannot be assigned.
         # Written as an object that is initialised with it and then copied,
-        # which is the same thing and is C. An array member is left out: it
-        # cannot be assigned either, and copying one element at a time is
-        # not what this pass is for.
-        member = held.get(name)
-        if member is None or member.array:
+        # which is the same thing and is C. `{}` is value initialisation,
+        # which for everything here means zeroed, and `{0}` is how C spells
+        # that for a scalar, a pointer and a struct alike. A member of a
+        # class with a constructor does not come this way: its braces are
+        # that constructor's arguments, and it is built with the subobjects.
+        if member is None:
+            continue
+        inside = value[1:-1].strip() if value.endswith("}") else value[1:].strip()
+        if "\x00fn" in member.ctype:
+            # A pointer to a function is carried with the name's place marked
+            # and cannot be spelled in front of another name; it is a pointer,
+            # and a pointer is assigned to.
+            written.append(f"this->{name} = {inside or '0'};")
+            continue
+        arguments = [one.strip() for one in _split_arguments(inside) if one.strip()]
+        kind = member.ctype.replace("*", "").strip()
+        if (
+            len(arguments) == 1
+            and "*" not in member.ctype
+            and _same_class(arguments[0], kind, f"{unit}\n{body}", classes)
+        ):
+            # `Point p_{other_};` - a copy, which is an assignment in C.
+            written.append(f"this->{name} = {arguments[0]};")
             continue
         written.append(
-            f"{{ {member.ctype} __py2bin_init_{name} = {value};"
+            f"{{ {member.ctype} __py2bin_init_{name} = {{{inside or '0'}}};"
             f" this->{name} = __py2bin_init_{name}; }}"
         )
     if not written:
@@ -10286,6 +11011,211 @@ def _open_with_member_values(
     spelled = " ".join(written)
     opening = body.find("{")
     return body[:opening + 1] + " " + spelled + body[opening + 1:]
+
+
+def _array_member_filled(
+    member: Member, value: str, found: Class, classes: "dict[str, Class]"
+) -> str:
+    """`int a_[3] = {4, 5, 6};` or `int a_[3]{4, 5, 6};` on the member itself.
+
+    An array cannot be assigned to in C, and a brace list is not an
+    expression. So the list initialises an array of the member's own shape,
+    which is then copied over byte by byte - what assigning one would do if C
+    allowed it, and pure C with nothing to include. `{}` is zeroed, and the
+    string given to a `char name_[8]` is the list C already takes for one.
+    """
+
+    kind = member.ctype.strip()
+    name = member.name
+    if kind in classes and _find_method(kind, "", classes) is not None:
+        raise CppTranslationError(
+            "<c++>", 0,
+            f"{found.name} gives `{kind} {name}{member.array}` a value where "
+            f"it is declared, and {kind} has a constructor. An array of "
+            f"objects is built one element at a time, each by the "
+            f"constructor its own braces name, and py2bin does not write "
+            f"that from a member's initialiser yet; build the elements in "
+            f"{found.name}'s constructor body",
+        )
+    inside = (
+        value[1:-1].strip()
+        if value.startswith("{") and value.endswith("}")
+        else value
+    )
+    temp, to, source, at = (
+        f"__py2bin_init_{name}",
+        f"__py2bin_to_{name}",
+        f"__py2bin_from_{name}",
+        f"__py2bin_at_{name}",
+    )
+    return (
+        f"{{ {kind} {temp}{member.array} = {{{inside or '0'}}};"
+        f" unsigned char *{to} = (unsigned char *)this->{name};"
+        f" unsigned char *{source} = (unsigned char *){temp};"
+        f" unsigned long {at};"
+        f" for ({at} = 0; {at} < sizeof(this->{name}); {at}++)"
+        f" {to}[{at}] = {source}[{at}]; }}"
+    )
+
+
+#: The words C spells an arithmetic type with. A brace list whose elements
+#: are all arithmetic fills a container of an arithmetic element: `{1, 2}`
+#: on a `vector<double>` is two doubles, as it is to a C++ compiler.
+_ARITHMETIC_WORDS = frozenset(
+    "int long short char double float unsigned signed _Bool bool".split()
+)
+
+
+def _type_words(spelled: str) -> "list[str]":
+    """A type as its words, qualifiers and the reference taken off."""
+
+    plain = re.sub(r"\b(?:const|volatile|struct)\b", " ", spelled)
+    return plain.replace("&", " ").replace("*", " * ").split()
+
+
+def _element_pushed(kind: str, classes: "dict[str, Class]") -> "str | None":
+    """What `push_back` on that class takes, or None where there is none.
+
+    Read off the method rather than off the class's name: the class that
+    takes a list this way is the one that says so, whatever it is called.
+    """
+
+    owner = _find_method(kind, "push_back", classes)
+    if owner is None:
+        return None
+    for method in classes[owner].methods:
+        if method.name != "push_back" or _arity(method.parameters) != 1:
+            continue
+        words = _type_words(method.parameters)
+        # The parameter's name comes last, unless it was left off.
+        if (
+            len(words) > 1
+            and re.fullmatch(r"[A-Za-z_]\w*", words[-1])
+            and words[-1] not in _ARITHMETIC_WORDS
+        ):
+            words = words[:-1]
+        return " ".join(words)
+    return None
+
+
+def _could_be_an_element(
+    one: str, element: str, scope: str, classes: "dict[str, Class]"
+) -> bool:
+    """Whether a brace list's entry is an element of that type, as C++ asks.
+
+    The same type, an arithmetic value for an arithmetic element, or a value
+    the element's class has a constructor for - `"a"` is a `string`. Nothing
+    else is: `"x"` is not a `char`, which is what makes `std::string
+    name_{"x"}` the constructor from a C string and not a list of one.
+    """
+
+    deduced = _deduced_type(one, scope)
+    if deduced is None:
+        return False
+    spelled = " ".join(_type_words(deduced))
+    if spelled == element:
+        return True
+    if all(word in _ARITHMETIC_WORDS for word in spelled.split()) and all(
+        word in _ARITHMETIC_WORDS for word in element.split()
+    ):
+        return True
+    words = [word for word in spelled.split() if word != "*"]
+    return (
+        bool(words)
+        and element in classes
+        and "*" not in element
+        and _constructor_taking_one(element, words[-1], classes)
+    )
+
+
+def _braced_meanings(
+    found: Class, classes: "dict[str, Class]", listed: "set[str]", scope: str
+) -> "dict[str, tuple[str, list[str]]]":
+    """What each brace initialiser on a member of class type means.
+
+    `Range range_{3, 10};` is the constructor taking two; `std::string
+    name_{"x"};` the one taking that; `std::vector<int> v_{};` the one
+    taking nothing; `Point p_{other_};` a copy; `std::vector<int> v_{1, 2,
+    3};` an initializer_list, which py2bin has no way to write and so fills
+    in as the pushes it means, after the vector is built. A member the
+    initialiser list names is left out: C++ applies the list where it speaks
+    and the member's own initialiser only where it does not. A member whose
+    class has no constructor is an aggregate and is left out too - its value
+    is assigned where `int n = 7;` is.
+    """
+
+    meanings: "dict[str, tuple[str, list[str]]]" = {}
+    held = {member.name: member for member in found.members}
+    for name, value in found.member_values:
+        if name in listed or not value.startswith("{") or not value.endswith("}"):
+            continue
+        member = held.get(name)
+        if member is None or member.array or member.reference or "*" in member.ctype:
+            continue
+        kind = member.ctype.strip()
+        owner = _find_method(kind, "", classes)
+        if owner is None:
+            continue
+        arguments = [
+            one.strip() for one in _split_arguments(value[1:-1]) if one.strip()
+        ]
+        if not arguments:
+            meanings[name] = ("default", [])
+            continue
+        if len(arguments) == 1 and _same_class(arguments[0], kind, scope, classes):
+            meanings[name] = ("copy", arguments)
+            continue
+        element = _element_pushed(kind, classes)
+        if element is not None and all(
+            _could_be_an_element(one, element, scope, classes) for one in arguments
+        ):
+            meanings[name] = ("list", arguments)
+            continue
+        if _constructor_taking(owner, len(arguments), classes):
+            meanings[name] = ("construct", arguments)
+            continue
+        takes = sorted(
+            {_arity(m.parameters) for m in classes[owner].methods if m.name == ""}
+        )
+        raise CppTranslationError(
+            "<c++>", 0,
+            f"{found.name} declares `{kind} {name}{value}`, and {kind} has no "
+            f"constructor taking {len(arguments)} argument(s) - it takes "
+            f"{', '.join(str(n) for n in takes)}. A brace list on a member of "
+            f"a class with a constructor is that constructor, called with what "
+            f"is in the braces; on a class that takes push_back, and whose "
+            f"elements these could be, it is an initializer_list and is "
+            f"filled in after the member is built; and this is neither. Give "
+            f"{kind} that constructor, or set the member in {found.name}'s "
+            f"constructor body",
+        )
+    return meanings
+
+
+def _with_list_members(
+    body: str, braced: "dict[str, tuple[str, list[str]]]"
+) -> str:
+    """`std::vector<int> v_{1, 2, 3};` - the pushes it means, first in the body.
+
+    Written as C++ against the bare member name, ahead of the pass that
+    points names at `this` and the one that turns a call on a member into C,
+    so both treat them exactly as they treat what the author wrote in the
+    body. The subobjects and the plain values are put in above them later,
+    so the vector is built before it is pushed to. A delegating constructor
+    gets none: C++ leaves the members' own initialisers to the constructor
+    it delegates to.
+    """
+
+    pushes = " ".join(
+        f"{name}.push_back({one});"
+        for name, (meaning, arguments) in braced.items()
+        if meaning == "list"
+        for one in arguments
+    )
+    if not pushes or _DELEGATE_INIT in body:
+        return body
+    opening = body.find("{")
+    return body[: opening + 1] + " " + pushes + body[opening + 1:]
 
 
 def _constructor_taking_one(
@@ -12974,15 +13904,18 @@ def _rewrite_body(
     receivers: "dict[str, str] | None" = None,
     inherited_arrays: "dict[str, str] | None" = None,
     unit: str = "",
-    enclosing: "list[tuple[str, str]]" = (),
+    enclosing: "list[tuple[str, str, frozenset, str]]" = (),
     pointer_arrays: "dict[str, str] | set[str]" = (),
     returns: str = "",
     inherited_references: "dict[str, str] | None" = None,
     referenced: "set[str] | None" = None,
     stable: str = "",
-    #: Whether this body *is* a loop's. What `break` and `continue` leave is
-    #: the loop's body, so a scope inside one has to know how far out that is.
-    in_a_loop: bool = False,
+    #: What this body *is*, if a jump leaves it: `_A_LOOP` for a while, for
+    #: or do body, `_A_SWITCH` for a switch's, `""` for any other block. What
+    #: `break` and `continue` leave is the innermost loop's body - or, for
+    #: `break` alone, the innermost switch's - so a scope inside one has to
+    #: know how far out that is, and which of the two jumps stops there.
+    leaves: str = "",
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -13827,13 +14760,15 @@ def _rewrite_body(
                 # by the objects the body declared, so `for (...) { if (x)
                 # break; }` had none, and the `break` destroyed everything
                 # the enclosing function had built - a vector declared before
-                # the loop read as empty afterwards.
-                *([("", "", frozenset(), True)] if in_a_loop else []),
+                # the loop read as empty afterwards. The marker carries what
+                # kind of body it stands for: a switch stops a `break` and
+                # not a `continue`, which goes on out to the loop around it.
+                *([("", "", frozenset(), leaves)] if leaves else []),
                 *(
                     # And which handlers are written at this level, so that a
                     # jump to one of them knows where to stop unwinding: past
                     # the body that holds the label it has not left.
-                    (name, known[name], _handlers_written(body), in_a_loop)
+                    (name, known[name], _handlers_written(body), leaves)
                     for name in destroyed
                     if _built_before(body, name, number)
                 ),
@@ -13852,7 +14787,7 @@ def _rewrite_body(
             # statement, translated two ways depending on its braces.
             referenced=set(referenced or ()) | set(local_references),
             stable=stable,
-            in_a_loop=_is_a_loop_body(body, number),
+            leaves=_body_a_jump_leaves(body, number),
         )
         for number, inner in enumerate(blocks)
     ]
@@ -13866,7 +14801,7 @@ def _rewrite_body(
     # before it saw a value already destroyed, which is silent.
     destroyed.sort(key=lambda name: _declared_at(body, name))
     body = _close_with_destructors(
-        body, destroyed, known, classes, enclosing, returns, [0], in_a_loop
+        body, destroyed, known, classes, enclosing, returns, [0], leaves
     )
     return _restore_nested(body, rewritten_blocks)
 
@@ -13885,34 +14820,51 @@ def _initialiser_brace(body: str, index: int) -> bool:
     before = body[:index].rstrip()
     return before.endswith("=") or before.endswith(",")
 
-def _is_a_loop_body(body: str, number: int) -> bool:
-    """Whether the lifted block is a body that `break` leaves: a loop's, or a switch's.
+#: The two kinds of body a `break` leaves. A `continue` leaves only the
+#: first: written inside a switch inside a loop, it goes on out to the loop.
+_A_LOOP = "loop"
+_A_SWITCH = "switch"
 
-    Read off the text in front of the marker it left, which is where the
-    `for (...)`, `while (...)` or `switch (...)` that owns it is still
-    written. Not knowing `switch`, a `break` out of one destroyed every
-    object of the enclosing function - a vector declared before the switch
-    read as empty afterwards.
+
+def _body_a_jump_leaves(body: str, number: int) -> str:
+    """What kind of body the lifted block is, if `break` leaves it.
+
+    `_A_LOOP` for a `for`, `while` or `do` body, `_A_SWITCH` for a switch's,
+    and `""` for a block that is neither. Read off the text in front of the
+    marker it left, which is where the `for (...)`, `while (...)` or
+    `switch (...)` that owns it is still written. Not knowing `switch`, a
+    `break` out of one destroyed every object of the enclosing function - a
+    vector declared before the switch read as empty afterwards. Not telling
+    the two apart, a `continue` inside a switch inside a loop stopped at the
+    switch, and what the loop's body had declared above it was never
+    destroyed - a leak, and a destructor with a side effect never ran.
     """
 
     at = body.find(_BLOCK_MARK % number)
     if at < 0:
-        return False
+        return ""
     before = _without_literals(body[:at]).rstrip()
     if re.search(r"(?<![.\w>])do$", before):
-        return True
+        return _A_LOOP
     if not before.endswith(")"):
-        return False
+        return ""
     opening = _opening_paren(before, len(before) - 1)
     if opening < 0:
-        return False
-    # A `switch` too: `break` leaves it, and what it declared dies there.
-    # (A `continue` inside a switch inside a loop leaves both; the loop's
-    # own objects between the two are the one case this does not reach.)
-    return (
-        re.search(r"(?<![.\w>])(for|while|switch)\s*$", before[:opening])
-        is not None
-    )
+        return ""
+    owner = re.search(r"(?<![.\w>])(for|while|switch)\s*$", before[:opening])
+    if owner is None:
+        return ""
+    return _A_SWITCH if owner.group(1) == "switch" else _A_LOOP
+
+
+def _stops_here(kind: str, jump: str) -> bool:
+    """Whether a body of this kind is where `jump` (break or continue) stops.
+
+    A loop's body stops both. A switch's stops a `break` and nothing else:
+    `continue` has no meaning to a switch and leaves the loop around it.
+    """
+
+    return kind == _A_LOOP or (kind == _A_SWITCH and jump == "break")
 
 
 def _lift_nested(body: str) -> "tuple[str, list[str]]":
@@ -14187,7 +15139,7 @@ def _statement_end(text: str, at: int) -> int:
         if piece in "\"'":
             quote = piece
             index += 1
-            while index < len(text) and text[index] != quote:
+            while index < len(text) and text[index] not in (quote, "\n"):
                 index += 2 if text[index] == "\\" else 1
             index += 1
             continue
@@ -14215,7 +15167,7 @@ def _split_on_operator(text: str, symbol: str) -> "list[str]":
         if piece in "\"'":
             quote = piece
             index += 1
-            while index < len(text) and text[index] != quote:
+            while index < len(text) and text[index] not in (quote, "\n"):
                 index += 2 if text[index] == "\\" else 1
             index += 1
             continue
@@ -14361,7 +15313,7 @@ def _one_operand(text: str, at: int) -> int:
     if text[index] in "\"'":
         quote = text[index]
         index += 1
-        while index < len(text) and text[index] != quote:
+        while index < len(text) and text[index] not in (quote, "\n"):
             index += 2 if text[index] == "\\" else 1
         index += 1
     elif text[index] == "(":
@@ -15928,7 +16880,7 @@ def _closing_paren(text: str, opening: int) -> int:
         if piece in "\"'":
             quote = piece
             index += 1
-            while index < len(text) and text[index] != quote:
+            while index < len(text) and text[index] not in (quote, "\n"):
                 index += 2 if text[index] == "\\" else 1
             index += 1
             continue
@@ -16386,10 +17338,10 @@ def _close_with_destructors(
     destroyed: "list[str]",
     known: "dict[str, str]",
     classes: "dict[str, Class]",
-    enclosing: "list[tuple[str, str, frozenset, bool]]" = (),
+    enclosing: "list[tuple[str, str, frozenset, str]]" = (),
     returns: str = "",
     counter: "list[int] | None" = None,
-    in_a_loop: bool = False,
+    leaves: str = "",
 ) -> str:
     """Run each destructor where the block ends - including at a `return`.
 
@@ -16415,8 +17367,8 @@ def _close_with_destructors(
     # block does not end theirs.
     outer = "".join(
         f" {_destructor_call(held, name, classes)}"
-        for name, held, _labels, _loop in reversed(list(enclosing))
-        if name  # not a loop boundary, which a `return` crosses
+        for name, held, _labels, _kind in reversed(list(enclosing))
+        if name  # not a loop or switch boundary, which a `return` crosses
     )
     # Where each one comes into existence. A `return` above a declaration
     # leaves before that object was ever built, and C++ destroys only what
@@ -16485,7 +17437,7 @@ def _close_with_destructors(
     out.append(body[at:])
     body = "".join(out)
     body = _destroy_before_leaving(
-        body, destroyed, known, classes, enclosing, in_a_loop
+        body, destroyed, known, classes, enclosing, leaves
     )
 
     closing = body.rfind("}")
@@ -16499,10 +17451,9 @@ def _close_with_destructors(
 #: `goto` a program wrote leaves exactly as much as one of those does.
 _TO_A_HANDLER = re.compile(r"\bgoto\s+([A-Za-z_]\w*)\s*;")
 
-#: `break` and `continue` leave the innermost loop's body. How far *out* they
-#: go is not written down anywhere a reader of this text can see, so only the
-#: scope holding one is taken apart here - which is the scope they are almost
-#: always written in.
+#: `break` and `continue` leave the innermost loop's body - or, for `break`,
+#: the innermost switch's. The scope holding one is taken apart here, and
+#: then each enclosing scope outward as far as the body the jump leaves.
 _LEAVES_A_LOOP = re.compile(r"\b(break|continue)\s*;")
 
 
@@ -16532,8 +17483,8 @@ def _destroy_before_leaving(
     destroyed: "list[str]",
     known: "dict[str, str]",
     classes: "dict[str, Class]",
-    enclosing: "list[tuple[str, str, frozenset, bool]]" = (),
-    in_a_loop: bool = False,
+    enclosing: "list[tuple[str, str, frozenset, str]]" = (),
+    leaves: str = "",
 ) -> str:
     """Run the destructors on the way out to a handler, as C++ unwinding does.
 
@@ -16567,6 +17518,7 @@ def _destroy_before_leaving(
         for name in reversed(destroyed)
     )
     for found in _LEAVES_A_LOOP.finditer(body):
+        jump = found.group(1)
         already = [
             name
             for name in destroyed
@@ -16577,15 +17529,21 @@ def _destroy_before_leaving(
             f" {_destructor_call(known[name], name, classes)}"
             for name in reversed(already)
         )
-        # And outward as far as the loop's own body, which is what `break`
-        # and `continue` leave. Written almost always inside an `if`, so
-        # taking apart only the scope holding the jump left everything the
-        # loop itself had built - a leak, and a quiet one.
-        if not in_a_loop:
-            for name, held, _labels, loop in reversed(list(enclosing)):
+        # And outward as far as the body this jump leaves. Written almost
+        # always inside an `if`, so taking apart only the scope holding the
+        # jump left everything the loop itself had built - a leak, and a
+        # quiet one. Only the nameless marker is a boundary: a named entry
+        # is one object of the body above, and stopping at the first of
+        # those left every object declared before it alive. Which body is
+        # the boundary depends on the jump - a switch stops a `break`, and a
+        # `continue` written inside one goes on out to the loop around it,
+        # destroying what the loop's body declared between the two.
+        if not _stops_here(leaves, jump):
+            for name, held, _labels, kind in reversed(list(enclosing)):
                 if name:
                     leaving += f" {_destructor_call(held, name, classes)}"
-                if loop:
+                    continue
+                if _stops_here(kind, jump):
                     break
         if not leaving.strip():
             continue
@@ -16609,11 +17567,11 @@ def _destroy_before_leaving(
         # And outward, one scope at a time, as far as the scope that holds
         # the handler - which the jump stays inside, so what that one built
         # is still alive.
-        for name, held, labels, _loop in reversed(list(enclosing)):
+        for name, held, labels, _kind in reversed(list(enclosing)):
             if found.group(1) in labels:
                 break
             if not name:
-                continue  # a loop boundary; a jump to a handler crosses it
+                continue  # a loop or switch boundary; a jump to a handler crosses it
             leaving += f" {_destructor_call(held, name, classes)}"
         if not leaving.strip():
             continue
@@ -17108,7 +18066,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     where the methods were, and calls rewritten to pass the object.
     """
 
-    text = _strip_comments(source)
+    # Before the comments go, and before anything at all reads the text:
+    # raw strings as ordinary literals, and the arms no build takes emptied,
+    # so no reader below ever opens a literal on a quote inside either.
+    cooked = _cook_source(source)
+    text = _strip_comments(cooked)
     # Before anything reads the text at all. What is inside an `#if 0` is not
     # part of the program, and every pass below reads the text as written -
     # so a class in one was lifted out and emitted, a construct this subset
@@ -17426,8 +18388,12 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         )
         if not plain and not namespaces and not loose:
             # Nothing C++ about this file at all: hand back what was written,
-            # comments and all, so a diagnostic points at the real text.
-            return source
+            # comments and all, so a diagnostic points at the real text. As
+            # cooked, not as typed: a raw string is C++ whatever else the
+            # file is, and the C stage cannot read one - and an emptied dead
+            # arm is one the preprocessor would have skipped, on the same
+            # lines.
+            return cooked
         if loose:
             text = _address_reference_arguments(text, _function_signatures(text))
             text = _rewrite_functions(text, {}, None, text)
@@ -17604,10 +18570,18 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     #    and py2bin only put subobject construction into one the author wrote,
     #    so `Outer o;` left `in` as whatever was on the stack. That is C++'s
     #    implicit default constructor, and leaving it out is not a refusal -
-    #    it is a program that runs and is wrong.
+    #    it is a program that runs and is wrong;
+    #  * a class that gives a member a value where it is declared - `int n =
+    #    7;`, `std::atomic<bool> running_{false};` - applies it in every
+    #    constructor, and with none written there was nowhere to apply it:
+    #    `n` was whatever the stack held, and the program ran and was wrong.
     for name in order:
         found = classes[name]
-        if not (_is_polymorphic(name, classes) or _subobjects(found, classes)):
+        if not (
+            _is_polymorphic(name, classes)
+            or _subobjects(found, classes)
+            or found.member_values
+        ):
             continue
         # Only where the author wrote no constructor at all, which is when
         # C++ writes one. A class that declares one taking arguments has no
@@ -23339,7 +24313,9 @@ def inline_local_includes(
     if settled in seen:
         return ""
     seen.add(settled)
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # Read the way clang reads it before anything here reads it at all: a
+    # raw string is one literal, and prose inside an `#if 0` is not code.
+    text = _cook_source(path.read_text(encoding="utf-8", errors="replace"))
     # What no build compiles is not part of this file, and that has to be
     # settled before the includes are read rather than after. An `#include`
     # inside an `#if 0` was pasted anyway - and, being the first mention of

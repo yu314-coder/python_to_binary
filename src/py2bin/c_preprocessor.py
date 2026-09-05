@@ -476,33 +476,25 @@ def _scan(source: str, origin: str) -> list[list[PPToken]]:
                 # and decides what the literal means, which is where knowing
                 # the target - and so how wide a wchar_t is - belongs.
                 quote = text[index]
-                index += 1
-                while index < total and text[index] != quote:
-                    if text[index] == "\n":
-                        break
-                    index += 2 if text[index] == "\\" else 1
-                if index >= total or text[index] != quote:
-                    raise CCompileError(
-                        origin,
-                        line,
-                        column,
-                        "unterminated string literal"
-                        if quote == '"'
-                        else "unterminated character constant",
+                close = index + 1
+                while close < total and text[close] not in (quote, "\n"):
+                    close += 2 if text[close] == "\\" else 1
+                if close < total and text[close] == quote:
+                    index = close + 1
+                    current.append(
+                        PPToken(
+                            "string" if quote == '"' else "character",
+                            text[start:index],
+                            line,
+                            column,
+                            origin,
+                            spaced,
+                        )
                     )
-                index += 1
-                current.append(
-                    PPToken(
-                        "string" if quote == '"' else "character",
-                        text[start:index],
-                        line,
-                        column,
-                        origin,
-                        spaced,
-                    )
-                )
-                spaced = False
-                continue
+                    spaced = False
+                    continue
+                # Nothing on the line closes it, so the prefix is a name and
+                # the quote after it is read on its own below.
             current.append(PPToken("identifier", name, line, column, origin, spaced))
             spaced = False
             continue
@@ -527,21 +519,22 @@ def _scan(source: str, origin: str) -> list[list[PPToken]]:
             continue
         if character in "\"'":
             start = index
-            index += 1
-            while index < total and text[index] != character:
-                if text[index] == "\n":
-                    break
-                index += 2 if text[index] == "\\" else 1
-            if index >= total or text[index] != character:
-                raise CCompileError(
-                    origin,
-                    line,
-                    column,
-                    "unterminated string literal"
-                    if character == '"'
-                    else "unterminated character constant",
-                )
-            index += 1
+            close = index + 1
+            while close < total and text[close] not in (character, "\n"):
+                close += 2 if text[close] == "\\" else 1
+            if close >= total or text[close] != character:
+                # A quote nothing on its line closes. Not an error here,
+                # because this runs before the conditionals are read: inside
+                # a skipped group it is prose - `this block doesn't compile`
+                # - and clang reads it as a stray character one wide and
+                # moves on. Where it stands in code that is compiled,
+                # `_convert` reports the unterminated literal it is, at this
+                # position.
+                current.append(PPToken("other", character, line, column, origin, spaced))
+                spaced = False
+                index += 1
+                continue
+            index = close + 1
             current.append(
                 PPToken(
                     "string" if character == '"' else "character",
@@ -1801,6 +1794,15 @@ def _convert(token: PPToken, error) -> Token:
             token,
         )
     if token.kind == "other":
+        if token.spelling in ('"', "'"):
+            # A quote `_scan` found nothing on its line to close: an error
+            # only here, where the token is one the program compiles.
+            error(
+                "unterminated string literal"
+                if token.spelling == '"'
+                else "unterminated character constant",
+                token,
+            )
         error(f"unsupported character {token.spelling!r}", token)
     lexer = Lexer(token.spelling, token.origin)
     lexer.line, lexer.column = token.line, token.column

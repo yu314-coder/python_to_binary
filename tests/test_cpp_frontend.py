@@ -465,6 +465,48 @@ class ClassesChosenByACondition(unittest.TestCase):
         self.assertIn("#ifdef WITH_EXTRA", said)
         self.assertIn("Box declares a member under", said)
 
+    def test_an_indented_directive_in_a_class_body_is_refused_by_the_same_name(self) -> None:
+        """C lets blanks stand before the `#`, and most editors put them there.
+
+        The refusal was anchored to the start of a line, so `    #ifdef`
+        slipped past it, was swallowed into the member after it, and died in
+        the C stage as `#ifdef takes one macro name` on a line nobody wrote.
+        """
+
+        said = self._refused(
+            "struct Box {\n    int a;\n    #ifdef WITH_EXTRA\n    int b;\n"
+            "    #endif\n    int total() { return a + 1; }\n};\n"
+            "int main(void){ Box b; b.a = 5; return b.total(); }\n"
+        )
+        self.assertIn("#ifdef WITH_EXTRA", said)
+        self.assertIn("Box declares a member under", said)
+        self.assertNotIn("takes one macro name", said)
+
+    def test_any_other_directive_where_a_member_goes_is_named_too(self) -> None:
+        """A `#define` between two members is not part of either.
+
+        Read as one it reached the C compiler in the middle of a declaration,
+        which reported a `#` that means nothing in C - true, and no help.
+        """
+
+        said = self._refused(
+            "struct Box {\n    int a;\n    #define EXTRA 1\n"
+            "    int total() { return a + EXTRA; }\n};\n"
+            "int main(void){ Box b; b.a = 5; return b.total(); }\n"
+        )
+        self.assertIn("Box holds `#define EXTRA 1` where a member goes", said)
+
+    def test_a_directive_in_a_method_body_is_left_to_the_preprocessor(self) -> None:
+        """The refusal is about where a member goes, and a body is not that."""
+
+        out = translate(
+            "struct T {\n int v() {\n    #define ANSWER 6\n"
+            "    return ANSWER;\n }\n};\n"
+            "int main(void){ T t; return t.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("#define ANSWER 6", out)
+
     def test_an_if_zero_inside_a_class_body_leaves_nothing_behind(self) -> None:
         """Every arm readable, so the `#if` and its `#endif` go too.
 
@@ -548,6 +590,172 @@ class ClassesChosenByACondition(unittest.TestCase):
             "t.cpp",
         )
         self.assertEqual(out.count("struct K {"), 1)
+
+
+class ReadTheWayClangReads(unittest.TestCase):
+    """What the text is before anything in this stage reads it.
+
+    Every reader here blanks the literals first and takes a quote to open a
+    literal that runs to the next quote. Two things in real files break that:
+    prose inside an `#if 0` - `this doesn't compile` - whose apostrophe
+    opened a character constant that ran on across the `#endif`, and a raw
+    string, whose quotes are not its ends. Both are settled before the
+    comments go: a dead arm is emptied and a raw string is cooked into the
+    ordinary literal spelling the same bytes.
+    """
+
+    def test_prose_in_a_dead_arm_is_never_read_as_code(self) -> None:
+        """One apostrophe, so nothing pairs with it.
+
+        The arm was taken to run to the end of the file, and the C stage
+        reported `this #if was never closed with #endif` on a program clang
+        compiles without a word.
+        """
+
+        out = translate(
+            "#if 0\nThis block doesn't compile.\n#endif\n"
+            "struct S { int v() { return 5; } };\n"
+            "int main(void){ S s; return s.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("return 5", out)
+        self.assertNotIn("doesn", out)
+        self.assertNotIn("#endif", out)
+
+    def test_apostrophes_in_comments_and_literals_stay_where_they_are(self) -> None:
+        out = translate(
+            "#if 0\nIt isn't compiled.\n#endif\n"
+            "// it's a comment\n/* and this one isn't\n   closed on its line */\n"
+            "struct S { int v() { return '\\'' + 0; } };\n"
+            "const char *s = \"it's \\\"quoted\\\"\";\n"
+            "int main(void){ S s; return s.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("'\\''", out)
+        self.assertIn("\"it's \\\"quoted\\\"\"", out)
+        self.assertNotIn("compiled", out)
+
+    def test_a_dead_arm_is_read_the_way_the_preprocessor_reads_one(self) -> None:
+        """Directives and comments, and nothing else.
+
+        A block comment hides an `#endif` inside it; a raw string does too;
+        a quote nothing on its line closes is a stray character; and an
+        `#include` in a dead arm names nothing this stage should paste.
+        """
+
+        out = translate(
+            "#if 0 // switched off\n"
+            "/* a comment holding\n#endif\n*/\n"
+            'const char *s = R"(\n#endif\n)";\n'
+            '"unterminated\n'
+            "#include <no_such_header.h>\n"
+            "struct T { int v() { return 1; } };\n"
+            "#endif\n"
+            "struct T { int v() { return 2; } };\n"
+            "int main(void){ T t; return t.v(); }\n",
+            "t.cpp",
+        )
+        self.assertIn("return 2", out)
+        self.assertNotIn("return 1", out)
+        self.assertNotIn("no_such_header", out)
+
+    def test_the_arm_a_conditional_leaves_live_is_untouched(self) -> None:
+        """Only what `_constant_arm` can read is emptied; a name is not."""
+
+        out = translate(
+            "#if 1\nint live = 1;\n#else\nint dead = 2;\n#endif\n"
+            "#ifdef NAMED\nint named = 3;\n#endif\n"
+            "int main(void){ return live; }\n",
+            "t.cpp",
+        )
+        self.assertIn("int live = 1;", out)
+        self.assertIn("int named = 3;", out)
+        self.assertNotIn("int dead", out)
+
+    def test_a_dead_arm_in_a_header_is_emptied_before_the_header_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "k.hpp").write_text(
+                "#if 0\nThis header doesn't say much.\n#endif\n"
+                "struct K { int v() { return 9; } };\n",
+                encoding="utf-8",
+            )
+            entry = root / "main.cpp"
+            entry.write_text(
+                '#include "k.hpp"\nint main(void){ K k; return k.v(); }\n',
+                encoding="utf-8",
+            )
+            out = translate(
+                inline_local_includes(entry, (), set(), set()), str(entry)
+            )
+        self.assertIn("return 9", out)
+        self.assertNotIn("doesn", out)
+
+    def test_a_raw_string_is_one_literal(self) -> None:
+        """`R"(a "b" c)"` reached the C stage as two strings and a name."""
+
+        out = translate(
+            'const char *s = R"(a "b" __LINE__ c\\n)";\n'
+            "int main(void){ return s[0]; }\n",
+            "t.cpp",
+        )
+        self.assertIn('"a \\"b\\" __LINE__ c\\\\n"', out)
+        self.assertNotIn('R"', out)
+
+    def test_a_delimiter_and_a_prefix_are_read(self) -> None:
+        out = translate(
+            'const char *a = R"xy(has )" inside)xy";\n'
+            'const wchar_t *b = LR"(w"ide)";\n'
+            'const char *c = u8R"(eight)";\n'
+            "int main(void){ return 0; }\n",
+            "t.cpp",
+        )
+        self.assertIn('"has )\\" inside"', out)
+        self.assertIn('L"w\\"ide"', out)
+        self.assertIn('u8"eight"', out)
+
+    def test_a_name_ending_in_r_is_not_a_raw_string(self) -> None:
+        """The prefix has to start a token: `FOOR"("` is a name and a string."""
+
+        out = translate(
+            '#define FOOR(x) x\n'
+            'const char *s = FOOR"(" ")";\n'
+            "int main(void){ return 0; }\n",
+            "t.cpp",
+        )
+        self.assertIn('FOOR"(" ")"', out)
+
+    def test_a_raw_string_keeps_the_line_count(self) -> None:
+        """A `__LINE__` after a raw string that spans lines is still exact.
+
+        The line breaks the string held come back after the literal, so
+        nothing below moves; `__LINE__` is answered off the same text.
+        """
+
+        out = with_headers(
+            'const char *two = R"(first\nsecond\nthird)"; int here = __LINE__;\n'
+            "int main(void){ return here; }\n"
+        )
+        self.assertIn('"first\\nsecond\\nthird"', out)
+        self.assertIn("int here = 3;", out)
+
+    def test_a_raw_string_in_a_define_stays_one_directive(self) -> None:
+        out = translate(
+            '#define GREETING R"(say "hi"\nagain)" MORE\n'
+            "int main(void){ return 0; }\n",
+            "t.cpp",
+        )
+        self.assertIn('#define GREETING "say \\"hi\\"\\nagain"\\\n MORE', out)
+
+    def test_an_endif_inside_a_live_raw_string_is_text(self) -> None:
+        out = translate(
+            "#if 1\n"
+            'const char *s = R"(\n#endif\n)";\n'
+            "#endif\n"
+            "int main(void){ return s[0]; }\n",
+            "t.cpp",
+        )
+        self.assertIn('"\\n#endif\\n"', out)
 
 
 class SeveralFiles(unittest.TestCase):
@@ -2067,6 +2275,283 @@ class Destructors(unittest.TestCase):
             "p.cpp",
         )
         self.assertIn("Pair__dtor(&p); return", out)
+
+    _IN_A_LOOP = """class R {
+public:
+    int n;
+    R() { n = 1; }
+    ~R() { n = 0; }
+};
+int main(void) {
+    for (int i = 0; i < 3; i++) {
+        R r;
+        switch (i) {
+            case 1:
+                continue;
+            case 2:
+                break;
+            default:
+                r.n = i;
+        }
+    }
+    return 0;
+}
+"""
+
+    def test_a_continue_inside_a_switch_destroys_what_the_loop_declared(
+        self,
+    ) -> None:
+        """A switch is where a `break` stops, and not where a `continue` does.
+
+        Read as the boundary for both jumps, the switch kept the `continue`
+        from reaching the object the loop's body declared above it: nothing
+        destroyed `r` on that path, so a destructor that counts was one
+        short - a leak, and an answer clang++ did not give.
+        """
+
+        out = translate(self._IN_A_LOOP, "r.cpp")
+        self.assertIn("R__dtor(&r); continue;", out)
+        # The `break` leaves the switch and nothing more; `r` lives on to the
+        # end of the loop's body, where its one other destructor call is.
+        self.assertRegex(out, r"case 2:\s*break;")
+        self.assertEqual(out.count("R__dtor(&r);"), 2)
+
+    def test_a_continue_inside_an_if_inside_a_switch_reaches_the_loop(
+        self,
+    ) -> None:
+        # One scope further in: the walk outward has to pass the switch's
+        # boundary and stop at the loop's.
+        source = self._IN_A_LOOP.replace(
+            "case 1:\n                continue;",
+            "case 1:\n                if (r.n) { continue; }\n                break;",
+        )
+        out = translate(source, "r.cpp")
+        self.assertRegex(out, r"if \(r\.n\)\s*\{\s*R__dtor\(&r\); continue;\s*\}")
+        self.assertEqual(out.count("R__dtor(&r);"), 2)
+
+    def test_a_continue_leaves_the_inner_loop_only(self) -> None:
+        source = """class R { public: int n; R() { n = 1; } ~R() { n = 0; } };
+int main(void) {
+    for (int i = 0; i < 3; i++) {
+        R outer;
+        for (int j = 0; j < 3; j++) {
+            R inner;
+            switch (j) {
+                case 1:
+                    continue;
+                default:
+                    inner.n = j;
+            }
+        }
+    }
+    return 0;
+}
+"""
+        out = translate(source, "r.cpp")
+        self.assertIn("R__dtor(&inner); continue;", out)
+        self.assertNotIn("R__dtor(&outer); continue;", out)
+        self.assertEqual(out.count("R__dtor(&outer);"), 1)
+
+    def test_every_object_the_loop_declared_dies_at_a_jump_inside_an_if(
+        self,
+    ) -> None:
+        """`R a; R b; if (x) break;` destroyed `b` and left `a`.
+
+        The walk outward stopped at the first entry that belonged to the
+        loop's body, which is the last object it declared. The boundary is
+        the body, not any one object in it - and the objects come apart in
+        reverse of their declaration.
+        """
+
+        source = """class R { public: int n; R() { n = 1; } ~R() { n = 0; } };
+int main(void) {
+    for (int i = 0; i < 3; i++) {
+        R a;
+        R b;
+        if (i == 1) { break; }
+        if (i == 2) { continue; }
+    }
+    return 0;
+}
+"""
+        out = translate(source, "r.cpp")
+        self.assertIn("R__dtor(&b); R__dtor(&a); break;", out)
+        self.assertIn("R__dtor(&b); R__dtor(&a); continue;", out)
+
+
+
+class TypedefsThisStageWrites(unittest.TestCase):
+    """A typedef py2bin writes goes below whatever the author's it names."""
+
+    _SOURCE = (
+        "#include <cstdio>\n"
+        "typedef int (*Op)(int, int);\n"
+        "static int add(int a, int b) { return a + b; }\n"
+        "static Op pick(int w) { return add; }\n"
+        "int main() { Op (*p2)(int) = pick; "
+        'printf("%d\\n", p2(0)(3, 4)); return 0; }\n'
+    )
+
+    def test_a_written_typedef_comes_after_the_one_it_names(self) -> None:
+        """`typedef Op (*__py2bin_fn_pick)(int w);` above `Op` was not C.
+
+        Every typedef this stage writes went to the top of the file. One
+        naming a typedef the author wrote stood above it, and the C compiler
+        refused the file at a line nobody wrote: `Op (*p2)(int) = pick;` in
+        the program became "expected a type name, found 'Op'".
+        """
+
+        out = translate(self._SOURCE, "t.cpp")
+        author = out.index("typedef int (*Op)(int, int);")
+        written = out.index("typedef Op (*__py2bin_fn_pick)")
+        self.assertLess(author, written)
+
+    def test_one_naming_nothing_of_the_author_s_stays_at_the_top(self) -> None:
+        # `add` takes and answers plain ints, so its own typedef names no
+        # type this file declares and has nowhere it has to go.
+        out = translate(self._SOURCE, "t.cpp")
+        self.assertLess(
+            out.index("typedef int (*__py2bin_fn_add)"),
+            out.index("typedef int (*Op)(int, int);"),
+        )
+
+    def test_it_goes_after_what_it_names_and_no_further(self) -> None:
+        """Directly after the last typedef it spells, not after them all.
+
+        `__py2bin_fn_pick` names `Op` and nothing else, so `Picker` - which
+        is written between them in the author's file - may stand below it.
+        Pushing every written typedef to the bottom would be as wrong in the
+        other direction: one is needed above the first use of the function
+        whose type it is.
+        """
+
+        out = translate(
+            "#include <cstdio>\n"
+            "typedef int (*Op)(int, int);\n"
+            "typedef Op (*Picker)(int);\n"
+            "static int add(int a, int b) { return a + b; }\n"
+            "static Op pick(int w) { return add; }\n"
+            "int main() { Picker P = pick; "
+            'printf("%d\\n", P(0)(3, 4)); return 0; }\n',
+            "t.cpp",
+        )
+        self.assertLess(
+            out.index("typedef int (*Op)(int, int);"),
+            out.index("typedef Op (*__py2bin_fn_pick)"),
+        )
+        self.assertIn("typedef Op (*Picker)(int);", out)
+
+    def test_a_template_copy_goes_below_the_type_it_takes(self) -> None:
+        """The copy was written before the typedef it names existed.
+
+        Templates are expanded first, and a copy taking a function by its
+        own type names a typedef the naming pass writes afterwards. Each
+        pass placed what it wrote after the author's declarations only, so
+        the copy stood above its type and the C stage refused the file at a
+        line nobody wrote.
+        """
+
+        out = translate(
+            "#include <cstdio>\n"
+            "typedef int (*Op)(int, int);\n"
+            "static int add(int a, int b) { return a + b; }\n"
+            "static Op pick(int w) { return add; }\n"
+            "template<class F> int call(F f, int w) { return f(w)(5, 6); }\n"
+            'int main() { printf("%d\\n", call(pick, 0)); return 0; }\n',
+            "t.cpp",
+        )
+        self.assertLess(
+            out.index("typedef Op (*__py2bin_fn_pick)"),
+            out.index("call__py2bin_fn_pick("),
+        )
+
+
+class BracedMembers(unittest.TestCase):
+    """C++11's brace initialiser where a data member is declared."""
+
+    def test_a_member_given_braces_is_a_member_and_not_a_method(self) -> None:
+        """`std::atomic<bool> running_{false};` stopped the build.
+
+        The class reader met the brace before the semicolon and handed the
+        declaration to the method reader, which asked what `running_`
+        returns and said it could not read the member - the error the user
+        reported. The brace opens a value, not a body.
+        """
+
+        out = translate(
+            "class B { public: int n_{7}; double r_{2.5}; "
+            "int get() { return n_; } };\n"
+            "int main(void) { B b; return b.get(); }\n",
+            "b.cpp",
+        )
+        self.assertIn("int n_;", out)
+        self.assertIn("double r_;", out)
+        self.assertIn("int __py2bin_init_n_ = {7}; this->n_ = __py2bin_init_n_;", out)
+        self.assertIn("double __py2bin_init_r_ = {2.5}; this->r_ = __py2bin_init_r_;", out)
+
+    def test_a_member_of_a_class_with_a_constructor_is_built_with_the_braces(
+        self,
+    ) -> None:
+        # `Range range_{3, 10};` is that constructor called with those two,
+        # exactly as an initialiser list saying `: range_(3, 10)` would be.
+        out = translate(
+            "class R { public: int lo; int hi; R(int a, int b) { lo = a; hi = b; } };\n"
+            "class B { public: R r_{3, 10}; int span() { return r_.hi - r_.lo; } };\n"
+            "int main(void) { B b; return b.span(); }\n",
+            "b.cpp",
+        )
+        self.assertRegex(out, r"R__ctor\w*\(&this->r_, 3, 10\)")
+
+    def test_a_member_written_where_a_local_would_become_pushes_stays_a_member(
+        self,
+    ) -> None:
+        """A class body has no room for a statement.
+
+        `std::vector<int> v_{1, 2};` written as a local becomes the object
+        and two `push_back` calls. Applied to a member, the pushes landed
+        inside the class body, where they read as member functions returning
+        nothing - and the member itself was gone from the struct, so every
+        offset below it moved with nothing said.
+        """
+
+        out = translate(
+            "class V { public: int n; void push_back(int v) { n = n + v; } "
+            "V() { n = 0; } };\n"
+            "class B { public: V v_{1, 2}; int total() { return v_.n; } };\n"
+            "int main(void) { B b; return b.total(); }\n",
+            "b.cpp",
+        )
+        # The pushes belong in the constructor, below the member's own
+        # build, and the member itself stays in the struct.
+        self.assertIn("    V v_;", out)
+        self.assertIn(
+            "V__ctor(&this->v_); V__push_back(&this->v_, 1);"
+            " V__push_back(&this->v_, 2);",
+            out,
+        )
+
+    def test_a_member_declaration_that_runs_on_is_refused_by_name(self) -> None:
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "class B { public: int x_{1}, y_{2}; };\n"
+                "int main(void) { B b; return 0; }\n",
+                "b.cpp",
+            )
+        self.assertIn("brace initialiser", str(caught.exception))
+
+    def test_a_class_with_only_member_values_gets_the_constructor_that_applies_them(
+        self,
+    ) -> None:
+        # Nobody wrote a constructor, so C++ writes one; without it there was
+        # nowhere to apply the values and the members held whatever the stack
+        # did - a program that runs and is wrong.
+        out = translate(
+            "class B { public: int n_{7}; };\n"
+            "int main(void) { B b; return b.n_; }\n",
+            "b.cpp",
+        )
+        self.assertIn("this->n_ = __py2bin_init_n_;", out)
+        self.assertIn("B__ctor", out)
 
 
 class ThrownObjects(unittest.TestCase):

@@ -2739,6 +2739,53 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a member given a value in braces, and four other things a class body holds
+
+`std::atomic<bool> running_{false};` stopped a build with "cannot read the
+member": C++11's brace initialiser on a data member arrived at the class
+reader, which met the brace before the semicolon and asked the method reader
+what `running_` returns. A brace there opens a value, not a body. Every shape
+is read now - an atomic, a plain number, a string, an aggregate, a container
+empty or given a list, a pointer, a class with a constructor taking two, an
+array - and what the braces mean is decided where the constructor is written,
+by the member's type: the member's own constructor called with them, a copy,
+a zero, or the pushes an initializer_list stands for. Where the class wrote
+no constructor at all, one is written, since otherwise there was nowhere to
+apply the values and the members held whatever the stack did. Two passes that
+rewrite a local's braces had been rewriting members' too: a member became a
+statement in the middle of a class body, which read back as a member function
+returning nothing while the member itself left the struct - a silent change
+of every offset below it. Both now leave a member's braces to the reader that
+knows the types. A pointer to a function is also a member of the table that
+resolves a bare name to `this`, so a method can call one.
+
+`Op (*p2)(int) = pick;`, with `Op` a typedef of a pointer to a function, was
+refused with "expected a type name, found 'Op'". The typedef py2bin writes
+for a function's own type went to the top of the file, above the author's
+typedef it names, and the C stage refused a line nobody wrote. Each written
+typedef now goes directly after the last declaration it names, and a template
+copy taking one goes below the typedef it takes - the two are written by
+different passes, and neither could see what the other had placed.
+
+A `continue` inside a `switch` inside a loop left the loop body's objects
+undestroyed. A switch is where a `break` stops and not where a `continue`
+does, and reading it as the boundary for both meant a destructor with a side
+effect never ran. The two jumps are told apart now, and the walk outward
+stops at the body each one leaves.
+
+Prose inside `#if 0` holding one apostrophe - "doesn't", the way a header
+explains what it has switched off - made the C++ stage report an `#if` that
+was never closed: the reader opened a character constant on the apostrophe
+and swallowed the `#endif`, and everything below went dark. A raw string
+literal `R"(a "b" c)"` reached the C stage as two literals; raw strings are
+cooked into ordinary ones before anything is lexed. An indented `#ifdef`
+inside a class body escaped the by-name refusal its unindented twin gets and
+died later saying nothing useful; the refusal is anchored on the whitespace C
+allows in front of a directive.
+
+2184 tests, 555 programs against clang++, 11 projects, 3372 builds across six
+targets.
+
 ### 0.9.13 - OpenSSL through py2bin: a declarator, a library that was named and dropped, and a DLL found by its component
 
 A program that includes <openssl/evp.h> now builds through py2bin. The C
