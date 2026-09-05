@@ -319,17 +319,12 @@ def _expression(
         refs.strings.append((len(code) - 4, expression.data))
         return
     if isinstance(expression, ExternCall):
-        if refs is None:
-            raise TypeError(
-                "x86-64 external calls require the darwin or windows encoder"
+        if expression.result == "f64":
+            raise ValueError(
+                f"external call {expression.symbol} returns a double in XMM0, "
+                "so its result is not an integer expression"
             )
-        if refs.extern_call is not None:
-            # Microsoft x64: four registers by position, 32 bytes of shadow.
-            _external_call_windows(
-                code, expression, slot_base, refs, refs.extern_call
-            )
-        else:
-            _external_call_x86(code, expression, slot_base, refs)
+        _external_call(code, expression, slot_base, refs)
         return
     if isinstance(expression, GlobalAddress):
         if refs is not None and refs.image_statics:
@@ -361,6 +356,18 @@ def _float_expression(
 ) -> None:
     """Place one IEEE-754 double expression in XMM0."""
 
+    if isinstance(expression, ExternCall):
+        if expression.result != "f64":
+            raise ValueError(
+                f"external call {expression.symbol} returns an integer word in "
+                "RAX, so its result is not a float expression"
+            )
+        # Both conventions this file emits - System V and Microsoft x64 -
+        # return a double in xmm0, so the call leaves it where this wants
+        # it. Only the arm64 encoder had this arm; a C program calling a
+        # double-returning import stopped here with an internal error.
+        _external_call(code, expression, slot_base, refs)
+        return
     if isinstance(expression, FloatConstant):
         code.extend(b"\x48\xb8" + struct.pack("<Q", _float_bits(expression.value)))
         code.extend(b"\x66\x48\x0f\x6e\xc0")  # movq xmm0, rax
@@ -575,6 +582,23 @@ _SYSV_INTEGER_RELOAD = (
     b"\x4c\x8b\x04\x24",  # r8
     b"\x4c\x8b\x0c\x24",  # r9
 )
+
+
+def _external_call(
+    code: bytearray, expression, slot_base: int, refs: "_X86Refs | None"
+) -> None:
+    """Emit the call to a dynamically bound symbol in whichever convention
+    the encoder is for; the result is in rax, or in xmm0 for an "f64"."""
+
+    if refs is None:
+        raise TypeError(
+            "x86-64 external calls require the darwin or windows encoder"
+        )
+    if refs.extern_call is not None:
+        # Microsoft x64: four registers by position, 32 bytes of shadow.
+        _external_call_windows(code, expression, slot_base, refs, refs.extern_call)
+    else:
+        _external_call_x86(code, expression, slot_base, refs)
 
 
 def _external_call_x86(

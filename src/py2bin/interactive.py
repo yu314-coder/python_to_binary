@@ -1118,12 +1118,46 @@ def _library_holding(program: Path, symbol: str, target: str) -> "str | None":
         say(f"  could not look: {error}")
         return None
     if found is None:
-        say(
-            "  Nothing fetched for this build exports it. If it lives in a\n"
-            "  library somebody else ships, name it with --library NAME.dll."
-        )
+        say("  Nothing fetched for this build exports it.")
+        _say_what_could_be_named(beside, target)
         return None
     return found.name
+
+
+def _say_what_could_be_named(beside: Path, target: str) -> None:
+    """List the shared libraries the index offers for what the headers are
+    about, so the name `--library` needs can be chosen rather than guessed.
+
+    Chosen by the author and not by py2bin: the packages named after a
+    component ship different versions of it, and the one whose library
+    matches the headers the program compiled against is not something a
+    directory listing can tell. A library of another version behind these
+    headers would load and compute something else.
+    """
+
+    from .header_fetch import components_fetched, libraries_offered
+
+    offered: "list[tuple[str, list[str]]]" = []
+    for component in components_fetched(beside):
+        try:
+            offered.extend(
+                libraries_offered(component, target.rsplit("-", 1)[-1], say=say)
+            )
+        except Exception as error:  # a network that is not there
+            say(f"  could not ask the index about {component}: {error}")
+    if not offered:
+        say(
+            "  If it lives in a library somebody else ships, name it with\n"
+            "  --library NAME.dll."
+        )
+        return
+    say("  Packages named after what the headers are about ship these:")
+    for label, names in offered:
+        say(f"    {label}: {', '.join(names)}")
+    say(
+        "  Name the one built to the version the headers are with --library\n"
+        "  NAME.dll, and --auto-fetch brings it beside the program."
+    )
 
 
 def _fetch_one_header(program: Path, wanted: str) -> "Path | None":
@@ -1134,9 +1168,33 @@ def _fetch_one_header(program: Path, wanted: str) -> "Path | None":
     path has to be the directory holding `nlohmann`.
     """
 
-    from .header_fetch import CACHE_DIRECTORY, HeaderFetchError, fetch_header
+    from .cli import _include_root
+    from .header_fetch import (
+        CACHE_DIRECTORY,
+        HeaderFetchError,
+        _valid_name,
+        fetch_header,
+    )
 
     into = program.parent / CACHE_DIRECTORY
+    try:
+        spelled = _valid_name(wanted)
+    except HeaderFetchError as error:
+        say(f"  {error}")
+        return None
+    before = into / spelled
+    if before.is_file():
+        # Fetched by an earlier build, and kept under the name it is included
+        # by. The cache is not on the search path until something asks for
+        # it, so the first round cannot see it - and it is all this round
+        # needs. Asking the network again for a set that is already here,
+        # which is what every build after the first did, is what a host
+        # that limits anonymous requests refuses by the afternoon.
+        say(
+            f"\n  {wanted} was fetched before; using the copy in "
+            f"{CACHE_DIRECTORY}"
+        )
+        return _include_root(before, wanted)
     say(f"\n  {wanted} is not here. Looking for a package that holds it.")
     try:
         kept = fetch_header(wanted, into, say=say)
@@ -1153,8 +1211,6 @@ def _fetch_one_header(program: Path, wanted: str) -> "Path | None":
                 "directory with --include."
             )
         return None
-    from .cli import _include_root
-
     root = _include_root(kept, wanted)
     say(f"  fetched {wanted} into {root}")
     return root
@@ -1430,12 +1486,21 @@ def _carry_libraries(
     carried: "list[Path]" = []
     if not libraries or not auto_fetch:
         return carried
-    from .header_fetch import CACHE_DIRECTORY, HeaderFetchError, fetch_library
+    from .header_fetch import (
+        CACHE_DIRECTORY,
+        HeaderFetchError,
+        components_fetched,
+        fetch_library,
+    )
 
     # Where the headers were downloaded to. A component ships its header and
     # its library together, so what was fetched to compile is where to look
     # first for what is needed to run.
     cache = program.parent / CACHE_DIRECTORY / ".cache"
+    # And what those headers are about - `openssl`, for a program that
+    # included `openssl/evp.h` - which is what the index knows the library's
+    # package by when the library's own name finds no package at all.
+    components = tuple(components_fetched(program.parent / CACHE_DIRECTORY))
     architecture = target.rsplit("-", 1)[-1]
     #: What a shared library is called on each target. A name written without
     #: one is the name the loader will look for, spelled the way that target
@@ -1446,6 +1511,15 @@ def _carry_libraries(
     for spelled in libraries:
         name = spelled.partition(":")[0].strip()
         if not name:
+            continue
+        if "/" in name or "\\" in name:
+            # `--library /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib`
+            # names the library by the path the loader reads it from, and
+            # that is where it stays: it is not beside the program and is
+            # not to be carried there. Read as a name beside the program it
+            # resolved - `dist / "/opt/..."` is `/opt/...` - to the installed
+            # file itself, which was then listed as carried, and the one-file
+            # step deletes what it has carried.
             continue
         if "." not in Path(name).name:
             # `--library WebView2Loader` is how the component names itself and
@@ -1463,7 +1537,12 @@ def _carry_libraries(
         say(f"\n  {name} goes beside the program. Looking for it.")
         try:
             found = fetch_library(
-                name, output.parent, architecture, cache=cache, say=say
+                name,
+                output.parent,
+                architecture,
+                cache=cache,
+                components=components,
+                say=say,
             )
             carried.append(found)
         except HeaderFetchError as error:

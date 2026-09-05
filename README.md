@@ -2739,6 +2739,54 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - OpenSSL through py2bin: a declarator, a library that was named and dropped, and a DLL found by its component
+
+A program that includes <openssl/evp.h> now builds through py2bin. The C
+stage reads a function that returns a pointer to a function - `int
+(*BIO_meth_get_write(const BIO_METHOD *))(BIO *, const char *, int)`, of
+which OpenSSL's headers hold eighteen - where before it refused the shape by
+name; `extern int (*handler)(int);` reads too, and a parameter written as a
+function, `int apply(int f(int), int x)`, is adjusted to the pointer C says
+it is. `--library` was accepted, recorded, and then dropped by the darwin
+and linux back ends: every import was bound to libSystem and the build said
+"done", and dyld refused to start the program; linux left the name out of
+DT_NEEDED. The library a program names is now its own LC_LOAD_DYLIB, or a
+DT_NEEDED entry, and the symbol binds to it. A library named by its path -
+`--library /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib` - was read as a
+file beside the program, listed as carried, and the one-file step deletes
+what it carried: it would have unlinked the installed library. It stays
+where it is now. An import whose prototype passes or answers a `double`
+goes through the floating registers on arm64 and x86-64 both; before, an
+integer argument to a `double` parameter built and printed wrong numbers,
+and a `double` result died on an internal message. A `float` at an import
+is refused by name. The header cache is consulted before the network:
+`openssl/evp.h` is kept under the name it is included by, and the check
+that looked for the stem alone asked the index again on every build. When
+the fetched headers come from a source repository that ships no library,
+`--auto-fetch --library libcrypto-3-x64.dll` finds the DLL in the packages
+of the component the headers are about, reading each package's directory
+through an HTTP range request and taking the one member out by its own
+range with the CRC checked - eight megabytes of a package too large to
+download whole. With no `--library`, the refusal lists what could be named,
+package by package; py2bin does not pick a DLL for headers of another
+version, since the first that exports the symbol is a 1.1 debug build. The
+refusal spells the name the way the target's loader reads it, and a `.dll`
+named on a darwin or linux build is refused where it would be used.
+
+Two things the skeptics of that round found beside it. A C++ data member
+whose name sits inside parentheses in any shape but the plainest - `int (*
+const op)(int)`, `int (*ops[4])(int)`, `int (*(*get)(int))(int)` - was read
+as a method and left out of the struct, which was laid out without it:
+sizeof was 8 where clang says 24, and every offset after it was wrong with
+nothing said. Every such shape is a member now, the name found after the
+stars and before the bounds, so `int (**pf)(int)` and `int (*two[2][3])(int)`
+read too; a comma list borrows the specifiers alone, so `int (*f)(int), *p`
+makes p an `int *` and not a second pointer to a function; and a method
+whose result is a pointer to a function is refused by name. And `std::cout << s` with `s` a
+`std::string`, the most ordinary line of C++, was refused: the shipped
+<iostream> had no overload for it. It has one. 2156 tests, 549 programs
+against clang++, 11 projects, 3336 builds across six targets.
+
 ### 0.9.13 - files as streams, a thread given arguments, and three linkage blocks
 
 <fstream> is shipped: ifstream and ofstream over file helpers beside the

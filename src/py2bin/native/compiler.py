@@ -323,6 +323,49 @@ def _extern_symbols(module: Module) -> list[str]:
     return found
 
 
+def _darwin_symbol_libraries(
+    module: Module,
+    externs: "list[tuple[int, str]]",
+    python_dylib: "str | None",
+) -> dict[str, str]:
+    """Which dylib each extern symbol binds to, for the two-level namespace.
+
+    What the program named comes first, as it does for the PE import table:
+    `--library /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib` is the
+    path dyld loads, and it becomes an LC_LOAD_DYLIB of its own with the
+    symbol bound to its ordinal. The front end had recorded the name in
+    ``module.symbol_libraries`` and this path never read it, so every
+    imported symbol was bound to libSystem: the build said "done", and dyld
+    refused to start the program. The vetted tables answer for the rest.
+
+    The tables, not `cabi` itself: knowing which library a symbol lives in
+    is a lookup, and going through the module that calls them would pull
+    `ctypes` - and with it `subprocess` - into a build that needs neither.
+    """
+
+    from ..cabi_tables import _cpython_library, symbol_library
+
+    interpreter = _cpython_library()
+    named = module.symbol_libraries
+    found: dict[str, str] = {}
+    for _offset, symbol in externs:
+        library = named.get(symbol)
+        if library is None:
+            library = symbol_library(symbol)
+            if library is None:
+                continue
+            if python_dylib is not None and library == interpreter:
+                # The build machine's absolute path is what makes an
+                # artifact refuse to start anywhere else: dyld resolves
+                # LC_LOAD_DYLIB before a line of the program runs, so a
+                # Mac without that exact interpreter at that exact path
+                # gets no error from the program, only a refusal to
+                # launch. A path relative to the executable travels.
+                library = python_dylib
+        found[symbol] = library
+    return found
+
+
 def _module_uses_extern(module: Module) -> bool:
     if any(_contains_extern(operation) for operation in module.operations):
         return True
@@ -469,7 +512,22 @@ def _emit_native_module(
         # not have to say which one a symbol came from - unlike the PE import
         # table, where a symbol belongs to one named DLL.
         version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        needed = (f"libpython{version}.so.1.0", "libc.so.6", "libm.so.6")
+        # And whatever the program named for the symbols it calls: a library
+        # that is not in this list is not searched, so `--library
+        # libcrypto.so.3` had been accepted, recorded, and left out of the
+        # image, and ld.so refused the program at start for the very symbol
+        # the name was given for.
+        named = module.symbol_libraries
+        needed = (
+            f"libpython{version}.so.1.0",
+            "libc.so.6",
+            "libm.so.6",
+            *dict.fromkeys(
+                named[symbol]
+                for symbol in _extern_symbols(module)
+                if symbol in named
+            ),
+        )
         image = write_elf_dynamic(
             target.partition("-")[2],
             lambda address: encode_linux_extern(module, address),
@@ -512,27 +570,9 @@ def _emit_native_module(
             # always loaded; any other library (for example the CPython
             # runtime) is added as a further LC_LOAD_DYLIB with its own
             # two-level namespace ordinal.
-            # The tables, not `cabi` itself: knowing which library a symbol
-            # lives in is a lookup, and going through the module that calls
-            # them would pull `ctypes` - and with it `subprocess` - into a
-            # build that needs neither.
-            from ..cabi_tables import _cpython_library, symbol_library
-
-            interpreter = _cpython_library()
-            symbol_libraries = {}
-            for _offset, symbol in externs:
-                library = symbol_library(symbol)
-                if library is None:
-                    continue
-                if python_dylib is not None and library == interpreter:
-                    # The build machine's absolute path is what makes an
-                    # artifact refuse to start anywhere else: dyld resolves
-                    # LC_LOAD_DYLIB before a line of the program runs, so a
-                    # Mac without that exact interpreter at that exact path
-                    # gets no error from the program, only a refusal to
-                    # launch. A path relative to the executable travels.
-                    library = python_dylib
-                symbol_libraries[symbol] = library
+            symbol_libraries = _darwin_symbol_libraries(
+                module, externs, python_dylib
+            )
             from ..cabi_tables import OBJC_FRAMEWORKS, _OBJC_SYMBOLS
 
             # A framework has to be loaded for its classes to exist, even when
@@ -568,22 +608,9 @@ def _emit_native_module(
             image = write_macho_arm64(code, info_plist, code_resources)
     elif target == "darwin-x86_64" and _module_uses_extern(module):
         code, externs, statics = encode_darwin_extern_x86_64(module, 0x100001000)
-        from ..cabi_tables import (
-            OBJC_FRAMEWORKS,
-            _OBJC_SYMBOLS,
-            _cpython_library,
-            symbol_library,
-        )
+        from ..cabi_tables import OBJC_FRAMEWORKS, _OBJC_SYMBOLS
 
-        interpreter = _cpython_library()
-        symbol_libraries = {}
-        for _offset, symbol in externs:
-            library = symbol_library(symbol)
-            if library is None:
-                continue
-            if python_dylib is not None and library == interpreter:
-                library = python_dylib
-            symbol_libraries[symbol] = library
+        symbol_libraries = _darwin_symbol_libraries(module, externs, python_dylib)
         frameworks = (
             OBJC_FRAMEWORKS
             if any(symbol in _OBJC_SYMBOLS for symbol in symbol_libraries)

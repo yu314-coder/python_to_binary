@@ -38,13 +38,17 @@ from .runtime_fetch import (
     _read_json,
     download_verified,
     extract_zip,
+    read_range,
 )
 
 __all__ = [
     "HeaderFetchError",
+    "components_fetched",
     "found_headers",
     "fetch_header",
     "fetch_header_from",
+    "fetch_library",
+    "libraries_offered",
     "search_index",
 ]
 
@@ -165,6 +169,19 @@ def search_index(name: str, *, results: int = _RESULTS) -> "list[str]":
     `WebView2` in its name - and there is nothing else in the name to go on.
     """
 
+    return [package for package, _version in _search_entries(name, results=results)]
+
+
+def _search_entries(
+    name: str, *, results: int = _RESULTS
+) -> "list[tuple[str, str | None]]":
+    """Package ids and the newest release of each, as one search answers them.
+
+    The index says which version it is listing, and a search with
+    pre-releases left out lists the newest release: for a caller that will
+    go on to open the package, that spares asking the version list of every
+    candidate. None where the index did not say."""
+
     stem = _valid_name(name).rsplit("/", 1)[-1]
     stem = re.sub(r"\.(h|hpp|hxx|hh)$", "", stem, flags=re.I)
     if not stem:
@@ -176,13 +193,19 @@ def search_index(name: str, *, results: int = _RESULTS) -> "list[str]":
     data = answer.get("data")
     if not isinstance(data, list):
         raise HeaderFetchError(f"the index answered nothing usable for {stem!r}")
-    found: "list[str]" = []
+    found: "list[tuple[str, str | None]]" = []
     for entry in data:
         if not isinstance(entry, dict):
             continue
         package = entry.get("id")
-        if isinstance(package, str) and package and package not in found:
-            found.append(package)
+        if not isinstance(package, str) or not package:
+            continue
+        if any(package == seen for seen, _version in found):
+            continue
+        version = entry.get("version")
+        if not isinstance(version, str) or not version or "-" in version:
+            version = None
+        found.append((package, version))
     return found
 
 
@@ -234,9 +257,12 @@ def fetch_header(
             f"GCC or MSVC, and does not compile here"
         )
     into = Path(into)
-    already = into / stem
-    if already.is_file():
-        return already
+    # Fetched before. Under the name it is included by first: `openssl/evp.h`
+    # is kept as `openssl/evp.h`, and a check that looked only for the stem
+    # missed it and asked the network again on every build.
+    for already in (into / wanted, into / stem):
+        if already.is_file():
+            return already
     reasons: "list[str]" = []
     # Which index to ask first. A name with a directory in it, or one spelled
     # the way only C++ spells a header, belongs to a library published as
@@ -439,6 +465,7 @@ def fetch_library(
     *,
     cache: "Path | None" = None,
     results: int = _RESULTS,
+    components: "tuple[str, ...]" = (),
     say=lambda message: None,
 ) -> Path:
     """Download the shared library `name` and keep the copy for this machine.
@@ -454,6 +481,16 @@ def fetch_library(
     files and nearly all of them are somebody else's business; the one
     matching the name given, for the architecture being built, is the one
     that was asked for.
+
+    ``components`` is what the fetched headers are about - `openssl` for a
+    program that included `openssl/evp.h` - and is where the index is asked
+    next when a search for the file's own name finds nothing: a package is
+    named after the component and not after the file in it, and OpenSSL's
+    `libcrypto-3-x64.dll` is in no package called that. Only the file named
+    is taken from whatever the component's packages turn out to be: the
+    name carries the version the program was written against, so the
+    package that ships a different version of the component ships a file of
+    a different name and is passed over.
     """
 
     stem = _valid_name(name).rsplit("/", 1)[-1]
@@ -508,6 +545,13 @@ def fetch_library(
             say(f"  {stem} came from the package {package} {version}")
             return found
         reasons.append(f"{package}: holds no {stem} for {architecture}")
+    for component in components:
+        found = _library_of_component(
+            component, stem, into, wanted, architecture, cache=cache, say=say,
+            reasons=reasons,
+        )
+        if found is not None:
+            return found
     spelled = "\n    ".join(reasons) or "nothing was found to try"
     raise HeaderFetchError(
         f"{stem!r} was not found:\n    {spelled}\n"
@@ -515,6 +559,259 @@ def fetch_library(
         f"binary to run. Put a copy there yourself, or install the component "
         f"on the machine that will run it"
     )
+
+
+#: How many of a component's packages are looked at. A component that is
+#: also a .NET namespace - OpenSSL is - has dozens of managed packages named
+#: after it ahead of the one that ships the native library, and each is
+#: turned over by reading its directory alone, so looking at many is cheap.
+_COMPONENT_RESULTS = 40
+
+
+def _library_of_component(
+    component: str,
+    stem: str,
+    into: Path,
+    folders: "tuple[str, ...]",
+    architecture: str,
+    *,
+    cache: "Path | None" = None,
+    say=lambda message: None,
+    reasons: "list[str] | None" = None,
+) -> "Path | None":
+    """The library `stem` out of a package named after `component`, if one
+    of the first few the index lists ships it for this machine.
+
+    Each candidate is asked what it holds before anything is downloaded -
+    a zip says so in its directory, which sits at its end - and only a
+    package that lists the file has the file taken out of it, by that
+    member's own byte range. The package OpenSSL ships its Windows
+    libraries in is 136MB of every build flavour of every architecture;
+    the one library wanted is 8MB of it.
+    """
+
+    reasons = reasons if reasons is not None else []
+    try:
+        entries = _search_entries(component, results=_COMPONENT_RESULTS)
+    except _DID_NOT_ANSWER as error:
+        reasons.append(f"the package index, asked for {component}: {error}")
+        return None
+    say(f"  looking through the {len(entries)} packages named after {component}")
+    for package, version in entries:
+        try:
+            if version is None:
+                version = _latest_version(package)
+            label = f"{package} {version}"
+            url = _package_url(package, version)
+            members = _members_of(url, label)
+            if members is None:
+                # A server that answers no range, or a directory too big for
+                # the format this reads: the whole package, then, within the
+                # ceiling any fetch has.
+                say(f"  trying {label}")
+                found = _take_library(url, label, into, stem, folders, cache=cache)
+                if found is not None:
+                    say(f"  {stem} came from the package {label}")
+                    return found
+                continue
+            member = _member_named(members, stem, folders)
+            if member is None:
+                continue
+            say(f"  trying {label}")
+            into.mkdir(parents=True, exist_ok=True)
+            written = into / stem
+            written.write_bytes(_member_bytes(url, label, member, _MAX_PACKAGE))
+        except _DID_NOT_ANSWER as error:
+            reasons.append(f"{package}: {error}")
+            continue
+        say(f"  {stem} came from the package {label}")
+        return written
+    reasons.append(
+        f"none of the {len(entries)} packages named after {component} holds "
+        f"{stem} for {architecture}"
+    )
+    return None
+
+
+def libraries_offered(
+    component: str, architecture: str, *, say=lambda message: None
+) -> "list[tuple[str, list[str]]]":
+    """Which shared libraries the packages named after `component` ship for
+    this machine: (package and version, library names), in the index's order.
+
+    For the message that says a library has to be named: it is a list of
+    what could be named, read off each package's directory and nothing
+    more. Which of them matches the headers the program compiled against is
+    the program's author's to say - the versions differ, and a library of
+    one version behind the headers of another is a program that starts and
+    computes something else.
+    """
+
+    folders = _RUNTIME_FOLDERS.get(architecture)
+    if folders is None:
+        return []
+    offered: "list[tuple[str, list[str]]]" = []
+    try:
+        entries = _search_entries(component, results=_COMPONENT_RESULTS)
+    except _DID_NOT_ANSWER:
+        return offered
+    say(f"  looking through the {len(entries)} packages named after {component}")
+    for package, version in entries:
+        try:
+            if version is None:
+                version = _latest_version(package)
+            members = _members_of(_package_url(package, version), f"{package} {version}")
+        except _DID_NOT_ANSWER:
+            continue
+        if not members:
+            continue
+        names: "list[str]" = []
+        for member in members:
+            name = member[0].rsplit("/", 1)[-1]
+            if not name.lower().endswith(".dll") or name in names:
+                continue
+            if any(folder.lower() in member[0].lower() for folder in folders):
+                names.append(name)
+        if names:
+            offered.append((f"{package} {version}", names))
+    return offered
+
+
+#: How much of the end of an archive is read to find its directory. The
+#: end-of-directory record is 22 bytes plus a comment of up to 64KB, so
+#: this many bytes hold it whatever the comment.
+_ZIP_TAIL = 64 * 1024 + 22
+
+#: A zip member as its central directory lists it: name, method, compressed
+#: size, size, CRC-32, and the offset of its local header.
+_Member = "tuple[str, int, int, int, int, int]"
+
+
+def _members_of(url: str, label: str) -> "list[_Member] | None":
+    """The directory of the zip at `url`, read without the rest of it.
+
+    The directory sits at the end of a zip, so the end is what is asked for.
+    None where the server answered the whole file rather than the end of it
+    - nothing of it is read then - or where the archive is written in the
+    64-bit form this does not read, and the caller falls back to a whole
+    download with the ceiling any download has.
+    """
+
+    answered = read_range(url, label, -_ZIP_TAIL)
+    if answered is None:
+        return None
+    tail, size = answered
+    at = tail.rfind(b"PK\x05\x06")
+    if at < 0 or at + 22 > len(tail):
+        raise FetchError(f"{label} is not a zip archive: {url}")
+    entries, directory_size, directory_at = struct.unpack_from("<HII", tail, at + 10)
+    if entries == 0xFFFF or directory_size == 0xFFFFFFFF or directory_at == 0xFFFFFFFF:
+        return None
+    tail_at = size - len(tail)
+    if directory_at >= tail_at:
+        directory = tail[directory_at - tail_at : directory_at - tail_at + directory_size]
+    else:
+        answered = read_range(url, label, directory_at, directory_at + directory_size)
+        if answered is None:
+            return None
+        directory = answered[0]
+    members: "list[_Member]" = []
+    at = 0
+    while at + 46 <= len(directory) and directory[at : at + 4] == b"PK\x01\x02":
+        method = struct.unpack_from("<H", directory, at + 10)[0]
+        crc, compressed, expanded = struct.unpack_from("<III", directory, at + 16)
+        name_length, extra_length, comment_length = struct.unpack_from(
+            "<HHH", directory, at + 28
+        )
+        local_at = struct.unpack_from("<I", directory, at + 42)[0]
+        name = directory[at + 46 : at + 46 + name_length].decode("utf-8", "replace")
+        members.append((name, method, compressed, expanded, crc, local_at))
+        at += 46 + name_length + extra_length + comment_length
+    if len(members) != entries:
+        raise FetchError(f"{label} has a directory that does not add up: {url}")
+    return members
+
+
+def _member_named(
+    members: "list[_Member]", stem: str, folders: "tuple[str, ...]"
+) -> "_Member | None":
+    """The member that is the library `stem` for this machine, if listed:
+    the same rule ``_library_from`` applies to an extracted package."""
+
+    named = [
+        member
+        for member in members
+        if member[0].rsplit("/", 1)[-1].lower() == stem.lower()
+    ]
+    for folder in folders:
+        for member in named:
+            if folder.lower() in member[0].lower():
+                return member
+    return None
+
+
+def _member_bytes(url: str, label: str, member: "_Member", limit: int) -> bytes:
+    """One member of the zip at `url`, by its own byte range, inflated here.
+
+    The local header repeats the name and may carry a different extra
+    field, so the range asked for allows for the longest one and the data
+    is found from the lengths the header itself states. The CRC-32 the
+    directory recorded is checked against what came out: a range answered
+    from the wrong bytes is a library that loads and then does something
+    else.
+    """
+
+    import zlib
+
+    name, method, compressed, expanded, crc, local_at = member
+    if expanded > limit or compressed > limit:
+        raise FetchError(f"{name} in {label} exceeds the {limit}-byte download limit")
+    if method not in (0, 8):
+        raise FetchError(f"{name} in {label} is stored in a way this cannot read")
+    most = local_at + 30 + len(name.encode("utf-8")) + 0xFFFF + compressed
+    answered = read_range(url, label, local_at, most)
+    if answered is None:
+        raise FetchError(f"{label} stopped answering ranges: {url}")
+    held = answered[0]
+    if held[:4] != b"PK\x03\x04":
+        raise FetchError(f"{name} in {label} is not where its directory says")
+    name_length, extra_length = struct.unpack_from("<HH", held, 26)
+    start = 30 + name_length + extra_length
+    data = held[start : start + compressed]
+    if len(data) != compressed:
+        raise FetchError(f"{name} in {label} is shorter than its directory says")
+    if method == 8:
+        try:
+            inflater = zlib.decompressobj(-15)
+            data = inflater.decompress(data, expanded) + inflater.flush()
+        except zlib.error as error:
+            raise FetchError(f"{name} in {label} did not inflate: {error}") from error
+    if len(data) != expanded or (zlib.crc32(data) & 0xFFFFFFFF) != crc:
+        raise FetchError(f"{name} in {label} did not come out as its directory says")
+    return data
+
+
+def components_fetched(into: Path) -> "list[str]":
+    """What the headers kept in `into` are about, as the includes spelled it.
+
+    A header included through a directory - `openssl/evp.h` - belongs to
+    the component the directory is named after, and a bare one - `zlib.h` -
+    to the one its own name is. That is how a package index knows the
+    component too, so these are the names to ask it for.
+    """
+
+    into = Path(into)
+    if not into.is_dir():
+        return []
+    found: "list[str]" = []
+    for path in sorted(into.iterdir()):
+        if path.name.startswith("."):
+            continue
+        if path.is_dir():
+            found.append(path.name)
+        elif path.suffix.lower() in (".h", ".hpp", ".hxx", ".hh"):
+            found.append(path.stem)
+    return found
 
 
 def _take_library(

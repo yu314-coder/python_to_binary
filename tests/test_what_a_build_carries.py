@@ -64,7 +64,9 @@ class WhatALibraryIsCalled(unittest.TestCase):
     def carried(self, target, spelled):
         asked = []
 
-        def fetch_library(name, into, architecture, cache=None, say=None):
+        def fetch_library(
+            name, into, architecture, cache=None, components=(), say=None
+        ):
             asked.append(name)
             made = into / name
             made.write_bytes(b"MZ")
@@ -105,6 +107,53 @@ class WhatALibraryIsCalled(unittest.TestCase):
             asked, carried = self.carried(target, "libthing")
             self.assertEqual(asked, [named], target)
             self.assertEqual(carried, [named], target)
+
+    def test_a_library_named_by_its_path_stays_where_it_is(self):
+        # `--library /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib` names
+        # the library by the path dyld loads it from. Read as a name beside
+        # the program, `dist / "/opt/..."` is `/opt/...` - the installed file
+        # itself, which the carrying step listed as carried and the one-file
+        # step then packed and deleted.
+        with tempfile.TemporaryDirectory() as elsewhere:
+            installed = Path(elsewhere) / "libthing.dylib"
+            installed.write_bytes(b"\xcf\xfa\xed\xfe")
+            asked, carried = self.carried("darwin-arm64", str(installed))
+            self.assertEqual((asked, carried), ([], []))
+            self.assertTrue(installed.is_file())
+
+    def test_what_the_fetched_headers_are_about_is_handed_on(self):
+        # The library's own name finds no package - OpenSSL's is called
+        # `openssl-native`, not `libcrypto-3-x64` - so the fetch is told what
+        # the headers beside the program came from.
+        handed = []
+
+        def fetch_library(
+            name, into, architecture, cache=None, components=(), say=None
+        ):
+            handed.append(components)
+            made = into / name
+            made.write_bytes(b"MZ")
+            return made
+
+        was = header_fetch.fetch_library
+        header_fetch.fetch_library = fetch_library
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                room = Path(directory)
+                program = room / "main.cpp"
+                program.write_text("int main() { return 0; }")
+                kept = room / header_fetch.CACHE_DIRECTORY / "openssl" / "evp.h"
+                kept.parent.mkdir(parents=True)
+                kept.write_text("")
+                output = room / "dist" / "main.exe"
+                output.parent.mkdir()
+                output.write_bytes(b"MZ")
+                interactive._carry_libraries(
+                    program, output, "windows-x86_64", ("libcrypto-3-x64.dll",), True
+                )
+        finally:
+            header_fetch.fetch_library = was
+        self.assertEqual(handed, [("openssl",)])
 
     def test_nothing_is_fetched_without_being_asked(self):
         # A file somebody else wrote, going into what the user is about to

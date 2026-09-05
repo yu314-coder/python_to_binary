@@ -817,13 +817,16 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
             # member, and read as a method it made the struct a class - which
             # was lifted away, leaving `typedef ALIASES;` behind.
             undecorated = _without_bounds(_without_decorations(declaration))
-            if "(" in undecorated and not _FUNCTION_POINTER_MEMBER.match(
-                undecorated
-            ):
+            if "(" in undecorated and not _DECLARATOR_SHAPED.match(undecorated):
                 # A member function declared here and defined outside. Told
-                # apart from `int (*op)(int);` by where the name sits: a
-                # method's is before the parentheses and a function pointer's
-                # is inside them, and both otherwise look the same.
+                # apart from `int (*op)(int);` by what follows the first
+                # parenthesis: a method's holds its parameters, a declarator's
+                # opens with `*` or another parenthesis. Asked instead whether
+                # the whole line was the one plain `int (*op)(int)` shape,
+                # `int (* const op)(int)` and `int (*(*get)(int))(int)` were
+                # read as methods and left out of the struct - which was then
+                # laid out without them, and sizeof and every offset after
+                # them were wrong with nothing said.
                 found.methods.append(
                     _method_from(declaration, "", filename, at + index)
                 )
@@ -851,6 +854,25 @@ def _split_members(body: str, name: str, filename: str, at: int) -> Class:
 _FUNCTION_POINTER_MEMBER = re.compile(
     r"^(.+?)\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*(\([^()]*\))$"
 )
+
+#: A declaration whose first parenthesis opens a declarator rather than a
+#: parameter list: `int (*op)(int)`, `int (* const op)(int)`, `int
+#: (*ops[4])(int)`, `int (*(*get)(int))(int)`. A method's first parenthesis
+#: is followed by a parameter or by `)`.
+_DECLARATOR_SHAPED = re.compile(r"^[^()]*\(\s*[*(]")
+
+#: Where the name sits in a declarator-shaped member: right after the `*`
+#: that makes it a pointer, past any qualifier, before an optional array
+#: bound and the parenthesis that closes its group. The outer `(*(` of a
+#: nested shape has no name after its star, so the search passes it by and
+#: finds the inner one.
+_FUNCTION_POINTER_NAME = re.compile(
+    r"\(\s*((?:\*\s*(?:(?:const|volatile)\s+)*)+)([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)*)\)"
+)
+
+#: Stands where the name goes in a member type carried whole, so the emitter
+#: can put the name back exactly there: `int (*\x01[4])(int)`.
+_NAME_HERE = "\x01"
 
 
 
@@ -899,11 +921,22 @@ def _members_from(
         return [_member_from(declaration, filename, at)]
     first = _member_from(parts[0], filename, at)
     found = [first]
+    # Each later declarator carries only its own stars and brackets, and
+    # borrows the specifiers alone: `int *p, q` makes q an int, and `int
+    # (*f)(int), *p` makes p an `int *`. The first member's whole type was
+    # borrowed before, stars and all - and, for a pointer to a function, the
+    # marked type the emitter reads, which no later declarator could follow.
+    head = parts[0].strip()
+    if _DECLARATOR_SHAPED.match(head):
+        base = head[: head.find("(")].strip()
+    else:
+        base = re.sub(r"[\s*&]*[A-Za-z_]\w*\s*(?:\[[^\]]*\]\s*)*$", "", head).strip()
+    if not base:
+        base = first.ctype
     for part in parts[1:]:
         if not part.strip():
             continue
-        # Each later declarator carries only its own stars and brackets.
-        found.append(_member_from(f"{first.ctype} {part.strip()}", filename, at))
+        found.append(_member_from(f"{base} {part.strip()}", filename, at))
     return found
 
 
@@ -921,6 +954,32 @@ def _member_from(declaration: str, filename: str, at: int) -> Member:
             name=pointer.group(2),
             ctype=f"{pointer.group(1).strip()}(*)"
             f"{pointer.group(3)}\x00fn",
+            array="",
+        )
+    spelled = declaration.strip()
+    if _DECLARATOR_SHAPED.match(spelled):
+        # `int (* const op)(int)`, `int (*ops[4])(int)`, `int (**pf)(int)`,
+        # `int (*two[2][3])(int)`, `int (*(*get)(int))(int)`: the name is
+        # inside the parentheses somewhere, after the stars and before the
+        # bounds, and everything else is the type. Carried whole with the
+        # name's place marked; the type is what C would spell with the name
+        # taken out. A qualifier on the pointer stays where it is written.
+        named = _FUNCTION_POINTER_NAME.search(spelled)
+        if named is None:
+            raise CppTranslationError(
+                filename,
+                at,
+                f"cannot read the data member {spelled!r}: py2bin reads a "
+                "member whose name sits inside parentheses as a pointer to a "
+                "function - `int (*op)(int)`, qualified, an array of them, or "
+                "one whose function answers another pointer - and the name "
+                "is not where those put it. Give the type a typedef and "
+                "declare the member with it",
+            )
+        return Member(
+            name=named.group(2),
+            ctype=f"{spelled[: named.start(2)]}{_NAME_HERE}"
+            f"{spelled[named.end(2):]}\x00fn",
             array="",
         )
     words = declaration.replace("*", " * ").replace("&", " & ").split()
@@ -993,6 +1052,18 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
     close_paren = head.rfind(")")
     if open_paren < 0 or close_paren < 0:
         raise CppTranslationError(filename, at, f"cannot read the member {head!r}")
+    if not named_with_brackets and re.match(r"\s*\*", head[open_paren + 1 :]):
+        # `int (*pick(int which))(int) { ... }` - a method whose result is a
+        # pointer to a function, its own name inside the parentheses. Read as
+        # a method named by what stands before the parenthesis it stopped
+        # with "expected a type name, found '*'", which named nothing.
+        raise CppTranslationError(
+            filename,
+            at,
+            f"cannot read the member {head!r}: a method whose result is a "
+            "pointer to a function is not implemented. Give the pointer type "
+            "a typedef and write `<typedef> name(params)`",
+        )
     before = head[:open_paren].strip()
     parameters = head[open_paren + 1: close_paren].strip()
     if parameters in ("void", ""):
@@ -9509,6 +9580,9 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
     for member in found.members:
         if member.ctype.endswith("\x00fn"):
             spelled = member.ctype[: -len("\x00fn")]
+            if _NAME_HERE in spelled:
+                lines.append(f"    {spelled.replace(_NAME_HERE, member.name)};")
+                continue
             head, _, tail = spelled.partition("(*)")
             lines.append(f"    {head}(*{member.name}){tail};")
             continue
@@ -20599,6 +20673,7 @@ public:
 
 _IOSTREAM_HEADER = r"""
 #include <stdio.h>
+#include <string>
 namespace std {
 /* The width and the fill are the stream's, not the value's: `setw` applies
    to the next thing written and then goes, which is what the standard says
@@ -20669,6 +20744,14 @@ public:
         while (v[n] != 0) { n = n + 1; }
         __space(n);
         printf("%s", v); return *this;
+    }
+    /* `cout << s` with s a std::string: the characters it holds, padded to
+       the width like any other text. There was no overload for it, and the
+       most ordinary line of C++ was refused for want of one. */
+    ostream &operator<<(string v) {
+        const char *p = v.c_str();
+        __space(v.size());
+        printf("%s", p); return *this;
     }
     ostream &operator<<(__setw v) { __width = v.__n; return *this; }
     ostream &operator<<(__setfill v) { __fill = v.__c; return *this; }

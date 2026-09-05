@@ -1834,6 +1834,13 @@ class Parser:
         # Set by declarator() to the token its name came from, so a caller that
         # needs to point an error at the name does not have to guess.
         self.declared_token: Token = self.tokens[0]
+        # Set by declarator() beside it: when the type it built is a function,
+        # the function's own parameters WITH their names, which the type alone
+        # does not keep (a FunctionType is compared structurally, and names
+        # are not part of what makes two function types the same). `None`
+        # when the declarator built no function of its own - an object, or a
+        # function type inherited whole from a typedef.
+        self.declared_parameters: tuple[tuple[CType, str], ...] | None = None
         self.holes = 0
 
     # --- token helpers ---
@@ -2439,7 +2446,16 @@ class Parser:
         ``optional`` accepts either form, which is what a prototype's parameter
         list needs: ``int f(int, int *);`` names nothing, ``int f(int a);`` does.
         ``self.declared_token`` is left holding the token the name came from, so
-        a caller can point an error at it.
+        a caller can point an error at it, and ``self.declared_parameters``
+        the named parameters of the function this declares, if it declares
+        one: ``int (*pick(int which))(int)`` is a function of ``which`` that
+        returns a pointer to a function of an ``int``, and a definition of
+        ``pick`` needs the name ``which``.
+
+        Both are restored after the postfix groups are read, because a
+        parameter list is itself a run of declarators and each of them sets
+        the same two fields: left alone, an error about ``pick`` pointed at
+        its last parameter.
         """
 
         self.declared_token = self.token
@@ -2448,13 +2464,48 @@ class Parser:
             self.take("(")
             hole = _Hole(self.next_hole())
             inner, name = self.declarator(hole, abstract=abstract, optional=optional)
+            name_token = self.declared_token
+            parameters = self.declared_parameters
             self.take(")")
-            return _fill(inner, hole, self.declarator_suffix(base)), name
+            outer = self.declarator_suffix(base)
+            if inner == hole:
+                # `int (pick)(int which)`: the parentheses regrouped nothing,
+                # so the function's own parameter list is the one outside.
+                parameters = self.declared_parameters
+            self.declared_token = name_token
+            self.declared_parameters = parameters
+            ctype = _fill(inner, hole, outer)
+            self.check_composition(ctype)
+            return ctype, name
         name = ""
         if not abstract and not (optional and self.token.kind != "identifier"):
             self.declared_token = self.token
             name = str(self.identifier().value)
-        return self.declarator_suffix(base), name
+        name_token = self.declared_token
+        ctype = self.declarator_suffix(base)
+        self.declared_token = name_token
+        return ctype, name
+
+    def check_composition(self, ctype: CType) -> None:
+        """Refuse a derived type C does not have, wherever it was composed.
+
+        ``declarator_suffix`` checks each group it applies, but a parenthesised
+        declarator is filled in afterwards: ``int (f(void))[3]`` applies the
+        ``[3]`` to ``int`` and the ``(void)`` to a hole, and only the fill
+        produces a function returning an array. So the whole type is walked
+        once it exists.
+        """
+
+        if isinstance(ctype, PointerType):
+            self.check_composition(ctype.target)
+        elif isinstance(ctype, ArrayType):
+            if isinstance(ctype.element, FunctionType):
+                self.error(f"an array of {ctype.element} is not a type C has")
+            self.check_composition(ctype.element)
+        elif isinstance(ctype, FunctionType):
+            if isinstance(ctype.result, (ArrayType, FunctionType)):
+                self.error(f"a function cannot return {ctype.result}")
+            self.check_composition(ctype.result)
 
     def next_hole(self) -> int:
         self.holes += 1
@@ -2500,7 +2551,7 @@ class Parser:
                 suffixes.append(("array", length))
                 continue
             if self.at("("):
-                suffixes.append(("function", self.parameter_type_list()))
+                suffixes.append(("function", self.parameter_list()))
                 continue
             break
         for kind, payload in reversed(suffixes):
@@ -2511,11 +2562,24 @@ class Parser:
             else:
                 if isinstance(base, (ArrayType, FunctionType)):
                     self.error(f"a function cannot return {base}")
-                base = FunctionType(base, payload)  # type: ignore[arg-type]
+                base = FunctionType(
+                    base, tuple(held for held, _spelled in payload)  # type: ignore[union-attr]
+                )
+        # The group next to the name is applied last, so it is the outermost
+        # constructor of the type built here: when that group is a parameter
+        # list, the declarator declares a function and these are its own
+        # parameters. Set after every parameter's declarator has run, since
+        # each of those sets this field for itself.
+        self.declared_parameters = (
+            tuple(suffixes[0][1])  # type: ignore[arg-type]
+            if suffixes and suffixes[0][0] == "function"
+            else None
+        )
         return base
 
-    def parameter_type_list(self) -> tuple[CType, ...]:
-        """``(void)`` or ``(TYPE, TYPE, ...)`` in a function declarator."""
+    def parameter_list(self) -> list[tuple[CType, str]]:
+        """``(void)`` or ``(TYPE [name], TYPE [name], ...)`` in a function
+        declarator: each parameter's adjusted type, with its name or ``""``."""
 
         token = self.take("(")
         if self.accept(")"):
@@ -2529,12 +2593,12 @@ class Parser:
         if self.at("void") and self.peek().value == ")":
             self.take("void")
             self.take(")")
-            return ()
-        parameters: list[CType] = []
+            return []
+        parameters: list[tuple[CType, str]] = []
         while True:
             if self.at("..."):
                 self.error("a variadic function type is not implemented")
-            parameter, _name = self.declarator(self.type_specifier(), optional=True)
+            parameter, name = self.declarator(self.type_specifier(), optional=True)
             if isinstance(parameter, ArrayType):
                 # A parameter of array type is adjusted to a pointer, and one of
                 # function type to a pointer to the function (C11 6.7.6.3p7-8).
@@ -2543,11 +2607,11 @@ class Parser:
                 parameter = PointerType(parameter)
             if isinstance(parameter, VoidType):
                 self.error("a parameter cannot have type void", token)
-            parameters.append(parameter)
+            parameters.append((parameter, name))
             if self.accept(")"):
                 break
             self.take(",")
-        return tuple(parameters)
+        return parameters
 
     def array_suffix(self, base: CType) -> CType:
         """The ``[N]`` part of a declarator whose name has already been taken."""
@@ -3081,6 +3145,18 @@ class Parser:
             library = self.library_for(name)
             if library is None:
                 continue
+            unloadable = _not_loadable_on(library, self.target)
+            if unloadable is not None and name in self.names_called():
+                # The same program built for the other machine with the same
+                # command: `--library libcrypto-3-x64.dll` on a darwin build
+                # went into an LC_LOAD_DYLIB, the build said "done", and dyld
+                # refused the program at launch. Only where something calls
+                # the function - a library nothing is taken from is not
+                # written into the image at all.
+                self.error(
+                    f"{name}() is to be imported from {library}, {unloadable}",
+                    function.token,
+                )
             # An aggregate by value is the one shape where py2bin's own call
             # convention and the platform's disagree and both sides are real:
             # py2bin hands over an address because it links nothing it did not
@@ -3105,6 +3181,30 @@ class Parser:
                     "as the address of the object, which is not what a library "
                     "built to this platform's own ABI reads. Declare the import "
                     "with a pointer parameter, or wrap it on the other side",
+                    function.token,
+                )
+            single = next(
+                (
+                    held
+                    for held in travelling
+                    if isinstance(held, FloatingType) and held.size == 4
+                ),
+                None,
+            )
+            if single is not None and name in self.names_called():
+                # The other shape the platform and py2bin disagree on. Every
+                # floating value here is carried as a double, and a call
+                # hands one over as a double; a `float` parameter or result
+                # is the same register holding four bytes of single
+                # precision, which is a different number. Left to fall
+                # through this too became "declared but never defined".
+                self.error(
+                    f"{name}() is an import from {library}, and it passes or "
+                    f"answers a {single} by value; py2bin hands an import "
+                    "every floating value as a double and reads one back as "
+                    "a double, and a float travels in the same register at "
+                    "half the width. Wrap it on the other side in a function "
+                    "that takes and returns double",
                     function.token,
                 )
             kinds = tuple(
@@ -3215,6 +3315,16 @@ class Parser:
         """Whether what follows is ``*``... ``name`` ``(`` -- a function, not an
         object. ``int (*p)(void)`` fails this test at its very first token."""
 
+        index = self.plain_name_index()
+        if index is None or index + 1 >= len(self.tokens):
+            return False
+        return self.tokens[index + 1].value == "("
+
+    def plain_name_index(self) -> int | None:
+        """The index of the name in a plain ``*``... ``name`` declarator, or
+        ``None`` where the declarator opens with something else - the ``(`` of
+        ``int (*p)(void)`` or of ``int (*f(int))(int)``."""
+
         index = self.index
         while index < len(self.tokens):
             token = self.tokens[index]
@@ -3228,12 +3338,12 @@ class Parser:
                 index += 1
                 continue
             break
-        if index + 1 >= len(self.tokens):
-            return False
+        if index >= len(self.tokens):
+            return None
         name = self.tokens[index]
         if name.kind != "identifier" or name.value in _RESERVED:
-            return False
-        return self.tokens[index + 1].value == "("
+            return None
+        return index
 
     def object_declaration(self, base: CType) -> None:
         """``TYPE name[= init], *other, third[3];`` at file scope."""
@@ -3244,16 +3354,8 @@ class Parser:
             if not name:
                 self.error("a file-scope declaration needs a name", name_token)
             if isinstance(ctype, FunctionType):
-                # `int (*f(int))(int)` -- a function whose own declarator is not
-                # simply `TYPE *... name(params)`. The parameter NAMES are what
-                # a definition needs, and this shape does not deliver them here.
-                self.error(
-                    f"{name!r} is declared as a function here, and py2bin only "
-                    "implements the plain declarator form 'TYPE *... name"
-                    "(params)'. Give the result type a typedef and write "
-                    f"'<typedef> {name}(params)'",
-                    name_token,
-                )
+                self.function_declared(ctype, name_token)
+                return
             initializer: object = None
             if self.accept("="):
                 initializer = self.initializer()
@@ -3317,12 +3419,71 @@ class Parser:
                         self.type_specifier(), optional=True
                     )
                     if isinstance(parameter_type, ArrayType):
-                        # A parameter of array type is adjusted to a pointer.
+                        # A parameter of array type is adjusted to a pointer,
+                        # and one of function type to a pointer to the
+                        # function (C11 6.7.6.3p7-8) - the same adjustment
+                        # `parameter_list` makes, so that `int apply(int
+                        # f(int), int x)` agrees with `int (*f)(int)` in the
+                        # prototype and calls f(x) as a pointer does.
                         parameter_type = PointerType(parameter_type.element)
+                    elif isinstance(parameter_type, FunctionType):
+                        parameter_type = PointerType(parameter_type)
                     parameters.append((parameter_type, parameter_name))
                     if self.accept(")"):
                         break
                     self.take(",")
+        self.register_function(name_token, result, parameters, variadic)
+
+    def function_declared(self, ctype: FunctionType, name_token: Token) -> None:
+        """A function whose declarator ``declarator`` read whole.
+
+        ``int (*BIO_meth_get_write(const BIO_METHOD *biom))(BIO *, const char
+        *, int);`` declares a function of ``biom`` that returns a pointer to a
+        function - the shape every OpenSSL accessor of a method table has,
+        and one ``TYPE *... name(params)`` cannot spell without a typedef.
+        The declarator grammar builds the right type for it; what it does
+        not keep is the parameter names, and ``declared_parameters`` carries
+        those alongside. From here it is the function any prototype or
+        definition is: the same redeclaration check, the same body.
+        """
+
+        name = str(name_token.value)
+        if self.at(","):
+            self.error(
+                f"{name!r} is declared as a function in a declaration that goes "
+                f"on to declare something else; declare each function in its "
+                f"own declaration",
+                self.token,
+            )
+        parameters = self.declared_parameters
+        if parameters is None:
+            # `typedef int T(int); T f;` - the function type came whole from
+            # the typedef, which names no parameter. A prototype needs none;
+            # a definition does, and C says as much (6.9.1p2: a definition's
+            # function type is not inherited from a typedef).
+            if self.at("{"):
+                self.error(
+                    f"{name!r} is defined with a function type taken from a "
+                    f"typedef; a definition has to spell its own parameters, "
+                    f"so write '{ctype.result} {name}(...)' with each "
+                    f"parameter named",
+                    self.token,
+                )
+            parameters = tuple((held, "") for held in ctype.parameters)
+        self.register_function(name_token, ctype.result, list(parameters), False)
+
+    def register_function(
+        self,
+        name_token: Token,
+        result: CType,
+        parameters: list[tuple[CType, str]],
+        variadic: bool,
+    ) -> None:
+        """Record a prototype, or parse and record a definition, once its
+        result type and named parameters are known and the parser stands at
+        the ``;`` or ``{`` that follows the declarator."""
+
+        name = str(name_token.value)
         if name in self.externs and name in _CABI_SYMBOLS and self.at(";"):
             # The same function declared twice, which C allows outright. The
             # first was py2bin's own header binding the name to the ABI it
@@ -3431,11 +3592,28 @@ class Parser:
         """
 
         base = self.type_specifier()
+        if self.plain_name_index() is None:
+            # `extern int (*EVP_MD_meth_get_init(const EVP_MD *md))(EVP_MD_CTX
+            # *ctx);` - a function returning a pointer to a function, which
+            # is how OpenSSL spells every accessor of a method table and how
+            # its deprecation macro, standing in for the storage class, hands
+            # it here. Or `extern int (*handler)(int);`, an object. Neither
+            # begins with a name, so the whole declarator is read and the
+            # type it built says which of the two this is.
+            ctype, name = self.declarator(base)
+            name_token = self.declared_token
+            if not name:
+                self.error("an extern declaration needs a name", name_token)
+            if isinstance(ctype, FunctionType):
+                self.function_declared(ctype, name_token)
+                return
+            self.extern_object(base, ctype, name)
+            return
         result = self.pointer_suffix(base)
         name_token = self.identifier()
         name = str(name_token.value)
         if not self.at("("):
-            self.extern_object(base, result, name)
+            self.extern_object(base, self.declarator_suffix(result), name)
             return
         if name not in _CABI_SYMBOLS:
             # `extern` adds nothing to a function declaration that C does not
@@ -3489,7 +3667,7 @@ class Parser:
         with no storage cannot be loaded from by accident.
         """
 
-        self.declared_elsewhere.setdefault(name, self.declarator_suffix(ctype))
+        self.declared_elsewhere.setdefault(name, ctype)
         if self.at("="):
             # `extern int x = 5;` is a definition, whatever the keyword says,
             # and this path reserves no storage for anything. Left to fall
@@ -3557,7 +3735,14 @@ def _abi_kind(held: CType, result: bool = False) -> "str | None":
     if isinstance(held, (PointerType, ArrayType)):
         return "ptr"
     if isinstance(held, FloatingType):
-        return "double"
+        # A double travels in the floating register file, and "f64" is the
+        # name the call emitters know that shape by - spelled "double" here,
+        # the kind matched nothing they test for, and an integer argument to
+        # a double parameter went out in x0 while the callee read d0. A
+        # `float` is the same register at half the width, and no call here
+        # converts to or from single precision: None, and bind_libraries
+        # says so by name where the function is called.
+        return "f64" if held.size == 8 else None
     if isinstance(held, IntegerType):
         return "int"
     return None
@@ -5597,6 +5782,9 @@ class Lowerer:
             return self.extern_call(node, discarded=False)
         function = self.unit.functions.get(node.name)
         if function is None:
+            # `extern int (*handler)(int);` and then `handler(1)`: an object
+            # another unit holds, called through. Nothing here can hold it.
+            self.defined_nowhere(node.name, node.token)
             self.error(
                 f"call to {node.name!r}, which is not a function declared in this "
                 "translation unit or a declared extern",
@@ -5608,7 +5796,8 @@ class Lowerer:
                 "py2bin has no linker, so the body of every function a program "
                 "calls has to be in this translation unit - or, where it lives "
                 "in a shared library somebody else shipped, name that library "
-                "with --library NAME.dll and it becomes an import",
+                f"with --library {_library_spelling(self.target)} and it "
+                "becomes an import",
                 node.token,
             )
         if function.name == "main":
@@ -5773,15 +5962,29 @@ class Lowerer:
                         f"{what} needs an integer, not {value.ctype}", argument.token
                     )
                 arguments.append(self.fit(value.expr, LLONG))
-        call = ExternCall(
-            symbol, tuple(arguments), _CABI_RESULT_WIDTH.get(symbol, "i64")
-        )
+        # A double comes back in the floating register file, not as a word
+        # in x0, and the node has to say so: the emitters choose the register
+        # they read by the result kind, and a result read as a word was
+        # whatever x0 held. The vetted table spells that "float" and a named
+        # library's prototype "f64"; either is the same register.
+        floating = result_kind in ("float", "f64")
+        if name in _CABI_SYMBOLS:
+            width = _CABI_RESULT_WIDTH.get(symbol, "i64")
+        else:
+            width = "f64" if floating else "i64"
+        call = ExternCall(symbol, tuple(arguments), width)
         if discarded or result_kind == "void":
-            self.emit(Store(self.new_temp(), call))
+            if floating:
+                self.emit(FloatStore(self.new_temp(), call))
+            else:
+                self.emit(Store(self.new_temp(), call))
             return Value(VOID, IntConstant(0))
         slot = self.new_temp()
-        self.emit(Store(slot, call))
         declared = self.unit.externs[name]
+        if floating:
+            self.emit(FloatStore(slot, call))
+            return Value(declared, FloatLoad(slot))
+        self.emit(Store(slot, call))
         return Value(declared, self.fit(IntLoad(slot), declared))
 
     def variadic_builtin(self, node: Call) -> Value:
@@ -8866,6 +9069,49 @@ def compile_c_to_ir(
     module = Lowerer(unit, filename, target).compile()
     module.symbol_libraries = dict(parser.symbol_libraries)
     return module
+
+
+def _library_spelling(target: str) -> str:
+    """How `--library` names a shared library for this target: the string
+    the loader is handed, spelled the way that loader reads it.
+
+    Windows looks a DLL up by its file name, beside the program first. dyld
+    loads an LC_LOAD_DYLIB path as written, so the name to give is the
+    library's install path - what `otool -D` prints for it. ld.so reads a
+    soname, `libcrypto.so.3` rather than `libcrypto.so`. Told `NAME.dll`,
+    a Mac had nothing to go on.
+    """
+
+    system = target.partition("-")[0]
+    if system == "windows":
+        return "NAME.dll"
+    if system == "darwin":
+        return "/path/to/libNAME.dylib (its install path, as otool -D prints it)"
+    return "libNAME.so.N (its soname)"
+
+
+def _not_loadable_on(library: str, target: str) -> "str | None":
+    """Why this target's loader could not load a library so named, or None.
+
+    A `.dll` is a PE image, and dyld and ld.so load neither; a `.dylib` is a
+    Mach-O one, and ld.so does not load it. A suffix says less elsewhere - a
+    Windows DLL may be called anything, and `.so` on a Mac is a Mach-O
+    extension module as often as not - so only the two certain cases.
+    """
+
+    system = target.partition("-")[0]
+    lowered = library.lower()
+    if lowered.endswith(".dll") and system != "windows":
+        return (
+            f"a Windows DLL, and this build is for {target}; name the library "
+            f"this machine's loader reads - --library {_library_spelling(target)}"
+        )
+    if lowered.endswith(".dylib") and system == "linux":
+        return (
+            f"a macOS dylib, and this build is for {target}; name the library "
+            f"ld.so reads - --library {_library_spelling(target)}"
+        )
+    return None
 
 
 def _libraries_named(

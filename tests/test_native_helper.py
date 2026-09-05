@@ -264,6 +264,46 @@ class IncludeDirectories(unittest.TestCase):
             )
             self.assertTrue((program.parent / "dist" / "app").is_file())
 
+    def test_a_header_fetched_by_an_earlier_build_is_used_offline(self) -> None:
+        """`--auto-fetch` reads what an earlier build kept before it reaches
+        for the network.
+
+        The cache is not on the search path until something asks for it, so
+        the first round cannot see it; the second round used to ask the
+        network for the set the first build had already kept, and a host that
+        limits anonymous requests then refused a build that needed nothing.
+        """
+
+        import tempfile
+        from pathlib import Path
+
+        from py2bin import header_fetch, runtime_fetch
+        from py2bin.interactive import _build_c
+
+        def no_network(url, label):
+            raise AssertionError(f"reached for {url}")
+
+        was = runtime_fetch.DOWNLOADER
+        runtime_fetch.DOWNLOADER = no_network
+        try:
+            with tempfile.TemporaryDirectory() as scratch:
+                room = Path(scratch)
+                kept = room / header_fetch.CACHE_DIRECTORY / "vendor" / "thing.h"
+                kept.parent.mkdir(parents=True)
+                kept.write_text(
+                    "static int answer(void) { return 7; }\n", encoding="utf-8"
+                )
+                program = room / "hello.cpp"
+                program.write_text(
+                    "#include <stdio.h>\n#include <vendor/thing.h>\n"
+                    'int main(void){ printf("%d\\n", answer()); return 0; }\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(_build_c(program, "linux-x86_64", auto_fetch=True), 0)
+                self.assertTrue((room / "dist" / "hello").is_file())
+        finally:
+            runtime_fetch.DOWNLOADER = was
+
     def test_the_missing_header_message_says_what_to_do(self) -> None:
         """It is read at the moment someone most needs to read it."""
 

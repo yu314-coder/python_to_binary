@@ -19,9 +19,12 @@ from py2bin import header_fetch, runtime_fetch
 from py2bin.header_fetch import (
     HeaderFetchError,
     _valid_name,
+    components_fetched,
     fetch_header,
     fetch_header_from,
+    fetch_library,
     found_headers,
+    libraries_offered,
     search_index,
     search_source,
 )
@@ -60,14 +63,44 @@ class _Downloader:
         runtime_fetch.DOWNLOADER = self.before
 
 
-def _zip_of(files: dict) -> bytes:
+def _zip_of(files: dict, compression=zipfile.ZIP_STORED) -> bytes:
     import io
 
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
+    with zipfile.ZipFile(buffer, "w", compression) as archive:
         for name, body in files.items():
             archive.writestr(name, body)
     return buffer.getvalue()
+
+
+class _Ranges:
+    """Stands in for the range downloader: answers a slice of what the table
+    holds, the way a server that honours `Range` does, and keeps a record of
+    every range asked - which is how a test tells a member-wise fetch from a
+    whole download."""
+
+    def __init__(self, table, corrupt=None):
+        self.table = table
+        self.asked = []
+        self.corrupt = corrupt
+
+    def __call__(self, url, label, start, stop):
+        for prefix, payload in self.table.items():
+            if url.startswith(prefix):
+                whole = payload[start:] if start < 0 else payload[start:stop]
+                if self.corrupt is not None and start >= 0:
+                    whole = self.corrupt(whole)
+                self.asked.append((url, start, stop, len(whole)))
+                return whole, len(payload)
+        raise runtime_fetch.FetchError(f"nothing canned for {url}")
+
+    def __enter__(self):
+        self.before = runtime_fetch.RANGE_DOWNLOADER
+        runtime_fetch.RANGE_DOWNLOADER = self
+        return self
+
+    def __exit__(self, *_):
+        runtime_fetch.RANGE_DOWNLOADER = self.before
 
 
 #: What the module's own tables and caches held when it was imported, taken by
@@ -223,6 +256,21 @@ class FetchFromAPackageTests(_Fetching):
                 with self.assertRaises(HeaderFetchError) as refused:
                     fetch_header("Thing.h", Path(work))
         self.assertIn("Thing: holds no Thing.h", str(refused.exception))
+
+
+class FetchedBeforeTests(_Fetching):
+    def test_a_header_kept_under_its_included_name_is_not_asked_for_again(self):
+        # `openssl/evp.h` is kept as `openssl/evp.h`, and the check for an
+        # earlier fetch looked only for `evp.h`: every build asked the network
+        # for a set it already had, until the host said no more for the hour.
+        with tempfile.TemporaryDirectory() as directory:
+            into = Path(directory)
+            kept = into / "openssl" / "evp.h"
+            kept.parent.mkdir()
+            kept.write_text("int evp;\n", encoding="utf-8")
+            with _Downloader({}) as network:
+                self.assertEqual(fetch_header("openssl/evp.h", into), kept)
+            self.assertEqual(network.asked, [])
 
 
 class FetchFromSourceTests(_Fetching):
@@ -431,6 +479,179 @@ class CollectionTests(_Fetching):
             with self.assertRaises(HeaderFetchError) as caught:
                 fetch_header("winnt.h", Path(work))
             self.assertIn("py2bin ships", str(caught.exception))
+
+
+#: A component's packages as the index lists them: the managed ones first,
+#: named after the component and shipping nothing native, and the one with
+#: the library far down the list.
+_STEM_SEARCH = "https://azuresearch-usnc.nuget.org/query?q=libthing-3-x64.dll&"
+_COMPONENT_SEARCH = "https://azuresearch-usnc.nuget.org/query?q=thing&"
+_MANAGED = "https://api.nuget.org/v3-flatcontainer/thing.managed/1.0.0/"
+_NATIVE = "https://api.nuget.org/v3-flatcontainer/thing-native/3.5.5/"
+_LIBRARY = bytes(range(256)) * 300  # what the library's bytes are, compressible
+
+
+def _component_table(package: bytes) -> dict:
+    return {
+        _STEM_SEARCH: json.dumps({"data": []}).encode(),
+        _COMPONENT_SEARCH: json.dumps(
+            {
+                "data": [
+                    {"id": "Thing.Managed", "version": "1.0.0"},
+                    {"id": "thing-native", "version": "3.5.5"},
+                ]
+            }
+        ).encode(),
+        _MANAGED: _zip_of({"lib/net45/Thing.dll": b"MZ managed", "Thing.nuspec": ""}),
+        _NATIVE: package,
+    }
+
+
+def _native_package(compression=zipfile.ZIP_DEFLATED) -> bytes:
+    return _zip_of(
+        {
+            "thing-native.nuspec": "<package/>",
+            "include/thing/thing.h": "int thing(void);",
+            "runtimes/win-x86/native/libthing-3.dll": b"MZ x86",
+            "runtimes/win-x64/native/libthing-3-x64.dll": _LIBRARY,
+            "runtimes/win-x64/native/libthing-other-x64.dll": b"MZ other",
+            "runtimes/win-arm64/native/libthing-3-arm64.dll": b"MZ arm64",
+        },
+        compression,
+    )
+
+
+class LibraryOfAComponentTests(_Fetching):
+    """`--library libthing-3-x64.dll` names a file no package is called after;
+    the package is called after the component the headers are about."""
+
+    def test_the_library_is_taken_out_of_the_components_package_by_its_range(self):
+        package = _native_package()
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work) / "dist"
+            with _Downloader(_component_table(package)) as network, _Ranges(
+                _component_table(package)
+            ) as ranges:
+                found = fetch_library(
+                    "libthing-3-x64.dll", into, "x86_64", components=("thing",)
+                )
+            self.assertEqual(found, into / "libthing-3-x64.dll")
+            self.assertEqual(found.read_bytes(), _LIBRARY)
+        # The stem was searched for first, the component second.
+        self.assertTrue(any(url.startswith(_STEM_SEARCH) for url in network.asked))
+        self.assertTrue(any(url.startswith(_COMPONENT_SEARCH) for url in network.asked))
+        # Neither package was downloaded whole: each was asked for its
+        # directory - the end of the file - and the one holding the library
+        # for the member's own bytes, from where its directory says the
+        # member starts, which is less than the package.
+        self.assertFalse(any(url.startswith(_NATIVE) for url in network.asked))
+        asked_of_native = [
+            (start, stop, got)
+            for url, start, stop, got in ranges.asked
+            if url.startswith(_NATIVE)
+        ]
+        self.assertEqual(asked_of_native[0][0], -(64 * 1024 + 22))
+        import io
+
+        member = zipfile.ZipFile(io.BytesIO(package)).getinfo(
+            "runtimes/win-x64/native/libthing-3-x64.dll"
+        )
+        self.assertEqual(asked_of_native[1][0], member.header_offset)
+        self.assertLess(asked_of_native[1][2], len(package))
+        self.assertTrue(any(url.startswith(_MANAGED) for url, *_rest in ranges.asked))
+
+    def test_a_stored_member_comes_out_the_same_way(self):
+        package = _native_package(zipfile.ZIP_STORED)
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work)
+            with _Downloader(_component_table(package)), _Ranges(
+                _component_table(package)
+            ):
+                found = fetch_library(
+                    "libthing-3-x64.dll", into, "x86_64", components=("thing",)
+                )
+            self.assertEqual(found.read_bytes(), _LIBRARY)
+
+    def test_a_server_that_answers_no_range_is_asked_for_the_whole_package(self):
+        package = _native_package()
+
+        def no_ranges(url, label, start, stop):
+            return None
+
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work)
+            before = runtime_fetch.RANGE_DOWNLOADER
+            runtime_fetch.RANGE_DOWNLOADER = no_ranges
+            try:
+                with _Downloader(_component_table(package)) as network:
+                    found = fetch_library(
+                        "libthing-3-x64.dll",
+                        into,
+                        "x86_64",
+                        components=("thing",),
+                        cache=into / ".cache",
+                    )
+            finally:
+                runtime_fetch.RANGE_DOWNLOADER = before
+            self.assertEqual(found.read_bytes(), _LIBRARY)
+        self.assertTrue(any(url.startswith(_NATIVE) for url in network.asked))
+
+    def test_a_member_that_does_not_come_out_as_listed_is_refused_by_name(self):
+        package = _native_package()
+
+        def flipped(data: bytes) -> bytes:
+            # Past the local header and its 42-character name: in the data.
+            return data[:80] + bytes(byte ^ 0xFF for byte in data[80:88]) + data[88:]
+
+        with tempfile.TemporaryDirectory() as work:
+            with _Downloader(_component_table(package)), _Ranges(
+                _component_table(package), corrupt=flipped
+            ):
+                with self.assertRaises(HeaderFetchError) as refused:
+                    fetch_library(
+                        "libthing-3-x64.dll", Path(work), "x86_64", components=("thing",)
+                    )
+            self.assertIn("libthing-3-x64.dll in thing-native 3.5.5", str(refused.exception))
+            self.assertEqual(list(Path(work).iterdir()), [])
+
+    def test_a_package_that_holds_it_for_another_machine_only_is_passed_over(self):
+        package = _native_package()
+        with tempfile.TemporaryDirectory() as work:
+            with _Downloader(_component_table(package)), _Ranges(
+                _component_table(package)
+            ):
+                with self.assertRaises(HeaderFetchError) as refused:
+                    fetch_library(
+                        "libthing-3-x64.dll", Path(work), "arm64", components=("thing",)
+                    )
+        self.assertIn(
+            "none of the 2 packages named after thing holds libthing-3-x64.dll for arm64",
+            str(refused.exception),
+        )
+
+    def test_what_the_headers_are_about_is_read_off_the_cache(self):
+        with tempfile.TemporaryDirectory() as work:
+            into = Path(work)
+            (into / "openssl").mkdir()
+            (into / "openssl" / "evp.h").write_text("")
+            (into / ".cache").mkdir()
+            (into / "zlib.h").write_text("")
+            (into / "notes.txt").write_text("")
+            self.assertEqual(components_fetched(into), ["openssl", "zlib"])
+            self.assertEqual(components_fetched(into / "absent"), [])
+
+    def test_what_could_be_named_is_listed_by_package(self):
+        package = _native_package()
+        with _Downloader(_component_table(package)), _Ranges(_component_table(package)):
+            self.assertEqual(
+                libraries_offered("thing", "x86_64"),
+                [("thing-native 3.5.5", ["libthing-3-x64.dll", "libthing-other-x64.dll"])],
+            )
+            self.assertEqual(
+                libraries_offered("thing", "arm64"),
+                [("thing-native 3.5.5", ["libthing-3-arm64.dll"])],
+            )
+            self.assertEqual(libraries_offered("thing", "riscv"), [])
 
 
 class FetchFromAUrlTests(_Fetching):

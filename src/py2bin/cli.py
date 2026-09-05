@@ -1236,8 +1236,15 @@ def _main(argv: list[str] | None = None) -> int:
                 # it runs, and a program that needs a second file is not a
                 # program somebody can send.
                 beside = [
-                    spelled.partition(":")[0].strip()
-                    for spelled in args.library
+                    name
+                    for name in (
+                        spelled.partition(":")[0].strip()
+                        for spelled in args.library
+                    )
+                    # A library named by its path is loaded from there, not
+                    # from beside the program; read as a name beside it, an
+                    # absolute path resolves to the installed file itself.
+                    if "/" not in name and "\\" not in name
                 ]
                 held, total = pack_beside_executable(
                     result.artifact, result.target, beside

@@ -1967,6 +1967,26 @@ class RejectionTests(CProgramTestCase):
         )
 
 
+def _extern_results(module) -> dict:
+    """Each external call's symbol and the result kind its IR node carries."""
+
+    import dataclasses
+
+    from py2bin.native.ir import ExternCall
+
+    found: dict = {}
+    seen = [module]
+    while seen:
+        node = seen.pop()
+        if isinstance(node, ExternCall):
+            found[node.symbol] = node.result
+        if isinstance(node, (list, tuple)):
+            seen.extend(node)
+        elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+            seen.extend(getattr(node, field.name) for field in dataclasses.fields(node))
+    return found
+
+
 class ExternDeclarationTests(CProgramTestCase):
     """`extern` on a function says nothing C has not already said.
 
@@ -2035,6 +2055,37 @@ int main(void) { printf("%d\\n", twice(21)); return 0; }
             "extern int nowhere(int);\nint main(void) { return 7; }\n", status=7
         )
 
+    def test_an_extern_prototype_in_the_nested_form(self):
+        # `OSSL_DEPRECATEDIN_3_0 int (*EVP_MD_meth_get_init(const EVP_MD
+        # *md))(EVP_MD_CTX *ctx);` reaches the parser as `extern int (*...`.
+        # The keyword used to send it down a path that wanted a name where
+        # the `(` stood. A prototype so spelled, then its definition.
+        self.run_c(
+            _STDIO
+            + """
+extern int (*pick(int which))(int);
+static int twice(int x) { return 2 * x; }
+static int thrice(int x) { return 3 * x; }
+int main(void) { printf("%d %d\\n", pick(0)(4), pick(1)(4)); return 0; }
+int (*pick(int which))(int) { return which ? thrice : twice; }
+""",
+            stdout="8 12\n",
+            status=0,
+        )
+
+    def test_an_extern_object_of_function_pointer_type(self):
+        # `extern int (*handler)(int);` is an object, declared here and
+        # defined elsewhere: written down, and refused only where it is read.
+        self.run_c(
+            "extern int (*handler)(int);\nextern int (*table[3])(int);\n"
+            "int main(void) { return 5; }\n",
+            status=5,
+        )
+        self.reject(
+            "extern int (*handler)(int);\nint main(void) { return handler(1); }\n",
+            "'handler' is declared in another translation unit and defined in none",
+        )
+
     def test_a_redeclaration_still_has_to_agree(self):
         self.reject(
             "extern int f(int);\n"
@@ -2056,6 +2107,191 @@ int main(void) { printf("%d\\n", twice(21)); return 0; }
         self.assertEqual(
             module.symbol_libraries, {"SomeVendorEntry": "vendor.dll"}
         )
+
+    def _built_against(self, target: str, library: str) -> Path:
+        # zlib is on every machine each target runs on, and crc32("abc") is
+        # one number wherever it is asked; clang's build of this program
+        # prints the same line.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        entry = root / "program.c"
+        entry.write_text(
+            _STDIO
+            + "extern unsigned long crc32(unsigned long crc, "
+            "const unsigned char *buf, unsigned int len);\n"
+            'int main(void) { printf("%lx\\n", '
+            'crc32(0, (const unsigned char *) "abc", 3)); return 0; }\n',
+            encoding="utf-8",
+        )
+        artifact = root / "program.bin"
+        compile_c_native(
+            entry, artifact, target=target, clean=True, libraries=(library,)
+        )
+        return artifact
+
+    def test_the_library_a_program_names_is_the_one_dyld_binds(self):
+        # The front end recorded the name and the darwin back end never read
+        # it: every import was bound to libSystem, the build said "done", and
+        # dyld refused the program at launch for a symbol libSystem does not
+        # have. The name is the path dyld loads, written into an
+        # LC_LOAD_DYLIB of its own, and the symbol binds to that ordinal.
+        for machine in ("darwin-x86_64", "darwin-arm64"):
+            artifact = self._built_against(machine, "/usr/lib/libz.1.dylib")
+            self.assertIn(b"/usr/lib/libz.1.dylib\0", artifact.read_bytes(), machine)
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        loaded = subprocess.run(
+            ["otool", "-L", str(artifact)], capture_output=True, text=True
+        ).stdout
+        self.assertIn("/usr/lib/libz.1.dylib", loaded)
+        bound = subprocess.run(
+            ["dyld_info", "-fixups", str(artifact)], capture_output=True, text=True
+        ).stdout
+        self.assertIn("libz/_crc32", bound)
+        ran = subprocess.run([str(artifact)], capture_output=True, text=True)
+        self.assertEqual((ran.returncode, ran.stdout), (0, "352441c2\n"))
+
+    def test_the_library_a_program_names_is_needed_by_the_linux_image(self):
+        # ld.so searches only the libraries the image names. The named one
+        # was left out - DT_NEEDED had the interpreter's and the C library's
+        # - so the program was refused at start for the very symbol the name
+        # was given for.
+        artifact = self._built_against("linux-x86_64", "libz.so.1")
+        image = artifact.read_bytes()
+        self.assertIn(b"libz.so.1\0", image)
+        self.assertIn(b"libc.so.6\0", image)
+
+    def test_a_library_the_target_cannot_load_is_refused_where_it_is_used(self):
+        # The same command as the Windows build, on a Mac: the DLL's name
+        # went into an LC_LOAD_DYLIB and dyld refused the program at launch.
+        source = (
+            "extern int SomeVendorEntry(int);\n"
+            "extern int NeverCalled(int);\n"
+            "int main(void) { return SomeVendorEntry(3); }\n"
+        )
+        for target, library, expected in (
+            ("darwin-arm64", "libcrypto-3-x64.dll", "a Windows DLL"),
+            ("linux-x86_64", "libcrypto-3-x64.dll", "a Windows DLL"),
+            ("linux-x86_64", "libcrypto.3.dylib", "a macOS dylib"),
+        ):
+            with self.assertRaises(CCompileError) as caught:
+                compile_c_to_ir(source, "vendor.c", target, libraries=(library,))
+            self.assertIn("SomeVendorEntry() is to be imported from", str(caught.exception))
+            self.assertIn(expected, str(caught.exception), target)
+        # Declared and never called, the function is not written into the
+        # image at all, so there is nothing to refuse.
+        module = compile_c_to_ir(
+            "extern int NeverCalled(int);\nint main(void) { return 0; }\n",
+            "vendor.c",
+            "darwin-arm64",
+            libraries=("vendor.dll",),
+        )
+        self.assertEqual(module.symbol_libraries, {"NeverCalled": "vendor.dll"})
+        # And a `.so` on a Mac is a Mach-O extension module as often as not.
+        compile_c_to_ir(source, "vendor.c", "darwin-arm64", libraries=("vendor.so",))
+
+    def test_the_import_message_spells_the_library_the_way_the_target_does(self):
+        # `--library NAME.dll` is no help to a Mac: dyld loads an
+        # LC_LOAD_DYLIB path as written, so what to give is the install path.
+        source = (
+            "extern int SomeVendorEntry(int);\n"
+            "int main(void) { return SomeVendorEntry(3); }\n"
+        )
+        for target, spelled in (
+            ("windows-x86_64", "--library NAME.dll"),
+            ("darwin-arm64", "--library /path/to/libNAME.dylib"),
+            ("linux-x86_64", "--library libNAME.so.N"),
+        ):
+            with self.assertRaises(CCompileError) as caught:
+                compile_c_to_ir(source, "vendor.c", target)
+            self.assertIn(
+                "call to 'SomeVendorEntry', which is declared but never defined",
+                str(caught.exception),
+            )
+            self.assertIn(spelled, str(caught.exception), target)
+
+
+    def test_a_double_travels_to_and_from_an_import_in_the_floating_registers(self):
+        # The prototype's `double` was recorded under a name the call emitter
+        # did not test for, so an integer argument to a double parameter went
+        # out in x0 while the callee read d0, and a double result was read
+        # back out of x0: the build said "done" and printed other numbers.
+        # libm's cbrt/ilogb/fdim are not in the vetted table, so they take
+        # the named-library path; clang's build prints the same line.
+        source = (
+            _STDIO
+            + "double cbrt(double x);\n"
+            "int ilogb(double x);\n"
+            "double fdim(double a, double b);\n"
+            "int main(void) {\n"
+            "    double r = cbrt(27);\n"
+            '    printf("%.3f %d %.1f %.3f\\n", r, ilogb(8), fdim(5, 2.5), '
+            "cbrt(8.0) + 1.0);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        module = compile_c_to_ir(
+            source, "vendor.c", "windows-x86_64", libraries=("vendor.dll",)
+        )
+        # The node says which register file the result is read from.
+        self.assertEqual(
+            _extern_results(module), {"cbrt": "f64", "fdim": "f64", "ilogb": "i64"}
+        )
+        for target, library in (
+            ("windows-x86_64", "vendor.dll"),
+            ("windows-arm64", "vendor.dll"),
+            ("linux-x86_64", "libm.so.6"),
+            ("darwin-x86_64", "/usr/lib/libSystem.B.dylib"),
+            ("darwin-arm64", "/usr/lib/libSystem.B.dylib"),
+        ):
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            entry = Path(directory.name) / "program.c"
+            entry.write_text(source, encoding="utf-8")
+            artifact = Path(directory.name) / "program.bin"
+            compile_c_native(
+                entry, artifact, target=target, clean=True, libraries=(library,)
+            )
+            if target == "darwin-arm64" and _HOST_IS_DARWIN_ARM64:
+                ran = subprocess.run([str(artifact)], capture_output=True, text=True)
+                self.assertEqual((ran.returncode, ran.stdout), (0, "3.000 3 2.5 3.000\n"))
+
+    def test_an_import_passing_or_answering_a_float_is_refused_by_name(self):
+        # A `float` is the same register holding four bytes of single
+        # precision, and no call here converts to or from it. Refused where
+        # it is called, and not at the declaration: a vendor's header
+        # declares every entry point and a program uses a handful.
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "float fratio_of(int a, int b);\n"
+                "int main(void) { return (int) fratio_of(1, 8); }\n",
+                "vendor.c",
+                "windows-x86_64",
+                libraries=("vendor.dll",),
+            )
+        self.assertIn(
+            "fratio_of() is an import from vendor.dll, and it passes or answers a "
+            "float by value",
+            str(caught.exception),
+        )
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "double scale(float f, int k);\n"
+                "int main(void) { return (int) scale(1.5, 2); }\n",
+                "vendor.c",
+                "windows-x86_64",
+                libraries=("vendor.dll",),
+            )
+        self.assertIn("scale() is an import from vendor.dll", str(caught.exception))
+        module = compile_c_to_ir(
+            "float never_called(float x);\ndouble ratio_of(int a, int b);\n"
+            "int main(void) { return (int) ratio_of(1, 8); }\n",
+            "vendor.c",
+            "windows-x86_64",
+            libraries=("vendor.dll",),
+        )
+        self.assertEqual(module.symbol_libraries, {"ratio_of": "vendor.dll"})
 
 
 class ConstantFoldingTests(CProgramTestCase):
@@ -3837,6 +4073,23 @@ int main(void) {
             stdout="2 4 6 8 10\n1\n",
         )
 
+    def test_a_parameter_of_function_type_is_adjusted_to_a_pointer(self):
+        # C11 6.7.6.3p8: `int f(int)` as a parameter is `int (*f)(int)`. The
+        # definition's own parameter loop adjusted arrays and not functions,
+        # so `apply(twice, 4)` was refused for handing a pointer to an `int
+        # (int)`, and the two spellings of one prototype disagreed.
+        self.run_c(
+            _STDIO
+            + """
+int twice(int x) { return 2 * x; }
+int apply(int f(int), int x);
+int apply(int (*f)(int), int x) { return f(x); }
+int both(int g(int), int h(int), int v) { return g(v) + h(v); }
+int main(void) { printf("%d %d\\n", apply(twice, 4), both(twice, twice, 5)); return 0; }
+""",
+            stdout="8 20\n",
+        )
+
     def test_a_function_pointer_is_a_parameter_like_any_other(self):
         self.run_c(
             _STDIO
@@ -3995,6 +4248,90 @@ int main(void) {
             stdout="5 11\n",
         )
 
+    def test_a_function_returning_a_function_pointer_needs_no_typedef(self):
+        # The same program with the declarator C actually has for it: a
+        # function of `k` returning a pointer to a function of two ints. The
+        # parser used to refuse this shape and ask for the typedef above.
+        self.run_c(
+            _STDIO
+            + """
+int add(int a, int b) { return a + b; }
+int (*chooser(int k))(int, int) { return add; }
+int main(void) {
+    int (*(*maker)(int))(int, int) = chooser;
+    printf("%d %d\\n", maker(0)(2, 3), chooser(1)(10, 1));
+    return 0;
+}
+""",
+            stdout="5 11\n",
+        )
+
+    def test_a_prototype_in_the_nested_form_and_its_definition(self):
+        # A prototype first, as a header writes it, then the definition, and
+        # the result called at once, called through `*`, and kept in a local.
+        self.run_c(
+            _STDIO
+            + """
+static int twice(int x) { return 2 * x; }
+static int thrice(int x) { return 3 * x; }
+int (*pick(int which))(int);
+int (*pick(int which))(int) { return which ? thrice : twice; }
+int main(void) {
+    int (*f)(int) = pick(1);
+    printf("%d %d %d %d\\n", pick(0)(5), (*pick(1))(5), f(7), pick(0)(f(1)));
+    return 0;
+}
+""",
+            stdout="10 15 21 6\n",
+        )
+
+    def test_a_method_table_accessor_as_openssl_spells_one(self):
+        # `int (*BIO_meth_get_write(const BIO_METHOD *biom))(BIO *, const char
+        # *, int);` - an opaque struct pointer in, unnamed parameters in the
+        # result's list, three of them. The pointer handed back is stored in
+        # a local, a global and a struct member, and called from each.
+        self.run_c(
+            _STDIO
+            + """
+struct bio_st { int total; };
+struct bio_method_st { int scale; };
+static int write_plain(struct bio_st *b, const char *s, int n) { b->total += n; return n; }
+static int write_double(struct bio_st *b, const char *s, int n) { b->total += 2 * n; return 2 * n; }
+int (*BIO_meth_get_write(const struct bio_method_st *biom)) (struct bio_st *, const char *, int);
+int (*BIO_meth_get_write(const struct bio_method_st *biom)) (struct bio_st *, const char *, int) {
+    return biom->scale == 2 ? write_double : write_plain;
+}
+struct holder { int (*write)(struct bio_st *, const char *, int); };
+int (*kept)(struct bio_st *, const char *, int);
+int main(void) {
+    struct bio_method_st plain = { 1 };
+    struct bio_method_st twice = { 2 };
+    struct bio_st b = { 0 };
+    struct holder h;
+    int (*local)(struct bio_st *, const char *, int) = BIO_meth_get_write(&plain);
+    kept = BIO_meth_get_write(&twice);
+    h.write = BIO_meth_get_write(&twice);
+    int a = local(&b, "abc", 3);
+    int c = kept(&b, "de", 2);
+    int d = h.write(&b, "f", 1);
+    int e = BIO_meth_get_write(&plain)(&b, "ghij", 4);
+    printf("%d %d %d %d %d\\n", a, c, d, e, b.total);
+    return 0;
+}
+""",
+            stdout="3 4 2 4 13\n",
+        )
+
+    def test_the_nested_form_compiles_for_every_target(self):
+        source = (
+            "static int twice(int x) { return 2 * x; }\n"
+            "int (*pick(int which))(int) { return twice; }\n"
+            "int main(void) { return pick(0)(3); }\n"
+        )
+        for target in MACHINE_TARGETS:
+            with self.subTest(target=target):
+                compile_c_to_ir(source, "p.c", target)
+
     def test_a_narrow_result_comes_back_converted_to_its_type(self):
         # The result register holds an unspecified value in its upper bits, so
         # a signed char result must be sign-extended and an unsigned one
@@ -4126,12 +4463,42 @@ class FunctionPointerRejectionTests(CProgramTestCase):
             "function inside a block",
         )
 
-    def test_a_nested_function_declarator_is_refused(self):
+    def test_a_nested_declarator_disagreeing_with_its_prototype_is_refused(self):
+        # And the error points at the function's name, not at the last token
+        # of a parameter list read after it: line 2, column 7 is the `f`.
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(
+                "int (*f(int a, int b))(int);\n"
+                "int (*f(int, int))(long);\n"
+                "int main(void) { return 0; }\n",
+                "reject.c",
+                "darwin-arm64",
+            )
+        self.assertRegex(
+            str(caught.exception),
+            r"reject\.c:2:7: 'f' was declared to return int \(\*\)\(int\) and is "
+            r"now declared to return int \(\*\)\(long\)",
+        )
+
+    def test_a_function_declarator_sharing_its_declaration_is_refused(self):
         self.reject(
-            "int add(int a, int b) { return a + b; }\n"
-            "int (*chooser(int k))(int, int) { return add; }\n"
-            "int main(void) { return 0; }\n",
-            "plain declarator form",
+            "int (*f(int))(int), x;\nint main(void) { return 0; }\n",
+            "'f' is declared as a function in a declaration that goes on to "
+            "declare something else",
+        )
+
+    def test_a_definition_cannot_take_its_function_type_from_a_typedef(self):
+        # `T f;` is a prototype and fine; `T f { ... }` names no parameter,
+        # and C itself forbids it (6.9.1p2).
+        self.reject(
+            "typedef int T(int);\nT f { return 0; }\nint main(void) { return 0; }\n",
+            "'f' is defined with a function type taken from a typedef",
+        )
+
+    def test_the_nested_form_inside_a_block_is_still_refused(self):
+        self.reject(
+            "int main(void) { int (*g(int))(int); return 0; }\n",
+            "'g' is declared as a function inside a block",
         )
 
     def test_types_c_does_not_have_are_refused(self):
@@ -4139,9 +4506,23 @@ class FunctionPointerRejectionTests(CProgramTestCase):
             "int table[2](void);\nint main(void) { return 0; }\n",
             "an array of int .void. is not a type C has",
         )
+        # Composed through the parentheses rather than in one suffix group:
+        # the `[3]` applies to `int` and the `(void)` to the hole, and only
+        # the fill produces a function returning an array.
         self.reject(
+            "int (f(void))[3];\nint main(void) { return 0; }\n",
+            "a function cannot return int.3.",
+        )
+        self.reject(
+            "int (t[2])(void);\nint main(void) { return 0; }\n",
+            "an array of int .void. is not a type C has",
+        )
+        # `int (*f(void))[3]` is a function returning a pointer to an array,
+        # which C does have, so it is a prototype and not an error.
+        compile_c_to_ir(
             "int (*f(void))[3];\nint main(void) { return 0; }\n",
-            "plain declarator form|cannot return",
+            "accept.c",
+            "darwin-arm64",
         )
 
     def test_a_function_pointer_compiles_for_every_target(self):
@@ -4264,6 +4645,38 @@ int main(void) {
 }
 """,
             stdout="1 2\n",
+        )
+
+    def test_a_typedef_function_type_declares_a_prototype(self):
+        # `T f;` declares the function f, of type T, and the definition that
+        # follows spells the parameters T could not name.
+        self.run_c(
+            _STDIO
+            + """
+typedef int T(int);
+T f;
+int main(void) { printf("%d\\n", f(20)); return 0; }
+int f(int x) { return x + 1; }
+""",
+            stdout="21\n",
+        )
+
+    def test_a_typedef_of_a_function_returning_a_function_pointer(self):
+        # `T` is the type of `pick` itself, so `T *` points at it.
+        self.run_c(
+            _STDIO
+            + """
+typedef int (*T(int))(int);
+static int twice(int x) { return 2 * x; }
+static int thrice(int x) { return 3 * x; }
+int (*pick(int which))(int) { return which ? thrice : twice; }
+int main(void) {
+    T *p = pick;
+    printf("%d %d\\n", p(0)(6), (*p)(1)(6));
+    return 0;
+}
+""",
+            stdout="12 18\n",
         )
 
 

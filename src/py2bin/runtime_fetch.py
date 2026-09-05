@@ -153,11 +153,26 @@ class FetchLock:
 DOWNLOADER = None
 
 
-def _open_https(url: str, label: str):
+#: A second seam, for a caller that wants part of a resource: it takes
+#: (url, label, start, stop) - ``stop`` None for "to the end", a negative
+#: ``start`` for that many bytes off the end - and answers (bytes, whole
+#: size), or None where the server will not answer a range. Left unset, a
+#: range is cut out of what ``DOWNLOADER`` answers, so a test that cans a
+#: whole file has canned every range of it too.
+RANGE_DOWNLOADER = None
+
+#: What a range request is told it may read, so a server that ignores the
+#: header and answers the whole resource cannot make it a whole download.
+_RANGE_SLACK = 1024
+
+
+def _open_https(url: str, label: str, headers: "dict[str, str] | None" = None):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.username or parsed.password:
         raise FetchError(f"{label} URL must be credential-free HTTPS: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    request = urllib.request.Request(
+        url, headers={"User-Agent": _USER_AGENT, **(headers or {})}
+    )
     stream = urllib.request.urlopen(request, timeout=60)
     if urllib.parse.urlsplit(stream.geturl()).scheme != "https":
         stream.close()
@@ -198,6 +213,55 @@ def _read_bytes(url: str, label: str, limit: int) -> bytes:
         return bytes(payload)
     with _open_https(url, label) as stream:
         return stream.read(limit)
+
+
+def read_range(
+    url: str, label: str, start: int, stop: "int | None" = None
+) -> "tuple[bytes, int] | None":
+    """Bytes ``[start, stop)`` of the resource at ``url``, and its whole size.
+
+    A negative ``start`` asks for that many bytes off the end, which is how
+    the directory of a zip is reached without the zip: it sits at the end.
+    None where the server answered the whole resource instead of the range
+    - the caller then has a whole download to decide about, and this reads
+    none of it. HTTP's range is inclusive at both ends; this one is not.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        raise FetchError(f"{label} URL must be credential-free HTTPS: {url}")
+    if RANGE_DOWNLOADER is not None:
+        return RANGE_DOWNLOADER(url, label, start, stop)
+    if DOWNLOADER is not None:
+        payload = DOWNLOADER(url, label)
+        if not isinstance(payload, (bytes, bytearray)):
+            raise FetchError(f"the installed downloader returned no bytes for {label}")
+        whole = bytes(payload)
+        if start < 0:
+            return whole[start:], len(whole)
+        return whole[start:stop], len(whole)
+    if start < 0:
+        spec, most = f"bytes={start}", -start
+    elif stop is None:
+        spec, most = f"bytes={start}-", None
+    else:
+        spec, most = f"bytes={start}-{stop - 1}", stop - start
+    stream = _open_https(url, label, {"Range": spec})
+    try:
+        if stream.status != 206:
+            return None
+        told = stream.headers.get("Content-Range", "")
+        # `bytes 100-199/5000`: the whole size is what follows the slash.
+        _span, _slash, size = told.rpartition("/")
+        if not size.isdigit():
+            raise FetchError(f"{label} answered a range without saying its size: {url}")
+        limit = (most if most is not None else int(size) - start) + _RANGE_SLACK
+        data = stream.read(limit)
+    finally:
+        stream.close()
+    if most is not None and len(data) > most:
+        raise FetchError(f"{label} answered more than the range asked for: {url}")
+    return data, int(size)
 
 
 def _read_json(url: str, label: str) -> dict:
