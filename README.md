@@ -2739,6 +2739,35 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a header read for its macros, and the global one a local hides
+
+`char text[INET_ADDRSTRLEN];` met a name nothing had defined. The header that
+defines it is taken by the run that preprocesses a branching header - that run
+expands what it includes inside itself, so its declarations arrive through
+that run's answer and its macros die with it. The header is now read a second
+time, by the C stage, for its macros alone: it is named in a `#pragma py2bin
+supplied` line, which marks it as one whose declarations are already here, and
+what that run reads of it is not emitted again. What such a header includes in
+turn is dropped with it.
+
+Three things had to be true for that to work. A struct defined twice with the
+same members is the same declaration and not an error - py2bin pastes the
+headers itself, so one file can arrive by two routes. A name this text
+declares as a type wins over a macro of that name in a header being read only
+for its macros: Windows writes `#define X509_NAME ((LPCSTR) 7)` and OpenSSL
+declares a struct of that name, which turned into `typedef struct
+X509_name_st ((LPCSTR) 7);`. And a name the program *calls* keeps its macro,
+since `FD_SET` is both a type and the macro that fills one.
+
+`::socket(...)` - the global one, said so because a name nearer than it would
+otherwise win, which is what a program does when it keeps a socket in a
+variable called `socket`. C has no such qualifier, so it comes off; and a call
+on a local that cannot be called at all reaches the function of that name,
+which is the only reading a C compiler would take either.
+
+2184 tests, 565 programs against clang++, 11 projects, 3432 builds across six
+targets.
+
 ### 0.9.13 - the C stage meets the same project
 
 Where the last round left the SidecarBridge Windows companion, the C++ stage

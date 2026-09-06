@@ -2169,7 +2169,13 @@ def _typedef_declarators(spelled: str) -> "list[str]":
         words = re.findall(r"[A-Za-z_]\w*", re.sub(r"\[[^\]]*\]", " ", part))
         if words and words[-1] not in _NOT_A_TYPE:
             names.append(words[-1])
-    return names
+    # A name and nothing else. What a declarator this could not take apart
+    # leaves behind is not one - `IAdviseSinkEx *` came back from one - and
+    # a caller writing it into a directive is handed something C has no
+    # meaning for.
+    return [
+        one for one in names if re.fullmatch(r"[A-Za-z_]\w*", one)
+    ]
 
 #: Words that say how something is stored rather than what it is. A type
 #: deduced from a declaration must not carry one: `mutable std::mutex m;` is
@@ -18856,6 +18862,15 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # so no reader below ever opens a literal on a quote inside either.
     cooked = _cook_source(source)
     text = _strip_comments(cooked)
+    # `::socket(...)` - the global one, said so because a name nearer than it
+    # would otherwise win. Here every name is already global by the time the
+    # C is written, so what the qualifier asks for is what happens anyway;
+    # left in, it reached the C stage as a `:` where an expression goes.
+    # Only where nothing stands in front of it: `Owner::name` is a different
+    # thing entirely.
+    text = _map_code(
+        text, lambda part: re.sub(r"(?<![A-Za-z_0-9>:])::\s*(?=[A-Za-z_])", "", part)
+    )
     # Before anything reads the text at all. What is inside an `#if 0` is not
     # part of the program, and every pass below reads the text as written -
     # so a class in one was lifted out and emitted, a construct this subset
@@ -19174,6 +19189,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             # the *source*, so without noticing it the `::` went to the C
             # compiler in a file that had nothing else C++ about it.
             or re.search(r"(?<![.\w>])std\s*::", source) is not None
+            # And `::name` on its own, which says "the global one" and is
+            # the same kind of thing: taken off `text` above, while this path
+            # hands back the source, it reached the C compiler as a `:` where
+            # an expression goes.
+            or re.search(r"(?<![A-Za-z_0-9>:])::\s*[A-Za-z_]", source) is not None
         )
         if not plain and not namespaces and not loose:
             # Nothing C++ about this file at all: hand back what was written,
@@ -25459,6 +25479,11 @@ def inline_local_includes(
             _READ_BY_A_BRANCH,
             _DEFINED_BY_A_BRANCH,
         )
+        # py2bin's own C++ headers are not the search path's, whichever
+        # directory they were read from: the C stage has no `<string>` and
+        # asking it for one is asking for a header nobody has. What this set
+        # is for is a header the C stage can read itself.
+        _READ_BY_A_BRANCH.difference_update(_BUILTIN_CPP_HEADERS)
         # What that run could not answer comes back as `#include` lines at
         # the top: py2bin's C headers, which the outer run reads, and py2bin's
         # C++ ones, which only this stage has. A project's own <fstream> on
@@ -25603,28 +25628,49 @@ def inline_local_includes(
     return _ANY_INCLUDE.sub(reach, text)
 
 
-def _already_supplied() -> str:
-    """The line that tells the preprocessor what a branch already brought."""
+def _already_supplied(pasted: str = "") -> str:
+    """The lines that tell the preprocessor what a branch already brought."""
 
     supplied = "".join(
         f'#pragma py2bin supplied "{name}"\n'
         for name in sorted(_SUPPLIED_BY_A_BRANCH | _READ_BY_A_BRANCH)
     )
-    return supplied
-
-
-def translate_project(
-    path: Path,
-    include_dirs: "tuple[str, ...]" = (),
-    target: "str | None" = None,
-) -> str:
-    """The C for one C++ source, with this project's headers pasted in."""
-
-    _SUPPLIED_BY_A_BRANCH.clear()
-    _READ_BY_A_BRANCH.clear()
-    _DEFINED_BY_A_BRANCH.clear()
-    inlined = inline_local_includes(path, include_dirs, None, None, target)
-    return translate(_already_supplied() + inlined, str(path))
+    # And the search path's own headers a branch took, asked for again. That
+    # run expanded them inside itself and its answer carries what they
+    # declare; their macros died with it, and `#define INET_ADDRSTRLEN 22` is
+    # one - a program writes it as an array bound and the C stage met a name
+    # nothing had defined. Named as supplied above, so what they declare is
+    # dropped where it is read and only the macros are kept.
+    read_again = "".join(
+        f"#include <{name}>\n" for name in sorted(_READ_BY_A_BRANCH)
+    )
+    # And then the names those headers define as macros that this text has
+    # already declared as types. Windows writes `#define X509_NAME ((LPCSTR)
+    # 7)` and OpenSSL declares a struct of that name; reading the first for
+    # its macros turned the second into `typedef struct X509_name_st
+    # ((LPCSTR) 7);`. What is declared here was chosen by the C++ stage and
+    # is what the program is written against, so it wins. `#undef` of a name
+    # that is not a macro is nothing at all, which is what C says of it.
+    bare = _without_literals(pasted)
+    # A name this text also *calls* keeps whatever macro it has: `FD_SET` is
+    # a type in <winsock2.h> and a macro that fills one, and a program says
+    # both. Only a name used as a type alone is protected.
+    called = {
+        found.group(1)
+        for found in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(", bare)
+    }
+    guarded = "".join(
+        f"#undef {name}\n"
+        for name in sorted(_typedef_names_declared(pasted))
+        # A name, and nothing that only looks like one: the reader of
+        # declarators answers with whatever stood where a name goes, and a
+        # declaration it could not take apart leaves something that is not
+        # an identifier - which `#undef` has no meaning for.
+        if re.fullmatch(r"[A-Za-z_]\w*", name)
+        and name not in _NOT_A_TYPE
+        and name not in called
+    )
+    return supplied + read_again + guarded
 
 
 def translate_unity(
@@ -25654,5 +25700,11 @@ def translate_unity(
         inline_local_includes(path, include_dirs, seen, shared, target)
         for path in sources
     ]
-    joined = _already_supplied() + "\n".join(pieces)
-    return translate(joined, str(sources[0]) if sources else "<c++>")
+    pasted = "\n".join(pieces)
+    # The preamble goes in front of the *answer*, not in front of what is
+    # translated: it is written for the C stage, and passing it through this
+    # one had the alias pass rewrite it - `#undef LPADVISESINKEX` became
+    # `#undef IAdviseSinkEx *`, since that is what the alias stands for.
+    return _already_supplied(pasted) + translate(
+        pasted, str(sources[0]) if sources else "<c++>"
+    )

@@ -2091,8 +2091,16 @@ class Parser:
             if tag is None:
                 self.error("an anonymous struct needs a body", keyword)
             return struct
+        again = None
         if struct.members is not None:
-            self.error(f"{struct} is defined twice", keyword)
+            # Defined twice. py2bin pastes the headers itself rather than
+            # letting an include guard do it, so one file can arrive by two
+            # routes - a branching header preprocessed on its own, and the
+            # same header read again for its macros. An identical repeat
+            # says nothing new and is the same declaration; one that differs
+            # is a real disagreement and is still reported.
+            again = struct
+            struct = StructType(tag, is_union)
         self.take("{")
         members: "list[tuple[str, CType] | tuple[str, CType, int]]" = []
         alignments: dict[str, int] = {}
@@ -2182,6 +2190,15 @@ class Parser:
                 f"order the members so it does not straddle one.",
                 keyword,
             )
+        if again is not None:
+            if again.members != struct.members:
+                self.error(
+                    f"{again} is defined twice, and the two do not agree: "
+                    f"the first holds {len(again.members or ())} member(s) "
+                    f"and this one {len(struct.members or ())}",
+                    keyword,
+                )
+            return again
         return struct
 
     def bitfield_width(self, ctype: CType, name: str, token: Token) -> int:
@@ -5785,7 +5802,18 @@ class Lowerer:
                 "statement, or use snprintf if the count is what is wanted",
                 node.token,
             )
-        if self.lookup(node.name) is not None:
+        held = self.lookup(node.name)
+        if held is not None and not _can_be_called(held):
+            # A local of that name which is not callable at all - `SOCKET
+            # socket = socket(AF_INET, ...)`, where C++ said `::socket` and
+            # meant the function. C++ has a spelling for that and C has none,
+            # so the qualifier comes off in the stage above and the name
+            # arrives here shadowed by something no call could mean. A
+            # function of the same name is what was meant; a program where
+            # this fires is one no C compiler would take either.
+            if node.name in self.unit.functions or node.name in self.unit.externs:
+                held = None
+        if held is not None:
             # An object of function-pointer type shadows any function of the
             # same name, exactly as C's scoping says it does.
             return self.call_through(
@@ -9033,6 +9061,20 @@ def _string_fits(literal: "StringLiteral", element: CType, target: str) -> bool:
     if isinstance(literal.data, bytes):
         return _is_character(element)
     return element == literal.element_for(target)
+
+
+def _can_be_called(held: object) -> bool:
+    """Whether what a name is bound to could be the callee of a call.
+
+    A pointer to a function can; so can a function type, which decays to
+    one. Anything else - an int holding a socket, a struct - cannot, and a
+    call written on it means something else was meant.
+    """
+
+    ctype = getattr(held, "ctype", None)
+    if isinstance(ctype, PointerType) and isinstance(ctype.target, FunctionType):
+        return True
+    return isinstance(ctype, FunctionType)
 
 
 def compile_c_to_ir(

@@ -1192,7 +1192,26 @@ class Preprocessor:
             # it, a program that includes <windows.h> and a header that was
             # preprocessed separately gets both copies and is told its
             # structs are defined twice.
-            self._builtins_read.add(spelled[2].strip('"'))
+            taken = spelled[2].strip('"')
+            self._builtins_read.add(taken)
+            # And for one of the search path's own: a run that preprocessed a
+            # branching header pasted this file's declarations into its
+            # answer, so this run reads it for its macros - `FD_SET`,
+            # `INET_ADDRSTRLEN` - and drops what it declares. Told only that
+            # a *builtin* of that name had been read, it kept the
+            # declarations and the C compiler was handed every struct twice.
+            self.already_pasted.add(taken)
+            return
+        if len(spelled) == 3 and spelled[:2] == ["py2bin", "default"]:
+            # The definition written after this one is a default, in the same
+            # sense as one of py2bin's own headers: a name a run that
+            # preprocessed a branching header defined, handed on because that
+            # run expanded what it included inside itself and its macros died
+            # with it. A header this run reads for itself may define the same
+            # name differently - OpenSSL spells `OSSL_DEPRECATEDIN_3_0` its
+            # own way - and that one is the program's, so it replaces this
+            # without a word.
+            self._defaults.add(spelled[2].strip('"'))
             return
         if not spelled:
             # `#pragma` with nothing after it. C says an implementation may
@@ -1363,8 +1382,18 @@ class Preprocessor:
                 # included directly and which was already in the unit, so
                 # its enum arrived twice and the C compiler said so.
                 lowered = name.lower()
-                if name in self.already_pasted or any(
-                    lowered == other.lower() for other in self.already_pasted
+                if (
+                    name in self.already_pasted
+                    or any(
+                        lowered == other.lower() for other in self.already_pasted
+                    )
+                    # And whatever one of those asks for in turn. A header
+                    # read only for its macros pulls in its own: <WebView2.h>
+                    # asks for <eventtoken.h>, and the struct that one
+                    # declares had already been pasted by the C++ stage - so
+                    # it arrived twice and the C compiler said so. What a
+                    # dropped header includes is dropped with it.
+                    or at.origin in self.pasted_origins
                 ):
                     self.pasted_origins.add(self._origin_of(candidate))
                 self.search_path_read.add(name)
@@ -1766,6 +1795,15 @@ class Preprocessor:
     def tokens(self) -> list[Token]:
         result: list[Token] = []
         for token in self.output:
+            if token.origin in self.pasted_origins:
+                # A header the C++ stage pasted already, read here for its
+                # macros: a program that includes <winsock2.h> gets its
+                # declarations from that stage and its `FD_SET` from this
+                # one, and what this run read of it is not emitted again.
+                # Without this the file arrived twice and every struct in it
+                # was defined twice; with the read skipped instead, every
+                # macro it defines was gone.
+                continue
             result.append(_convert(token, self.error))
         line, column, origin = 1, 1, ""
         if self.output:
