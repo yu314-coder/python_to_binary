@@ -2739,6 +2739,53 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the C stage meets the same project
+
+Where the last round left the SidecarBridge Windows companion, the C++ stage
+was done with it and the C stage had its turn. What that found:
+
+`typedef int (OSSL_CALLBACK)(const OSSL_PARAM[], void *);` - a typedef of a
+function type, written twice a few lines apart, which is how OpenSSL declares
+its callbacks. The second time the name is a type already, so the parentheses
+read as a parameter list of one type declaring nothing and the reader asked
+for an identifier. A lone name in parentheses is a declarator.
+
+A header the run that preprocesses a branching one had already taken was
+pasted a second time by the outer run, so every struct in it was defined
+twice. The two are kept apart now - which of the search path's headers a
+branch took is not the same question as which of py2bin's own were supplied,
+and a project that vendors a header py2bin also ships still gets its own.
+
+A `unique_ptr` with a deleter of its own, which is how a program holds
+something a C library made. A nested class declared inside a class and
+defined below it, `struct Owner::Session { ... };` - the lifting moves a class
+written *inside* another and never saw this one, so nothing declared the type
+at all. A lifted class now sits directly above the class it was written in
+rather than at the top of the file, where one holding a
+`std::filesystem::path` stood above the header that declares a path.
+
+The input structures a program sends to move the pointer or press a key -
+`INPUT`, `MOUSEINPUT`, `KEYBDINPUT`, `SendInput` and the flags - which is the
+whole job of a remote-control host and which py2bin's <windows.h> did not
+declare.
+
+A closure captured what its own body declared: a lambda writing
+`std::lock_guard lock(m);` of its own, inside a function that also had a
+`lock`, captured the outer one. A declaration opening with `mutable` had no
+type this reader could see, and the first member under each `public:` had
+none either - the label has no `;` of its own and came through glued to it.
+
+And two that were quiet. `const string s = t;` came out as `conststruct
+string s;`, because the keyword in front of the type was optional in the
+pattern but the space after it was not. And the table of brace depths counted
+every brace in the raw text, so `payload << "}"` read as a scope closing and
+from there every depth in the file was one too few: a function written after
+it was taken for a nested one, and what was rewritten as its body was
+somebody else's.
+
+2184 tests, 563 programs against clang++, 11 projects, 3420 builds across six
+targets.
+
 ### 0.9.13 - a real Windows project, built from its own repository
 
 The SidecarBridge Windows companion - a WebView2 shell over an encrypted

@@ -2528,7 +2528,20 @@ class Parser:
                 return True
             if self.token.kind != "identifier" or self.token.value in _RESERVED:
                 return False
-            return not self.at_type()
+            if not self.at_type():
+                return True
+            # A type name inside the parentheses, alone: `(NAME)` with the
+            # `)` right after it, which a parameter list cannot be - a
+            # parameter list of one type is that type *declaring* something,
+            # and what is declared here is the name itself. This is how a
+            # header that declares the same function type twice reads the
+            # second time: `typedef int (OSSL_CALLBACK)(const OSSL_PARAM[],
+            # void *)` written again, with OSSL_CALLBACK a type by then.
+            # Read as a parameter list it wanted a name after the type and
+            # found the closing parenthesis, and OpenSSL's headers say so
+            # twice within a few lines of each other.
+            self.index += 1
+            return self.at(")")
         finally:
             self.index = saved
 

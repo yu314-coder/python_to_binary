@@ -1819,7 +1819,13 @@ _LITERAL_TYPES = (
 
 #: The head of a declaration statement: the type, then its declarators.
 _DECLARATION_STATEMENT = re.compile(
-    r"^\s*((?:(?:const|unsigned|signed|long|short|static)\s+)*[A-Za-z_]\w*)\s+(.+)$",
+    # `mutable` and the rest say how a thing is stored, not what it is, and a
+    # declaration that opens with one still declares something: `mutable
+    # std::mutex gate;` had no type this reader could see, so nothing that
+    # asks what `gate` is - a `lock_guard` deducing its argument from it,
+    # among others - got an answer.
+    r"^\s*((?:(?:const|unsigned|signed|long|short|static|mutable|volatile"
+    r"|thread_local|inline|constexpr|register)\s+)*[A-Za-z_]\w*)\s+(.+)$",
     re.S,
 )
 
@@ -1850,11 +1856,19 @@ def _declared_here(text: str) -> "dict[str, str]":
         cleaned = statement.strip().rstrip(";").strip()
         if not cleaned or cleaned.startswith(("{", "}")):
             continue
+        # An access label has no `;` of its own, so it comes through glued to
+        # the member written after it - and the first member under each
+        # `public:` was a declaration this reader could not see at all.
+        cleaned = re.sub(
+            r"^(?:(?:public|private|protected)\s*:\s*)+", "", cleaned
+        ).strip()
+        if not cleaned:
+            continue
         match = _DECLARATION_STATEMENT.match(cleaned)
         if match is None:
             continue
-        spelled = match.group(1).strip()
-        if spelled.split()[-1] in _NOT_A_TYPE:
+        spelled = _without_storage(match.group(1))
+        if not spelled or spelled.split()[-1] in _NOT_A_TYPE:
             continue
         for part in _split_arguments(match.group(2)):
             declarator = _DECLARATOR.match(part)
@@ -2156,6 +2170,22 @@ def _typedef_declarators(spelled: str) -> "list[str]":
         if words and words[-1] not in _NOT_A_TYPE:
             names.append(words[-1])
     return names
+
+#: Words that say how something is stored rather than what it is. A type
+#: deduced from a declaration must not carry one: `mutable std::mutex m;` is
+#: a mutex, and a `lock_guard` deduced from it was written out as
+#: `lock_guard<mutable mutex>` - a copy whose parameter the C stage met as
+#: `mutable struct mutex *`, which is not C at all.
+_STORAGE_WORDS = re.compile(
+    r"(?<![.\w>])(?:mutable|static|inline|register|thread_local|extern)\s+"
+)
+
+
+def _without_storage(spelled: str) -> str:
+    """The type as written, with the words about storage taken off."""
+
+    return " ".join(_STORAGE_WORDS.sub(" ", spelled).split())
+
 
 def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     """What type an argument has, as far as this can tell without a type system.
@@ -4323,6 +4353,63 @@ def _lift_nested_enums(text: str) -> str:
             return "\n".join(lifted) + ("\n" if lifted else "") + text
 
 
+#: `struct Owner::Name {` - a class declared inside another and defined
+#: outside it, which is how a header keeps a type private and its definition
+#: out of the header.
+_NESTED_DEFINED_OUTSIDE = re.compile(
+    r"(?<![.\w>])(class|struct)\s+([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)\s*"
+    r"(?::\s*[^{;]*)?\{"
+)
+
+
+def _lift_out_of_line_nested(text: str, filename: str) -> str:
+    """A nested class defined outside the class that declares it.
+
+    `struct Session;` inside the class and `struct Owner::Session { ... };`
+    below it: the definition is at the top level already, and only its name
+    says otherwise. The lifting below moves a class written *inside* another
+    and never sees this one, so nothing declared the type at all - the C got
+    a `shared_ptr` holding a `Session *` and no `struct Session` anywhere.
+
+    The qualifier comes off the definition and off every mention of it, and
+    the declaration left inside the class goes: what the class holds is a
+    pointer to it, and C has that without the type being complete.
+    """
+
+    for found in list(_NESTED_DEFINED_OUTSIDE.finditer(_without_literals(text))):
+        outer, name = found.group(2), found.group(3)
+        if outer not in _CLASS_NAMES and not re.search(
+            rf"(?<![.\w>])(?:class|struct)\s+{re.escape(outer)}\b", text
+        ):
+            continue
+        # A class of that name at the top level already means two types would
+        # answer to one name, and which a mention meant could not be told.
+        if re.search(
+            rf"(?<![.\w>:])(?:class|struct)\s+{re.escape(name)}\s*(?::[^{{;]*)?\{{",
+            _without_literals(text),
+        ):
+            raise CppTranslationError(
+                filename,
+                _line_of(text, found.start()),
+                f"{outer}::{name} is defined here and a class called {name} "
+                f"is defined at the top level too. py2bin gives a nested "
+                f"class the name it was written with, so the two would "
+                f"answer to one name; rename one of them",
+            )
+        text = re.sub(
+            rf"(?<![.\w>]){re.escape(outer)}\s*::\s*{re.escape(name)}\b",
+            name,
+            text,
+        )
+        # And the declaration inside the class, which now says nothing.
+        text = re.sub(
+            rf"(?m)^[ \t]*(?:class|struct)\s+{re.escape(name)}\s*;[ \t]*\n",
+            "",
+            text,
+        )
+    return text
+
+
 def _lift_nested_classes(text: str) -> str:
     """A class written inside another becomes one of its own.
 
@@ -4394,7 +4481,27 @@ def _lift_nested_classes(text: str) -> str:
             # Put back at the front rather than set aside in a list: a
             # class nested two deep holds a class of its own, and one the
             # loop never reads again was lifted once and left holding it.
-            text = taken + "\n" + text[:start] + kept + text[end:]
+            # Directly above the class it was written in, rather than at the
+            # top of the file: a nested class can only be named through the
+            # outer one, so nothing above that needs it - and put first of
+            # all, one holding a `std::filesystem::path` stood above the
+            # header that declares a path, so its member had a type the C
+            # stage had never seen.
+            # Above the class's own `template <...>` clause where it has
+            # one, or the clause would be left standing in front of the
+            # lifted class instead of the one it was written for.
+            above = heading.start() if heading is not None else head.start()
+            text = (
+                text[:above]
+                + taken
+                + "\n"
+                + text[above:start]
+                + kept
+                + text[end:]
+            )
+            # Everything from `above` on has moved right by what was put in
+            # front of it, and the outer class's head was read before that.
+            moved = len(taken) + 1
             # `Outer<int>::Inner` names the copy for those arguments.
             text = _map_code(
                 text,
@@ -4413,15 +4520,16 @@ def _lift_nested_classes(text: str) -> str:
             if named:
                 # A bare `Inner` means this copy, and only inside the class it
                 # was written in - which is where the parameters have meaning.
-                closing = _matching(text, head.end() - 1)
-                inside = text[head.end(): closing]
+                opens = head.end() + moved
+                closing = _matching(text, opens - 1)
+                inside = text[opens: closing]
                 inside = _map_code(
                     inside,
                     lambda part, n=name, s=applied: re.sub(
                         rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*(?:::|<))", s, part
                     ),
                 )
-                text = text[:head.end()] + inside + text[closing:]
+                text = text[:opens] + inside + text[closing:]
             else:
                 text = _map_code(
                     text,
@@ -5934,6 +6042,15 @@ def _captures_used(
         for found in [re.search(r"([A-Za-z_]\w*)\s*$", part.strip())]
         if found is not None
     }
+    # And whatever the body declares for itself, which shadows the scope
+    # around it. A closure that writes `std::lock_guard lock(m);` of its own,
+    # in a function that also has a `lock`, captured the outer one - and the
+    # class written for the closure then held a member of a type whose
+    # arguments were never settled, which the C stage met as a name it had
+    # never seen.
+    its_own |= set(_declared_here(body)) | {
+        found.group(1) for found in _AUTO_NAMED.finditer(_without_literals(body))
+    }
     start = _enclosing_body_start(before)
     scope = before[start:]
     # The names the enclosing function was given, which are as much a part of
@@ -7134,15 +7251,35 @@ def _expand_templates(text: str, filename: str) -> str:
                     )
                     continue
                 # Spelled out, so the entry is whichever takes that many
-                # template parameters.
+                # template parameters - and where one of them is a pack, what
+                # the call passes fills it. `make_shared<Room>(id)` spells
+                # the type it makes and leaves the argument's type to be
+                # read: taken as spelling every parameter there is, the copy
+                # was written to take nothing and the call handed it one.
                 for entry in patterns[name]:
                     # `entry[0]` is the parameter list already read, not the
                     # text it was read from.
-                    if _arity_fits(entry[0], arguments):
-                        asked.append(
-                            (name, [a.strip() for a in arguments], entry)
-                        )
-                        break
+                    if not _arity_fits(entry[0], arguments):
+                        continue
+                    settled = [a.strip() for a in arguments]
+                    if any(pack for _n, _t, pack in entry[0]) and len(
+                        settled
+                    ) < len(entry[0]):
+                        after = region[close + 1:].lstrip()
+                        if after.startswith("("):
+                            passed = _call_arguments(
+                                region, len(region) - len(after)
+                            )
+                            for one in passed:
+                                held = _deduced_type(one, scope, found.start())
+                                if held is None:
+                                    settled = None
+                                    break
+                                settled.append(held.strip())
+                    if settled is None:
+                        continue
+                    asked.append((name, settled, entry))
+                    break
         return asked, unread
 
     def _spelled_parameters(kind: str, pattern_text: str) -> "str | None":
@@ -7187,7 +7324,22 @@ def _expand_templates(text: str, filename: str) -> str:
             ]
             named = _instantiated_name(found.group(1), arguments)
             if named not in made:
-                continue
+                # A copy whose name carries more than the use spelled: the
+                # rest were read from what the call passes, which is how a
+                # pack is filled where the first argument is written out -
+                # `make_shared<Room>(id)`. Without this the copy existed
+                # under its longer name and the call still said
+                # `make_shared`, which nothing declares.
+                wider = [
+                    one
+                    for one in made
+                    if one.startswith(f"{named}_")
+                    and _INSTANTIATED.get(one, ("", []))[0] == found.group(1)
+                    and _INSTANTIATED[one][1][: len(arguments)] == arguments
+                ]
+                if len(wider) != 1:
+                    continue
+                named = wider[0]
             out.append(region[at:found.start()])
             out.append(named)
             at = close + 1
@@ -9454,6 +9606,8 @@ def _deduce_class_arguments(text: str) -> str:
         settled: "dict[str, str]" = {}
         for spelled, value in zip(wanted, given):
             held = _deduced_type(value, text, match.start())
+            if held is not None:
+                held = _without_storage(held)
             if held is None:
                 return None
             shape = re.sub(r"\b[A-Za-z_]\w*$", "", spelled).strip()
@@ -12482,8 +12636,13 @@ _OBJECT_POINTER = re.compile(
 #: The `struct` an author may write in front of the type is swallowed here
 #: rather than left standing: the rewrite below spells one of its own, and
 #: `struct Point b = a;` came out as `struct struct Point b;`.
+#: The keyword and the space after it are one piece. Written as an optional
+#: word followed by its own `\s*`, the space in front of the *type* was
+#: eaten whenever no keyword stood there - so `const string s = t;` matched
+#: from just after `const`, and the declaration written in its place came
+#: out as `conststruct string s;`.
 _COPY_INIT = re.compile(
-    r"\b(?:struct|class)?\s*\b([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
+    r"(?<![.\w>])(?:(?:struct|class)\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
     r"(\*?\s*(?:this\s*->\s*)?[A-Za-z_]\w*(?:\s*\[[^\]]*\])?)\s*;"
 )
 
@@ -18781,6 +18940,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _rewrite_initialiser_lists(text)
     text = _rewrite_brace_initialisers(text)
     text = _rewrite_static_members(text, filename)
+    text = _lift_out_of_line_nested(text, filename)
     text = _lift_nested_classes(text)
     text = _brace_defaults_as_values(text, [0])
     text = _rewrite_default_arguments(text)
@@ -21381,7 +21541,14 @@ def _brace_depths(text: str) -> "tuple[list[int], list[int]]":
     at: "list[int]" = []
     depth: "list[int]" = []
     level = 0
-    for match in _A_BRACE.finditer(text):
+    # Against a copy with the literals blanked, which is the same length, so
+    # the positions still index the real text. A brace inside a string is
+    # text: `payload << "}"` counted as a scope closing, and from there every
+    # depth in the file was one too few - so a function written after it was
+    # taken for a nested one, and what was rewritten as its body was somebody
+    # else's. Nothing said so; the C simply came out with a statement in a
+    # place the program never put one.
+    for match in _A_BRACE.finditer(_without_literals(text)):
         level += 1 if match.group(0) == "{" else -1
         at.append(match.start())
         depth.append(level)
@@ -24128,6 +24295,35 @@ public:
     void reset(T *p) { if (raw != 0) { delete raw; } raw = p; }
 };
 
+/* And the same holder with a deleter of its own, which is how a program
+   holds something a C library made: `unique_ptr<EVP_PKEY, KeyDeleter>`,
+   where the deleter is a class with a call operator that frees it. Written
+   out as a second pattern rather than as a default template argument, which
+   this subset does not have - and without it the two-argument spelling
+   matched no pattern at all and reached the C stage as C++. */
+template<typename T, typename D>
+class unique_ptr {
+public:
+    T *raw;
+    D __deleter;
+    unique_ptr() { raw = 0; }
+    unique_ptr(T *p) { raw = p; }
+    unique_ptr(unique_ptr &o) { raw = o.raw; o.raw = 0; }
+    unique_ptr &operator=(unique_ptr &o) {
+        if (raw != 0) { __deleter(raw); }
+        raw = o.raw; o.raw = 0; return *this;
+    }
+    ~unique_ptr() { if (raw != 0) { __deleter(raw); raw = 0; } }
+    T *get() { return raw; }
+    T *operator->() { return raw; }
+    T &operator*() { return *raw; }
+    int operator!() { return raw == 0; }
+    int operator==(T *p) { return raw == p; }
+    int operator!=(T *p) { return raw != p; }
+    T *release() { T *held; held = raw; raw = 0; return held; }
+    void reset(T *p) { if (raw != 0) { __deleter(raw); } raw = p; }
+};
+
 template<typename T>
 class shared_ptr {
 public:
@@ -24146,12 +24342,10 @@ public:
 /* `make_shared<T>(...)` and `make_unique<T>(...)` - the holder built around
    a new object in one step, which is how a program that never writes `new`
    asks for one. The arguments go to T's own constructor. */
-template<typename T> shared_ptr<T> make_shared() { shared_ptr<T> made(new T()); return made; }
-template<typename T, typename A> shared_ptr<T> make_shared(A a) { shared_ptr<T> made(new T(a)); return made; }
-template<typename T, typename A, typename B> shared_ptr<T> make_shared(A a, B b) { shared_ptr<T> made(new T(a, b)); return made; }
-template<typename T> unique_ptr<T> make_unique() { unique_ptr<T> made(new T()); return made; }
-template<typename T, typename A> unique_ptr<T> make_unique(A a) { unique_ptr<T> made(new T(a)); return made; }
-template<typename T, typename A, typename B> unique_ptr<T> make_unique(A a, B b) { unique_ptr<T> made(new T(a, b)); return made; }
+template<typename T, typename... A>
+shared_ptr<T> make_shared(A... args) { shared_ptr<T> made(new T(args...)); return made; }
+template<typename T, typename... A>
+unique_ptr<T> make_unique(A... args) { unique_ptr<T> made(new T(args...)); return made; }
 }
 """
 
@@ -24999,6 +25193,16 @@ def _line_of(text: str, index: int) -> int:
 #: pasted, which may be below the program's own include of the same thing.
 _SUPPLIED_BY_A_BRANCH: "set[str]" = set()
 
+#: The search path's own headers a branch run has already pasted. Kept apart
+#: from the names of py2bin's supplied ones, which are seen for a different
+#: reason: a project that vendors a header py2bin also ships must still get
+#: its own copy pasted.
+_READ_BY_A_BRANCH: "set[str]" = set()
+
+#: What those headers defined, kept so the other run has them: a branch run
+#: expands what it includes inside itself, and the macros go with it.
+_DEFINED_BY_A_BRANCH: "dict[str, str]" = {}
+
 
 #: A header that declares one thing or another according to a macro.
 _CHOOSES_A_BRANCH = re.compile(r"(?m)^[ \t]*#[ \t]*(?:else|elif)\b")
@@ -25252,6 +25456,8 @@ def inline_local_includes(
             _SUPPLIED_BY_A_BRANCH,
             seen_headers,
             frozenset(_BUILTIN_CPP_HEADERS),
+            _READ_BY_A_BRANCH,
+            _DEFINED_BY_A_BRANCH,
         )
         # What that run could not answer comes back as `#include` lines at
         # the top: py2bin's C headers, which the outer run reads, and py2bin's
@@ -25324,6 +25530,19 @@ def inline_local_includes(
             # translated, and included with angles was handed below
             # untouched, so a class in it reached a C compiler and the
             # constructor was reported as a type it had never heard of.
+            if named in _READ_BY_A_BRANCH:
+                # Already read off the search path by the run that
+                # preprocessed a branching header: that run pastes what it
+                # includes into its own answer. Pasted again here, the file
+                # arrived twice - once preprocessed and once as written - and
+                # every struct in it was defined twice.
+                #
+                # The include line stays, and the pragma below says the
+                # header has been taken already: the C stage then reads it
+                # for its macros and drops what it declares, which is what
+                # keeps `#define INET_ADDRSTRLEN 22` reaching the program
+                # that writes `char text[INET_ADDRSTRLEN]`.
+                return match.group(0)
             return inline_local_includes(
                 candidate, include_dirs, seen, seen_headers, target
             )
@@ -25387,10 +25606,11 @@ def inline_local_includes(
 def _already_supplied() -> str:
     """The line that tells the preprocessor what a branch already brought."""
 
-    return "".join(
+    supplied = "".join(
         f'#pragma py2bin supplied "{name}"\n'
-        for name in sorted(_SUPPLIED_BY_A_BRANCH)
+        for name in sorted(_SUPPLIED_BY_A_BRANCH | _READ_BY_A_BRANCH)
     )
+    return supplied
 
 
 def translate_project(
@@ -25401,6 +25621,8 @@ def translate_project(
     """The C for one C++ source, with this project's headers pasted in."""
 
     _SUPPLIED_BY_A_BRANCH.clear()
+    _READ_BY_A_BRANCH.clear()
+    _DEFINED_BY_A_BRANCH.clear()
     inlined = inline_local_includes(path, include_dirs, None, None, target)
     return translate(_already_supplied() + inlined, str(path))
 
@@ -25426,6 +25648,8 @@ def translate_unity(
     seen: set[Path] = set()
     shared: set[str] = set()
     _SUPPLIED_BY_A_BRANCH.clear()
+    _READ_BY_A_BRANCH.clear()
+    _DEFINED_BY_A_BRANCH.clear()
     pieces = [
         inline_local_includes(path, include_dirs, seen, shared, target)
         for path in sources

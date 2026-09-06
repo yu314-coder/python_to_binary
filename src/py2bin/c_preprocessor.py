@@ -345,6 +345,14 @@ _DECLARES_INTERFACES = frozenset({"unknwn.h", "objidl.h", "oaidl.h"})
 _HANDED_TO_CPLUSPLUS = frozenset({"unknwn.h", "objidl.h", "oaidl.h"})
 
 
+#: Names this preprocessor settles for itself on every run. Handing one back
+#: from a branch would pin the value that run saw.
+_ALREADY_KNOWN_ELSEWHERE = frozenset(
+    {"__cplusplus", "__py2bin_translating", "__FILE__", "__LINE__", "__DATE__",
+     "__TIME__", "__STDC__", "__STDC_VERSION__"}
+)
+
+
 def as_cplusplus(
     named: str,
     directory: "Path | None",
@@ -353,6 +361,8 @@ def as_cplusplus(
     supplied: "set[str]",
     already: "set[str]",
     cplusplus: "frozenset[str]" = frozenset(),
+    from_the_path: "set[str] | None" = None,
+    defines: "dict[str, str] | None" = None,
 ) -> str:
     """One header, preprocessed as a C++ compiler would see it.
 
@@ -415,6 +425,33 @@ def as_cplusplus(
     already.update(kept - handed)
     # The search-path headers this run expanded are in the unit now too.
     already.update(engine.search_path_read)
+    # Which of them came off the search path rather than out of py2bin's own
+    # set. The caller pastes each header once per unit and tells the two
+    # apart by name, so a project that vendors a header py2bin also ships
+    # would otherwise have its own copy skipped as though py2bin's had been
+    # supplied in its place.
+    if from_the_path is not None:
+        from_the_path.update(engine.search_path_read)
+    # And what those headers *define*, written back out as directives. The
+    # run that reads a branching header expands everything it includes inside
+    # itself, so a macro one of them defines - `#define INET_ADDRSTRLEN 22`,
+    # which a program writes as an array bound - died here and reached the
+    # other run as a name nothing had defined. Only the plain ones: a macro
+    # taking arguments, or one built into this preprocessor, is not something
+    # to hand on.
+    if defines is not None:
+        # What those headers define, for a caller that needs them: a branch
+        # run expands what it includes inside itself, so its macros die with
+        # it. Handed back, not written out - where to put them, and which of
+        # them a later header will define differently, is the caller's
+        # question and not this one's.
+        for name, macro in engine.macros.items():
+            if macro.parameters is not None or macro.builtin:
+                continue
+            spelled = " ".join(one.spelling for one in macro.body).strip()
+            if not spelled or name in _ALREADY_KNOWN_ELSEWHERE:
+                continue
+            defines[name] = spelled
     # The dropped ones are asked for by name, so the other run reads them -
     # at the top, where it puts every directive, which is above every use.
     # Dropped without asking, a generated header named a type nothing had
@@ -2577,6 +2614,73 @@ typedef HANDLE DPI_AWARENESS_CONTEXT;
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
 extern BOOL SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT);
 extern UINT GetDpiForWindow(HWND);
+/* Synthesised input: what a program sends to move the pointer or press a
+   key on the machine it runs on, which is the whole job of a remote-control
+   host. The union is one of three shapes chosen by `type`, and `SendInput`
+   takes an array of them with the size of one written out. */
+typedef struct tagMOUSEINPUT {
+    LONG dx;
+    LONG dy;
+    DWORD mouseData;
+    DWORD dwFlags;
+    DWORD time;
+    ULONG_PTR dwExtraInfo;
+} MOUSEINPUT, *PMOUSEINPUT, *LPMOUSEINPUT;
+
+typedef struct tagKEYBDINPUT {
+    WORD wVk;
+    WORD wScan;
+    DWORD dwFlags;
+    DWORD time;
+    ULONG_PTR dwExtraInfo;
+} KEYBDINPUT, *PKEYBDINPUT, *LPKEYBDINPUT;
+
+typedef struct tagHARDWAREINPUT {
+    DWORD uMsg;
+    WORD wParamL;
+    WORD wParamH;
+} HARDWAREINPUT, *PHARDWAREINPUT, *LPHARDWAREINPUT;
+
+typedef struct tagINPUT {
+    DWORD type;
+    union {
+        MOUSEINPUT mi;
+        KEYBDINPUT ki;
+        HARDWAREINPUT hi;
+    };
+} INPUT, *PINPUT, *LPINPUT;
+
+#define INPUT_MOUSE 0
+#define INPUT_KEYBOARD 1
+#define INPUT_HARDWARE 2
+#define MOUSEEVENTF_MOVE 0x0001
+#define MOUSEEVENTF_LEFTDOWN 0x0002
+#define MOUSEEVENTF_LEFTUP 0x0004
+#define MOUSEEVENTF_RIGHTDOWN 0x0008
+#define MOUSEEVENTF_RIGHTUP 0x0010
+#define MOUSEEVENTF_MIDDLEDOWN 0x0020
+#define MOUSEEVENTF_MIDDLEUP 0x0040
+#define MOUSEEVENTF_XDOWN 0x0080
+#define MOUSEEVENTF_XUP 0x0100
+#define MOUSEEVENTF_WHEEL 0x0800
+#define MOUSEEVENTF_HWHEEL 0x1000
+#define MOUSEEVENTF_MOVE_NOCOALESCE 0x2000
+#define MOUSEEVENTF_VIRTUALDESK 0x4000
+#define MOUSEEVENTF_ABSOLUTE 0x8000
+#define KEYEVENTF_EXTENDEDKEY 0x0001
+#define KEYEVENTF_KEYUP 0x0002
+#define KEYEVENTF_UNICODE 0x0004
+#define KEYEVENTF_SCANCODE 0x0008
+#define WHEEL_DELTA 120
+#define XBUTTON1 0x0001
+#define XBUTTON2 0x0002
+extern UINT SendInput(UINT, LPINPUT, int);
+extern BOOL SetCursorPos(int, int);
+extern BOOL GetCursorPos(LPPOINT);
+extern SHORT GetKeyState(int);
+extern SHORT GetAsyncKeyState(int);
+extern UINT MapVirtualKeyW(UINT, UINT);
+
 #define IDC_ARROW ((LPCWSTR)32512)
 #define IDI_APPLICATION ((LPCWSTR)32512)
 #define COLOR_WINDOW 5
