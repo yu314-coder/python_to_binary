@@ -4552,10 +4552,32 @@ def _lift_nested_classes(text: str) -> str:
                 )
                 text = text[:opens] + inside + text[closing:]
             else:
-                text = _map_code(
-                    text,
+                # The bare name means this class only where the outer one's
+                # own name is in scope: inside its body, and inside a method
+                # of it defined further down. Rewritten across the whole file
+                # it renamed anything else spelled the same - `class thread {
+                # class id; }` in py2bin's own <thread> turned the member
+                # `int id;` of a struct that had nothing to do with it into
+                # `int thread__id;`, and the program was told its own struct
+                # had no such member. Outside, the class is named through the
+                # outer one, and those have been rewritten already.
+                opens = head.end() + moved
+                closing = _matching(text, opens - 1)
+                inside = _map_code(
+                    text[opens: closing],
                     lambda part, n=name, s=spelled: re.sub(
                         rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, part
+                    ),
+                )
+                text = text[:opens] + inside + text[closing:]
+                text = _within_out_of_line_methods(
+                    text,
+                    outer,
+                    lambda part, n=name, s=spelled: _map_code(
+                        part,
+                        lambda one, n=n, s=s: re.sub(
+                            rf"(?<![.\w>:]){re.escape(n)}\b(?!\s*::)", s, one
+                        ),
                     ),
                 )
             moved = True
@@ -9459,6 +9481,27 @@ def _rewrite_threads(text: str, filename: str) -> str:
                     f"know what that function should call",
                 )
             passed = packed(f"{owner} *", f"&{held}", given[1:], "(*{on})({passing})")
+        elif (
+            len(given) == 1
+            and re.fullmatch(r"[A-Za-z_]\w*", held)
+            and _declared_return(text, None, held) is not None
+        ):
+            # `thread t(work);` - a plain function and nothing to call it
+            # with. The trampoline calls it by name and the platform is
+            # handed nothing, because there is nothing to hand it.
+            #
+            # Read as a callable object instead - which is what the branch
+            # below is for - the address of the *function* was passed as
+            # though it were the address of a variable holding one, and
+            # calling through it read the first eight bytes of the code as a
+            # pointer. It never got that far: the type it needed had no
+            # name, because the name of the function is what a typedef is
+            # written for and this pass had already taken it out of the text.
+            made.append(
+                f"static long {entry}(void *__py2bin_given) {{ "
+                f"{held}(); return 0; }}"
+            )
+            passed = "0"
         elif len(given) == 1:
             # Anything callable held in a name: the object is what the
             # trampoline calls, and it is the argument too.
@@ -10811,6 +10854,15 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
         # emitted, and the C compiler below reads a pragma where it stands.
         lines.append(f"#pragma pack(push, {packed})")
     lines.append(f"struct {found.name} {{")
+    #: How many lines there were with the struct opened and nothing in it, so
+    #: the filler below is added when there is *nothing* here - not when there
+    #: are no data members. A class with virtual methods and no data of its
+    #: own holds the pointer to its table and that is all it holds: eight
+    #: bytes, which is what C++ says. Given a byte of filler as well it came
+    #: out sixteen, and every class deriving from it was eight bytes too big -
+    #: py2bin was consistent with itself, so nothing failed and `sizeof` was
+    #: simply wrong. COM's `IUnknown` is exactly that class.
+    opened = len(lines)
     if found.base and found.base not in found.virtual_bases:
         # First, so a pointer to the derived object is a pointer to the base.
         lines.append(f"    struct {found.base} __base;")
@@ -10843,7 +10895,7 @@ def _emit_class(found: Class, classes: "dict[str, Class]") -> str:
             lines.append(f"    {head}(*{member.name}){tail};")
             continue
         lines.append(f"    {member.ctype} {member.name}{member.array};")
-    if not found.members and not found.base and not found.mixins:
+    if len(lines) == opened:
         # C has no empty struct; give it something so the type exists.
         # A byte, not an int. C++ says an empty class has size 1 and
         # alignment 1; given four, an array of them had the wrong stride and
@@ -23039,10 +23091,33 @@ _CHRONO_HEADER = r"""
 namespace std {
 namespace chrono {
 
-struct nanoseconds  { long long __n; long long count() const { return __n; } };
-struct microseconds { long long __n; long long count() const { return __n; } };
-struct milliseconds { long long __n; long long count() const { return __n; } };
-struct seconds      { long long __n; long long count() const { return __n; } };
+/* Each takes a count where it is written - `std::chrono::milliseconds(16)`
+   is how a program says how long - and holds it in the unit it is named
+   for. The empty one is what the casts below build before filling it in. */
+struct nanoseconds {
+    long long __n;
+    nanoseconds() { __n = 0; }
+    nanoseconds(long long given) { __n = given; }
+    long long count() const { return __n; }
+};
+struct microseconds {
+    long long __n;
+    microseconds() { __n = 0; }
+    microseconds(long long given) { __n = given; }
+    long long count() const { return __n; }
+};
+struct milliseconds {
+    long long __n;
+    milliseconds() { __n = 0; }
+    milliseconds(long long given) { __n = given; }
+    long long count() const { return __n; }
+};
+struct seconds {
+    long long __n;
+    seconds() { __n = 0; }
+    seconds(long long given) { __n = given; }
+    long long count() const { return __n; }
+};
 
 /* What subtracting one time point from another answers. It holds
    nanoseconds, and each cast divides down to the unit asked for - which is
@@ -23069,6 +23144,37 @@ struct time_point {
     long long __n;
     long long time_since_epoch_count() const { return __n; }
     duration operator-(time_point o) const { duration r; r.__n = __n - o.__n; return r; }
+    /* A moment plus a length is a moment. Written once per unit because each
+       is a struct of its own here, and in nanoseconds because that is what a
+       time point counts. This is what paces a loop: `next += 16ms` and sleep
+       until then, so the interval does not drift by however long the body
+       took. */
+    time_point operator+(nanoseconds d) const { time_point r; r.__n = __n + d.__n; return r; }
+    time_point operator+(microseconds d) const { time_point r; r.__n = __n + d.__n * 1000LL; return r; }
+    time_point operator+(milliseconds d) const { time_point r; r.__n = __n + d.__n * 1000000LL; return r; }
+    time_point operator+(seconds d) const { time_point r; r.__n = __n + d.__n * 1000000000LL; return r; }
+    time_point operator+(duration d) const { time_point r; r.__n = __n + d.__n; return r; }
+    time_point operator-(nanoseconds d) const { time_point r; r.__n = __n - d.__n; return r; }
+    time_point operator-(microseconds d) const { time_point r; r.__n = __n - d.__n * 1000LL; return r; }
+    time_point operator-(milliseconds d) const { time_point r; r.__n = __n - d.__n * 1000000LL; return r; }
+    time_point operator-(seconds d) const { time_point r; r.__n = __n - d.__n * 1000000000LL; return r; }
+    time_point operator-(duration d) const { time_point r; r.__n = __n - d.__n; return r; }
+    void operator+=(nanoseconds d) { __n = __n + d.__n; }
+    void operator+=(microseconds d) { __n = __n + d.__n * 1000LL; }
+    void operator+=(milliseconds d) { __n = __n + d.__n * 1000000LL; }
+    void operator+=(seconds d) { __n = __n + d.__n * 1000000000LL; }
+    void operator+=(duration d) { __n = __n + d.__n; }
+    void operator-=(nanoseconds d) { __n = __n - d.__n; }
+    void operator-=(microseconds d) { __n = __n - d.__n * 1000LL; }
+    void operator-=(milliseconds d) { __n = __n - d.__n * 1000000LL; }
+    void operator-=(seconds d) { __n = __n - d.__n * 1000000000LL; }
+    void operator-=(duration d) { __n = __n - d.__n; }
+    int operator<(time_point o) const { return __n < o.__n; }
+    int operator>(time_point o) const { return __n > o.__n; }
+    int operator<=(time_point o) const { return __n <= o.__n; }
+    int operator>=(time_point o) const { return __n >= o.__n; }
+    int operator==(time_point o) const { return __n == o.__n; }
+    int operator!=(time_point o) const { return __n != o.__n; }
 };
 
 /*CLOCK*/
@@ -23135,8 +23241,11 @@ _THREADS = {
 extern void *CreateThread(void *security, unsigned long stack,
                           __py2bin_thread_entry entry, void *argument,
                           unsigned long flags, void *id);
-extern int WaitForSingleObject(void *handle, unsigned long milliseconds);
+extern int WaitForSingleObject(void *handle, unsigned long how_long);
 extern int CloseHandle(void *handle);
+extern void Sleep(unsigned long how_long);
+extern unsigned long GetCurrentThreadId(void);
+extern unsigned long GetThreadId(void *handle);
 
 static unsigned long __py2bin_thread_start(__py2bin_thread_entry entry, void *argument) {
     return (unsigned long)CreateThread(0, 0, entry, argument, 0, 0);
@@ -23145,11 +23254,27 @@ static void __py2bin_thread_wait(unsigned long handle) {
     WaitForSingleObject((void *)handle, 0xFFFFFFFF);
     CloseHandle((void *)handle);
 }
+/* What a thread is called is not what a handle is. Windows hands out a
+   handle, and two handles to one thread are different numbers - so the
+   identity a program compares is asked for by name. */
+static unsigned long __py2bin_thread_self(void) { return GetCurrentThreadId(); }
+static unsigned long __py2bin_thread_id_of(unsigned long handle) {
+    if (handle == 0) { return 0; }
+    return GetThreadId((void *)handle);
+}
+static void __py2bin_thread_sleep(long long how_long) {
+    if (how_long <= 0) { Sleep(0); return; }
+    /* Rounded up: a sleep that asks for a nanosecond and returns at once is
+       a busy loop, which is not what the program asked for. */
+    Sleep((unsigned long)((how_long + 999999LL) / 1000000LL));
+}
 """,
     "posix": r"""
 extern int pthread_create(void *handle, void *attributes,
                           __py2bin_thread_entry entry, void *argument);
 extern int pthread_join(void *handle, void *answer);
+extern void *pthread_self(void);
+extern int usleep(unsigned int how_long);
 
 static unsigned long __py2bin_thread_start(__py2bin_thread_entry entry, void *argument) {
     /* The identity is a word on every platform py2bin targets, and the one
@@ -23161,6 +23286,23 @@ static unsigned long __py2bin_thread_start(__py2bin_thread_entry entry, void *ar
 }
 static void __py2bin_thread_wait(unsigned long handle) {
     pthread_join((void *)handle, 0);
+}
+/* Here the handle *is* the identity: what `pthread_create` writes and what
+   `pthread_self` answers are the same word. */
+static unsigned long __py2bin_thread_self(void) { return (unsigned long)pthread_self(); }
+static unsigned long __py2bin_thread_id_of(unsigned long handle) { return handle; }
+static void __py2bin_thread_sleep(long long how_long) {
+    long long left;
+    unsigned int slice;
+    if (how_long <= 0) { usleep(0); return; }
+    /* Rounded up, and in slices: POSIX lets `usleep` refuse a whole second. */
+    left = (how_long + 999LL) / 1000LL;
+    while (left > 0) {
+        slice = 999000U;
+        if (left < 999000LL) { slice = (unsigned int)left; }
+        usleep(slice);
+        left = left - (long long)slice;
+    }
 }
 """,
 }
@@ -23179,12 +23321,38 @@ def _thread_header(target: "str | None") -> str:
 #: runs was settled where it was written, by the pass that builds a trampoline
 #: for the callable and hands this the address of one.
 _THREAD_HEADER = r"""
+/* For `sleep_for` and `sleep_until`, which are written over what a duration
+   and a time point hold. Asked for rather than written out again: two
+   declarations of one struct is not C, and a program that includes both
+   headers would have had them. */
+#include <chrono>
 typedef long (*__py2bin_thread_entry)(void *);
 namespace std {
 /*START*/
 
+/* What a program compares. Not the handle: on Windows those are two
+   different things, and a program guarding `join` against joining itself -
+   which is the one thing every program uses this for - would have compared a
+   handle with a thread id and always found them different.
+   
+   C++ spells it `std::thread::id`, and `thread` names it below with a member
+   typedef rather than declaring it inside itself. A class written inside
+   another is lifted out and every mention of its short name is rewritten -
+   including, since `id` is a word a program uses too, the member `int id;`
+   of a struct that had nothing to do with this. The typedef is only a name
+   for a type and nothing is rewritten for it. */
+class __py2bin_thread_id {
+public:
+    unsigned long __id;
+    __py2bin_thread_id() { __id = 0; }
+    int operator==(__py2bin_thread_id other) const { return __id == other.__id; }
+    int operator!=(__py2bin_thread_id other) const { return __id != other.__id; }
+    int operator<(__py2bin_thread_id other) const { return __id < other.__id; }
+};
+
 class thread {
 public:
+    typedef __py2bin_thread_id id;
     unsigned long __handle;
     thread() { __handle = 0; }
     /* Started by `__begin` rather than by a constructor taking a callable:
@@ -23201,7 +23369,40 @@ public:
     /* Detaching leaves the thread running and forgets the handle. Nothing is
        reclaimed, which is what the arena does with everything. */
     void detach() { __handle = 0; }
+    __py2bin_thread_id get_id() const {
+        __py2bin_thread_id made;
+        made.__id = __py2bin_thread_id_of(__handle);
+        return made;
+    }
 };
+
+/* The running thread, which is a namespace and not a class in C++ too. */
+namespace this_thread {
+
+__py2bin_thread_id get_id() {
+    __py2bin_thread_id made;
+    made.__id = __py2bin_thread_self();
+    return made;
+}
+void yield() { __py2bin_thread_sleep(0); }
+
+/* One per unit the program can name, because each is a struct of its own
+   here and there is no template over them. */
+void sleep_for(chrono::nanoseconds how_long) { __py2bin_thread_sleep(how_long.__n); }
+void sleep_for(chrono::microseconds how_long) { __py2bin_thread_sleep(how_long.__n * 1000LL); }
+void sleep_for(chrono::milliseconds how_long) { __py2bin_thread_sleep(how_long.__n * 1000000LL); }
+void sleep_for(chrono::seconds how_long) { __py2bin_thread_sleep(how_long.__n * 1000000000LL); }
+void sleep_for(chrono::duration how_long) { __py2bin_thread_sleep(how_long.__n); }
+
+/* Until a moment rather than for a length: the difference is read against
+   the clock here, so a loop that paces itself does not drift by however long
+   the body took. A moment already past is not a sleep at all. */
+void sleep_until(chrono::time_point when) {
+    long long left;
+    left = when.__n - __py2bin_now();
+    if (left > 0) { __py2bin_thread_sleep(left); }
+}
+}
 }
 """
 
@@ -25676,12 +25877,27 @@ def inline_local_includes(
     return _ANY_INCLUDE.sub(reach, text)
 
 
-def _already_supplied(pasted: str = "") -> str:
-    """The lines that tell the preprocessor what a branch already brought."""
+def _already_supplied(
+    pasted: str = "", ours: "set[str] | None" = None
+) -> str:
+    """The lines that tell the preprocessor what this stage already brought."""
 
+    from .c_preprocessor import _BUILTIN_HEADERS
+
+    # py2bin's own C++ headers that were pasted here and that the C stage
+    # ships a header of the same name for. `unknwn.h` is one: COM's root is a
+    # class with virtual methods in the text this stage pastes and a struct
+    # holding a pointer to a table in the text that one does, and both are
+    # `struct IUnknown`. Whichever header downstream asks for it - a fetched
+    # `ocidl.h` does - the C stage pasted its own on top of the class this
+    # stage had already written out, and one struct defined twice is not C.
+    # Which names those are is asked of the C stage rather than listed here.
+    also_here = {
+        name for name in (ours or ()) if name in _BUILTIN_HEADERS
+    }
     supplied = "".join(
         f'#pragma py2bin supplied "{name}"\n'
-        for name in sorted(_SUPPLIED_BY_A_BRANCH | _READ_BY_A_BRANCH)
+        for name in sorted(_SUPPLIED_BY_A_BRANCH | _READ_BY_A_BRANCH | also_here)
     )
     # And the search path's own headers a branch took, asked for again. That
     # run expanded them inside itself and its answer carries what they
@@ -25753,6 +25969,6 @@ def translate_unity(
     # translated: it is written for the C stage, and passing it through this
     # one had the alias pass rewrite it - `#undef LPADVISESINKEX` became
     # `#undef IAdviseSinkEx *`, since that is what the alias stands for.
-    return _already_supplied(pasted) + translate(
+    return _already_supplied(pasted, shared) + translate(
         pasted, str(sources[0]) if sources else "<c++>"
     )

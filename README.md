@@ -1052,9 +1052,16 @@ POSIX wanting `void *(*)(void *)` and Windows wanting `DWORD (*)(LPVOID)` are
 the same thing on x86-64 and ARM64: one pointer in the first register, an
 answer in the first result register.
 
-`std::thread(&Host::run, this)`, `std::thread(callable)`, assignment into a
-member, `joinable`, `join` and `detach` all work, with `<mutex>` and
-`<atomic>` beside them. Five programs in the corpus start real threads.
+`std::thread(&Host::run, this)`, `std::thread(callable)`,
+`std::thread(work)` on a plain function, assignment into a member,
+`joinable`, `join` and `detach` all work, with `<mutex>` and `<atomic>`
+beside them. So do the two questions every program using a thread asks:
+`std::this_thread::get_id()` against `t.get_id()`, which is how the guard on
+a `join` is written, and `sleep_for` / `sleep_until`, which is how a loop
+paces itself. The identity is asked for by name rather than taken off the
+handle, because on Windows those are two different things and comparing them
+would have answered "not me" every time - which is the answer that turns the
+guard into a deadlock. Several programs in the corpus start real threads.
 
 Two of the three bugs that took the longest were not about threads at all.
 `[] { }` was not read as a lambda, because the parameter list may be left out
@@ -2742,6 +2749,54 @@ runtime and library adapters.
 
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
+
+### 0.9.13 - which thread is this, a class inside another, and a class that is only its table
+
+The two questions every program that starts a thread asks, and `<thread>` had
+neither answer. `if (worker.joinable() && worker.get_id() !=
+std::this_thread::get_id())` is how you guard a `join` against joining
+yourself, and the file stopped there with the namespace still spelled out in
+the C. The identity is asked for by name and is not the handle: Windows hands
+out a handle, two handles to one thread are different numbers, and comparing
+those would have answered "not me" every time - which is the answer that turns
+that guard into a deadlock. `sleep_for` and `sleep_until` came with it, the
+second reading the clock so a loop that paces itself does not drift by however
+long its body took, and `<chrono>` grew the arithmetic that goes with it: a
+count where a duration is written, and a moment plus a length.
+
+`std::thread t(work);` on a plain function taking nothing had never worked. It
+was read as a callable object, so the address of the *function* was passed as
+though it were the address of a variable holding one - and it never got that
+far, because the type that needed had no name: the name of the function is
+what the typedef is written for, and this pass had already taken it out of the
+text. The trampoline calls it by name.
+
+`std::thread::id` is a class of its own that `thread` names with a typedef,
+rather than a class written inside `thread` - and finding out why fixed
+something older. A class written inside another is lifted out and every bare
+mention of its short name rewritten to follow it. That rewrite ran over the
+whole file, so a struct further down with a *member* called `tag` had its
+member renamed too and the program was told its own struct held no such thing.
+The bare name means the nested class only where the outer one is in scope:
+inside its body and inside a method of it defined below.
+
+And a class with virtual methods and no data of its own was sixteen bytes
+where C++ says eight. C has no empty struct, so py2bin adds a byte to one -
+and the test for "empty" asked whether there were any data members rather than
+whether anything at all had been written, so the byte went in beside the
+pointer to the table. Every class below it was eight bytes too big. Nothing
+failed: py2bin lays out both sides itself and was consistent with itself, so
+the only symptom was `sizeof` answering wrongly. COM's `IUnknown` is exactly
+that class.
+
+Which is also how the last one showed up. py2bin's own C++ headers were not
+named as supplied to the C stage, so a program that reached `unknwn.h` through
+a fetched SDK header got COM's root twice: a class with virtual methods from
+this stage and a struct holding a pointer to a table from that one. Which
+names those are is asked of the C stage rather than listed.
+
+2184 tests, 573 programs against clang++, 11 projects, 3468 builds across
+six targets.
 
 ### 0.9.13 - an array of a fixed size, and the braces C lets you leave out
 

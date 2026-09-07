@@ -288,6 +288,10 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     "SetLastError": ("SetLastError", ("int",), "void", "KERNEL32.dll"),
     "GetCurrentProcessId": ("GetCurrentProcessId", (), "int", "KERNEL32.dll"),
     "GetCurrentThreadId": ("GetCurrentThreadId", (), "int", "KERNEL32.dll"),
+    #: Which thread a *handle* is for. Windows hands out a handle and two
+    #: handles to one thread are different numbers, so `std::thread::id` is
+    #: asked for by name rather than taken off the handle.
+    "GetThreadId": ("GetThreadId", ("ptr",), "int", "KERNEL32.dll"),
     "GetStdHandle": ("GetStdHandle", ("int",), "ptr", "KERNEL32.dll"),
     "CloseHandle": ("CloseHandle", ("ptr",), "int", "KERNEL32.dll"),
     "WriteFile": (
@@ -434,6 +438,13 @@ _CABI_SYMBOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     #: pointer to a function, which at this level is a pointer like any other.
     "pthread_create": ("pthread_create", ("ptr", "ptr", "ptr", "ptr")),
     "pthread_join": ("pthread_join", ("ptr", "ptr")),
+    #: Which thread this is - the word `pthread_create` wrote, asked for from
+    #: inside the thread itself, which is what `std::this_thread::get_id()`
+    #: answers with.
+    "pthread_self": ("pthread_self", ()),
+    #: And the one way POSIX has of waiting that needs nothing declared: it
+    #: takes microseconds, and `<thread>` slices a longer sleep up for it.
+    "usleep": ("usleep", ("int",)),
     "getppid": ("getppid", ()),
     "getuid": ("getuid", ()),
     "getgid": ("getgid", ()),
@@ -623,6 +634,10 @@ _CABI_RESULTS: dict[str, str] = {
     "clock_gettime": "int",
     "pthread_create": "int",
     "pthread_join": "int",
+    #: A `pthread_t`, which is a pointer-wide word on every platform py2bin
+    #: targets and is compared rather than dereferenced.
+    "pthread_self": "ptr",
+    "usleep": "int",
     "getppid": "int",
     "getuid": "int",
     "getgid": "int",
@@ -781,6 +796,7 @@ _CABI_RESULT_WIDTH: dict[str, str] = {
     "clock_gettime": "i32",
     "pthread_create": "i32",
     "pthread_join": "i32",
+    "usleep": "i32",
     "getppid": "i32",
     "getuid": "u32",
     "getgid": "u32",

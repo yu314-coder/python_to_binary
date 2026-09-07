@@ -93,6 +93,14 @@ _libc.pthread_create.argtypes = (
 )
 _libc.pthread_join.restype = ctypes.c_int
 _libc.pthread_join.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+# Which thread this is, and the one way POSIX has of waiting that needs
+# nothing declared. `<thread>` is written over both: the first is what
+# `std::this_thread::get_id()` answers with, and the second is what a sleep
+# is cut into slices for.
+_libc.pthread_self.restype = ctypes.c_void_p
+_libc.pthread_self.argtypes = ()
+_libc.usleep.restype = ctypes.c_int
+_libc.usleep.argtypes = (ctypes.c_uint,)
 
 
 def pthread_create(
@@ -107,6 +115,18 @@ def pthread_join(handle: object, answer: object) -> int:
     """POSIX ``pthread_join``: wait for that thread to finish."""
 
     return int(_libc.pthread_join(handle, answer))
+
+
+def pthread_self() -> int:
+    """POSIX ``pthread_self``: which thread is running this."""
+
+    return int(_libc.pthread_self() or 0)
+
+
+def usleep(how_long: int) -> int:
+    """POSIX ``usleep``: wait that many microseconds."""
+
+    return int(_libc.usleep(how_long))
 
 
 def clock_gettime(which: int, into: object) -> int:
