@@ -2739,6 +2739,26 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a thread handed an object that has to be built
+
+`std::thread t(handle, session, 3);` where `Session` has one constructor and
+it takes arguments. A platform thread is given one pointer, so py2bin writes a
+small class holding what the call was given and hands that over; the class was
+*assigning* its members, and a member whose class is never built empty cannot
+be brought into existence and then filled in, so the build stopped on a class
+the program itself never default-builds.
+
+Writing an initialiser list on that constructor does not help, because by the
+time threads are rewritten the pass that converts initialiser lists has
+already run, and a list written here would still be a list when the class is
+read. The pack's constructor is now written directly in the form that pass
+leaves behind, so its members are built from the arguments rather than
+assigned afterwards. The same holds for a thread started on a method, where
+the object it is called on is the first thing the pack holds.
+
+2184 tests, 566 programs against clang++, 11 projects, 3438 builds across
+six targets.
+
 ### 0.9.13 - a header read for its macros, and the global one a local hides
 
 `char text[INET_ADDRSTRLEN];` met a name nothing had defined. The header that

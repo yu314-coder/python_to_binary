@@ -9376,13 +9376,16 @@ def _rewrite_threads(text: str, filename: str) -> str:
             parameters = ", ".join(
                 [f"{on_type} v_on"] + [f"{one} v{index}" for index, one in enumerate(spelled_types)]
             )
-            assigned = "on = v_on; " + " ".join(
-                f"a{index} = v{index};" for index in range(len(bound))
+            # As above: built, not assigned, and in the form the
+            # initialiser-list pass leaves - it has run already.
+            built = f"{_MEMBER_INIT}(on, v_on); " + " ".join(
+                f"{_MEMBER_INIT}(a{index}, v{index});"
+                for index in range(len(bound))
             )
             passing = ", ".join(f"__py2bin_a->a{index}" for index in range(len(bound)))
             made.append(
                 f"class {pack} {{\npublic:\n{members}"
-                f"    {pack}({parameters}) {{ {assigned} }}\n}};\n"
+                f"    {pack}({parameters}) {{ {built} }}\n}};\n"
                 f"static long {entry}(void *__py2bin_given) {{ "
                 f"{pack} *__py2bin_a = ({pack} *)__py2bin_given; "
                 # Through a plain local, as the branches below write the
@@ -9495,15 +9498,23 @@ def _rewrite_threads(text: str, filename: str) -> str:
             parameters = ", ".join(
                 f"{one} v{index}" for index, one in enumerate(spelled_types)
             )
-            assigned = " ".join(
-                f"a{index} = v{index};" for index in range(len(bound))
+            # Each member built rather than assigned, and written as the
+            # marker the initialiser-list pass leaves behind rather than as
+            # a list: that pass has already run by the time this one writes
+            # the class, so a list written here would still be a list when
+            # the class is read. An argument may be of a class whose only
+            # constructor takes something, and a member of one cannot be
+            # brought into existence empty and filled in afterwards.
+            built = " ".join(
+                f"{_MEMBER_INIT}(a{index}, v{index});"
+                for index in range(len(bound))
             )
             passing = ", ".join(
                 f"__py2bin_a->a{index}" for index in range(len(bound))
             )
             made.append(
                 f"class {pack} {{\npublic:\n{members}"
-                f"    {pack}({parameters}) {{ {assigned} }}\n}};\n"
+                f"    {pack}({parameters}) {{ {built} }}\n}};\n"
                 f"static long {entry}(void *__py2bin_given) {{ "
                 f"{pack} *__py2bin_a = ({pack} *)__py2bin_given; "
                 f"{held}({passing}); return 0; }}"
