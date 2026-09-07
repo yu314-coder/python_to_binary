@@ -2469,9 +2469,14 @@ def _members_declared(inside: str) -> "list[tuple[str, str]]":
             carried = plain[: named.start(2)] + plain[named.end(2):]
             found.append((named.group(2), " ".join(carried.split())))
             continue
+        # `long` and `short` are part of the type and not the name of one.
+        # Without them `long long size;` read as a member called `long` of
+        # type `long`, so the table said the class had no `size` at all -
+        # and every member after the first of a multi-word type went the
+        # same way.
         head = re.match(
             r"^((?:const\s+|volatile\s+|unsigned\s+|signed\s+|static\s+"
-            r"|struct\s+|mutable\s+)*[A-Za-z_]\w*)\s+(.+)$",
+            r"|struct\s+|mutable\s+|long\s+|short\s+)*[A-Za-z_]\w*)\s+(.+)$",
             spelled,
         )
         if head is None:
@@ -3868,8 +3873,157 @@ def _close_range_bodies(text: str) -> str:
 #: after it lost.
 _BRACE_INIT = re.compile(
     r"(?<![.\w>])(?<!class )(?<!struct )([A-Za-z_]\w*)\s+(\*?)\s*"
-    r"([A-Za-z_]\w*)\s*((?:\[[^\[\]]*\])*)\s*\{([^{}]*)\}\s*;"
+    # `T x = {1, 2};` as readily as `T x{1, 2};`. C++ calls the first
+    # copy-list-initialisation and the second direct, and for everything this
+    # subset has the two mean the same thing. Read only in the second shape,
+    # a declaration written the way C has always written one went past
+    # untouched - and a member of it that is a class was then handed a value
+    # where its own struct goes.
+    r"([A-Za-z_]\w*)\s*((?:\[[^\[\]]*\])*)\s*(?:=\s*)?\{([^{}]*)\}\s*;"
 )
+
+
+#: `= {` in an expression, which C++ reads against whatever is on the left.
+_BRACED_ASSIGNMENT = re.compile(r"(?<![=!<>+\-*/%&|^])=\s*\{")
+
+
+def _rewrite_braced_assignments(text: str, filename: str) -> str:
+    """`state[key] = {a, b, 0};` - the braces mean the type on the left.
+
+    C++ builds that type from the values and assigns it. C has no brace list
+    in an expression at all, so the object is built where a declaration can
+    hold it and then assigned - which is what the C++ says, one step later.
+
+    Not a declaration: those are read by the pass above, and one is told from
+    an assignment by what stands in front of the name. `State s = {...};` has
+    a type there and `at->states["k"] = {...};` has an expression.
+    """
+
+    counter = 0
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        change = None
+        for found in _BRACED_ASSIGNMENT.finditer(bare):
+            opening = found.end() - 1
+            begin = 0
+            for mark in (";", "{", "}", ")", ":"):
+                begin = max(begin, bare.rfind(mark, 0, found.start()) + 1)
+            left = text[begin: found.start()].strip()
+            if not left or left[-1] not in "]_" and not left[-1].isalnum():
+                continue
+            # One word, so a type in front of a name is not read as one.
+            # What is inside brackets comes off first: a subscript holds an
+            # expression of its own, and a literal blanked to spaces put
+            # those spaces in the middle of `at->states["one"]`.
+            plain = _without_literals(left)
+            for _again in range(4):
+                shorter = re.sub(r"\[[^\[\]]*\]|\([^()]*\)", "", plain)
+                if shorter == plain:
+                    break
+                plain = shorter
+            if len(plain.split()) != 1:
+                continue
+            try:
+                closing = _matching(bare, opening)
+            except ValueError:
+                continue
+            rest = closing
+            while rest < len(bare) and bare[rest] in " \t":
+                rest += 1
+            if rest >= len(bare) or bare[rest] != ";":
+                continue
+            held = _deduced_type(left, text, begin)
+            if held is None or "*" in held:
+                continue
+            held = re.sub(r"\b(?:const|volatile)\b", " ", held).strip()
+            counter += 1
+            name = f"__py2bin_braced_{counter}"
+            inside = text[opening + 1: closing - 1]
+            change = (
+                begin,
+                rest + 1,
+                f"{held} {name} = {{{inside}}}; {left} = {name};",
+            )
+            break
+        if change is None:
+            return text
+        start, end, written = change
+        text = text[:start] + written + text[end:]
+    return text
+
+
+def _class_body_of(text: str, named: str) -> "re.Match[str] | None":
+    """The head of the class of that name here, or None."""
+
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) == named:
+            return head
+    return None
+
+
+def _a_class_here(spelled: str, names: "set[str]") -> bool:
+    """Whether that written type is one of the classes in this text.
+
+    A pointer to one is not: it is a word, and what a brace list leaves out
+    is a zero for it and a default constructor for the class itself.
+    """
+
+    if "*" in spelled:
+        return False
+    word = re.sub(
+        r"\b(?:const|volatile|struct|class|mutable|static)\b", " ", spelled
+    ).replace("&", " ").strip()
+    return word in names
+
+
+def _built_one_member_at_a_time(
+    held: str, name: str, inside: str, text: str
+) -> "str | None":
+    """`State s = {"a", 5};` where a member is a class, built one at a time.
+
+    C++ copy-initialises each member from the value written for it, so a
+    `std::string` member takes the constructor a `const char *` chooses.
+    Written out as a C initialiser list instead, the string's own struct was
+    handed a pointer - and the C stage said so, which is as far as this ever
+    got. Members the list does not reach are value-initialised: the default
+    constructor for a class, a zero for anything else.
+
+    None wherever this does not apply, which is the ordinary case - a struct
+    of numbers is an aggregate in C too and goes through as one.
+    """
+
+    head = _class_body_of(text, held)
+    if head is None or head.group(3):
+        # A class with a base initialises that first, and the members of it
+        # are not in this body. Left as it was rather than built wrongly.
+        return None
+    try:
+        closing = _matching(text, head.end() - 1)
+    except ValueError:
+        return None
+    members = _members_declared(text[head.end(): closing - 1])
+    if not members or any(
+        not re.fullmatch(r"[A-Za-z_]\w*", one) for one, _held in members
+    ):
+        return None
+    names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+    if not any(_a_class_here(spelled, names) for _one, spelled in members):
+        return None
+    values = [one.strip() for one in _split_arguments(inside)] if inside.strip() else []
+    if len(values) > len(members):
+        return None
+    if any("{" in one for one in values):
+        # A member given a list of its own. That is another of these, one
+        # level down, and this pass has no name to give the object it would
+        # need - so it is left rather than half-done.
+        return None
+    out = [f"{held} {name};"]
+    for index, (member_name, spelled) in enumerate(members):
+        if index < len(values):
+            out.append(f"{name}.{member_name} = {values[index]};")
+        elif not _a_class_here(spelled, names):
+            out.append(f"{name}.{member_name} = 0;")
+    return " ".join(out)
 
 
 def _rewrite_brace_initialisers(text: str) -> str:
@@ -3926,6 +4080,12 @@ def _rewrite_brace_initialisers(text: str) -> str:
             return f"{held} {name}{bounds} = {{{inside or '0'}}};"
         if held in constructed():
             return f"{held} {name}({inside});"
+        # An aggregate whose members are not all numbers: each takes the
+        # value written for it the way C++ says, which is a constructor for a
+        # member that has one.
+        built = _built_one_member_at_a_time(held, name, inside, whole)
+        if built is not None:
+            return built
         # `T x{}` is value initialisation, which for everything in this
         # subset means zeroed. Left as a bare declaration it was whatever
         # the stack happened to hold, and a program that read it before
@@ -19097,6 +19257,11 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # takes `push_back` has already had its list turned into pushes: read as
     # an aggregate first, `vector<int> v{1, 2}` would have become a struct
     # initialiser for a class whose members are a pointer and a count.
+    # Before that second reading and not before the first: what a brace list
+    # on the left of an `=` means is the type of what is on the left, and
+    # working that out means the copies of the templates already exist -
+    # `at->states["k"]` is a `map<string, State>`'s subscript.
+    text = _rewrite_braced_assignments(text, filename)
     text = _rewrite_brace_initialisers(text)
     # Again, because a member template inside a class template could not be
     # read until the class had been written out: until then its calls are on

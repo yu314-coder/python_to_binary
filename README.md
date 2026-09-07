@@ -2750,6 +2750,36 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a list of values given to whatever holds them
+
+`session->transfers[id] = {path, size, 0};` - a brace list on the right of an
+assignment, where the braces mean the type on the *left* and C has no brace
+list in an expression at all. It is built into an object a declaration can
+hold and then assigned, which is what the C++ says one step later. The type of
+the left is read the same way any other type here is, so it works on a
+subscript of a map as readily as on a name.
+
+Reaching that turned up two things underneath it. `State s = {"a", 5, 0};` -
+a declaration written with the `=` C has always written one with - was not
+read at all: the pass that reads brace initialisers matched only the form
+without it, so the declaration went past untouched and the C stage met a
+`std::string` member being handed a pointer where its own struct goes. And
+that is the second thing: C++ copy-initialises each member from the value
+written for it, so a member that is a class takes the constructor its value
+chooses. An aggregate whose members are not all numbers is now built one
+member at a time; what the list does not reach is value-initialised, which is
+the default constructor for a class and a zero for anything else.
+
+And a member of a multi-word type is one member. `long long size;` read as a
+member called `long` of type `long`, so the table of what a class holds said
+there was no `size` - and every member after the first of such a type went the
+same way. That table is what says which overload a call on a member wants, so
+it has been quietly answering "no such member" for `long long`, `unsigned long
+long` and `long double` all along.
+
+2184 tests, 573 programs against clang++, 11 projects, 3480 builds across
+six targets.
+
 ### 0.9.13 - a name a declaration takes from its type
 
 `std::filesystem::path path = directory / safeName;` - the class is called
