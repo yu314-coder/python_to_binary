@@ -1827,6 +1827,14 @@ class Parser:
         # Copied per parse: a typedef in one translation unit must not
         # leak into the next compilation in the same process.
         self.typedefs: dict[str, CType] = typedefs_for(target)
+        #: The names each open block has declared as *objects*, innermost
+        #: last. C says a declaration takes the name away from whatever had
+        #: it: `struct path path;` and from there on `path` is the variable,
+        #: not the typedef - which is what lets a program keep a
+        #: `std::filesystem::path` in something called `path`. Without this
+        #: the statement after it read as a declaration whose type is `path`
+        #: and stopped at the `=`.
+        self.shadowing: list[set[str]] = [set()]
         self.enum_tags: dict[str, CType] = {}
         self.enumerators: dict[str, int] = {}
         self.globals: dict[str, GlobalObject] = {}
@@ -1893,6 +1901,20 @@ class Parser:
 
     # --- types ---
 
+    def shadowed(self, name: str) -> bool:
+        """Whether something declared here has taken that name from its type."""
+
+        for scope in reversed(self.shadowing):
+            if name in scope:
+                return True
+        return False
+
+    def declares_an_object(self, name: str) -> None:
+        """Note that this block has given that name to something."""
+
+        if name:
+            self.shadowing[-1].add(name)
+
     def at_type(self) -> bool:
         token = self.token
         if token.kind != "identifier":
@@ -1900,11 +1922,15 @@ class Parser:
         name = str(token.value)
         if name in _UNSUPPORTED_KEYWORDS:
             return True
-        if name in _TYPE_KEYWORDS or name in _QUALIFIERS or name in self.typedefs:
+        if name in _TYPE_KEYWORDS or name in _QUALIFIERS:
             return True
         if name in {"struct", "union", "enum", "typedef"}:
             return True
+        if name in self.typedefs:
+            return not self.shadowed(name)
         if name in _OPAQUE_NAMES:
+            if self.shadowed(name):
+                return False
             # 'PyObject x' is not something py2bin can lay out, but 'PyObject *x'
             # is a handle. Only the pointer form is a type here.
             return self.peek().value == "*"
@@ -2863,10 +2889,16 @@ class Parser:
     def compound_statement(self) -> Compound:
         token = self.take("{")
         body: list[Node] = []
-        while not self.accept("}"):
-            if self.token.kind == "eof":
-                self.error("unterminated block")
-            body.append(self.statement())
+        # A block of its own, so a name declared inside it goes back to
+        # meaning its type on the way out.
+        self.shadowing.append(set())
+        try:
+            while not self.accept("}"):
+                if self.token.kind == "eof":
+                    self.error("unterminated block")
+                body.append(self.statement())
+        finally:
+            self.shadowing.pop()
         return Compound(token, body)
 
     def statement(self) -> Node:
@@ -2994,6 +3026,11 @@ class Parser:
             if self.accept("="):
                 initializer = self.initializer()
             entries.append((ctype, name, initializer))
+            # After the declarator and its initializer, which is where C says
+            # the name arrives: `path path = path;` reads the *outer* `path`
+            # on the right, and only a declaration already finished takes the
+            # name from the type.
+            self.declares_an_object(name)
             if self.accept(";"):
                 break
             self.take(",")
@@ -3018,18 +3055,24 @@ class Parser:
         token = self.take("for")
         self.take("(")
         initializer: Node | None
-        if self.accept(";"):
-            initializer = None
-        elif self.at_type():
-            initializer = self.declaration_statement()
-        else:
-            initializer = ExpressionStatement(self.token, self.expression())
+        # The `for` is a scope of its own in C, so a name its first clause
+        # declares goes back to meaning its type after the loop.
+        self.shadowing.append(set())
+        try:
+            if self.accept(";"):
+                initializer = None
+            elif self.at_type():
+                initializer = self.declaration_statement()
+            else:
+                initializer = ExpressionStatement(self.token, self.expression())
+                self.take(";")
+            test = None if self.at(";") else self.expression()
             self.take(";")
-        test = None if self.at(";") else self.expression()
-        self.take(";")
-        step = None if self.at(")") else self.expression()
-        self.take(")")
-        return For(token, initializer, test, step, self.statement())
+            step = None if self.at(")") else self.expression()
+            self.take(")")
+            return For(token, initializer, test, step, self.statement())
+        finally:
+            self.shadowing.pop()
 
     # --- translation unit ---
 
@@ -3565,7 +3608,13 @@ class Parser:
         self.functions[name] = Function(
             name, result, parameters, None, name_token, variadic
         )
-        body = self.compound_statement()
+        # A parameter takes its name from its type too, and for the whole
+        # body: `void write(struct path path)` is as ordinary as the local.
+        self.shadowing.append({spelled for _held, spelled in parameters})
+        try:
+            body = self.compound_statement()
+        finally:
+            self.shadowing.pop()
         self.functions[name] = Function(
             name, result, parameters, body, name_token, variadic
         )

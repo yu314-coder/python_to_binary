@@ -2750,6 +2750,28 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a name a declaration takes from its type
+
+`std::filesystem::path path = directory / safeName;` - the class is called
+`path` and so is the variable, which is what a program does when the name is
+the obvious one. C has always allowed it: a declaration takes the name away
+from whatever had it, so from there on `path` is the variable and not the
+typedef. py2bin read the next statement as another declaration whose type was
+`path` and stopped at the `=`.
+
+The C stage now knows what each open block has declared as an object, and a
+typedef name that something here has taken is not a type any more. A block
+gives the name back on the way out; a `for` clause is a block of its own; and
+a parameter takes the name from its type for the whole body. What cannot be
+shadowed is a keyword, which is why `int` is safe.
+
+The rule cuts both ways and that is the point: `count count = 2;` followed by
+`for (count count = 0; ...)` is refused now, because by then `count` is the
+variable - which is what clang says about it too.
+
+2184 tests, 572 programs against clang++, 11 projects, 3474 builds across
+six targets.
+
 ### 0.9.13 - which thread is this, a class inside another, and a class that is only its table
 
 The two questions every program that starts a thread asks, and `<thread>` had
