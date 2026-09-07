@@ -6446,6 +6446,12 @@ def _inside_a_template_pattern(text: str, at: int) -> bool:
     return found is not None and _is_a_template_pattern(text, found[0])
 
 
+#: Where a member template's copies are to be written, held in the text
+#: itself so that rewriting the call sites cannot move it out from under
+#: them. Spelled with a NUL, which no program's text holds.
+_COPIES_GO_HERE = "\x00member-copies\x00"
+
+
 def _expand_member_templates(text: str, filename: str) -> str:
     """`template<typename T> T twice(T v)` written inside a class.
 
@@ -6492,7 +6498,16 @@ def _expand_member_templates(text: str, filename: str) -> str:
         parameters = _template_parameters(found.group(1))
         pattern = rest[:closing + 1]
         name = definition.group(2)
-        without = text[:found.start()] + text[found.end() + closing + 1:]
+        # Marked rather than measured. `_member_copies` rewrites every call
+        # site to name the copy it wants, and a call site before this point
+        # makes the offset wrong by however much that name grew or shrank -
+        # so the copies were written into the middle of whatever stood there
+        # instead, cutting a method in half: `return this->ptr_ != oth` and
+        # then a function head where the rest of it should have been.
+        without = (
+            text[:found.start()] + _COPIES_GO_HERE
+            + text[found.end() + closing + 1:]
+        )
         holder = _class_around(text, found.start())
         copies, without = _member_copies(
             without,
@@ -6505,14 +6520,9 @@ def _expand_member_templates(text: str, filename: str) -> str:
         if not copies:
             # Nothing calls it, so there is nothing to write. The pattern is
             # gone either way: it is not C.
-            text = without
+            text = without.replace(_COPIES_GO_HERE, "", 1)
             continue
-        text = (
-            without[:found.start()]
-            + "\n".join(copies)
-            + "\n"
-            + without[found.start():]
-        )
+        text = without.replace(_COPIES_GO_HERE, "\n".join(copies) + "\n", 1)
     raise CppTranslationError(
         "<c++>", 0,
         "member templates that never stop asking for another copy",
@@ -25467,6 +25477,12 @@ public:
     virtual unsigned long AddRef() = 0;
     virtual unsigned long Release() = 0;
 };
+/* What a program spells a pointer to it with. py2bin's C header declares
+   this and py2bin's C++ one did not, so a program that included <unknwn.h>
+   from C++ - or a fetched header that names `LPUNKNOWN` in a prototype -
+   met a word where a type goes. The C stage does not paste that header a
+   second time once this one has, so the name has to arrive here. */
+typedef IUnknown *LPUNKNOWN;
 """
 
 
@@ -26203,6 +26219,17 @@ def inline_local_includes(
     return _ANY_INCLUDE.sub(reach, text)
 
 
+#: `void FreeAddrInfoEx(ADDRINFOEXA *);` - a function declared at the start
+#: of a line, taking no parentheses inside its own. Enough to name what a
+#: pasted header declares; a declaration written any other way keeps whatever
+#: macro of its name a header read only for its macros may hold, which is the
+#: behaviour that was there before.
+_A_DECLARED_FUNCTION = __import__("re").compile(
+    r"(?m)^[ \t]*(?:[A-Za-z_]\w*[ \t]+|[*][ \t]*)+([A-Za-z_]\w*)[ \t]*"
+    r"\([^();{}]*\)[ \t]*;"
+)
+
+
 def _already_supplied(
     pasted: str = "", ours: "set[str] | None" = None
 ) -> str:
@@ -26249,16 +26276,41 @@ def _already_supplied(
         found.group(1)
         for found in re.finditer(r"(?<![.\w>])([A-Za-z_]\w*)\s*\(", bare)
     }
+    # And the same for a name this text declares as a *function*. Windows
+    # names one entry point twice, once for each width, and then aliases the
+    # plain name onto one of them - and the alias is written *after* the
+    # declaration it must not touch:
+    #
+    #     void FreeAddrInfoEx(ADDRINFOEXA *);
+    #     void FreeAddrInfoExW(ADDRINFOEXW *);
+    #     #define FreeAddrInfoEx FreeAddrInfoExW
+    #
+    # Read in order that is three separate things. But the macros of that
+    # header are collected by the run above and arrive at the top of the
+    # unit, ahead of everything, so the first declaration came out under the
+    # second's name and with the first's parameter - and the C stage said,
+    # correctly, that one function was declared two ways.
+    declared_here = {
+        found.group(1)
+        for found in _A_DECLARED_FUNCTION.finditer(bare)
+    }
+    # A declaration looks like a call to the scan above - `void
+    # FreeAddrInfoEx(ADDRINFOEXA *);` is a name with a `(` after it - so the
+    # names declared here come off the set that keeps its macro. What that
+    # set is for is a name the program *invokes*, and `FD_SET` is one
+    # because it is a macro that fills a struct, not because anything
+    # declares a function of that name.
+    invoked = called - declared_here
     guarded = "".join(
         f"#undef {name}\n"
-        for name in sorted(_typedef_names_declared(pasted))
+        for name in sorted(set(_typedef_names_declared(pasted)) | declared_here)
         # A name, and nothing that only looks like one: the reader of
         # declarators answers with whatever stood where a name goes, and a
         # declaration it could not take apart leaves something that is not
         # an identifier - which `#undef` has no meaning for.
         if re.fullmatch(r"[A-Za-z_]\w*", name)
         and name not in _NOT_A_TYPE
-        and name not in called
+        and name not in invoked
     )
     return supplied + read_again + guarded
 

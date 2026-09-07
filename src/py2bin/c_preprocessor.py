@@ -2216,6 +2216,26 @@ typedef UINT *LPUINT;
 typedef LONG *LPLONG;
 typedef ULONG *LPULONG;
 typedef CHAR *PSZ;
+/* What the registry answers with. A fetched <shlwapi.h> declares functions
+   returning it and the header that names it is not one this build reads, so
+   the declaration met a type nothing had. */
+typedef LONG LSTATUS;
+typedef DWORD ACCESS_MASK;
+typedef ACCESS_MASK REGSAM;
+/* What CreateThread is given: a function taking one pointer and answering a
+   DWORD. A fetched header declares its own entry points in terms of it. */
+typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
+typedef LPTHREAD_START_ROUTINE PTHREAD_START_ROUTINE;
+/* Structs a fetched header names in a prototype and nothing here defines.
+   Declared and not defined, which is what the SDK's own forward-declaration
+   blocks do: a pointer to an incomplete struct is a complete type, and a
+   program that actually calls one of those entry points needs the layout -
+   which the header that declares it properly is the one to bring. */
+typedef struct __py2bin_uCLSSPEC uCLSSPEC;
+typedef struct __py2bin_QUERYCONTEXT QUERYCONTEXT;
+typedef struct __py2bin_RemSTGMEDIUM RemSTGMEDIUM;
+typedef struct IDataObject IDataObject;
+typedef IDataObject *LPDATAOBJECT;
 typedef HANDLE *PHANDLE;
 typedef HANDLE *LPHANDLE;
 typedef HANDLE *SPHANDLE;
@@ -2276,6 +2296,13 @@ typedef struct _LIST_ENTRY {
 #define DECLSPEC_NOINLINE
 #define DECLSPEC_DEPRECATED
 #define DECLSPEC_CACHEALIGN
+/* What a hand-written header hangs off a declaration to tell a compiler how
+   the function behaves - what frees what it returns, that its answer is
+   fresh memory. Nothing about the declaration, so nothing here, and a
+   fetched header that spells them met a word where it wanted a body. */
+#define __WINE_MALLOC
+#define __WINE_DEALLOC(...)
+#define __WINE_ALLOC_SIZE(...)
 /* Not defined away, on purpose. This one decides where a member sits, and a
    struct laid out differently from the one written runs and is wrong with
    nothing said - so it is left spelled as the `__declspec` it is, and the
@@ -3760,6 +3787,16 @@ typedef unsigned char byte;
 #define DECLSPEC_UUID(x)
 #define DECLSPEC_NOVTABLE
 #define MIDL_INTERFACE(x) struct
+/* The older way of writing the same thing, which a hand-written header uses
+   where a generated one says `MIDL_INTERFACE`: `DECLARE_INTERFACE_(IThing,
+   IUnknown) { STDMETHOD(Do)(THIS) PURE; };`. In the shape the macros around
+   it already take here - `PURE` is `= 0` and `STDMETHOD` is a virtual - that
+   is a class deriving from another with pure virtual methods, which is what
+   COM is and what this translator lays out as a table. */
+#define DECLARE_INTERFACE(i) struct i
+#define DECLARE_INTERFACE_(i, b) struct i : public b
+#define DECLARE_INTERFACE_IID(i, x) struct i
+#define DECLARE_INTERFACE_IID_(i, b, x) struct i : public b
 #define interface struct
 #define BEGIN_INTERFACE
 #define END_INTERFACE
@@ -3783,6 +3820,11 @@ _OBJBASE_H = """
 #ifndef __py2bin_objbase_h
 #define __py2bin_objbase_h
 #include <rpcndr.h>
+/* COM's umbrella, which is what a header including this one is asking for:
+   Windows' own `objbase.h` brings the interfaces with it. Without them a
+   fetched `shlwapi.h` - which includes this and nothing else for its COM -
+   named `LPMONIKER` and `LPDATAOBJECT` where a type goes and met nothing. */
+#include <objidl.h>
 
 #ifndef COINIT_APARTMENTTHREADED
 #define COINIT_APARTMENTTHREADED 0x2
@@ -4251,9 +4293,24 @@ _OBJIDL_H = """
    the one thing py2bin cannot spell, and Seek takes one; on both Windows
    machines an eight-byte struct travels in the register an eight-byte
    integer travels in, so this is the same ABI and can be called. */
+/* Not one branch's: a header that names `LPMONIKER` in a prototype does so
+   whichever way it is being read, and a fetched `shlwapi.h` reached through
+   `objbase.h` names several. Read only in the C branch, the C++ stage - which
+   is the one that defines __cplusplus - had no such type and stopped on the
+   declaration. The two below name what the classes further down define, so
+   they stay in the C branch, where a class is not what an interface is. */
 #ifndef __cplusplus
 typedef struct IStream IStream;
 typedef struct ISequentialStream ISequentialStream;
+/* COM's root, forward-declared here rather than taken from <unknwn.h>. That
+   header may have been read by the C++ stage already, in which case what it
+   declares does not arrive a second time - and the branch below names
+   `IUnknown *` in a table of function pointers. A forward declaration is
+   what the SDK's own `__IUnknown_FWD_DEFINED__` block does, and it does not
+   collide with the definition that arrives later: a pointer to an
+   incomplete struct is a complete type. */
+typedef struct IUnknown IUnknown;
+#endif
 /* The other interfaces this header forward-declares, and the names the set
    spells a pointer to each of them with. Declared and not defined, which is
    what the set's own `#ifndef __IDataObject_FWD_DEFINED__` blocks do: a
@@ -4308,7 +4365,6 @@ typedef IEnumFORMATETC *LPENUMFORMATETC;
 typedef IEnumSTATDATA *LPENUMSTATDATA;
 typedef IEnumSTATSTG *LPENUMSTATSTG;
 typedef IStream *LPSTREAM;
-#endif
 
 typedef struct __py2bin_STATSTG {
     LPOLESTR pwcsName;

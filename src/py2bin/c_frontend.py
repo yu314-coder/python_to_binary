@@ -3725,8 +3725,19 @@ class Parser:
                 name_token,
             )
         self.check_vetted_abi(name, result, declared, name_token)
-        if name in self.functions or name in self.externs:
+        if name in self.functions:
             self.error(f"{name!r} is already declared", name_token)
+        if name in self.externs:
+            # Declared twice, which C allows outright, and the path a
+            # prototype without the `extern` keyword takes has always allowed
+            # it here. py2bin's own <chrono> binds `QueryPerformanceCounter`
+            # to the ABI it emits a call for, and <windows.h> declares the
+            # same entry point; a program that includes both got exactly
+            # this. Both have just been checked against the same table, so a
+            # header that disagrees about what the function takes is still
+            # refused - by the disagreement, and not by having been written
+            # down twice.
+            return
         self.externs[name] = result
 
     def extern_object(self, base: CType, ctype: CType, name: str) -> None:

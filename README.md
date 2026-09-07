@@ -2756,6 +2756,53 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - what a fetched header asks of the core it is built on, again
+
+Their build reaches the C stage's reading of every header their program
+includes, and each of these stopped it. A one-file probe that includes the
+same seven headers and nothing else builds in a minute where theirs takes
+twelve, which is what made this round go at all.
+
+`DECLARE_INTERFACE_(IQueryAssociations, IUnknown)` - the older way of writing
+what a generated header spells `MIDL_INTERFACE`. In the shape the macros
+around it already take here, where `PURE` is `= 0` and `STDMETHOD` is a
+virtual, that is a class deriving from another with pure virtual methods,
+which is what COM is. `__WINE_MALLOC` and `__WINE_DEALLOC(f)` say how a
+function behaves and nothing about its declaration, so they say nothing here.
+`LSTATUS`, `REGSAM`, `ACCESS_MASK`, `LPTHREAD_START_ROUTINE` and three structs
+a prototype names and nothing defines - declared and not defined, which is
+what the SDK's own forward-declaration blocks do.
+
+Two were py2bin's own headers being thinner than Windows'. `objbase.h` brings
+COM's interfaces with it there, and here it brought only the four calls that
+start one - so a header including it for `LPMONIKER` met a word where a type
+goes. And the pointer typedefs COM spells - `LPMONIKER`, `LPDATAOBJECT`,
+`LPSTREAM` - were written in `<objidl.h>`'s C branch alone, where the C++
+stage never reads them; a header names one in a prototype whichever way it is
+being read. `LPUNKNOWN` was the same in reverse: py2bin's C `<unknwn.h>`
+declares it and py2bin's C++ one did not, and since the C stage does not paste
+that header a second time once the C++ stage has, the name has to arrive from
+there.
+
+Also: a vetted external symbol declared twice. C allows it outright and the
+path a prototype without the `extern` keyword takes had always allowed it;
+the path an `extern` of a vetted symbol takes had not, so a program that
+included two headers naming `QueryPerformanceCounter` was refused. Both
+declarations are checked against the same table, so a header that disagrees
+about what the function takes is still refused - by the disagreement.
+
+And one that was py2bin's own mistake, found by their build and reproduced by
+nothing smaller. A member template's copies are written where the pattern
+stood; the pass that writes them also rewrites every call site to name the
+copy it wants, and a call site *above* that point moves it. The copies landed
+in the middle of the method before them and cut it in half - `return
+this->ptr_ != oth`, and then a function head where the rest of it should have
+been. The place is a mark carried in the text now, so nothing can move it out
+from under them.
+
+2184 tests, 576 programs against clang++, 11 projects, 3498 builds across six
+targets.
+
 ### 0.9.13 - a file open for both at once
 
 `std::fstream file(path, ios::binary | ios::in | ios::out);` - which is how a
