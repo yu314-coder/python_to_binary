@@ -2650,6 +2650,24 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
             )
             if held is not None:
                 return held
+            # Not a member of that class - but the class may be a smart
+            # pointer, and then the member is one of whatever its
+            # `operator->` answers. `session->transfers` where `session` is a
+            # `shared_ptr<Session>` is how a program reaches anything at all
+            # through one, and read as a member of the pointer it had no
+            # type: so nothing could say what `session->transfers[id]` was,
+            # and a brace list assigned to it had nothing to be built as.
+            through = _member_result(text, owner, r"operator\s*->")
+            if through is not None:
+                inner = re.sub(
+                    r"\b(?:const|struct|union)\b", " ", through.replace("*", " ")
+                ).strip()
+                if inner and inner != owner:
+                    held = _member_result(
+                        text, inner, rf"{re.escape(reached.group(2))}\s*[;=\[]"
+                    )
+                    if held is not None:
+                        return held
     # Arithmetic: `raw + 8` is where `raw` points moved along, and `x * 2.0`
     # is whichever of the two is wider - which is what C++ does with them.
     # Not the `-` of an arrow: that is a member read, handled above, and
@@ -16825,6 +16843,44 @@ def _rewrite_holder_operators(
                         ),
                         call,
                     )
+                # A method on a *member* of what it holds:
+                # `session->transfers.count(id)`. Written before the blanket
+                # rewrite below, because after that the receiver is a call
+                # and no later pass finds a receiver that is not a name -
+                # so the C compiler was handed `.push_back(` on a struct.
+                # Only the pairs the body actually spells, so a holder of a
+                # class with many members costs one scan and not one pass
+                # per member per method.
+                spelled_here = {
+                    (found.group(1), found.group(2))
+                    for found in re.finditer(
+                        rf"(?<![.\w>]){re.escape(variable)}\s*->\s*"
+                        rf"([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(",
+                        _without_literals(body),
+                    )
+                }
+                held_by = dict(_CLASS_MEMBERS.get(reached, ()))
+                for member, method in sorted(spelled_here):
+                    spelled = held_by.get(member)
+                    if spelled is None or "*" in spelled or "&" in spelled:
+                        continue
+                    kind = _class_named(spelled)
+                    provider = _find_method(kind, method, classes)
+                    if provider is None:
+                        continue
+                    if _method_named(kind, method, classes, returns_object=True):
+                        # Its answer is written through a hidden pointer the
+                        # caller provides, which is a shape this cannot write
+                        # here. Left as it was rather than called wrongly.
+                        continue
+                    at = f"&{call}->{member}"
+                    body = _rewrite_calls(
+                        body,
+                        rf"(?<![.\w>]){re.escape(variable)}\s*->\s*"
+                        rf"{re.escape(member)}\s*\.\s*{re.escape(method)}\s*\(",
+                        _dispatched(kind, method, classes, at, provider, body),
+                        at,
+                    )
                 # A member reached through it, rather than a method.
                 body = _map_code(
                     body,
@@ -17063,18 +17119,34 @@ def _member_paths(
     for _hop in range(6):
         fresh: dict[str, str] = {}
         for variable, held in frontier.items():
-            for member, spelled in _CLASS_MEMBERS.get(held, ()):
-                if "*" in spelled or "&" in spelled:
-                    continue
-                kind = _class_named(spelled)
-                if kind not in classes:
-                    continue
-                reach = "->" if variable in pointers else "."
-                path = f"{variable}{reach}{member}"
-                if within and path not in mentioned:
-                    continue
-                if path not in known and path not in paths:
-                    fresh[path] = kind
+            reaches: "list[tuple[str, str]]" = [
+                ("->" if variable in pointers else ".", held)
+            ]
+            # A smart pointer is a class held by value whose members are a
+            # raw pointer and nothing a program names. What a program does
+            # name is on the other side of its `operator->`, and it is
+            # reached from the variable in exactly the shape below:
+            # `session->transfers` where `session` is a `shared_ptr<Session>`.
+            # Without this the path was never built, so the pass that turns a
+            # subscript into a call had no receiver by that name and the C
+            # compiler was handed `[...]` on a struct.
+            arrow = _method_by_name(held, "op_arrow", classes)
+            if arrow is not None:
+                pointee = _class_named(arrow.returns)
+                if pointee in classes and pointee != held:
+                    reaches.append(("->", pointee))
+            for reach, holder in reaches:
+                for member, spelled in _CLASS_MEMBERS.get(holder, ()):
+                    if "*" in spelled or "&" in spelled:
+                        continue
+                    kind = _class_named(spelled)
+                    if kind not in classes:
+                        continue
+                    path = f"{variable}{reach}{member}"
+                    if within and path not in mentioned:
+                        continue
+                    if path not in known and path not in paths:
+                        fresh[path] = kind
         if not fresh:
             break
         paths.update(fresh)

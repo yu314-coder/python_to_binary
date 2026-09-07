@@ -2750,6 +2750,27 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - what a smart pointer stands in front of
+
+`session->transfers[id]` where `session` is a `shared_ptr<Session>`. A smart
+pointer is a class held by value whose one member is a raw pointer, so the
+table of what an object holds said `session` had no `transfers` at all - what
+a program names is on the other side of `operator->`. Three things went wrong
+for want of that one hop, and none of them looked related.
+
+Nothing could say what `session->transfers[id]` *was*, so the brace list
+assigned to it had no type to be built as. The pass that turns a subscript
+into a call finds its receiver by the name it is reached by, and there was no
+such name, so the C compiler was handed `[...]` on a struct and read it as
+pointer arithmetic. And a method on a member reached that way -
+`session->marks.push_back(3)` - was written out only after the arrow itself
+had become a call, by which point no pass finds a receiver that is not a name;
+it is written where the arrow is, against the pairs the body actually spells
+rather than against every member of every class.
+
+2184 tests, 574 programs against clang++, 11 projects, 3486 builds across
+six targets.
+
 ### 0.9.13 - a list of values given to whatever holds them
 
 `session->transfers[id] = {path, size, 0};` - a brace list on the right of an
