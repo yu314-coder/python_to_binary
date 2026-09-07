@@ -22710,6 +22710,12 @@ public:
     static const int end = 2;
 };
 typedef ios ios_base;
+/* What a program spells when it says how far along a file it means.
+   `file.seekp(static_cast<std::streamoff>(state.offset))` is the ordinary
+   way to write it, and a cast to a type nothing declares is not a cast. */
+typedef long long streamoff;
+typedef long long streampos;
+typedef long streamsize;
 /* A file read as a stream, over the file helpers <filesystem> brought in:
    py2bin's string holds 255 characters, and a file read into one would
    have been cut there without a word. Read a block at a time into a buffer
@@ -22938,6 +22944,89 @@ public:
     ofstream &operator<<(unsigned int v) { char __b[32]; snprintf(__b, 32, "%u", v); __put(__b, __length(__b)); return *this; }
     ofstream &operator<<(unsigned long v) { char __b[32]; snprintf(__b, 32, "%lu", v); __put(__b, __length(__b)); return *this; }
     ofstream &operator<<(double v) { char __b[64]; snprintf(__b, 64, "%.6g", v); __put(__b, __length(__b)); return *this; }
+};
+
+/* A file open for both at once. `fstream f(p, ios::binary | ios::in |
+   ios::out)` is how a program fills a file in at an offset - which is what
+   receiving a file in chunks is - and neither of the two above can do it:
+   one only reads and the other empties the file to write it. The pair of
+   flags keeps what is there and does not create, which is what C++ says of
+   them, so the underlying open has a third way of being asked. */
+class fstream {
+public:
+    long long __handle;
+    int failed;
+    long __got;
+    void __start(const char *where, int mode) {
+        if ((mode & 16) != 0) {
+            /* trunc: emptied and written, whatever else was asked for. */
+            __handle = __py2bin_file_open(where, 1, 0);
+        } else if ((mode & 1) != 0 && (mode & 2) != 0) {
+            __handle = __py2bin_file_open(where, 2, 0);
+        } else if ((mode & 2) != 0) {
+            __handle = __py2bin_file_open(where, 1, (mode & 8) != 0);
+        } else {
+            __handle = __py2bin_file_open(where, 0, 0);
+        }
+        failed = __handle < 0;
+        __got = 0;
+        if (__handle >= 0 && (mode & 32) != 0) {
+            __py2bin_file_seek(__handle, 0, 2);
+        }
+    }
+    long __length(const char *s) { long n; n = 0; while (s[n] != 0) { n = n + 1; } return n; }
+    fstream() { __handle = -1; failed = 1; __got = 0; }
+    fstream(const char *where) { __start(where, 3); }
+    fstream(const char *where, int mode) { __start(where, mode); }
+    fstream(string where) { __start(where.c_str(), 3); }
+    fstream(string where, int mode) { __start(where.c_str(), mode); }
+    fstream(path where) { __start(where.c_str(), 3); }
+    fstream(path where, int mode) { __start(where.c_str(), mode); }
+    ~fstream() { close(); }
+    void open(const char *where) { close(); __start(where, 3); }
+    void open(const char *where, int mode) { close(); __start(where, mode); }
+    void open(string where) { close(); __start(where.c_str(), 3); }
+    void open(string where, int mode) { close(); __start(where.c_str(), mode); }
+    void open(path where) { close(); __start(where.c_str(), 3); }
+    void open(path where, int mode) { close(); __start(where.c_str(), mode); }
+    int is_open() { return __handle >= 0; }
+    void close() { if (__handle >= 0) { __py2bin_file_close(__handle); __handle = -1; } }
+    void flush() { }
+    int good() { return failed == 0 && __handle >= 0; }
+    int fail() { return failed != 0; }
+    int eof() { return __got == 0; }
+    operator bool() { return failed == 0 && __handle >= 0; }
+    int operator!() { return failed != 0 || __handle < 0; }
+    fstream &write(const char *data, long count) {
+        if (__handle >= 0) { __py2bin_file_write(__handle, data, count); }
+        return *this;
+    }
+    fstream &put(char c) { return write(&c, 1); }
+    fstream &read(char *into, long count) {
+        __got = 0;
+        if (__handle >= 0) {
+            __got = __py2bin_file_read(__handle, into, count);
+            if (__got < 0) { __got = 0; failed = 1; }
+        }
+        return *this;
+    }
+    long gcount() { return __got; }
+    /* One position, as the file has: py2bin keeps no separate read and
+       write cursor, so `seekg` and `seekp` are the same move. A program
+       that alternates the two on one stream would notice; one that fills a
+       file in at offsets, which is what this is for, would not. */
+    void seekp(long long offset) { if (__handle >= 0) { __py2bin_file_seek(__handle, (long)offset, 0); } }
+    void seekp(long long offset, int whence) { if (__handle >= 0) { __py2bin_file_seek(__handle, (long)offset, whence); } }
+    void seekg(long long offset) { seekp(offset); }
+    void seekg(long long offset, int whence) { seekp(offset, whence); }
+    long long tellp() { return __handle < 0 ? -1 : (long long)__py2bin_file_seek(__handle, 0, 1); }
+    long long tellg() { return tellp(); }
+    fstream &operator<<(const char *s) { return write(s, __length(s)); }
+    fstream &operator<<(string s) { return write(s.c_str(), (long)s.size()); }
+    fstream &operator<<(char c) { return write(&c, 1); }
+    fstream &operator<<(int v) { char __b[32]; snprintf(__b, 32, "%d", v); return write(__b, __length(__b)); }
+    fstream &operator<<(long v) { char __b[32]; snprintf(__b, 32, "%ld", v); return write(__b, __length(__b)); }
+    fstream &operator<<(double v) { char __b[64]; snprintf(__b, 64, "%.6g", v); return write(__b, __length(__b)); }
 };
 }
 """

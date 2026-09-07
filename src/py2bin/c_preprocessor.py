@@ -2872,7 +2872,13 @@ int __py2bin_fs_widen(const char *__narrow, wchar_t *__into, int __room) {
 #endif
 long long __py2bin_file_open(const char *__p, int __writing, int __append) {
     void *__h;
-    if (__writing) {
+    if (__writing == 2) {
+        /* Read and write, keeping what is there: `fstream f(p, in | out)`,
+           which is how a program fills a file in at an offset. The file has
+           to exist, which is what C++ says of that pair of flags. */
+        __h = CreateFileA(__p, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, 0,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    } else if (__writing) {
         __h = CreateFileA(__p, GENERIC_WRITE, FILE_SHARE_READ, 0,
                           __append ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
         if (__h != INVALID_HANDLE_VALUE && __append) { SetFilePointer(__h, 0, 0, FILE_END); }
@@ -3022,11 +3028,18 @@ int __py2bin_fs_widen(const char *__narrow, wchar_t *__into, int __room) {
 long long __py2bin_file_open(const char *__p, int __writing, int __append) {
     int __flags;
     long __fd;
+    /* O_RDWR is 2 on both, and neither creates nor truncates: `fstream f(p,
+       in | out)` fills a file in at an offset and the file has to exist,
+       which is what C++ says of that pair of flags. */
+    if (__writing == 2) {
+        __flags = 2;
+    } else {
 #ifdef __py2bin_darwin__
     __flags = __writing ? (1 | 0x200 | (__append ? 8 : 0x400)) : 0;
 #else
     __flags = __writing ? (1 | 0x40 | (__append ? 0x400 : 0x200)) : 0;
 #endif
+    }
     __fd = __py2bin_open(__p, __flags, 420);
     if (__fd < 0) { return -1; }
     return (long long)__fd;

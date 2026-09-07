@@ -1720,6 +1720,12 @@ not special cases in the compiler:
   on Linux, `getdirentries` on macOS and `FindFirstFile` on Windows, each
   with a struct laid out differently per architecture - and a struct read
   wrong gives plausible answers.
+* `<fstream>` — `ifstream`, `ofstream` and `fstream`, straight over the file
+  system calls rather than through py2bin's 255-character string, since a
+  file read into one would have been cut without a word. `fstream` is the one
+  that opens for both at once: `ios::in | ios::out` keeps what is there and
+  does not create the file, which is how a program fills one in at an offset.
+  It has one position, not the separate read and write cursors C++ describes.
 * `<functional>` — `less`, `greater`, `plus`, `equal_to` and the rest of the
   comparison and arithmetic objects, which are small classes with a call
   operator. `std::function<int(int)>` becomes a class that holds any of them,
@@ -2749,6 +2755,28 @@ runtime and library adapters.
 
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
+
+### 0.9.13 - a file open for both at once
+
+`std::fstream file(path, ios::binary | ios::in | ios::out);` - which is how a
+program fills a file in at an offset as the pieces of it arrive, and neither
+of the two streams py2bin shipped can do it: one only reads, and the other
+empties the file to write it. That pair of flags keeps what is there and does
+not create the file, which is what C++ says of them, so the open underneath
+has a third way of being asked - `OPEN_EXISTING` with both accesses on
+Windows, plain `O_RDWR` elsewhere.
+
+`fstream` has one position, not the separate read and write cursors C++
+describes, so `seekg` and `seekp` are the same move. A program that alternates
+the two on one stream would notice; one that fills a file in at offsets, which
+is what this is for, cannot. That is said here rather than left to be found.
+
+`streamoff`, `streampos` and `streamsize` are declared with it. A program
+writes `file.seekp(static_cast<std::streamoff>(offset))`, and a cast to a type
+nothing declares is not a cast.
+
+2184 tests, 575 programs against clang++, 11 projects, 3492 builds across
+six targets.
 
 ### 0.9.13 - what a smart pointer stands in front of
 
