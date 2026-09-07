@@ -6893,6 +6893,97 @@ class Lowerer:
             index += 1
         return combined, index
 
+    def taken_for(
+        self, ctype: "CType", items: "list[object]", index: int, token: Token
+    ) -> "tuple[object, int]":
+        """One sub-object's initializer, taken off the front of a flat list.
+
+        C lets the inner braces go: `struct S a = {1, 2};` where `S` holds an
+        array of three fills the first two elements of that array. The rule is
+        that a value standing where an aggregate goes is not that aggregate -
+        it is the first thing *inside* it, and as many values as it needs are
+        taken. Written out again with the braces put back, so everything
+        below reads one value per member and nothing there has to know.
+        """
+
+        if index >= len(items):
+            return None, index
+        item = items[index]
+        # Braces that are written are the sub-object's own, whatever it is.
+        if isinstance(item, tuple):
+            return item, index + 1
+        if isinstance(ctype, ArrayType) and ctype.count is not None:
+            # `char name[4]` takes a string as one value, not four.
+            if isinstance(item, StringLiteral):
+                return item, index + 1
+            gathered: "list[object]" = []
+            for _ in range(ctype.count):
+                if index >= len(items):
+                    break
+                taken, index = self.taken_for(ctype.element, items, index, token)
+                if taken is None:
+                    break
+                gathered.append(taken)
+            return (token, gathered), index
+        if isinstance(ctype, StructType) and ctype.members is not None:
+            members = list(ctype.members)
+            if ctype.is_union:
+                members = members[:1]
+            gathered = []
+            for member in members:
+                if member.name.startswith(_UNNAMED_BITFIELD):
+                    continue
+                if index >= len(items):
+                    break
+                taken, index = self.taken_for(member.ctype, items, index, token)
+                if taken is None:
+                    break
+                gathered.append(taken)
+            return (token, gathered), index
+        return item, index + 1
+
+    def with_braces_put_back(
+        self,
+        ctype: "CType",
+        items: "list[object]",
+        slots: "list[CType]",
+        token: Token,
+    ) -> "list[object]":
+        """That list with one entry per slot, or as it was if it is that already.
+
+        Nothing to do for the ordinary case, which is one value per member and
+        braces around anything nested - so a program that writes them all out
+        goes through untouched.
+        """
+
+        if not any(
+            isinstance(held, (ArrayType, StructType))
+            and position < len(items)
+            and not isinstance(items[position], tuple)
+            and not isinstance(items[position], StringLiteral)
+            for position, held in enumerate(slots)
+        ):
+            return items
+        rebuilt: "list[object]" = []
+        index = 0
+        for held in slots:
+            if index >= len(items):
+                break
+            taken, index = self.taken_for(held, items, index, token)
+            if taken is None:
+                break
+            rebuilt.append(taken)
+        if index < len(items):
+            # More values than the object has room for, counted the way C
+            # counts them once the braces are back. Said here rather than
+            # left to the checks below, which would see the shorter list.
+            self.error(
+                f"the initializer has {len(items)} values but {ctype} holds "
+                f"{index}",
+                token,
+            )
+        return rebuilt
+
     def struct_initializer(
         self,
         base: "IntExpression",
@@ -6920,6 +7011,9 @@ class Lowerer:
         named = [
             one for one in members if not one.name.startswith(_UNNAMED_BITFIELD)
         ]
+        items = self.with_braces_put_back(
+            ctype, list(items), [one.ctype for one in named], token
+        )
         if len(items) > len(named):
             self.error(
                 f"the initializer has {len(items)} values but {ctype} holds "
@@ -7001,6 +7095,15 @@ class Lowerer:
                 "an array needs a braced initializer, not a single value", token
             )
         _brace, items = initializer
+        # Only an array *of* aggregates can have braces left out, and asked
+        # first so a million-element array of ints does not have a slot
+        # written down for each of them to answer a question with one shape.
+        if isinstance(ctype.element, (ArrayType, StructType)) and any(
+            not isinstance(one, (tuple, StringLiteral)) for one in items
+        ):
+            items = self.with_braces_put_back(
+                ctype, list(items), [ctype.element] * ctype.count, token
+            )
         if len(items) > ctype.count:
             self.error(
                 f"the initializer has {len(items)} values but the array holds "

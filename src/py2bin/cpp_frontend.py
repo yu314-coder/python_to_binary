@@ -3879,27 +3879,42 @@ def _rewrite_brace_initialisers(text: str) -> str:
     else is an aggregate, and C has written those with `=` all along.
     """
 
-    constructed = {
-        head.group(2)
-        for head in _CLASS_HEAD.finditer(text)
-        if _has_a_constructor(text, head)
-    }
-    # Where a `{` opens directly inside a class body, the declaration it
-    # ends is a data member's: `std::string name_{"x"};`. What that means
-    # turns on the member's type - a constructor call, a value, a zero - and
-    # the class reader is what knows the types. Rewritten here the way a
-    # local is, `string name_{"x"}` became `string name_("x");`, which the
-    # reader took for a method called `name_` - and the member left the
-    # struct without a word said. So a member of a class with a constructor
-    # is left as written for the reader; the rest are written into the
-    # `= {...}` form the reader already takes off a member.
-    members = _member_level_braces(_without_literals(text))
+    # Both of the questions below read the whole file, and this pass is run
+    # twice - once before the templates are written out and once after,
+    # where most files have nothing left for it to do. Worked out at the
+    # first match rather than up front, so a run that matches nothing costs
+    # the one scan it takes to find that out.
+    known: "dict[str, object]" = {}
+
+    def constructed() -> "set[str]":
+        if "constructed" not in known:
+            known["constructed"] = {
+                head.group(2)
+                for head in _CLASS_HEAD.finditer(text)
+                if _has_a_constructor(text, head)
+            }
+        return known["constructed"]  # type: ignore[return-value]
+
+    def members() -> "set[int]":
+        # Where a `{` opens directly inside a class body, the declaration it
+        # ends is a data member's: `std::string name_{"x"};`. What that
+        # means turns on the member's type - a constructor call, a value, a
+        # zero - and the class reader is what knows the types. Rewritten
+        # here the way a local is, `string name_{"x"}` became `string
+        # name_("x");`, which the reader took for a method called `name_` -
+        # and the member left the struct without a word said. So a member of
+        # a class with a constructor is left as written for the reader; the
+        # rest are written into the `= {...}` form the reader already takes
+        # off a member.
+        if "members" not in known:
+            known["members"] = _member_level_braces(_without_literals(text))
+        return known["members"]  # type: ignore[return-value]
 
     def one(match: "re.Match[str]", whole: str) -> "str | None":
         held, star, name, bounds = match.groups()[:4]
         if held in _NOT_A_TYPE or star:
             return None
-        if match.start(5) - 1 in members:
+        if match.start(5) - 1 in members():
             return None
         # From the real text: a literal inside the braces is blanked in the
         # copy the match was found against, and `char s[3]{'h', 'i'}` would
@@ -3909,7 +3924,7 @@ def _rewrite_brace_initialisers(text: str) -> str:
         # list of elements, not a constructor call taking three arguments.
         if bounds:
             return f"{held} {name}{bounds} = {{{inside or '0'}}};"
-        if held in constructed:
+        if held in constructed():
             return f"{held} {name}({inside});"
         # `T x{}` is value initialisation, which for everything in this
         # subset means zeroed. Left as a bare declaration it was whatever
@@ -19022,6 +19037,15 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # After the copies, because what says a class takes `push_back` is the
     # copy written for these arguments.
     text = _rewrite_list_initialisers(text)
+    # And the brace initialisers again, for the ones written on a template:
+    # `std::array<uint8_t, 2> id{a, b};` is not a declaration any pass can
+    # read while its type is still spelled with arguments - `array<uint8_t,
+    # 2>` is not one name - and by here the copy has been written out and it
+    # is. After the list initialisers rather than before, so a container that
+    # takes `push_back` has already had its list turned into pushes: read as
+    # an aggregate first, `vector<int> v{1, 2}` would have become a struct
+    # initialiser for a class whose members are a pointer and a count.
+    text = _rewrite_brace_initialisers(text)
     # Again, because a member template inside a class template could not be
     # read until the class had been written out: until then its calls are on
     # objects of a type that does not exist yet. `ComPtr<T>::As` is one -
@@ -24798,35 +24822,48 @@ public:
 _ARRAY_HEADER = r"""
 
 namespace std {
-/* `array<T, N>` needs a value template argument, which this subset does not
-   deduce - so the count lives in the object and the storage is a vector's.
-   `std::array<int, 4> a;` gives four default elements, as C++ does. */
-template<typename T>
+/* `array<T, N>` is N elements and nothing else - no pointer, no count, and
+   nothing allocated. Written that way here: the count is the second template
+   argument, so `sizeof` answers what C++ says it does and the storage is the
+   object itself.
+
+   It was a vector's storage behind a `T *` once, on the belief that a value
+   template argument could not be deduced. It can - a plain `T items[N]` is
+   written out per instantiation like any other member - and the shape
+   mattered: `std::array<uint8_t, 1500> buffer{};` is how a program asks for
+   a receive buffer on the stack, and with a null pointer inside it read and
+   wrote through nothing.
+
+   No constructor, so the braces a program writes are an aggregate's and mean
+   what they mean in C: `{}` zeroes it, `{a, b}` fills the first two
+   elements. */
+template<typename T, unsigned long N>
 class array {
 public:
-    T *items;
-    unsigned long count;
+    T items[N];
     typedef T *iterator;
+    typedef const T *const_iterator;
     typedef T value_type;
     typedef unsigned long size_type;
-    array() { items = 0; count = 0; }
-    void resize(unsigned long want) {
-        items = (T *)malloc(sizeof(T) * want);
-        count = want;
-    }
-    unsigned long size() { return count; }
-    int empty() { return count == 0; }
+    unsigned long size() const { return N; }
+    unsigned long max_size() const { return N; }
+    int empty() const { return N == 0; }
     T &operator[](unsigned long i) { return items[i]; }
+    const T &operator[](unsigned long i) const { return items[i]; }
     T &at(unsigned long i) { return items[i]; }
+    const T &at(unsigned long i) const { return items[i]; }
     T &front() { return items[0]; }
-    T &back() { return items[count - 1]; }
+    T &back() { return items[N - 1]; }
     T *begin() { return items; }
-    T *end() { return items + count; }
+    T *end() { return items + N; }
+    const T *cbegin() const { return items; }
+    const T *cend() const { return items + N; }
     T *data() { return items; }
+    const T *data() const { return items; }
     void fill(T value) {
         unsigned long i;
         i = 0;
-        while (i < count) { items[i] = value; i = i + 1; }
+        while (i < N) { items[i] = value; i = i + 1; }
     }
 };
 }

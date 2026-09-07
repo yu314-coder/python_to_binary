@@ -554,9 +554,11 @@ such load for those.
 **Braced initialisers** work for whatever they nest: `struct P a = {1, 2}`, a
 struct inside a struct, an array of structs, a two-dimensional array, a string
 member, a union, a partly-filled list (C zero-fills the rest, and so does
-this), and any of them at file scope. One entry point initialises whatever is
-at an address, of whatever shape it is, because a member may be an array or a
-struct or a scalar and C nests them freely.
+this), and any of them at file scope. The inner braces may be left out, which
+is what C says they mean: a value standing where an aggregate goes is the
+first thing *inside* it, and as many values as it needs are taken. One entry
+point initialises whatever is at an address, of whatever shape it is, because
+a member may be an array or a struct or a scalar and C nests them freely.
 
 **What it is not.** py2bin's C compiler implements C and ships its own copies
 of the standard headers (`stdio.h`, `stdlib.h`, `string.h`, `ctype.h`,
@@ -1689,8 +1691,10 @@ not special cases in the compiler:
   bool that makes `while (in >> n)` end. The number parsing is written out by
   hand rather than handed to `scanf`, because py2bin's printf reads its format
   at compile time and what is wanted here is a position that moves.
-* `<array>` — the count lives in the object rather than in the type, because
-  a value template argument is not something this subset deduces.
+* `<array>` — `array<T, N>` is N elements and nothing else: the storage is
+  the object, so `sizeof` answers what C++ says and there is nothing
+  allocated behind it. No constructor, so the braces a program writes on one
+  are an aggregate's and mean what they mean in C.
 * `<iostream>` — `cout` with one `operator<<` per type it can print, each
   handing the stream back so the next `<<` in the chain has something to be
   called on.
@@ -2738,6 +2742,39 @@ runtime and library adapters.
 
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
+
+### 0.9.13 - an array of a fixed size, and the braces C lets you leave out
+
+`std::array<uint8_t, 1500> buffer{};` is how a program asks for a receive
+buffer on the stack. py2bin shipped `<array>` as a one-parameter template
+holding a pointer and a count, on the belief that the size could not be a
+template argument - so any program spelling the type the way C++ spells it,
+with two, met a name that did not match, and one that got past that read and
+wrote through a null pointer. It can be a template argument: `T items[N]` is
+written out per instantiation like any other member. `array<T, N>` is now N
+elements and nothing else, so `sizeof` answers what C++ says and there is no
+allocation behind it. No constructor either, which makes the braces an
+aggregate's.
+
+Those braces are read in two places now. A declaration whose type is still
+spelled with its arguments is not one any pass can take apart - `array<uint8_t,
+2>` is not one name - so the brace initialisers are read again once the copies
+of the templates have been written out and it is. After the list initialisers
+rather than before: a container that takes `push_back` has its list turned
+into pushes first, or `vector<int> v{1, 2}` would have become a struct
+initialiser for a pointer and a count.
+
+And underneath, the thing C has always allowed and py2bin did not: the inner
+braces left out. `struct S a = {1, 2, 3};` where the first member is an array
+of two fills that array and then the member after it - a value standing where
+an aggregate goes is not the aggregate, it is the first thing inside it, and
+as many values as it needs are taken. py2bin counted one value per member and
+refused. The braces are put back before anything reads the list, so every
+check below still sees one value per member and none of them had to learn
+about it.
+
+2184 tests, 568 programs against clang++, 11 projects, 3450 builds across six
+targets.
 
 ### 0.9.13 - a thread handed an object that has to be built
 
