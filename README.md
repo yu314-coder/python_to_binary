@@ -2795,7 +2795,7 @@ a fetched SDK header got COM's root twice: a class with virtual methods from
 this stage and a struct holding a pointer to a table from that one. Which
 names those are is asked of the C stage rather than listed.
 
-2184 tests, 573 programs against clang++, 11 projects, 3468 builds across
+2184 tests, 571 programs against clang++, 11 projects, 3468 builds across
 six targets.
 
 ### 0.9.13 - an array of a fixed size, and the braces C lets you leave out
