@@ -2756,6 +2756,34 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a table written out as a list
+
+`static const std::map<int, WORD> table = {{0x28, VK_RETURN}, ...};` - how a
+program writes a small lookup table out, and py2bin had none of it.
+
+A brace list fills a container that takes `push_back`, and a map or a set
+takes `insert` instead; what a pair in the list means for a map is the value
+the key stands for, so it becomes `table[key] = value`, which is what a fresh
+map does with that list.
+
+Two things underneath. The splitter that reads a comma-separated list counted
+parentheses and brackets and not braces, so `{{1, 10}, {2, 20}}` came apart at
+the comma *inside* an entry - a comma inside braces is never a separator, and
+now it is not read as one anywhere. And a declaration that begins with `const`
+is still a declaration: read from the `const`, its type was `const`, no class
+of that name takes anything, and the list was left standing for the C stage to
+refuse. The same word had been hiding a brace-initialised declaration from the
+pass above it.
+
+The pass that writes out an object-valued `?:` was tightened at the same time.
+It took the class from whichever arm it could read, and `found == table.end()
+? 0 : found->second` - where the second arm could not be read at all - gave a
+number the class the deduction had fallen back on. Both arms have to answer,
+and answer the same class.
+
+2184 tests, 581 programs against clang++, 11 projects, 3528 builds across six
+targets.
+
 ### 0.9.13 - a file read whole, through a range
 
 `std::vector<uint8_t> held((std::istreambuf_iterator<char>(file)),

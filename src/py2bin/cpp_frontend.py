@@ -3893,7 +3893,11 @@ def _close_range_bodies(text: str) -> str:
 #: `Thing final( ... );` - the class turned inside out, and every member
 #: after it lost.
 _BRACE_INIT = re.compile(
-    r"(?<![.\w>])(?<!class )(?<!struct )([A-Za-z_]\w*)\s+(\*?)\s*"
+    r"(?<![.\w>])(?<!class )(?<!struct )"
+    # `const State s = {...};` is a declaration like any other, and read from
+    # the `const` its type was `const` - a word no class is called.
+    r"(?:(?:const|volatile|static|mutable|register)\s+)*"
+    r"([A-Za-z_]\w*)\s+(\*?)\s*"
     # `T x = {1, 2};` as readily as `T x{1, 2};`. C++ calls the first
     # copy-list-initialisation and the second direct, and for everything this
     # subset has the two mean the same thing. Read only in the second shape,
@@ -3987,18 +3991,24 @@ def _split_object_conditionals(text: str, filename: str) -> str:
             question = _without_literals(spelled).find("?")
             asked = spelled[:question].strip()
             names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
-            held = None
-            for arm in arms:
-                answer = _deduced_type(arm.strip(), text, found.start())
-                if answer is None:
-                    continue
-                plain = re.sub(
-                    r"\b(?:const|volatile|struct)\b", " ", answer
-                ).strip()
-                if plain in names:
-                    held = plain
-                    break
-            if held is None:
+            # Both arms, and both the same class. One arm answering a class
+            # is not enough: `found == table.end() ? 0 : found->second` has
+            # a `0` in it, and where the other arm could not be read at all
+            # the class the deduction fell back on was written down as the
+            # type of a number - a program built out of one bad answer.
+            answers = [
+                _deduced_type(arm.strip(), text, found.start()) for arm in arms
+            ]
+            if any(one is None for one in answers):
+                continue
+            plain = {
+                re.sub(r"\b(?:const|volatile|struct)\b", " ", one).strip()
+                for one in answers
+            }
+            if len(plain) != 1:
+                continue
+            held = plain.pop()
+            if held not in names:
                 continue
             counter += 1
             name = f"__py2bin_chosen_{counter}"
@@ -10232,9 +10242,37 @@ def _fold_constexpr_calls(text: str) -> str:
 
 #: `vector<int> v = {1, 2, 3};` and `vector<int> v{1, 2, 3};` - a container
 #: given its contents where it is declared.
+#: The words that may stand in front of the type and are not one. Written
+#: out because a declaration that begins with `const` is a declaration:
+#: `const std::map<int, WORD> table = {{1, 10}};` read from the `const` had
+#: `const` for its type, no class of that name takes `insert`, and the list
+#: was left standing for the C stage to refuse.
+_QUALIFIERS_FIRST = r"(?:(?:const|volatile|static|mutable|register)\s+)*"
+
 _LIST_INITIALISED = re.compile(
-    r"(?<![.\w>])([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?:=\s*)?\{"
+    rf"(?<![.\w>]){_QUALIFIERS_FIRST}([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?:=\s*)?\{{"
 )
+
+
+def _takes_insert(text: str, name: str) -> bool:
+    """Whether that class declares `insert`, so a list can fill it that way.
+
+    A map and a set are filled by `insert` where a vector is filled by
+    `push_back`, and `map<int, int> table = {{1, 10}, {2, 20}};` is how a
+    program writes a small lookup table out.
+    """
+
+    for head in _CLASS_HEAD.finditer(text):
+        if head.group(2) != name:
+            continue
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            return False
+        return bool(
+            re.search(r"(?<![.\w>])insert\s*\(", text[head.end(): closing - 1])
+        )
+    return False
 
 
 def _takes_push_back(text: str, name: str) -> bool:
@@ -10280,8 +10318,11 @@ def _rewrite_list_initialisers(text: str) -> str:
                 continue
             if found.end() - 1 in members:
                 continue
+            filling = "push_back"
             if not _takes_push_back(text, found.group(1)):
-                continue
+                if not _takes_insert(text, found.group(1)):
+                    continue
+                filling = "insert"
             opening = found.end() - 1
             try:
                 after = _matching(bare, opening)
@@ -10298,9 +10339,30 @@ def _rewrite_list_initialisers(text: str) -> str:
                 if one.strip()
             ]
             held, named = found.group(1), found.group(2)
-            written = f"{held} {named}; " + " ".join(
-                f"{named}.push_back({one});" for one in values
-            )
+            if filling == "push_back":
+                written = f"{held} {named}; " + " ".join(
+                    f"{named}.push_back({one});" for one in values
+                )
+            else:
+                # A pair per entry is a map, and what the pair means is the
+                # value the key stands for: `table[key] = value`, which is
+                # what a fresh map does with that list. A plain value is a
+                # set's, and that is what `insert` takes.
+                filled = []
+                for one in values:
+                    if one.startswith("{") and one.endswith("}"):
+                        parts = _split_arguments(one[1:-1])
+                        if len(parts) != 2:
+                            filled = []
+                            break
+                        filled.append(
+                            f"{named}[{parts[0].strip()}] = {parts[1].strip()};"
+                        )
+                    else:
+                        filled.append(f"{named}.insert({one});")
+                if not filled:
+                    continue
+                written = f"{held} {named}; " + " ".join(filled)
             change = (found.start(), rest + 1, written)
             break
         if change is None:
@@ -18199,9 +18261,13 @@ def _split_arguments(arguments: str) -> "list[str]":
             current.append(piece)
             continue
         for char in piece:
-            if char in "([":
+            # Braces count too: `{{1, 10}, {2, 20}}` is two entries, and a
+            # comma inside one of them separates a key from its value rather
+            # than one entry from the next. A lambda handed as an argument
+            # brings a pair of them along as well.
+            if char in "([{":
                 depth += 1
-            elif char in ")]":
+            elif char in ")]}":
                 depth -= 1
             if char == "," and depth == 0:
                 parts.append("".join(current))
