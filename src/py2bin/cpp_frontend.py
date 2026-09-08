@@ -11794,8 +11794,23 @@ def _emit_one(
         known[spelled] = held
         # A member that is a pointer already *is* the address. Taking one of
         # it gave `&this->p` where a `T *` was wanted, which is a `T **`.
-        receivers[spelled] = spelled if "*" in holder.ctype else f"&{spelled}"
-        if "*" in holder.ctype:
+        # A reference member takes the `&`, unlike a pointer one: every
+        # mention of it is dereferenced when the method is written out, so
+        # `&this->r` becomes `&(*this->r)`, which is the pointer again.
+        receivers[spelled] = (
+            spelled
+            if "*" in holder.ctype and not holder.reference
+            else f"&{spelled}"
+        )
+        # A *reference* member is not one of those. It is held as a pointer
+        # here because C has no reference, but the program writes
+        # `transport_.start()` with a dot and means the object - and every
+        # mention of it is dereferenced when the method is written out, so
+        # the address of it is `&this->transport_`, which that dereference
+        # turns back into the pointer. Counted among the pointers, it was
+        # looked for as `transport_->start()`, found nowhere, and reached the
+        # C stage as a member call on a struct that has only data.
+        if "*" in holder.ctype and not holder.reference:
             pointers.add(spelled)
             # And what *that* object holds, one level on. A class reached
             # through a pointer member is how a generated callback reaches
@@ -16082,7 +16097,15 @@ def _rewrite_body(
                 continue
             for member, prefix in _reachable_members(classes[known[variable]], classes):
                 held = member.ctype.replace("*", "").strip()
-                if "*" not in member.ctype or held not in classes:
+                # A reference member is held as a pointer and written with
+                # a dot, and it is *not* one of these: `transport_.start()`
+                # is a call on the object, and looked for as
+                # `transport_->start()` it is found nowhere.
+                if (
+                    "*" not in member.ctype
+                    or member.reference
+                    or held not in classes
+                ):
                     continue
                 reached = f"{variable}{access}{prefix}{member.name}"
                 if reached not in spelled_here:
@@ -16099,7 +16122,12 @@ def _rewrite_body(
                 continue
             for member, prefix in _reachable_members(classes[known[variable]], classes):
                 held = member.ctype.replace("*", "").strip()
-                if "*" in member.ctype or held not in classes:
+                if held not in classes:
+                    continue
+                # A reference is written the way an object held by value is,
+                # and its address is `&this->r` - which the dereference every
+                # mention of it gets turns back into the pointer it holds.
+                if "*" in member.ctype and not member.reference:
                     continue
                 reached = f"{variable}{access}{prefix}{member.name}"
                 if reached not in spelled_here:
@@ -17719,8 +17747,15 @@ def _member_paths(
                     reaches.append(("->", pointee))
             for reach, holder in reaches:
                 for member, spelled in _CLASS_MEMBERS.get(holder, ()):
-                    if "*" in spelled or "&" in spelled:
+                    if "*" in spelled:
                         continue
+                    # A *reference* member is not a pointer the program can
+                    # see: `WindowsTransport &transport_` is written
+                    # `transport_.start()` and means the object, not an
+                    # address to be reached through. C has no reference, so
+                    # it is held as a pointer here - which is why it was
+                    # skipped with the pointers, and why `transport_.start()`
+                    # reached the C stage as a member call on a struct.
                     kind = _class_named(spelled)
                     if kind not in classes:
                         continue

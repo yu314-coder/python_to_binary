@@ -2756,6 +2756,23 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a member that is a reference
+
+`WindowsTransport &transport_;` held by a session, and `transport_.start()`
+inside its methods. C has no reference, so py2bin holds one as a pointer - and
+it was then counted among the pointers, so every call on it was looked for as
+`transport_->start()`, found nowhere, and reached the C stage as a member call
+on a struct that has only data.
+
+A reference is written the way an object held by value is written, with a dot,
+and its address is `&this->transport_` - which the dereference every mention of
+it gets, when the method is written out, turns back into the pointer it holds.
+So it belongs with the members held by value and not with the pointers, at both
+of the two places that sort them.
+
+2184 tests, 585 programs against clang++, 11 projects, 3552 builds across six
+targets.
+
 ### 0.9.13 - a walk over what a call answered
 
 `for (wchar_t character : wideFromUtf8(text))` - walking over what a call
