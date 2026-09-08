@@ -2756,6 +2756,29 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an empty object where a value goes
+
+`return written > 0 ? made : std::string{};` - two shapes at once, and py2bin
+had neither.
+
+`string{}` is a value of that class, built empty, standing where a value goes.
+C has no such expression: an object needs somewhere to live. So it is declared
+at the top of the statement and named where the braces were - which is safe to
+lift out of an arm of a `?:` precisely because there is nothing inside the
+braces to evaluate.
+
+Then the conditional itself. py2bin's C stage lowers one through a slot
+holding a single machine word, so two structs are refused there rather than
+half-copied. What C++ means is nothing harder - one of the two, whichever the
+condition picks - so where the whole answer is a conditional it is written as
+that: an object of the type, an `if` that gives it one answer and an `else`
+that gives it the other. Only there. A conditional inside a larger expression
+would have to be lifted out of it, and lifting changes when the arms are
+evaluated, which is the one thing about `?:` a program can depend on.
+
+2184 tests, 577 programs against clang++, 11 projects, 3504 builds across
+six targets.
+
 ### 0.9.13 - what a fetched header asks of the core it is built on, again
 
 Their build reaches the C stage's reading of every header their program

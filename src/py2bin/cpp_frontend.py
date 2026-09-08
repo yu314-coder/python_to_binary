@@ -3904,6 +3904,141 @@ _BRACE_INIT = re.compile(
 #: `= {` in an expression, which C++ reads against whatever is on the left.
 _BRACED_ASSIGNMENT = re.compile(r"(?<![=!<>+\-*/%&|^])=\s*\{")
 
+#: `string{}` - a value of that class, built empty, where a value goes.
+_BRACED_TEMPORARY = re.compile(r"(?<![.\w>:])([A-Za-z_]\w*)\s*\{\s*\}")
+
+#: What may stand in front of one for it to be an expression rather than a
+#: declaration. A declaration has a type there, and those have been read by
+#: the pass above long before this one runs.
+_A_VALUE_GOES_HERE = re.compile(r"(?:[=(,?:]|\breturn)\s*$")
+
+#: A class head, whose base clause puts a `:` in front of a name and whose
+#: body may be empty.
+_A_CLASS_STARTS_HERE = re.compile(
+    r"^\s*(?:template\s*<[^<>]*>\s*)?(?:class|struct|union)\b"
+)
+
+
+#: `return c ? a : b;` - the whole answer is one conditional.
+_RETURNS_A_CONDITIONAL = re.compile(r"(?<![.\w>])return\s+([^;]*\?[^;]*);")
+
+
+def _split_object_conditionals(text: str, filename: str) -> str:
+    """`return ok ? one : other;` where the two are objects, written out.
+
+    C has a conditional and py2bin's C stage lowers it through a slot that
+    holds one machine word, so the two answers have to be numbers or
+    pointers; two structs are refused there rather than half-copied. What
+    C++ means is nothing harder, though - one of the two, whichever the
+    condition picks - so it is written as that: an object of the type, an
+    `if` that gives it one answer and an `else` that gives it the other.
+
+    Only where the conditional is the whole of what is returned. A
+    conditional buried inside a larger expression would have to be lifted out
+    of it, and lifting changes when the arms are evaluated - which is the one
+    thing about `?:` a program can depend on.
+    """
+
+    counter = 0
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        change = None
+        for found in _RETURNS_A_CONDITIONAL.finditer(bare):
+            spelled = text[found.start(1): found.end(1)]
+            arms = _conditional_arms(spelled)
+            if arms is None:
+                continue
+            question = _without_literals(spelled).find("?")
+            asked = spelled[:question].strip()
+            names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+            held = None
+            for arm in arms:
+                answer = _deduced_type(arm.strip(), text, found.start())
+                if answer is None:
+                    continue
+                plain = re.sub(
+                    r"\b(?:const|volatile|struct)\b", " ", answer
+                ).strip()
+                if plain in names:
+                    held = plain
+                    break
+            if held is None:
+                continue
+            counter += 1
+            name = f"__py2bin_chosen_{counter}"
+            change = (
+                found.start(),
+                found.end(),
+                f"{held} {name}; if ({asked}) {{ {name} = {arms[0]}; }} "
+                f"else {{ {name} = {arms[1]}; }} return {name};",
+            )
+            break
+        if change is None:
+            return text
+        start, end, written = change
+        text = text[:start] + written + text[end:]
+    return text
+
+
+def _rewrite_braced_temporaries(text: str, filename: str) -> str:
+    """`return ok ? made : string{};` - an empty object where a value goes.
+
+    C++ builds one of that class, value-initialised, and hands it over. C has
+    no such expression: an object needs somewhere to live. So it is declared
+    at the top of the statement and named where the braces were - which is
+    what the braces mean, and which is safe to lift out of an arm of a `?:`
+    precisely because there is nothing inside them to evaluate.
+    """
+
+    counter = 0
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+        change = None
+        for found in _BRACED_TEMPORARY.finditer(bare):
+            held = found.group(1)
+            if held not in names:
+                continue
+            if _A_VALUE_GOES_HERE.search(bare[:found.start()]) is None:
+                continue
+            begin = 0
+            for mark in (";", "{", "}"):
+                begin = max(begin, bare.rfind(mark, 0, found.start()) + 1)
+            ahead = bare[begin: found.start()]
+            # `struct B : A {};` ends in a colon and a class name and a pair
+            # of braces, which is what this pass looks for and is not one:
+            # read as an empty object it took the base out of the class and
+            # left `struct B : __py2bin_empty_1;`, which is not a class at
+            # all. A base clause is the one other place a `:` stands in front
+            # of a type.
+            if _A_CLASS_STARTS_HERE.match(ahead):
+                continue
+            if ahead.count("(") != ahead.count(")"):
+                # The statement begins inside parentheses this pass cannot
+                # see the start of - a `for` clause is the one that matters -
+                # and a declaration written there is not a declaration.
+                continue
+            counter += 1
+            name = f"__py2bin_empty_{counter}"
+            change = (
+                begin,
+                found.start(),
+                found.end(),
+                f"{held} {name}; ",
+                name,
+            )
+            break
+        if change is None:
+            return text
+        begin, start, end, written, name = change
+        text = (
+            text[:begin] + written + text[begin:start] + name + text[end:]
+        )
+    return text
+
+
+
+
 
 def _rewrite_braced_assignments(text: str, filename: str) -> str:
     """`state[key] = {a, b, 0};` - the braces mean the type on the left.
@@ -19343,6 +19478,12 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # on the left of an `=` means is the type of what is on the left, and
     # working that out means the copies of the templates already exist -
     # `at->states["k"]` is a `map<string, State>`'s subscript.
+    # Before the assignments, so `a = string{};` is read as an assignment
+    # from a value rather than as a list given to whatever holds it.
+    text = _rewrite_braced_temporaries(text, filename)
+    # After them, because `return ok ? made : string{};` has an object in an
+    # arm only once the braces have become one.
+    text = _split_object_conditionals(text, filename)
     text = _rewrite_braced_assignments(text, filename)
     text = _rewrite_brace_initialisers(text)
     # Again, because a member template inside a class template could not be
