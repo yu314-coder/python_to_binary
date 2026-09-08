@@ -4,7 +4,9 @@
 //
 // The range was read as "everything up to the first `)`", so a range holding
 // parentheses of its own matched nothing and the loop reached the C stage
-// still written in C++.
+// still written in C++. No pattern counts parentheses, so the header is
+// scanned to the `)` that closes the `for` - a call inside a call is two
+// deep, and a pattern written for one level would have missed it.
 //
 // The header was read one code piece at a time, and a literal in the range
 // splits it into two - so `widened("abc")` was half a header either side of
@@ -44,6 +46,11 @@ int main() {
     int summed = 0;
     for (int one : counted(4)) summed += one;
 
+    // A call inside a call, which is where a pattern counting one level of
+    // parentheses stops.
+    int nested = 0;
+    for (wchar_t character : widened(std::string("de"))) nested += (int)character;
+
     // The plain kinds, which have to go on working.
     std::vector<int> plain;
     plain.push_back(5);
@@ -51,6 +58,6 @@ int main() {
     int again = 0;
     for (int one : plain) again += one;
 
-    printf("%d %d %d %d\n", total, summed, again, made);
+    printf("%d %d %d %d %d\n", total, summed, again, nested, made);
     return 0;
 }

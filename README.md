@@ -2764,7 +2764,9 @@ Three things stood in the way.
 
 The range was read as "everything up to the first `)`", so a range holding
 parentheses of its own matched nothing at all and the loop reached the C stage
-still written in C++. The header was read one code piece at a time, and a
+still written in C++. No pattern counts parentheses - a call inside a call is
+two deep and a pattern written for one level misses it - so the header is
+scanned to the `)` that closes the `for`. The header was read one code piece at a time, and a
 literal in the range splits it into two - `widened("abc")` was half a header
 either side of the string; read over the whole text with the literals blanked,
 it is one match. And the call is made once now: a range-`for` becomes an index

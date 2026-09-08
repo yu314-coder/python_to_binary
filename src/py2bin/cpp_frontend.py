@@ -3774,6 +3774,13 @@ _MEMBER_INIT = "__py2bin_member_init"
 #: The `&` or `*` goes with the type, and it is written against the name -
 #: `auto &x`, not `auto & x`. Read as its own piece, or the pattern needed
 #: whitespace that nobody writes and matched nothing.
+#: `T name :` at the start of a `for` header, which is what tells a range
+#: loop from an ordinary one. What follows it is the range, and that is read
+#: by scanning to the `)` that closes the `for` rather than by a pattern.
+_RANGE_HEAD = re.compile(
+    r"^\s*([A-Za-z_][\w\s]*?)\s*([*&]*)\s*([A-Za-z_]\w*)\s*(?<!:):(?!:)"
+)
+
 _RANGE_FOR = re.compile(
     # The colon is the range's, not half of a `::`: the type group is lazy,
     # and `for (string::iterator it = s.begin(); ...)` read as `s`, `tring`
@@ -3928,13 +3935,23 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
     anyway.
     """
 
-    def one(match: "re.Match[str]", whole: str) -> "str | None":
+    def one(match: "re.Match[str]", header: str) -> "str | None":
         held = (match.group(1) + " " + match.group(2)).strip()
-        # From the real text: a range holding a literal - `for (char c :
+        # No test on the type beyond its being there: `auto` and `const` are
+        # both words that are never a type on their own, and both are what a
+        # range-`for` is usually written with. What tells this from an
+        # ordinary `for` is the `:` with a name in front of it, which the
+        # pattern has already found - an ordinary header has a `;` where
+        # this has a colon.
+        if not held:
+            return None
+        # From the real header: a range holding a literal - `for (char c :
         # std::string("ab"))` - comes back with the literal blanked out
         # otherwise.
         name = match.group(3)
-        over = whole[match.start(4): match.end(4)].strip()
+        over = header[match.end():].strip()
+        if not over:
+            return None
         counter[0] += 1
         index = f"__py2bin_each_{counter[0]}"
         # What a call answered is walked over by name: the call would
@@ -3944,10 +3961,7 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
         opened = ""
         if "(" in _without_literals(over):
             counter[0] += 1
-            opened = (
-                f"auto __py2bin_over_{counter[0]} = "
-                f"{whole[match.start(4): match.end(4)].strip()}; "
-            )
+            opened = f"auto __py2bin_over_{counter[0]} = {over}; "
             over = f"__py2bin_over_{counter[0]}"
         # A bare name is left bare: the rewriters that turn `v.size()` into a
         # call look for a name on the left, and `(v).size()` is not one.
@@ -3963,10 +3977,32 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
             f"{{ {held} {name} = {reached}[{index}];"
         )
 
-    # Over the whole text rather than per code piece: a range with a string
-    # literal in it - `for (wchar_t c : widened("abc"))` - is one match
-    # spanning that literal, and each piece on its own held half a header.
-    out = _sub_code(_RANGE_FOR, text, one)
+    # Scanned rather than matched: the range may hold calls inside calls -
+    # `wideFromUtf8(jsonString(json, "text"))` - and no pattern counts
+    # parentheses. The header ends at the `)` that closes the `for`, which is
+    # found by matching it. Over the blanked text so a literal in the range
+    # is not read as structure, and sliced from the real one so it is not
+    # read as blanks either.
+    bare = _without_literals(text)
+    pieces: "list[str]" = []
+    at = 0
+    for opens in re.finditer(r"(?<![.\w>])for\s*\(", bare):
+        if opens.start() < at:
+            continue
+        close = _closing_paren(bare, opens.end() - 1)
+        if close < 0:
+            continue
+        split = _RANGE_HEAD.match(bare[opens.end(): close])
+        if split is None:
+            continue
+        written = one(split, text[opens.end(): close])
+        if written is None:
+            continue
+        pieces.append(text[at: opens.start()])
+        pieces.append(written)
+        at = close + 1
+    pieces.append(text[at:])
+    out = "".join(pieces)
     if out == text:
         return text
     # The body gained an opening brace, so it needs a closing one. The loop
