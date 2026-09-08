@@ -3790,23 +3790,37 @@ _STATIC_DEFINITION = re.compile(
 
 
 
+#: A type as it may be written in front of an array's name: a name, perhaps
+#: with template arguments, perhaps a pointer. `std::pair<const char *, WORD>
+#: values[]` is one, and read as a single word it was not.
+_A_SPELLED_TYPE = r"[A-Za-z_]\w*(?:\s*<[^<>;{}]*>)?(?:\s*[*&]+)?"
+
+
 def _array_extent(text: str, name: str) -> "int | None":
     """How many elements an array has, read from where it was declared."""
 
     code = _without_literals(text)
     counted = re.search(
-        rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\[\s*(\d+)\s*\]", code
+        rf"(?<![.\w>]){_A_SPELLED_TYPE}\s+{re.escape(name)}\s*\[\s*(\d+)\s*\]",
+        code,
     )
     if counted is not None:
         return int(counted.group(1))
-    # `int a[] = {1, 2, 3}` says how many by listing them.
+    # `int a[] = {1, 2, 3}` says how many by listing them. Read to the brace
+    # that closes the list rather than to the first `}` in the text: an
+    # element may be a list of its own - `{{"a", 1}, {"b", 2}}` is two
+    # elements - and stopping at the first one counted them wrong.
     listed = re.search(
-        rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\[\s*\]\s*=\s*\{{([^}}]*)\}}",
+        rf"(?<![.\w>]){_A_SPELLED_TYPE}\s+{re.escape(name)}\s*\[\s*\]\s*=\s*\{{",
         code,
     )
     if listed is None:
         return None
-    inside = listed.group(1).strip()
+    try:
+        closing = _matching(code, listed.end() - 1)
+    except ValueError:
+        return None
+    inside = text[listed.end(): closing - 1].strip()
     return len(_split_arguments(inside)) if inside else 0
 
 def _rewrite_range_for(text: str, counter: "list[int]") -> str:
@@ -14657,6 +14671,23 @@ def _rewrite_object_array_values(
                     else []
                 )
                 passed = f", {built.group(1)}" if built.group(1).strip() else ""
+                made.append(
+                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
+                    f"({spot}{passed});"
+                )
+                continue
+            if value.startswith("{") and value.endswith("}"):
+                # `{"control", VK_CONTROL}` - the arguments the element is
+                # built from, written the way C++11 lets you write them.
+                # Read as an object already built, the copy came out as
+                # `values[0] = *&{"control", VK_CONTROL}`, which is not an
+                # expression in C or anywhere else.
+                given = [
+                    one.strip()
+                    for one in _split_arguments(value[1:-1])
+                    if one.strip()
+                ]
+                passed = f", {', '.join(given)}" if given else ""
                 made.append(
                     f"{_c_name(owner, '', _call_suffix(owner, '', classes, given, body))}"
                     f"({spot}{passed});"

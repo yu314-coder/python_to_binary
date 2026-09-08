@@ -2756,6 +2756,26 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an array of pairs written out
+
+`const std::pair<const char *, WORD> values[] = {{"control", VK_CONTROL},
+...};` and a range-`for` over it. Two things, and neither was about pairs.
+
+An element written as `{a, b}` is what that element is built *from*. py2bin
+read the constructor-call spelling - `A xs[2] = {A(1), A(2)}` - and took
+anything else for an object already built, so the copy came out as `values[0]
+= *&{"control", 17}`, which is not an expression in C or anywhere else.
+
+And the extent of an array is read from its declaration, which is how a
+range-`for` over a plain array knows where to stop. The type had to be a
+single word for that to be found, so one written with template arguments was
+not - and `values` was taken for a container and asked its `size()`. The
+count is read to the brace that closes the list now, rather than to the first
+`}` in the text: an element may be a list of its own.
+
+2184 tests, 582 programs against clang++, 11 projects, 3534 builds across
+six targets.
+
 ### 0.9.13 - a table written out as a list
 
 `static const std::map<int, WORD> table = {{0x28, VK_RETURN}, ...};` - how a
