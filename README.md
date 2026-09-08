@@ -2756,6 +2756,40 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - walking back from the end
+
+`for (auto it = held.rbegin(); it != held.rend(); ++it)` - releasing keys in
+the order opposite to pressing them, which is how a program undoes a sequence.
+
+Everywhere else in this subset an iterator is a pointer, and a pointer's `++`
+goes forward - so the one iterator that cannot be a pointer is the one that
+goes the other way. Written as a small class instead, `it != v.rend()` asks a
+method for an *object*, and a method answering one answers nothing in the C:
+the caller provides the space and the callee writes through a hidden pointer.
+The call needs a temporary, and a temporary is a declaration, which the middle
+of a `for` header has no room for.
+
+So the walk is written as what it means, the way a range-`for` already is: an
+index counting down, and `*it` in the body is the element at that index. Only
+that exact shape, which is the one way the walk is written.
+
+The general fix was tried first and thrown away, which is worth saying. Opening
+the loop up - condition at the top of the body, step left in the header so
+`continue` still works - is correct on paper and produced a program that ran
+and answered wrongly: the block it wrapped the loop in was a scope, and the
+pass that destroys what a scope owns destroyed the container the loop was
+walking. Everything after the loop saw it empty. A rewrite that can do that is
+not worth having for an idiom that can be written out directly.
+
+And `const std::vector<T> &` - how nearly every container is passed to a
+function - had the words in front of the type read as part of its name, so the
+class asked about was `const vector__int`, which nothing declares. `auto n =
+held.size();` on such a parameter had no type at all, and the `auto` reached
+the C stage as a storage class.
+
+2184 tests, 583 programs against clang++, 11 projects, 3540 builds across
+six targets.
+
 ### 0.9.13 - an array of pairs written out
 
 `const std::pair<const char *, WORD> values[] = {{"control", VK_CONTROL},

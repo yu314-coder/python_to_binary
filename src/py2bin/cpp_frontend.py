@@ -2833,7 +2833,15 @@ def _deduced_from_call(spelled: str, text: str, before: int) -> "str | None":
         held = _deduced_type(member.group(1), text, before)
         if held is None:
             return None
-        return _declared_return(text, held.replace("*", "").strip(), member.group(2))
+        # The words in front of the type are not part of its name. `const
+        # std::vector<int> &held` is how nearly every container is passed to
+        # a function, and the class asked for was `const vector__int` - which
+        # nothing declares, so `auto n = held.size();` had no type at all and
+        # the `auto` reached the C stage.
+        owner = re.sub(
+            r"\b(?:const|volatile|struct|union)\b", " ", held
+        ).replace("*", " ").strip()
+        return _declared_return(text, owner, member.group(2))
     # `(b - a).count()` and `f(x).m()` - a call on something that is itself
     # an expression rather than a name. The receiver is worked out first and
     # the member read off whatever it answered, which is the only way a chain
@@ -3822,6 +3830,91 @@ def _array_extent(text: str, name: str) -> "int | None":
         return None
     inside = text[listed.end(): closing - 1].strip()
     return len(_split_arguments(inside)) if inside else 0
+
+#: `for (auto it = v.rbegin(); it != v.rend(); ++it)` - a walk back from the
+#: end, written the one way C++ writes it. The same container on both sides.
+_A_REVERSE_WALK = re.compile(
+    r"(?<![.\w>])for\s*\(\s*(?:auto|[A-Za-z_][\w:]*(?:\s*<[^<>;]*>)?)\s*[&*]?\s*"
+    r"([A-Za-z_]\w*)\s*=\s*([A-Za-z_][\w]*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)"
+    r"\s*(\.|->)\s*rbegin\s*\(\s*\)\s*;\s*"
+    r"\1\s*!=\s*\2\s*(?:\.|->)\s*rend\s*\(\s*\)\s*;\s*"
+    r"\+\+\s*\1\s*\)"
+)
+
+
+def _rewrite_reverse_walks(text: str, counter: "list[int]") -> str:
+    """A walk back from the end, written as the index loop it means.
+
+    Everywhere else in this subset an iterator is a pointer, and a pointer's
+    `++` goes forward - so the one iterator that cannot be a pointer is the
+    one that goes the other way. It could be a small class, and then `it !=
+    v.rend()` asks a method for an object: the caller provides the space and
+    the callee writes through a hidden pointer, so the call needs a
+    temporary - and a temporary is a declaration, which the middle of a `for`
+    header has no room for.
+
+    So the loop is written as what it means, the way a range-`for` is: an
+    index counting down, and `*it` in the body is the element at that index.
+    Only this exact shape, which is the one way the walk is written.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        found = _A_REVERSE_WALK.search(bare)
+        if found is None:
+            return text
+        name = found.group(1)
+        over = re.sub(r"\s+", "", text[found.start(2): found.end(2)])
+        reach = found.group(3)
+        counter[0] += 1
+        index = f"__py2bin_back_{counter[0]}"
+        held = f"{over}{reach}size()"
+        rest = found.end()
+        while rest < len(text) and text[rest] in " \t\n":
+            rest += 1
+        if rest >= len(text):
+            return text
+        if text[rest] == "{":
+            try:
+                shut = _matching(text, rest)
+            except ValueError:
+                return text
+            inner = text[rest + 1: shut - 1]
+        else:
+            depth = 0
+            shut = -1
+            for at in range(rest, len(bare)):
+                piece = bare[at]
+                if piece in "([{":
+                    depth += 1
+                elif piece in ")]}":
+                    depth -= 1
+                elif piece == ";" and depth == 0:
+                    shut = at + 1
+                    break
+            if shut < 0:
+                return text
+            inner = text[rest: shut]
+        element = f"{over}[(unsigned long){index}]"
+        inner = _map_code(
+            inner,
+            lambda part, n=name, e=element: re.sub(
+                rf"(?<![.\w>])\*\s*{re.escape(n)}(?![\w(])", e, part
+            ),
+        )
+        inner = _map_code(
+            inner,
+            lambda part, n=name, e=element: re.sub(
+                rf"(?<![.\w>]){re.escape(n)}\s*->", f"{e}.", part
+            ),
+        )
+        written = (
+            f"for (long {index} = (long){held} - 1; {index} >= 0; {index}--) "
+            f"{{ {inner} }}"
+        )
+        text = text[:found.start()] + written + text[shut:]
+    return text
+
 
 def _rewrite_range_for(text: str, counter: "list[int]") -> str:
     """`for (int x : v)` becomes an index loop over the same container.
@@ -19703,6 +19796,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _lift_nested_classes(text)
     text = _brace_defaults_as_values(text, [0])
     text = _rewrite_default_arguments(text)
+    # Before the range-`for`, which does the same kind of thing: both turn a
+    # walk into an index loop, and this one's shape is the more particular.
+    text = _rewrite_reverse_walks(text, [0])
     text = _rewrite_range_for(text, [0])
     # After the spellings, because the body a callback carries has `nullptr`
     # and named casts in it like any other and the class it was written in
@@ -23035,6 +23131,7 @@ public:
 #: pretending otherwise would be the dishonest part, not the leak.
 _VECTOR_HEADER = r"""
 namespace std {
+
 template<typename T>
 class vector {
 public:
