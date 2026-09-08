@@ -6617,6 +6617,54 @@ def _inside_a_template_pattern(text: str, at: int) -> bool:
     return found is not None and _is_a_template_pattern(text, found[0])
 
 
+#: `vector(It first, It last) {` inside a class - a constructor, which has no
+#: return type and so is not what `_DEFINITION` reads.
+_A_TEMPLATE_CONSTRUCTOR = re.compile(
+    r"^\s*([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*(?::[^;{}]*)?\{"
+)
+
+
+def _constructor_copies(
+    text: str,
+    holder: str,
+    parameters: "list[tuple[str, bool]]",
+    declared: str,
+    pattern: str,
+) -> "list[str]":
+    """One copy of a template constructor per set of argument types built.
+
+    A constructor is never called by name, so the sites are the declarations
+    that build one: `vector__uint8_t held(first, last);` and `new
+    vector__uint8_t(first, last)`. Each copy is an ordinary constructor of
+    the class, told from the others by what it takes - which is the same
+    thing an overloaded constructor written out by hand would be.
+    """
+
+    made: "dict[str, str]" = {}
+    bare = _without_literals(text)
+    for built in re.finditer(
+        rf"(?<![.\w>])(?:new\s+)?{re.escape(holder)}\s+?\*?\s*"
+        rf"(?:[A-Za-z_]\w*)?\s*\(",
+        bare,
+    ):
+        close = _closing_paren(text, built.end() - 1)
+        if close < 0:
+            continue
+        given = _call_arguments(text, built.end() - 1)
+        if len(given) != len(_split_arguments(declared)):
+            continue
+        deduced = _deduce_arguments(
+            parameters, declared, given, text, built.start()
+        )
+        if deduced is None:
+            continue
+        named = _instantiated_name(holder, deduced)
+        if named in made:
+            continue
+        made[named] = _substituted(pattern, parameters, deduced)
+    return list(made.values())
+
+
 #: Where a member template's copies are to be written, held in the text
 #: itself so that rewriting the call sites cannot move it out from under
 #: them. Spelled with a NUL, which no program's text holds.
@@ -6655,6 +6703,31 @@ def _expand_member_templates(text: str, filename: str) -> str:
         # const read as "not a function at all" and was refused.
         definition = _DEFINITION.match(rest) or _QUALIFIED_DEFINITION.match(rest)
         if definition is None:
+            # A constructor, which has no return type and so is not what the
+            # patterns above read. `vector(It first, It last)` is the one
+            # every program that reads a file whole writes:
+            # `vector<uint8_t> held((istreambuf_iterator<char>(file)),
+            # istreambuf_iterator<char>());`.
+            around = _class_around(text, found.start())
+            built = _A_TEMPLATE_CONSTRUCTOR.match(rest)
+            if around is not None and built is not None and built.group(1) == around[1]:
+                try:
+                    shut = _matching(rest, built.end() - 1)
+                except ValueError:
+                    return text
+                copies = _constructor_copies(
+                    text[:found.start()] + text[found.end() + shut + 1:],
+                    around[1],
+                    _template_parameters(found.group(1)),
+                    built.group(2),
+                    rest[:shut + 1],
+                )
+                text = (
+                    text[:found.start()]
+                    + "\n".join(copies)
+                    + text[found.end() + shut + 1:]
+                )
+                continue
             raise CppTranslationError(
                 filename,
                 _line_of(text, found.start()),
@@ -16989,6 +17062,21 @@ _HOLDS_A_HOLDER = re.compile(r"((?:\.|->)\s*As\w*\s*\(\s*)&")
 _KEEP_ADDRESS = "\x00address"
 
 
+#: A name standing where a condition is asked: alone in an `if` or a `while`,
+#: in front of a `?`, either side of `&&` or `||`, or after a `!`.
+#: A whole path, because what is asked may be a member of a known object:
+#: `this->inside` is how a method writes one of its own.
+_A_REACHED_NAME = r"[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*"
+
+_A_NAME_IN_A_CONDITION = re.compile(
+    rf"(?<![.\w>])(?:if|while)\s*\(\s*({_A_REACHED_NAME})\s*\)"
+    rf"|(?<![.\w>])({_A_REACHED_NAME})\s*\?(?!\?)"
+    rf"|(?<![.\w>&|])({_A_REACHED_NAME})\s*(?:&&|\|\|)"
+    rf"|(?:&&|\|\|)\s*({_A_REACHED_NAME})(?![.\w(\[]|->|::)"
+    rf"|!\s*({_A_REACHED_NAME})(?![.\w(\[]|->|::)"
+)
+
+
 def _ask_objects_in_conditions(
     body: str,
     classes: "dict[str, Class]",
@@ -17008,7 +17096,19 @@ def _ask_objects_in_conditions(
     pass below this one.
     """
 
-    for variable in sorted(known, key=len, reverse=True):
+    # The names this body actually asks about, found in one scan. Walking
+    # every known object and running five substitutions over the body for
+    # each is the shape that made the translator quadratic once before: a
+    # body with forty objects and none of them in a condition paid forty
+    # rebuilds of the text to do nothing.
+    wanted: "set[str]" = set()
+    for found in _A_NAME_IN_A_CONDITION.finditer(_without_literals(body)):
+        wanted.update(
+            re.sub(r"\s*(->|\.)\s*", r"\1", one)
+            for one in found.groups()
+            if one
+        )
+    for variable in sorted(wanted & set(known), key=len, reverse=True):
         owner = known[variable]
         method = _conversion_for_a_condition(owner, classes)
         if method is None:
@@ -22845,6 +22945,18 @@ public:
     unsigned long count;
     unsigned long room;
     vector() { items = 0; count = 0; room = 0; }
+    /* A range, which is how a program reads a file whole:
+       `vector<uint8_t> held((istreambuf_iterator<char>(file)),
+       istreambuf_iterator<char>());`. Written over `!=` and `++` and
+       nothing else, which is all an input iterator promises - so a pair of
+       pointers works here as readily as a pair of stream readers. */
+    template<typename It>
+    vector(It first, It last) {
+        items = 0;
+        count = 0;
+        room = 0;
+        while (first != last) { push_back((T)(*first)); ++first; }
+    }
     unsigned long size() { return count; }
     int empty() { return count == 0; }
     /* Every element taken apart, which is what letting go of them means.
@@ -23190,6 +23302,43 @@ public:
     ofstream &operator<<(unsigned int v) { char __b[32]; snprintf(__b, 32, "%u", v); __put(__b, __length(__b)); return *this; }
     ofstream &operator<<(unsigned long v) { char __b[32]; snprintf(__b, 32, "%lu", v); __put(__b, __length(__b)); return *this; }
     ofstream &operator<<(double v) { char __b[64]; snprintf(__b, 64, "%.6g", v); __put(__b, __length(__b)); return *this; }
+};
+
+/* `vector<uint8_t> held((istreambuf_iterator<char>(file)),
+   istreambuf_iterator<char>());` - how a program reads a file whole. The
+   pair is a range: the first holds the stream and the second is the end,
+   which is what a stream with nothing left compares equal to.
+
+   One character at a time through the stream's own `get`, which is what the
+   standard's iterator does too. `T` is what the program spells - `char` - and
+   is only ever the width the stream reads. */
+template<typename T>
+class istreambuf_iterator {
+public:
+    ifstream *__from;
+    int __value;
+    int __done;
+    typedef T value_type;
+    istreambuf_iterator() { __from = 0; __value = -1; __done = 1; }
+    istreambuf_iterator(ifstream &from) {
+        __from = &from;
+        __done = 0;
+        __step();
+    }
+    void __step() {
+        if (__from == 0) { __done = 1; __value = -1; return; }
+        __value = __from->get();
+        if (__value < 0) { __done = 1; }
+    }
+    T operator*() const { return (T)__value; }
+    istreambuf_iterator<T> &operator++() { __step(); return *this; }
+    istreambuf_iterator<T> &operator++(int) { __step(); return *this; }
+    int operator==(const istreambuf_iterator<T> &other) const {
+        return __done && other.__done;
+    }
+    int operator!=(const istreambuf_iterator<T> &other) const {
+        return !(__done && other.__done);
+    }
 };
 
 /* A file open for both at once. `fstream f(p, ios::binary | ios::in |
@@ -24437,6 +24586,8 @@ optional<T> make_optional(T value) { optional<T> made(value); return made; }
 #: bound off the declaration and needs no object at all.
 _ITERATOR_HEADER = r"""
 namespace std {
+
+
 
 template<typename C> long size(C &c) { return (long)c.size(); }
 template<typename T, int N> long size(T (&a)[N]) { return (long)N; }

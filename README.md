@@ -2756,6 +2756,28 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a file read whole, through a range
+
+`std::vector<uint8_t> held((std::istreambuf_iterator<char>(file)),
+std::istreambuf_iterator<char>());` - how a program reads a file whole, and
+py2bin had none of the three pieces it needs.
+
+`istreambuf_iterator` is a class holding the stream, handing out one character
+at a time through the stream's own `get`; the empty one is the end, and two of
+them compare equal when both are spent. `vector` takes a range now, written
+over `!=` and `++` and nothing else - which is all an input iterator promises,
+so a pair of pointers works there too.
+
+And the piece under both: a template *constructor* inside a class. py2bin
+expands a member template from the calls that name it, and a constructor is
+never called by name - so it was refused as "a template written inside a class
+has to be a member function". The sites are the declarations that build one,
+and each copy is an ordinary constructor of the class, told from the others by
+what it takes.
+
+2184 tests, 580 programs against clang++, 11 projects, 3522 builds across
+six targets.
+
 ### 0.9.13 - a directory made all the way down, and an object asked whether it is true
 
 `std::error_code error; std::filesystem::create_directories(directory,
