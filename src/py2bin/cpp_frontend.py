@@ -74,6 +74,9 @@ _OPERATOR_NAMES = {
     "<=": "op_le", ">=": "op_ge", "[]": "op_index", "()": "op_call",
     "&": "op_bit_and",
     "+=": "op_add_assign", "-=": "op_sub_assign", "=": "op_assign",
+    # `p /= "piece"` is how a path is built up a piece at a time, and it is
+    # the same member `p = p / "piece"` calls written the other way.
+    "/=": "op_div_assign", "*=": "op_mul_assign",
     "<<": "op_shl", ">>": "op_shr",
     # `->` and a `*` with nothing on its left. Both are how a holder stands
     # in for what it holds - a smart pointer, an iterator - and neither is
@@ -112,7 +115,7 @@ _POSTFIX = {"op_inc": "op_inc_post", "op_dec": "op_dec_post"}
 #: so that the pattern for `+` cannot match the `+` inside `+=`. Where two
 #: bind equally the longer is tried first, for the same reason.
 _OPERATOR_PRECEDENCE = {
-    "+=": 0, "-=": 0,
+    "+=": 0, "-=": 0, "/=": 0, "*=": 0,
     "*": 1, "/": 1, "%": 1,
     "+": 2, "-": 2,
     "<<": 3, ">>": 3,
@@ -3906,6 +3909,39 @@ _BRACED_ASSIGNMENT = re.compile(r"(?<![=!<>+\-*/%&|^])=\s*\{")
 
 #: `string{}` - a value of that class, built empty, where a value goes.
 _BRACED_TEMPORARY = re.compile(r"(?<![.\w>:])([A-Za-z_]\w*)\s*\{\s*\}")
+
+#: `uint64_t{1}` - a number said to be of that type, which C spells with a
+#: cast. Only what is inside one pair of braces and holds none of its own.
+_BRACED_NUMBER = re.compile(
+    r"(?<![.\w>:])([A-Za-z_]\w*)\s*\{([^{}]*)\}"
+)
+
+
+def _rewrite_braced_numbers(text: str, filename: str) -> str:
+    """`uint64_t{1} << n` - a value of that type, which in C is a cast.
+
+    C++11 lets any type be written in front of braces, and for a number that
+    is what a cast has always been: `1` said to be sixty-four bits wide, so
+    that shifting it does not run off the end of an `int`. A program guarding
+    a replay window writes exactly that, and read as anything else the shift
+    was thirty-two bits wide and the guard let a repeat through.
+
+    Only for a type that is not a class here: a class built from braces is a
+    different thing and is read by the passes around this one.
+    """
+
+    names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+
+    def one(match: "re.Match[str]", whole: str) -> "str | None":
+        held = match.group(1)
+        if held in names or held in _NOT_A_TYPE or not _names_a_type(held):
+            return None
+        if _A_VALUE_GOES_HERE.search(_without_literals(whole)[:match.start()]) is None:
+            return None
+        inside = whole[match.start(2): match.end(2)].strip()
+        return f"(({held})({inside}))" if inside else f"(({held})0)"
+
+    return _sub_code(_BRACED_NUMBER, text, one)
 
 #: What may stand in front of one for it to be an expression rather than a
 #: declaration. A declaration has a type there, and those have been read by
@@ -16852,6 +16888,9 @@ def _rewrite_operators(
     # `*p`, `p->m()` and `!p`, where `p` is a holder standing in for what it
     # holds. None of the three takes a right operand, so the two-operand pass
     # above has nothing to match; each is written where it stands.
+    # Before the holder operators, which rewrite `!p` where a class writes
+    # `operator!`: this one leaves that spelling to them.
+    body = _ask_objects_in_conditions(body, classes, known, pointers)
     body = _rewrite_holder_operators(body, classes, known, pointers)
     # `(*v[i])(x)` - a call on something that is not a name. `v[i]` has
     # already become a call answering an address by here, and a container of
@@ -16948,6 +16987,59 @@ _HOLDS_A_HOLDER = re.compile(r"((?:\.|->)\s*As\w*\s*\(\s*)&")
 
 #: Stands in for that `&` while the rest are rewritten.
 _KEEP_ADDRESS = "\x00address"
+
+
+def _ask_objects_in_conditions(
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+) -> str:
+    """`if (file)` asks the object, and C has no way to ask a struct anything.
+
+    C++ says a condition converts what it is given to bool, and for an object
+    that is the class's own conversion - the same one `while (in >> n)` uses
+    once the stream has answered. Written where the object stands, because
+    that is where the question is asked: in an `if`, a `while`, in front of a
+    `?`, and on either side of `&&` or `||`.
+
+    `!object` is left alone where the class writes `operator!`, which is the
+    other way a holder says "there is nothing here" and is rewritten by the
+    pass below this one.
+    """
+
+    for variable in sorted(known, key=len, reverse=True):
+        owner = known[variable]
+        method = _conversion_for_a_condition(owner, classes)
+        if method is None:
+            continue
+        provider = _find_method(owner, method, classes)
+        if provider is None:
+            continue
+        address = variable if variable in pointers else f"&{variable}"
+        asked = f"{_c_name(provider, method)}({address})"
+        name = re.escape(variable)
+        spellings = [
+            (rf"(?<![.\w>])(if|while)\s*\(\s*{name}\s*\)", rf"\1 ({asked})"),
+            # In front of a `?`, which is a condition and not the arm of one.
+            (rf"(?<![.\w>]){name}\s*\?(?!\?)", f"{asked} ?"),
+            (rf"(?<![.\w>&|]){name}\s*(&&|\|\|)", rf"{asked} \1"),
+            # Not `&& this->held`: an arrow is what follows a name that is
+            # being reached through, not one being asked whether it is true,
+            # and a lookahead that excluded `.` but not `->` turned
+            # `this->held` into a conversion called on `this` and reached
+            # through.
+            (rf"(&&|\|\|)\s*{name}(?![.\w(\[]|->|::)", rf"\1 {asked}"),
+        ]
+        if _find_method(owner, "op_not", classes) is None:
+            spellings.append(
+                (rf"!\s*{name}(?![.\w(\[]|->|::)", f"!{asked}")
+            )
+        for pattern, written in spellings:
+            body = _map_code(
+                body, lambda part, p=pattern, w=written: re.sub(p, w, part)
+            )
+    return body
 
 
 def _rewrite_holder_operators(
@@ -19481,6 +19573,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # Before the assignments, so `a = string{};` is read as an assignment
     # from a value rather than as a list given to whatever holds it.
     text = _rewrite_braced_temporaries(text, filename)
+    # After it, so `string{}` has already gone: a class is not what this one
+    # is for.
+    text = _rewrite_braced_numbers(text, filename)
     # After them, because `return ok ? made : string{};` has an object in an
     # arm only once the braces have become one.
     text = _split_object_conditionals(text, filename)
@@ -24451,6 +24546,10 @@ public:
 #: py2bin can run a binary for exactly one of those here. A struct read wrong
 #: gives plausible answers, so it is left out rather than guessed at.
 _FILESYSTEM_HEADER = r"""
+/* For the overloads that report a failure instead of throwing one, which is
+   how a program that wants a directory but does not mind an existing one
+   writes it. */
+#include <system_error>
 #include <string>
 #include <py2bin_fs.h>
 
@@ -24511,6 +24610,42 @@ public:
 
     /* `p / "sub"`, which is how a path is built. The separator is only added
        where there is not one already, so joining twice does not double it. */
+    /* Built up a piece at a time, which is the other way a program writes
+       what `operator/` does. */
+    /* Written out rather than as `*this = *this / piece`: the pass that
+       turns an operator into a call reads the *program's* text, and a
+       header's own method body is where the operator would have had to be
+       rewritten for that to work. */
+    void __separate() {
+        if (__size() > 0) {
+            if (text.at(__size() - 1) != '/') { __add_text("/"); }
+        }
+    }
+    void operator/=(const char *piece) { __separate(); __add_text(piece); }
+    void operator/=(const std::string &piece) {
+        __separate();
+        int i;
+        i = 0;
+        while (i < piece.size()) { __add(piece.at(i)); i = i + 1; }
+    }
+    void operator/=(const wchar_t *piece) {
+        char __narrow[520];
+        __py2bin_fs_narrow(piece, __narrow, 520);
+        __separate();
+        __add_text(__narrow);
+    }
+    void operator/=(const std::wstring &piece) {
+        __separate();
+        int i;
+        i = 0;
+        while (i < piece.size()) { __add((char)piece.at(i)); i = i + 1; }
+    }
+    void operator/=(path piece) {
+        __separate();
+        int i;
+        i = 0;
+        while (i < piece.__size()) { __add(piece.__at(i)); i = i + 1; }
+    }
     path operator/(const char *piece) {
         path joined;
         int i;
@@ -24670,6 +24805,62 @@ unsigned long file_size(path p) {
     return (unsigned long)held;
 }
 int create_directory(path p) { return __py2bin_fs_mkdir(p.c_str()); }
+int create_directory(path p, std::error_code &error) {
+    int made;
+    made = __py2bin_fs_mkdir(p.c_str());
+    error.assign(made ? 0 : 1);
+    return made;
+}
+/* Every directory along the way, which is what the plural means. Each prefix
+   in turn, and one that is there already is not a failure - `create_directories`
+   answers false for that and leaves the error alone, as C++ says. */
+int create_directories(path p) {
+    std::string spelled = p.text;
+    unsigned long at;
+    int made;
+    made = 0;
+    at = 0;
+    while (at < spelled.size()) {
+        if (spelled[at] == '/' || spelled[at] == '\\') {
+            if (at > 0) {
+                std::string ahead = spelled.substr(0, at);
+                if (!__py2bin_fs_is_directory(ahead.c_str())) {
+                    made = __py2bin_fs_mkdir(ahead.c_str());
+                }
+            }
+        }
+        at = at + 1;
+    }
+    if (!__py2bin_fs_is_directory(spelled.c_str())) {
+        made = __py2bin_fs_mkdir(spelled.c_str());
+    }
+    return made;
+}
+int create_directories(path p, std::error_code &error) {
+    int made;
+    made = create_directories(p);
+    error.assign(0);
+    return made;
+}
+int remove(path p, std::error_code &error) {
+    int gone;
+    gone = remove(p);
+    error.assign(gone ? 0 : 1);
+    return gone;
+}
+/* Where the platform says scratch files go. */
+path temp_directory_path() {
+    path out;
+    char buffer[260];
+    buffer[0] = 0;
+    __py2bin_fs_tempdir(buffer, 260);
+    out.text.assign(buffer);
+    return out;
+}
+path temp_directory_path(std::error_code &error) {
+    error.assign(0);
+    return temp_directory_path();
+}
 int remove(path p) {
     if (__py2bin_fs_is_directory(p.c_str())) {
         return __py2bin_fs_rmdir(p.c_str());
@@ -25497,6 +25688,36 @@ public:
     + "}\n"
 )
 
+_SYSTEM_ERROR_HEADER = r"""
+
+namespace std {
+/* `std::error_code error; create_directories(p, error);` - the whole of what
+   a program uses this for: a place for a call to put a failure instead of
+   throwing one. It holds the number the platform answered with; `message()`
+   is not one of the things this can say, since py2bin has no table of
+   what a system's numbers mean, and it answers so rather than inventing
+   text. */
+class error_code {
+public:
+    int __value;
+    error_code() { __value = 0; }
+    error_code(int given) { __value = given; }
+    int value() const { return __value; }
+    void clear() { __value = 0; }
+    void assign(int given) { __value = given; }
+    operator bool() const { return __value != 0; }
+    int operator!() const { return __value == 0; }
+    int operator==(const error_code &other) const { return __value == other.__value; }
+    int operator!=(const error_code &other) const { return __value != other.__value; }
+    const char *message() const {
+        return __value == 0 ? "no error" : "the platform reported a failure";
+    }
+};
+typedef error_code error_condition;
+}
+"""
+
+
 _ARRAY_HEADER = r"""
 
 namespace std {
@@ -25897,6 +26118,7 @@ _BUILTIN_CPP_HEADERS = {
     "iterator": _ITERATOR_HEADER,
     "stdexcept": _STDEXCEPT_HEADER,
     "filesystem": _FILESYSTEM_HEADER,
+    "system_error": _SYSTEM_ERROR_HEADER,
     "functional": _FUNCTIONAL_HEADER,
 }
 

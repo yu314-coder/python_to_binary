@@ -16,6 +16,7 @@
 // expression would have to be lifted out, and lifting changes when the arms
 // are evaluated, which is the one thing about `?:` a program can depend on.
 #include <cstdio>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -55,15 +56,28 @@ static std::string longer(const std::string &one, const std::string &two) {
 // And a conditional whose arms are numbers is left exactly as it was.
 static int bigger(int a, int b) { return a > b ? a : b; }
 
+// A type in front of braces is not always a class. For a number it is what a
+// cast has always been - `1` said to be sixty-four bits wide, so that
+// shifting it does not run off the end of an `int`, which is how a program
+// guarding against a replayed packet writes it.
+static uint64_t marked(int distance) {
+    uint64_t window = 0;
+    window = window | (uint64_t{1} << distance);
+    return window;
+}
+
 int main() {
     std::string one = named(1);
     std::string none = named(0);
     Point here = placed(1);
     Point nowhere = placed(0);
     Empty empty;
+    uint64_t high = marked(40);
     printf("%s|%d|%d %d|%d %d|%d %d|%s|%d|%d\n", one.c_str(), (int)none.size(),
            here.x, here.y, nowhere.x, nowhere.y,
            (int)filled(1).size(), (int)filled(0).size(),
            longer("longer", "no").c_str(), bigger(3, 9), empty.x);
+    printf("%d %d %d %.1f %u\n", (int)(high >> 40), (int)(high >> 8) != 0,
+           int{7}, double{0.5}, unsigned{});
     return 0;
 }

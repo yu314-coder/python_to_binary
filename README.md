@@ -2756,6 +2756,39 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a directory made all the way down, and an object asked whether it is true
+
+`std::error_code error; std::filesystem::create_directories(directory,
+error);` - how a program asks for a directory, does not mind one being there
+already, and does not want a throw either. Four things py2bin did not have:
+`<system_error>`, the plural `create_directories`, the overloads that report
+through an error rather than throwing, and `temp_directory_path`. The error
+holds the number the platform answered with; `message()` says only that
+something failed, because py2bin has no table of what a system's numbers mean
+and will not invent text.
+
+`directory /= L"SidecarBridge";` - the same member `directory = directory /
+x` calls, written the other way, and the operator table had no name for `/=`
+at all.
+
+And the one this turned up on the way: `if (file)`. C++ says a condition
+converts what it is given to bool, and for an object that is the class's own
+conversion - the same one `while (in >> n)` uses once the stream has answered.
+py2bin asked it only for a *call* to one of the class's operators; an object
+standing in a condition by itself reached the C stage as a struct, which
+refused it. Now every place a condition is asked: an `if`, a `while`, in front
+of a `?`, either side of `&&` and `||`, and `!` where the class writes no
+`operator!` of its own.
+
+Both new passes were caught out by the corpus before they were pushed. The
+first read `struct B : A {};` - a colon, a class name, a pair of braces - as
+an empty object and took the base out of the class. The second read `&&
+this->held` as asking `this` whether it was true and then reaching through the
+answer, because the lookahead that excluded `.` did not exclude `->`.
+
+2184 tests, 579 programs against clang++, 11 projects, 3516 builds across six
+targets.
+
 ### 0.9.13 - an empty object where a value goes
 
 `return written > 0 ? made : std::string{};` - two shapes at once, and py2bin

@@ -2531,6 +2531,7 @@ extern BOOL MoveFileA(LPCSTR, LPCSTR);
 extern DWORD GetFileAttributesA(LPCSTR);
 extern DWORD SetFilePointer(HANDLE, LONG, LPVOID, DWORD);
 extern DWORD GetCurrentDirectoryA(DWORD, LPSTR);
+extern DWORD GetTempPathA(DWORD, LPSTR);
 
 #define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
 #define FILE_ATTRIBUTE_DIRECTORY 0x00000010
@@ -2863,6 +2864,9 @@ int __py2bin_fs_rename(const char *__a, const char *__b) {
 int __py2bin_fs_cwd(char *__into, int __room) {
     return (int)GetCurrentDirectoryA((unsigned int)__room, __into);
 }
+int __py2bin_fs_tempdir(char *__into, int __room) {
+    return (int)GetTempPathA((unsigned int)__room, __into);
+}
 
 /* A path on Windows is UTF-16 and py2bin's `path` holds UTF-8, so a path
    that came from the kernel or is going back to it is converted rather than
@@ -2979,6 +2983,20 @@ int __py2bin_fs_cwd(char *__into, int __room) {
        path is resolved against, which is the answer callers use it for. */
     if (__room > 1) { __into[0] = '.'; __into[1] = 0; return 1; }
     return 0;
+}
+int __py2bin_fs_tempdir(char *__into, int __room) {
+    /* What POSIX says it is when nothing in the environment says otherwise.
+       Reading TMPDIR would need an environment this compiles no access to,
+       and `/tmp` is the answer on every system py2bin targets. */
+    const char *__where = "/tmp";
+    int __at;
+    __at = 0;
+    while (__where[__at] != 0 && __at + 1 < __room) {
+        __into[__at] = __where[__at];
+        __at = __at + 1;
+    }
+    if (__room > 0) { __into[__at] = 0; }
+    return __at;
 }
 
 /* Everywhere else a `wchar_t` holds one code point, so the conversion is

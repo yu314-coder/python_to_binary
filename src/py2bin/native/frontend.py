@@ -292,6 +292,9 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     #: handles to one thread are different numbers, so `std::thread::id` is
     #: asked for by name rather than taken off the handle.
     "GetThreadId": ("GetThreadId", ("ptr",), "int", "KERNEL32.dll"),
+    #: Where the platform says scratch files go, which is what
+    #: `std::filesystem::temp_directory_path()` answers with.
+    "GetTempPathA": ("GetTempPathA", ("int", "ptr"), "int", "KERNEL32.dll"),
     "GetStdHandle": ("GetStdHandle", ("int",), "ptr", "KERNEL32.dll"),
     "CloseHandle": ("CloseHandle", ("ptr",), "int", "KERNEL32.dll"),
     "WriteFile": (
