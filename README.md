@@ -2756,6 +2756,25 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a flag set to a plain value
+
+`std::atomic<bool> running_; running_ = false;` - the plainest line there is,
+and py2bin had two things wrong with it.
+
+A class that says how to be assigned *from this value* uses that. `atomic`
+declares `operator=(T)`, and py2bin built an `atomic<bool>` from the `false`
+first and then assigned that object over the member - which handed the
+operator an object where it wanted a value.
+
+And the pass that writes the operator call matched only a *name* on the right.
+`false` is a `0` by the time it reads the statement, so the line was left alone
+and the C stage was handed a struct being assigned an int. The address is taken
+only where the operator wants an object; one taking a plain value wants the
+value.
+
+2184 tests, 586 programs against clang++, 11 projects, 3558 builds across six
+targets.
+
 ### 0.9.13 - a member that is a reference
 
 `WindowsTransport &transport_;` held by a session, and `transport_.start()`

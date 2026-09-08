@@ -15150,6 +15150,24 @@ def _convert_assignments(
         if not _constructs_from(held, given, classes):
             out.append(statement)
             continue
+        # A class that says how to be assigned *from this value* uses that,
+        # rather than being built from it and then copied over itself.
+        # `std::atomic<bool> running_; running_ = false;` declares
+        # `operator=(bool)`, and converting first handed that operator an
+        # object where it wanted a value - the C stage said so, about a line
+        # the program had written in the plainest way there is.
+        if any(
+            _class_named(
+                re.sub(
+                    r"\b(?:const|volatile|struct)\b", " ", one.parameters
+                ).replace("&", " ").strip()
+            )
+            != held
+            for one in _overload_set(held, "op_assign", classes)
+            if one.parameters.strip()
+        ):
+            out.append(statement)
+            continue
         out.append(
             statement[: found.start(1)]
             + f"{left} = {held}({value});"
@@ -17132,9 +17150,14 @@ def _rewrite_operators(
         # dereference of what the operator answers, which is one too many.
         # Taken with the name it cancels the address this would take: `&*p`
         # is `p`.
+        # A number as readily as a name: `std::atomic<bool> running_;
+        # running_ = false;` is the plainest line there is, and `false` is a
+        # `0` by the time this reads it. Matched only as a name, the
+        # statement was left alone and the C stage was handed a struct being
+        # assigned an int.
         pattern = re.compile(
             rf"(?<![.\w>=!<])(\*\s*)?{re.escape(variable)}\s*=(?!=)\s*"
-            rf"([A-Za-z_]\w*)\s*;"
+            rf"([A-Za-z_]\w*|-?\d+(?:\.\d+)?)\s*;"
         )
 
         def assigned(
@@ -17161,7 +17184,14 @@ def _rewrite_operators(
             declared = (
                 _parameter_types(picked.parameters) if picked is not None else []
             )
-            wants_address = not declared or not declared[0].endswith("_p")
+            # The address only where the operator wants an object. One
+            # taking a plain value - `operator=(bool)`, which is what an
+            # atomic declares - wants the value, and handed `&0` the C stage
+            # said so.
+            first = declared[0] if declared else ""
+            wants_address = not declared or (
+                not first.endswith("_p") and _class_named(first) in classes
+            )
             passed = (
                 f"&{source}"
                 if wants_address and source not in pointers
