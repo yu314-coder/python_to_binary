@@ -2756,6 +2756,25 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a walk over what a call answered
+
+`for (wchar_t character : wideFromUtf8(text))` - walking over what a call
+answered, which is how a program handles a string it has just converted.
+Three things stood in the way.
+
+The range was read as "everything up to the first `)`", so a range holding
+parentheses of its own matched nothing at all and the loop reached the C stage
+still written in C++. The header was read one code piece at a time, and a
+literal in the range splits it into two - `widened("abc")` was half a header
+either side of the string; read over the whole text with the literals blanked,
+it is one match. And the call is made once now: a range-`for` becomes an index
+loop that asks the range its size and then indexes it, so a call written there
+would have been made once for the size and once per element, which is not what
+the program says.
+
+2184 tests, 584 programs against clang++, 11 projects, 3546 builds across six
+targets.
+
 ### 0.9.13 - walking back from the end
 
 `for (auto it = held.rbegin(); it != held.rend(); ++it)` - releasing keys in

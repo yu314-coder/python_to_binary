@@ -3779,8 +3779,12 @@ _RANGE_FOR = re.compile(
     # and `for (string::iterator it = s.begin(); ...)` read as `s`, `tring`
     # and a range beginning `:iterator` - a loop over a string's characters
     # where the program wrote an ordinary iterator loop.
+    # The range may hold parentheses of its own: `for (wchar_t c :
+    # wideFromUtf8(text))` is how a program walks what a call answered, and a
+    # range read as "everything up to the first `)`" matched nothing at all
+    # there - so the loop reached the C stage as C++.
     r"\bfor\s*\(\s*([A-Za-z_][\w\s]*?)\s*([*&]*)\s*([A-Za-z_]\w*)\s*"
-    r"(?<!:):(?!:)\s*([^)]+)\)"
+    r"(?<!:):(?!:)\s*((?:[^()]|\([^()]*\))+)\)"
 )
 
 #: `static int count;` written inside a class.
@@ -3924,11 +3928,27 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
     anyway.
     """
 
-    def one(match: "re.Match[str]") -> str:
+    def one(match: "re.Match[str]", whole: str) -> "str | None":
         held = (match.group(1) + " " + match.group(2)).strip()
-        name, over = match.group(3), match.group(4).strip()
+        # From the real text: a range holding a literal - `for (char c :
+        # std::string("ab"))` - comes back with the literal blanked out
+        # otherwise.
+        name = match.group(3)
+        over = whole[match.start(4): match.end(4)].strip()
         counter[0] += 1
         index = f"__py2bin_each_{counter[0]}"
+        # What a call answered is walked over by name: the call would
+        # otherwise be made once for the bound and once for every element,
+        # and a call made more than once is not what the program wrote. The
+        # name is `auto`, which the pass that reads those settles later.
+        opened = ""
+        if "(" in _without_literals(over):
+            counter[0] += 1
+            opened = (
+                f"auto __py2bin_over_{counter[0]} = "
+                f"{whole[match.start(4): match.end(4)].strip()}; "
+            )
+            over = f"__py2bin_over_{counter[0]}"
         # A bare name is left bare: the rewriters that turn `v.size()` into a
         # call look for a name on the left, and `(v).size()` is not one.
         reached = over if over.isidentifier() else f"({over})"
@@ -3938,12 +3958,15 @@ def _rewrite_range_for(text: str, counter: "list[int]") -> str:
         extent = _array_extent(text, over) if over.isidentifier() else None
         bound = str(extent) if extent is not None else f"{reached}.size()"
         return (
-            f"for (unsigned long {index} = 0; {index} < {bound}; "
+            f"{opened}for (unsigned long {index} = 0; {index} < {bound}; "
             f"{index} = {index} + 1) "
             f"{{ {held} {name} = {reached}[{index}];"
         )
 
-    out = _map_code(text, lambda part: _RANGE_FOR.sub(one, part))
+    # Over the whole text rather than per code piece: a range with a string
+    # literal in it - `for (wchar_t c : widened("abc"))` - is one match
+    # spanning that literal, and each piece on its own held half a header.
+    out = _sub_code(_RANGE_FOR, text, one)
     if out == text:
         return text
     # The body gained an opening brace, so it needs a closing one. The loop
