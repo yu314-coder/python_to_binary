@@ -2756,6 +2756,44 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - sockets, and a prototype without a keyword
+
+Their program reached the *imports*: everything it is written in translates and
+parses, and what was left was naming the entry points it calls.
+
+Winsock is one of Windows' own libraries - `ws2_32.dll` ships with the system
+and is bound by the loader - so its entry points belong in py2bin's import
+table beside kernel32's, and not behind `--library`. That option is for a
+component somebody else shipped, and it *carries the file beside the program*,
+which for one of Windows' own is neither possible nor wanted: asked to do it,
+the build went looking for a package to download and never came back. Twenty
+of them are declared now, from `WSAStartup` to `inet_ntop`.
+
+And a platform header declares its entry points as plain prototypes - `int
+WSAStartup(WORD, LPWSADATA);` - with no `extern` in front. Only the `extern`
+spelling became an import; this one was a function declared and never defined,
+and the program was told to name a library for something that ships with the
+system. It is checked against the same table, so a header that disagrees about
+what the function takes is still refused by the disagreement.
+
+`MAKEWORD` went in with them, and `MAKELONG`, `LOWORD`, `HIWORD`, `LOBYTE` and
+`HIBYTE`: macros of the platform's that neither py2bin's `<windows.h>` nor any
+fetched header had, so `WSAStartup(MAKEWORD(2, 2), &data)` read as a call to a
+function nothing declares.
+
+The last one is not about Windows at all. `std::string formatCode(const
+std::string &digits)` and `result += digits[i]` - a container passed the way
+every container is passed, and one of its elements appended. A reference is a
+pointer here, so `digits[i]` read as pointer arithmetic and answered `string`,
+and the append chose the overload that takes a whole string over the one that
+takes a character. The pass that *writes* the subscript out already read it as
+the container's own operator; the deduction agrees with it now, reading what
+the operator answers off the prototype emitted above every call, since the
+class body is long gone by the time the question is asked.
+
+2184 tests, 588 programs against clang++, 11 projects, 3576 builds across six
+targets.
+
 ### 0.9.13 - a flag set to a plain value
 
 `std::atomic<bool> running_; running_ = false;` - the plainest line there is,

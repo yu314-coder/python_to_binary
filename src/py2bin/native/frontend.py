@@ -295,6 +295,59 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     #: Where the platform says scratch files go, which is what
     #: `std::filesystem::temp_directory_path()` answers with.
     "GetTempPathA": ("GetTempPathA", ("int", "ptr"), "int", "KERNEL32.dll"),
+
+    #: Sockets, which on Windows are a library of the platform's like any
+    #: other - `ws2_32.dll` ships with the system and is bound by the loader.
+    #: Named here rather than left to `--library`: that option is for a
+    #: component somebody else shipped, and it carries the file beside the
+    #: program, which is neither possible nor wanted for one of Windows' own.
+    #: A socket is a handle-width word, so it and everything that takes one
+    #: are pointers here.
+    "WSAStartup": ("WSAStartup", ("int", "ptr"), "int", "WS2_32.dll"),
+    "WSACleanup": ("WSACleanup", (), "int", "WS2_32.dll"),
+    "WSAGetLastError": ("WSAGetLastError", (), "int", "WS2_32.dll"),
+    "socket": ("socket", ("int", "int", "int"), "ptr", "WS2_32.dll"),
+    "closesocket": ("closesocket", ("ptr",), "int", "WS2_32.dll"),
+    "bind": ("bind", ("ptr", "ptr", "int"), "int", "WS2_32.dll"),
+    "listen": ("listen", ("ptr", "int"), "int", "WS2_32.dll"),
+    "accept": ("accept", ("ptr", "ptr", "ptr"), "ptr", "WS2_32.dll"),
+    "connect": ("connect", ("ptr", "ptr", "int"), "int", "WS2_32.dll"),
+    "shutdown": ("shutdown", ("ptr", "int"), "int", "WS2_32.dll"),
+    "recv": ("recv", ("ptr", "ptr", "int", "int"), "int", "WS2_32.dll"),
+    "send": ("send", ("ptr", "ptr", "int", "int"), "int", "WS2_32.dll"),
+    "recvfrom": (
+        "recvfrom", ("ptr", "ptr", "int", "int", "ptr", "ptr"), "int",
+        "WS2_32.dll",
+    ),
+    "sendto": (
+        "sendto", ("ptr", "ptr", "int", "int", "ptr", "int"), "int",
+        "WS2_32.dll",
+    ),
+    "setsockopt": (
+        "setsockopt", ("ptr", "int", "int", "ptr", "int"), "int", "WS2_32.dll",
+    ),
+    "getsockopt": (
+        "getsockopt", ("ptr", "int", "int", "ptr", "ptr"), "int", "WS2_32.dll",
+    ),
+    "select": (
+        "select", ("int", "ptr", "ptr", "ptr", "ptr"), "int", "WS2_32.dll",
+    ),
+    "ioctlsocket": ("ioctlsocket", ("ptr", "int", "ptr"), "int", "WS2_32.dll"),
+    "getsockname": (
+        "getsockname", ("ptr", "ptr", "ptr"), "int", "WS2_32.dll",
+    ),
+    "htons": ("htons", ("int",), "int", "WS2_32.dll"),
+    "htonl": ("htonl", ("int",), "int", "WS2_32.dll"),
+    "ntohs": ("ntohs", ("int",), "int", "WS2_32.dll"),
+    "ntohl": ("ntohl", ("int",), "int", "WS2_32.dll"),
+    "inet_pton": ("inet_pton", ("int", "ptr", "ptr"), "int", "WS2_32.dll"),
+    "inet_ntop": (
+        "inet_ntop", ("int", "ptr", "ptr", "int"), "ptr", "WS2_32.dll",
+    ),
+    "getaddrinfo": (
+        "getaddrinfo", ("ptr", "ptr", "ptr", "ptr"), "int", "WS2_32.dll",
+    ),
+    "freeaddrinfo": ("freeaddrinfo", ("ptr",), "void", "WS2_32.dll"),
     "GetStdHandle": ("GetStdHandle", ("int",), "ptr", "KERNEL32.dll"),
     "CloseHandle": ("CloseHandle", ("ptr",), "int", "KERNEL32.dll"),
     "WriteFile": (

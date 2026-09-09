@@ -2296,6 +2296,15 @@ typedef struct _LIST_ENTRY {
 #define DECLSPEC_NOINLINE
 #define DECLSPEC_DEPRECATED
 #define DECLSPEC_CACHEALIGN
+/* Words out of bytes and longs out of words. `WSAStartup(MAKEWORD(2, 2),
+   &data)` is the first line of every program that opens a socket on Windows,
+   and these are macros of the platform's that nothing here had. */
+#define MAKEWORD(a, b) ((WORD)(((BYTE)((a) & 0xff)) | ((WORD)((BYTE)((b) & 0xff))) << 8))
+#define MAKELONG(a, b) ((LONG)(((WORD)((a) & 0xffff)) | ((DWORD)((WORD)((b) & 0xffff))) << 16))
+#define LOWORD(l) ((WORD)((l) & 0xffff))
+#define HIWORD(l) ((WORD)(((DWORD)(l) >> 16) & 0xffff))
+#define LOBYTE(w) ((BYTE)((w) & 0xff))
+#define HIBYTE(w) ((BYTE)(((WORD)(w) >> 8) & 0xff))
 /* What a hand-written header hangs off a declaration to tell a compiler how
    the function behaves - what frees what it returns, that its answer is
    fresh memory. Nothing about the declaration, so nothing here, and a

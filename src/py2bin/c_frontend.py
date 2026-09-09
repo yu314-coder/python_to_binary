@@ -5891,6 +5891,44 @@ class Lowerer:
                 "translation unit or a declared extern",
                 node.token,
             )
+        if function.body is None and node.name in _CABI_SYMBOLS:
+            # A prototype for a symbol py2bin knows how to import, written
+            # the way a platform header writes one - `int WSAStartup(WORD,
+            # LPWSADATA);`, with no `extern` in front of it. The `extern`
+            # spelling has always become an import here; this one was a
+            # function declared and never defined, and the program was told
+            # to name a library for something that ships with the system.
+            # Checked against the same table, so a header that disagrees
+            # about what the function takes is refused by the disagreement.
+            declared = [held for held, _spelled in function.parameters]
+            _symbol, signature = _CABI_SYMBOLS[node.name]
+            if len(declared) != len(signature):
+                self.error(
+                    f"prototype for {node.name!r} declares {len(declared)} "
+                    f"parameter(s) but its vetted adapter ABI takes "
+                    f"{len(signature)}",
+                    node.token,
+                )
+            for position, (held, kind) in enumerate(
+                zip(declared, signature), 1
+            ):
+                if not _matches_abi(held, kind):
+                    self.error(
+                        f"parameter {position} of {node.name!r} is declared "
+                        f"{held!r} but its vetted adapter ABI passes {kind!r}",
+                        node.token,
+                    )
+            if not _matches_abi(
+                function.result, _CABI_RESULTS[node.name], result=True
+            ):
+                self.error(
+                    f"prototype for {node.name!r} returns "
+                    f"{str(function.result)!r} but its vetted adapter ABI "
+                    f"returns {_CABI_RESULTS[node.name]!r}",
+                    node.token,
+                )
+            self.unit.externs[node.name] = function.result
+            return self.extern_call(node, discarded=False)
         if function.body is None:
             self.error(
                 f"call to {node.name!r}, which is declared but never defined; "

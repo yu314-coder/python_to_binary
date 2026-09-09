@@ -2619,13 +2619,48 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
     indexed = _INDEXED.match(spelled)
     if indexed is not None:
         held = _deduced_type(indexed.group(1).strip(), text, before)
-        if held is not None and "*" in held:
-            return held[::-1].replace("*", "", 1)[::-1].strip()
-        if held is not None:
+        if held is not None and "*" not in held:
             # A container indexed answers whatever its subscript operator
             # declares. That is where `for (auto &x : v)` gets the type of
             # what it walks over.
-            return _subscript_result(text, held.strip())
+            plain = re.sub(
+                r"\b(?:const|volatile|struct)\b", " ", held
+            ).strip()
+            through = _subscript_result(text, plain)
+            if through is None:
+                # As below: the class body is gone by the time this is
+                # asked, and the emitted prototype is what is left.
+                emitted = _declared_return(text, plain, "op_index")
+                if emitted is not None and emitted.endswith("*"):
+                    through = emitted[:-1].strip()
+            return through
+        if held is not None and "*" in held:
+            # A *reference* to a container is a pointer here, and `digits[i]`
+            # on one asks the container for its element - not the element of
+            # an array of containers. `const std::string &digits` is how a
+            # string is passed to a function, and read as pointer arithmetic
+            # the type of `digits[i]` came back as `string`, so `result +=
+            # digits[i]` chose the overload that appends a whole string
+            # rather than the one that appends a character. The pass that
+            # writes the subscript out already reads it as the operator; this
+            # is what it takes for the deduction to agree with it.
+            plain = re.sub(
+                r"\b(?:const|volatile|struct)\b", " ", held
+            ).replace("*", " ").strip()
+            through = _subscript_result(text, plain)
+            if through is None:
+                # The class body is not in the text once the classes have
+                # been written out, and this question is asked after that.
+                # The durable record is the prototype emitted above every
+                # call - `char *string__op_index(...)` - where the `&` of a
+                # reference return has already become a `*`, so one comes
+                # back off.
+                emitted = _declared_return(text, plain, "op_index")
+                if emitted is not None and emitted.endswith("*"):
+                    through = emitted[:-1].strip()
+            if through is not None:
+                return through
+            return held[::-1].replace("*", "", 1)[::-1].strip()
         return None
     # `c ? a : b` - both arms have the same type in a program that compiles,
     # so either one answers. Read as arithmetic below, the `?` was not an
