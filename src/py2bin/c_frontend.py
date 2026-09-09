@@ -1078,6 +1078,9 @@ _CTYPE_OF_ABI.update(
         "float": DOUBLE,
         "void": VOID,
         "ptr": PointerType(VOID),
+        # What a `SOCKET` is: a word wide enough to hold a pointer, which
+        # the callee treats as a number and never follows.
+        "handle": ULLONG,
     }
 )
 
@@ -3900,6 +3903,17 @@ def _matches_abi(ctype: CType, kind: str, *, result: bool = False) -> bool:
         return isinstance(ctype, IntegerType)
     if kind == "ptr":
         return isinstance(ctype, PointerType)
+    if kind == "handle":
+        # A whole machine word the callee never dereferences: a pointer, or
+        # an integer as wide as one. `SOCKET` is `UINT_PTR` - `unsigned long
+        # long` on every target py2bin builds for - so a prototype written
+        # the way Windows writes it was being refused for agreeing with
+        # Windows. A narrower integer stays refused, because there the
+        # difference is real: half the word would be left behind.
+        return isinstance(ctype, PointerType) or (
+            isinstance(ctype, IntegerType)
+            and ctype.size == size_of(PointerType(VOID))
+        )
     if kind == "f64":
         # Specifically a double. A C ``float`` is passed in the same register
         # class but is half the width, so accepting it would hand the callee
@@ -5843,6 +5857,46 @@ class Lowerer:
             return _ARGUMENT_CEILING
         return _MAXIMUM_ARGUMENTS
 
+    def vetted_prototype(self, function: "Function", node: Call) -> None:
+        """Take a prototype for a symbol py2bin imports as the import itself.
+
+        A prototype written the way a platform header writes one - `int
+        WSAStartup(WORD, LPWSADATA);`, with no `extern` in front of it. The
+        `extern` spelling has always become an import here; this one was a
+        function declared and never defined, and the program was told to name
+        a library for something that ships with the system. Checked against
+        the same table, so a header that disagrees about what the function
+        takes is refused by the disagreement.
+        """
+
+        declared = [held for held, _spelled in function.parameters]
+        _symbol, signature = _CABI_SYMBOLS[node.name]
+        if len(declared) != len(signature):
+            self.error(
+                f"prototype for {node.name!r} declares {len(declared)} "
+                f"parameter(s) but its vetted adapter ABI takes "
+                f"{len(signature)}",
+                node.token,
+            )
+        for position, (held, kind) in enumerate(zip(declared, signature), 1):
+            if not _matches_abi(held, kind):
+                self.error(
+                    f"parameter {position} of {node.name!r} is declared "
+                    f"{str(held)!r} but its vetted adapter ABI passes "
+                    f"{kind!r}",
+                    node.token,
+                )
+        if not _matches_abi(
+            function.result, _CABI_RESULTS[node.name], result=True
+        ):
+            self.error(
+                f"prototype for {node.name!r} returns "
+                f"{str(function.result)!r} but its vetted adapter ABI "
+                f"returns {_CABI_RESULTS[node.name]!r}",
+                node.token,
+            )
+        self.unit.externs[node.name] = function.result
+
     def call(self, node: Call) -> Value:
         if node.name in _MATH_BUILTINS and self.lookup(node.name) is None:
             if node.name not in self.unit.functions:
@@ -5922,42 +5976,7 @@ class Lowerer:
                 node.token,
             )
         if function.body is None and node.name in _CABI_SYMBOLS:
-            # A prototype for a symbol py2bin knows how to import, written
-            # the way a platform header writes one - `int WSAStartup(WORD,
-            # LPWSADATA);`, with no `extern` in front of it. The `extern`
-            # spelling has always become an import here; this one was a
-            # function declared and never defined, and the program was told
-            # to name a library for something that ships with the system.
-            # Checked against the same table, so a header that disagrees
-            # about what the function takes is refused by the disagreement.
-            declared = [held for held, _spelled in function.parameters]
-            _symbol, signature = _CABI_SYMBOLS[node.name]
-            if len(declared) != len(signature):
-                self.error(
-                    f"prototype for {node.name!r} declares {len(declared)} "
-                    f"parameter(s) but its vetted adapter ABI takes "
-                    f"{len(signature)}",
-                    node.token,
-                )
-            for position, (held, kind) in enumerate(
-                zip(declared, signature), 1
-            ):
-                if not _matches_abi(held, kind):
-                    self.error(
-                        f"parameter {position} of {node.name!r} is declared "
-                        f"{held!r} but its vetted adapter ABI passes {kind!r}",
-                        node.token,
-                    )
-            if not _matches_abi(
-                function.result, _CABI_RESULTS[node.name], result=True
-            ):
-                self.error(
-                    f"prototype for {node.name!r} returns "
-                    f"{str(function.result)!r} but its vetted adapter ABI "
-                    f"returns {_CABI_RESULTS[node.name]!r}",
-                    node.token,
-                )
-            self.unit.externs[node.name] = function.result
+            self.vetted_prototype(function, node)
             return self.extern_call(node, discarded=False)
         if function.body is None:
             self.error(
@@ -6107,10 +6126,15 @@ class Lowerer:
                 arguments.append(CStringConstant(argument.data + b"\0"))
                 continue
             value = self.rvalue(argument)
-            if kind == "ptr":
+            if kind in ("ptr", "handle"):
                 if value.null:
                     arguments.append(IntConstant(0))
                 elif isinstance(value.ctype, PointerType):
+                    arguments.append(value.expr)
+                elif kind == "handle" and _matches_abi(value.ctype, kind):
+                    # A socket, which the callee reads as a number. Passed as
+                    # the whole word it is, without the narrowing an "int"
+                    # would have written.
                     arguments.append(value.expr)
                 else:
                     self.error(
@@ -6732,6 +6756,20 @@ class Lowerer:
                     node.name,
                     _CTYPE_OF_ABI.get(_CABI_RESULTS[node.name], INT),
                 )
+                self.extern_call(node, discarded=True)
+                return
+            # And one a header *did* write a prototype for, called where its
+            # answer is thrown away. Read as a value instead, a symbol whose
+            # prototype says `void` - `freeaddrinfo(addresses);` - was
+            # refused for having no value to give, which is exactly what the
+            # statement was not asking for.
+            prototyped = self.unit.functions.get(node.name)
+            if (
+                prototyped is not None
+                and prototyped.body is None
+                and node.name in _CABI_SYMBOLS
+            ):
+                self.vetted_prototype(prototyped, node)
                 self.extern_call(node, discarded=True)
                 return
         if isinstance(node, Comma):

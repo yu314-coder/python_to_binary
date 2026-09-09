@@ -117,6 +117,11 @@ _KERNEL_EXPORTS = {
 #             Lowered exactly like "int"; the distinct name is what lets the
 #             canonical-C frontend reject passing a plain integer where the
 #             callee will dereference a pointer.
+#   "handle" -- a whole machine word the callee never follows: a pointer, or
+#             an integer as wide as one. Windows' `SOCKET` is `UINT_PTR`, so
+#             a program that says so is right and "ptr" would refuse it -
+#             while a plain `int` is still refused, since half a word is not
+#             a socket. Lowered exactly like "ptr".
 #   "cstr" -- a compile-time string constant, materialized as a NUL-terminated
 #             blob whose pointer is passed.
 #   "cdata" -- like "cstr", but the callee is told the length separately and so
@@ -301,40 +306,47 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
     #: Named here rather than left to `--library`: that option is for a
     #: component somebody else shipped, and it carries the file beside the
     #: program, which is neither possible nor wanted for one of Windows' own.
-    #: A socket is a handle-width word, so it and everything that takes one
-    #: are pointers here.
+    #: A socket is a handle-width word, and Windows spells it as one:
+    #: `SOCKET` is `UINT_PTR`, an unsigned integer wide enough to hold a
+    #: pointer, and nothing ever follows it. That is the "handle" kind - a
+    #: whole word, taken as a pointer or as an integer of the same width -
+    #: rather than "ptr", which is for a pointer the callee dereferences.
     "WSAStartup": ("WSAStartup", ("int", "ptr"), "int", "WS2_32.dll"),
     "WSACleanup": ("WSACleanup", (), "int", "WS2_32.dll"),
     "WSAGetLastError": ("WSAGetLastError", (), "int", "WS2_32.dll"),
-    "socket": ("socket", ("int", "int", "int"), "ptr", "WS2_32.dll"),
-    "closesocket": ("closesocket", ("ptr",), "int", "WS2_32.dll"),
-    "bind": ("bind", ("ptr", "ptr", "int"), "int", "WS2_32.dll"),
-    "listen": ("listen", ("ptr", "int"), "int", "WS2_32.dll"),
-    "accept": ("accept", ("ptr", "ptr", "ptr"), "ptr", "WS2_32.dll"),
-    "connect": ("connect", ("ptr", "ptr", "int"), "int", "WS2_32.dll"),
-    "shutdown": ("shutdown", ("ptr", "int"), "int", "WS2_32.dll"),
-    "recv": ("recv", ("ptr", "ptr", "int", "int"), "int", "WS2_32.dll"),
-    "send": ("send", ("ptr", "ptr", "int", "int"), "int", "WS2_32.dll"),
+    "socket": ("socket", ("int", "int", "int"), "handle", "WS2_32.dll"),
+    "closesocket": ("closesocket", ("handle",), "int", "WS2_32.dll"),
+    "bind": ("bind", ("handle", "ptr", "int"), "int", "WS2_32.dll"),
+    "listen": ("listen", ("handle", "int"), "int", "WS2_32.dll"),
+    "accept": ("accept", ("handle", "ptr", "ptr"), "handle", "WS2_32.dll"),
+    "connect": ("connect", ("handle", "ptr", "int"), "int", "WS2_32.dll"),
+    "shutdown": ("shutdown", ("handle", "int"), "int", "WS2_32.dll"),
+    "recv": ("recv", ("handle", "ptr", "int", "int"), "int", "WS2_32.dll"),
+    "send": ("send", ("handle", "ptr", "int", "int"), "int", "WS2_32.dll"),
     "recvfrom": (
-        "recvfrom", ("ptr", "ptr", "int", "int", "ptr", "ptr"), "int",
+        "recvfrom", ("handle", "ptr", "int", "int", "ptr", "ptr"), "int",
         "WS2_32.dll",
     ),
     "sendto": (
-        "sendto", ("ptr", "ptr", "int", "int", "ptr", "int"), "int",
+        "sendto", ("handle", "ptr", "int", "int", "ptr", "int"), "int",
         "WS2_32.dll",
     ),
     "setsockopt": (
-        "setsockopt", ("ptr", "int", "int", "ptr", "int"), "int", "WS2_32.dll",
+        "setsockopt", ("handle", "int", "int", "ptr", "int"), "int",
+        "WS2_32.dll",
     ),
     "getsockopt": (
-        "getsockopt", ("ptr", "int", "int", "ptr", "ptr"), "int", "WS2_32.dll",
+        "getsockopt", ("handle", "int", "int", "ptr", "ptr"), "int",
+        "WS2_32.dll",
     ),
     "select": (
         "select", ("int", "ptr", "ptr", "ptr", "ptr"), "int", "WS2_32.dll",
     ),
-    "ioctlsocket": ("ioctlsocket", ("ptr", "int", "ptr"), "int", "WS2_32.dll"),
+    "ioctlsocket": (
+        "ioctlsocket", ("handle", "int", "ptr"), "int", "WS2_32.dll",
+    ),
     "getsockname": (
-        "getsockname", ("ptr", "ptr", "ptr"), "int", "WS2_32.dll",
+        "getsockname", ("handle", "ptr", "ptr"), "int", "WS2_32.dll",
     ),
     "htons": ("htons", ("int",), "int", "WS2_32.dll"),
     "htonl": ("htonl", ("int",), "int", "WS2_32.dll"),

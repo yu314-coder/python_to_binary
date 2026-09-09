@@ -775,6 +775,38 @@ def _plainly_c(inner: str) -> bool:
     return "(" not in written
 
 
+def _a_member_is_given_a_value(inner: str) -> bool:
+    """Whether this struct body declares a member with a value on it.
+
+    `struct Session { int socket = 0; };` has no method in it, so it read as
+    C already and went out exactly as it was written - with the `= 0` still
+    on the member, which is not C at all. A value on a member belongs in the
+    constructor, and writing it there is what the class machinery does; a
+    struct with one is not plainly C and has to go through it.
+
+    Only at the top of the body: `enum { A = 1 };` written inside a struct is
+    C, and so is the `=` in it.
+    """
+
+    bare = _without_literals(_without_decorations(inner))
+    depth = 0
+    for index, letter in enumerate(bare):
+        if letter == "{":
+            # A nested body - a tagged member's own, or an enum's. Anything
+            # else opening a brace at this level is C++'s brace initialiser
+            # on a member: `std::atomic<bool> running_{false};`.
+            if depth == 0 and not re.search(
+                r"\b(?:struct|union|enum)\b[^;{}]*$", bare[:index]
+            ):
+                return True
+            depth += 1
+        elif letter == "}":
+            depth -= 1
+        elif letter == "=" and depth == 0 and bare[index + 1: index + 2] != "=":
+            return True
+    return False
+
+
 def _holds_a_class(inner: str, known: "list[str]") -> bool:
     """Whether a struct body declares a member that is one of those classes.
 
@@ -4407,8 +4439,29 @@ def _built_one_member_at_a_time(
     ):
         return None
     names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
-    if not any(_a_class_here(spelled, names) for _one, spelled in members):
+    # A member whose class writes a constructor is the whole reason for this
+    # pass: that constructor is what an initialiser list has to call. Where
+    # no member has one - `sockaddr_in`, whose members are numbers and an
+    # `in_addr` that is itself only numbers - the struct is an aggregate in C
+    # exactly as it is in C++, and C initialises it. Built here instead, a
+    # member this could not write a value for was left out and arrived
+    # uninitialised, which nothing says out loud.
+    built = {
+        head.group(2)
+        for head in _CLASS_HEAD.finditer(text)
+        if _has_a_constructor(text, head)
+    }
+    if not any(_a_class_here(spelled, built) for _one, spelled in members):
         return None
+    # An array member reads as a pointer in the table above, and the two are
+    # not the same thing to assign to: `char sin_zero[8]` given `= 0` is not
+    # C. Read off the body, which is where the extent still is.
+    arrays = {
+        one.group(1)
+        for one in re.finditer(
+            r"\b([A-Za-z_]\w*)\s*\[", _without_literals(text[head.end(): closing - 1])
+        )
+    }
     values = [one.strip() for one in _split_arguments(inside)] if inside.strip() else []
     if len(values) > len(members):
         return None
@@ -4421,6 +4474,10 @@ def _built_one_member_at_a_time(
     for index, (member_name, spelled) in enumerate(members):
         if index < len(values):
             out.append(f"{name}.{member_name} = {values[index]};")
+        elif member_name in arrays:
+            # Nothing to write that would be right, so the whole thing is
+            # left rather than half-done.
+            return None
         elif not _a_class_here(spelled, names):
             out.append(f"{name}.{member_name} = 0;")
     return " ".join(out)
@@ -12601,23 +12658,23 @@ def _constructor_taking(
 
 def _same_class(
     value: str, held: str, scope: str, classes: "dict[str, Class]",
-    nearer: str = "",
+    nearer: "str | tuple[str, ...]" = (),
 ) -> bool:
     """Whether `value` names an object of exactly the class `held`.
 
-    `nearer` is the text whose declarations are the closer ones - a function
-    body, where the scope is the whole unit around it. Asked of the unit
-    alone, a name the program declares locally was answered with a member of
-    some shipped header that happens to share it: `char text[64]` here and
-    `string text;` inside <filesystem>'s path, so `s = text` was read as a
-    copy of a string and nothing was constructed.
+    `nearer` is the text of the scopes whose declarations are the closer
+    ones, innermost first - a block, then the function around it - where
+    `scope` is the whole unit outside them. Asked of the unit alone, a name
+    the program declares locally was answered with a member of some shipped
+    header that happens to share it: `char text[64]` here and `string text;`
+    inside <filesystem>'s path, so `s = text` was read as a copy of a string
+    and nothing was constructed.
     """
 
     if held not in classes:
         return False
-    spelled = (_deduced_type(value, nearer) if nearer else None) or _deduced_type(
-        value, scope
-    )
+    closer = (nearer,) if isinstance(nearer, str) else tuple(nearer)
+    spelled = _nearest_type(value, (*closer, scope))
     if spelled is None or "*" in spelled:
         return False
     return spelled.replace("const", "").strip() == held
@@ -15132,8 +15189,30 @@ def _rewrite_member_pointers(
     return _map_code(body, lambda part: re.sub(r",\s*\)", ")", part))
 
 
+def _nearest_type(expression: str, scopes: "tuple[str, ...]") -> "str | None":
+    """The type the nearest of these scopes gives a name, innermost first.
+
+    C++ looks a name up one scope at a time and stops at the first that
+    declares it. A reader handed every scope at once answers with whichever
+    declaration it happens to reach last, which is not the same thing - and
+    where the scopes end in the whole unit, that last one is a member of some
+    class in a shipped header.
+    """
+
+    for scope in scopes:
+        if not scope:
+            continue
+        held = _deduced_type(expression, scope)
+        if held is not None:
+            return held
+    return None
+
+
 def _convert_assignments(
-    body: str, classes: "dict[str, Class]", text: str
+    body: str,
+    classes: "dict[str, Class]",
+    text: str,
+    outer: "tuple[str, ...]" = (),
 ) -> str:
     """`s = "a";` becomes `s = string("a");` - the temporary C++ builds.
 
@@ -15160,7 +15239,7 @@ def _convert_assignments(
         # value below: `const char *text = "given";` here and `string text;`
         # in a shipped header are two names, and the wrong one was answered.
         held = (
-            _deduced_type(left, body)
+            _nearest_type(left, (body, *outer))
             or _deduced_type(left, text)
             or _lvalue_class(left, text, classes)
         )
@@ -15194,7 +15273,7 @@ def _convert_assignments(
         # shipped header uses for a member of its own - `char text[64]` here
         # and `string text;` inside <filesystem>'s path - so the value was
         # said to be a string already and nothing was converted.
-        given = _deduced_type(value, body) or _deduced_type(value, text)
+        given = _nearest_type(value, (body, *outer)) or _deduced_type(value, text)
         if given is None:
             out.append(statement)
             continue
@@ -15401,6 +15480,14 @@ def _rewrite_body(
     inherited_references: "dict[str, str] | None" = None,
     referenced: "set[str] | None" = None,
     stable: str = "",
+    #: The text of the scopes this one sits inside, innermost first. A block
+    #: is rewritten on its own, so a name declared by the function around it
+    #: is not in its text at all - and a reader that fell straight through to
+    #: the whole unit found `string text;` inside a shipped header where the
+    #: function had written `char text[16]`. Kept apart rather than joined,
+    #: because a name is looked up in one scope at a time and the nearest
+    #: answer is the one C++ takes.
+    outer: "tuple[str, ...]" = (),
     #: The parameter list of the function this body belongs to, so a name it
     #: was given can be typed. `known` holds what the body declares, and a
     #: parameter is declared above it - which is text no reader inside the
@@ -15471,7 +15558,7 @@ def _rewrite_body(
             # class already gets. Without it there was no constructor to
             # choose and the overload set was reported as unreadable.
             if len(given) == 1 and _same_class(
-                given[0], type_name, scope(), classes, body
+                given[0], type_name, scope(), classes, (body, *outer)
             ) and not _constructor_taking_one(type_name, type_name, classes):
                 if _find_method(type_name, "~", classes):
                     destroyed.append(variable)
@@ -15626,7 +15713,11 @@ def _rewrite_body(
     # is what lets the pass below hoist it like any other. Before that pass,
     # and before the subscript rewrite, so the left side is still written the
     # way the program wrote it - `m[3]` and not a call.
-    body = _convert_assignments(body, classes, unit or body)
+    # The scopes around this one are asked before the whole unit, which is
+    # the order C++ looks a name up in. A block that does not declare `text`
+    # itself takes the enclosing function's declaration of it, not a member
+    # of that name in some other class.
+    body = _convert_assignments(body, classes, unit or body, outer)
 
     # `items[i].~T()` - where a container takes its elements apart. Before
     # the temporaries, which otherwise read the `C()` of `~C()` as one being
@@ -16325,6 +16416,9 @@ def _rewrite_body(
             referenced=set(referenced or ()) | set(local_references),
             stable=stable,
             leaves=_body_a_jump_leaves(body, number),
+            # This scope is the one around the block, and the scopes around
+            # this one are around it too.
+            outer=(body, *outer),
         )
         for number, inner in enumerate(blocks)
     ]
@@ -17213,9 +17307,17 @@ def _rewrite_operators(
         # `0` by the time this reads it. Matched only as a name, the
         # statement was left alone and the C stage was handed a struct being
         # assigned an int.
+        # And an expression: `discoverySocket_ = static_cast<uintptr_t>(socket);`
+        # arrives here as `held_ = (uintptr_t)(socket);`, and matched as
+        # neither a name nor a number it was left for the C stage to refuse.
+        # Read to the `;` with parentheses balanced two deep and no `=`
+        # inside, so what is matched is one expression and this statement's
+        # own - `x = y = 0;` is not one of these. What it means is still read
+        # by the deducer below, and an expression it cannot type is left
+        # exactly as it was.
         pattern = re.compile(
             rf"(?<![.\w>=!<])(\*\s*)?{re.escape(variable)}\s*=(?!=)\s*"
-            rf"([A-Za-z_]\w*|-?\d+(?:\.\d+)?)\s*;"
+            rf"((?:[^()=;]|\((?:[^()=;]|\([^()=;]*\))*\))+?)\s*;"
         )
 
         def assigned(
@@ -17250,6 +17352,12 @@ def _rewrite_operators(
             wants_address = not declared or (
                 not first.endswith("_p") and _class_named(first) in classes
             )
+            if wants_address and not re.fullmatch(r"[A-Za-z_][\w.>-]*", source):
+                # An operator that wants an object, given an expression that
+                # is not a name: there is nothing here whose address could be
+                # taken, and `&(a + b)` is not C. Left for the passes that
+                # give a temporary a name of its own.
+                return match.group(0)
             passed = (
                 f"&{source}"
                 if wants_address and source not in pointers
@@ -20167,6 +20275,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         if (
             keyword == "struct"
             and _plainly_c(inner)
+            and not _a_member_is_given_a_value(inner)
             and not _bases_of(head)
             and not _holds_a_class(inner, order)
         ):

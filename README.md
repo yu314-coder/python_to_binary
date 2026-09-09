@@ -2756,6 +2756,56 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the scopes a block sits inside
+
+Six of theirs, all found by building their Windows companion.
+
+`char text[INET_ADDRSTRLEN]{}` declared in a loop body, used inside an `if`
+inside it. The C++ stage lifts every nested block out and rewrites it on its
+own, so a name the enclosing function declared is not in the block's text at
+all - and the reader, falling straight through to the whole unit, found
+`string text;` inside py2bin's own `<filesystem>` again. A block now carries
+the text of the scopes it sits inside, nearest first, and a name is looked up
+in one scope at a time the way C++ looks it up. Handing the reader all of them
+joined does not do it: it answers with the last match, which is the header's.
+
+`freeaddrinfo(addresses);` - a call to a symbol py2bin imports, written as a
+statement, where the header's prototype says it answers nothing. Read through
+the value path, it was refused for having no value to give, which is what the
+statement had not asked for.
+
+`SOCKET listener = socket(...)`. Windows spells a socket `UINT_PTR`: an
+unsigned integer wide enough to hold a pointer, which nothing ever follows.
+The vetted table called it a pointer, so a program declaring it the way
+Windows declares it was refused for agreeing with Windows. There is a kind for
+that now - a handle: a pointer, or a word of the same width. A plain `int` is
+still refused, and `ptr` is untouched, so a `PyObject *` still cannot be an
+integer somebody made up.
+
+`sockaddr_in address{}` was built one member at a time - which is a pass for
+members whose class has a constructor to call. `char sin_zero[8]` was handed
+`= 0`, which is not C, and `sin_addr`, being a struct, was left out and
+arrived holding whatever the stack held. Where no member's class writes a
+constructor, the struct is an aggregate in C exactly as it is in C++, and C
+initialises it.
+
+`discoverySocket_ = static_cast<uintptr_t>(socket);` where the member is a
+`std::atomic`. The rewrite that turns an assignment into the class's own
+`operator=` read a name and a number, and a cast is neither by the time it
+gets there - so the statement stood and the C stage was handed a struct being
+assigned an integer. It reads the whole expression now, to the `;`, and hands
+back anything it cannot type unchanged.
+
+`struct Session { int socket = 0; };`. A struct with no method in it is C
+already and goes out exactly as it was written - which put the `= 0` in front
+of a C compiler. A value on a member is C++ wherever it is written, and it
+belongs in the constructor; a struct with one goes through the machinery that
+writes it there. An `=` inside an `enum` written in the body is still C, and
+is left alone.
+
+2184 tests, 598 programs against clang++, 11 projects, 3630 builds across
+six targets.
+
 ### 0.9.13 - a local that shares a name with a header
 
 `char text[64]; ... localAddress_ = text;` - a buffer filled by a call and
