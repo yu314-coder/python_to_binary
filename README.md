@@ -2756,6 +2756,24 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an argument that converts to the parameter
+
+`std::string escapeJson(const std::string &value);` called as
+`escapeJson(state)` where `state` is a `const char *`. C++ builds a string and
+binds the reference to that; py2bin took the address of the pointer and handed
+the C stage a `char **`.
+
+The check that stops it was already written - a reference to a class binds to
+an object of that class and only then - and it looked the parameter's type up
+by where the argument stands in the *call* rather than by where the parameter
+stands in the *declaration*. Those differ by one for every function that
+answers an object, because the caller's space goes in front. So for exactly
+the calls that return something, the check found nothing and the address was
+taken anyway.
+
+2184 tests, 590 programs against clang++, 11 projects, 3582 builds across six
+targets.
+
 ### 0.9.13 - sockets, and a prototype without a keyword
 
 Their program reached the *imports*: everything it is written in translates and

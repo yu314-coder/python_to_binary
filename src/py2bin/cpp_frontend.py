@@ -22083,10 +22083,18 @@ def _address_reference_arguments(
             inside = text[found.end(): close]
             parts = _split_arguments(inside) if inside.strip() else []
             shift = 1 if len(parts) == arity.get(name, -2) + 1 else 0
-            for index in positions:
-                if index + shift >= len(parts):
+            for declared_at in positions:
+                if declared_at + shift >= len(parts):
                     continue
-                index = index + shift
+                # Where the argument stands in the call, and where the
+                # parameter stands in the declaration: they differ by the
+                # hidden pointer a value return puts in front. What the
+                # parameter *is* is keyed by the second, and asked for by
+                # the first it was never found - so the check below, which
+                # is what keeps a `const char *` from having its address
+                # taken where a `const string &` is wanted, was skipped for
+                # every call that answers an object.
+                index = declared_at + shift
                 argument = parts[index].strip()
                 if argument.startswith("&"):
                     continue
@@ -22109,7 +22117,7 @@ def _address_reference_arguments(
                 # C++ converts a derived object to its base wherever one is
                 # wanted; C makes you say so. The address is the same - the
                 # base is the first member - so this is a cast and no more.
-                wanted = wanted_types.get((name, index))
+                wanted = wanted_types.get((name, declared_at))
                 held = _deduced_type(argument, reading)
                 # A reference to a class binds to an object of that class,
                 # and only then. `escapeJson(state)` where `state` is a
