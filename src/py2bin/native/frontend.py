@@ -348,6 +348,8 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
         "getaddrinfo", ("ptr", "ptr", "ptr", "ptr"), "int", "WS2_32.dll",
     ),
     "freeaddrinfo": ("freeaddrinfo", ("ptr",), "void", "WS2_32.dll"),
+    "gethostname": ("gethostname", ("ptr", "int"), "int", "WS2_32.dll"),
+    "gethostbyname": ("gethostbyname", ("ptr",), "ptr", "WS2_32.dll"),
     "GetStdHandle": ("GetStdHandle", ("int",), "ptr", "KERNEL32.dll"),
     "CloseHandle": ("CloseHandle", ("ptr",), "int", "KERNEL32.dll"),
     "WriteFile": (

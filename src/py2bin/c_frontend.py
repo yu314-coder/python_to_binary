@@ -992,6 +992,11 @@ CType = (
 
 VOID = VoidType()
 
+#: What each shape in the vetted table is as a C type, for a call written
+#: with nothing declaring it: the table says the shape and this says how to
+#: spell it. Only the kinds a result may have.
+_CTYPE_OF_ABI: "dict[str, CType]" = {}
+
 #: The file system calls a C program may make, and how many arguments each
 #: takes. Named with the prefix because they are py2bin's own primitives, not
 #: POSIX's own spelling: `open` is a name a program may use for its own.
@@ -1065,6 +1070,16 @@ BOOL = IntegerType("_Bool", 1, False, 0)
 # arithmetic conversions pick the floating type in a mixed expression.
 FLOAT = FloatingType("float", 4, 6)
 DOUBLE = FloatingType("double", 8, 7)
+
+_CTYPE_OF_ABI.update(
+    {
+        "int": INT,
+        "bool": INT,
+        "float": DOUBLE,
+        "void": VOID,
+        "ptr": PointerType(VOID),
+    }
+)
 
 #: `long` on Windows, which is four bytes there and eight everywhere else.
 #: Windows is LLP64: it widened its pointers and left `long` where it was, so
@@ -5882,6 +5897,21 @@ class Lowerer:
         if node.name in self.unit.externs:
             return self.extern_call(node, discarded=False)
         function = self.unit.functions.get(node.name)
+        if function is None and node.name in _CABI_SYMBOLS:
+            # The builtins above have already had their turn by here, so a
+            # name that reaches this point is not one of them.
+            # A symbol py2bin knows how to import, called with no declaration
+            # anywhere in the unit. That happens where the header declaring
+            # it was read by the C++ stage and its declarations dropped -
+            # `gethostname` is one - and the table *is* the shape, so there
+            # is nothing a prototype would have added: the call is checked
+            # against the same signature either way. Written into the unit's
+            # externs as well, which is what the import table downstream is
+            # built from.
+            self.unit.externs.setdefault(
+                node.name, _CTYPE_OF_ABI.get(_CABI_RESULTS[node.name], INT)
+            )
+            return self.extern_call(node, discarded=False)
         if function is None:
             # `extern int (*handler)(int);` and then `handler(1)`: an object
             # another unit holds, called through. Nothing here can hold it.
@@ -6682,6 +6712,26 @@ class Lowerer:
                 self.variadic_builtin(node)
                 return
             if node.name in self.unit.externs:
+                self.extern_call(node, discarded=True)
+                return
+            # The same, for one whose answer is thrown away: a vetted symbol
+            # called where nothing declared it. Not one this compiler
+            # implements itself, though - `exit` is in the table *and* is a
+            # builtin that ends the program, and taken as an import here it
+            # never reached the builtin below: a program that called it
+            # emitted no stop at all.
+            if (
+                node.name in _CABI_SYMBOLS
+                and node.name not in self.unit.functions
+                and node.name not in _EXIT_BUILTINS
+                and node.name not in _FILE_BUILTINS
+                and node.name not in _INTO_A_BUFFER
+                and node.name not in _VARIADIC_BUILTINS
+            ):
+                self.unit.externs.setdefault(
+                    node.name,
+                    _CTYPE_OF_ABI.get(_CABI_RESULTS[node.name], INT),
+                )
                 self.extern_call(node, discarded=True)
                 return
         if isinstance(node, Comma):

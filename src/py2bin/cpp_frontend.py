@@ -12600,13 +12600,24 @@ def _constructor_taking(
 
 
 def _same_class(
-    value: str, held: str, scope: str, classes: "dict[str, Class]"
+    value: str, held: str, scope: str, classes: "dict[str, Class]",
+    nearer: str = "",
 ) -> bool:
-    """Whether `value` names an object of exactly the class `held`."""
+    """Whether `value` names an object of exactly the class `held`.
+
+    `nearer` is the text whose declarations are the closer ones - a function
+    body, where the scope is the whole unit around it. Asked of the unit
+    alone, a name the program declares locally was answered with a member of
+    some shipped header that happens to share it: `char text[64]` here and
+    `string text;` inside <filesystem>'s path, so `s = text` was read as a
+    copy of a string and nothing was constructed.
+    """
 
     if held not in classes:
         return False
-    spelled = _deduced_type(value, scope)
+    spelled = (_deduced_type(value, nearer) if nearer else None) or _deduced_type(
+        value, scope
+    )
     if spelled is None or "*" in spelled:
         return False
     return spelled.replace("const", "").strip() == held
@@ -15145,7 +15156,14 @@ def _convert_assignments(
             continue
         left = statement[found.start(1): found.end(1)].strip()
         value = statement[found.start(2): found.end(2)].strip()
-        held = _deduced_type(left, text) or _lvalue_class(left, text, classes)
+        # The body's own declarations first, for the same reason as the
+        # value below: `const char *text = "given";` here and `string text;`
+        # in a shipped header are two names, and the wrong one was answered.
+        held = (
+            _deduced_type(left, body)
+            or _deduced_type(left, text)
+            or _lvalue_class(left, text, classes)
+        )
         if held is None:
             out.append(statement)
             continue
@@ -15171,7 +15189,12 @@ def _convert_assignments(
             # expression answered.
             out.append(statement)
             continue
-        given = _deduced_type(value, text)
+        # The body's own declarations first. What is read here is the whole
+        # unit, and a name declared in this function is also a name some
+        # shipped header uses for a member of its own - `char text[64]` here
+        # and `string text;` inside <filesystem>'s path - so the value was
+        # said to be a string already and nothing was converted.
+        given = _deduced_type(value, body) or _deduced_type(value, text)
         if given is None:
             out.append(statement)
             continue
@@ -15448,7 +15471,7 @@ def _rewrite_body(
             # class already gets. Without it there was no constructor to
             # choose and the overload set was reported as unreadable.
             if len(given) == 1 and _same_class(
-                given[0], type_name, scope(), classes
+                given[0], type_name, scope(), classes, body
             ) and not _constructor_taking_one(type_name, type_name, classes):
                 if _find_method(type_name, "~", classes):
                     destroyed.append(variable)

@@ -2756,6 +2756,31 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a local that shares a name with a header
+
+`char text[64]; ... localAddress_ = text;` - a buffer filled by a call and
+then kept in a string. py2bin read it as a copy of a string, so nothing was
+converted, nothing was constructed, and the C stage was handed a `char *`
+where a struct goes.
+
+The deducer reads one flat text: the body, the scope around it, and every
+header pasted into the unit. Asked what `text` is with no position to be
+nearest to, it answered with the *last* declaration of that name anywhere -
+which is `string text;`, a member of the `path` class inside py2bin's own
+`<filesystem>`. Making the no-position case take the first match instead - what
+the comment there had always claimed it did - refused 36 corpus programs, so
+that was put back; the two sites that read a body ask the body first and the
+scope after.
+
+Two more of theirs, both about the same table. `gethostname` joins the socket
+entry points. And a vetted symbol called where *nothing* declares it is an
+import now: the header that declares it is one the C++ stage consumes, so no
+prototype reaches the C stage at all - and the table is the shape, so a
+prototype would have added nothing to check against.
+
+2184 tests, 591 programs against clang++, 11 projects, 3588 builds across
+six targets.
+
 ### 0.9.13 - an argument that converts to the parameter
 
 `std::string escapeJson(const std::string &value);` called as
