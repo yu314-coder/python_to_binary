@@ -2308,6 +2308,28 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
         # this a name declared with it had no type at all, and a
         # capture-default could not tell its scope had even declared it.
         return _what_auto_holds(spelled, code, text, before)
+    # `auto v = expr;` is a declaration too, and the pattern above passes
+    # over it because `auto` is not a type. Passed over, a declaration
+    # *further away* won: `auto session = make_shared<Session>();` here and
+    # `BridgeSession session(...)` in another function, and a lambda capturing
+    # the first was given the type of the second - so the closure held a
+    # `BridgeSession *` and was handed the address of a holder.
+    promised = [
+        one
+        for one in re.finditer(
+            rf"(?<![.\w>])auto\b[\s*&]*{re.escape(spelled)}\s*=(?!=)", code
+        )
+        if _could_start_a_declaration(code, one.start())
+    ]
+    if promised:
+        places = [(one.start(), False) for one in found]
+        places += [(one.start(), True) for one in promised]
+        ahead = [one for one in places if before < 0 or one[0] < before]
+        nearest = max(ahead) if ahead else min(places)
+        if nearest[1]:
+            settled = _what_auto_holds(spelled, code, text, before)
+            if settled is not None:
+                return settled
     # The declaration nearest above the call, which is the one C++ would have
     # in scope; falling back to the first anywhere when the call comes first.
     earlier = [match for match in found if before < 0 or match.start() < before]
@@ -16211,6 +16233,7 @@ def _rewrite_body(
         classes,
         unit,
         set(pointers) | set(referenced or ()),
+        nearer=outer,
     )
 
     # `int &r = a.v;` is a pointer whose uses are dereferenced. Done before
@@ -22638,6 +22661,7 @@ def _address_reference_arguments(
     scope: str = "",
     already: "set[str]" = frozenset(),
     also: "dict[tuple[str, int], str]" = {},
+    nearer: "tuple[str, ...]" = (),
 ) -> str:
     """`bump(a, 9)` becomes `bump(&a, 9)` where the parameter is a reference.
 
@@ -22743,12 +22767,18 @@ def _address_reference_arguments(
                 # wanted; C makes you say so. The address is the same - the
                 # base is the first member - so this is a cast and no more.
                 wanted = wanted_types.get((name, declared_at))
-                # Asked at the call. `reading` is this body and then the
-                # file, and with no position the reader takes the last
-                # declaration of that name anywhere - so a `session` two
-                # functions down answered for the one being passed here, and
-                # the address a reference parameter wants was not taken.
-                held = _deduced_type(argument, reading, found.start())
+                # Asked of this text up to the call first, then of the scopes
+                # around it, and only then of the file. `reading` is this
+                # body and then the whole unit, and the reader takes the last
+                # declaration of that name anywhere when it is given no
+                # position - so a `session` two functions down answered for
+                # the one being passed here. A block is rewritten on its own,
+                # so what the function around it declares is in `nearer` and
+                # nowhere in this text at all: without it, `instance` here
+                # was answered by an `HINSTANCE instance` in another file.
+                held = _nearest_type(
+                    argument, (text[: found.start()], *nearer)
+                ) or _deduced_type(argument, reading, found.start())
                 # A reference to a class binds to an object of that class,
                 # and only then. `escapeJson(state)` where `state` is a
                 # `const char *` and the parameter is a `const string &` is a

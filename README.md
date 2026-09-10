@@ -2756,6 +2756,27 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the nearest declaration, twice more
+
+`auto session = std::make_shared<Session>();` in one function and
+`BridgeSession session(7);` in another written above it. `auto` is not a type,
+so the reader that finds declarations passes over it - and passed over, the
+declaration further away won: a lambda capturing the first was given the type
+of the second, so the closure held a `BridgeSession *` and was handed the
+address of a holder. An `auto` nearer than the typed one is now the one
+answered, through the promise its initialiser makes.
+
+And `makeResponse(localAddress_, instance, host)` written inside a nested
+block, where `instance` and `host` are declared by the function around it and
+named again in another file's entry point. A block is rewritten on its own, so
+what the function around it declares is in neither the block's text nor the
+file's - and the reader answered with `HINSTANCE` and `WebViewHost`, so the
+address a reference parameter wants was not taken. The pass carries the scopes
+around the block now, the way the rest of them do.
+
+2184 tests, 609 programs against clang++, 11 projects, 3696 builds across
+six targets.
+
 ### 0.9.13 - an arrow written on a dereference
 
 `session->closed` inside a lambda that captured `session`. Inside the closure
