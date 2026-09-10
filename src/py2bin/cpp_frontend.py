@@ -2574,6 +2574,38 @@ def _tags_a_typedef_names(text: str) -> "dict[str, str]":
             alias = piece.strip()
             if alias.isidentifier() and alias != head.group(1):
                 found.setdefault(alias, head.group(1))
+    # And the same struct named with its body no longer in front of it. By
+    # the time a function body is rewritten, `typedef struct _TAG { ... } A,
+    # B;` has been taken apart into the body and a typedef naming it - and a
+    # plain struct's aliases are not resolved with the classes', so this is
+    # the only place left that says a `DATA_BLOB` is a `_CRYPTOAPI_BLOB`.
+    for one in re.finditer(
+        r"(?<![.\w>])typedef\s+(?:struct|union|class)\s+([A-Za-z_]\w*)\s+"
+        r"([^;{}()]*);",
+        bare,
+    ):
+        for piece in one.group(2).split(","):
+            alias = piece.strip()
+            if alias.isidentifier() and alias != one.group(1):
+                found.setdefault(alias, one.group(1))
+    # And the chains: <dpapi.h> writes one body and names the rest off it -
+    # `typedef CRYPT_INTEGER_BLOB DATA_BLOB, *PDATA_BLOB;` - so the name a
+    # program writes is two typedefs away from the body.
+    for _round in range(4):
+        fresh = False
+        for one in re.finditer(
+            r"(?<![.\w>])typedef\s+([A-Za-z_]\w*)\s+([^;{}()]*);", bare
+        ):
+            tag = found.get(one.group(1))
+            if tag is None:
+                continue
+            for piece in one.group(2).split(","):
+                alias = piece.strip()
+                if alias.isidentifier() and alias not in found and alias != tag:
+                    found[alias] = tag
+                    fresh = True
+        if not fresh:
+            break
     if len(_TAGS_READ) > 8:
         _TAGS_READ.clear()
     _TAGS_READ[key] = found
@@ -20579,6 +20611,14 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         held = _pack_in_force(packing, one.start())
         if held is not None:
             _CLASS_PACK[one.group(2)] = held
+    # And under every other name a typedef gives it. A plain struct's body is
+    # hoisted out of the text before a function body is rewritten, so this
+    # table is all that is left to answer what one holds - and it was keyed
+    # by the tag, which is the one name a program never writes. `DATA_BLOB
+    # output;` and then `output.pbData` had no type at all.
+    for alias, tag in _tags_a_typedef_names(text).items():
+        if tag in _CLASS_MEMBERS and alias not in _CLASS_MEMBERS:
+            _CLASS_MEMBERS[alias] = _CLASS_MEMBERS[tag]
     _POLYMORPHIC = _polymorphic_names(text)
     _INHERITED_FROM = {
         one for m in _CLASS_HEAD.finditer(text) for one in _bases_of(m)
@@ -23874,6 +23914,32 @@ public:
         items[at] = value;
         count = count + 1;
         return items + at;
+    }
+    /* A range put in at a position, which is how a program joins two of
+       these: `frame.insert(frame.end(), payload.begin(), payload.end());`.
+       Written over `!=` and `++` like the range constructor above, so a pair
+       of pointers works as readily as a pair of stream readers. The position
+       is kept as an offset and not as the pointer it came in as: reserving
+       moves the storage, and the pointer handed in points into the old. */
+    template<typename It>
+    T *insert(T *where, It first, It last) {
+        unsigned long start;
+        unsigned long at;
+        unsigned long j;
+        start = (unsigned long)(where - items);
+        at = start;
+        while (first != last) {
+            if (count == room) {
+                if (room == 0) { reserve(8); } else { reserve(room * 2); }
+            }
+            j = count;
+            while (j > at) { items[j] = items[j - 1]; j = j - 1; }
+            items[at] = (T)(*first);
+            count = count + 1;
+            at = at + 1;
+            ++first;
+        }
+        return items + start;
     }
     void assign(unsigned long many, T value) {
         unsigned long i;

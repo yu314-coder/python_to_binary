@@ -2756,6 +2756,23 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a struct with more than one name
+
+`typedef struct _CRYPTOAPI_BLOB { ... } CRYPT_INTEGER_BLOB, ..., DATA_BLOB,
+...;`, and then `output.pbData`. A plain struct's body is hoisted out of the
+text before a function body is rewritten, so the table of what each class
+holds is all that is left to ask - and it was keyed by the tag, which is the
+one name a program never writes. It carries every name the declarator list
+gives, the ones a later typedef names off those, and the ones written without
+the body in front of them.
+
+`frame.insert(frame.end(), payload.begin(), payload.end())` - a range put into
+a vector at a position, which is how a program joins two of them. The shipped
+`<vector>` had `insert` for one value and not for a range.
+
+2184 tests, 604 programs against clang++, 11 projects, 3666 builds across
+six targets.
+
 ### 0.9.13 - a conditional, and a name of the program's own
 
 Seven more of theirs.
