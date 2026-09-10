@@ -2756,6 +2756,28 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an arrow written on a dereference
+
+`session->closed` inside a lambda that captured `session`. Inside the closure
+the use is written through the capture, so the arrow stands on
+`(*this->session)` and not on a name at all - and the pass that turns an arrow
+into the holder's own `operator->` keys on names. The class is read off the
+expression instead, and only where that class writes one: `(*p)->m` on a
+pointer to a plain struct is C already.
+
+And `describe(value)`, where the parameter is a `const std::string &`: the
+reader was asked what `value` is without being told where the call is, so an
+`int value` in a function further down answered for the string here and the
+address the parameter wants was not taken. The same shape as the last two
+rounds - a name two functions apart both use, and a reader that takes the last
+declaration anywhere when it is given no position.
+
+Still refused, by name: a smart pointer passed *by reference* and reached
+through, which is the same arrow on a name py2bin carries as a pointer.
+
+2184 tests, 608 programs against clang++, 11 projects, 3690 builds across
+six targets.
+
 ### 0.9.13 - an array of objects, and a holder asked
 
 `const std::string values[] = {"sbp=3", "build=windows", made + more};` - an

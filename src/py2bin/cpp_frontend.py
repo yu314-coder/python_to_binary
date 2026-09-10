@@ -17852,6 +17852,9 @@ def _rewrite_operators(
     # `operator!`: this one leaves that spelling to them.
     body = _ask_objects_in_conditions(body, classes, known, pointers)
     body = _rewrite_holder_operators(body, classes, known, pointers)
+    # And the same arrow written on something that is not a name, which is
+    # what a lambda's capture by reference becomes.
+    body = _arrows_through_a_dereference(body, classes, scope or body)
     # `(*v[i])(x)` - a call on something that is not a name. `v[i]` has
     # already become a call answering an address by here, and a container of
     # callables is exactly what a program keeps one of.
@@ -18037,6 +18040,54 @@ def _ask_objects_in_conditions(
                 body, lambda part, p=pattern, w=written: re.sub(p, w, part)
             )
     return body
+
+
+def _arrows_through_a_dereference(
+    body: str, classes: "dict[str, Class]", scope: str
+) -> str:
+    """`(*p)->m` where what `p` points at is a holder: the arrow is its own.
+
+    A lambda's capture by reference is a pointer to the object it closed
+    over, and every use inside the closure is written through it - so
+    `session->closed` arrives here as `(*this->session)->closed`, which is
+    not a name and so not something the pass below can key on. The class is
+    read off the expression instead, and only where that class writes an
+    `operator->`: `(*p)->m` on a pointer to a plain struct is C already, and
+    a struct with no such operator has nothing this could write.
+    """
+
+    if not classes:
+        return body
+    bare = _without_literals(body)
+    out: "list[str]" = []
+    at = 0
+    for found in re.finditer(r"\(\s*\*\s*", bare):
+        if found.start() < at:
+            continue
+        closing = _closing_paren(bare, found.start())
+        if closing < 0:
+            continue
+        if re.match(r"\s*->", bare[closing + 1:]) is None:
+            continue
+        inside = body[found.end(): closing].strip()
+        if not inside:
+            continue
+        held = _deduced_type(inside, scope)
+        if held is None:
+            continue
+        owner = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", held
+        ).replace("*", " ").strip()
+        provider = _find_method(owner, "op_arrow", classes)
+        if provider is None:
+            continue
+        out.append(body[at:found.start()])
+        out.append(f"{_c_name(provider, 'op_arrow')}({inside})")
+        at = closing + 1
+    if not out:
+        return body
+    out.append(body[at:])
+    return "".join(out)
 
 
 def _rewrite_holder_operators(
@@ -22692,7 +22743,12 @@ def _address_reference_arguments(
                 # wanted; C makes you say so. The address is the same - the
                 # base is the first member - so this is a cast and no more.
                 wanted = wanted_types.get((name, declared_at))
-                held = _deduced_type(argument, reading)
+                # Asked at the call. `reading` is this body and then the
+                # file, and with no position the reader takes the last
+                # declaration of that name anywhere - so a `session` two
+                # functions down answered for the one being passed here, and
+                # the address a reference parameter wants was not taken.
+                held = _deduced_type(argument, reading, found.start())
                 # A reference to a class binds to an object of that class,
                 # and only then. `escapeJson(state)` where `state` is a
                 # `const char *` and the parameter is a `const string &` is a
