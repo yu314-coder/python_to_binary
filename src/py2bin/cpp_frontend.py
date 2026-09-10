@@ -2536,6 +2536,50 @@ def _members_declared(inside: str) -> "list[tuple[str, str]]":
     return found
 
 
+#: `typedef struct _CRYPTOAPI_BLOB { ... } DATA_BLOB;` - a struct named twice,
+#: once as a tag and once as the name programs write. Every Windows header
+#: does it, and so does most C.
+_A_TYPEDEF_WITH_A_BODY = re.compile(
+    r"(?<![.\w>])typedef\s+(?:struct|union|class)\s+([A-Za-z_]\w*)\s*\{"
+)
+
+#: The tags read off one text, kept so the scan is done once. Keyed by what
+#: the text is rather than by the object, since a pass hands on a new string
+#: every time it changes one character.
+_TAGS_READ: "dict[tuple[int, int], dict[str, str]]" = {}
+
+
+def _tags_a_typedef_names(text: str) -> "dict[str, str]":
+    """Every `typedef struct TAG { ... } Name;` in this text, Name -> TAG."""
+
+    key = (len(text), hash(text))
+    found = _TAGS_READ.get(key)
+    if found is not None:
+        return found
+    found = {}
+    bare = _without_literals(text)
+    for head in _A_TYPEDEF_WITH_A_BODY.finditer(bare):
+        try:
+            closing = _matching(text, head.end() - 1)
+        except ValueError:
+            continue
+        # Every name the declarator list gives it, not only the first:
+        # <wincrypt.h> writes one body and eleven names for it, and the one
+        # a program uses - `DATA_BLOB` - is the ninth. A pointer alias is not
+        # one of these; the star makes it another type.
+        ended = bare.find(";", closing)
+        if ended < 0:
+            continue
+        for piece in text[closing:ended].split(","):
+            alias = piece.strip()
+            if alias.isidentifier() and alias != head.group(1):
+                found.setdefault(alias, head.group(1))
+    if len(_TAGS_READ) > 8:
+        _TAGS_READ.clear()
+    _TAGS_READ[key] = found
+    return found
+
+
 def _member_result(text: str, owner: str, spelled: str) -> "str | None":
     """What the member matching `spelled` on that class is declared to answer.
 
@@ -2577,6 +2621,13 @@ def _member_result(text: str, owner: str, spelled: str) -> "str | None":
             return None
         # A reference is a name for what is there; the type is what it names.
         return (found.group(1).strip() + " " + found.group(2).replace("&", "")).strip()
+    # No class of that name - but a C struct is named twice, and the name a
+    # program writes is the typedef's rather than the tag the body carries.
+    # `DATA_BLOB output;` and then `output.pbData`, which is how every
+    # Windows program reads one back.
+    tag = _tags_a_typedef_names(text).get(owner)
+    if tag is not None:
+        return _member_result(text, tag, spelled)
     return None
 
 
@@ -4194,6 +4245,215 @@ _A_CLASS_STARTS_HERE = re.compile(
 
 #: `return c ? a : b;` - the whole answer is one conditional.
 _RETURNS_A_CONDITIONAL = re.compile(r"(?<![.\w>])return\s+([^;]*\?[^;]*);")
+
+
+#: The words that open a control structure, so the parenthesis after one is
+#: not a call's. A conditional inside `while (...)` is asked once per turn of
+#: the loop, and lifting it out would ask it once.
+_OPENS_A_CONTROL = frozenset("if while for switch return sizeof catch".split())
+
+
+def _one_argument_around(bare: str, at: int) -> "tuple[int, int] | None":
+    """The whole argument of a call that `at` stands inside, or None.
+
+    Bounded by the parenthesis that opens the argument list and by the commas
+    at its level, which is the one place a conditional's extent can be read
+    off the text without knowing what binds tighter than what. Anywhere else
+    - inside a grouping parenthesis, in a `while`'s condition, at file scope -
+    the answer is None and the conditional is left where it was written.
+    """
+
+    depth = 0
+    index = at - 1
+    while index >= 0:
+        piece = bare[index]
+        if piece in ")]}":
+            depth += 1
+        elif piece == "(":
+            if depth == 0:
+                break
+            depth -= 1
+        elif piece in "[{":
+            if depth == 0:
+                return None
+            depth -= 1
+        elif depth == 0 and piece == ",":
+            break
+        elif depth == 0 and piece == ";":
+            return None
+        index -= 1
+    if index < 0:
+        return None
+    if bare[index] == "(":
+        # A call's parenthesis and not a grouping one, nor a control
+        # structure's: `f(c ? a : b)` is an argument, `(c ? a : b)` is an
+        # expression this cannot bound and `while (c ? a : b)` is asked
+        # again every turn.
+        word = re.search(r"([A-Za-z_]\w*)\s*$", bare[:index])
+        if word is None or word.group(1) in _OPENS_A_CONTROL:
+            return None
+    start = index + 1
+    depth = 0
+    index = at + 1
+    while index < len(bare):
+        piece = bare[index]
+        if piece in "([{":
+            depth += 1
+        elif piece in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and piece == ",":
+            break
+        elif depth == 0 and piece == ";":
+            return None
+        index += 1
+    if index >= len(bare):
+        return None
+    return start, index
+
+
+def _statement_holding(bare: str, at: int) -> "int | None":
+    """Where the statement holding `at` starts, or None if it cannot be said.
+
+    A conditional is lifted to a line of its own in front of the statement it
+    stands in, so that line has to be somewhere a declaration may go: after a
+    `;`, a `{` or a `}`, at brace depth of at least one, and with nothing
+    between that point and the statement that a jump or a label could land
+    on. `if (x) f(c ? a : b);` is not such a place - there is one statement
+    there and putting two would change which of them the `if` runs.
+    """
+
+    depth = 0
+    index = at - 1
+    while index >= 0:
+        piece = bare[index]
+        if piece in ")]":
+            depth += 1
+        elif piece in "([":
+            # The call's own parenthesis, walked out of. What is outside it
+            # is where the statement is, which is what this is looking for.
+            if depth:
+                depth -= 1
+        elif depth == 0 and piece in ";{}":
+            break
+        index -= 1
+    if index < 0:
+        return None
+    start = index + 1
+    if bare.count("{", 0, start) - bare.count("}", 0, start) < 1:
+        # File scope, or a class body: neither takes a statement.
+        return None
+    # `for (int i = 0; f(c ? a : b); i++)` ends its first clause with a `;`
+    # that is inside the `for`'s own parenthesis, and a statement written
+    # there is written inside the header. Counted from the brace before it,
+    # because a header is short and a body is not.
+    brace = max(bare.rfind("{", 0, start), bare.rfind("}", 0, start))
+    inside = bare[brace + 1: start]
+    if inside.count("(") != inside.count(")"):
+        return None
+    ahead = bare[start:at]
+    if re.search(
+        r"(?<![.\w])(?:else|do|if|while|for|switch|case|default)(?![\w])", ahead
+    ):
+        # `if (x) f(c ? a : b);` - there is one statement there, and putting
+        # two would change which of them the `if` runs. With braces around
+        # it the brace is the boundary and this reads nothing.
+        return None
+    if re.search(r"(?<!:):(?!:)", ahead):
+        # A label: what follows it is where a jump lands, and a declaration
+        # written in front of it is never reached.
+        return None
+    return start
+
+
+def _split_argument_conditionals(text: str, filename: str) -> str:
+    """`f(ok ? "x" : name)` where one arm is an object, written out.
+
+    C++ gives `?:` one type: where one arm is a class and the other converts
+    to it, the conversion happens in the arm and the whole conditional
+    answers the class. py2bin's C stage lowers a conditional through one
+    machine word, so a struct there is refused - and their `makeMDNSResponse(
+    ..., localAddress_.empty() ? "127.0.0.1" : localAddress_, ...)` was
+    handed a `char *` and a `string` and said so.
+
+    Written as the `if` C++ means: an object of the type, an arm that gives
+    it one answer and an arm that gives it the other, and the argument
+    becomes that object's name. Only where the conditional is exactly one
+    argument of a call, which is the one place its extent can be read off the
+    text - and only in front of a statement that may have another put before
+    it, so that what the condition guards is unchanged.
+    """
+
+    counter = 0
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+        change = None
+        for mark in re.finditer(r"\?", bare):
+            bounds = _one_argument_around(bare, mark.start())
+            if bounds is None:
+                continue
+            start, end = bounds
+            spelled = text[start:end]
+            # The `?` this reads has to be the argument's own first one, or
+            # the arms below belong to a conditional inside one of them.
+            if _without_literals(spelled).find("?") != mark.start() - start:
+                continue
+            arms = _conditional_arms(spelled)
+            if arms is None:
+                continue
+            asked = spelled[: mark.start() - start].strip()
+            if not asked:
+                continue
+            answers = [
+                _deduced_type(one.strip(), text, start) for one in arms
+            ]
+            if any(one is None for one in answers):
+                continue
+            plain = [
+                re.sub(r"\b(?:const|volatile|struct)\b", " ", one)
+                .replace("&", " ")
+                .strip()
+                for one in answers
+            ]
+            held = None
+            written = list(arms)
+            if plain[0] == plain[1] and plain[0] in names:
+                held = plain[0]
+            else:
+                for index in (0, 1):
+                    other = plain[1 - index]
+                    if plain[index] not in names or other in names:
+                        continue
+                    if other.replace("*", " ").strip() in names:
+                        # A pointer to the class is not the class, and
+                        # building one from it is not what C++ does.
+                        break
+                    held = plain[index]
+                    written[1 - index] = f"{held}({arms[1 - index]})"
+                    break
+            if held is None:
+                continue
+            opened = _statement_holding(bare, start)
+            if opened is None:
+                continue
+            counter += 1
+            name = f"__py2bin_picked_{counter}"
+            change = (opened, start, end, held, name, asked, written)
+            break
+        if change is None:
+            return text
+        opened, start, end, held, name, asked, written = change
+        text = (
+            text[:opened]
+            + f"{held} {name}; if ({asked}) {{ {name} = {written[0]}; }} "
+            f"else {{ {name} = {written[1]}; }} "
+            + text[opened:start]
+            + name
+            + text[end:]
+        )
+    return text
 
 
 def _split_object_conditionals(text: str, filename: str) -> str:
@@ -6926,10 +7186,24 @@ def _constructor_copies(
         )
         if deduced is None:
             continue
-        named = _instantiated_name(holder, deduced)
+        copy = _substituted(pattern, parameters, deduced)
+        # Keyed by what the copy takes and not by how it is spelled. `const
+        # uint8_t *` and `uint8_t *` are one type as far as the C is
+        # concerned - the overload codes erase the qualifier, and so does the
+        # name a copy is given - so a program using both spellings had two
+        # constructors with one name, and the C stage said the second was
+        # already defined. A range constructor reads what it is given and
+        # writes nothing through it, which is why C++ has two here and C
+        # needs one.
+        head = _A_TEMPLATE_CONSTRUCTOR.match(copy)
+        named = (
+            "_".join(_parameter_types(head.group(2)))
+            if head is not None
+            else _instantiated_name(holder, deduced)
+        )
         if named in made:
             continue
-        made[named] = _substituted(pattern, parameters, deduced)
+        made[named] = copy
     return list(made.values())
 
 
@@ -6937,6 +7211,56 @@ def _constructor_copies(
 #: itself so that rewriting the call sites cannot move it out from under
 #: them. Spelled with a NUL, which no program's text holds.
 _COPIES_GO_HERE = "\x00member-copies\x00"
+
+
+#: `typedef vector__uint8_t Bytes;` - another name for a class, written at
+#: file scope. A pointer alias is not one of these: it keeps its `*` and is
+#: resolved with the rest of them once the classes have been collected.
+_A_CLASS_ALIAS = re.compile(
+    r"(?<![.\w>])typedef\s+(?:struct\s+|class\s+)?([A-Za-z_]\w*)\s+"
+    r"([A-Za-z_]\w*)\s*;"
+)
+
+
+def _resolve_alias_spellings(text: str) -> str:
+    """Another name a program gave a class, replaced by the class's name.
+
+    `using Bytes = std::vector<uint8_t>;` is `typedef vector__uint8_t Bytes;`
+    by the time the copies exist, and every use of the class in that program
+    is written `Bytes`. The reader that types an expression looks a class
+    body up by name, so `hello.begin()` on a `Bytes` had no type at all - and
+    the copy of the range constructor that call site was meant to ask for was
+    never made, so `Bytes(first, last)` was refused for taking two arguments
+    where the class had a constructor taking none.
+
+    Only at file scope, and only where the alias names a class this file
+    declares: a typedef written inside a class body names a type in that
+    class and nowhere else. The pass that resolves every other alias runs
+    once the classes are collected, which is long after the copies are made.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+        found = None
+        for one in _A_CLASS_ALIAS.finditer(_without_literals(text)):
+            named, alias = one.group(1), one.group(2)
+            if named not in names or alias in names or named == alias:
+                continue
+            if _depth_at(text, one.start()) != 0:
+                continue
+            found = one
+            break
+        if found is None:
+            return text
+        named, alias = found.group(1), found.group(2)
+        text = text[: found.start()] + text[found.end():]
+        text = _map_code(
+            text,
+            lambda part, a=alias, n=named: re.sub(
+                rf"(?<![.\w>]){re.escape(a)}\b", n, part
+            ),
+        )
+    return text
 
 
 def _expand_member_templates(text: str, filename: str) -> str:
@@ -15576,6 +15900,14 @@ def _rewrite_body(
                     for one in given
                 ],
                 scope(),
+                # This body's own declarations come first in that text, and
+                # the reader takes the nearest one above the position it is
+                # given. Without a position it takes the last anywhere, so
+                # `DATA_BLOB output;` here lost to `ostringstream output;`
+                # in another function two thousand lines down - and the
+                # constructor could not be chosen for a member of a class
+                # the object was not.
+                len(body),
             )
             passed = f", {arguments}" if arguments else ""
             call = f"{_c_name(owner, '', suffix)}(&{variable}{passed});"
@@ -17323,6 +17655,18 @@ def _rewrite_operators(
         def assigned(
             match: "re.Match[str]", o=owner, a=address, h=holds, v=variable
         ) -> str:
+            # `WindowsTransport *__py2bin_on = __py2bin_a->on;` is a
+            # declaration, not an assignment through a pointer: the star
+            # belongs to the declarator and the word in front of it is the
+            # type. Read as an assignment, the type was left standing in
+            # front of the call this writes, and the C stage was handed
+            # `struct T (*T__op_assign(p, &q));`. A statement's own `=` has
+            # punctuation in front of it - `;`, `{`, `)`, `:` - or a word
+            # that is not a type, which is what `else x = y;` has.
+            ahead = match.string[: match.start()].rstrip()
+            named = re.search(r"([A-Za-z_]\w*)\s*[*&]*$", ahead)
+            if named is not None and named.group(1) not in _NOT_A_TYPE:
+                return match.group(0)
             if match.group(1):
                 a = v
             source = match.group(2)
@@ -20124,6 +20468,10 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _rewrite_variant_alternatives(text)
     text = _rewrite_duration_cast(text)
     text = _expand_templates(text, filename)
+    # Now that the copies exist and have their names: a program that gave one
+    # of them a name of its own uses that name everywhere, and the pass below
+    # reads a class by the name the class was written with.
+    text = _resolve_alias_spellings(text)
     # And again: a member template inside a class *template* has no calls to
     # read while the class is still a pattern - nothing has an object of it -
     # so it was left alone above. The copies written just now are ordinary
@@ -20162,6 +20510,8 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # After them, because `return ok ? made : string{};` has an object in an
     # arm only once the braces have become one.
     text = _split_object_conditionals(text, filename)
+    # And one written as an argument rather than as what a `return` answers.
+    text = _split_argument_conditionals(text, filename)
     text = _rewrite_braced_assignments(text, filename)
     text = _rewrite_brace_initialisers(text)
     # Again, because a member template inside a class template could not be
@@ -26295,6 +26645,11 @@ int getline(@NAME@ &in, string &out, char stop) {
 
 _SSTREAM_HEADER = (
     r"""
+/* Every class here holds a `string` and calls `to_string`, so the header
+   that declares them is part of this one. Left out, a program that included
+   <sstream> and not <string> had `struct ostringstream { string held; }`
+   emitted above the type of its own member. */
+#include <string>
 
 namespace std {
 /* A stream that writes into a string. `<<` is what a program uses it for,

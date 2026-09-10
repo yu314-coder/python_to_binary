@@ -2756,6 +2756,58 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a conditional, and a name of the program's own
+
+Seven more of theirs.
+
+`f(ok ? "127.0.0.1" : address)`. C++ gives `?:` one type, so the literal arm
+becomes a string and the whole conditional answers one; py2bin lowers a
+conditional through a single machine word and was handed a `char *` and a
+struct. It is written out as the `if` C++ means - but only where the
+conditional is exactly one argument of a call, which is the one place its
+extent can be read off the text, and only in front of a statement that may
+have another put before it. `while (f(c ? a : b))` asks the condition once a
+turn, and lifting it would ask it once.
+
+`Bridge *__py2bin_on = __py2bin_a->on;` - the declaration py2bin writes into
+a thread's trampoline. The rewrite that turns an assignment into a class's own
+`operator=` had just been widened to read a whole expression, and read this
+declaration as an assignment through a pointer: the type stayed standing in
+front of the call that replaced it. A statement's own `=` has punctuation in
+front of it, or a word that is not a type.
+
+`using Bytes = std::vector<uint8_t>;` and then `Bytes(first, last)`. The alias
+is a typedef by the time the template copies exist, and the reader that types
+an expression looks a class body up by name - so `hello.begin()` on a `Bytes`
+had no type at all, the range constructor's copy was never made, and the build
+site was refused for taking two arguments where the class had a constructor
+taking none.
+
+And once the copies were made, two of them: one for `uint8_t *` and one for
+`const uint8_t *`, which are two types in C++ and one in C. They came out as
+the same function defined twice. A template constructor gets one copy per
+signature the C has, not per spelling the program wrote.
+
+`typedef struct _CRYPTOAPI_BLOB { ... } CRYPT_INTEGER_BLOB, ..., DATA_BLOB,
+...;` - one body and eleven names, which is how <wincrypt.h> writes it and how
+most C writes anything. The reader looks a class body up by the name in front
+of its brace, so `output.pbData` on a `DATA_BLOB` had no type; it reads the
+declarator list now, every name in it.
+
+And then the same name in two functions. `DATA_BLOB output;` in one and
+`std::ostringstream output;` in another two thousand lines down: the reader
+takes the last declaration anywhere when it is given no position to be
+nearest to, so the second answered for the first. The constructor choice is
+made with the position of the body it is in.
+
+`<sstream>` on its own. Every class in it holds a `string`, and the header
+that declares one was not part of it - so a program that included <sstream>
+and not <string> had `struct ostringstream { string held; }` emitted above the
+type of its own member.
+
+2184 tests, 603 programs against clang++, 11 projects, 3660 builds across
+six targets.
+
 ### 0.9.13 - the scopes a block sits inside
 
 Six of theirs, all found by building their Windows companion.

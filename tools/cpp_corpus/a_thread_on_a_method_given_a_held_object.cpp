@@ -7,8 +7,16 @@
 
 struct Session { int socket = 0; };
 
+// `= delete` on the copy operations, which is how a class holding a thread
+// is written. It gives the class an `operator=`, and the trampoline's own
+// `Bridge *__py2bin_on = __py2bin_a->on;` was read as an assignment through
+// one - so the type stayed standing in front of the call that replaced it.
 class Bridge {
 public:
+    Bridge() {}
+    Bridge(const Bridge &) = delete;
+    Bridge &operator=(const Bridge &) = delete;
+
     std::thread worker_;
     std::thread captureWorker_;
     int fromRun = 0;
