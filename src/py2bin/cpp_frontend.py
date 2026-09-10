@@ -15333,6 +15333,34 @@ def _rewrite_object_array_values(
                     f"({spot}{passed});"
                 )
                 continue
+            # A literal or a name, and nothing else. Those are the two
+            # things the reader below settles without guessing: asked about
+            # `string("hosts=") + "10.0.0.4"` it answers `const char *`,
+            # which is the type of one half of it, and an element built from
+            # that half would be the wrong string with nothing said.
+            simple = value.isidentifier() or any(
+                pattern.match(value) for pattern, _named in _LITERAL_TYPES
+            )
+            spelled = _deduced_type(value, body) if simple else None
+            plain = (
+                re.sub(r"\b(?:const|volatile|struct)\b", " ", spelled or "")
+                .replace("&", " ")
+                .replace("*", " ")
+                .strip()
+            )
+            if spelled is not None and plain != held:
+                # A value that is not an object of this class - a literal, or
+                # anything else the class has a constructor for. C++ builds
+                # the element from it; copied instead, the C read `values[0]
+                # = *&"sbp=3";`, and the address of a literal is not
+                # something to take. Only where the value's type could be
+                # read: an expression this cannot type is left to the passes
+                # that give a temporary a name, which is what they are for.
+                made.append(
+                    f"{_c_name(owner, '', _call_suffix(owner, '', classes, [value], body))}"
+                    f"({spot}, {value});"
+                )
+                continue
             # Anything else is an object already built, and C++ copies it.
             made.append(_copied_in(held, f"{variable}[{index}]", f"&{value}", classes))
         # Whatever the braces did not fill, C++ default-constructs.
@@ -17933,6 +17961,11 @@ _A_NAME_IN_A_CONDITION = re.compile(
     rf"|(?<![.\w>&|])({_A_REACHED_NAME})\s*(?:&&|\|\|)"
     rf"|(?:&&|\|\|)\s*({_A_REACHED_NAME})(?![.\w(\[]|->|::)"
     rf"|!\s*({_A_REACHED_NAME})(?![.\w(\[]|->|::)"
+    # `static_cast<bool>(held)`, which by here is `((_Bool)(held))`. C++
+    # asks the object the same question a condition asks it; py2bin handed
+    # the C stage a struct where a cast wants a value, and it said so.
+    rf"|\(\s*_Bool\s*\)\s*\(\s*({_A_REACHED_NAME})\s*\)"
+    rf"|\(\s*_Bool\s*\)\s*({_A_REACHED_NAME})(?![.\w(\[]|->|::)"
 )
 
 
@@ -17989,6 +18022,11 @@ def _ask_objects_in_conditions(
             # `this->held` into a conversion called on `this` and reached
             # through.
             (rf"(&&|\|\|)\s*{name}(?![.\w(\[]|->|::)", rf"\1 {asked}"),
+            (rf"\(\s*_Bool\s*\)\s*\(\s*{name}\s*\)", f"(_Bool)({asked})"),
+            (
+                rf"\(\s*_Bool\s*\)\s*{name}(?![.\w(\[]|->|::)",
+                f"(_Bool)({asked})",
+            ),
         ]
         if _find_method(owner, "op_not", classes) is None:
             spellings.append(
@@ -26287,6 +26325,8 @@ public:
     T *operator->() { return raw; }
     T &operator*() { return *raw; }
     int operator!() { return raw == 0; }
+    /* What `if (held)` asks, and what a cast of one to bool asks. */
+    operator bool() { return raw != 0; }
     int operator==(T *p) { return raw == p; }
     int operator!=(T *p) { return raw != p; }
     T *release() { T *held; held = raw; raw = 0; return held; }
@@ -26316,6 +26356,8 @@ public:
     T *operator->() { return raw; }
     T &operator*() { return *raw; }
     int operator!() { return raw == 0; }
+    /* What `if (held)` asks, and what a cast of one to bool asks. */
+    operator bool() { return raw != 0; }
     int operator==(T *p) { return raw == p; }
     int operator!=(T *p) { return raw != p; }
     T *release() { T *held; held = raw; raw = 0; return held; }
@@ -26332,6 +26374,11 @@ public:
     T *operator->() { return raw; }
     T &operator*() { return *raw; }
     int operator!() { return raw == 0; }
+    /* What `if (held)` and `static_cast<bool>(held)` ask, which C++ gives
+       every one of these and this had only the `!` of. Left out, a condition
+       on a holder was refused - and a cast of one to bool was refused too,
+       which is the same question written the other way. */
+    operator bool() { return raw != 0; }
     int operator==(T *p) { return raw == p; }
     int operator!=(T *p) { return raw != p; }
     void reset(T *p) { raw = p; }

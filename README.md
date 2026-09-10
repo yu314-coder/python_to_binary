@@ -2756,6 +2756,26 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an array of objects, and a holder asked
+
+`const std::string values[] = {"sbp=3", "build=windows", made + more};` - an
+array of objects whose elements are not objects. C++ builds each from what is
+written for it; copied instead, the C read `values[0] = *&"sbp=3";`, and the
+address of a literal is not something to take. Built now where the element's
+value is a literal or a name, which are the two things the reader settles
+without guessing - asked about `made + more` it answers with the type of one
+half, and an element built from that half would be the wrong string with
+nothing said.
+
+`if (held)` and `static_cast<bool>(held)` on a smart pointer. C++ gives every
+one of these an `operator bool`; py2bin's had only the `!` of it, so a
+condition on a holder was refused - and a cast of one to bool was refused too,
+which is the same question written the other way. The pass that asks an object
+in a condition reads the cast now as well.
+
+2184 tests, 607 programs against clang++, 11 projects, 3684 builds across
+six targets.
+
 ### 0.9.13 - a receiver named like another
 
 `output.insert(output.end(), name.begin() + start, name.begin() + length)`.
