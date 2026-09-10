@@ -2756,6 +2756,21 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a receiver named like another
+
+`output.insert(output.end(), name.begin() + start, name.begin() + length)`.
+A member template's copies are made from the calls, and which class a call is
+on is read from the receiver - asked of the whole file rather than at the
+call, so the reader took the last declaration of that name anywhere. `output`
+is a name two functions apart may both use: a `Bytes &output` here and an
+`ostringstream output` a few hundred lines down, and the second answered for
+the first. The call was taken for one on another class, no copy was written
+for it, and the C stage was handed a call to the one-value `insert` with a
+range's arguments.
+
+2184 tests, 605 programs against clang++, 11 projects, 3672 builds across
+six targets.
+
 ### 0.9.13 - a struct with more than one name
 
 `typedef struct _CRYPTOAPI_BLOB { ... } CRYPT_INTEGER_BLOB, ..., DATA_BLOB,

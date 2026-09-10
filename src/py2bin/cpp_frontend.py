@@ -7461,13 +7461,27 @@ def _member_copies(
             continue
         if holder:
             receiver = _receiver_before(text, call.start())
-            held = (_deduced_type(receiver, text) or "").replace("*", "").strip()
+            # Asked at the call, not of the whole file. With no position the
+            # reader takes the last declaration of that name anywhere, and
+            # `output` is a name two functions apart may both use: a `Bytes
+            # &output` here and an `ostringstream output` a few hundred lines
+            # down, and the second answered for the first - so the call was
+            # taken for one on another class and no copy was written for it.
+            held = (
+                (_deduced_type(receiver, text, call.start()) or "")
+                .replace("*", "")
+                .strip()
+            )
             if not held:
                 # The whole chain could not be read. The name at the end of
                 # it is declared somewhere, and what it is declared as is
                 # what the call is made on.
                 tail = re.split(r"\.|->", receiver)[-1].strip()
-                held = (_deduced_type(tail, text) or "").replace("*", "").strip()
+                held = (
+                    (_deduced_type(tail, text, call.start()) or "")
+                    .replace("*", "")
+                    .strip()
+                )
             if held and held != holder:
                 continue
         if call.group(2):
