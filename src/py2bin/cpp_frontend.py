@@ -13733,6 +13733,29 @@ def _chosen_overload(
     ]
     if len(exact) == 1:
         return exact[0]
+    # `p == nullptr`, which arrives here as `p == 0`. C++ turns a null
+    # constant into a pointer by a standard conversion and into a class only
+    # by that class's own constructor, and the standard one wins - so the
+    # form taking a pointer is the one meant. Without this, a holder that
+    # compares against a raw pointer *and* against another holder made
+    # `a == nullptr` ambiguous between the two.
+    nulls = [
+        index
+        for index, one in enumerate(given)
+        if one.strip() in ("0", "nullptr")
+    ]
+    if nulls:
+        pointed = [
+            m
+            for m in candidates
+            if all(
+                index < len(_parameter_types(m.parameters))
+                and _parameter_types(m.parameters)[index].endswith("_p")
+                for index in nulls
+            )
+        ]
+        if len(pointed) == 1:
+            return pointed[0]
     codes = plain if plain != codes and not exact else codes
     near = [
         m
@@ -17429,6 +17452,25 @@ def _rewrite_binary_operator(
         passed = (
             f"&{right}" if right in known and right not in pointers else right
         )
+        if passed is right and right.startswith("(") and right.endswith(")"):
+            # `&(*p)` is `p`. A lambda's capture by reference is written
+            # through a star, so an operand this scope knows arrives as
+            # `(*this->session)` - not a name, so the rule above did not fire
+            # and the object was handed over by value where the operator
+            # wants its address.
+            inner = right[1:-1].strip()
+            if (
+                _closing_paren(right, 0) == len(right) - 1
+                and inner.startswith("*")
+                and inner[1:].strip()
+            ):
+                spelled = _deduced_type(right, f"{body}\n{scope}")
+                if spelled is not None and _class_named(
+                    re.sub(r"\b(?:const|volatile|struct)\b", " ", spelled)
+                    .replace("&", " ")
+                    .strip()
+                ) in classes:
+                    passed = inner[1:].strip()
         out.append(body[at:found.start()])
         # The scope goes with the body: which overload `a == b` means is read
         # off the type of `b`, and `b` may be a parameter, declared in a head
@@ -17880,6 +17922,9 @@ def _rewrite_operators(
     # reading it means following the arrow rather than the call that replaces
     # it.
     body = _assign_through_a_dereference(body, classes, scope or body)
+    # And a call on such a member, which is the same receiver written with a
+    # method after it rather than an `=`.
+    body = _call_through_a_dereference(body, classes, scope or body)
     # And the same arrow written on something that is not a name, which is
     # what a lambda's capture by reference becomes.
     body = _arrows_through_a_dereference(body, classes, scope or body)
@@ -18068,6 +18113,87 @@ def _ask_objects_in_conditions(
                 body, lambda part, p=pattern, w=written: re.sub(p, w, part)
             )
     return body
+
+
+def _call_through_a_dereference(
+    body: str, classes: "dict[str, Class]", scope: str
+) -> str:
+    """`(*p)->m.f(v)` where `m` is an object: the call is that class's own.
+
+    The other half of the assignment below. A lambda's capture by reference
+    puts the holder behind a dereference, so `session->socketClosed.exchange(
+    true)` arrives here with a receiver that is not a name - and the pass
+    that rewrites a method call walks the names this scope knows, so the call
+    was left as C++ and the C stage was asked for a member called `exchange`.
+    """
+
+    if not classes:
+        return body
+    bare = _without_literals(body)
+    out: "list[str]" = []
+    at = 0
+    for found in re.finditer(r"\(\s*\*\s*", bare):
+        if found.start() < at:
+            continue
+        closing = _closing_paren(bare, found.start())
+        if closing < 0:
+            continue
+        reached = re.match(
+            r"\s*->\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(",
+            bare[closing + 1:],
+        )
+        if reached is None:
+            continue
+        inside = body[found.end(): closing].strip()
+        if not inside:
+            continue
+        held = _deduced_type(inside, scope)
+        if held is None:
+            continue
+        owner = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", held
+        ).replace("*", " ").strip()
+        if _find_method(owner, "op_arrow", classes) is None:
+            continue
+        holds = _arrow_target(owner, classes)
+        if holds is None:
+            continue
+        member = _member_result(
+            scope, holds, rf"{re.escape(reached.group(1))}\s*[;=\[]"
+        )
+        if member is None:
+            continue
+        spelled = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", member
+        ).replace("&", " ").strip()
+        if "*" in spelled or spelled not in classes:
+            continue
+        provider = _find_method(spelled, reached.group(2), classes)
+        if provider is None:
+            continue
+        opens = closing + 1 + reached.end() - 1
+        shut = _closing_paren(bare, opens)
+        if shut < 0:
+            continue
+        arguments = body[opens + 1: shut]
+        given = [
+            one.strip() for one in _split_arguments(arguments) if one.strip()
+        ]
+        left = (
+            body[found.start(): closing + 1 + reached.start(1)]
+            + reached.group(1)
+        )
+        suffix = _call_suffix(spelled, reached.group(2), classes, given, scope)
+        passed = f", {arguments}" if arguments.strip() else ""
+        out.append(body[at:found.start()])
+        out.append(
+            f"{_c_name(provider, reached.group(2), suffix)}(&{left}{passed})"
+        )
+        at = shut + 1
+    if not out:
+        return body
+    out.append(body[at:])
+    return "".join(out)
 
 
 def _assign_through_a_dereference(
@@ -24059,6 +24185,22 @@ public:
         room = 0;
         while (first != last) { push_back((T)(*first)); ++first; }
     }
+    /* `vector<uint8_t> result(n);` - n elements, each value-initialised,
+       which is what a program writes when it is about to fill a buffer.
+       Written as a default-built element copied into each place: `reserve`
+       takes storage and builds nothing, so without this the elements were
+       whatever was last left where they sit. */
+    vector(unsigned long many) {
+        unsigned long i;
+        T __py2bin_each{};
+        items = 0;
+        count = 0;
+        room = 0;
+        reserve(many);
+        i = 0;
+        while (i < many) { items[i] = __py2bin_each; i = i + 1; }
+        count = many;
+    }
     unsigned long size() { return count; }
     int empty() { return count == 0; }
     /* Every element taken apart, which is what letting go of them means.
@@ -24166,6 +24308,18 @@ public:
         i = 0;
         while (i < many) { items[i] = value; i = i + 1; }
         count = many;
+    }
+    /* Two of these exchange what they hold. It is how a program takes a
+       container's contents away without copying them - `held.swap(shared);`
+       under a lock, and then the work is done outside it - and there is
+       nothing else here that says "and leave the other one empty". */
+    void swap(vector &other) {
+        T *__held;
+        unsigned long __count;
+        unsigned long __room;
+        __held = items; __count = count; __room = room;
+        items = other.items; count = other.count; room = other.room;
+        other.items = __held; other.count = __count; other.room = __room;
     }
 };
 }
@@ -26496,8 +26650,12 @@ public:
     operator bool() { return raw != 0; }
     int operator==(T *p) { return raw == p; }
     int operator!=(T *p) { return raw != p; }
+    int operator==(const unique_ptr &o) { return raw == o.raw; }
+    int operator!=(const unique_ptr &o) { return raw != o.raw; }
     T *release() { T *held; held = raw; raw = 0; return held; }
     void reset(T *p) { if (raw != 0) { delete raw; } raw = p; }
+    /* Letting go of what it owns and taking nothing in its place. */
+    void reset() { if (raw != 0) { delete raw; raw = 0; } }
 };
 
 /* And the same holder with a deleter of its own, which is how a program
@@ -26548,7 +26706,15 @@ public:
     operator bool() { return raw != 0; }
     int operator==(T *p) { return raw == p; }
     int operator!=(T *p) { return raw != p; }
+    /* And against another holder, which is how a program asks whether the
+       one it is looking at is the one it kept: `if (session_ == session)`.
+       Written only against a raw pointer, that comparison was handed a
+       holder where a `T *` goes. */
+    int operator==(const shared_ptr &o) { return raw == o.raw; }
+    int operator!=(const shared_ptr &o) { return raw != o.raw; }
     void reset(T *p) { raw = p; }
+    /* Letting go of it without putting anything in its place. */
+    void reset() { raw = 0; }
 };
 
 /* `make_shared<T>(...)` and `make_unique<T>(...)` - the holder built around

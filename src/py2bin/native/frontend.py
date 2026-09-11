@@ -428,6 +428,74 @@ WINDOWS_API: dict[str, tuple[str, tuple[str, ...], str, str]] = {
         "MessageBoxW", ("ptr", "ptr", "ptr", "int"), "int", "USER32.dll",
     ),
     "GetSystemMetrics": ("GetSystemMetrics", ("int",), "int", "USER32.dll"),
+    #: What a program that acts on the desktop for somebody else calls: it
+    #: presses keys and moves the pointer, reads and writes the clipboard,
+    #: and copies the screen into a bitmap. All of it ships with Windows and
+    #: is bound by the loader, so it belongs here rather than behind
+    #: `--library`, which is for a component somebody else shipped.
+    "SendInput": ("SendInput", ("int", "ptr", "int"), "int", "USER32.dll"),
+    "SetCursorPos": ("SetCursorPos", ("int", "int"), "int", "USER32.dll"),
+    "OpenClipboard": ("OpenClipboard", ("ptr",), "int", "USER32.dll"),
+    "CloseClipboard": ("CloseClipboard", (), "int", "USER32.dll"),
+    "EmptyClipboard": ("EmptyClipboard", (), "int", "USER32.dll"),
+    "GetClipboardData": (
+        "GetClipboardData", ("int",), "ptr", "USER32.dll",
+    ),
+    "SetClipboardData": (
+        "SetClipboardData", ("int", "ptr"), "ptr", "USER32.dll",
+    ),
+    "GetDC": ("GetDC", ("ptr",), "ptr", "USER32.dll"),
+    "ReleaseDC": ("ReleaseDC", ("ptr", "ptr"), "int", "USER32.dll"),
+    #: The drawing half of the same, which Windows keeps in its own library.
+    "BitBlt": (
+        "BitBlt",
+        ("ptr", "int", "int", "int", "int", "ptr", "int", "int", "int"),
+        "int",
+        "GDI32.dll",
+    ),
+    "CreateCompatibleBitmap": (
+        "CreateCompatibleBitmap", ("ptr", "int", "int"), "ptr", "GDI32.dll",
+    ),
+    "CreateCompatibleDC": (
+        "CreateCompatibleDC", ("ptr",), "ptr", "GDI32.dll",
+    ),
+    "DeleteDC": ("DeleteDC", ("ptr",), "int", "GDI32.dll"),
+    "DeleteObject": ("DeleteObject", ("ptr",), "int", "GDI32.dll"),
+    "SelectObject": ("SelectObject", ("ptr", "ptr"), "ptr", "GDI32.dll"),
+    #: The memory a clipboard entry is handed over in, and the block a call
+    #: that answers one asks you to let go of afterwards.
+    "GlobalAlloc": ("GlobalAlloc", ("int", "int"), "ptr", "KERNEL32.dll"),
+    "GlobalFree": ("GlobalFree", ("ptr",), "ptr", "KERNEL32.dll"),
+    "GlobalLock": ("GlobalLock", ("ptr",), "ptr", "KERNEL32.dll"),
+    "GlobalUnlock": ("GlobalUnlock", ("ptr",), "int", "KERNEL32.dll"),
+    "LocalFree": ("LocalFree", ("ptr",), "ptr", "KERNEL32.dll"),
+    "GetComputerNameW": (
+        "GetComputerNameW", ("ptr", "ptr"), "int", "KERNEL32.dll",
+    ),
+    "GetEnvironmentVariableW": (
+        "GetEnvironmentVariableW", ("ptr", "ptr", "int"), "int",
+        "KERNEL32.dll",
+    ),
+    #: Windows' own keeping of a secret, which is what a program uses so that
+    #: what it wrote down can only be read back by the same user on the same
+    #: machine.
+    "CryptProtectData": (
+        "CryptProtectData",
+        ("ptr", "ptr", "ptr", "ptr", "ptr", "int", "ptr"),
+        "int",
+        "CRYPT32.dll",
+    ),
+    "CryptUnprotectData": (
+        "CryptUnprotectData",
+        ("ptr", "ptr", "ptr", "ptr", "ptr", "int", "ptr"),
+        "int",
+        "CRYPT32.dll",
+    ),
+    #: A stream over bytes already in memory, which is how a program hands an
+    #: image to a COM encoder without writing a file first.
+    "SHCreateMemStream": (
+        "SHCreateMemStream", ("ptr", "int"), "ptr", "SHLWAPI.dll",
+    ),
     "SetWindowPos": (
         "SetWindowPos",
         ("ptr", "ptr", "int", "int", "int", "int", "int"),

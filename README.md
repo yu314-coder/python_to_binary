@@ -2756,6 +2756,46 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the desktop calls a companion makes
+
+`held.swap(activePointerModifiers);` under a lock, so the work is done outside
+it. The shipped `<vector>` had no `swap`, and there is nothing else in it that
+says "and leave the other one empty".
+
+And twenty-four Windows entry points a program that acts on the desktop for
+somebody else calls: it presses keys and moves the pointer (`SendInput`,
+`SetCursorPos`), reads and writes the clipboard, copies the screen into a
+bitmap through GDI, hands the memory back with `GlobalFree` and `LocalFree`,
+and keeps a secret with DPAPI's `CryptProtectData`. All of them ship with
+Windows and are bound by the loader, so they belong in the import table rather
+than behind `--library`, which is for a component somebody else shipped.
+
+And a call on a member reached the same way: `session->socketClosed.exchange(
+true)` inside the closure, where the receiver is again not a name.
+
+`if (session_ == session) { session_.reset(); }` - two holders compared
+against each other, and one let go of without anything to put in its place.
+The shipped `shared_ptr` and `unique_ptr` compared only against a raw pointer,
+so the comparison was handed a holder where a `T *` goes, and neither had a
+`reset` that takes nothing. With both forms present, `a == nullptr` was
+ambiguous between them: C++ turns a null constant into a pointer by a standard
+conversion and into a holder only by that holder's own constructor, and the
+standard one wins - which the overload chooser now says.
+
+And the operand of that comparison, when the closure is what holds it: the
+capture is a pointer, so `session` arrives as `(*this->session)` - not a name,
+so the rule that hands an object over by address did not fire and the operator
+was given one by value. `&(*p)` is `p`.
+
+`std::vector<uint8_t> result(n);` - n elements, each value-initialised, which
+is what a program writes when it is about to fill a buffer. The shipped
+`<vector>` could be built empty or from a range and not from a count, and
+`reserve` takes storage without building anything - so the elements would have
+been whatever was last left where they sit.
+
+2184 tests, 615 programs against clang++, 11 projects, 3732 builds across
+six targets.
+
 ### 0.9.13 - an assignment through a capture
 
 `session->closed = true;` inside a lambda that captured `session`. The capture

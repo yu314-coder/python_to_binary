@@ -11,6 +11,7 @@ struct Session {
     int socket = 0;
     std::atomic<bool> authenticated{false};
     std::atomic<bool> closed{false};
+    std::atomic<bool> socketClosed{false};
 };
 
 int main() {
@@ -19,10 +20,17 @@ int main() {
     auto closeSession = [&] {
         session->closed = true;
         session->authenticated = false;
-        std::printf("closing %d\n", session->socket);
+        // And a call on such a member, which is the same receiver written
+        // with a method after it rather than an `=`.
+        if (!session->socketClosed.exchange(true)) {
+            std::printf("closing %d\n", session->socket);
+        }
+        std::printf("again %d\n", (int)session->socketClosed.exchange(true));
     };
     closeSession();
-    std::printf("%d %d\n", (int)session->closed.load(),
-                (int)session->authenticated.load());
+    closeSession();
+    std::printf("%d %d %d\n", (int)session->closed.load(),
+                (int)session->authenticated.load(),
+                (int)session->socketClosed.load());
     return 0;
 }
