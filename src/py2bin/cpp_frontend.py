@@ -17875,6 +17875,11 @@ def _rewrite_operators(
     # `operator!`: this one leaves that spelling to them.
     body = _ask_objects_in_conditions(body, classes, known, pointers)
     body = _rewrite_holder_operators(body, classes, known, pointers)
+    # An assignment to a member reached that way, before the arrow becomes a
+    # call: what says which `operator=` is meant is the member's type, and
+    # reading it means following the arrow rather than the call that replaces
+    # it.
+    body = _assign_through_a_dereference(body, classes, scope or body)
     # And the same arrow written on something that is not a name, which is
     # what a lambda's capture by reference becomes.
     body = _arrows_through_a_dereference(body, classes, scope or body)
@@ -18063,6 +18068,82 @@ def _ask_objects_in_conditions(
                 body, lambda part, p=pattern, w=written: re.sub(p, w, part)
             )
     return body
+
+
+def _assign_through_a_dereference(
+    body: str, classes: "dict[str, Class]", scope: str
+) -> str:
+    """`(*p)->m = v;` where `m` is an object whose class writes `operator=`.
+
+    A lambda's capture by reference is a pointer to the object it closed
+    over, so `session->closed = true` inside the closure arrives here as
+    `(*this->session)->closed = 1;`. The pass that turns an assignment into
+    the class's own `operator=` walks the names this scope knows, and the
+    left of this one is not a name - so an `atomic<bool>` member was handed
+    an `int` and the C stage said so.
+    """
+
+    if not classes:
+        return body
+    bare = _without_literals(body)
+    out: "list[str]" = []
+    at = 0
+    for found in re.finditer(r"\(\s*\*\s*", bare):
+        if found.start() < at:
+            continue
+        closing = _closing_paren(bare, found.start())
+        if closing < 0:
+            continue
+        reached = re.match(
+            r"\s*->\s*([A-Za-z_]\w*)\s*=(?!=)\s*", bare[closing + 1:]
+        )
+        if reached is None:
+            continue
+        inside = body[found.end(): closing].strip()
+        if not inside:
+            continue
+        held = _deduced_type(inside, scope)
+        if held is None:
+            continue
+        owner = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", held
+        ).replace("*", " ").strip()
+        if _find_method(owner, "op_arrow", classes) is None:
+            continue
+        holds = _arrow_target(owner, classes)
+        if holds is None:
+            continue
+        member = _member_result(
+            scope, holds, rf"{re.escape(reached.group(1))}\s*[;=\[]"
+        )
+        if member is None:
+            continue
+        spelled = re.sub(
+            r"\b(?:const|volatile|struct)\b", " ", member
+        ).replace("&", " ").strip()
+        if "*" in spelled or spelled not in classes:
+            continue
+        writer = _find_method(spelled, "op_assign", classes)
+        if writer is None:
+            continue
+        ends = bare.find(";", closing)
+        if ends < 0:
+            continue
+        start = closing + 1 + reached.end()
+        value = body[start:ends].strip()
+        if not value:
+            continue
+        left = body[found.start(): closing + 1 + reached.start(1)] + reached.group(1)
+        suffix = _call_suffix(spelled, "op_assign", classes, [value], scope)
+        out.append(body[at:found.start()])
+        out.append(
+            f"{_c_name(writer, 'op_assign', suffix)}(&{left}, {value})"
+        )
+        at = ends
+    if not out:
+        return body
+    out.append(body[at:])
+    return "".join(out)
 
 
 def _arrows_through_a_dereference(

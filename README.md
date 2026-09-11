@@ -2756,6 +2756,18 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an assignment through a capture
+
+`session->closed = true;` inside a lambda that captured `session`. The capture
+is a pointer to the holder, so the left of the assignment arrives as
+`(*this->session)->closed` - not a name, and the pass that turns an assignment
+into the class's own `operator=` walks the names this scope knows. The
+`std::atomic<bool>` member was handed an `int`, and the C stage said so. The
+member's class is read by following the arrow, before the arrow becomes a call.
+
+2184 tests, 610 programs against clang++, 11 projects, 3702 builds across
+six targets.
+
 ### 0.9.13 - the nearest declaration, twice more
 
 `auto session = std::make_shared<Session>();` in one function and
