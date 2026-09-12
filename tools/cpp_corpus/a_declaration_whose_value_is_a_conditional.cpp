@@ -14,7 +14,20 @@ static std::filesystem::path fallback() {
     return std::filesystem::path("/tmp");
 }
 
+// And one whose two arms do not agree with each other: the declared type is
+// what the object is, and an arm the reader cannot work out is left to the
+// assignment, which is the pass that knows how to convert one.
+static std::string stable(const std::string &deviceID, const std::string &deviceKind,
+                          const std::string &deviceName) {
+    const std::string stableID = deviceID.empty()
+        ? deviceKind + ":" + deviceName
+        : deviceID;
+    return stableID;
+}
+
 int main() {
+    std::printf("%s %s\n", stable("", "phone", "mine").c_str(),
+                stable("kept", "phone", "mine").c_str());
     int length = 4;
     std::filesystem::path directory = length > 0
         ? std::filesystem::path("/one") : fallback();

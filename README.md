@@ -2756,6 +2756,64 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a declaration behind a lifted block
+
+`const std::string message(plain.begin() + 1, plain.end());` written after an
+`if (...) { ... }`. A block is lifted out of the body it sits in and stands as
+a mark between two NULs while the body around it is rewritten - and the reader
+that types a name, asking where the statement began, read that mark as an
+ordinary word. A word that does not lead a type means "no declaration starts
+here", so this one was invisible: `message` was then typed by whatever some
+*other* function in the unit declared under that name, which was a `char *`.
+The address a `const std::string &` parameter wants was not taken.
+
+No program's text holds a NUL, so the mark can only ever be one of these. Two
+unit tests, one with the block lifted and one with it written out, which is
+what says the fix is about the mark and nothing else.
+
+And `strtod`, which their `jsonNumber` reads a number with. py2bin's
+`<stdlib.h>` ships as C source for the same reason its allocator does - it
+links nothing it did not compile, and a C runtime's `strtod` lives in a
+library it has no linker for. `atof` comes with it. What the corpus program
+checks is not only the value but where the reading stopped, which is how a
+caller tells "no number here" from "the number zero".
+
+And the literal-blanking trap again, in the two readers that say where an
+object was declared. A program that writes `jsonString(message, "proof")`
+spells the name of a later local inside a string; read off the raw text, that
+counted as the declaration of `proof`, so an early `return` above it took
+apart an object that did not exist yet - reported by the C stage as a name
+declared nowhere, on a line that is correct C++. The blanked copy is the same
+length, so the offsets still point at the real text.
+
+And the same split again, for a declaration whose two arms do not agree with
+each other: `const std::string stableID = deviceID.empty() ? deviceKind + ":"
++ deviceName : deviceID;`. The declared type is what the object is - the
+program spelled it - so one arm reading as that class is enough; an arm the
+reader cannot work out is left to the assignment, which is the pass that knows
+how to convert one.
+
+`sendFrame(socket, session->encrypted(packet), session->sendMutex)` - a method
+that answers an object by value, reached through a smart pointer. A value
+return writes into space the caller provides, so the call needs a temporary:
+the pass that makes one looked the method up on the holder, which does not
+have it, and the pass that fills the temporary ran after the arrow had already
+become a call on what it answers. Both follow the arrow now, and the filling
+runs before the operators as well as after.
+
+And `std::array<std::uint8_t, 16> tag{};` - a declaration written with braces,
+which the reader that types a name did not count as one. It knew the four other
+ways to write a declaration and not that one, so the only `tag` it could find
+in the unit was a `const std::string &tag` parameter of another function; the
+range `insert` written for `tag.begin()` was then the one taking characters,
+and the C stage reported the mismatch on a line that is correct C++. This is
+the same failure as every other in this note - a name typed from a declaration
+somewhere else in the program - and it stops being rare the moment a project
+has four files with ordinary names in them.
+
+2188 tests, 624 programs against clang++, 11 projects, 3786 builds across
+six targets.
+
 ### 0.9.13 - a declaration whose value is a conditional
 
 `path directory = length > 0 ? path(buffer) : temp_directory_path();` - the

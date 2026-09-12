@@ -3455,6 +3455,93 @@ void *realloc(void *__block, size_t __size) {
 
 int abs(int __value) { return __value < 0 ? -__value : __value; }
 long labs(long __value) { return __value < 0 ? -__value : __value; }
+
+/* Reading a number out of text. Written here as C rather than imported,
+   for the same reason the allocator above is: py2bin links nothing it did
+   not compile, and a C runtime's `strtod` lives in a library it has no
+   linker for.
+
+   `__end` is where the reading stopped, which is how a caller tells "no
+   number here" from "the number zero": `strtod(s, &end); if (end == s)` is
+   the whole idiom, and without it a program cannot say the difference.
+
+   Accepted: leading space, a sign, digits with an optional point, and an
+   `e` exponent. Hexadecimal floats, infinities and NaNs are not read; a
+   program that hands one of those gets zero back and an `__end` that has
+   not moved, which says plainly that nothing was read.
+
+   The whitespace test is written with the codes rather than the escapes -
+   9 through 13 are tab, newline, vertical tab, form feed and return - so
+   that this text carries no backslash of its own. */
+double strtod(const char *__text, char **__end) {
+    const char *__at;
+    const char *__back;
+    double __value;
+    double __scale;
+    int __negative;
+    int __any;
+    int __power;
+    int __down;
+
+    __at = __text;
+    while (*__at == 32 || (*__at >= 9 && *__at <= 13)) { __at++; }
+    __negative = 0;
+    if (*__at == '+' || *__at == '-') {
+        __negative = *__at == '-';
+        __at++;
+    }
+    __value = 0.0;
+    __any = 0;
+    while (*__at >= '0' && *__at <= '9') {
+        __value = __value * 10.0 + (double)(*__at - '0');
+        __any = 1;
+        __at++;
+    }
+    if (*__at == '.') {
+        __at++;
+        __scale = 1.0;
+        while (*__at >= '0' && *__at <= '9') {
+            __scale = __scale / 10.0;
+            __value = __value + (double)(*__at - '0') * __scale;
+            __any = 1;
+            __at++;
+        }
+    }
+    if (!__any) {
+        /* Nothing was read, so the end is where the caller started - not
+           where the spaces and the sign ended. */
+        if (__end != 0) { *__end = (char *)__text; }
+        return 0.0;
+    }
+    if (*__at == 'e' || *__at == 'E') {
+        __back = __at;
+        __at++;
+        __down = 0;
+        if (*__at == '+' || *__at == '-') {
+            __down = *__at == '-';
+            __at++;
+        }
+        if (*__at >= '0' && *__at <= '9') {
+            __power = 0;
+            while (*__at >= '0' && *__at <= '9') {
+                __power = __power * 10 + (int)(*__at - '0');
+                __at++;
+            }
+            while (__power > 0) {
+                __value = __down ? __value / 10.0 : __value * 10.0;
+                __power--;
+            }
+        } else {
+            /* `1e` with no digits after it: the `e` is not part of the
+               number, and the reading stopped in front of it. */
+            __at = __back;
+        }
+    }
+    if (__end != 0) { *__end = (char *)__at; }
+    return __negative ? -__value : __value;
+}
+
+double atof(const char *__text) { return strtod(__text, (char **)0); }
 """
 
 #: How py2bin gives a program `NULL`. Guarded, because C says a redefinition

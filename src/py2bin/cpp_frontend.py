@@ -2278,13 +2278,18 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     # buffer;` does, and without it the type of one was never read - so a
     # call taking it picked the wrong overload, silently, by falling back to
     # the first.
+    # The `{` is the same declaration written the other way: `array<uint8_t,
+    # 16> tag{};` declares `tag`, and passed over, the type read for it came
+    # from a `const string &tag` parameter of some other function in the
+    # unit - so `tag.begin()` answered `char *` and the range `insert`
+    # chosen for it was the one taking characters.
     pattern = re.compile(
         # `&` as readily as `*`: `const V &v` is a parameter as ordinary as
         # `V *p`, and read without it the type of `v` could not be found at
         # all - so nothing reached through it could be either, and `v.x`
         # inside a function taking a reference had no type.
         rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*([*&]?)\s*"
-        rf"\b{re.escape(spelled)}\b\s*([=;,)\[(])"
+        rf"\b{re.escape(spelled)}\b\s*([=;,)\[({{])"
     )
     code = _without_literals(text)
     found = [
@@ -4556,15 +4561,25 @@ def _split_declared_conditionals(text: str, filename: str) -> str:
             answers = [
                 _deduced_type(arm.strip(), text, found.start()) for arm in arms
             ]
-            if any(one is None for one in answers):
-                continue
             plain = {
                 re.sub(r"\b(?:const|volatile|struct)\b", " ", one)
                 .replace("&", " ")
                 .strip()
                 for one in answers
+                # `void` is not a type an arm can have - a declaration's
+                # value is never nothing - so it is the reader saying it
+                # could not work the expression out, the same as None.
+                if one is not None and one.strip() != "void"
             }
-            if plain != {spelled}:
+            # The declared type is what the object is - the program spelled
+            # it - so the arms do not have to agree with each other. One of
+            # them has to read as this class, which is what says this is the
+            # conditional C++ converts and not two numbers; an arm whose type
+            # cannot be read is left to the assignment below, which is the
+            # pass that knows how to convert one. `const std::string
+            # stableID = deviceID.empty() ? deviceKind + ":" + deviceName :
+            # deviceID;` has one of each.
+            if spelled not in plain or plain - {spelled}:
                 continue
             name = found.group(2)
             change = (
@@ -11637,7 +11652,15 @@ def _could_start_a_declaration(text: str, at: int) -> bool:
     """
 
     before = text[:at]
-    cut = max((before.rfind(char) for char in ";{}(,)"), default=-1)
+    # A block this pass lifted out stands in the text as a mark between two
+    # NULs, and a statement after a block is where a declaration goes as
+    # surely as one after a `}`. Read as an ordinary word, the mark was a
+    # word that does not lead a type - so `if (...) { ... }` followed by
+    # `const string message(...)` hid that declaration from every reader,
+    # and the type of `message` was then whatever some other function's
+    # `message` happened to be. No program's text holds a NUL, so it can
+    # only ever be one of these marks.
+    cut = max((before.rfind(char) for char in ";{}(,)\x00"), default=-1)
     return all(word in _LEADS_A_TYPE for word in before[cut + 1:].split())
 
 
@@ -15011,6 +15034,17 @@ def _hoist_value_returns(
                 continue
             owner = _find_method(holds, method, classes)
             if owner is None:
+                # A method of what a *holder* holds, reached through its
+                # `operator->`: `session->encrypted(packet)` where `session`
+                # is a `shared_ptr<Session>`. The pass that turns that into a
+                # call on the held object runs after this one, so what it
+                # will become is not in the text yet - and a value return
+                # still needs the space the caller provides, whichever
+                # spelling the call arrives in.
+                reached = _arrow_target(holds, classes)
+                if reached is not None:
+                    owner = _find_method(reached, method, classes)
+            if owner is None:
                 continue
             member = _method_by_name(owner, method, classes)
             declared = _returns_object(member, classes) if member else None
@@ -16477,10 +16511,24 @@ def _rewrite_body(
             return match.group(0)
         holds = reachable[receiver]
         owner = _find_method(holds, method, classes)
+        address = receiver if receiver in pointers else f"&{receiver}"
+        if owner is None:
+            # A method of what a *holder* holds, reached through its
+            # `operator->`: `session->encrypted(packet)` where `session` is a
+            # `shared_ptr<Session>` and `encrypted` answers an object. The
+            # receiver the call needs is what the arrow answers and not the
+            # holder, so the address handed over is the arrow's own call.
+            reached = _arrow_target(holds, classes)
+            through = _find_method(holds, "op_arrow", classes)
+            if reached is not None and through is not None:
+                on_what = _find_method(reached, method, classes)
+                if on_what is not None:
+                    owner = on_what
+                    holds = reached
+                    address = f"{_c_name(through, 'op_arrow')}({address})"
         if owner is None:
             return match.group(0)
         known[variable] = type_name
-        address = receiver if receiver in pointers else f"&{receiver}"
         fixed = _addressed_arguments(
             holds, method, arguments, known, pointers, classes
         )
@@ -16732,6 +16780,13 @@ def _rewrite_body(
     # two structs and cannot.
     for spelled, holds in _declared_objects(body, classes).items():
         known.setdefault(spelled, holds)
+    # Before the operators as well as after them. A method reached through a
+    # holder's `operator->` is rewritten by those into a call on what the
+    # arrow answers - and once it is that, the shape below no longer reads as
+    # a declaration filled by a method, so `Bytes out = session->encrypted(p);`
+    # kept a call that had nowhere to write its answer. Run again afterwards,
+    # where it has always run, for everything the operators leave behind.
+    body = _VALUE_INIT.sub(declare_from_call, body)
     body = _rewrite_operators(
         body,
         classes,
@@ -17143,20 +17198,31 @@ def _declared_at(body: str, name: str) -> int:
     """Where this object first appears, which is where it was declared.
 
     The same reading `_built_before` does, and for the same reason: a name is
-    mentioned first where it is brought into being.
+    mentioned first where it is brought into being. Read with the literals
+    blanked, because a program that writes `jsonString(message, "proof")`
+    spells the name of a later local inside a string - and the blanked copy
+    is the same length, so the offset still points at the real text.
     """
 
-    where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", body)
+    where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", _without_literals(body))
     return where.start() if where is not None else 0
 
 
 def _built_before(body: str, name: str, block: int) -> bool:
-    """Whether that object is declared above the block with this number."""
+    """Whether that object is declared above the block with this number.
 
-    mark = body.find(_BLOCK_MARK % block)
+    The literals are blanked for the same reason as above: `"proof"` written
+    as a key in a call before the block is not a declaration of `proof`, and
+    read as one the block's `return` took apart an object that did not exist
+    yet - which the C stage reported as a name declared nowhere, on a line
+    that is correct C++.
+    """
+
+    bare = _without_literals(body)
+    mark = bare.find(_BLOCK_MARK % block)
     if mark < 0:
         return True
-    where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", body)
+    where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", bare)
     return where is not None and where.start() < mark
 
 

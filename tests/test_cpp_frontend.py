@@ -62,6 +62,56 @@ int main(void) {
 """
 
 
+class Reading(unittest.TestCase):
+    def test_a_declaration_after_a_lifted_block_is_still_seen(self) -> None:
+        # A block is lifted out of the body it sits in and stands as a mark
+        # between two NULs while the body around it is rewritten. The reader
+        # that types a name asks where the statement began, and it read that
+        # mark as an ordinary word - a word that does not lead a type - so a
+        # declaration written after an `if (...) { ... }` was invisible, and
+        # the name was then typed by whatever some *other* function declared
+        # under the same name. In a one-file probe that is almost always the
+        # right answer by luck; in a program of four files it is not.
+        from py2bin.cpp_frontend import _BLOCK_MARK, _deduced_type
+
+        body = (
+            "{\n    if (plain[0] != kAuthenticationPacket) "
+            + (_BLOCK_MARK % 0)
+            + "\n    const string message(plain.begin() + 1, plain.end());\n"
+        )
+        self.assertEqual(_deduced_type("message", body), "const string")
+
+    def test_a_declaration_after_a_closing_brace_is_still_seen(self) -> None:
+        # The same shape with the block written out, which has always worked
+        # and is what says the fix above is about the mark and nothing else.
+        from py2bin.cpp_frontend import _deduced_type
+
+        body = (
+            "{\n    if (plain[0] != kAuthenticationPacket) { return; }\n"
+            "    const string message(plain.begin() + 1, plain.end());\n"
+        )
+        self.assertEqual(_deduced_type("message", body), "const string")
+
+    def test_a_name_a_brace_declares_is_read_over_a_further_parameter(self) -> None:
+        # `array<uint8_t, 16> tag{};` declares `tag` as surely as any other
+        # form does, and the reader passed over it: the only declaration it
+        # could see was the `const string &tag` of another function, so
+        # `tag.begin()` answered `char *` and the range `insert` written for
+        # it was the one taking characters.
+        from py2bin.cpp_frontend import _deduced_type
+
+        unit = (
+            "static void report(const string &tag) { puts(tag.c_str()); }\n"
+            "static void framed(void) {\n"
+            "    array__uint8_t_16 tag{};\n"
+            "    use(tag.begin());\n"
+            "}\n"
+        )
+        self.assertEqual(
+            _deduced_type("tag", unit, unit.index("use(")), "array__uint8_t_16"
+        )
+
+
 class Translating(unittest.TestCase):
     def test_a_class_becomes_a_struct_and_free_functions(self) -> None:
         out = translate(_VEC, "vec.cpp")
