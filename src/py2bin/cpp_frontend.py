@@ -2832,7 +2832,9 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
             # through one, and read as a member of the pointer it had no
             # type: so nothing could say what `session->transfers[id]` was,
             # and a brace list assigned to it had nothing to be built as.
-            through = _member_result(text, owner, r"operator\s*->")
+            through = _member_result(
+                text, owner, r"operator\s*->"
+            ) or _ARROW_TARGET.get(owner)
             if through is not None:
                 inner = re.sub(
                     r"\b(?:const|struct|union)\b", " ", through.replace("*", " ")
@@ -4507,6 +4509,83 @@ def _split_argument_conditionals(text: str, filename: str) -> str:
             + name
             + text[end:]
         )
+    return text
+
+
+#: `path directory = ok ? one : other;` - a declaration whose value is a
+#: conditional. The type is spelled, so the object it declares is the one the
+#: arms are written into.
+_A_DECLARED_CONDITIONAL = re.compile(
+    r"(?<![.\w>])((?:const\s+)?[A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*"
+    r"([^;{}]*\?[^;{}]*);"
+)
+
+
+def _split_declared_conditionals(text: str, filename: str) -> str:
+    """`T name = ok ? one : other;`, written as the `if` C++ means.
+
+    The same as the `return` above, for the other place a conditional stands
+    whole: the value of a declaration. Split here rather than left for the
+    passes below, because those hoist what an arm calls into a temporary
+    ahead of the statement - and then *both* arms are evaluated, which is the
+    one thing about `?:` a program can depend on. `path directory = length >
+    0 ? path(buffer) : temp_directory_path();` asked the filesystem for a
+    temporary directory whether or not it needed one.
+    """
+
+    for _round in range(_HOIST_ROUNDS):
+        bare = _without_literals(text)
+        names = {one.group(2) for one in _CLASS_HEAD.finditer(text)}
+        change = None
+        for found in _A_DECLARED_CONDITIONAL.finditer(bare):
+            if not _could_start_a_declaration(bare, found.start()):
+                continue
+            spelled = re.sub(
+                r"\b(?:const|volatile|struct)\b", " ", found.group(1)
+            ).strip()
+            if spelled not in names:
+                continue
+            written = text[found.start(3): found.end(3)]
+            arms = _conditional_arms(written)
+            if arms is None:
+                continue
+            question = _without_literals(written).find("?")
+            asked = written[:question].strip()
+            if not asked:
+                continue
+            answers = [
+                _deduced_type(arm.strip(), text, found.start()) for arm in arms
+            ]
+            if any(one is None for one in answers):
+                continue
+            plain = {
+                re.sub(r"\b(?:const|volatile|struct)\b", " ", one)
+                .replace("&", " ")
+                .strip()
+                for one in answers
+            }
+            if plain != {spelled}:
+                continue
+            name = found.group(2)
+            change = (
+                found.start(),
+                found.end(),
+                # The empty statement after the `else` is load-bearing: the
+                # pass that hoists what a call answers puts its temporary at
+                # the start of the statement that uses it, and it finds that
+                # start by scanning back over whole `{...}` groups. Without a
+                # `;` to stop at, the temporary for the *next* statement -
+                # `other.string()` in the printf below - landed in front of
+                # this `if`, where the object it reads has not been given a
+                # value yet.
+                f"{spelled} {name}; if ({asked}) {{ {name} = {arms[0]}; }} "
+                f"else {{ {name} = {arms[1]}; }};",
+            )
+            break
+        if change is None:
+            return text
+        start, end, said = change
+        text = text[:start] + said + text[end:]
     return text
 
 
@@ -6524,7 +6603,14 @@ def _lambda_result(body: str, parameters: str, text: str) -> str:
     if match is None or not match.group(1).strip():
         return "void"
     scope = parameters + ";\n" + body + "\n" + text
-    held = _deduced_type(match.group(1).strip(), scope)
+    # The lambda's own body first, and the file after it. Asked of the two
+    # joined, the reader answers with the last declaration of that name
+    # anywhere - and `value` is a name a program uses in a dozen functions:
+    # `[&] { Bytes value; randomBytes(value, 32); return value; }` was given
+    # the type of a `const wchar_t *value` written somewhere else entirely.
+    held = _nearest_type(
+        match.group(1).strip(), (parameters + ";\n" + body, scope)
+    )
     return held or "int"
 
 
@@ -9232,6 +9318,18 @@ _SPELLS_A_TYPE = re.compile(
 #: The classes this file declares. Read before the exception pass, which runs
 #: before classes are taken apart and so has nothing else to ask.
 _CLASS_NAMES: "set[str]" = set()
+
+#: What each class's `operator->` answers, read off the class bodies while
+#: they are still in the text. The reader that types `held->member` looks the
+#: operator up in the text, and a class whose body has been emitted elsewhere
+#: has none left to look in - `_CLASS_MEMBERS` beside this one keeps the data
+#: members for the same reason, and a method is not one of those.
+_ARROW_TARGET: "dict[str, str]" = {}
+
+#: `Session *operator->() { ... }` written in a class body.
+_AN_ARROW_OPERATOR = re.compile(
+    r"(?<![.\w>])([A-Za-z_][\w\s]*?)\s*([*&]*)\s*operator\s*->\s*\(\s*\)"
+)
 
 #: The names this file typedefs. A conversion operator is named by the type
 #: it answers - `operator uintptr_t() const`, which is what `std::atomic<T>`
@@ -13704,14 +13802,38 @@ def _closeness(code: str, declared: str) -> int:
 
 
 def _chosen_overload(
-    set_of: "list[Method]", given: "list[str]", text: str, before: int
+    set_of: "list[Method]",
+    given: "list[str]",
+    text: str,
+    before: int,
+    nearer: "tuple[str, ...]" = (),
 ) -> "Method | None":
-    """Which member of an overload set a call with these arguments means."""
+    """Which member of an overload set a call with these arguments means.
+
+    `nearer` is the text of the scopes around this one, innermost first. A
+    block is rewritten on its own, so what the function around it declares is
+    not in `text` before `before` at all - and the reader falls back to the
+    first declaration of that name anywhere, which for a name as ordinary as
+    `buffer` is some other function's.
+    """
 
     candidates = [m for m in set_of if _arity(m.parameters) == len(given)]
     if len(candidates) <= 1:
         return candidates[0] if candidates else None
-    wanted = [_deduced_type(value, text, before) for value in given]
+    wanted = [
+        # A bare name only. A scope's text is enough to say where a name was
+        # declared and not enough to type an expression: the class bodies are
+        # in the unit and not in the block, so `hello.begin() + 1` asked of a
+        # scope alone reads as the `1`. Anything else goes to the whole text
+        # with a position, which is what it was always read from.
+        (
+            _nearest_type(value, nearer)
+            if nearer and value.strip().isidentifier()
+            else None
+        )
+        or _deduced_type(value, text, before)
+        for value in given
+    ]
     if any(item is None for item in wanted):
         # Some argument could not be read. The ones that could may still
         # settle it: `find(':', somewhere)` has three candidates and only
@@ -13828,13 +13950,14 @@ def _call_suffix(
     given: "list[str]",
     text: str = "",
     before: int = -1,
+    nearer: "tuple[str, ...]" = (),
 ) -> "str | None":
     """The suffix a call site should use, read from what it passes."""
 
     set_of = _overload_set(owner, method, classes)
     if len(set_of) < 2:
         return None
-    picked = _chosen_overload(set_of, given, text, before)
+    picked = _chosen_overload(set_of, given, text, before, nearer)
     if picked is not None:
         return _suffix_of(owner, picked, classes)
     if len([m for m in set_of if _arity(m.parameters) == len(given)]) < 2:
@@ -13843,7 +13966,20 @@ def _call_suffix(
         # mistake said in the same place.
         return str(len(given))
     spelled = ", ".join(given)
-    wanted = [_deduced_type(value, text, before) for value in given]
+    wanted = [
+        # A bare name only. A scope's text is enough to say where a name was
+        # declared and not enough to type an expression: the class bodies are
+        # in the unit and not in the block, so `hello.begin() + 1` asked of a
+        # scope alone reads as the `1`. Anything else goes to the whole text
+        # with a position, which is what it was always read from.
+        (
+            _nearest_type(value, nearer)
+            if nearer and value.strip().isidentifier()
+            else None
+        )
+        or _deduced_type(value, text, before)
+        for value in given
+    ]
     if all(item is not None for item in wanted):
         # The types were read; it is the overloads that have no answer for
         # them. Saying so - and what they take - is the difference between
@@ -16027,6 +16163,12 @@ def _rewrite_body(
                 # constructor could not be chosen for a member of a class
                 # the object was not.
                 len(body),
+                # And the scopes around this one, for a block: `wchar_t
+                # buffer[MAX_PATH]` is declared by the function and the
+                # construction is inside an `if`, so this body does not hold
+                # the declaration and the fallback found a `char buffer`
+                # somewhere else entirely.
+                outer,
             )
             passed = f", {arguments}" if arguments else ""
             call = f"{_c_name(owner, '', suffix)}(&{variable}{passed});"
@@ -20877,6 +21019,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     text = _split_object_conditionals(text, filename)
     # And one written as an argument rather than as what a `return` answers.
     text = _split_argument_conditionals(text, filename)
+    # And one written as the value of a declaration, which is the third place
+    # a conditional stands whole.
+    text = _split_declared_conditionals(text, filename)
     text = _rewrite_braced_assignments(text, filename)
     text = _rewrite_brace_initialisers(text)
     # Again, because a member template inside a class template could not be
@@ -20928,6 +21073,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     _THROWN_KINDS.clear()
     _LAMBDA_RESULTS.clear()
     _CLASS_MEMBERS = {}
+    _ARROW_TARGET.clear()
     _CLASS_PACK.clear()
     packing = _pack_regions(text)
     for one in _CLASS_HEAD.finditer(text):
@@ -20936,6 +21082,15 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         except ValueError:
             continue
         _CLASS_MEMBERS[one.group(2)] = _members_declared(text[one.end(): shut - 1])
+        # And what its `operator->` answers, for the same reason: a class
+        # reached through a holder is typed by asking the holder what its
+        # arrow gives back, and by the time a body is rewritten the holder's
+        # own body is not in the text any more.
+        arrow = _AN_ARROW_OPERATOR.search(text[one.end(): shut - 1])
+        if arrow is not None:
+            _ARROW_TARGET[one.group(2)] = (
+                arrow.group(1).strip() + " " + arrow.group(2).replace("&", "")
+            ).strip()
         # What `#pragma pack` was in force where the class was *written*. The
         # directives are moved to the top of the file and the class is
         # emitted somewhere else again, so by the time it is written out
@@ -23039,7 +23194,21 @@ def _address_reference_arguments(
 
 
 #: A name, a member of one, or an element of one: things with an address.
-_ADDRESSABLE = re.compile(r"^[A-Za-z_]\w*(\s*(\.|->)\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*$")
+#: What has an address: a name, and whatever is reached off it by members
+#: and subscripts. A call may stand at the front of that chain only when an
+#: arrow follows it - `op_arrow(&session)->sendMutex` is a member of what the
+#: call points at, and it is where a holder puts everything it holds. A call
+#: followed by a `.` is a member of a temporary and has no address worth
+#: taking, so it is not one of these.
+_ADDRESSABLE = re.compile(
+    r"^[A-Za-z_]\w*"
+    r"(?:"
+    r"(?:\s*(?:\.|->)\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*"
+    r"|"
+    r"\s*\((?:[^()]|\([^()]*\))*\)\s*->\s*[A-Za-z_]\w*"
+    r"(?:\s*(?:\.|->)\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*"
+    r")$"
+)
 
 
 def _has_an_address(argument: str) -> bool:

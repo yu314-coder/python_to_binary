@@ -2756,6 +2756,58 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a declaration whose value is a conditional
+
+`path directory = length > 0 ? path(buffer) : temp_directory_path();` - the
+third place a conditional stands whole, after a `return` and a call argument.
+Left to the passes below, they hoist what an arm calls into a temporary ahead
+of the statement, and then *both* arms are evaluated: their program asked the
+filesystem for a temporary directory whether or not it needed one. It is split
+into the `if` C++ means, before anything hoists.
+
+The empty statement the split writes after the `else` is load-bearing. The
+pass that hoists what a call answers puts its temporary at the start of the
+statement that uses it and finds that start by scanning back over whole
+`{...}` groups; with no `;` to stop at, the temporary for the statement *after*
+the split landed in front of it, reading an object that had not been given a
+value yet.
+
+And what the split then exposed: `path directory(buffer);` inside the `if`,
+where `buffer` is declared by the function around it. A block is rewritten on
+its own, so the block's text does not hold that declaration - and the reader
+fell back to the *first* one anywhere, which in a program of four files is
+some other function's `char buffer[]`. It chose the `char *` constructor for a
+`wchar_t *`. The overload choice carries the scopes around the block now, the
+way the rest of them do.
+
+`sendFrame(session->socket, frame, session->sendMutex)`, where the parameter
+is a `std::mutex&` and `session` is a smart pointer. The address of a
+reference argument is taken only where the argument's type can be read, and
+reading a member through a holder means asking the holder what its
+`operator->` answers - a method, and by the time a body is rewritten the
+holder's own body has been emitted elsewhere and is not in the text to ask.
+What each class's arrow answers is remembered while the bodies are still
+there, beside the members that were already kept for the same reason. An
+address may also be taken through that arrow now: `op_arrow(&session)->m` is a
+member of what the call points at, while a call followed by a `.` is a member
+of a temporary and still has no address worth taking.
+
+2184 tests, 620 programs against clang++, 11 projects, 3762 builds across
+six targets.
+
+### 0.9.13 - what a lambda answers
+
+`const Bytes nonce = [&] { Bytes value; randomBytes(value, 32); return value;
+}();` - what a lambda answers is read from its `return`, and the reader was
+asked of the lambda's body and the whole file joined. It takes the last
+declaration of that name anywhere, and `value` is a name a program uses in a
+dozen functions: this one was given the type of a `const wchar_t *value`
+written somewhere else entirely. The body is asked first now, the file after
+it - the seventh pass this week to need the same thing.
+
+2184 tests, 617 programs against clang++, 11 projects, 3744 builds across
+six targets.
+
 ### 0.9.13 - a walk that never came back
 
 `--library libcrypto-3-x64.dll` on their build ran for three hours with no
