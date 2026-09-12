@@ -2756,6 +2756,27 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a walk that never came back
+
+`--library libcrypto-3-x64.dll` on their build ran for three hours with no
+output and was then killed by the kernel. Naming a library makes the C stage
+walk every call the unit makes, and that walk went from the function bodies
+into the types hung off their declarations - which is a graph, and a cyclic
+one wherever a struct reaches itself through a pointer. `PROPVARIANT` does,
+through a typedef declared before its body, and so does every COM interface.
+A walk with no memory of what it had seen never came back: the work list grew
+by a million entries a second. It keeps the same set of visited objects the
+walker beside it always kept, and finishes on their unit in five seconds. Only
+reachable with `--library`, and only where some undefined prototype takes an
+aggregate by value, which is why no corpus program had ever entered it; it is
+a unit test now, with a timeout.
+
+Then `value.back()` and `value.pop_back()` - how a program trims a string from
+the end - which the shipped `<string>` had neither of.
+
+2184 tests, 616 programs against clang++, 11 projects, 3738 builds across
+six targets.
+
 ### 0.9.13 - the desktop calls a companion makes
 
 `held.swap(activePointerModifiers);` under a lock, so the work is done outside

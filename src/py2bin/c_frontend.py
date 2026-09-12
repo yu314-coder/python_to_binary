@@ -3200,20 +3200,34 @@ class Parser:
 
         if self._names_called is None:
             found: "set[str]" = set()
-            seen: "list[object]" = [
+            pending: "list[object]" = [
                 function.body
                 for function in self.functions.values()
                 if function.body is not None
             ]
-            while seen:
-                node = seen.pop()
+            # Each object once. A body's tree is a tree, but the types hung
+            # off its declarations are a graph, and a cyclic one: a struct's
+            # members name types that name the struct. Walked without
+            # remembering what it had seen, this never finished on a unit
+            # that held one - the work list grew by a million entries a
+            # second for three hours, and then the kernel ended it. The
+            # walker above this one has always kept a set; this one is the
+            # same walk and keeps the same set.
+            seen: "set[int]" = set()
+            while pending:
+                node = pending.pop()
+                if isinstance(node, (list, tuple)):
+                    pending.extend(node)
+                    continue
+                if not dataclasses.is_dataclass(node) or id(node) in seen:
+                    continue
+                seen.add(id(node))
                 if isinstance(node, Call):
                     found.add(node.name)
-                if dataclasses.is_dataclass(node):
-                    for field in dataclasses.fields(node):
-                        seen.append(getattr(node, field.name))
-                elif isinstance(node, (list, tuple)):
-                    seen.extend(node)
+                for field in dataclasses.fields(node):
+                    if field.name == "token":
+                        continue
+                    pending.append(getattr(node, field.name))
             self._names_called = found
         return self._names_called
 

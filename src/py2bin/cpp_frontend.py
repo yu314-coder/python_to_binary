@@ -23735,6 +23735,11 @@ public:
     void push_back(char c) {
         if (len < 255) { buf[len] = c; len = len + 1; buf[len] = 0; }
     }
+    /* The last character, and taking it off: how a program trims a string
+       from the end - `while (!s.empty() && (s.back() & 0xC0) == 0x80)
+       s.pop_back();` walks back off a UTF-8 continuation byte. */
+    char back() { return buf[len - 1]; }
+    void pop_back() { if (len > 0) { len = len - 1; buf[len] = 0; } }
     void clear() { len = 0; buf[0] = 0; }
     int compare(const char *s) {
         int i;
@@ -24014,6 +24019,11 @@ public:
     void push_back(wchar_t c) {
         if (len < 255) { buf[len] = c; len = len + 1; buf[len] = 0; }
     }
+    /* The last character, and taking it off: how a program trims a string
+       from the end - `while (!s.empty() && (s.back() & 0xC0) == 0x80)
+       s.pop_back();` walks back off a UTF-8 continuation byte. */
+    wchar_t back() { return buf[len - 1]; }
+    void pop_back() { if (len > 0) { len = len - 1; buf[len] = 0; } }
     void clear() { len = 0; buf[0] = 0; }
     /* `resize` shortens or lengthens; what it grows into is zero, which is
        what the standard says a default-inserted wchar_t is. */

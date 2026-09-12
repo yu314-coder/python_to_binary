@@ -2108,6 +2108,44 @@ int (*pick(int which))(int) { return which ? thrice : twice; }
             module.symbol_libraries, {"SomeVendorEntry": "vendor.dll"}
         )
 
+    def test_binding_a_library_finishes_on_a_cyclic_type_graph(self):
+        # Binding walks every call the unit makes, and that walk went from the
+        # bodies into the types hung off their declarations. A struct that
+        # reaches itself through a pointer - spelled with a typedef declared
+        # before the body, which is how <propidl.h> writes PROPVARIANT - makes
+        # that graph cyclic, and a walk with no memory of what it had seen
+        # never came back: the work list grew by a million entries a second
+        # for three hours, and then the kernel ended the process. The walk
+        # only runs where some undefined prototype takes an aggregate by
+        # value, which is what `by_value` is here for.
+        import threading
+
+        source = (
+            "typedef struct tagVariant VARIANT;\n"
+            "struct tagVariant { unsigned short kind; "
+            "union { int number; VARIANT *inner; }; };\n"
+            "struct pair { int a; int b; };\n"
+            "int by_value(struct pair p);\n"
+            "int api(void *p);\n"
+            "int main(void) { VARIANT v; v.kind = 1; v.inner = 0; "
+            "return api(&v); }\n"
+        )
+        held: dict = {}
+
+        def bind() -> None:
+            held["module"] = compile_c_to_ir(
+                source, "cyclic.c", "windows-x86_64", libraries=("vendor.dll",)
+            )
+
+        worker = threading.Thread(target=bind, daemon=True)
+        worker.start()
+        worker.join(60)
+        self.assertFalse(
+            worker.is_alive(),
+            "binding a library did not finish on a struct that reaches itself",
+        )
+        self.assertEqual(held["module"].symbol_libraries, {"api": "vendor.dll"})
+
     def _built_against(self, target: str, library: str) -> Path:
         # zlib is on every machine each target runs on, and crc32("abc") is
         # one number wherever it is asked; clang's build of this program
