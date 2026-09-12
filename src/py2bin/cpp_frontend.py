@@ -16079,6 +16079,36 @@ def _one_declaration(
         f"{head.group(2)} {one};" for one in spelled
     )
 
+#: `__py2bin_value_3` - a name one of these passes gave an object of its own.
+_A_TEMPORARY_NAME = re.compile(r"(__py2bin_[a-z]+_)(\d+)")
+
+
+def _numbers_taken(text: str, taken: "dict[str, int]") -> "dict[str, int]":
+    """The highest number each kind of temporary has been given so far.
+
+    A block is rewritten on its own and every counter starts at one again, so
+    the name this block gives an object may be the name the function around it
+    gave a different one. In C that is an inner declaration shadowing an outer
+    and would be harmless - except that the enclosing scope's destructors are
+    written *inside* this block, at each `return` and `break` and `continue`,
+    and there the name they mean is the one this block declared. So
+    `vector<uint8_t> __py2bin_value_1` of the loop was taken apart by the
+    destructor written for it while the nearest declaration in view was a
+    `string __py2bin_value_1` this block had made - which the C stage reported
+    as a destructor handed the wrong type, on a line that is correct C++.
+
+    Handed down rather than searched for: the scopes around a block do not
+    change while its own passes run, so the numbers they used are read once,
+    where they are written, and not again for every block inside.
+    """
+
+    for one in _A_TEMPORARY_NAME.finditer(text):
+        number = int(one.group(2))
+        if number > taken.get(one.group(1), 0):
+            taken[one.group(1)] = number
+    return taken
+
+
 def _rewrite_body(
     body: str,
     classes: "dict[str, Class]",
@@ -16112,6 +16142,10 @@ def _rewrite_body(
     #: `break` alone, the innermost switch's - so a scope inside one has to
     #: know how far out that is, and which of the two jumps stops there.
     leaves: str = "",
+    #: The highest number each kind of temporary has been given by the scopes
+    #: around this one, so a name this block writes cannot be a name one of
+    #: them already used for something else. See `_numbers_taken`.
+    taken: "dict[str, int] | None" = None,
 ) -> str:
     """Rewrite declarations and calls inside one function body.
 
@@ -16125,6 +16159,7 @@ def _rewrite_body(
 
     known = dict(known)
     pointers = set(pointers)
+    taken = dict(taken or {})
     destroyed: list[str] = []
 
     def declare(match: "re.Match[str]", whole: str) -> "str | None":
@@ -16312,7 +16347,7 @@ def _rewrite_body(
     # `new int(5)` stores as well as answers, and C has no one expression
     # that does both. Written out as its own statement first, so what reaches
     # the rewrite below is the storage on its own.
-    body = _hoist_new_initialisers(body, classes, [0])
+    body = _hoist_new_initialisers(body, classes, [taken.get("__py2bin_new_", 0)])
     # Before the allocating form, which would otherwise read the `(room)` as
     # the argument list of a `new` with no type after it.
     body = _rewrite_placement_new(body, classes)
@@ -16322,7 +16357,9 @@ def _rewrite_body(
     # its own first, so that every pass which knows how to fill a declaration
     # - an operator, a call, a temporary - handles this too rather than each
     # having to learn about `return`.
-    body = _name_returned_objects(body, classes, returns, [0])
+    body = _name_returned_objects(
+        body, classes, returns, [taken.get(_ANSWER_PREFIX, 0)]
+    )
 
     # `A xs[3] = {A(1), A(2), A(3)};` - each element is constructed where it
     # stands. Before the temporaries pass, which would otherwise hoist each
@@ -16353,15 +16390,19 @@ def _rewrite_body(
 
     # `V(5)` written where a value goes: C has no expression that constructs,
     # so each temporary becomes an object with a name ahead of the statement.
-    body = _rewrite_temporaries(body, classes, [0])
-    body = _rewrite_brace_temporaries(body, classes, [0])
+    body = _rewrite_temporaries(body, classes, [taken.get("__py2bin_temp_", 0)])
+    body = _rewrite_brace_temporaries(
+        body, classes, [taken.get(_BRACE_PREFIX, 0)]
+    )
 
     # `f.filename().c_str()`: a call on what a value return handed back. The
     # declarations have not been read yet - they are rewritten below, and
     # this has to run before that - so what this body declares is scanned for
     # first, without touching it.
     hoisted = {**_declared_objects(body, classes), **known}
-    body = _hoist_value_returns(body, classes, hoisted, [0], unit)
+    body = _hoist_value_returns(
+        body, classes, hoisted, [taken.get(_VALUE_PREFIX, 0)], unit
+    )
     # The names it wrote are objects of this scope from here on. Left out,
     # `webRoot = current_path() / L"web";` had its call hoisted into a
     # temporary that nothing afterwards knew held a `path` - so the operator
@@ -16403,7 +16444,12 @@ def _rewrite_body(
     # declared, and `known` holds only what came from outside.
     operands = {**hoisted, **known}
     body = _hoist_object_operators(
-        body, classes, operands, [0], pointers, set(referenced or ())
+        body,
+        classes,
+        operands,
+        [max(taken.get(_OPERATOR_PREFIX, 0), taken.get(_ANSWER_PREFIX, 0))],
+        pointers,
+        set(referenced or ()),
     )
     # `(a + b).c_str()` - the parentheses were the author's and what is
     # inside them is now one name. Left standing, the pass that rewrites a
@@ -17005,7 +17051,12 @@ def _rewrite_body(
     # cast, which is the one place that says so.
     body = _address_dispatched_arguments(body, classes, known, pointers)
     body = _convert_class_arguments(
-        body, classes, known, pointers, [0], f"{scope()}\n{stable}"
+        body,
+        classes,
+        known,
+        pointers,
+        [taken.get(_MADE_PREFIX, 0)],
+        f"{scope()}\n{stable}",
     )
 
     # After the dereference pass, not before it: each call in a chain hands
@@ -17017,6 +17068,10 @@ def _rewrite_body(
     )
 
     # Now that this scope is known, each block is rewritten inside it.
+    # Read once, here, and handed to every block: the scopes around them do
+    # not change while their own passes run, and a name one of those scopes
+    # gave a temporary must not be the name a block gives another.
+    handed = _numbers_taken(body, dict(taken))
     rewritten_blocks = [
         _rewrite_body(
             inner,
@@ -17068,6 +17123,7 @@ def _rewrite_body(
             # This scope is the one around the block, and the scopes around
             # this one are around it too.
             outer=(body, *outer),
+            taken=handed,
         )
         for number, inner in enumerate(blocks)
     ]
@@ -17081,7 +17137,14 @@ def _rewrite_body(
     # before it saw a value already destroyed, which is silent.
     destroyed.sort(key=lambda name: _declared_at(body, name))
     body = _close_with_destructors(
-        body, destroyed, known, classes, enclosing, returns, [0], leaves
+        body,
+        destroyed,
+        known,
+        classes,
+        enclosing,
+        returns,
+        [taken.get(_ANSWER_PREFIX, 0)],
+        leaves,
     )
     return _restore_nested(body, rewritten_blocks)
 

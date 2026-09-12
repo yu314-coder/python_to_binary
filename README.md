@@ -2756,6 +2756,25 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a temporary a block names again
+
+This translator writes objects of its own - the temporary that holds what a
+call answered, the one that holds an operand - and numbers them. Every counter
+started at one again inside a block, so the name a block gave an object could
+be the name the function around it had already given a different one. In C that
+is an inner declaration shadowing an outer, which is legal and harmless on its
+own; what made it wrong is that the enclosing scope's destructors are written
+*inside* the block, at each `return` and `break` and `continue`, and there the
+name means the block's object. A `vector<uint8_t>` the function built was taken
+apart by a destructor holding a `string` the loop had made.
+
+The numbers a scope used are read once, where they are written, and handed to
+every block inside it - so a block three deep avoids the names of all three
+scopes above it, and a sibling block is free to reuse what it never sees.
+
+2190 tests, 625 programs against clang++, 11 projects, 3792 builds across six
+targets.
+
 ### 0.9.13 - a declaration behind a lifted block
 
 `const std::string message(plain.begin() + 1, plain.end());` written after an

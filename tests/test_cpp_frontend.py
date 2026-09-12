@@ -111,6 +111,36 @@ class Reading(unittest.TestCase):
             _deduced_type("tag", unit, unit.index("use(")), "array__uint8_t_16"
         )
 
+    def test_a_block_does_not_name_a_temporary_an_outer_scope_used(self) -> None:
+        # Every counter starts at one again for a block, so the name a block
+        # gives an object of its own may be the name the function around it
+        # gave a different one. In C that is shadowing and harmless - except
+        # that the enclosing scope's destructors are written *inside* the
+        # block, at each `return`, and there the name means the block's
+        # object: a vector was taken apart by a destructor holding a string.
+        from py2bin.cpp_frontend import _numbers_taken
+
+        outer = (
+            "struct vector__uint8_t __py2bin_value_1;"
+            " struct string __py2bin_value_3;"
+            " struct path __py2bin_temp_2;"
+        )
+        self.assertEqual(
+            _numbers_taken(outer, {}),
+            {"__py2bin_value_": 3, "__py2bin_temp_": 2},
+        )
+
+    def test_the_numbers_a_scope_took_are_added_to_what_it_was_given(self) -> None:
+        # Handed down from scope to scope, so a block three deep avoids the
+        # names of all three above it and not only its parent's.
+        from py2bin.cpp_frontend import _numbers_taken
+
+        taken = {"__py2bin_value_": 5}
+        self.assertEqual(
+            _numbers_taken("struct string __py2bin_value_2;", taken),
+            {"__py2bin_value_": 5},
+        )
+
 
 class Translating(unittest.TestCase):
     def test_a_class_becomes_a_struct_and_free_functions(self) -> None:
