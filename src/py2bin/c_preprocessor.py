@@ -2432,8 +2432,130 @@ typedef struct _OVERLAPPED {
 #define IDYES 6
 #define IDNO 7
 
+/* GetSystemMetrics asks for one of these. The primary display's width and
+   height were the only two here, so a program that asks where the desktop
+   *begins* - which is what a machine with two monitors has to ask, since the
+   second one may sit to the left of the first and start at a negative x -
+   named a constant nothing declared. */
 #define SM_CXSCREEN 0
 #define SM_CYSCREEN 1
+#define SM_CXVSCROLL 2
+#define SM_CYHSCROLL 3
+#define SM_CYCAPTION 4
+#define SM_CXBORDER 5
+#define SM_CYBORDER 6
+#define SM_CXICON 11
+#define SM_CYICON 12
+#define SM_CXCURSOR 13
+#define SM_CYCURSOR 14
+#define SM_CYMENU 15
+#define SM_CXFULLSCREEN 16
+#define SM_CYFULLSCREEN 17
+#define SM_MOUSEPRESENT 19
+#define SM_CYVSCROLL 20
+#define SM_CXHSCROLL 21
+#define SM_SWAPBUTTON 23
+#define SM_CXMIN 28
+#define SM_CYMIN 29
+#define SM_CXSIZE 30
+#define SM_CYSIZE 31
+#define SM_CXFRAME 32
+#define SM_CYFRAME 33
+#define SM_CXMINTRACK 34
+#define SM_CYMINTRACK 35
+#define SM_CXDOUBLECLK 36
+#define SM_CYDOUBLECLK 37
+#define SM_CMOUSEBUTTONS 43
+#define SM_CXSMICON 49
+#define SM_CYSMICON 50
+#define SM_CXMAXTRACK 59
+#define SM_CYMAXTRACK 60
+#define SM_CXMAXIMIZED 61
+#define SM_CYMAXIMIZED 62
+#define SM_NETWORK 63
+#define SM_XVIRTUALSCREEN 76
+#define SM_YVIRTUALSCREEN 77
+#define SM_CXVIRTUALSCREEN 78
+#define SM_CYVIRTUALSCREEN 79
+#define SM_CMONITORS 80
+#define SM_SAMEDISPLAYFORMAT 81
+#define SM_REMOTESESSION 0x1000
+#define SM_SHUTTINGDOWN 0x2000
+
+/* What BitBlt is told to do with the two rectangles. A program that copies
+   the screen passes SRCCOPY, and CAPTUREBLT with it to catch the windows
+   drawn with layered transparency - which a screen share has to, or the
+   picture comes back with holes in it. The rest of the ternary codes come
+   along because they are the same table. */
+#define SRCCOPY 0x00CC0020
+#define SRCPAINT 0x00EE0086
+#define SRCAND 0x008800C6
+#define SRCINVERT 0x00660046
+#define SRCERASE 0x00440328
+#define NOTSRCCOPY 0x00330008
+#define NOTSRCERASE 0x001100A6
+#define MERGECOPY 0x00C000CA
+#define MERGEPAINT 0x00BB0226
+#define PATCOPY 0x00F00021
+#define PATPAINT 0x00FB0A09
+#define PATINVERT 0x005A0049
+#define DSTINVERT 0x00550009
+#define BLACKNESS 0x00000042
+#define WHITENESS 0x00FF0062
+#define CAPTUREBLT 0x40000000
+#define NOMIRRORBITMAP 0x80000000
+
+/* How the bits in a device-independent bitmap are to be read, and what kind
+   of compression they are in. A screen capture asks for none of either. */
+#define DIB_RGB_COLORS 0
+#define DIB_PAL_COLORS 1
+#define BI_RGB 0
+#define BI_RLE8 1
+#define BI_RLE4 2
+#define BI_BITFIELDS 3
+
+/* The clipboard's formats. Unicode text is the one a program written this
+   century asks for. */
+#define CF_TEXT 1
+#define CF_BITMAP 2
+#define CF_METAFILEPICT 3
+#define CF_SYLK 4
+#define CF_DIF 5
+#define CF_TIFF 6
+#define CF_OEMTEXT 7
+#define CF_DIB 8
+#define CF_PALETTE 9
+#define CF_PENDATA 10
+#define CF_RIFF 11
+#define CF_WAVE 12
+#define CF_UNICODETEXT 13
+#define CF_ENHMETAFILE 14
+#define CF_HDROP 15
+#define CF_LOCALE 16
+#define CF_DIBV5 17
+
+/* GlobalAlloc's flags. The clipboard takes ownership of what it is given, and
+   what it is given has to be moveable. */
+#define GMEM_FIXED 0x0000
+#define GMEM_MOVEABLE 0x0002
+#define GMEM_ZEROINIT 0x0040
+#define GMEM_MODIFY 0x0080
+#define GMEM_SHARE 0x2000
+#define GHND 0x0042
+#define GPTR 0x0040
+
+/* CryptProtectData's flags. A service with no desktop has to forbid the
+   prompt, or the call waits for a user who is not there. */
+#define CRYPTPROTECT_UI_FORBIDDEN 0x1
+#define CRYPTPROTECT_LOCAL_MACHINE 0x4
+#define CRYPTPROTECT_AUDIT 0x10
+#define CRYPTPROTECT_VERIFY_PROTECTION 0x40
+
+/* What IStream::Stat is asked to fill in. NONAME says not to allocate the
+   name, which the caller would otherwise have to free. */
+#define STATFLAG_DEFAULT 0
+#define STATFLAG_NONAME 1
+#define STATFLAG_NOOPEN 2
 
 #define FOREGROUND_BLUE 0x0001
 #define FOREGROUND_GREEN 0x0002
@@ -2749,6 +2871,93 @@ typedef struct tagINPUT {
 #define WHEEL_DELTA 120
 #define XBUTTON1 0x0001
 #define XBUTTON2 0x0002
+
+/* The keys SendInput is given. A program that forwards a keyboard names them
+   rather than their numbers - that is what they are for - and the header had
+   the call and none of the names, so every one of them was a name nothing
+   declared. Two of them are worth reading twice: VK_PRIOR and VK_NEXT are
+   Page Up and Page Down, which is what Windows calls them. */
+#define VK_LBUTTON 0x01
+#define VK_RBUTTON 0x02
+#define VK_CANCEL 0x03
+#define VK_MBUTTON 0x04
+#define VK_BACK 0x08
+#define VK_TAB 0x09
+#define VK_CLEAR 0x0C
+#define VK_RETURN 0x0D
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_PAUSE 0x13
+#define VK_CAPITAL 0x14
+#define VK_ESCAPE 0x1B
+#define VK_SPACE 0x20
+#define VK_PRIOR 0x21
+#define VK_NEXT 0x22
+#define VK_END 0x23
+#define VK_HOME 0x24
+#define VK_LEFT 0x25
+#define VK_UP 0x26
+#define VK_RIGHT 0x27
+#define VK_DOWN 0x28
+#define VK_SELECT 0x29
+#define VK_PRINT 0x2A
+#define VK_EXECUTE 0x2B
+#define VK_SNAPSHOT 0x2C
+#define VK_INSERT 0x2D
+#define VK_DELETE 0x2E
+#define VK_HELP 0x2F
+#define VK_LWIN 0x5B
+#define VK_RWIN 0x5C
+#define VK_APPS 0x5D
+#define VK_SLEEP 0x5F
+#define VK_NUMPAD0 0x60
+#define VK_NUMPAD1 0x61
+#define VK_NUMPAD2 0x62
+#define VK_NUMPAD3 0x63
+#define VK_NUMPAD4 0x64
+#define VK_NUMPAD5 0x65
+#define VK_NUMPAD6 0x66
+#define VK_NUMPAD7 0x67
+#define VK_NUMPAD8 0x68
+#define VK_NUMPAD9 0x69
+#define VK_MULTIPLY 0x6A
+#define VK_ADD 0x6B
+#define VK_SEPARATOR 0x6C
+#define VK_SUBTRACT 0x6D
+#define VK_DECIMAL 0x6E
+#define VK_DIVIDE 0x6F
+#define VK_F1 0x70
+#define VK_F2 0x71
+#define VK_F3 0x72
+#define VK_F4 0x73
+#define VK_F5 0x74
+#define VK_F6 0x75
+#define VK_F7 0x76
+#define VK_F8 0x77
+#define VK_F9 0x78
+#define VK_F10 0x79
+#define VK_F11 0x7A
+#define VK_F12 0x7B
+#define VK_NUMLOCK 0x90
+#define VK_SCROLL 0x91
+#define VK_LSHIFT 0xA0
+#define VK_RSHIFT 0xA1
+#define VK_LCONTROL 0xA2
+#define VK_RCONTROL 0xA3
+#define VK_LMENU 0xA4
+#define VK_RMENU 0xA5
+#define VK_OEM_1 0xBA
+#define VK_OEM_PLUS 0xBB
+#define VK_OEM_COMMA 0xBC
+#define VK_OEM_MINUS 0xBD
+#define VK_OEM_PERIOD 0xBE
+#define VK_OEM_2 0xBF
+#define VK_OEM_3 0xC0
+#define VK_OEM_4 0xDB
+#define VK_OEM_5 0xDC
+#define VK_OEM_6 0xDD
+#define VK_OEM_7 0xDE
 extern UINT SendInput(UINT, LPINPUT, int);
 extern BOOL SetCursorPos(int, int);
 extern BOOL GetCursorPos(LPPOINT);

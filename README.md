@@ -2756,6 +2756,34 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the names a desktop is driven by
+
+py2bin ships its own `<windows.h>`, because the SDK's headers demand GCC or
+MSVC, and that header carried the calls and almost none of the names they are
+called with. So a companion that shares a desktop - which is what these calls
+are for - named one constant after another that nothing declared, each one
+stopping the build on a line that is correct Windows C.
+
+`GetSystemMetrics(SM_XVIRTUALSCREEN)`: the header had the primary display's
+width and height and nothing else, so a program asking where the desktop
+*begins*, which a machine with a second monitor to the left of the first has
+to ask, had no name for it. `BitBlt(..., SRCCOPY | CAPTUREBLT)`: no raster
+operations at all, and CAPTUREBLT is the one that catches the windows drawn
+with layered transparency - without it a screen share comes back with holes in
+it. `SetClipboardData(CF_UNICODETEXT, ...)`, `GlobalAlloc(GMEM_MOVEABLE, ...)`,
+`CryptProtectData(..., CRYPTPROTECT_UI_FORBIDDEN, ...)`, `Stat(&s,
+STATFLAG_NONAME)`, and the eighty-one virtual keys a forwarded keyboard is
+spelled with, VK_PRIOR and VK_NEXT among them, which are Page Up and Page Down.
+
+The corpus program that covers them is built for Windows with the values
+written out beside the names and compared at compile time, because a negative
+array size is not a program: the sweep does not run a Windows binary, so that
+is the only place the numbers themselves are asked about rather than the
+spelling.
+
+2190 tests, 626 programs against clang++, 11 projects, 3798 builds across six
+targets.
+
 ### 0.9.13 - a temporary a block names again
 
 This translator writes objects of its own - the temporary that holds what a
