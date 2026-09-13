@@ -19552,6 +19552,64 @@ def _free_returns_object(
 _A_DISPATCH_CAST = re.compile(r"\(\(\s*[^()]*?\(\s*\*\s*\)\s*\(")
 
 
+def _upcast_for_a_table(
+    value: str,
+    declared: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointers: "set[str]",
+    body: str,
+) -> "str | None":
+    """`(struct IStream *)stream` - a derived pointer where a base is wanted.
+
+    `encoder->Initialize(stream, ...)` hands an `IWICStream *` to a parameter
+    that is an `IStream *`, which C++ converts and C makes you say. The pass
+    that writes that cast finds a call by the name of what it calls, and a call
+    through an object's table has no name - only the cast in front of it, which
+    is the one place the parameter's type is written. So the call reached the C
+    stage with the derived pointer, refused on a line that is correct C++.
+    """
+
+    if declared.count("*") != 1:
+        return None
+    spelled = re.sub(
+        r"\b(?:const|struct|volatile|union)\b", " ", declared.replace("*", " ")
+    ).split()
+    if len(spelled) != 1 or spelled[0] not in classes:
+        return None
+    base = spelled[0]
+    if value.startswith("&"):
+        # `&object` of a derived class, which is a pointer to it.
+        name = value[1:].strip()
+        if not name.isidentifier() or name in pointers:
+            return None
+        held = known.get(name)
+    else:
+        if not (value.isidentifier() and value in pointers):
+            return None
+        held = known.get(value)
+        if held is None:
+            deduced = _deduced_type(value, body) or ""
+            if deduced.count("*") != 1:
+                return None
+            held = re.sub(
+                r"\b(?:const|struct|volatile|union)\b",
+                " ",
+                deduced.replace("*", " "),
+            ).strip()
+    if not held or held == base or held not in classes:
+        return None
+    # A cast is the whole conversion only where the base is at offset zero -
+    # the first base, and its first base, all the way up. A second base is a
+    # member further along, and a cast to it would say the right type and
+    # point at the wrong bytes. Left alone, the C stage refuses the call
+    # instead: a build that stops, rather than a program that is wrong.
+    path = _subobject_path(held, base, classes)
+    if not path or not set(path.split(".")) <= {"__base"}:
+        return None
+    return f"(struct {base} *)({value})"
+
+
 def _address_dispatched_arguments(
     body: str,
     classes: "dict[str, Class]",
@@ -19590,6 +19648,13 @@ def _address_dispatched_arguments(
             if not declared.strip().endswith("*"):
                 continue
             value = given[index].strip()
+            upcast = _upcast_for_a_table(
+                value, declared, classes, known, pointers, body
+            )
+            if upcast is not None:
+                given[index] = upcast
+                changed = True
+                continue
             if value.startswith("&") or value in pointers:
                 continue
             # A name, or a member reached through one: both have an address,

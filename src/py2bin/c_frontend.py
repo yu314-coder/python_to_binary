@@ -1692,6 +1692,13 @@ class TranslationUnit:
     #: refusal can happen where the name is read instead - which for most of
     #: these is nowhere at all.
     declared_elsewhere: dict[str, CType] = dataclasses.field(default_factory=dict)
+    #: What each extern takes, in order, read off its prototype. `externs`
+    #: keeps only the result, which is all a call's value needs - but whether
+    #: an object handed to one is a reference C++ bound depends on what the
+    #: parameter points at, and the vetted table says only "a pointer".
+    extern_parameters: "dict[str, tuple[CType, ...]]" = dataclasses.field(
+        default_factory=dict
+    )
 
 
 # --- parser ------------------------------------------------------------------
@@ -1822,6 +1829,8 @@ class Parser:
         self.index = 0
         self.functions: dict[str, Function] = {}
         self.externs: dict[str, CType] = {}
+        #: What each of those takes, in order. See TranslationUnit.
+        self.extern_parameters: "dict[str, tuple[CType, ...]]" = {}
         #: Shared libraries the program named, and which symbols each claims.
         self.libraries: "list[tuple[str, frozenset[str]]]" = []
         #: Where each symbol taken from one of them comes from.
@@ -3188,6 +3197,7 @@ class Parser:
             self.globals,
             self.library_symbols,
             self.declared_elsewhere,
+            extern_parameters=self.extern_parameters,
         )
 
     def names_called(self) -> "set[str]":
@@ -3322,6 +3332,9 @@ class Parser:
                 continue
             self.library_symbols[name] = (name, kinds, result)
             self.externs[name] = function.result
+            self.extern_parameters[name] = tuple(
+                held for held, _spelled in function.parameters
+            )
             self.symbol_libraries[name] = library
 
     def library_for(self, name: str) -> "str | None":
@@ -3771,6 +3784,7 @@ class Parser:
             # down twice.
             return
         self.externs[name] = result
+        self.extern_parameters[name] = tuple(declared)
 
     def extern_object(self, base: CType, ctype: CType, name: str) -> None:
         """``extern GUID IID_IThing;`` -- an object defined somewhere else.
@@ -4474,11 +4488,19 @@ _MATH_BUILTINS = {
 class Lowerer:
     """Lowers a parsed translation unit to py2bin's native IR."""
 
-    def __init__(self, unit: TranslationUnit, filename: str, target: str):
+    def __init__(
+        self,
+        unit: TranslationUnit,
+        filename: str,
+        target: str,
+        cplusplus: bool = False,
+    ):
         self.enumerators = dict(getattr(unit, "enumerators", {}) or {})
         self.unit = unit
         self.filename = filename
         self.target = target
+        #: Whether this is C the C++ translator wrote. See `bound_reference`.
+        self.cplusplus = cplusplus
         self.operations: list[Operation] = []
         self.stack_slots = 0
         #: The largest the frame ever was, which is what it must be built to.
@@ -5054,6 +5076,67 @@ class Lowerer:
             self.error(f"{what} needs an integer or pointer value", node.token)
         return value
 
+    def type_unevaluated(self, node: Node) -> CType:
+        """The type an expression has, without the code that would evaluate it.
+
+        What ``sizeof e`` needs, and what binding a reference needs: whether an
+        argument is the object a parameter points at has to be settled before
+        the argument is evaluated, because evaluating it twice would repeat
+        whatever it calls.
+        """
+
+        if isinstance(node, Identifier):
+            local = self.lookup(node.name)
+            if local is not None:
+                return local.ctype
+        saved_operations = self.operations
+        saved_slots = self.stack_slots
+        self.operations = []
+        try:
+            if isinstance(node, (Index, MemberAccess)) or (
+                isinstance(node, Unary) and node.operator == "*"
+            ):
+                ctype, _address = self.lvalue(node)
+            else:
+                ctype = self.rvalue(node).ctype
+        finally:
+            self.operations = saved_operations
+            self.stack_slots = saved_slots
+        return ctype
+
+    def bound_reference(
+        self, argument: Node, parameter: CType
+    ) -> "IntExpression | None":
+        """The address of an object C++ bound a reference parameter to.
+
+        A header written for both languages declares such a parameter once for
+        each: `REFGUID` is `const GUID &` to C++ and `const GUID *` to C, and
+        py2bin reads the C branch. So `CoCreateInstance(CLSID_Thing, ...)`,
+        which is correct C++, reached this stage as a `GUID` handed to a
+        pointer, and was refused on a line nothing was wrong with.
+
+        Only in C the C++ translator wrote, and only where the object is of
+        exactly the type the parameter points at. In C++ that argument can mean
+        nothing else - a pointer parameter is never handed an object, so the
+        declaration it met was a reference. Plain C keeps the diagnostic,
+        because there it is an error.
+        """
+
+        if not self.cplusplus or not isinstance(parameter, PointerType):
+            return None
+        wanted = parameter.target
+        if not isinstance(wanted, StructType):
+            return None
+        if not (
+            isinstance(argument, (Identifier, Index, MemberAccess))
+            or (isinstance(argument, Unary) and argument.operator == "*")
+        ):
+            return None
+        if self.type_unevaluated(argument) is not wanted:
+            return None
+        _held, address = self.lvalue(argument)
+        return address
+
     def sizeof_expression(self, node: Node) -> int:
         """``sizeof e`` does not evaluate ``e``; it needs only its type."""
 
@@ -5079,19 +5162,7 @@ class Lowerer:
                     "of a pointer to it",
                     node.token,
                 )
-        saved_operations = self.operations
-        saved_slots = self.stack_slots
-        self.operations = []
-        try:
-            if isinstance(node, (Index, MemberAccess)) or (
-                isinstance(node, Unary) and node.operator == "*"
-            ):
-                ctype, _address = self.lvalue(node)
-            else:
-                ctype = self.rvalue(node).ctype
-        finally:
-            self.operations = saved_operations
-            self.stack_slots = saved_slots
+        ctype = self.type_unevaluated(node)
         size = size_of(ctype)
         if size is None:
             self.error(f"sizeof needs a complete type, not {ctype}", node.token)
@@ -6068,6 +6139,10 @@ class Lowerer:
             if isinstance(parameter, StructType):
                 prepared.append(self.aggregate_argument(argument, parameter, what))
                 continue
+            bound = self.bound_reference(argument, parameter)
+            if bound is not None:
+                prepared.append(bound)
+                continue
             prepared.append(
                 self.stored_bits(
                     self.assign_convert(
@@ -6139,6 +6214,24 @@ class Lowerer:
                     )
                 arguments.append(CStringConstant(argument.data + b"\0"))
                 continue
+            if kind == "ptr":
+                # The prototype says what the pointer points at, which the
+                # vetted table's kinds do not: `REFCLSID` is a pointer to a
+                # GUID, and that is what makes a GUID handed to it a reference
+                # C++ bound rather than a mistake.
+                taken = self.unit.extern_parameters.get(name)
+                if taken is None and name in self.unit.functions:
+                    # A prototype written without `extern`, which is kept
+                    # with the functions rather than with the externs.
+                    taken = tuple(
+                        held
+                        for held, _spelled in self.unit.functions[name].parameters
+                    )
+                if taken is not None and position <= len(taken):
+                    bound = self.bound_reference(argument, taken[position - 1])
+                    if bound is not None:
+                        arguments.append(bound)
+                        continue
             value = self.rvalue(argument)
             if kind in ("ptr", "handle"):
                 if value.null:
@@ -6337,6 +6430,10 @@ class Lowerer:
                 prepared.append(
                     self.aggregate_argument(argument, parameter_type, what)
                 )
+                continue
+            bound = self.bound_reference(argument, parameter_type)
+            if bound is not None:
+                prepared.append(bound)
                 continue
             converted = self.assign_convert(
                 self.rvalue(argument),
@@ -9424,7 +9521,7 @@ def compile_c_to_ir(
     parser = Parser(tokens, filename, target)
     parser.libraries = _libraries_named(libraries)
     unit = parser.translation_unit()
-    module = Lowerer(unit, filename, target).compile()
+    module = Lowerer(unit, filename, target, cplusplus=cplusplus).compile()
     module.symbol_libraries = dict(parser.symbol_libraries)
     return module
 

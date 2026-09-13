@@ -3540,6 +3540,104 @@ int main(void) {
         )
 
 
+
+#: A GUID and the pointer spelling a header's C branch gives `REFGUID`.
+_A_GUID = (
+    "typedef struct _GUID { unsigned int Data1; unsigned short Data2; "
+    "unsigned short Data3; unsigned char Data4[8]; } GUID;\n"
+    "typedef const GUID *REFGUID;\n"
+)
+
+
+class ReferencesAHeaderSpellsAsPointers(CProgramTestCase):
+    """A reference C++ binds, where the header's C branch has a pointer.
+
+    `REFGUID` is `const GUID &` to C++ and `const GUID *` to C, and py2bin reads
+    the C branch - so `CoCreateInstance(CLSID_Thing, ...)`, correct C++, reached
+    the C stage as a GUID handed to a pointer and was refused. In C the
+    translator wrote, an object of exactly the pointed-at type can only have
+    met a reference, so its address is what is passed. In C somebody wrote it
+    is an error, and stays one.
+    """
+
+    def _compiles(self, source, target="darwin-arm64", cplusplus=True):
+        compile_c_to_ir(source, "program.c", target, cplusplus=cplusplus)
+
+    def test_a_named_function_is_handed_the_address(self) -> None:
+        source = _A_GUID + (
+            "static unsigned take(REFGUID id) { return id->Data1; }\n"
+            "static const GUID seven = {7, 0, 0, {0}};\n"
+            "int main(void) { return (int)take(seven); }\n"
+        )
+        self._compiles(source)
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source, cplusplus=False)
+
+    def test_a_call_through_a_pointer_is_handed_the_address(self) -> None:
+        source = _A_GUID + (
+            "static unsigned take(REFGUID id) { return id->Data1; }\n"
+            "static const GUID seven = {7, 0, 0, {0}};\n"
+            "int main(void) {\n"
+            "    unsigned (*through)(REFGUID) = take;\n"
+            "    return (int)through(seven);\n"
+            "}\n"
+        )
+        self._compiles(source)
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source, cplusplus=False)
+
+    def test_an_import_is_handed_the_address(self) -> None:
+        source = _A_GUID + (
+            "typedef const GUID *REFCLSID;\n"
+            "typedef const GUID *REFIID;\n"
+            "typedef long HRESULT;\n"
+            "extern HRESULT CoCreateInstance(REFCLSID clsid, void *outer,\n"
+            "    unsigned int context, REFIID riid, void **object);\n"
+            "static const GUID thing = {1, 2, 3, {0}};\n"
+            "static const GUID asked = {4, 5, 6, {0}};\n"
+            "int main(void) {\n"
+            "    void *made = 0;\n"
+            "    return (int)CoCreateInstance(thing, 0, 1, &asked, &made);\n"
+            "}\n"
+        )
+        self._compiles(source, target="windows-x86_64")
+        with self.assertRaisesRegex(CCompileError, "needs a pointer"):
+            self._compiles(source, target="windows-x86_64", cplusplus=False)
+
+    def test_an_object_of_another_type_is_still_refused(self) -> None:
+        # The rule is reference binding, not "take the address of whatever":
+        # a struct the parameter does not point at is still the error it was.
+        source = _A_GUID + (
+            "struct Other { unsigned int Data1; };\n"
+            "static unsigned take(REFGUID id) { return id->Data1; }\n"
+            "static const struct Other seven = {7};\n"
+            "int main(void) { return (int)take(seven); }\n"
+        )
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source)
+
+    def test_the_callee_reads_the_object_it_was_bound_to(self) -> None:
+        # Built the way a C++ program is and run: what arrives is the object's
+        # own address, so the callee reads the numbers the program spelled.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        entry = root / "program.cpp"
+        entry.write_text(
+            "#include <stdio.h>\n" + _A_GUID + (
+                "static unsigned take(REFGUID id) { return id->Data1 * 6 + id->Data2; }\n"
+                "static const GUID seven = {7, 3, 0, {0}};\n"
+                "int main(void) { printf(\"%u\\n\", take(seven)); return 0; }\n"
+            ),
+            encoding="utf-8",
+        )
+        artifact = root / "program.bin"
+        compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        result = subprocess.run([str(artifact)], capture_output=True, text=True)
+        self.assertEqual(result.stdout, "45\n")
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

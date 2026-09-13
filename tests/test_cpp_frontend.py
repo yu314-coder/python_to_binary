@@ -143,6 +143,22 @@ class Reading(unittest.TestCase):
 
 
 class Translating(unittest.TestCase):
+    def test_a_derived_pointer_is_cast_for_a_call_through_a_table(self) -> None:
+        # A virtual call is written as a cast through the object's table, and
+        # the pass that casts a derived pointer for a base parameter looks a
+        # call up by name - which this one does not have. The cast in front of
+        # the call is the one place the parameter's type is written.
+        source = (
+            "struct IBase { virtual int take(int n) = 0; };\n"
+            "struct IDerived : IBase { virtual int more() = 0; };\n"
+            "struct IUser { virtual int use(IBase *b) = 0; };\n"
+            "int run(IUser *user, IDerived *derived) {\n"
+            "    return user->use(derived);\n"
+            "}\n"
+        )
+        out = translate(source, "table.cpp")
+        self.assertIn("(struct IBase *)(derived)", out)
+
     def test_a_class_becomes_a_struct_and_free_functions(self) -> None:
         out = translate(_VEC, "vec.cpp")
         self.assertIn("struct Vec {", out)

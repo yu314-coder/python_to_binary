@@ -2756,6 +2756,62 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a base pointer handed through a table
+
+`encoder->Initialize(stream, WICBitmapEncoderNoCache)` - an `IWICStream *`
+handed to a parameter that is an `IStream *`. C++ converts a pointer to a class
+into a pointer to any of its bases wherever one is wanted, and C makes you
+write the cast. This translator writes it for a return, a free function and a
+method called by name; it finds each of those by the name of what is called.
+A virtual call has no name - it is a call through the object's table, with a
+cast in front of it saying what each parameter is - so the derived pointer
+reached the C stage as it was and was refused, on a line that is correct C++.
+The cast in front of the call is where the parameter's type is read now.
+
+Only for a base at offset zero: the first base, and its first base, however
+far up - three levels, for COM's streams. A second base is a member further
+along, and a cast to it would say the right type and point at the wrong bytes.
+That one is left for the C stage to refuse, so it is a build that stops and not
+a program that runs and is wrong; the probe for it prints clang++'s answer or
+nothing.
+
+2196 tests, 629 programs against clang++, 11 projects, 3822 builds across six
+targets.
+
+### 0.9.13 - a reference a header spells as a pointer
+
+`CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
+IID_PPV_ARGS(&factory))` and `factory->CreateEncoder(GUID_ContainerFormatJpeg,
+nullptr, &encoder)` - a GUID handed to a parameter C++ declares as a
+reference. The Windows headers are written for both languages and say it once
+for each: `REFGUID` is `const GUID &` to C++ and `const GUID *` to C. py2bin
+reads the C branch, so both calls reached the C stage as a GUID where a pointer
+was wanted and were refused, on lines that are correct Windows C++.
+
+The translator could not fix it, because it never sees the declaration: a
+header py2bin ships is read by the C stage, after translation. So the C stage
+does it, in the one case where it cannot mean anything else - C the translator
+wrote, and an object of exactly the type the parameter points at. In C++ a
+pointer parameter is never handed an object, so the declaration that argument
+met was a reference, and its address is what is passed. C somebody wrote keeps
+the diagnostic, because there it is an error.
+
+It had to be done three times over, because a call reaches the C stage three
+ways: a named function, a call through a pointer - which is also how a method
+is reached through an interface's table - and an import from the vetted table.
+The last one needed its prototype's parameter types, which the parser read and
+threw away once it had the result type; they are kept now. Whether an argument
+is that object has to be settled before the argument is evaluated, since
+evaluating it twice would repeat whatever it calls - which is the same question
+`sizeof` asks, and the two share the answer.
+
+Still refused, and loudly: a method that *implements* such a parameter and
+reads the GUID as `format.Data1`; and `IID_IUnknown`, which py2bin's headers do
+not declare.
+
+2196 tests, 629 programs against clang++, 11 projects, 3822 builds across six
+targets.
+
 ### 0.9.13 - a file-scope object given its members
 
 `static Plain kept = {11, 2};` outside every function, and the program read
