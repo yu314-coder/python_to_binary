@@ -3899,3 +3899,166 @@ class ConditionsKeepTheirParentheses(unittest.TestCase):
             "}\n"
         )
         self.assertNotRegex(out, r"\bif\s+this->ptr_\b")
+
+
+_A_WINDOWS_INTERFACE = (
+    "typedef long HRESULT;\n"
+    "typedef struct EventRegistrationToken { long long value; }"
+    " EventRegistrationToken;\n"
+    "struct IThing {\n"
+    "    virtual HRESULT STDMETHODCALLTYPE remove_Changed("
+    "EventRegistrationToken token) = 0;\n"
+    "    virtual HRESULT STDMETHODCALLTYPE get_Count(int *count) = 0;\n"
+    "};\n"
+)
+
+
+class ACallThroughATableWindowsDeclared(unittest.TestCase):
+    """A method a Windows interface declares is called as Windows calls it.
+
+    `webView_->remove_WebMessageReceived(webMessageToken_)` hands an 8-byte
+    struct to a method WebView2 implements, which reads it as its bytes in the
+    register. The table's cast spelled the parameter as a pointer, the way
+    this translator hands an object to a method of its own, and the token's
+    address went where its value belonged - built, and silently wrong.
+    """
+
+    def test_the_cast_names_the_convention_and_takes_the_struct_by_value(self):
+        out = translate(
+            _A_WINDOWS_INTERFACE
+            + "HRESULT forget(IThing *thing, EventRegistrationToken token) {\n"
+            "    return thing->remove_Changed(token);\n"
+            "}\n",
+            "t.cpp",
+        )
+        self.assertIn(
+            "((HRESULT (__stdcall *)(struct IThing *, struct "
+            "EventRegistrationToken))((thing)->__vptr[0]))(thing, token)",
+            out,
+        )
+
+    def test_a_class_of_the_programs_own_keeps_its_own_convention(self):
+        out = translate(
+            "typedef struct EventRegistrationToken { long long value; }"
+            " EventRegistrationToken;\n"
+            "struct Plain {\n"
+            "    virtual int take(EventRegistrationToken token) {\n"
+            "        return (int)token.value;\n"
+            "    }\n"
+            "};\n"
+            "int plain(Plain *p, EventRegistrationToken token) {\n"
+            "    return p->take(token);\n"
+            "}\n",
+            "t.cpp",
+        )
+        self.assertNotIn("__stdcall", out)
+        self.assertIn(
+            "((int (*)(struct Plain *, struct EventRegistrationToken *))"
+            "((p)->__vptr[0]))(p, &token)",
+            out,
+        )
+
+    def test_the_macro_a_hand_written_header_uses_names_it_too(self):
+        # `STDMETHOD(name)` is `virtual HRESULT STDMETHODCALLTYPE name`, and a
+        # name inside a macro's body was left for a pass that had already run.
+        out = translate(
+            "typedef long HRESULT;\n"
+            "typedef struct EventRegistrationToken { long long value; }"
+            " EventRegistrationToken;\n"
+            "DECLARE_INTERFACE(IThing) {\n"
+            "    STDMETHOD(remove_Changed)(EventRegistrationToken token) PURE;\n"
+            "};\n"
+            "HRESULT forget(IThing *thing, EventRegistrationToken token) {\n"
+            "    return thing->remove_Changed(token);\n"
+            "}\n",
+            "t.cpp",
+        )
+        self.assertIn(
+            "(HRESULT (__stdcall *)(struct IThing *, struct "
+            "EventRegistrationToken))",
+            out,
+        )
+
+    def test_an_override_of_one_is_declared_in_it_as_well(self):
+        # Written without the word, and overriding a slot declared with it -
+        # which is what makes it a method Windows may call.
+        out = translate(
+            "typedef long HRESULT;\n"
+            "struct IHandler {\n"
+            "    virtual HRESULT STDMETHODCALLTYPE Invoke(int *given) = 0;\n"
+            "};\n"
+            "struct Handler : IHandler {\n"
+            "    HRESULT Invoke(int *given) override { *given = 7; return 0; }\n"
+            "};\n"
+            "int main() {\n"
+            "    Handler h; IHandler *i = &h; int n = 0;\n"
+            "    i->Invoke(&n);\n"
+            "    return n;\n"
+            "}\n",
+            "t.cpp",
+        )
+        self.assertIn("HRESULT __stdcall Handler__Invoke(struct Handler *, int *);", out)
+        self.assertRegex(out, r"static HRESULT __stdcall Handler__Invoke\(")
+
+    def test_an_override_taking_an_object_by_value_is_refused_by_name(self):
+        with self.assertRaisesRegex(
+            CppTranslationError,
+            "Handler::remove_Changed overrides a method a Windows interface "
+            "declares",
+        ):
+            translate(
+                _A_WINDOWS_INTERFACE
+                + "struct Handler : IThing {\n"
+                "    HRESULT remove_Changed(EventRegistrationToken token) override {\n"
+                "        return 0;\n"
+                "    }\n"
+                "    HRESULT get_Count(int *count) override { *count = 1; return 0; }\n"
+                "};\n"
+                "int main() { Handler h; int n = 0; h.get_Count(&n); return n; }\n",
+                "t.cpp",
+            )
+
+    def test_the_token_reaches_the_call_as_its_bytes_on_windows(self):
+        import dataclasses
+
+        from py2bin.c_frontend import compile_c_to_ir
+        from py2bin.native.ir import HeapLoad, IndirectCall
+
+        c = translate(
+            _A_WINDOWS_INTERFACE
+            + "HRESULT forget(IThing *thing, EventRegistrationToken token) {\n"
+            "    return thing->remove_Changed(token);\n"
+            "}\n"
+            "int main() {\n"
+            "    EventRegistrationToken k; k.value = 1;\n"
+            "    IThing *t = 0;\n"
+            "    return t ? (int)forget(t, k) : 0;\n"
+            "}\n",
+            "t.cpp",
+        )
+
+        def through(target: str) -> list:
+            found: list = []
+
+            def walk(node) -> None:
+                if isinstance(node, IndirectCall):
+                    found.append(node)
+                if dataclasses.is_dataclass(node) and not isinstance(node, type):
+                    for field in dataclasses.fields(node):
+                        walk(getattr(node, field.name))
+                elif isinstance(node, (list, tuple)):
+                    for item in node:
+                        walk(item)
+
+            module = compile_c_to_ir(c, "t.c", target, cplusplus=True)
+            for function in module.functions:
+                walk(function.operations)
+            walk(module.operations)
+            return found
+
+        (windows,) = through("windows-x86_64")
+        self.assertIsInstance(windows.arguments[1], HeapLoad)
+        self.assertEqual(windows.arguments[1].size, 8)
+        # Off Windows the word means nothing, and the call is py2bin's own.
+        (darwin,) = through("darwin-arm64")
+        self.assertNotIsInstance(darwin.arguments[1], HeapLoad)

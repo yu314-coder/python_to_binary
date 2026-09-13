@@ -172,6 +172,12 @@ class Method:
     #: not track whether an object is const, so what this is for is telling
     #: such a pair apart when it is read - not choosing between them.
     readonly: bool = False
+    #: Declared in the convention a Windows interface names: `virtual HRESULT
+    #: STDMETHODCALLTYPE remove_Changed(EventRegistrationToken token) = 0;`.
+    #: What is on the other side of that slot may be a DLL's method, or a
+    #: method Windows calls, so a call through it is written the way Windows
+    #: makes one - and so is every override of it, declared so or not.
+    platform: bool = False
 
 
 @dataclass
@@ -1487,12 +1493,14 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
     # `const` after the parameter list, which is the only place it can be and
     # still be about the object rather than about a type.
     readonly = re.search(r"\)\s*const\s*$", head) is not None
+    platform = False
 
     def decorated(method: Method) -> Method:
         method.virtual = virtual
         method.pure = pure
         method.shared = shared
         method.readonly = readonly
+        method.platform = platform
         return method
 
     # `int operator()(int x)` has two parameter lists as far as `find` is
@@ -1519,6 +1527,11 @@ def _method_from(head: str, body: str, filename: str, at: int) -> Method:
             "a typedef and write `<typedef> name(params)`",
         )
     before = head[:open_paren].strip()
+    # `HRESULT __stdcall Invoke(...)`: the convention stands between what the
+    # member answers and its name, and is neither. Taken off here, and kept.
+    if _A_DECLARED_CONVENTION.search(before):
+        platform = True
+        before = _A_DECLARED_CONVENTION.sub(" ", before).strip()
     parameters = head[open_paren + 1: close_paren].strip()
     if parameters in ("void", ""):
         parameters = ""
@@ -2915,7 +2928,9 @@ def _wider(left: "str | None", right: "str | None") -> "str | None":
 
 #: `((int (*)(struct Base *))(p->__vptr[0]))(p)` - a virtual call, spelled
 #: the way this translator spells one. The cast names the return type.
-_DISPATCHED = re.compile(r"^\(\(\s*(.+?)\s*\(\s*\*\s*\)\s*\(", re.S)
+_DISPATCHED = re.compile(
+    r"^\(\(\s*(.+?)\s*\(\s*(?:__stdcall\s*)?\*\s*\)\s*\(", re.S
+)
 
 #: `(int)x`, `(const char *)p` - a cast, which says what something is.
 #: `(long long)v`, `(unsigned long)n`, `(const char *)p` - a type is more
@@ -6750,7 +6765,8 @@ def _pure_virtual_of(text: str, interface: str) -> "tuple[str, str, str] | None"
             return None
         inside = text[head.end(): closing - 1]
         found = re.search(
-            r"virtual\s+([A-Za-z_][\w\s*]*?)\s*(?:STDMETHODCALLTYPE\s+)?"
+            r"virtual\s+([A-Za-z_][\w\s*]*?)\s*"
+            r"(?:(?:STDMETHODCALLTYPE|_?_stdcall)\s+)?"
             r"([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*=\s*0\s*;",
             inside,
         )
@@ -11331,6 +11347,76 @@ def _strip_namespace_qualifiers(text: str, namespaces: "set[str]") -> str:
         )
     return text
 
+#: `__stdcall` where a member is declared, however the header spelled it:
+#: `STDMETHODCALLTYPE` has been written out to it before members are read.
+_A_DECLARED_CONVENTION = re.compile(r"(?<![\w])_?_stdcall\b")
+
+
+def _is_platform_slot(
+    name: str, method: "Method", classes: "dict[str, Class]"
+) -> bool:
+    """Whether a virtual of this class is a slot Windows fills or calls.
+
+    Declared in the convention a Windows interface names - here, or in any
+    base it overrides: `HRESULT Invoke(...) override` in a handler says
+    nothing about conventions, and is one because what it overrides is.
+    """
+
+    # Not asked of the method itself: `HRESULT get_Count(int *) override` is
+    # read with `virtual` unset, and overrides all the same. What decides is a
+    # virtual of the same slot declared in the convention, here or above.
+    if method.shared or method.name in ("", "~"):
+        return False
+    key = _slot_key(method)
+    for seen in [name, *_every_base(name, classes)]:
+        if seen not in classes:
+            continue
+        for declared in classes[seen].methods:
+            if (
+                declared.platform
+                and declared.virtual
+                and _slot_key(declared) == key
+            ):
+                return True
+    return False
+
+
+def _refuse_platform_objects_by_value(
+    classes: "dict[str, Class]", filename: str
+) -> None:
+    """Refuse an override Windows may call that takes an object by value.
+
+    This translator hands a class or a struct over as its address and copies
+    it on entry - its own convention, and right between two functions it
+    wrote. A method Windows calls through a table was compiled against the
+    platform's: an aggregate of 1, 2, 4 or 8 bytes arrives as its bytes on
+    x64, and anything up to 16 on ARM64, so what the method would read as an
+    address is the value itself. Which rule applies turns on a size this
+    stage cannot see, so every one is refused by name, rather than the sizes
+    that happen to agree being let through by luck.
+    """
+
+    for found in classes.values():
+        for method in found.methods:
+            if method.pure or not _is_platform_slot(found.name, method, classes):
+                continue
+            for part in _split_arguments(method.parameters):
+                if not part.strip() or not _passed_by_address(part, classes):
+                    continue
+                raise CppTranslationError(
+                    filename,
+                    method.line,
+                    f"{found.name}::{method.name} overrides a method a Windows "
+                    "interface declares, so Windows may call it, and it takes "
+                    f"`{part.strip()}` by value. Windows hands a struct of 8 "
+                    "bytes or less over as its bytes (16 on ARM64), where this "
+                    "translator's own methods take any object as its address, "
+                    "and which this one is turns on a size read after this "
+                    "stage. Receiving one that way is not implemented; take a "
+                    "pointer to it instead",
+                )
+
+
 #: The spellings a generated COM header is written in. Distinctive enough
 #: that a file using one of them is COM code, which is what decides whether
 #: the rest of the table - `interface`, `PURE` - is applied at all.
@@ -11367,7 +11453,19 @@ def _com_macros() -> "list[tuple[str, list[str], str]]":
             else []
         )
         found.append((name, spelled, body.strip()))
-    return sorted(found, key=lambda one: len(one[0]), reverse=True)
+    # A body may be written in terms of another of these - `STDMETHOD(name)`
+    # is `virtual HRESULT STDMETHODCALLTYPE name`, as the SDK spells it - and
+    # is written out in terms of what that one stands for. The text is
+    # rewritten longest name first, so the shorter name's body would put back
+    # a name the rewrite had already gone past.
+    plain = {name: body for name, parameters, body in found if not parameters}
+    resolved: "list[tuple[str, list[str], str]]" = []
+    for name, parameters, body in found:
+        for other, meaning in plain.items():
+            if other != name and other not in parameters:
+                body = re.sub(rf"(?<![.\w>]){re.escape(other)}\b", meaning, body)
+        resolved.append((name, parameters, body))
+    return sorted(resolved, key=lambda one: len(one[0]), reverse=True)
 
 
 def _expand_com_spellings(text: str) -> str:
@@ -11880,7 +11978,10 @@ def _platform_structs() -> "frozenset[str]":
 
 
 def _c_signature(
-    owner: str, method: "Method", classes: "dict[str, Class]"
+    owner: str,
+    method: "Method",
+    classes: "dict[str, Class]",
+    platform: "bool | None" = None,
 ) -> "tuple[str, str]":
     """The C return type and parameter list a method is emitted with.
 
@@ -11894,6 +11995,12 @@ def _c_signature(
     parameters = [f"struct {owner} *"]
     if returned:
         parameters.append(f"struct {returned} *")
+    # A slot Windows fills or calls takes an object the way Windows passes
+    # one: written by value here, and handed over by the platform's rule in
+    # the C stage, which knows how big it is. Everywhere else this
+    # translator's own convention, which is an address.
+    if platform is None:
+        platform = _is_platform_slot(owner, method, classes)
     for part in _split_arguments(method.parameters):
         if not part.strip():
             continue
@@ -11901,7 +12008,7 @@ def _c_signature(
         held = re.sub(
             r"\b(?:const|struct|volatile|union)\b", " ", part.replace("*", " ")
         ).split()
-        if _passed_by_address(part, classes) and held:
+        if _passed_by_address(part, classes) and held and not platform:
             # `struct` in front of a class, because that is what it is
             # emitted as; the plain name for a platform struct, which is a
             # typedef and whose tag is something else again.
@@ -11985,7 +12092,10 @@ def _emit_vtables(order: "list[str]", classes: "dict[str, Class]") -> str:
                 continue
             seen.add(symbol)
             result, parameters = _c_signature(provider, method, classes)
-            lines.append(f"{result} {symbol}({parameters});")
+            convention = (
+                "__stdcall " if _is_platform_slot(provider, method, classes) else ""
+            )
+            lines.append(f"{result} {convention}{symbol}({parameters});")
     for name in polymorphic:
         slots = _virtual_slots(name, classes)
         entries = []
@@ -12102,8 +12212,13 @@ def _second_base_tables(
                 symbol = _c_name(
                     provider, key[0], _suffix_of(provider, method, classes)
                 )
+                convention = (
+                    "__stdcall "
+                    if _is_platform_slot(provider, method, classes)
+                    else ""
+                )
                 lines.append(
-                    f"static {result} {thunk}({head}) {{ "
+                    f"static {result} {convention}{thunk}({head}) {{ "
                     f"{answer}{symbol}(({spelled[0]})((char *)__self - "
                     f"{_offset_of(name, member)}){passed}); }}"
                 )
@@ -12588,7 +12703,13 @@ def _emit_one(
             f"(*this->{member.name})",
             body,
         )
-    written = f"static {returns} {name}({parameters}) {body}"
+    # A method Windows may call is declared the way the header declared its
+    # slot, so the C stage can refuse what Windows would hand it and it would
+    # not read.
+    convention = (
+        "__stdcall " if _is_platform_slot(found.name, method, classes) else ""
+    )
+    written = f"static {returns} {convention}{name}({parameters}) {body}"
     if method.name == "" and _shared_bases(found.name, classes):
         written += "\n" + _complete_constructor(
             found, classes, name, returns, parameters, shared_arguments, scope
@@ -19680,7 +19801,9 @@ def _free_returns_object(
 #: `((int (*)(struct Base *, struct P *))((p)->__vptr[2]))(` - the head of a
 #: virtual call as this translator writes one. The cast opens the parameter
 #: list, and the parameter list says what each argument has to be.
-_A_DISPATCH_CAST = re.compile(r"\(\(\s*[^()]*?\(\s*\*\s*\)\s*\(")
+_A_DISPATCH_CAST = re.compile(
+    r"\(\(\s*[^()]*?\(\s*(?:__stdcall\s*)?\*\s*\)\s*\("
+)
 
 
 def _upcast_for_a_table(
@@ -20161,13 +20284,21 @@ def _dispatch(
         # Written for the class the table belongs to, which is the shared
         # base where there is one: those entries take a pointer to it.
         carrier = _vptr_carrier(holds, classes)
+        # A slot Windows fills is called the way Windows calls, and the C
+        # stage is told so in the word the header declared it with. Asked of
+        # the class the call is written on, for the cast and its parameters
+        # alike, so the two cannot disagree about which convention this is.
+        platform = _is_platform_slot(holds, declared, classes)
         result, parameters = _c_signature(
             carrier if carrier in _shared_bases(holds, classes) else holds,
             declared,
             classes,
+            platform,
         )
+        convention = "__stdcall " if platform else ""
         return (
-            f"(({result} (*)({parameters}))(({receiver})->{path}[{slots.index(key)}]))"
+            f"(({result} ({convention}*)({parameters}))"
+            f"(({receiver})->{path}[{slots.index(key)}]))"
         )
 
     return chosen
@@ -21968,6 +22099,10 @@ def _translate(source: str, filename: str = "<c++>") -> str:
             for name in _by_dependency(order, classes)
         ]
     )
+    # Before anything is written from the classes, and while the file they
+    # came from is still known: an override Windows may call that takes an
+    # object by value is refused here, by name.
+    _refuse_platform_objects_by_value(classes, filename)
     tables = _emit_vtables(order, classes)
     if tables:
         declarations += "\n" + tables

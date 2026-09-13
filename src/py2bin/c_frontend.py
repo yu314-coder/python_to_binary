@@ -740,6 +740,13 @@ class FunctionType:
 
     result: "CType"
     parameters: tuple["CType", ...]
+    #: The calling convention the declaration names, where it names one.
+    #: `HRESULT (__stdcall *remove)(IThing *, EventRegistrationToken)` is how
+    #: a Windows header writes a method of an interface a DLL implements, and
+    #: what is on the other side of that pointer was compiled by somebody
+    #: else. Not part of the type's identity: x64 has one convention, and C
+    #: compares two such types as the same type.
+    convention: "str | None" = dataclasses.field(default=None, compare=False)
 
     def __str__(self) -> str:
         inside = ", ".join(str(item) for item in self.parameters) or "void"
@@ -845,7 +852,9 @@ def _fill(ctype: "CType", hole: _Hole, actual: "CType") -> "CType":
     if isinstance(ctype, ArrayType):
         return ArrayType(_fill(ctype.element, hole, actual), ctype.count)
     if isinstance(ctype, FunctionType):
-        return FunctionType(_fill(ctype.result, hole, actual), ctype.parameters)
+        return FunctionType(
+            _fill(ctype.result, hole, actual), ctype.parameters, ctype.convention
+        )
     return ctype
 
 
@@ -1349,6 +1358,63 @@ def _same_shape(left: CType, right: CType) -> bool:
     )
 
 
+def _holds_floating(ctype: "CType") -> bool:
+    """Whether a floating member is anywhere inside this."""
+
+    if isinstance(ctype, FloatingType):
+        return True
+    if isinstance(ctype, ArrayType):
+        return _holds_floating(ctype.element)
+    if isinstance(ctype, StructType) and ctype.members is not None:
+        return any(_holds_floating(member.ctype) for member in ctype.members)
+    return False
+
+
+def _a_floating_union(ctype: "CType") -> bool:
+    """Whether a union with a floating member is anywhere inside this."""
+
+    if isinstance(ctype, ArrayType):
+        return _a_floating_union(ctype.element)
+    if not isinstance(ctype, StructType) or ctype.members is None:
+        return False
+    if ctype.is_union:
+        return _holds_floating(ctype)
+    return any(_a_floating_union(member.ctype) for member in ctype.members)
+
+
+def _homogeneous_floating(ctype: "StructType") -> bool:
+    """Whether AAPCS64 hands this over in its floating-point registers.
+
+    One to four members, every one of them the same floating type however
+    they are nested: `struct { float x, y; }` is, and `struct { float x; int
+    n; }` is not. A union with any floating member counts, which is wider than
+    the rule - it refuses a union nobody hands a DLL by value, rather than
+    guessing which of its members decides.
+    """
+
+    if _a_floating_union(ctype):
+        return True
+    leaves: "list[CType]" = []
+
+    def walk(held: "CType") -> bool:
+        # False as soon as this cannot be one, so an array of a thousand stops
+        # at its fifth element.
+        if isinstance(held, ArrayType):
+            if held.count is None:
+                return False
+            return all(walk(held.element) for _ in range(held.count))
+        if isinstance(held, StructType):
+            if held.members is None:
+                return False
+            return all(walk(member.ctype) for member in held.members)
+        leaves.append(held)
+        return len(leaves) <= 4 and isinstance(held, FloatingType)
+
+    if not walk(ctype) or not leaves:
+        return False
+    return len({leaf.size for leaf in leaves}) == 1
+
+
 def compatible(left: CType, right: CType) -> bool:
     """Assignment compatibility for pointers, ignoring qualifiers."""
 
@@ -1657,6 +1723,10 @@ class Function:
     #: promoted and written into a run of 8-byte cells, whose address is what
     #: `va_start` hands back - so `va_arg` is a load and a step forward.
     variadic: bool = False
+    #: The calling convention a declaration of it named: see
+    #: :attr:`FunctionType.convention`. Any declaration naming one is enough,
+    #: since a prototype and its definition are one function.
+    convention: "str | None" = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -1783,6 +1853,14 @@ _IGNORED_SPECIFIERS = frozenset(
         "__restrict", "__restrict__",
     }
 )
+
+#: The convention Windows declares its API and its interfaces in. Still read
+#: and dropped as a specifier - it changes no call py2bin makes to a function
+#: it compiled - but where it is written the declaration is kept marked: the
+#: other side may be code Windows compiled, which takes a struct small enough
+#: to fit a register as its bytes and a double in a register of its own, and
+#: a call to it has to be made the way that code reads one.
+_PLATFORM_CONVENTIONS = frozenset({"__stdcall", "_stdcall"})
 
 #: What an `__attribute__` may say that changes where a member sits. Refused
 #: by name rather than dropped, for the reason `__declspec(align)` is: a
@@ -2473,6 +2551,28 @@ class Parser:
             else:
                 self.skip_attribute()
 
+    def convention_named(self, start: int, end: int) -> "str | None":
+        """The calling convention written among these tokens, if one is.
+
+        Only the one Windows declares its API and its interfaces in, and only
+        outside any parentheses - where a parameter list or a `__declspec`
+        holds words about something else.
+        """
+
+        depth = 0
+        for token in self.tokens[start:end]:
+            if token.value == "(":
+                depth += 1
+            elif token.value == ")":
+                depth -= 1
+            elif (
+                depth == 0
+                and token.kind == "identifier"
+                and token.value in _PLATFORM_CONVENTIONS
+            ):
+                return "__stdcall"
+        return None
+
     def pointer_suffix(self, base: CType) -> CType:
         while True:
             # And before the `*` as well as after it: `int (__cdecl *_PIFV)
@@ -2532,12 +2632,18 @@ class Parser:
         base = self.pointer_suffix(base)
         if self.at("(") and self.at_nested_declarator():
             self.take("(")
+            opened = self.index
             hole = _Hole(self.next_hole())
             inner, name = self.declarator(hole, abstract=abstract, optional=optional)
             name_token = self.declared_token
             parameters = self.declared_parameters
+            # `HRESULT (__stdcall *remove)(...)`: the convention is written
+            # beside the star, and belongs to the function the star points at.
+            convention = self.convention_named(opened, self.index)
             self.take(")")
             outer = self.declarator_suffix(base)
+            if convention is not None and isinstance(outer, FunctionType):
+                outer = dataclasses.replace(outer, convention=convention)
             if inner == hole:
                 # `int (pick)(int which)`: the parentheses regrouped nothing,
                 # so the function's own parameter list is the one outside.
@@ -3407,6 +3513,7 @@ class Parser:
         no linker has no linkage to limit.
         """
 
+        started = self.index
         while self.token.kind == "identifier" and (
             self.token.value == "static"
             or self.token.value in _IGNORED_SPECIFIERS
@@ -3425,7 +3532,13 @@ class Parser:
         if self.at_function_declarator():
             declared = self.pointer_suffix(base)
             name_token = self.identifier()
-            self.function_definition(declared, name_token)
+            self.function_definition(
+                declared,
+                name_token,
+                # `HRESULT __stdcall Invoke(...)`, wherever in front of the
+                # name the word was put.
+                self.convention_named(started, self.index - 1),
+            )
             return
         self.object_declaration(base)
 
@@ -3509,7 +3622,9 @@ class Parser:
                 return
         self.globals[entry.name] = entry
 
-    def function_definition(self, result: CType, name_token: Token) -> None:
+    def function_definition(
+        self, result: CType, name_token: Token, convention: "str | None" = None
+    ) -> None:
         name = str(name_token.value)
         self.take("(")
         parameters: list[tuple[CType, str]] = []
@@ -3550,7 +3665,7 @@ class Parser:
                     if self.accept(")"):
                         break
                     self.take(",")
-        self.register_function(name_token, result, parameters, variadic)
+        self.register_function(name_token, result, parameters, variadic, convention)
 
     def function_declared(self, ctype: FunctionType, name_token: Token) -> None:
         """A function whose declarator ``declarator`` read whole.
@@ -3596,6 +3711,7 @@ class Parser:
         result: CType,
         parameters: list[tuple[CType, str]],
         variadic: bool,
+        convention: "str | None" = None,
     ) -> None:
         """Record a prototype, or parse and record a definition, once its
         result type and named parameters are known and the parser stands at
@@ -3621,13 +3737,19 @@ class Parser:
         previous = self.functions.get(name)
         if previous is not None:
             self.check_redeclaration(previous, result, parameters, name_token)
+            # Named on any one declaration, it is the function's: a prototype
+            # written `__stdcall` and a definition that leaves the word off are
+            # still one function, and one Windows may call.
+            convention = convention or previous.convention
         if self.accept(";"):
             # A prototype. It carries no body, and repeating it is legal C as
             # long as the signature agrees, which check_redeclaration enforced.
             if previous is None:
                 self.functions[name] = Function(
-                    name, result, parameters, None, name_token, variadic
+                    name, result, parameters, None, name_token, variadic, convention
                 )
+            else:
+                previous.convention = convention
             return
         if previous is not None and previous.body is not None:
             self.error(f"{name!r} is already defined", name_token)
@@ -3651,7 +3773,7 @@ class Parser:
         # function's own name -- and any name a prototype introduced -- resolves
         # inside it. That is what makes direct and mutual recursion parseable.
         self.functions[name] = Function(
-            name, result, parameters, None, name_token, variadic
+            name, result, parameters, None, name_token, variadic, convention
         )
         # A parameter takes its name from its type too, and for the whole
         # body: `void write(struct path path)` is as ordinary as the local.
@@ -3661,7 +3783,7 @@ class Parser:
         finally:
             self.shadowing.pop()
         self.functions[name] = Function(
-            name, result, parameters, body, name_token, variadic
+            name, result, parameters, body, name_token, variadic, convention
         )
 
     def check_redeclaration(
@@ -4786,6 +4908,7 @@ class Lowerer:
             if value.null:
                 return IntConstant(0)
             if isinstance(value.ctype, PointerType) and compatible(target, value.ctype):
+                self.check_convention_kept(value.ctype, target, token, what)
                 return value.expr
             if isinstance(value.ctype, PointerType):
                 self.error(
@@ -5644,6 +5767,7 @@ class Lowerer:
                 "between a floating type and a pointer",
                 node.token,
             )
+        self.check_convention_kept(value.ctype, target, node.token, "this cast")
         return Value(target, value.expr, null=value.null)
 
     def copy_struct(
@@ -5850,7 +5974,9 @@ class Lowerer:
             )
         self.lower_callee(function)
         ctype = FunctionType(
-            function.result, tuple(item for item, _name in function.parameters)
+            function.result,
+            tuple(item for item, _name in function.parameters),
+            function.convention,
         )
         return ctype, FunctionAddress(name)
 
@@ -6273,6 +6399,17 @@ class Lowerer:
         # The same hidden argument a direct call to such a function gets: the
         # signature is what both sides agree on, so a pointer to a function
         # answering an aggregate is called exactly as its name would be.
+        # A pointer declared `__stdcall` is called the way Windows calls, on
+        # Windows: what is on the other side of it may be a DLL's method.
+        platform = self.platform_convention(signature.convention)
+        if platform and isinstance(signature.result, (FloatingType, StructType)):
+            self.error(
+                f"a call through {ctype}, declared __stdcall, answers "
+                f"{signature.result}; Windows hands that back where a call "
+                "py2bin makes through a pointer does not look for it. Not "
+                "implemented",
+                token,
+            )
         answers = isinstance(signature.result, StructType)
         if len(signature.parameters) + (1 if answers else 0) > limit:
             self.error(
@@ -6297,8 +6434,25 @@ class Lowerer:
         ):
             what = f"argument {position} of a call through {ctype}"
             if isinstance(parameter, StructType):
+                if platform:
+                    prepared.extend(
+                        self.platform_aggregate(
+                            argument, parameter, what, len(prepared)
+                        )
+                    )
+                    continue
                 prepared.append(self.aggregate_argument(argument, parameter, what))
                 continue
+            if platform and isinstance(parameter, FloatingType):
+                self.error(
+                    f"{what} is {parameter}, and the pointer is declared "
+                    "__stdcall: Windows reads that from a floating-point "
+                    "register, and a call py2bin makes through a pointer "
+                    "passes it as its bits in an integer one, so the method "
+                    "would read something else. Not implemented; hand it over "
+                    "through a pointer",
+                    argument.token,
+                )
             bound = self.bound_reference(argument, parameter)
             if bound is not None:
                 prepared.append(bound)
@@ -6617,6 +6771,194 @@ class Lowerer:
             prepared.append(area)
         return prepared
 
+    def platform_convention(self, convention: "str | None") -> bool:
+        """Whether a declared convention changes a call on this target.
+
+        On Windows it does: the other side of a `__stdcall` pointer may be a
+        DLL's method, or a function Windows calls back, and both follow the
+        platform's rules rather than py2bin's. Anywhere else the word is
+        ignored, as clang ignores it there, and nothing Windows compiled can
+        be on the other side.
+        """
+
+        return convention is not None and self.target.startswith("windows-")
+
+    def platform_difference(self, ctype: CType) -> "str | None":
+        """How Windows passes this where py2bin's own calls do not, if it does.
+
+        None where the two are one call: an integer or a pointer in its
+        register, and an aggregate the platform passes by address as well -
+        on x64 anything but 1, 2, 4 or 8 bytes, on ARM64 anything over 16.
+        """
+
+        if isinstance(ctype, FloatingType):
+            return (
+                f"Windows passes a {ctype} in a floating-point register, and "
+                "py2bin reads one as its bits in an integer register"
+            )
+        if not isinstance(ctype, StructType):
+            return None
+        if self.target == "windows-x86_64":
+            if ctype.size in (1, 2, 4, 8):
+                return (
+                    f"Windows passes {ctype}, {ctype.size} byte(s), as its bytes "
+                    "in the register, and py2bin reads that register as its "
+                    "address"
+                )
+            return None
+        if _homogeneous_floating(ctype):
+            return (
+                f"Windows on ARM64 passes {ctype}, all floating members, in its "
+                "floating-point registers"
+            )
+        if ctype.size <= 16:
+            return (
+                f"Windows on ARM64 passes {ctype}, {ctype.size} bytes, as its "
+                "bytes in registers, and py2bin reads a register as its address"
+            )
+        return None
+
+    def platform_aggregate(
+        self, argument: Node, wanted: "StructType", what: str, used: int
+    ) -> "list[IntExpression]":
+        """A struct or union handed to what Windows compiled, as Windows takes it.
+
+        py2bin's own calls pass the address and let the callee copy. A DLL's
+        method was compiled to the platform's rule, and reads whatever is in
+        the register as the value: on x64 an aggregate of 1, 2, 4 or 8 bytes
+        is its bytes and anything else the address of a copy the callee may
+        write to; on ARM64 up to 16 bytes is its bytes in one register or two,
+        more is the address of a copy, and one made of floating members goes
+        in the floating-point registers, which this does not write.
+        """
+
+        address = self.aggregate_argument(argument, wanted, what)
+        size = wanted.size
+        if self.target == "windows-x86_64":
+            if size in (1, 2, 4, 8):
+                return [HeapLoad(address, size, False)]
+            return [self.platform_copy(wanted, address)]
+        if _homogeneous_floating(wanted):
+            self.error(
+                f"{what} is {wanted}, all floating members, and Windows on "
+                "ARM64 passes that in its floating-point registers, which a "
+                "call py2bin makes through a pointer does not write. Not "
+                "implemented; hand it over through a pointer",
+                argument.token,
+            )
+        if size > 16:
+            return [self.platform_copy(wanted, address)]
+        if size in (1, 2, 4, 8):
+            return [HeapLoad(address, size, False)]
+        # Copied into whole words first, so no load reads a byte past the
+        # object; what lands beyond its end is padding the callee never reads.
+        room = SlotAddress(self.take(size))
+        self.copy_bytes(wanted, room, address)
+        if size < 8:
+            return [HeapLoad(room, 8, False)]
+        if used == 7:
+            # Two words and one register left: the platform then puts the
+            # whole object on the stack and nothing after it in a register,
+            # which is not the order this passes arguments in.
+            self.error(
+                f"{what} is {wanted}, two words Windows on ARM64 wants in "
+                "registers together, and only one argument register is left. "
+                "Not implemented; hand it over through a pointer",
+                argument.token,
+            )
+        return [
+            HeapLoad(room, 8, False),
+            HeapLoad(IntBinary("add", room, IntConstant(8)), 8, False),
+        ]
+
+    def platform_copy(
+        self, wanted: "StructType", address: IntExpression
+    ) -> IntExpression:
+        """The address of a copy made for the callee, which the callee owns."""
+
+        room = SlotAddress(self.take(wanted.size))
+        self.copy_bytes(wanted, room, address)
+        return room
+
+    def check_platform_callee(self, function: Function) -> None:
+        """Refuse a function Windows may call with values py2bin does not read.
+
+        Declared `__stdcall`, a function is one a Windows header says code
+        compiled elsewhere calls: a callback, or a method of an interface
+        handed to a DLL. py2bin reads every parameter from an integer register
+        and an aggregate as an address, so a double, or a struct small enough
+        to travel as its bytes, would be read as something else and the
+        function would run on it without a word.
+        """
+
+        for position, (parameter_type, _name) in enumerate(function.parameters, 1):
+            reason = self.platform_difference(parameter_type)
+            if reason is not None:
+                self.error(
+                    f"{function.name}() is declared __stdcall, so Windows may call "
+                    f"it, and its parameter {position} is {parameter_type}: "
+                    f"{reason}. Receiving it that way is not implemented; take "
+                    "a pointer to it instead",
+                    function.token,
+                )
+        if isinstance(function.result, (FloatingType, StructType)):
+            self.error(
+                f"{function.name}() is declared __stdcall, so Windows may call "
+                f"it, and it answers {function.result}, which Windows looks for "
+                "somewhere py2bin does not put it. Not implemented",
+                function.token,
+            )
+
+    def check_convention_kept(
+        self, given: CType, wanted: CType, token: Token, what: str
+    ) -> None:
+        """Refuse to make a function of one convention a pointer of the other
+        where the two would be called differently.
+
+        A `__stdcall` pointer is called the way Windows calls, and a function
+        py2bin compiled without the word reads what py2bin passes. Where every
+        parameter is an integer or a pointer that is one call; where one is
+        not, the pointer holds a function one of the two calls hands something
+        it does not read.
+        """
+
+        if not (
+            isinstance(given, PointerType)
+            and isinstance(given.target, FunctionType)
+            and isinstance(wanted, PointerType)
+            and isinstance(wanted.target, FunctionType)
+        ):
+            return
+        before, after = given.target.convention, wanted.target.convention
+        if before == after or not self.platform_convention(before or after):
+            return
+        signature = wanted.target
+        reason = None
+        for held in signature.parameters:
+            reason = self.platform_difference(held)
+            if reason is not None:
+                break
+        if reason is None:
+            if not isinstance(signature.result, (FloatingType, StructType)):
+                return
+            reason = f"it answers {signature.result}, which the two hand back differently"
+        if after is not None:
+            turned = (
+                f"{given}, which is not declared __stdcall, into {wanted}, "
+                "which is"
+            )
+        else:
+            turned = (
+                f"{given}, which is declared __stdcall, into {wanted}, which "
+                "is not"
+            )
+        self.error(
+            f"{what} makes {turned}: {reason}. A call made one way would hand "
+            "the function something it reads the other way; hand the value "
+            "over through a pointer instead",
+            token,
+        )
+
     def aggregate_argument(
         self, argument: Node, wanted: "StructType", what: str
     ) -> IntExpression:
@@ -6739,6 +7081,8 @@ class Lowerer:
         if function.name in self.lowered or function.name in self.lowering:
             return
         assert function.body is not None
+        if self.platform_convention(function.convention):
+            self.check_platform_callee(function)
         self.lowering.add(function.name)
         saved = (
             self.operations,

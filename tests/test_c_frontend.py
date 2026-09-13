@@ -5502,3 +5502,214 @@ class ExitBuiltins(unittest.TestCase):
             if isinstance(operation, ExitValue)
         ]
         self.assertTrue(found, "exit() inside a function emitted nothing")
+
+
+def _calls_through_pointers(module, name: str) -> list:
+    """The calls through a pointer one function of the module makes."""
+
+    import dataclasses
+
+    from py2bin.native.ir import IndirectCall
+
+    found: list = []
+
+    def walk(node) -> None:
+        if isinstance(node, IndirectCall):
+            found.append(node)
+        if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            for field in dataclasses.fields(node):
+                walk(getattr(node, field.name))
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    for function in module.functions:
+        if function.name == name:
+            walk(function.operations)
+    return found
+
+
+_A_TABLE_WINDOWS_DECLARED = (
+    "typedef struct Token { long long value; } Token;\n"
+    "typedef struct Box { int left, top, right, bottom; } Box;\n"
+    "typedef struct Span { long long a, b, c; } Span;\n"
+    "typedef struct Thing Thing;\n"
+    "struct Thing {\n"
+    "    int (__stdcall *remove)(Thing *self, Token token);\n"
+    "    int (__stdcall *place)(Thing *self, Box box);\n"
+    "    int (__stdcall *spread)(Thing *self, Span span);\n"
+    "    int (*own)(Thing *self, Token token);\n"
+    "};\n"
+    "static int forget(Thing *t, Token *k) { return t->remove(t, *k); }\n"
+    "static int put(Thing *t, Box *b) { return t->place(t, *b); }\n"
+    "static int cover(Thing *t, Span *s) { return t->spread(t, *s); }\n"
+    "static int keep(Thing *t, Token *k) { return t->own(t, *k); }\n"
+    "int main(void) {\n"
+    "    Thing t; Token k; Box b; Span s;\n"
+    "    t.remove = 0; t.place = 0; t.spread = 0; t.own = 0;\n"
+    "    k.value = 1; b.left = 2; b.top = 2; b.right = 2; b.bottom = 2;\n"
+    "    s.a = 3; s.b = 3; s.c = 3;\n"
+    "    return forget(&t, &k) + put(&t, &b) + cover(&t, &s) + keep(&t, &k);\n"
+    "}\n"
+)
+
+_FLOATING_MEMBERS_THROUGH_A_TABLE = (
+    "typedef struct Point { float x, y; } Point;\n"
+    "typedef struct Thing Thing;\n"
+    "struct Thing { int (__stdcall *at)(Thing *self, Point p); };\n"
+    "int go(Thing *t, Point p) { return t->at(t, p); }\n"
+    "int main(void) {\n"
+    "    Thing t; Point p; t.at = 0; p.x = 1; p.y = 2;\n"
+    "    return go(&t, p);\n"
+    "}\n"
+)
+
+
+class CallsThroughATableWindowsDeclared(unittest.TestCase):
+    """A pointer declared `__stdcall` is called the way Windows calls one.
+
+    What is on the other side of one may be a method a DLL implements, and
+    that reads a struct of 1, 2, 4 or 8 bytes as its bytes in the register on
+    x64, and one of up to 16 bytes that way on ARM64 - where py2bin's own
+    calls pass every aggregate as its address. So `remove_WebMessageReceived`
+    was handed the token's address in place of the token, and nothing said so.
+    """
+
+    def _arguments(self, target: str, name: str) -> tuple:
+        module = compile_c_to_ir(_A_TABLE_WINDOWS_DECLARED, "t.c", target)
+        (call,) = _calls_through_pointers(module, name)
+        return call.arguments
+
+    def _refusal(self, source: str, target: str = "windows-x86_64") -> str:
+        with self.assertRaises(CCompileError) as caught:
+            compile_c_to_ir(source, "t.c", target)
+        return str(caught.exception)
+
+    def test_a_struct_of_one_word_is_its_bytes_on_x64(self) -> None:
+        from py2bin.native.ir import HeapLoad
+
+        passed = self._arguments("windows-x86_64", "forget")[1]
+        self.assertIsInstance(passed, HeapLoad)
+        self.assertEqual(passed.size, 8)
+
+    def test_a_bigger_struct_is_the_address_of_a_copy_on_x64(self) -> None:
+        from py2bin.native.ir import SlotAddress
+
+        # The callee owns what it is handed and may write to it, so what it
+        # is handed is room this frame made - not the caller's own object.
+        for name in ("put", "cover"):
+            self.assertIsInstance(
+                self._arguments("windows-x86_64", name)[1], SlotAddress
+            )
+
+    def test_sixteen_bytes_is_two_words_on_arm64(self) -> None:
+        from py2bin.native.ir import HeapLoad, SlotAddress
+
+        arguments = self._arguments("windows-arm64", "put")
+        self.assertEqual(len(arguments), 3)
+        for word in arguments[1:]:
+            self.assertIsInstance(word, HeapLoad)
+            self.assertEqual(word.size, 8)
+        self.assertIsInstance(self._arguments("windows-arm64", "cover")[1], SlotAddress)
+
+    def test_a_pointer_without_the_word_is_py2bins_own_call(self) -> None:
+        from py2bin.native.ir import HeapLoad
+
+        for target in ("windows-x86_64", "windows-arm64"):
+            self.assertNotIsInstance(self._arguments(target, "keep")[1], HeapLoad)
+
+    def test_off_windows_the_word_changes_nothing(self) -> None:
+        from py2bin.native.ir import HeapLoad
+
+        for name in ("forget", "put", "cover"):
+            self.assertNotIsInstance(self._arguments("darwin-arm64", name)[1], HeapLoad)
+
+    def test_a_double_through_one_is_refused_by_name(self) -> None:
+        message = self._refusal(
+            "typedef struct Thing Thing;\n"
+            "struct Thing { int (__stdcall *scale)(Thing *self, double by); };\n"
+            "int go(Thing *t) { return t->scale(t, 2.5); }\n"
+            "int main(void) { Thing t; t.scale = 0; return go(&t); }\n"
+        )
+        self.assertRegex(message, r"is double, and the pointer is declared __stdcall")
+
+    def test_floating_members_are_refused_on_arm64_and_are_a_word_on_x64(self) -> None:
+        message = self._refusal(_FLOATING_MEMBERS_THROUGH_A_TABLE, "windows-arm64")
+        self.assertRegex(message, r"all floating members")
+        # x64 decides by size alone: the same eight bytes are an integer.
+        compile_c_to_ir(_FLOATING_MEMBERS_THROUGH_A_TABLE, "t.c", "windows-x86_64")
+
+    def test_two_words_with_one_register_left_are_refused_on_arm64(self) -> None:
+        message = self._refusal(
+            "typedef struct Box { int left, top, right, bottom; } Box;\n"
+            "typedef struct Thing Thing;\n"
+            "struct Thing {\n"
+            "    int (__stdcall *wide)(Thing *self, int a, int b, int c, int d,\n"
+            "                          int e, int f, Box box);\n"
+            "};\n"
+            "int go(Thing *t, Box *b) { return t->wide(t, 1, 2, 3, 4, 5, 6, *b); }\n"
+            "int main(void) {\n"
+            "    Thing t; Box b; t.wide = 0;\n"
+            "    b.left = 0; b.top = 0; b.right = 0; b.bottom = 0;\n"
+            "    return go(&t, &b);\n"
+            "}\n",
+            "windows-arm64",
+        )
+        self.assertRegex(message, r"only one argument register is left")
+
+    def test_a_function_windows_may_call_is_refused_what_it_cannot_read(self) -> None:
+        message = self._refusal(
+            "typedef struct Token { long long value; } Token;\n"
+            "int __stdcall take(Token token) { return (int)token.value; }\n"
+            "int main(void) { Token k; k.value = 3; return take(k); }\n"
+        )
+        self.assertRegex(message, r"take\(\) is declared __stdcall, so Windows may call it")
+        # A struct Windows hands over by address as well arrives as py2bin
+        # reads it, and is let through.
+        compile_c_to_ir(
+            "typedef struct Span { long long a, b, c; } Span;\n"
+            "int __stdcall take(Span span) { return (int)span.c; }\n"
+            "int main(void) { Span s; s.a = 0; s.b = 0; s.c = 3; return take(s); }\n",
+            "t.c",
+            "windows-x86_64",
+        )
+
+    def test_a_function_is_not_quietly_made_the_other_kind_of_pointer(self) -> None:
+        message = self._refusal(
+            "typedef struct Token { long long value; } Token;\n"
+            "int take(Token token) { return (int)token.value; }\n"
+            "int main(void) {\n"
+            "    int (__stdcall *p)(Token) = take;\n"
+            "    Token k; k.value = 1;\n"
+            "    return p(k);\n"
+            "}\n"
+        )
+        self.assertRegex(message, r"which is not declared __stdcall, into")
+        # Where every parameter is a word, the two are one call.
+        compile_c_to_ir(
+            "int take(int n) { return n; }\n"
+            "int main(void) { int (__stdcall *p)(int) = take; return p(1); }\n",
+            "t.c",
+            "windows-x86_64",
+        )
+
+    def test_the_sdk_macro_names_the_convention(self) -> None:
+        from py2bin.native.ir import HeapLoad
+
+        module = compile_c_to_ir(
+            "#include <rpcndr.h>\n"
+            "typedef struct Token { long long value; } Token;\n"
+            "typedef struct Thing Thing;\n"
+            "struct Thing {\n"
+            "    long (STDMETHODCALLTYPE *remove)(Thing *self, Token token);\n"
+            "};\n"
+            "long go(Thing *t, Token k) { return t->remove(t, k); }\n"
+            "int main(void) {\n"
+            "    Thing t; Token k; t.remove = 0; k.value = 1;\n"
+            "    return (int)go(&t, k);\n"
+            "}\n",
+            "t.c",
+            "windows-x86_64",
+        )
+        (call,) = _calls_through_pointers(module, "go")
+        self.assertIsInstance(call.arguments[1], HeapLoad)

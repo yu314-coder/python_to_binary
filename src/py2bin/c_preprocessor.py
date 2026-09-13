@@ -4102,7 +4102,13 @@ typedef unsigned char byte;
 #define __RPC_API
 #define __RPC_USER
 #define RPC_ENTRY
-#define STDMETHODCALLTYPE
+/* The convention a COM method is declared in, spelled as the SDK spells it.
+   It changes no call py2bin makes to a function it compiled. What it says is
+   that the other side of the table may be a DLL's method, or a method Windows
+   calls: an aggregate small enough to travel as its bytes is handed to one
+   of those as its bytes, and a double - which Windows passes in a register
+   py2bin's calls through a pointer do not write - is refused by name. */
+#define STDMETHODCALLTYPE __stdcall
 #define STDMETHODVCALLTYPE
 #define STDAPICALLTYPE
 #define WINOLEAPI HRESULT
@@ -4126,8 +4132,8 @@ typedef unsigned char byte;
 #define PURE = 0
 #define THIS_
 #define THIS void
-#define STDMETHOD(name) virtual HRESULT name
-#define STDMETHOD_(type, name) virtual type name
+#define STDMETHOD(name) virtual HRESULT STDMETHODCALLTYPE name
+#define STDMETHOD_(type, name) virtual type STDMETHODCALLTYPE name
 #define STDMETHODIMP HRESULT
 #define STDMETHODIMP_(type) type
 #define STDAPI HRESULT

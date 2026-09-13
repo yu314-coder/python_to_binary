@@ -2756,6 +2756,48 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a token handed back by value
+
+SidecarBridge's `windows` branch builds to `main.exe` now, and reading what it
+built turned up this: `host->webView_->remove_WebMessageReceived(
+host->webMessageToken_)` - an `EventRegistrationToken`, eight bytes, handed by
+value to a method WebView2 implements. The call through the table was written
+the way this translator hands an object to a method of its own, as its
+address, and WebView2 would have read the address as the token. It built, and
+nothing said a word.
+
+A method a Windows DLL implements reads a struct small enough to fit a
+register as its bytes - on x64 one of 1, 2, 4 or 8 bytes, on ARM64 anything up
+to 16, in one register or two - and anything bigger as the address of a copy
+it owns and may write to. py2bin's own calls pass every aggregate as its
+address and let the callee copy, which is right between two functions py2bin
+compiled and wrong for one somebody else did. What tells the two apart is the
+word the header declares the method with: `STDMETHODCALLTYPE`, which py2bin's
+`<rpcndr.h>` now spells `__stdcall`, as the SDK does. The C stage keeps the
+word on a function pointer's type and on a function declared with it, and on
+Windows a call through such a pointer hands a struct over by the platform's
+rule. The translator writes a call through a slot declared that way - or
+through an override of one, declared or not - with the struct by value and the
+word in the cast, and leaves the size to the C stage, which is where it is
+known. `put_Bounds(bounds)`, sixteen bytes, now goes as the address of a copy.
+
+What is not written that way is refused by name: a `double` through such a
+pointer, which Windows passes in a floating-point register; a struct of
+floating members on ARM64; two words with one argument register left on ARM64;
+a function declared `__stdcall` that Windows would hand something it does not
+read; a function made into a pointer of the other kind where the two calls
+differ; and an override Windows may call that takes an object by value,
+refused by the translator because the size that decides is read after it. Off
+Windows the word means nothing, as it means nothing to clang there, and the
+call is py2bin's own.
+
+The corpus program hands a 24-byte struct through a `__stdcall` pointer to a
+`__stdcall` function that writes to its copy, and prints what the caller still
+holds.
+
+2238 tests, 638 programs against clang++, 11 projects, 3882 builds across six
+targets.
+
 ### 0.9.13 - a member built from a value
 
 `WindowsTransport::WindowsTransport(EventHandler eventHandler) :
