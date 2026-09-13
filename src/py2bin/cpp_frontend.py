@@ -16079,6 +16079,61 @@ def _one_declaration(
         f"{head.group(2)} {one};" for one in spelled
     )
 
+#: `IID_PPV_ARGS(&factory)` - a macro the Windows SDK writes for C++ only,
+#: because what it stands for depends on the type of what it is handed.
+_AN_IID_PAIR = re.compile(r"(?<![.\w>])IID_PPV_ARGS\s*\(")
+
+
+def _spell_iid_pairs(body: str, scopes: "tuple[str, ...]") -> str:
+    """`IID_PPV_ARGS(&factory)` - the interface's id, and where to write it.
+
+    The SDK spells it `__uuidof(**(pp)), IID_PPV_ARGS_Helper(pp)`: two
+    arguments, and the first one asks the compiler what type `pp` points at,
+    twice over. A macro cannot answer that, and py2bin's `__uuidof` takes the
+    name of an interface rather than an expression - so the call reached the C
+    stage with one argument where Windows wants two, reported as
+    `CoCreateInstance() takes 5 argument(s), got 4` on a line that is correct
+    Windows C++. Read here instead, where the declaration of `factory` is in
+    view, and written out as the pair the C branch of the same header uses.
+
+    Refused by name where the type cannot be read: an interface id spelled
+    wrong is a call that asks an object for something it is not, and the
+    program would find that out at run time on a machine this one cannot run.
+    """
+
+    out: "list[str]" = []
+    at = 0
+    for found in _AN_IID_PAIR.finditer(_without_literals(body)):
+        close = _closing_paren(body, found.end() - 1)
+        if close < 0:
+            continue
+        given = body[found.end(): close].strip()
+        spelled = given[1:].strip() if given.startswith("&") else given
+        wanted = 1 if given.startswith("&") else 2
+        held = _nearest_type(spelled, scopes) if spelled.isidentifier() else None
+        interface = None
+        if held is not None:
+            stars = held.count("*")
+            bare = held.replace("*", "").strip()
+            bare = re.sub(r"\b(?:const|volatile)\b", " ", bare).strip()
+            if stars == wanted and bare.isidentifier():
+                interface = bare
+        if interface is None:
+            raise CppTranslationError(
+                "<c++>",
+                0,
+                f"IID_PPV_ARGS({given}) needs the interface {given} points at, "
+                "and the type of that is not written anywhere this can read. "
+                f"Spell the pair out - `&IID_IThing, (void **)({given})` - "
+                "which is what the same header's C branch says",
+            )
+        out.append(body[at: found.start()])
+        out.append(f"&IID_{interface}, (void **)({given})")
+        at = close + 1
+    out.append(body[at:])
+    return "".join(out)
+
+
 #: `__py2bin_value_3` - a name one of these passes gave an object of its own.
 _A_TEMPORARY_NAME = re.compile(r"(__py2bin_[a-z]+_)(\d+)")
 
@@ -16321,6 +16376,13 @@ def _rewrite_body(
             if held in classes and re.fullmatch(r"[A-Za-z_]\w*", name)
         )
         return f"{body}\n{declared}" if not unit else f"{body}\n{declared}\n{unit}"
+
+    # `IID_PPV_ARGS(&factory)` - two arguments written as one, and which two
+    # depends on the type of what is handed to it. Before the pass below,
+    # which is the first to write a `&` of its own: the `&` here is the
+    # author's and is read as such.
+    if "IID_PPV_ARGS" in body:
+        body = _spell_iid_pairs(body, (body, *outer, unit))
 
     # `&held` where the class overloads it. First of everything, because
     # every pass below writes `&` in front of a receiver of its own and by
@@ -23888,23 +23950,34 @@ def _construct_before_main(text: str, made: "dict[str, str]", classes) -> str:
     initialiser that can call anything.
     """
 
-    # `G withArgs(7);` is a declaration with a constructor call in it, and C
-    # reads that as a function taking a 7. The arguments move to the call
-    # below and the declaration is left as the object it declares.
-    text = _sub_code(
-        _FILE_SCOPE_OBJECT,
-        text,
-        lambda match, whole: (
-            # `= value` comes off the same way `(args)` does: the value moves
-            # to the constructor call below and the declaration keeps the
-            # object alone.
-            f"{whole[match.start(): match.end(2)]};"
-            if match.group(5) is not None and match.group(2) in made
-            else None
-            if not match.group(3) or match.group(2) not in made
-            else f"{whole[match.start(): match.start(3) - 1].rstrip()};"
-        ),
-    )
+    def declaration_alone(match: "re.Match[str]", whole: str) -> "str | None":
+        """The object on its own, where its value moves to a constructor call.
+
+        `G withArgs(7);` is a declaration with a constructor call in it, and C
+        reads that as a function taking a 7. The arguments move to the call
+        below and the declaration is left as the object it declares. `= value`
+        comes off the same way.
+
+        Only where there is a constructor to move it to. A plain struct has
+        none - it is an aggregate, and `static G g = {11, 2};` builds it by
+        writing the members out, which is C already. Taken off anyway, the
+        value went to a call that was never written and the program read two
+        zeroes where it had spelled two numbers: no diagnostic, no build
+        failure, just the wrong answer.
+        """
+
+        variable = match.group(2)
+        if variable not in made:
+            return None
+        if _find_method(made[variable][0], "", classes) is None:
+            return None
+        if match.group(5) is not None:
+            return f"{whole[match.start(): match.end(2)]};"
+        if not match.group(3):
+            return None
+        return f"{whole[match.start(): match.start(3) - 1].rstrip()};"
+
+    text = _sub_code(_FILE_SCOPE_OBJECT, text, declaration_alone)
     calls = []
     for variable, (held, arguments) in made.items():
         owner = _find_method(held, "", classes)

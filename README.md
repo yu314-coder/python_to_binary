@@ -2756,6 +2756,33 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a file-scope object given its members
+
+`static Plain kept = {11, 2};` outside every function, and the program read
+two zeroes where it had spelled two numbers. No diagnostic and no build
+failure - the worst kind of wrong.
+
+A file-scope object's constructor has nowhere to run in C, so this translator
+takes the value off the declaration and writes the call at the top of `main`
+instead. A plain struct has no constructor: it is an aggregate, and writing
+the members out is what builds it, which is C already. The value was taken off
+anyway and handed to a call that was never written. It is only taken off now
+where there is a constructor to take it to.
+
+And `IID_PPV_ARGS(&factory)` - one name standing for two arguments, and which
+two depends on the type of what it is handed. The Windows SDK writes it
+`__uuidof(**(pp)), IID_PPV_ARGS_Helper(pp)`, which asks the compiler what `pp`
+points at; a macro cannot answer that, and py2bin's `__uuidof` takes the name
+of an interface rather than an expression. So `CoCreateInstance(..., CLSCTX,
+IID_PPV_ARGS(&factory))` reached the C stage with four arguments where the API
+wants five. It is read from the declaration of `factory` now and written as the
+pair the same header's C branch uses - and refused by name where the type
+cannot be read, because an interface id spelled wrong is a call that asks an
+object for something it is not.
+
+2190 tests, 628 programs against clang++, 11 projects, 3810 builds across six
+targets.
+
 ### 0.9.13 - the names a desktop is driven by
 
 py2bin ships its own `<windows.h>`, because the SDK's headers demand GCC or
