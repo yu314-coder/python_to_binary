@@ -142,6 +142,61 @@ class Reading(unittest.TestCase):
         )
 
 
+class WhereAConditionalArgumentMayBeLifted(unittest.TestCase):
+    """Where `f(c ? "text" : name)` may be written as an `if` ahead of it.
+
+    Lifting the conditional out evaluates its condition when the statement is
+    reached. That is right only where C++ would have evaluated the call
+    anyway - and the check for that had read every colon as a label and every
+    keyword as a braceless body, so a second conditional argument after a
+    first, or a call in an `if`'s own condition, was never lifted.
+    """
+
+    def _held(self, statement: str) -> "int | None":
+        from py2bin.cpp_frontend import _statement_holding, _without_literals
+
+        text = "void run() {\n    " + statement + "\n}\n"
+        bare = _without_literals(text)
+        at = bare.rindex("?")
+        # The start of the argument the last `?` stands in: after its comma
+        # or its call's parenthesis.
+        comma = max(bare.rfind(",", 0, at), bare.rfind("(", 0, at))
+        return _statement_holding(bare, comma + 1)
+
+    def test_a_second_conditional_argument_after_a_first(self) -> None:
+        self.assertIsNotNone(
+            self._held('int a = f(ok ? "a" : "b", ok ? "c" : name);')
+        )
+
+    def test_a_call_in_an_ifs_own_condition(self) -> None:
+        self.assertIsNotNone(
+            self._held('if (!f(ok ? "a" : "b", ok ? "c" : name)) { stop(); }')
+        )
+
+    def test_a_call_in_a_switchs_own_condition(self) -> None:
+        self.assertIsNotNone(self._held('switch (f(ok ? "c" : name)) { }'))
+
+    def test_a_braceless_if_body_is_refused(self) -> None:
+        self.assertIsNone(self._held('if (x) f(ok ? "c" : name);'))
+
+    def test_an_operand_of_a_short_circuit_is_refused(self) -> None:
+        self.assertIsNone(self._held('bool b = x && f(ok ? "c" : name);'))
+        self.assertIsNone(self._held('if (x || f(ok ? "c" : name)) { }'))
+
+    def test_an_arm_of_an_enclosing_conditional_is_refused(self) -> None:
+        self.assertIsNone(self._held('int v = x ? f(ok ? "c" : name) : 0;'))
+
+    def test_a_loop_condition_is_refused(self) -> None:
+        self.assertIsNone(self._held('while (f(ok ? "c" : name)) { }'))
+
+    def test_a_label_and_a_case_are_refused(self) -> None:
+        self.assertIsNone(self._held('again: f(ok ? "c" : name);'))
+        self.assertIsNone(self._held('case 1: f(ok ? "c" : name);'))
+
+    def test_an_else_is_refused(self) -> None:
+        self.assertIsNone(self._held('else f(ok ? "c" : name);'))
+
+
 class Translating(unittest.TestCase):
     def test_an_assignment_through_a_reference_member_writes_what_it_names(
         self,

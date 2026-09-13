@@ -4414,16 +4414,64 @@ def _statement_holding(bare: str, at: int) -> "int | None":
     if inside.count("(") != inside.count(")"):
         return None
     ahead = bare[start:at]
-    if re.search(
-        r"(?<![.\w])(?:else|do|if|while|for|switch|case|default)(?![\w])", ahead
+    if re.match(r"\s*[A-Za-z_]\w*\s*:(?!:)", ahead):
+        # A label: what follows it is where a jump lands, and a declaration
+        # written in front of it is never reached. A label is the first thing
+        # in a statement, so that is the only place one is looked for - a
+        # colon further along is a conditional's, and reading every colon as
+        # a label refused `f(ok ? "a" : "b", ok ? "c" : name)` because of the
+        # first argument.
+        return None
+    # What stands between the statement's start and the argument, read at the
+    # depth each piece is at. The argument list's own parenthesis is the
+    # innermost one still open there, so anything shallower encloses the call
+    # itself: an operand of `&&`, `||` or `?:` is evaluated only sometimes,
+    # and a condition lifted out in front of the statement would be evaluated
+    # always. The same operators inside an earlier argument are that
+    # argument's own business - C++ does not say which argument goes first.
+    stack: "list[int]" = []
+    marks: "list[int]" = []
+    index = 0
+    while index < len(ahead):
+        piece = ahead[index]
+        if piece in "([":
+            stack.append(index)
+        elif piece in ")]":
+            if stack:
+                stack.pop()
+        elif ahead.startswith("&&", index) or ahead.startswith("||", index):
+            marks.append(len(stack))
+            index += 2
+            continue
+        elif piece == "?":
+            marks.append(len(stack))
+        elif piece == ":":
+            if ahead.startswith("::", index):
+                index += 2
+                continue
+            marks.append(len(stack))
+        index += 1
+    if any(depth < len(stack) for depth in marks):
+        return None
+    for word in re.finditer(
+        r"(?<![.\w])(else|do|if|while|for|switch|case|default)(?![\w])", ahead
     ):
         # `if (x) f(c ? a : b);` - there is one statement there, and putting
-        # two would change which of them the `if` runs. With braces around
-        # it the brace is the boundary and this reads nothing.
-        return None
-    if re.search(r"(?<!:):(?!:)", ahead):
-        # A label: what follows it is where a jump lands, and a declaration
-        # written in front of it is never reached.
+        # two would change which of them the `if` runs. The one place a
+        # keyword may stand is at the front of the statement, as an `if` or a
+        # `switch` whose own parenthesis is still open at the argument: the
+        # call is then in the condition, which is evaluated once, exactly
+        # where the lifted line goes. A loop's condition is evaluated again
+        # every turn, so a loop keeps the refusal.
+        opens = ahead.find("(", word.end())
+        if (
+            word.group(1) in ("if", "switch")
+            and not ahead[: word.start()].strip()
+            and opens >= 0
+            and not ahead[word.end(): opens].strip()
+            and opens in stack
+        ):
+            continue
         return None
     return start
 

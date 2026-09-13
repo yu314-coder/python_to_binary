@@ -2756,6 +2756,43 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a second conditional argument
+
+`if (!sendControlMessage(text.empty() ? "clipboardError" : "clipboardText",
+text.empty() ? "Windows clipboard is empty or unavailable." : text))` - two
+conditional arguments to a call taking `const std::string &`, the second with a
+literal in one arm and a string in the other. C++ gives that conditional one
+type, the string, and converts the literal in its own arm; py2bin writes it as
+the `if` C++ means, in front of the statement. It did that already for one such
+argument, and not here.
+
+The check for where the `if` may go read every colon as a label, so the first
+argument's conditional stopped the second from being written out; and every
+keyword as a braceless body, so a call in an `if`'s own condition was never
+lifted either. It reads what actually encloses the call now. A label is looked
+for only where a label can be, at the front of the statement. An `&&`, `||` or
+`?:` refuses only when it stands outside the call's own parentheses, where the
+call is evaluated only sometimes and a lifted condition would be evaluated
+always - the same operators inside an earlier argument are that argument's
+business, since C++ does not say which argument goes first. And a keyword is
+allowed only as an `if` or a `switch` at the front whose parenthesis is still
+open at the call, which is a condition evaluated once; a loop, an `else`, a
+`case` and a braceless body keep the refusal, and each of those is a test.
+
+Reading what encloses the call also closed a hole the old check had left open,
+the other way. It looked only for a keyword or a colon, so a call that was the
+right operand of `&&` - `ok && send(none.empty() ? fallback() : none)` - had its
+conditional lifted in front of the statement, and `fallback()` ran whether or
+not `ok` was false. clang++ prints `0 0` for that program; py2bin printed `0 1`,
+without a word. Refused now, and loudly: the conditional stays where it is and
+the C stage will not carry a struct through `?:`.
+
+The corpus program's untaken arm calls a function that counts, and the count is
+printed, so an arm evaluated that should not have been is a wrong number.
+
+2217 tests, 633 programs against clang++, 11 projects, 3852 builds across six
+targets.
+
 ### 0.9.13 - a value a captured holder answers
 
 `const Bytes frame = session->encrypted(packet);` inside
