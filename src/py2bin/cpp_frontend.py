@@ -2289,7 +2289,11 @@ def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
         # all - so nothing reached through it could be either, and `v.x`
         # inside a function taking a reference had no type.
         rf"\b((?:const\s+)?[A-Za-z_]\w*)\s*([*&]?)\s*"
-        rf"\b{re.escape(spelled)}\b\s*([=;,)\[({{])"
+        # And a `:` that is not half of `::` - `for (char c : text)` declares
+        # `c` as surely as `char c = ...` does. Passed over, the type read for
+        # the loop's variable was whatever the nearest other `c` above was,
+        # and `result += c` chose between `string`'s `+=` forms by it.
+        rf"\b{re.escape(spelled)}\b\s*([=;,)\[({{]|:(?!:))"
     )
     code = _without_literals(text)
     found = [
@@ -13602,6 +13606,13 @@ def _bare_method_calls(
             continue
         member = _method_by_name(provider, method, classes)
         if member is None or _returns_object(member, classes) is None:
+            continue
+        if _is_shared(provider, method, classes):
+            # A static member is never given the object, so it has no
+            # receiver to give back. Named `this->escapeJson(state)` here, it
+            # became a method call handed `this` as well as the space its
+            # answer goes into - one argument more than the function takes.
+            # Left bare, the loop below writes it as the function it is.
             continue
         body = _name_the_receiver(body, method)
 

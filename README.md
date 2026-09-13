@@ -2756,6 +2756,28 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a static member called by its own class
+
+`payload << "\"state\":\"" << escapeJson(state)` inside
+`BridgeSession::sendInitialState`, where `escapeJson` is a `static` member. A
+bare call to one of a class's own members means `this->` - except a static
+one, which is never given the object. The pass that hands a member call its
+receiver back, so that an answer used as an object (reached on, or written to
+a stream) is written through space the caller provides, named the static one
+too: it reached the C as `BridgeSession__escapeJson(this, &answer, &state)`,
+one argument more than the function takes. A static member is skipped there
+now, and the pass after it writes it as the function it is.
+
+And `for (char c : text)`, which declares `c` with a `:`. The reader that types
+a name knew `=`, `;`, `,`, `)`, `[`, `(` and `{` after a declarator and not
+that, so the type it found for a loop's variable was the nearest other `c` -
+in a program that also had a `const char *c`, `result += c` was chosen by that.
+A `:` that is half of `::` is still nothing: `int Box::size` does not declare
+`Box`.
+
+2220 tests, 635 programs against clang++, 11 projects, 3864 builds across six
+targets.
+
 ### 0.9.13 - a second conditional argument
 
 `if (!sendControlMessage(text.empty() ? "clipboardError" : "clipboardText",

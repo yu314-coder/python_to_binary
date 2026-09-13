@@ -63,6 +63,31 @@ int main(void) {
 
 
 class Reading(unittest.TestCase):
+    def test_the_variable_a_range_for_declares(self) -> None:
+        # `for (char c : text)` declares `c` with a `:`. Passed over, the type
+        # read for it was another `c` in the unit - here a `const char *` -
+        # and an overload chosen by it was the wrong one.
+        from py2bin.cpp_frontend import _deduced_type
+
+        unit = (
+            "static const char *c = \"elsewhere\";\n"
+            "void run(const string &text) {\n"
+            "    for (char c : text) {\n"
+            "        use(c);\n"
+            "    }\n"
+            "}\n"
+        )
+        self.assertEqual(_deduced_type("c", unit, unit.index("use(")), "char")
+
+    def test_a_conditionals_colon_is_not_a_range_for(self) -> None:
+        # A `:` after a name is a range-for's only where a type stands before
+        # the name. `ok ? count : 0` has none, so `count` is still the `long`
+        # declared above it.
+        from py2bin.cpp_frontend import _deduced_type
+
+        unit = "long count = 4;\nint run(bool ok) { return use(ok ? count : 0); }\n"
+        self.assertEqual(_deduced_type("count", unit, unit.index("use(")), "long")
+
     def test_a_declaration_after_a_lifted_block_is_still_seen(self) -> None:
         # A block is lifted out of the body it sits in and stands as a mark
         # between two NULs while the body around it is rewritten. The reader
@@ -198,6 +223,37 @@ class WhereAConditionalArgumentMayBeLifted(unittest.TestCase):
 
 
 class Translating(unittest.TestCase):
+    def test_a_static_member_used_in_a_stream_is_not_given_this(self) -> None:
+        # A bare call to one of the class's own members means `this->` -
+        # except a static one, which is never given the object. Named with a
+        # receiver because its answer was written into a stream, it was handed
+        # `this` as well as the space its answer goes into. Through the whole
+        # translation, headers included: without the stream's own class in
+        # the text the call is never recognised as feeding one.
+        import tempfile
+        from py2bin.cpp_frontend import translate_unity
+
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "static_member.cpp"
+            entry.write_text(
+                "#include <sstream>\n#include <string>\n"
+                "class S {\n"
+                "public:\n"
+                "    void send(const std::string &v);\n"
+                "private:\n"
+                "    static std::string quoted(const std::string &value);\n"
+                "};\n"
+                "std::string S::quoted(const std::string &value) { return value; }\n"
+                "void S::send(const std::string &v) {\n"
+                "    std::ostringstream out;\n"
+                "    out << quoted(v) << \"!\";\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            out = translate_unity((entry,), (), "darwin-arm64")
+        self.assertRegex(out, r"S__quoted\(")
+        self.assertNotRegex(out, r"S__quoted\(\s*this\b")
+
     def test_an_assignment_through_a_reference_member_writes_what_it_names(
         self,
     ) -> None:
