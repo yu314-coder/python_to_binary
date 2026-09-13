@@ -223,6 +223,39 @@ class WhereAConditionalArgumentMayBeLifted(unittest.TestCase):
 
 
 class Translating(unittest.TestCase):
+    def test_a_members_value_is_prepared_before_the_member_is_built(self) -> None:
+        # `macID_(computerID())`: the temporary a by-value return needs is
+        # written in front of that initialiser, and the initialisers are then
+        # moved to the top of the body. The temporary has to move with its
+        # own entry - left behind, it was declared after the assignment that
+        # reads it.
+        import tempfile
+        from py2bin.cpp_frontend import translate_unity
+
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "member_value.cpp"
+            entry.write_text(
+                "#include <string>\n"
+                "static std::string computerID() { return \"id\"; }\n"
+                "class T {\n"
+                "public:\n"
+                "    T() : before_(), macID_(computerID()) {}\n"
+                "private:\n"
+                "    std::string before_;\n"
+                "    std::string macID_;\n"
+                "    std::string after_;\n"
+                "};\n",
+                encoding="utf-8",
+            )
+            out = translate_unity((entry,), (), "darwin-arm64")
+        head = out.index("T__ctor(struct T *this")
+        body = out[head: out.index("}", out.index("{", head))]
+        declared = body.find("__py2bin_value_1;")
+        used = body.find("this->macID_ = ")
+        self.assertGreaterEqual(declared, 0, body)
+        self.assertGreaterEqual(used, 0, body)
+        self.assertLess(declared, used, body)
+
     def test_a_static_member_used_in_a_stream_is_not_given_this(self) -> None:
         # A bare call to one of the class's own members means `this->` -
         # except a static one, which is never given the object. Named with a

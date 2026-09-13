@@ -12501,6 +12501,7 @@ def _emit_one(
         body = _return_through_pointer(body, returned or "")
     if method.name == "":
         body = _delegating_initialiser(body, found, classes, unit)
+        body, prepared = _initialiser_preparations(body)
         body, base_arguments = _base_initialiser(body, found)
         body, member_arguments = _member_initialisers(body)
         # `std::atomic<bool> running_{false};` - a member of class type
@@ -12536,7 +12537,8 @@ def _emit_one(
             body, found, classes, member_arguments, unit
         )
         body = _open_with_subobjects(
-            body, found, classes, base_arguments, member_arguments, scope
+            body, found, classes, base_arguments, member_arguments, scope,
+            prepared,
         )
     elif method.name == "~":
         body = _close_with_subobjects(body, found, classes)
@@ -12846,6 +12848,58 @@ def _delegating_initialiser(
         + ");"
         + body[match.end():]
     )
+
+
+def _initialiser_preparations(body: str) -> "tuple[str, dict[str, str]]":
+    """What the passes wrote in front of each initialiser, taken out with it.
+
+    `macID_(computerID())` - a member built from what a call answers by value.
+    The body is rewritten with the initialiser list still in it, one marker
+    per entry, so the temporary that call needs is written in front of that
+    entry's marker, where it belongs. The markers are then taken out and the
+    subobjects are built at the top of the body - and the temporaries were
+    left where they were, below them: `this->macID_ = *&__py2bin_value_1;`
+    ran before `__py2bin_value_1` was declared.
+
+    So whatever stands between one marker and the next is that entry's own,
+    and goes with it. Keyed by what the entry builds - the member's name, or
+    `__base` - so that it can be put back in front of that subobject and
+    nothing else, in the order C++ builds them: a member's value that reads
+    an earlier member still reads it after that member exists.
+    """
+
+    markers = list(
+        re.finditer(rf"({_BASE_INIT}|{_MEMBER_INIT})\s*\(", body)
+    )
+    if not markers:
+        return body, {}
+    prepared: "dict[str, str]" = {}
+    out: "list[str]" = []
+    at = body.find("{") + 1
+    out.append(body[:at])
+    for marker in markers:
+        close = _closing_paren(body, marker.end() - 1)
+        if close < 0:
+            continue
+        ahead = body[at:marker.start()]
+        end = close + 1
+        while end < len(body) and body[end] in " ;":
+            end += 1
+        if marker.group(1) == _BASE_INIT:
+            key = "__base"
+        else:
+            first = _split_arguments(body[marker.end():close])
+            key = first[0].strip() if first else ""
+            if key.startswith("this->"):
+                key = key[len("this->"):]
+        if ahead.strip() and key:
+            prepared[key] = prepared.get(key, "") + " " + ahead.strip()
+        else:
+            out.append(ahead)
+        out.append(body[marker.start():end])
+        at = end
+    out.append(body[at:])
+    return "".join(out), prepared
 
 
 def _base_initialiser(body: str, found: Class) -> "tuple[str, str | None]":
@@ -13257,12 +13311,26 @@ def _open_with_subobjects(
     base_arguments: "str | None" = None,
     member_arguments: "dict[str, str] | None" = None,
     scope: str = "",
+    prepared: "dict[str, str] | None" = None,
 ) -> str:
     named = dict(member_arguments or {})
+    #: What was written in front of each initialiser, put back in front of
+    #: the subobject it builds. See `_initialiser_preparations`.
+    ahead = dict(prepared or {})
+    # And read along with the body when an argument's type is asked for: a
+    # temporary one of them declares is what an entry is handed, and with
+    # its declaration taken out of the body the entry `macID_(value)` could
+    # not tell it held a `string` - so a `string` was built from it with the
+    # form that takes characters.
+    reading_ahead = " ".join(ahead.values())
+
+    def before(key: str) -> "list[str]":
+        written = ahead.pop(key, "").strip()
+        return [written] if written else []
     # Which overload builds a member is read off what the list passed, and
     # that is usually a parameter - declared in a head this body does not
     # hold. `Person(string n) : name(n)` picked the `const char *` one.
-    reading = f"{body}\n{scope}"
+    reading = f"{body}\n{reading_ahead}\n{scope}"
     calls = []
     #: Which of the addresses below name a base rather than a member. A base
     #: shares this object's shared bases and is built with the form that does
@@ -13305,6 +13373,7 @@ def _open_with_subobjects(
                 [a.strip() for a in _split_arguments(base_arguments)]
                 if base_arguments else []
             )
+            calls.extend(before("__base"))
             calls.extend(built(held, address, given, base_arguments or ""))
             continue
         owner = _find_method(held, "", classes)
@@ -13315,6 +13384,7 @@ def _open_with_subobjects(
         spelled = address.lstrip("&").replace("this->", "")
         arguments = named.pop(spelled, None)
         if arguments is not None:
+            calls.extend(before(spelled))
             given = (
                 [one.strip() for one in _split_arguments(arguments)]
                 if arguments.strip()
@@ -13384,7 +13454,12 @@ def _open_with_subobjects(
     # Whatever the list named that is not a subobject is an ordinary member,
     # and an ordinary member is assigned to. After the constructions, because
     # one of them may be what it is assigned from.
-    calls.extend(f"this->{name} = {value};" for name, value in named.items())
+    for name, value in named.items():
+        calls.extend(before(name))
+        calls.append(f"this->{name} = {value};")
+    # Anything left belonged to an entry built somewhere other than here. Put
+    # first, so that what it declares is at least declared before any use.
+    calls = [one.strip() for one in ahead.values() if one.strip()] + calls
     if not calls:
         return body
     opening = body.find("{")

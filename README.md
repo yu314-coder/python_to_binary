@@ -2756,6 +2756,27 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a member built from a value
+
+`WindowsTransport::WindowsTransport(EventHandler eventHandler) :
+eventHandler_(std::move(eventHandler)), pairingCode_(), macID_(computerID())`
+- a member built from what a free function answers by value. The constructor's
+body is rewritten with the initialiser list still in it, one marker per entry,
+so the temporary that call needs was written in front of its entry, which is
+right. The entries were then taken out and the subobjects built at the top of
+the body, in the order C++ builds them - and the temporaries were left where
+they were, below: `this->macID_ = *&__py2bin_value_1;` came before
+`__py2bin_value_1` was declared.
+
+What is written in front of each entry now goes with that entry, and is put
+back in front of the subobject it builds - the base included. Each one, and not
+all of them at the top: a member whose value reads a member built before it
+still reads it after that member exists, which is what C++ promises and what a
+single block at the top would have broken without a word.
+
+2221 tests, 637 programs against clang++, 11 projects, 3876 builds across six
+targets.
+
 ### 0.9.13 - a static member called by its own class
 
 `payload << "\"state\":\"" << escapeJson(state)` inside
