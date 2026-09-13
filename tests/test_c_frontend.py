@@ -3638,6 +3638,102 @@ class ReferencesAHeaderSpellsAsPointers(CProgramTestCase):
         result = subprocess.run([str(artifact)], capture_output=True, text=True)
         self.assertEqual(result.stdout, "45\n")
 
+
+#: A one-member struct, which a header writing the SDK's large integers as the
+#: integers they are passes where the struct was spelled.
+_A_LONE_MEMBER = (
+    "typedef struct _ULI { unsigned long long QuadPart; } ULI;\n"
+    "static unsigned long long take(unsigned long long size) { return size * 3; }\n"
+    "static void land(unsigned long long *where) { *where = 42; }\n"
+)
+
+
+class AHeaderWritesAStructAsItsMember(CProgramTestCase):
+    """`stream->Seek(zero, ...)` - a one-member struct where its member is wanted.
+
+    py2bin's <objidl.h> writes `LARGE_INTEGER` parameters as the integers they
+    are, because that is how Windows passes the eight-byte struct. A C++
+    program written against the SDK hands the struct. In C the translator wrote
+    that can only mean the member - unless the struct's class has a conversion
+    operator, where it means the operator and must stay refused.
+    """
+
+    def _compiles(self, source, cplusplus=True):
+        compile_c_to_ir(source, "program.c", "darwin-arm64", cplusplus=cplusplus)
+
+    def test_a_call_through_a_pointer_is_handed_the_member(self) -> None:
+        source = _A_LONE_MEMBER + (
+            "int main(void) {\n"
+            "    ULI size = {5};\n"
+            "    unsigned long long (*through)(unsigned long long) = take;\n"
+            "    return (int)through(size);\n"
+            "}\n"
+        )
+        self._compiles(source)
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source, cplusplus=False)
+
+    def test_a_named_function_is_handed_the_member(self) -> None:
+        source = _A_LONE_MEMBER + (
+            "int main(void) { ULI size = {5}; return (int)take(size); }\n"
+        )
+        self._compiles(source)
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source, cplusplus=False)
+
+    def test_a_pointer_to_the_struct_is_a_pointer_to_its_member(self) -> None:
+        source = _A_LONE_MEMBER + (
+            "int main(void) { ULI where = {0}; land(&where); return (int)where.QuadPart; }\n"
+        )
+        self._compiles(source)
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source, cplusplus=False)
+
+    def test_a_struct_with_a_conversion_operator_is_still_refused(self) -> None:
+        # The translator names a conversion operator `Class__op_to_...`. Where
+        # one exists the operator is what C++ meant, and reading the member
+        # instead would print the wrong number without a word.
+        source = _A_LONE_MEMBER + (
+            "static unsigned long long _ULI__op_to_unsigned_long_long(struct _ULI *this)\n"
+            "{ return this->QuadPart * 1000; }\n"
+            "int main(void) { ULI size = {5}; return (int)take(size); }\n"
+        )
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source)
+
+    def test_a_struct_of_two_members_is_still_refused(self) -> None:
+        source = _A_LONE_MEMBER + (
+            "typedef struct { unsigned long long a; unsigned long long b; } Two;\n"
+            "int main(void) { Two both = {5, 6}; return (int)take(both); }\n"
+        )
+        with self.assertRaisesRegex(CCompileError, "needs"):
+            self._compiles(source)
+
+    def test_the_callee_reads_the_member_it_was_handed(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        entry = root / "program.cpp"
+        entry.write_text(
+            "#include <stdio.h>\n" + _A_LONE_MEMBER + (
+                "int main(void) {\n"
+                "    ULI size = {5};\n"
+                "    ULI where = {0};\n"
+                "    unsigned long long (*through)(unsigned long long) = take;\n"
+                "    land(&where);\n"
+                "    printf(\"%llu %llu %llu\\n\", through(size), take(size), where.QuadPart);\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            encoding="utf-8",
+        )
+        artifact = root / "program.bin"
+        compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        result = subprocess.run([str(artifact)], capture_output=True, text=True)
+        self.assertEqual(result.stdout, "15 15 42\n")
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

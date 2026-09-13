@@ -2756,6 +2756,36 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a stream seeked with the SDK's integers
+
+`memoryStream->Seek(zero, STREAM_SEEK_SET, nullptr)`, then
+`stat.cbSize.QuadPart`. py2bin's `<objidl.h>` writes the eight-byte integers
+the SDK passes by value as the integers they are - a struct passed by value
+through a foreign table is the one thing py2bin cannot spell, and on Windows an
+eight-byte struct travels where an eight-byte integer does. A program written
+against the SDK hands the struct: `LARGE_INTEGER zero{}`. So `Seek` reached the
+C stage with a struct where a `long long` was wanted, and was refused.
+
+It is passed as its one member now, and a pointer to one as a pointer to its
+member - in C the translator wrote, where nothing else could have been meant.
+Except where the struct's class has a conversion operator: the translator does
+not yet apply one to an argument, and a member read where the program's
+`operator long long()` was meant would print the wrong number without a word.
+That case is still refused, and a probe for it prints clang++'s answer or
+nothing.
+
+And `STATSTG`'s `cbSize`, which the header declared as the integer too. A
+member has no reason to be written that way - the bytes of a `ULARGE_INTEGER`
+are the bytes of the integer - and `stat.cbSize.QuadPart` read a member out of
+something with none. It is the SDK's type now.
+
+The corpus program implements IStream itself, so every value a call hands over
+is kept and printed: a value that arrived wrong, or a slot that dispatched to
+the wrong method, is a wrong number.
+
+2202 tests, 629 programs against clang++, 11 projects, 3828 builds across six
+targets.
+
 ### 0.9.13 - a base pointer handed through a table
 
 `encoder->Initialize(stream, WICBitmapEncoderNoCache)` - an `IWICStream *`

@@ -5137,6 +5137,82 @@ class Lowerer:
         _held, address = self.lvalue(argument)
         return address
 
+    def lone_member(self, held: CType, wanted: CType) -> "Member | None":
+        """The one member of a struct, where it is exactly the type wanted.
+
+        Refused where the struct's class has a conversion operator of its own:
+        the translator names every one `Class__op_to_...`, and a member read
+        where the program's operator was meant is a program that runs and is
+        wrong. `struct Meters { long long v; operator long long() ...}` handed
+        to a `long long` means the operator, not `v`.
+        """
+
+        if not isinstance(held, StructType) or not held.members:
+            return None
+        if len(held.members) != 1:
+            return None
+        only = held.members[0]
+        if only.width is not None:
+            return None
+        if not isinstance(only.ctype, (IntegerType, FloatingType)):
+            return None
+        if only.ctype != wanted:
+            return None
+        if held.name and any(
+            name.startswith(f"{held.name}__op_to_") for name in self.unit.functions
+        ):
+            return None
+        return only
+
+    def header_scalar(
+        self, argument: Node, parameter: CType
+    ) -> "IntExpression | None":
+        """A one-member struct handed where a header wrote its member.
+
+        py2bin's own COM headers write the eight-byte struct the SDK passes by
+        value - `LARGE_INTEGER` - as the integer it is, because a struct passed
+        by value through a foreign table is the one thing py2bin cannot spell,
+        and on both Windows machines an eight-byte struct travels where an
+        eight-byte integer does (IStream, in <objidl.h>). A C++ program written
+        against the SDK hands the struct: `stream->Seek(zero, ...)` reached this
+        stage as a struct where a `long long` was wanted. In C++ that can only
+        mean its one member - no conversion of the program's own could have
+        been meant, which `lone_member` checks - so the member is what is
+        passed, and a pointer to such a struct is a pointer to its member.
+
+        Only in C the translator wrote. In C somebody wrote it is an error, and
+        stays one.
+        """
+
+        if not self.cplusplus:
+            return None
+        if isinstance(parameter, (IntegerType, FloatingType)):
+            if not (
+                isinstance(argument, (Identifier, Index, MemberAccess))
+                or (isinstance(argument, Unary) and argument.operator == "*")
+            ):
+                return None
+            only = self.lone_member(self.type_unevaluated(argument), parameter)
+            if only is None:
+                return None
+            _held, address = self.lvalue(argument)
+            value = self.load(
+                only.ctype, _binary("add", address, IntConstant(only.offset))
+            )
+            return self.stored_bits(value.expr, parameter)
+        if isinstance(parameter, PointerType) and isinstance(
+            parameter.target, (IntegerType, FloatingType)
+        ):
+            if not (isinstance(argument, Unary) and argument.operator == "&"):
+                return None
+            held = self.type_unevaluated(argument)
+            if not isinstance(held, PointerType):
+                return None
+            if self.lone_member(held.target, parameter.target) is None:
+                return None
+            return self.rvalue(argument).expr
+        return None
+
     def sizeof_expression(self, node: Node) -> int:
         """``sizeof e`` does not evaluate ``e``; it needs only its type."""
 
@@ -6143,6 +6219,10 @@ class Lowerer:
             if bound is not None:
                 prepared.append(bound)
                 continue
+            unwrapped = self.header_scalar(argument, parameter)
+            if unwrapped is not None:
+                prepared.append(unwrapped)
+                continue
             prepared.append(
                 self.stored_bits(
                     self.assign_convert(
@@ -6434,6 +6514,10 @@ class Lowerer:
             bound = self.bound_reference(argument, parameter_type)
             if bound is not None:
                 prepared.append(bound)
+                continue
+            unwrapped = self.header_scalar(argument, parameter_type)
+            if unwrapped is not None:
+                prepared.append(unwrapped)
                 continue
             converted = self.assign_convert(
                 self.rvalue(argument),

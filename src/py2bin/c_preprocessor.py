@@ -4692,7 +4692,12 @@ typedef IStream *LPSTREAM;
 typedef struct __py2bin_STATSTG {
     LPOLESTR pwcsName;
     unsigned long type;
-    unsigned long long cbSize;
+    /* The SDK's type, not the integer it holds. The bytes are the same, and a
+       program reads `stat.cbSize.QuadPart` - which, written as the integer,
+       reached the C stage as a member of something that has none. A parameter
+       has a reason to be written as the integer (see IStream below); a member
+       has none. */
+    ULARGE_INTEGER cbSize;
     unsigned long mtime_low, mtime_high;
     unsigned long ctime_low, ctime_high;
     unsigned long atime_low, atime_high;
