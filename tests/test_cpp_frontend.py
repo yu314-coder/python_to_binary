@@ -143,6 +143,23 @@ class Reading(unittest.TestCase):
 
 
 class Translating(unittest.TestCase):
+    def test_an_assignment_through_a_reference_member_writes_what_it_names(
+        self,
+    ) -> None:
+        # A reference member is held as a pointer, and every use outside the
+        # constructor goes through it - an assignment most of all, since C++
+        # never re-seats a reference. Left out, `count = v;` stored an int
+        # into the pointer.
+        source = (
+            "struct Counter {\n"
+            "    int &count;\n"
+            "    explicit Counter(int &c) : count(c) {}\n"
+            "    void set(int v) { count = v; }\n"
+            "};\n"
+        )
+        out = translate(source, "counter.cpp")
+        self.assertRegex(out, r"\(\*this->count\)\s*=\s*v")
+
     def test_a_derived_pointer_is_cast_for_a_call_through_a_table(self) -> None:
         # A virtual call is written as a cast through the object's table, and
         # the pass that casts a derived pointer for a base parameter looks a

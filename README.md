@@ -2756,6 +2756,34 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a value a captured holder answers
+
+`const Bytes frame = session->encrypted(packet);` inside
+`auto sendControlMessage = [&](const std::string &kind) { ... }`: a method
+answering an object by value, reached through a smart pointer the lambda
+captured by reference. A capture by reference was a pointer member, and every
+use of it was dereferenced before any other pass looked at the body -
+`(*this->session)->encrypted(packet)`. The pass that gives a by-value return
+the space it writes into finds its receiver by name, and that is not a name,
+so the call reached the C stage as a member call on a struct.
+
+This is the second of the two causes behind most of what went wrong in a
+program of this size: a pass keys on a name, and a capture was not spelled as
+one. The same capture written as a reference member of an ordinary class -
+`std::shared_ptr<Session> &session;` - had always worked. So that is what a
+capture by reference is now: a reference member, with the body keeping the
+name and the dereference written when the method is. Every pass that already
+handled a reference member handles a capture the same way.
+
+It exposed an older gap in exactly that path: an assignment through a
+reference member in a method was left out of the dereference, so `count =
+count + 1;` stored an int into the pointer the reference is held as. A
+reference is never re-seated in C++, and the constructor, which is where one is
+bound, is written apart - so every other use goes through it now.
+
+2208 tests, 632 programs against clang++, 11 projects, 3846 builds across six
+targets.
+
 ### 0.9.13 - the library calls a forwarded pointer makes
 
 A program forwarding a mouse and keyboard clamps a coordinate into 0..1,

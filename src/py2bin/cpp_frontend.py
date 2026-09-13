@@ -6509,14 +6509,6 @@ def _expand_lambdas(
         owner = next((s.strip() for v, s, _r, _f in held if v == _SELF), None)
         if owner is not None:
             body = _through_self(body, owner, text)
-        body = _deref_references(
-            body,
-            {
-                v: s for v, s, by_reference, _f in held
-                if by_reference and v != _SELF
-            },
-            {name: None for name in classes},
-        )
         members = "".join(
             # Without the qualifier: a closure's members are this
             # translator's own, nothing here enforces const, and every
@@ -6525,7 +6517,7 @@ def _expand_lambdas(
             # at all, and the call on it went to the C compiler as
             # `message->size()`.
             f"    {re.sub(r'\b(?:const|volatile)\b', ' ', spelled).strip()} "
-            f"{'*' if by_reference else ''}{variable};\n"
+            f"{('&' if variable != _SELF else '*') if by_reference else ''}{variable};\n"
             for variable, spelled, by_reference, _from in held
         )
         operators = "".join(
@@ -12532,8 +12524,13 @@ def _emit_one(
                 body,
             )
             continue
+        # Every use, assignments included. A reference is never re-seated in
+        # C++ - `count = count + 1;` in a method writes through it - and the
+        # only place one is bound is the constructor, which is handled above.
+        # Left out, an assignment to a reference member stored a value into
+        # the pointer it is held as, and the C stage refused it.
         body = re.sub(
-            rf"(?<![.\w>])this->{re.escape(member.name)}\b(?!\s*=[^=])",
+            rf"(?<![.\w>])this->{re.escape(member.name)}\b",
             f"(*this->{member.name})",
             body,
         )
