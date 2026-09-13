@@ -25260,6 +25260,15 @@ T max(T a, T b) { return a > b ? a : b; }
 template<typename T>
 T min(T a, T b) { return a < b ? a : b; }
 
+/* C++17's: the value, unless it is outside the bounds, where it is the bound
+   it passed. Asked in that order - below the low one, then above the high one
+   - which is the order the standard says, and what decides the answer when
+   the bounds are given the wrong way round. By value, as `min` and `max` are
+   here: for the types this is written for, a copy and a reference are the
+   same number. */
+template<typename T>
+T clamp(T v, T lo, T hi) { return v < lo ? lo : (hi < v ? hi : v); }
+
 template<typename T>
 void swap(T &a, T &b) { T held = a; a = b; b = held; }
 
@@ -25274,6 +25283,19 @@ long count(T *first, T *last, T value) {
     long seen = 0;
     while (first != last) { if (*first == value) { seen = seen + 1; } first = first + 1; }
     return seen;
+}
+
+/* Each element of the range, changed, written into the range starting at
+   `into` - which may be the same range, and is, where a program lowers a
+   string in place. Answers where the writing stopped, as the standard's does.
+   The one-range form; the two-range one takes a second input and nothing here
+   has needed it. */
+template<typename T, typename U, typename F>
+U *transform(T *first, T *last, U *into, F change) {
+    for (; first != last; ++first, ++into) {
+        *into = change(*first);
+    }
+    return into;
 }
 
 template<typename T>

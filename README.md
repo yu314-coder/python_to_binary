@@ -2756,6 +2756,37 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - the library calls a forwarded pointer makes
+
+A program forwarding a mouse and keyboard clamps a coordinate into 0..1,
+rounds it onto a 65535 grid, compares a scroll delta against a threshold,
+lowers a key's name, and paces a capture loop. Three of those were wrong, in
+three different ways.
+
+`std::clamp` and `std::transform` did not exist - a build that stopped. They
+are in the shipped `<algorithm>` now, written the way its `min`, `max` and
+`sort` are.
+
+`std::round` was refused by name on x86-64, whose one rounding instruction
+cannot break a tie away from zero - also a build that stopped. It is worked out
+exactly there now, from `trunc`: the fraction `x - trunc(x)` is exact, and one
+step away from zero is added when it is at least a half. Not the usual
+`floor(x + 0.5)`, which answers 1 for the largest double below one half; and
+negative zero, NaN and the infinities come back as `round()` says. The same
+lowering is reachable by name, so a test runs it on arm64 against arm64's own
+instruction and compares them bit for bit.
+
+And `std::abs` on a double built and answered wrongly. By the time a call is
+compiled the `std::` is gone, and C has one `abs`, taking an int - so the
+double was truncated on the way in, and `std::abs(-0.5) > 0.01` was false. A
+scroll of less than a whole unit was ignored with no diagnostic. In C the
+translator wrote, py2bin's own `abs` now answers for the type it is given: a
+double or float as its magnitude, a 64-bit integer at its full width. C keeps
+C's answer, and a program's own `abs` is its own.
+
+2207 630 11 3834 tests,  programs against clang++,  projects,  builds across six
+targets.
+
 ### 0.9.13 - a stream seeked with the SDK's integers
 
 `memoryStream->Seek(zero, STREAM_SEEK_SET, nullptr)`, then

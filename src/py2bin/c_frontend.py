@@ -5868,19 +5868,87 @@ class Lowerer:
             self.error(
                 f"{node.name}() takes exactly one argument", node.token
             )
-        if node.name == "round" and not self.target.endswith("-arm64"):
-            self.error(
-                "round() breaks ties away from zero, which x86-64's roundsd "
-                "cannot do in one instruction and py2bin will not approximate; "
-                "use trunc(), floor() or ceil(), or target arm64",
-                node.token,
-            )
         value = self.rvalue(node.arguments[0])
         if not is_arithmetic(value.ctype):
             self.error(
                 f"{node.name}() needs a number, not {value.ctype}", node.token
             )
+        if node.name == "round" and not self.target.endswith("-arm64"):
+            # x86-64's roundsd cannot break a tie away from zero, so the one
+            # instruction is not round(). What it can do exactly is below.
+            return Value(DOUBLE, self.round_away(self.widen(value)))
         return Value(DOUBLE, FloatUnary(_MATH_BUILTINS[node.name], self.widen(value)))
+
+    def round_away(self, operand: FloatExpression) -> FloatExpression:
+        """round(): to the nearest whole number, a tie going away from zero.
+
+        Exact, not approximated: `trunc(x)` is exact, `x - trunc(x)` is exact
+        (for any |x| that has a fraction at all, the two share every bit above
+        it), and whether that is at least a half is a comparison. The step is
+        one away from zero when it is, and nothing when it is not - written as
+        arithmetic on 0 and 1, so there is no branch and no approximation.
+
+        The classic shortcut, `floor(x + 0.5)`, is not this: the largest
+        double below one half plus one half rounds up to 1.0, so it answers 1
+        where round() answers 0. Negative zero survives - both a negative
+        number that rounds to it and -0.0 itself - because the direction is
+        the sign bit. A NaN compares false and comes back as itself; an
+        infinity has a NaN for its fraction and so also comes back as itself.
+        """
+
+        x = self.materialize_float(operand)
+        whole = self.materialize_float(FloatUnary("trunc", x))
+        fraction = FloatUnary("abs", FloatBinary("sub", x, whole))
+        step = IntToFloat(FloatCompare("ge", fraction, FloatConstant(0.5)))
+        # The direction is read off the sign bit, not off `x < 0`: negative
+        # zero is not less than zero, and asked that way its step came out
+        # +0.0 - and -0.0 + +0.0 is +0.0, where round() keeps the sign. With
+        # the bit, the step of a negative zero is -0.0 and the sum stays -0.0.
+        negative = IntToFloat(
+            IntBinary("urshift", FloatBits(x, 8), IntConstant(63))
+        )
+        away = FloatBinary(
+            "sub",
+            FloatConstant(1.0),
+            FloatBinary("mul", FloatConstant(2.0), negative),
+        )
+        return FloatBinary("add", whole, FloatBinary("mul", step, away))
+
+    def abs_overload(self, node: Call) -> "Value | None":
+        """`std::abs` on a double, a float or a 64-bit integer.
+
+        C has one `abs`, and it takes an int. C++ has one for every arithmetic
+        type, declared by both <cmath> and <cstdlib>. By the time a call is
+        compiled the `std::` is gone and py2bin's C <stdlib.h> is what answers
+        to `abs` - so a double was converted to an int on the way in, and
+        `std::abs(-0.5) > 0.01` was false. No diagnostic; a program comparing a
+        scroll delta against a threshold ignored every small one.
+
+        Only in C the C++ translator wrote, and only for py2bin's own `abs`: a
+        program that defines one of its own gets its own, and plain C keeps
+        C's answer, which is the int one.
+        """
+
+        if not self.cplusplus or len(node.arguments) != 1:
+            return None
+        if self.lookup("abs") is not None:
+            return None
+        declared = self.unit.functions.get("abs")
+        if declared is not None and declared.token.origin != "<stdlib.h>":
+            return None
+        held = self.type_unevaluated(node.arguments[0])
+        if isinstance(held, FloatingType):
+            value = self.rvalue(node.arguments[0])
+            magnitude = FloatUnary("abs", self.widen(value))
+            return Value(held, self.narrow(magnitude, held))
+        if isinstance(held, IntegerType) and held.size == 8 and held.signed:
+            value = self.rvalue(node.arguments[0])
+            x = self.materialize(self.fit(value.expr, held))
+            # |x| as (x ^ m) - m, m being all ones for a negative x and none
+            # otherwise: the shift is the arithmetic one.
+            mask = IntBinary("rshift", x, IntConstant(63))
+            return Value(held, IntBinary("sub", IntBinary("xor", x, mask), mask))
+        return None
 
     def arena_builtin(self, node: Call) -> Value:
         """Reserve the arena and hand back its base.
@@ -6059,6 +6127,22 @@ class Lowerer:
         self.unit.externs[node.name] = function.result
 
     def call(self, node: Call) -> Value:
+        if node.name == "abs":
+            overloaded = self.abs_overload(node)
+            if overloaded is not None:
+                return overloaded
+        if (
+            node.name == "__py2bin_round_away"
+            and node.name not in self.unit.functions
+        ):
+            # What round() is on x86-64, by name, so that it can be run - and
+            # checked against the one-instruction round() - on arm64 too.
+            if len(node.arguments) != 1:
+                self.error(f"{node.name}() takes exactly one argument", node.token)
+            value = self.rvalue(node.arguments[0])
+            if not is_arithmetic(value.ctype):
+                self.error(f"{node.name}() needs a number, not {value.ctype}", node.token)
+            return Value(DOUBLE, self.round_away(self.widen(value)))
         if node.name in _MATH_BUILTINS and self.lookup(node.name) is None:
             if node.name not in self.unit.functions:
                 return self.math_builtin(node)

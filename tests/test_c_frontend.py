@@ -3734,6 +3734,95 @@ class AHeaderWritesAStructAsItsMember(CProgramTestCase):
         result = subprocess.run([str(artifact)], capture_output=True, text=True)
         self.assertEqual(result.stdout, "15 15 42\n")
 
+
+class RoundAndAbsAsTheLanguageMeansThem(CProgramTestCase):
+    """round() on every target, and C++'s abs for every arithmetic type."""
+
+    def _cpp_status_and_stdout(self, text: str) -> "tuple[int, str] | None":
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        entry = root / "program.cpp"
+        entry.write_text(text, encoding="utf-8")
+        artifact = root / "program.bin"
+        compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+        if not _HOST_IS_DARWIN_ARM64:
+            return None
+        ran = subprocess.run([str(artifact)], capture_output=True, text=True)
+        return ran.returncode, ran.stdout
+
+    def test_the_exact_round_agrees_with_the_instruction_bit_for_bit(self) -> None:
+        # On x86-64 round() is worked out from trunc(); on arm64 it is one
+        # instruction. `__py2bin_round_away` is the first by name, so it can
+        # be run here against the second, down to the sign of a zero.
+        self.run_c(
+            _STDIO
+            + "#include <math.h>\n#include <string.h>\n"
+            + "int main(void) {\n"
+            + "    const double v[] = {0.5, -0.5, 1.5, -1.5, 2.5, -2.5,\n"
+            + "        0.49999999999999994, -0.49999999999999994, -0.3, 0.3,\n"
+            + "        0.0, -0.0, 1e300, -1e300, 4503599627370497.0,\n"
+            + "        -4503599627370497.0, 2.4999999999999996, 123456.5, -123456.5};\n"
+            + "    int same = 0;\n"
+            + "    int i;\n"
+            + "    for (i = 0; i < 19; i++) {\n"
+            + "        double a = round(v[i]);\n"
+            + "        double b = __py2bin_round_away(v[i]);\n"
+            + "        if (memcmp(&a, &b, sizeof a) == 0) same++;\n"
+            + "    }\n"
+            + "    printf(\"%d of 19\\n\", same);\n"
+            + "    return 0;\n"
+            + "}\n",
+            stdout="19 of 19\n",
+        )
+
+    def test_round_builds_for_every_target(self) -> None:
+        # It was refused by name on the four x86-64 targets.
+        source = (
+            "#include <math.h>\n"
+            "int main(void) { double x = 2.5; return (int)round(x); }\n"
+        )
+        for target in (
+            "darwin-arm64", "darwin-x86_64", "linux-x86_64",
+            "linux-arm64", "windows-x86_64", "windows-arm64",
+        ):
+            compile_c_to_ir(source, "program.c", target)
+
+    def test_cpp_abs_answers_for_the_type_it_is_given(self) -> None:
+        got = self._cpp_status_and_stdout(
+            "#include <cmath>\n#include <cstdlib>\n#include <cstdio>\n"
+            "int main() {\n"
+            "    double d = -2.75;\n"
+            "    float f = -1.5f;\n"
+            "    long long l = -5000000000LL;\n"
+            "    int i = -7;\n"
+            "    std::printf(\"%.2f %.2f %lld %d %d\\n\", std::abs(d), (double)std::abs(f),\n"
+            "                std::abs(l), std::abs(i), std::abs(-0.5) > 0.01);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        if got is not None:
+            self.assertEqual(got[1], "2.75 1.50 5000000000 7 1\n")
+
+    def test_c_abs_is_still_the_int_one(self) -> None:
+        # C has one abs, and a double handed to it is converted to an int.
+        # That is C's answer, and C keeps it.
+        self.run_c(
+            _STDIO + "#include <stdlib.h>\n"
+            "int main(void) { double d = -2.75; printf(\"%d\\n\", abs(d)); return 0; }\n",
+            stdout="2\n",
+        )
+
+    def test_a_programs_own_abs_is_its_own(self) -> None:
+        # No <cmath>, no <cstdlib>: the only abs in view is the program's, and
+        # it takes an int.
+        got = self._cpp_status_and_stdout(
+            "static int abs(int v) { return v < 0 ? -v : v; }\n"
+            "int main() { double d = -2.75; return abs(d); }\n"
+        )
+        if got is not None:
+            self.assertEqual(got[0], 2)
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
