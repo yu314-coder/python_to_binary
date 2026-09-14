@@ -20936,6 +20936,170 @@ _CLOSES_A_CONDITION = re.compile(r"^\s*#\s*endif\b")
 #: The middle of a conditional: an arm after the one the `#if` opened.
 _ANOTHER_ARM = re.compile(r"^\s*#\s*(?:else|elif)\b")
 
+#: How an include guard opens, in either spelling: `#ifndef CLOCK_H`, or
+#: `#if !defined(CLOCK_H)`.
+_A_GUARD_OPENS = re.compile(
+    r"^\s*#\s*(?:ifndef\s+([A-Za-z_]\w*)"
+    r"|if\s*!\s*defined\s*\(\s*([A-Za-z_]\w*)\s*\))\s*$"
+)
+
+#: A pragma, and the one pragma that says nothing about the lines around it.
+_A_PRAGMA = re.compile(r"^\s*#\s*pragma\b")
+_PRAGMA_ONCE = re.compile(r"^\s*#\s*pragma\s+once\s*$")
+
+
+def _hoisted_directives(
+    lines: "list[str]", leading_only: bool = False
+) -> "tuple[list[str], list[str]]":
+    """The directives that go above the classes, and the lines left in place.
+
+    A directive on a line of its own goes up, and with it the lines a trailing
+    backslash carries it onto: `# define ALIAS \\` and the name written on the
+    line below are one directive. Taken a line at a time, the name was left
+    behind as a line of code - OpenSSL's <kdf.h> spells three aliases that
+    way - and what the lifted line continued onto was whatever directive came
+    next. A conditional holding nothing but directives goes up whole, brackets
+    and all; one holding code stays where it is, whole, so what it guards is
+    still guarded by it. An include guard holding code is split in two: see
+    :func:`_an_include_guard_parts`.
+
+    `leading_only` is for what an include guard holds: only the directives
+    written before its first line of code go up, and from that line on
+    everything stays in the order it was written. A `#define` after a
+    declaration is after it for a reason, and lifted above one it can turn a
+    name the declaration spells into a number.
+    """
+
+    directives: "list[str]" = []
+    kept: "list[str]" = []
+    code_seen = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if _OPENS_A_CONDITION.match(line):
+            region: "list[str]" = []
+            depth = 0
+            while index < len(lines):
+                here = lines[index]
+                region.append(here)
+                index += 1
+                if _OPENS_A_CONDITION.match(here):
+                    depth += 1
+                elif _CLOSES_A_CONDITION.match(here):
+                    depth -= 1
+                    if depth == 0:
+                        break
+            if leading_only and code_seen:
+                kept.extend(region)
+                continue
+            if not _holds_code(region):
+                directives.extend(region)
+                continue
+            parts = _an_include_guard_parts(region)
+            if parts is None:
+                kept.extend(region)
+            else:
+                above, below = parts
+                directives.extend(above)
+                kept.extend(below)
+            code_seen = True
+            continue
+        if line.lstrip().startswith("#"):
+            directive = [line]
+            index += 1
+            while directive[-1].rstrip().endswith("\\") and index < len(lines):
+                directive.append(lines[index])
+                index += 1
+            (kept if leading_only and code_seen else directives).extend(directive)
+            continue
+        kept.append(line)
+        index += 1
+        if line.strip():
+            code_seen = True
+    return directives, kept
+
+
+def _holds_code(region: "list[str]") -> bool:
+    """Whether a line of this is code - a directive's continuations are not."""
+
+    continuing = False
+    for line in region:
+        stripped = line.strip()
+        if continuing:
+            continuing = stripped.endswith("\\")
+            continue
+        if stripped.startswith("#"):
+            continuing = stripped.endswith("\\")
+            continue
+        if stripped:
+            return True
+    return False
+
+
+def _an_include_guard_parts(
+    region: "list[str]",
+) -> "tuple[list[str], list[str]] | None":
+    """An include guard holding code, written as two guarded copies.
+
+    `#ifndef CLOCK_H` / `#define CLOCK_H` / `#include <time.h>` / `typedef
+    unsigned long count_t;` / `#endif` guards a typedef, so it stayed below
+    the classes whole - and the <time.h> a method's `time_t` needs stayed
+    down there with it. What goes up is the guard around the directives
+    written before its first line of code, without its `#define`; what stays
+    is the guard, its `#define` and everything from that line on, in order.
+    Where the name was defined before the header, both copies are skipped,
+    as the one guard was; where it was not, the leading directives are read
+    above the classes and the rest where it was written, with the name
+    defined from that point on, as it was.
+
+    None where this is not plainly an include guard - a second arm, a first
+    line defining something else, the name read again inside, or a pragma,
+    which is about the lines around it - since the two copies could then
+    disagree; and None where nothing leads the code, which leaves nothing to
+    move. Either way the region stays whole, as it always has.
+    """
+
+    opened = _A_GUARD_OPENS.match(region[0])
+    if (
+        opened is None
+        or len(region) < 3
+        or not _CLOSES_A_CONDITION.match(region[-1])
+    ):
+        return None
+    name = opened.group(1) or opened.group(2)
+    at = 1
+    while at < len(region) - 1 and not region[at].strip():
+        at += 1
+    if at >= len(region) - 1 or not re.match(
+        rf"^\s*#\s*define\s+{re.escape(name)}(?:\s|$)", region[at]
+    ):
+        return None
+    inner = region[at + 1:-1]
+    depth = 0
+    for line in inner:
+        if _OPENS_A_CONDITION.match(line):
+            depth += 1
+        elif _CLOSES_A_CONDITION.match(line):
+            depth -= 1
+        elif depth == 0 and _ANOTHER_ARM.match(line):
+            return None
+        if re.search(rf"(?<![\w]){re.escape(name)}\b", line):
+            return None
+        # A pragma says something about the lines around it - `#pragma
+        # pack(1)` is where the members of the struct below it sit - so one
+        # is not moved away from them. `once` alone says nothing of the kind.
+        if _A_PRAGMA.match(line) and not _PRAGMA_ONCE.match(line):
+            return None
+    # Inside, the same again: a guard pasted inside another is split as well,
+    # and a conditional holding code stays with the code.
+    above, below = _hoisted_directives(inner, leading_only=True)
+    if not any(one.strip() for one in above):
+        return None
+    return (
+        [region[0], *above, region[-1]],
+        [region[0], region[at], *below, region[-1]],
+    )
+
 #: `#else` on its own, which has no condition to read.
 _THE_LAST_ARM = re.compile(r"^\s*#\s*else\b")
 
@@ -21986,33 +22150,17 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # while still letting the condition decide. Hoisting the `#include` *out*
     # of it would be the same mistake in the other direction - the header
     # would be read whether or not the condition held.
-    directives = []
-    kept_lines = []
-    lines = remainder.split("\n")
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if _OPENS_A_CONDITION.match(line):
-            region = []
-            depth = 0
-            while index < len(lines):
-                here = lines[index]
-                region.append(here)
-                index += 1
-                if _OPENS_A_CONDITION.match(here):
-                    depth += 1
-                elif _CLOSES_A_CONDITION.match(here):
-                    depth -= 1
-                    if depth == 0:
-                        break
-            guards_code = any(
-                stripped and not stripped.startswith("#")
-                for stripped in (part.strip() for part in region)
-            )
-            (kept_lines if guards_code else directives).extend(region)
-            continue
-        (directives if line.lstrip().startswith("#") else kept_lines).append(line)
-        index += 1
+    #
+    # An include guard is not a condition in that sense. A header is pasted
+    # once, so its guard holds on the one copy there is - but holding a typedef
+    # as well as an `#include`, it counted as guarding code, stayed below the
+    # classes, and kept the include down there with it: `time_t
+    # Clock__stamp(...)` was written above the <time.h> that declares time_t,
+    # and a header of py2bin's own lost HRESULT the same way. Such a guard is
+    # written twice now, once around the directives leading its code above the
+    # classes and once around the rest where it was - see
+    # `_an_include_guard_parts`.
+    directives, kept_lines = _hoisted_directives(remainder.split("\n"))
     remainder = "\n".join(kept_lines)
     # As written, before anything is hoisted out of it: the hoisted C types
     # go back out in this order, which is valid C whenever the C++ was.

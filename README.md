@@ -2756,6 +2756,63 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - an include guard written twice
+
+`examples/webview2` stopped building - `expected a type name, found
+'HRESULT'` - and so did any program with a header shaped like `#ifndef CLOCK_H`
+/ `#define CLOCK_H` / `#include <time.h>` / `typedef unsigned long count_t;` /
+a class with a method answering `time_t` / `#endif`. clang++ prints `42 7` for
+that program; py2bin said `time_t` was not a type.
+
+Every directive is lifted above the classes before they are written out,
+because a method that calls printf needs <stdio.h> read before it. A
+conditional is lifted whole only when it holds nothing but directives - one
+guarding code stays where it is, so what it guards stays guarded - and a
+typedef is code. So the guard stayed below the classes and kept its `#include`
+down there with it, and the class was written above the header declaring what
+it names. The example's header is that shape: py2bin's `<unknwn.h>`, which is
+where HRESULT comes from, and typedefs of the program's own, in one guard.
+
+An include guard is not a condition in that sense - a header is pasted once,
+so its guard holds on the one copy there is - and one holding code is written
+twice now: around the directives leading its code, above the classes and
+without its `#define`, and around everything from its first line of code on,
+where it was and with it. A name defined before the header still skips both
+copies, and one that was not is defined where it always was. A guard inside a
+guard, which is what pasting a header that includes another makes, is split
+the same way. What is not plainly an include guard stays whole, as before: a
+second arm, a first line defining something else, the guard's own name read
+again inside it, or a pragma, which is about the lines around it.
+
+Only the leading directives move, because the first version of this moved them
+all and a rebuild of SidecarBridge said so. OpenSSL's <kdf.h> declares its
+functions, then defines names as numbers, and continues three of those
+`#define`s onto a second line; the lifted line took its backslash up to the
+top of the unit and left the name it continued with below, as a line of code,
+and the build stopped on a `0` where a type belonged. A directive and the lines
+its backslash carries it onto now move as one, at the top of a file as well as
+inside a guard, and a directive written after code stays after it.
+
+And the example. `tools/webview2_interfaces.py` declares every slot
+`STDMETHODCALLTYPE`, as the vendor's header does, so `put_Bounds(RECT bounds)`
+is called the way Windows takes a struct and not with the address of the
+caller's own. On a Windows target the header now includes `<windows.h>` for
+`HWND` and `RECT` instead of declaring them - its `RECT` was another struct
+than the SDK's - and on any other target, where `<windows.h>` is refused, it
+declares those two and nothing else, `BOOL` and `LPCWSTR` coming with
+`<unknwn.h>`. `webview2_min.h` was regenerated from a fetched `WebView2.h`: the
+same 86 slots in the same order, each with the word added. The example builds
+for all six targets and prints `1 1 2` here, and the translated call is
+`((HRESULT (__stdcall *)(struct ICoreWebView2Controller *, RECT))(...))(controller,
+bounds)`.
+
+The project added to the sweep is a guarded header including another guarded
+one, each holding an include and a typedef, with a macro continued onto a
+second line after the class, and it agrees with clang++.
+
+2246 tests, 638 programs against clang++, 12 projects, 3882 builds across six
+targets.
+
 ### 0.9.13 - a token handed back by value
 
 SidecarBridge's `windows` branch builds to `main.exe` now, and reading what it

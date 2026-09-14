@@ -4062,3 +4062,231 @@ class ACallThroughATableWindowsDeclared(unittest.TestCase):
         # Off Windows the word means nothing, and the call is py2bin's own.
         (darwin,) = through("darwin-arm64")
         self.assertNotIsInstance(darwin.arguments[1], HeapLoad)
+
+
+class AnIncludeGuardHoldingCode(unittest.TestCase):
+    """An include guard holding code as well is written twice.
+
+    Its directives go above the classes, as every directive does, and its code
+    stays where it was written. Kept whole because a typedef in it counted as
+    code, a guard kept its `#include` below the classes too - and `time_t
+    Clock__stamp(...)` was written above the <time.h> that declares time_t.
+    """
+
+    def _translated_and_run(
+        self, files: "dict[str, str]"
+    ) -> "tuple[str, str | None]":
+        import platform
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, text in files.items():
+                (root / name).write_text(text, encoding="utf-8")
+            entry = root / "main.cpp"
+            out = translate_unity((entry,), (), "darwin-arm64")
+            artifact = root / "program"
+            compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+            printed = None
+            if sys.platform == "darwin" and platform.machine() == "arm64":
+                printed = subprocess.run(
+                    [str(artifact)], capture_output=True, text=True
+                ).stdout
+        return out, printed
+
+    def test_the_include_goes_above_the_class_that_needs_it(self) -> None:
+        out, printed = self._translated_and_run(
+            {
+                "clock.h": (
+                    "#ifndef CLOCK_H\n#define CLOCK_H\n#include <time.h>\n"
+                    "typedef unsigned long count_t;\n"
+                    "class Clock {\npublic:\n"
+                    "    time_t stamp() { return (time_t)42; }\n"
+                    "    count_t ticks() { return 7; }\n};\n#endif\n"
+                ),
+                "main.cpp": (
+                    '#include <stdio.h>\n#include "clock.h"\n'
+                    'int main() { Clock c; printf("%ld %lu\\n", '
+                    "(long)c.stamp(), (unsigned long)c.ticks()); return 0; }\n"
+                ),
+            }
+        )
+        self.assertLess(out.index("#include <time.h>"), out.index("Clock__stamp"))
+        if printed is not None:
+            self.assertEqual(printed, "42 7\n")
+
+    def test_a_guard_pasted_inside_another_is_written_twice_as_well(self) -> None:
+        out, printed = self._translated_and_run(
+            {
+                "ticks.h": (
+                    "#ifndef TICKS_H\n#define TICKS_H\n#include <time.h>\n"
+                    "typedef unsigned long ticks_t;\n#endif\n"
+                ),
+                "clock.h": (
+                    '#ifndef CLOCK_H\n#define CLOCK_H\n#include "ticks.h"\n'
+                    "typedef int reading_t;\n"
+                    "class Clock {\npublic:\n"
+                    "    time_t stamp() { return (time_t)42; }\n"
+                    "    ticks_t ticks() { return 7; }\n};\n#endif\n"
+                ),
+                "main.cpp": (
+                    '#include <stdio.h>\n#include "clock.h"\n'
+                    'int main() { Clock c; printf("%ld %lu\\n", '
+                    "(long)c.stamp(), (unsigned long)c.ticks()); return 0; }\n"
+                ),
+            }
+        )
+        self.assertLess(out.index("#include <time.h>"), out.index("Clock__stamp"))
+        if printed is not None:
+            self.assertEqual(printed, "42 7\n")
+
+    def test_a_com_header_keeps_hresult_beside_a_name_of_the_programs_own(self) -> None:
+        # The shape examples/webview2 has: py2bin's <unknwn.h> and a typedef
+        # of the program's own in one guard. HRESULT is declared by what that
+        # header includes, and went below the class that answers one.
+        out, printed = self._translated_and_run(
+            {
+                "local.h": (
+                    "#ifndef LOCAL_H\n#define LOCAL_H\n#include <unknwn.h>\n"
+                    "typedef int BOOL;\n#endif\n"
+                ),
+                "main.cpp": (
+                    '#include <stdio.h>\n#include "local.h"\n'
+                    "class Thing : public IUnknown {\npublic:\n"
+                    "    HRESULT QueryInterface(REFIID riid, void **object) {\n"
+                    "        *object = this; return S_OK;\n    }\n"
+                    "    unsigned long AddRef() { return 2; }\n"
+                    "    unsigned long Release() { return 1; }\n};\n"
+                    "int main() { Thing t; BOOL yes = 1; IUnknown *u = &t;\n"
+                    '    printf("%d %d\\n", (int)u->AddRef(), yes); return 0; }\n'
+                ),
+            }
+        )
+        self.assertLess(
+            out.index("#include <wtypes.h>"), out.index("Thing__QueryInterface")
+        )
+        if printed is not None:
+            self.assertEqual(printed, "2 1\n")
+
+    def test_the_two_copies_of_a_guard(self) -> None:
+        from py2bin.cpp_frontend import _hoisted_directives
+
+        directives, kept = _hoisted_directives(
+            [
+                "#ifndef CLOCK_H",
+                "#define CLOCK_H",
+                "#pragma once",
+                "#include <time.h>",
+                "typedef long count_t;",
+                "#endif",
+            ]
+        )
+        # Without its `#define` above: a name defined before the header still
+        # skips both copies, and one that was not is defined where it was.
+        self.assertEqual(
+            directives,
+            ["#ifndef CLOCK_H", "#pragma once", "#include <time.h>", "#endif"],
+        )
+        self.assertEqual(
+            kept,
+            ["#ifndef CLOCK_H", "#define CLOCK_H", "typedef long count_t;", "#endif"],
+        )
+
+    def test_what_is_not_plainly_a_guard_stays_whole(self) -> None:
+        from py2bin.cpp_frontend import _hoisted_directives
+
+        shapes = {
+            "a second arm": [
+                "#ifndef MODE_H", "#define MODE_H", "#include <time.h>",
+                "int mode(void);", "#else", "int other(void);", "#endif",
+            ],
+            "a pragma about the lines around it": [
+                "#ifndef PACKED_H", "#define PACKED_H", "#include <time.h>",
+                "#pragma pack(1)", "struct P { char a; int b; };", "#endif",
+            ],
+            "its own name read again": [
+                "#ifndef NAME_H", "#define NAME_H", "#include <time.h>",
+                "#undef NAME_H", "int value;", "#endif",
+            ],
+            "something else defined first": [
+                "#ifndef FIRST_H", "#define OTHER 1", "#include <time.h>",
+                "int value;", "#endif",
+            ],
+        }
+        for label, lines in shapes.items():
+            with self.subTest(label):
+                directives, kept = _hoisted_directives(list(lines))
+                self.assertEqual(directives, [])
+                self.assertEqual(kept, lines)
+
+    def test_a_directive_after_code_stays_after_it(self) -> None:
+        # OpenSSL's <kdf.h> declares its functions and only then defines the
+        # names that expand to numbers. Lifted above the declarations with
+        # the rest, a directive written after code can change what that code
+        # reads - so only the ones leading the code go up.
+        from py2bin.cpp_frontend import _hoisted_directives
+
+        directives, kept = _hoisted_directives(
+            [
+                "#ifndef KDF_H",
+                "#define KDF_H",
+                "#include <stddef.h>",
+                "int kdf_mode(int wanted);",
+                "#define KDF_MODE_EXPAND 2",
+                "#endif",
+            ]
+        )
+        self.assertEqual(
+            directives, ["#ifndef KDF_H", "#include <stddef.h>", "#endif"]
+        )
+        self.assertEqual(
+            kept,
+            [
+                "#ifndef KDF_H",
+                "#define KDF_H",
+                "int kdf_mode(int wanted);",
+                "#define KDF_MODE_EXPAND 2",
+                "#endif",
+            ],
+        )
+
+    def test_a_continued_directive_moves_in_one_piece(self) -> None:
+        # `# define ALIAS \` and the name on the next line are one directive.
+        # Taken a line at a time the name stayed behind as a line of code, and
+        # the lifted line continued onto whatever directive came next.
+        from py2bin.cpp_frontend import _hoisted_directives
+
+        directives, kept = _hoisted_directives(
+            ["#define KDF_ALIAS \\", "            KDF_MODE_EXPAND", "int value;"]
+        )
+        self.assertEqual(
+            directives, ["#define KDF_ALIAS \\", "            KDF_MODE_EXPAND"]
+        )
+        self.assertEqual(kept, ["int value;"])
+
+    def test_a_header_shaped_like_openssls_kdf_builds(self) -> None:
+        out, printed = self._translated_and_run(
+            {
+                "kdf.h": (
+                    "#ifndef KDF_H\n# define KDF_H\n# include <time.h>\n"
+                    "int kdf_mode(int wanted);\n"
+                    "# define KDF_MODE_EXPAND 2\n"
+                    "# define KDF_ALIAS_EXPAND \\\n"
+                    "            KDF_MODE_EXPAND\n"
+                    "class Kdf {\npublic:\n"
+                    "    time_t made() { return (time_t)8; }\n};\n"
+                    "#endif\n"
+                ),
+                "main.cpp": (
+                    '#include <stdio.h>\n#include "kdf.h"\n'
+                    "int kdf_mode(int wanted) { return wanted; }\n"
+                    "int main() {\n    Kdf k;\n"
+                    '    printf("%d %ld\\n", kdf_mode(KDF_ALIAS_EXPAND), '
+                    "(long)k.made());\n    return 0;\n}\n"
+                ),
+            }
+        )
+        self.assertLess(out.index("# include <time.h>"), out.index("Kdf__made"))
+        if printed is not None:
+            self.assertEqual(printed, "2 8\n")

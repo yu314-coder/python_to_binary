@@ -44,10 +44,13 @@ python3 build.py main.cpp --target windows-x86_64
 ```
 
 `webview2_min.h` here was written that way. Every slot is at the index the
-vendor put it at, so a call lands where it says. The methods a program usually
-calls carry their real signature; the rest hold their place in the table, and
-calling one of those is a mistake nothing here can catch — add its signature
-to `SPELLED` in the generator when you need it.
+vendor put it at, so a call lands where it says, and is declared
+`STDMETHODCALLTYPE`, as the vendor declares it — which is what tells py2bin the
+other side of the table was compiled for Windows, so `put_Bounds` hands its
+`RECT` over the way Windows takes a struct rather than as an address. The
+methods a program usually calls carry their real signature; the rest hold their
+place in the table, and calling one of those is a mistake nothing here can
+catch — add its signature to `SPELLED` in the generator when you need it.
 
 `main.cpp` calls through the interfaces the way a real program does. It stands
 its own object behind them rather than the one the loader hands back, so the
@@ -57,4 +60,8 @@ is the same either way. To talk to the real WebView2, keep the calls and let
 generated header, bound by the loader like any other import — give you the
 environment.
 
-`<unknwn.h>` is py2bin's own, for the same reason this file exists.
+`<unknwn.h>` is py2bin's own, for the same reason this file exists. For
+`HWND` and `RECT` the header includes `<windows.h>` on a Windows target, as the
+vendor's header expects a program to have done; on any other target, where
+`<windows.h>` is refused, it declares those two itself. `BOOL` and `LPCWSTR`
+come with `<unknwn.h>` everywhere.

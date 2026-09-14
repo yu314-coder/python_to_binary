@@ -87,10 +87,19 @@ def main(argv: "list[str]") -> int:
         out.append(f"\n/* {len(slots)} slots, in the vendor header's order. */")
         out.append(f"class {name} : public IUnknown {{\npublic:")
         for index, slot in enumerate(slots):
+            # In the convention the vendor declares every slot in. It is what
+            # tells py2bin the other side of the table was compiled for
+            # Windows, so `put_Bounds(RECT bounds)` hands the struct over the
+            # way Windows takes one rather than as its address.
             if slot in SPELLED:
-                out.append(f"    virtual HRESULT {slot}({SPELLED[slot]}) = 0;")
+                out.append(
+                    f"    virtual HRESULT STDMETHODCALLTYPE {slot}({SPELLED[slot]}) = 0;"
+                )
             else:
-                out.append(f"    virtual HRESULT {slot}(void *unused_{index}) = 0;")
+                out.append(
+                    f"    virtual HRESULT STDMETHODCALLTYPE {slot}"
+                    f"(void *unused_{index}) = 0;"
+                )
         out.append("};")
     out.append(_TAIL)
     print("\n".join(out))
@@ -100,19 +109,26 @@ def main(argv: "list[str]") -> int:
 _HEAD = '''/* WebView2's interfaces, in py2bin's C++ subset.
  *
  * Written by tools/webview2_interfaces.py from the vendor's own header, so
- * every slot is at the index that header put it at and a call lands where it
- * says. The ones a program usually calls carry their real signature; the rest
- * hold their place in the table, and calling one would be a mistake this
- * cannot catch.
+ * every slot is at the index that header put it at, in the convention it
+ * declares it in, and a call lands where it says. The ones a program usually
+ * calls carry their real signature; the rest hold their place in the table,
+ * and calling one would be a mistake this cannot catch.
  */
 #ifndef PY2BIN_WEBVIEW2_H
 #define PY2BIN_WEBVIEW2_H
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <unknwn.h>
 
+#ifndef _WIN32
+/* The vendor's header takes these from <windows.h>, which is Windows' own and
+   refused anywhere else. <unknwn.h> brings BOOL and LPCWSTR on every target;
+   these are the rest of what the signatures below name, so the example builds
+   anywhere. */
 typedef void *HWND;
-typedef int BOOL;
-typedef const wchar_t *LPCWSTR;
-typedef struct __webview2_rect { long left; long top; long right; long bottom; } RECT;
+typedef struct tagRECT { long left; long top; long right; long bottom; } RECT;
+#endif
 
 class ICoreWebView2;
 class ICoreWebView2Controller;
