@@ -91,7 +91,7 @@ __all__ = ["preprocess"]
 #: What `#pragma pack` is handed to the parser as. A name no program can
 #: write, so nothing else can be mistaken for one. Stated in `c_frontend`,
 #: which is what reads it, and checked against that here.
-from .c_frontend import _PACK_MARKER
+from .c_frontend import _BUILDS_MARKER, _OWNING_MARKER, _PACK_MARKER
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1216,6 +1216,34 @@ class Preprocessor:
         if not spelled:
             # `#pragma` with nothing after it. C says an implementation may
             # do what it likes, and there is nothing here to do.
+            return
+        if len(spelled) == 5 and spelled[:2] == ["py2bin", "owning"]:
+            # Which structs are classes that copy by code of their own, and
+            # which functions copy one, from the C++ translator - which is
+            # the only thing that knows. Passed on as tokens, the way a `pack`
+            # is: see `_OWNING_MARKER`.
+            output.append(
+                dataclasses.replace(
+                    name_token, kind="identifier", spelling=_OWNING_MARKER
+                )
+            )
+            output.extend(rest[2:5])
+            output.append(
+                dataclasses.replace(name_token, kind="punctuator", spelling=";")
+            )
+            return
+        if len(spelled) == 4 and spelled[:2] == ["py2bin", "builds"]:
+            # Which constructor builds a struct from nothing, from the C++
+            # translator: see `_BUILDS_MARKER`.
+            output.append(
+                dataclasses.replace(
+                    name_token, kind="identifier", spelling=_BUILDS_MARKER
+                )
+            )
+            output.extend(rest[2:4])
+            output.append(
+                dataclasses.replace(name_token, kind="punctuator", spelling=";")
+            )
             return
         if spelled[0] == "pack":
             # It changes how every struct after it is laid out, so it cannot
@@ -3583,6 +3611,66 @@ _STDLIB_H = f"#define __PY2BIN_ARENA_BYTES {ARENA_BYTES}UL\n" + """
 static size_t __py2bin_heap_bump = 0;
 static size_t __py2bin_heap_end = 0;
 static size_t __py2bin_heap_claimed = 0;
+/* Where the arena begins, so `free` can tell one of its own blocks from an
+   address it never handed out. */
+static size_t __py2bin_heap_base = 0;
+
+/* Blocks given back, kept for the next request of the same size. Each block
+   begins with a header of two words - a tag saying the block is live or
+   given back, and its size class - which keeps every address handed out
+   aligned to sixteen. A class is sixteen bytes a step up to 128, and a power
+   of two above that; a block given back goes on its class's list, and a
+   request is answered from that list before the arena is bumped.
+
+   Before this, `free` gave nothing back, which was harmless while a string
+   was a fixed array and a vector never let go of its storage - and is not
+   once objects take storage of their own as they grow and give it back as
+   they go: a program that builds strings in a loop ran the arena dry. */
+#define __PY2BIN_HEAP_CLASSES 64
+static size_t __py2bin_heap_free[64];
+static long __py2bin_heap_ticket = 0;
+static long __py2bin_heap_serving = 0;
+#define __PY2BIN_BLOCK_LIVE ((size_t)0x70793262696e4cULL)
+#define __PY2BIN_BLOCK_FREE ((size_t)0x70793262696e46ULL)
+
+static size_t __py2bin_heap_class_size(size_t __class) {
+    if (__class < (size_t)8) return (__class + (size_t)1) * (size_t)16;
+    return (size_t)256 << (__class - (size_t)8);
+}
+
+static size_t __py2bin_heap_class_of(size_t __n) {
+    size_t __class;
+    size_t __size;
+    if (__n <= (size_t)128) return __n / (size_t)16 - (size_t)1;
+    __class = (size_t)8;
+    __size = (size_t)256;
+    while (__size < __n) { __size = __size << 1; __class = __class + (size_t)1; }
+    return __class;
+}
+
+/* The lists are shared by every thread, so they are reached under a lock: a
+   ticket, taken with an add, and a wait until it is the one being served.
+   Held only while a list is read or written. Not a lock taken by adding one
+   and giving it back on finding it held - under four threads that never
+   settled, each one's attempt keeping the count from the zero the next one
+   was waiting to see. */
+static void __py2bin_heap_take(void) {
+    long __mine;
+    __mine = __py2bin_atomic_add(&__py2bin_heap_ticket, 1);
+    /* Waited for by reading, and confirmed once with the atomic add, which is
+       what orders the reads of the lists after it. Waiting with the add
+       itself wrote the word on every turn, and on ARM64 each of those writes
+       broke the exclusive reservation of the thread trying to hand the lock
+       on: four threads took six seconds over eight thousand allocations. */
+    for (;;) {
+        while (*(volatile long *)&__py2bin_heap_serving != __mine) { }
+        if (__py2bin_atomic_add(&__py2bin_heap_serving, 0) == __mine) return;
+    }
+}
+
+static void __py2bin_heap_give(void) {
+    __py2bin_atomic_add(&__py2bin_heap_serving, 1);
+}
 
 /* The bump moves with an atomic add, so two callers are handed two blocks
    rather than the same one. A read and then a write is not enough: both read
@@ -3596,9 +3684,14 @@ static size_t __py2bin_heap_claimed = 0;
    is there for whoever sees it. */
 void *malloc(size_t __n) {
     size_t __p;
+    size_t __class;
+    size_t __size;
+    size_t __i;
+    size_t *__head;
     if ((size_t)__py2bin_atomic_add((long *)&__py2bin_heap_end, 0) == 0) {
         if (__py2bin_atomic_add((long *)&__py2bin_heap_claimed, 1) == 0) {
             __py2bin_heap_bump = (size_t)__py2bin_arena();
+            __py2bin_heap_base = __py2bin_heap_bump;
             __py2bin_atomic_add(
                 (long *)&__py2bin_heap_end,
                 (long)(__py2bin_heap_bump + __PY2BIN_ARENA_BYTES));
@@ -3612,16 +3705,36 @@ void *malloc(size_t __n) {
        still gets a distinct address, as C says it may. */
     __n = (__n + (size_t)15) & ~(size_t)15;
     if (__n == (size_t)0) __n = (size_t)16;
-    /* Written as a subtraction so a size near the top of the range cannot
-       wrap the sum past the end and be let through. */
-    /* Taken first and checked after. The other order is a read of the bump,
-       a comparison, and then a write - and between the read and the write
-       another caller may have taken the same block. Overshooting the end
-       costs the arena nothing that was not already gone: the only way past
-       the check is that there was no room. */
-    __p = (size_t)__py2bin_atomic_add((long *)&__py2bin_heap_bump, (long)__n);
-    if (__p + __n > __py2bin_heap_end || __p + __n < __p) return NULL;
-    return (void *)__p;
+    if (__n > (size_t)__PY2BIN_ARENA_BYTES) return NULL;
+    __class = __py2bin_heap_class_of(__n);
+    __size = __py2bin_heap_class_size(__class);
+    __py2bin_heap_take();
+    __p = __py2bin_heap_free[__class];
+    if (__p != (size_t)0) {
+        __py2bin_heap_free[__class] = *(size_t *)(__p + (size_t)16);
+    }
+    __py2bin_heap_give();
+    if (__p != (size_t)0) {
+        /* Cleared, as a block fresh from the arena is: storage handed out
+           here has always come back zeroed, and nothing is lost by a block
+           given back a second time keeping that. */
+        for (__i = (size_t)0; __i < __size; __i++)
+            ((unsigned char *)(__p + (size_t)16))[__i] = 0;
+    } else {
+        /* Taken first and checked after. The other order is a read of the
+           bump, a comparison, and then a write - and between the read and
+           the write another caller may have taken the same block.
+           Overshooting the end costs the arena nothing that was not already
+           gone: the only way past the check is that there was no room. */
+        __p = (size_t)__py2bin_atomic_add(
+            (long *)&__py2bin_heap_bump, (long)(__size + (size_t)16));
+        if (__p + __size + (size_t)16 > __py2bin_heap_end
+            || __p + __size + (size_t)16 < __p) return NULL;
+    }
+    __head = (size_t *)__p;
+    __head[0] = __PY2BIN_BLOCK_LIVE;
+    __head[1] = __class;
+    return (void *)(__p + (size_t)16);
 }
 
 void *calloc(size_t __count, size_t __size) {
@@ -3632,33 +3745,63 @@ void *calloc(size_t __count, size_t __size) {
     __total = __count * __size;
     __block = (unsigned char *)malloc(__total);
     if (__block == NULL) return NULL;
-    /* The arena is zero-filled when it is mapped, but a block reused after a
-       realloc is not, so this clears rather than assuming. */
     for (__i = (size_t)0; __i < __total; __i++) __block[__i] = 0;
     return (void *)__block;
 }
 
+/* Whether this is a block `malloc` handed out and nobody has given back. A
+   pointer from somewhere else - or one given back already - is left alone:
+   reading a header it does not have would put a stranger's memory on a
+   list, and that is a fault much later and far from here. */
+static int __py2bin_heap_owns(void *__block) {
+    size_t __at;
+    __at = (size_t)__block;
+    if (__at < __py2bin_heap_base + (size_t)16 || __at >= __py2bin_heap_end) return 0;
+    if ((__at & (size_t)15) != (size_t)0) return 0;
+    if (((size_t *)(__at - (size_t)16))[0] != __PY2BIN_BLOCK_LIVE) return 0;
+    if (((size_t *)(__at - (size_t)16))[1] >= (size_t)__PY2BIN_HEAP_CLASSES) return 0;
+    return 1;
+}
+
 void free(void *__block) {
-    /* An arena does not reclaim. Saying so plainly is better than a free()
-       that appears to work and silently does nothing about fragmentation. */
-    (void)__block;
+    size_t *__head;
+    size_t __class;
+    if (__block == NULL) return;
+    if (!__py2bin_heap_owns(__block)) return;
+    __head = (size_t *)((size_t)__block - (size_t)16);
+    __class = __head[1];
+    __head[0] = __PY2BIN_BLOCK_FREE;
+    __py2bin_heap_take();
+    *(size_t *)__block = __py2bin_heap_free[__class];
+    __py2bin_heap_free[__class] = (size_t)__head;
+    __py2bin_heap_give();
 }
 
 void *realloc(void *__block, size_t __size) {
     unsigned char *__old;
     unsigned char *__new;
+    size_t __have;
     size_t __i;
     if (__block == NULL) return malloc(__size);
+    __old = (unsigned char *)__block;
+    if (!__py2bin_heap_owns(__block)) {
+        /* Not one of these blocks, so nothing says how big it is: this copies
+           the new size and reads no further than the arena holds, which is
+           what this did for every block before the header recorded one. */
+        __new = (unsigned char *)malloc(__size);
+        if (__new == NULL) return NULL;
+        for (__i = (size_t)0; __i < __size; __i++) {
+            if ((size_t)(__old + __i) >= __py2bin_heap_bump) break;
+            __new[__i] = __old[__i];
+        }
+        return (void *)__new;
+    }
+    __have = __py2bin_heap_class_size(((size_t *)(__old - (size_t)16))[1]);
+    if (__size <= __have) return __block;
     __new = (unsigned char *)malloc(__size);
     if (__new == NULL) return NULL;
-    /* Nothing records how big the old block was, so this copies the smaller
-       of the two -- the new size -- and reads no more of the old block than
-       the arena holds. Growing is exact; shrinking copies only what stays. */
-    __old = (unsigned char *)__block;
-    for (__i = (size_t)0; __i < __size; __i++) {
-        if ((size_t)(__old + __i) >= __py2bin_heap_bump) break;
-        __new[__i] = __old[__i];
-    }
+    for (__i = (size_t)0; __i < __have; __i++) __new[__i] = __old[__i];
+    free(__block);
     return (void *)__new;
 }
 
@@ -3758,6 +3901,31 @@ double atof(const char *__text) { return strtod(__text, (char **)0); }
 #: a null pointer constant - so whichever got there first keeps it, which is
 #: what every real header does.
 _NULL = "#ifndef NULL\n#define NULL ((void *)0)\n#endif\n"
+
+#: The three streams a program starts with, and what writes to them.
+#: printf is compiled rather than called, and writes as it formats - nothing
+#: waits in a buffer - so `fflush` has nothing to do; everything else here
+#: writes through printf or fprintf, so it reaches the stream in the order it
+#: was written. A FILE is the descriptor it writes to: there is no fopen.
+_STDIO_H = (
+    "#define EOF (-1)\n"
+    + _NULL
+    + """
+typedef struct __py2bin_file { int __py2bin_fd; } FILE;
+static FILE __py2bin_stdin_file = { 0 };
+static FILE __py2bin_stdout_file = { 1 };
+static FILE __py2bin_stderr_file = { 2 };
+#define stdin (&__py2bin_stdin_file)
+#define stdout (&__py2bin_stdout_file)
+#define stderr (&__py2bin_stderr_file)
+int fflush(FILE *__stream) { return 0; }
+int fputs(const char *__text, FILE *__stream) { fprintf(__stream, "%s", __text); return 1; }
+int puts(const char *__text) { printf("%s\\n", __text); return 1; }
+int fputc(int __c, FILE *__stream) { fprintf(__stream, "%c", __c); return (unsigned char)__c; }
+int putc(int __c, FILE *__stream) { fprintf(__stream, "%c", __c); return (unsigned char)__c; }
+int putchar(int __c) { printf("%c", __c); return (unsigned char)__c; }
+"""
+)
 
 #: `offsetof`, which is the standard way a program asks where a member sits -
 #: and the standard way a program checks that a header's layout is what it
@@ -5179,7 +5347,7 @@ _BUILTIN_HEADERS = {
     "objbase.h": _OBJBASE_H,
     "combaseapi.h": _OBJBASE_H,
     "ole2.h": _OBJBASE_H,
-    "stdio.h": "#define EOF (-1)\n" + _NULL,
+    "stdio.h": _STDIO_H,
     # <stdlib.h> brings the heap, and brings it as C source for the same
     # reason <math.h> does: an allocator you can read is one you can check.
     # The compiler itself supplies exactly one thing, __py2bin_arena(), which

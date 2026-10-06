@@ -2756,6 +2756,276 @@ runtime and library adapters.
 The full history, with the reasoning behind each fix, is in
 [the guide](docs/DETAILED_GUIDE.md). This is the short form.
 
+### 0.9.13 - a handler for what was thrown
+
+Thirty-five exception programs in idiomatic C++17 - a handler for a base, a
+`throw` of a number, `std::runtime_error` with a message built from a string,
+`at()` past the end - found that ten agreed with clang++, twenty-one were
+refused, and four built and printed the wrong thing. Thirty-three agree now;
+the two left are below.
+
+**A handler takes what it is written for, and nothing else.** A try with one
+handler took whatever arrived: `try { throw B(4); } catch (const A &a)`
+inside a try for `B` ran A's handler and carried on, and the handler for `B`
+never ran - clang++ prints `400` for that program and py2bin printed `11`.
+Every value that was not an object went in flight as one kind, so `throw
+'c'` was caught by the `catch (int x)` written before the `catch (char c)`,
+and a `double` went through a whole-number word and was caught as 2 where 2.5
+was thrown. Each type is told apart now. A handler for a class takes every
+class deriving from it - so `catch (const std::exception &e)` is the handler
+for every standard exception, as it is written to be - and a pointer to a
+class takes pointers to those, found through the class's own base list,
+second bases included. Anything else takes its own type. A handler that
+names nothing, `catch (const E &)`, is read, and `catch (E e)` copies what
+was thrown with E's own copy instead of building an E and assigning over it,
+which a class without a default constructor refused. `throw E{7, 8}` is
+built from its braces.
+
+**The standard exceptions are libc++'s.** `<exception>` and `<stdexcept>`
+are the two families under `std::exception`: `logic_error` with
+`domain_error`, `invalid_argument`, `length_error` and `out_of_range`, and
+`runtime_error` with `range_error`, `overflow_error` and `underflow_error`.
+Each holds its message as a string of its own, so one built from `"negative:
+" + std::to_string(v)` keeps it; before, they took `const char *` only, had
+no hierarchy, and half of them did not exist. `bad_alloc`, `bad_cast` and
+`bad_typeid` derive from `std::exception` and say what libc++'s say.
+
+**The library throws what libc++ throws.** `at()` on a vector, a string, a
+map, an array, a deque and a string_view, `substr`, `insert`, `erase` and
+`replace` given a position past the end, a bitset's `test`, `set`, `reset`
+and `flip`, `optional::value()` with nothing in it, and `stoi`, `stol`,
+`stoll`, `stoul`, `stoull`, `stod` and `stof` given no number or too big a
+one - each throws the class libc++ throws and says what libc++ says:
+`vector`, `basic_string`, `map::at:  key not found`, `stoi: no conversion`.
+Thirty of those, side by side with clang++, agree word for word. Before,
+`at(5)` on a vector of two read past the end and `stoi("x")` answered 0.
+Where nothing in the program could catch one - no handler for it, for a class
+it derives from, and no `catch (...)` - it is what C++ does with an exception
+nothing catches: terminate, which says so on stderr in libc++'s words and
+aborts. Written that way a program that never catches pays nothing for it:
+no function that calls `at` is one that can throw, and no flag is tested
+after each call. An exception that reaches the end of `main` stops the
+program with 134, the status a shell reports for an abort, where it was 3.
+
+**Fixed on the way, each one silent:**
+
+- The jump to a handler written in a loop body that declares no objects of
+  its own took apart what the function had built before the loop. A vector
+  of strings filled in the loop lost everything it held before the throw -
+  clang++ prints `item0 item1 error2 item3 item4` and py2bin printed `item3
+  item4` - and was destroyed twice. A scope's handlers now stop the
+  unwinding whether or not it declared anything.
+- A member initialiser whose constructor threw was stepped over: the
+  members after it were built, the constructor's body ran, and the object
+  was destroyed as though it existed. Now the members built before it are
+  taken apart, last first, then the base, and nothing else - and the same
+  happens when the constructor's body throws.
+- A method building its answer after an `if` - `if (k < 0) { k = 0; }
+  return Name(base + k);` - built the temporary at the top of the method,
+  before the `if`, from the `k` it had not changed yet. A lifted block is a
+  statement boundary now, as a `}` is. This one is not about exceptions.
+- `delete all[0]` on an array of pointers given its pointers in a list ran no
+  destructor, and `for (Shape *s : all)` over it read `delete all[2];` as a
+  declaration of two elements and stopped one short.
+- A function whose return type began with `const` - `const char *what()
+  const`, every `const T &at() const` - was never seen by the pass that
+  rewrites exceptions: a throw in one stayed C++, and a call in one to a
+  function that throws was never followed by a test.
+- The word that holds what is in flight was a `long`. On Windows, where a
+  `long` is 32 bits, the address of every object thrown was cut in half.
+
+And the loud ones: a method that throws could not read its own members -
+`__py2bin_thrown = 1;` was read as declaring a local `n`, which hid the
+member `n` - and the same reading split any `count = 0;` into a declaration
+of `t`. A throw inside a lambda or an `operator[]` was never rewritten; both
+are followed now, through the object that holds them, and another operator
+whose own body throws is refused by name rather than left unchecked. `new
+R(1)` with a constructor that can throw is lifted whole, and given back if it
+throws. A function answering a reference had its result held in a pointer
+and used as a value. A `try` with nothing in it that throws reached the C as
+`try`. `throw ParseError{"..." + s, line}` is built one member at a time.
+
+**<stdio.h> has its streams.** `puts`, `putchar`, `fputs`, `fputc`, `putc`,
+`fprintf` and `fflush` were each a call to a function declared nowhere.
+`stdin`, `stdout` and `stderr` are `FILE *`s now, `fprintf(stderr, ...)`
+writes to the second descriptor, and `fflush` has nothing to do because
+printf writes as it formats. There is still no `fopen`.
+
+Still to come: the object thrown is never destroyed after its handler, so
+its destructor does not run and its storage is kept. An exception nothing
+catches runs the destructors on its way out of each function before the
+program stops, where libc++ stops without them, and the abort is a status
+of 134 rather than the signal - which is one of the two programs that do not
+agree. The other gives a member array braces of its own, `Arr a{{1, 2, 3,
+4}}`, which is refused. A throwing operator other than a call and a
+subscript is refused, and so is `std::exception_ptr`. `<algorithm>` has no
+`for_each`, `find_if` or `accumulate` yet. And declarations filled by a
+call have three faults of their own, which are the next round: `T t = f();`
+builds a default `t` first, a `T` filled by a method or an operator is never
+destroyed, and `return T(...)` copies where C++17 builds in place.
+
+2303 tests, 697 programs against clang++, 12 projects, 4236 builds across six
+targets.
+
+### 0.9.13 - a string as long as it is
+
+`std::string` was a struct holding `char buf[256]`, and every operation on it
+stopped at the 255th character without a word. A program building JSON a
+piece at a time - twenty-nine thousand characters of it, which is what a
+program sends over a socket - printed its length as `255` where clang++
+prints `29428`, and what it printed as the end of the text was the
+twenty-eighth of its two thousand entries. A thousand-character string was
+255 long, and so was a wide string of 304. Nothing was refused and nothing
+said so; the output was just short.
+
+The string now owns its characters: storage of its own, as much as it is
+given, handed back when it goes and copied when it is copied. It is copied
+through the same `owning` route as any class with a copy of its own, so a
+string held in a struct, a vector or an answer is copied with what holds it
+and never shares its characters with the copy. What it reports is what libc++
+reports.
+`capacity()` is 22 until it needs storage, then grows as libc++ grows it -
+twice what it had, or what is asked if that is more, as one short of a
+multiple of eight - so `22 47 47 95 95 191 103` comes out of both for the same
+program. `npos` is the largest `size_t`. `compare` answers the difference of
+the first two bytes that differ, read unsigned: `-23` for "abc" against
+"abz", as libc++ does, where a plain -1 would pass every test that only asks
+`< 0`. The wide string is the same class a character wider, written out from
+the same text, so the two cannot drift apart.
+
+What the string could not do before it does now, each as C++17 has it:
+`find` and `rfind` from a position, `find_first_of`, `find_last_of` and their
+`_not_of`s, the common forms of `insert`, `erase`, `replace`, `append` and
+`assign` - by position and count, not yet by iterator - `substr`, `resize`
+with a fill character, `shrink_to_fit`, `swap`, `front`, `back`, `pop_back`,
+and `stoi`, `stol`, `stoll`, `stoul`, `stoull`, `stod`, `stof` and
+`to_wstring` beside `to_string`. Five programs that were refused agree with
+clang++ now. A member or a form that is not written stops the build - `struct
+string has no member named 'rbegin'`, or a call to a `string__compare__3` that
+is not there for `compare(1, 2, "el")` - rather than being built as something
+else.
+
+**An object whose constructor threw is not taken apart.** The way out to a
+handler destroyed every object declared before the throw, including the one
+whose constructor threw - an object that was never built. A program counting
+its live objects ended at `-3`, one destructor too many for each. An object is
+now marked built where its constructor returns, in a nested block as well, and
+the way out takes apart only what was built. clang++ prints `-9 0` for that
+program; py2bin printed `-9 -3`.
+
+**An argument that throws stops the call it is an argument of.** A call that
+can throw is lifted out of its statement so that it can be checked before the
+statement goes on. With one such call inside another's arguments, the outer
+one was lifted first, and `g(f(3), f(-4))` called `g` with `f(-4)` already
+thrown: clang++ counts five calls in that program and py2bin counted six. The
+inner calls are lifted first now, each checked before the one it feeds.
+
+**A reference to a pointer is bound like any other reference.** `Shape *const
+&` - which is what `push_back(const T &)` becomes in a `vector<Shape *>`, and
+the vector takes its elements by reference now that it copies them with their
+own code - binds to the pointer where one is named, and to a temporary holding
+the value where it is handed `&s` or `new Shape()`. Neither was done: a
+function or a method taking one was handed the pointer where its address
+belonged, and the C stage refused the call.
+
+Smaller, found on the way: an overloaded member is chosen by the declaration
+of its argument nearest above the call, where it was the last one in the
+whole unit - `out.text.assign(buffer)` in `<filesystem>`, beside its own `char
+buffer[260]`, was typed by a `wchar_t buffer[8]` the program declared in
+another function, and no `assign` takes one. `size & ~(unsigned long)15` in a
+method of a class with a destructor was read as the class calling its
+destructor, because the destructor is stored under the name `~`. A function
+answering `int &`, with an object to destroy on its way out, kept the answer
+in C as an `int &`.
+
+Still to come: `at()` does not throw when it is out of range and `stoi` does
+not throw on text that is not a number - they go with the round about
+exceptions, which also has handlers matched through a class hierarchy, the
+`<stdexcept>` classes, and what happens to an exception nothing catches.
+
+### 0.9.13 - copies that copy
+
+Eighty one-feature programs in idiomatic C++17 - written against the language,
+not against what py2bin already did - found that the corpus was shaped around
+what works. Several of the failures built and ran and printed the wrong thing.
+This round is the ones about copying, and one about strings.
+
+**A copied vector shared its storage.** `std::vector<int> b = a; b[0] = 10;`
+changed `a`, and so did a vector handed to a function by value, assigned, or
+held in a struct that was copied: clang++ prints `1 2 3 | 10 20 | 3 30` for
+such a program and py2bin printed `99 20 30 | 99 20 | 30 30`. A vector of a
+class with a copy constructor of its own crashed on its first `push_back`.
+The vector now owns its elements: storage of its own on a copy, each element
+built where it stands with the element's own copy, assigned where one is
+already there, taken apart when it goes, and the storage given back. What it
+does and in what order is libc++'s, so a class that prints as it is copied
+prints the same lines: `push_back` that has to grow builds the new element
+first and then moves the old ones, `insert` with room builds a new last
+element and assigns the rest up, and capacity goes 1, 2, 4. `vector<int>
+r(3, 7)` is three sevens; it was read as a range from 3 to 7, because the
+range constructor is a template the standard constrains to iterators, and it
+is constrained here too.
+
+**An object is copied by its class's own code wherever C++ copies one.** A
+class with a copy constructor or an assignment of its own, a class with a
+table pointer, and a class holding or deriving from either - every struct
+holding a vector, for one - is told to the C stage with `#pragma py2bin owning
+NAME COPY ASSIGN`, and from there every copy C makes of that struct is a call:
+an assignment calls ASSIGN, and an initialiser, a parameter taken by value and
+an answer handed back call COPY. However a pass came to write the copy, it is
+made by the class's code. Where the class wrote neither, the translator writes
+the ones C++ writes, member by member, as C from the class's layout. Before,
+such a copy was its bytes: two objects owning one buffer, and - with a table
+pointer - a `Base` copied from a `Derived` through a reference that answered
+virtual calls as the `Derived`. clang++ prints `derived base base` for that
+program; py2bin printed `derived derived derived`.
+
+And a new object is built as a copy, not assigned over nothing: an answer is
+copied into the caller's room with `__py2bin_copy_into`, which the C stage
+makes with the copy constructor, where it was `*__ret = value` - a class's
+`operator=` handed storage that held no object. The same for a thrown object,
+a member built from what it was given, and a parameter taken by value. A
+derived class with no copy constructor was copied with its base's, which
+copied the base and left the rest as whatever was there.
+
+**A string literal is printed as it was written.** Nearly every pass that
+turns C++ into C read a string as readily as code. `printf("Point(%d)\n",
+p.x)` in a program with a class `Point` had `Point(%d)` taken for a temporary
+to build; `"Point(1) and Point()"` printed `__py2bin_temp_2 and
+__py2bin_temp_3`; `"p.twice()"` printed `Point__twice(&p)`; `"class A { };"`
+printed nothing at all; and a constructor printing its own class's name built
+another of itself every time it ran. Help text, a fragment of JSON, a script
+handed to a browser: anything that looked like C++ came out as something else,
+and nothing said so. Every string's body is now put aside right after the dead
+`#if` arms are emptied - before the first pass that reads code - and put back
+when the C is written, so no pass can read it. A character literal that is a
+bracket or a quote is written as its escape.
+
+**`free` gives storage back.** The allocator was a fixed arena whose `free`
+kept nothing, which did not matter while nothing let go of storage. Each block
+now carries a header with its size class, and a block given back goes on its
+class's list and is handed out again, cleared, as fresh arena storage always
+was. A pointer that is not a block's start - a second free, the stack, the
+middle of a block - is left alone rather than put on a list. Under four threads
+the lists are behind a ticket lock, waited for by reading: waiting with the
+atomic add wrote the word on every turn, and on ARM64 each write broke the
+reservation of the thread handing the lock on - four threads took six seconds
+over eight thousand allocations.
+
+Smaller, found on the way: a member initialised from a reference parameter was
+handed the address of the pointer; `&r.items[i]` through a reference lost its
+`&`; `items = fresh` with `items` a pointer to a class with an `operator=` was
+an assignment of the object; a range-for over `const char *names[]` asked the
+array for its `size()`, and a trailing comma counted as one more element.
+
+Still to come, and said here so nobody is surprised: map, set, list, deque
+and the unordered containers still share storage when copied - that is the
+next round. A temporary lives to the end of its scope rather than the end of
+its statement, and catching by value, capturing by value, a pair and an
+aggregate's braces build a member and then assign it where C++ copies it: the
+values are right, and a class that prints as it is copied prints differently.
+The string, which was the other half of this paragraph, is the note above.
+
 ### 0.9.13 - an include guard written twice
 
 `examples/webview2` stopped building - `expected a type name, found

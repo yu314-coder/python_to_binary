@@ -770,6 +770,20 @@ _UNNAMED_BITFIELD = "__py2bin_pad_"
 #: directive is not a token, and this is the only channel between the two.
 _PACK_MARKER = "__py2bin_pragma_pack"
 
+#: What `#pragma py2bin owning NAME COPY ASSIGN` reaches the parser as:
+#: `struct NAME` is a class whose objects are copied by code of their own - a
+#: copy constructor, an assignment, a table pointer that has to be its own
+#: class's - and a copy of its bytes is not a copy of one. COPY builds an
+#: object from another and ASSIGN copies one over an object already built,
+#: each taking the two addresses. Written by the C++ translator, which is the
+#: only thing that knows; see `Lowerer.copied_by_code`.
+_OWNING_MARKER = "__py2bin_pragma_owning"
+
+#: What `#pragma py2bin builds NAME CTOR` reaches the parser as: CTOR is the
+#: constructor that builds a `struct NAME` from nothing, taking its address.
+#: Written by the C++ translator for `__py2bin_default_into`.
+_BUILDS_MARKER = "__py2bin_pragma_builds"
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Member:
@@ -1769,6 +1783,13 @@ class TranslationUnit:
     extern_parameters: "dict[str, tuple[CType, ...]]" = dataclasses.field(
         default_factory=dict
     )
+    #: Struct tag -> the functions that copy-construct and copy-assign one.
+    #: See `_OWNING_MARKER`.
+    owning: "dict[str, tuple[str, str]]" = dataclasses.field(
+        default_factory=dict
+    )
+    #: Struct tag -> the constructor that builds one from nothing.
+    builds: "dict[str, str]" = dataclasses.field(default_factory=dict)
 
 
 # --- parser ------------------------------------------------------------------
@@ -1909,6 +1930,10 @@ class Parser:
         self.externs: dict[str, CType] = {}
         #: What each of those takes, in order. See TranslationUnit.
         self.extern_parameters: "dict[str, tuple[CType, ...]]" = {}
+        #: Struct tag -> its copy constructor and its assignment.
+        self.owning: "dict[str, tuple[str, str]]" = {}
+        #: Struct tag -> the constructor that builds one from nothing.
+        self.builds: "dict[str, str]" = {}
         #: Shared libraries the program named, and which symbols each claims.
         self.libraries: "list[tuple[str, frozenset[str]]]" = []
         #: Where each symbol taken from one of them comes from.
@@ -3278,6 +3303,20 @@ class Parser:
             if self.token.kind == "identifier" and self.token.value == _PACK_MARKER:
                 self.pragma_pack()
                 continue
+            if self.token.kind == "identifier" and self.token.value == _OWNING_MARKER:
+                self.index += 1
+                named = str(self.identifier().value)
+                copies = str(self.identifier().value)
+                assigns = str(self.identifier().value)
+                self.owning[named] = (copies, assigns)
+                self.take(";")
+                continue
+            if self.token.kind == "identifier" and self.token.value == _BUILDS_MARKER:
+                self.index += 1
+                named = str(self.identifier().value)
+                self.builds[named] = str(self.identifier().value)
+                self.take(";")
+                continue
             if self.accept("extern"):
                 self.extern_prototype()
                 continue
@@ -3304,6 +3343,8 @@ class Parser:
             self.library_symbols,
             self.declared_elsewhere,
             extern_parameters=self.extern_parameters,
+            owning=dict(self.owning),
+            builds=dict(self.builds),
         )
 
     def names_called(self) -> "set[str]":
@@ -4646,6 +4687,9 @@ class Lowerer:
         #: Bytes per character the sink stores. One for a `char` buffer, two
         #: or four for a `wchar_t` one - the platform decides which.
         self.sink_width = 1
+        #: The descriptor formatted output goes to when there is no sink: 1
+        #: for printf, and 2 inside an `fprintf(stderr, ...)`.
+        self.out_fd = 1
         self.digit_slot: int | None = None
         self.text_slot: int | None = None
         self.float_scratch: dict[str, int] = {}
@@ -5788,7 +5832,54 @@ class Lowerer:
                 f"this assignment needs {ctype}, but this is {source.ctype}",
                 node.token,
             )
+        if self.copied_by_code(
+            ctype, address, source.expr, node.token, construct=False
+        ):
+            return Value(ctype, address)
         return Value(ctype, self.copy_bytes(ctype, address, source.expr))
+
+    def copied_by_code(
+        self,
+        ctype: CType,
+        destination: IntExpression,
+        source: IntExpression,
+        token: Token,
+        *,
+        construct: bool,
+    ) -> bool:
+        """Copy an object of a class that copies by its own code, by that code.
+
+        The C++ translator says which structs those are and what copies them:
+        a class with a copy constructor or an assignment of its own, one
+        holding such a class, and one with a table pointer, which a copy has
+        to point at its own class's table. Their bytes copied are two objects
+        sharing whatever the first owned, or an object answering virtual calls
+        as the class it was copied from - built and run without a word. So
+        the copy is a call: to the copy constructor where the object is being
+        made (`construct`, an initialiser, a parameter, an answer) and to the
+        assignment where it already exists. False where the struct is not
+        one of those, and its bytes are the copy.
+        """
+
+        if not isinstance(ctype, StructType) or ctype.name not in self.unit.owning:
+            return False
+        copies, assigns = self.unit.owning[ctype.name]
+        named = copies if construct else assigns
+        function = self.unit.functions.get(named)
+        if function is None or function.body is None:
+            self.error(
+                f"struct {ctype.name} is copied here, and the "
+                f"{'copy constructor' if construct else 'assignment'} that "
+                f"copies one, {named}(), is not defined in this translation unit",
+                token,
+            )
+        destination = self.materialize(destination)
+        source = self.materialize(source)
+        self.lower_callee(function)
+        self.emit(
+            Store(self.new_temp(), IRCall(named, (destination, source)))
+        )
+        return True
 
     def copy_bytes(
         self, ctype: "StructType", address: IntExpression, source: IntExpression
@@ -6252,7 +6343,122 @@ class Lowerer:
             )
         self.unit.externs[node.name] = function.result
 
+    def copy_into(self, node: Call) -> Value:
+        """`__py2bin_copy_into(&to, &from)`: build at the first a copy of the second.
+
+        What the C++ translator writes wherever C++ makes a new object as a
+        copy of another - a returned object, a thrown one, a member or a
+        parameter built from what it was given. Not an assignment, because
+        nothing has been built where the copy goes. A class that copies by
+        code of its own is copied by its copy constructor; anything else by
+        its bytes, which for those is the whole of what a copy is.
+        """
+
+        if len(node.arguments) != 2:
+            self.error(f"{node.name}() takes two addresses", node.token)
+        destination = self.rvalue(node.arguments[0])
+        source = self.rvalue(node.arguments[1])
+        if not isinstance(destination.ctype, PointerType):
+            self.error(
+                f"{node.name}() builds an object where its first argument "
+                f"points, and this is {destination.ctype}",
+                node.token,
+            )
+        if not isinstance(destination.ctype.target, StructType):
+            # A number, a pointer, an enumerator: its value is the whole of
+            # a copy of one. Written by a container for whatever it holds,
+            # which is as often an `int` as a class.
+            if not isinstance(source.ctype, PointerType):
+                self.error(
+                    f"{node.name}() copies from where its second argument "
+                    f"points, and this is {source.ctype}",
+                    node.token,
+                )
+            target = destination.ctype.target
+            if size_of(target) is None:
+                self.error(f"{node.name}() cannot copy a {target}", node.token)
+            address = self.materialize(destination.expr)
+            value = self.load(source.ctype.target, self.materialize(source.expr))
+            stored = self.assign_convert(value, target, node.token, "this copy")
+            if is_floating(target):
+                stored = self.materialize_float(stored)
+            else:
+                stored = self.materialize(stored)
+            self.emit(
+                HeapStore(address, self.stored_bits(stored, target), size_of(target))
+            )
+            return Value(VOID, IntConstant(0))
+        held = destination.ctype.target
+        if not (
+            isinstance(source.ctype, PointerType)
+            and isinstance(source.ctype.target, StructType)
+            and (source.ctype.target is held or source.ctype.target == held)
+        ):
+            self.error(
+                f"{node.name}() copies a {held} from what its second argument "
+                f"points at, and this is {source.ctype}",
+                node.token,
+            )
+        if not self.copied_by_code(
+            held, destination.expr, source.expr, node.token, construct=True
+        ):
+            self.copy_bytes(held, destination.expr, source.expr)
+        return Value(VOID, IntConstant(0))
+
+    def default_into(self, node: Call) -> Value:
+        """`__py2bin_default_into(&to)`: build an object where nothing was.
+
+        Its bytes zeroed, which is what value-initialising one is for every
+        type that has no constructor of its own, and then that constructor
+        where it has one - the one the C++ translator named for the struct.
+        What a container writes to fill a place it has made room for.
+        """
+
+        if len(node.arguments) != 1:
+            self.error(f"{node.name}() takes one address", node.token)
+        where = self.rvalue(node.arguments[0])
+        if not isinstance(where.ctype, PointerType):
+            self.error(
+                f"{node.name}() builds an object where its argument points, "
+                f"and this is {where.ctype}",
+                node.token,
+            )
+        held = where.ctype.target
+        size = size_of(held)
+        if size is None:
+            self.error(f"{node.name}() cannot build a {held}", node.token)
+        address = self.materialize(where.expr)
+        offset = 0
+        while offset < size:
+            unit = 8 if size - offset >= 8 else (
+                4 if size - offset >= 4 else (2 if size - offset >= 2 else 1)
+            )
+            self.emit(
+                HeapStore(
+                    IntBinary("add", address, IntConstant(offset)),
+                    IntConstant(0),
+                    unit,
+                )
+            )
+            offset += unit
+        if isinstance(held, StructType) and held.name in self.unit.builds:
+            named = self.unit.builds[held.name]
+            function = self.unit.functions.get(named)
+            if function is None or function.body is None:
+                self.error(
+                    f"struct {held.name} is built here, and its constructor "
+                    f"{named}() is not defined in this translation unit",
+                    node.token,
+                )
+            self.lower_callee(function)
+            self.emit(Store(self.new_temp(), IRCall(named, (address,))))
+        return Value(VOID, IntConstant(0))
+
     def call(self, node: Call) -> Value:
+        if node.name == "__py2bin_copy_into" and node.name not in self.unit.functions:
+            return self.copy_into(node)
+        if node.name == "__py2bin_default_into" and node.name not in self.unit.functions:
+            return self.default_into(node)
         if node.name == "abs":
             overloaded = self.abs_overload(node)
             if overloaded is not None:
@@ -6296,9 +6502,9 @@ class Lowerer:
             return self.variadic_builtin(node)
         if node.name in _INTO_A_BUFFER and node.name not in self.unit.functions:
             return self.formatted_into(node, bounded=node.name in _BOUNDED_BUFFER)
-        if node.name == "printf" and "printf" not in self.unit.functions:
+        if node.name in ("printf", "fprintf") and node.name not in self.unit.functions:
             self.error(
-                "printf's return value is not implemented; call it as a "
+                f"{node.name}'s return value is not implemented; call it as a "
                 "statement, or use snprintf if the count is what is wanted",
                 node.token,
             )
@@ -7064,6 +7270,14 @@ class Lowerer:
 
         for passed, name, parameter_type in copied:
             local = self.declare(name, parameter_type, function.token)
+            if self.copied_by_code(
+                parameter_type,
+                SlotAddress(local.slot),
+                self.load(passed.ctype, SlotAddress(passed.slot)).expr,
+                function.token,
+                construct=True,
+            ):
+                continue
             self.copy_bytes(
                 parameter_type,
                 SlotAddress(local.slot),
@@ -7208,6 +7422,14 @@ class Lowerer:
                 # What arrived is the address of the caller's object; the copy
                 # C promises is made here, exactly as a real call makes it on
                 # entry to its own frame.
+                if self.copied_by_code(
+                    parameter_type,
+                    SlotAddress(local.slot),
+                    expression,
+                    node.token,
+                    construct=True,
+                ):
+                    continue
                 self.copy_bytes(
                     parameter_type, SlotAddress(local.slot), expression
                 )
@@ -7352,6 +7574,9 @@ class Lowerer:
             if node.name == "printf" and "printf" not in self.unit.functions:
                 self.printf(node)
                 return
+            if node.name == "fprintf" and "fprintf" not in self.unit.functions:
+                self.fprintf(node)
+                return
             if node.name in _INTO_A_BUFFER and node.name not in self.unit.functions:
                 self.formatted_into(node, bounded=node.name in _BOUNDED_BUFFER)
                 return
@@ -7474,6 +7699,14 @@ class Lowerer:
                         f"is {value.ctype}",
                         node.token,
                     )
+                if self.copied_by_code(
+                    ctype,
+                    self.address_of(local),
+                    value.expr,
+                    node.token,
+                    construct=True,
+                ):
+                    continue
                 self.copy_bytes(ctype, self.address_of(local), value.expr)
                 continue
             stored = self.assign_convert(
@@ -8188,11 +8421,18 @@ class Lowerer:
             )
         held = self.lookup(_RESULT_POINTER)
         assert held is not None
-        self.copy_bytes(
+        if not self.copied_by_code(
             result,
             self.load(held.ctype, SlotAddress(held.slot)).expr,
             value.expr,
-        )
+            node.token,
+            construct=True,
+        ):
+            self.copy_bytes(
+                result,
+                self.load(held.ctype, SlotAddress(held.slot)).expr,
+                value.expr,
+            )
         if context.call_body:
             self.emit(IRReturn(None))
             return
@@ -8219,7 +8459,7 @@ class Lowerer:
         """
 
         if self.sink is None:
-            self.emit(Write(payload))
+            self.emit(Write(payload, self.out_fd))
             return
         for byte in payload:
             self.put_byte(IntConstant(byte))
@@ -8264,7 +8504,7 @@ class Lowerer:
         """
 
         if self.sink is None:
-            self.emit(WriteRuntime(address, length))
+            self.emit(WriteRuntime(address, length, self.out_fd))
             return
         buffer, limit, count = self.sink
         source = self.new_temp()
@@ -8418,6 +8658,50 @@ class Lowerer:
             getattr(node, "token", None),
         )
         return 0
+
+    def fprintf(self, node: Call) -> None:
+        """`fprintf(stream, format, ...)`: printf, to the stream's descriptor.
+
+        Which stream is read when the call runs - a FILE * may be either -
+        and the formatting is written once for each, so the arguments are
+        worked out once, on the path taken.
+        """
+
+        if len(node.arguments) < 2:
+            self.error("fprintf needs a stream and a format", node.token)
+        stream = self.rvalue(node.arguments[0])
+        if not (
+            isinstance(stream.ctype, PointerType)
+            and isinstance(stream.ctype.target, StructType)
+            and stream.ctype.target.name == "__py2bin_file"
+        ):
+            self.error(
+                f"fprintf writes to a FILE *, not {stream.ctype}", node.token
+            )
+        field = stream.ctype.target.member("__py2bin_fd")
+        if field is None:
+            self.error("this FILE has no descriptor in it", node.token)
+        held = self.materialize(stream.expr)
+        descriptor = HeapLoad(
+            _binary("add", held, IntConstant(field.offset)), 4
+        )
+        to_stdout = self.new_label("fprintf_stdout")
+        done = self.new_label("fprintf_done")
+        self.emit(
+            JumpIfFalse(IntCompare("eq", descriptor, IntConstant(2)), to_stdout)
+        )
+        rest = Call(node.token, "fprintf", list(node.arguments[1:]))
+        was = self.out_fd
+        try:
+            self.out_fd = 2
+            self.printf(rest)
+            self.emit(Jump(done))
+            self.emit(Label(to_stdout))
+            self.out_fd = 1
+            self.printf(rest)
+        finally:
+            self.out_fd = was
+        self.emit(Label(done))
 
     def printf(self, node: Call) -> None:
         if not node.arguments or not isinstance(node.arguments[0], StringLiteral):

@@ -5713,3 +5713,183 @@ class CallsThroughATableWindowsDeclared(unittest.TestCase):
         )
         (call,) = _calls_through_pointers(module, "go")
         self.assertIsInstance(call.arguments[1], HeapLoad)
+
+
+_A_COUNTED_BOX = (
+    "#pragma py2bin owning Box Box__copy Box__assign\n"
+    "#include <stdio.h>\n"
+    "struct Box { int n; };\n"
+    "static void Box__copy(struct Box *this, struct Box *from) {\n"
+    "    this->n = from->n; printf(\"copy %d\\n\", from->n); }\n"
+    "static struct Box *Box__assign(struct Box *this, struct Box *from) {\n"
+    "    this->n = from->n; printf(\"assign %d\\n\", from->n); return this; }\n"
+)
+
+
+class ClassesCopiedByTheirOwnCode(CProgramTestCase):
+    """A struct the C++ translator marks is copied by calls, wherever C copies one.
+
+    `#pragma py2bin owning NAME COPY ASSIGN`: an assignment of one calls
+    ASSIGN, and an initialiser, a parameter taken by value and an answer
+    handed back call COPY - each taking the two addresses. A struct not
+    named is copied as its bytes, as C copies any struct.
+    """
+
+    def test_each_copy_c_makes_is_a_call(self) -> None:
+        self.run_c(
+            _A_COUNTED_BOX
+            + "static struct Box make(int n) { struct Box b; b.n = n; return b; }\n"
+            + "static int take(struct Box b) { return b.n; }\n"
+            + "int main(void) {\n"
+            + "    struct Box a; struct Box c;\n"
+            + "    a.n = 1; c.n = 0;\n"
+            + "    struct Box b = a;\n"
+            + "    c = a;\n"
+            + "    int t = take(a);\n"
+            + "    struct Box d = make(5);\n"
+            + "    printf(\"%d %d %d %d\\n\", b.n, c.n, t, d.n);\n"
+            + "    return 0;\n}\n",
+            stdout="copy 1\nassign 1\ncopy 1\ncopy 5\ncopy 5\n1 1 1 5\n",
+        )
+
+    def test_a_struct_not_named_is_copied_as_bytes(self) -> None:
+        self.run_c(
+            _STDIO
+            + "struct Plain { int n; };\n"
+            + "int main(void) { struct Plain a; struct Plain b; a.n = 4; b = a;\n"
+            + "    printf(\"%d\\n\", b.n); return 0; }\n",
+            stdout="4\n",
+        )
+
+    def test_copy_into_builds_a_copy_of_any_type(self) -> None:
+        self.run_c(
+            _A_COUNTED_BOX
+            + "int main(void) {\n"
+            + "    struct Box a; struct Box b; long x = 7; long y = 0; double f = 2.5, g = 0;\n"
+            + "    a.n = 3;\n"
+            + "    __py2bin_copy_into(&b, &a);\n"
+            + "    __py2bin_copy_into(&y, &x);\n"
+            + "    __py2bin_copy_into(&g, &f);\n"
+            + "    printf(\"%d %ld %.1f\\n\", b.n, y, g);\n"
+            + "    return 0;\n}\n",
+            stdout="copy 3\n3 7 2.5\n",
+        )
+
+    def test_default_into_zeroes_and_then_builds(self) -> None:
+        self.run_c(
+            "#pragma py2bin builds Made Made__ctor\n"
+            + _STDIO
+            + "struct Made { int n; int left; };\n"
+            + "static void Made__ctor(struct Made *this) { this->n = 9; }\n"
+            + "struct Bare { int a; int b; };\n"
+            + "int main(void) {\n"
+            + "    struct Made m; struct Bare r; long w;\n"
+            + "    m.left = 5; r.a = 1; r.b = 2; w = 3;\n"
+            + "    __py2bin_default_into(&m);\n"
+            + "    __py2bin_default_into(&r);\n"
+            + "    __py2bin_default_into(&w);\n"
+            + "    printf(\"%d %d %d %d %ld\\n\", m.n, m.left, r.a, r.b, w);\n"
+            + "    return 0;\n}\n",
+            stdout="9 0 0 0 0\n",
+        )
+
+    def test_a_marked_struct_with_no_copy_defined_is_refused(self) -> None:
+        self.reject(
+            "#pragma py2bin owning Box Box__copy Box__assign\n"
+            "struct Box { int n; };\n"
+            "int main(void) { struct Box a; struct Box b; a.n = 1; b = a; return b.n; }\n",
+            r"Box__assign\(\), is not defined in this translation unit",
+        )
+
+
+class AnAllocatorThatGivesBack(CProgramTestCase):
+    """`free` gives storage back, and `malloc` hands it out again.
+
+    The arena is fixed, and `free` used to keep nothing: a program that
+    allocated and freed in a loop ran out after its turnover passed the
+    arena, however little it held at any one time.
+    """
+
+    def test_turnover_past_the_arena_is_answered(self) -> None:
+        self.run_c(
+            _STDIO
+            + "#include <stdlib.h>\n"
+            + "int main(void) {\n"
+            + "    long round; long total = 0; void *keep[16]; int k;\n"
+            + "    for (k = 0; k < 16; k++) keep[k] = 0;\n"
+            + "    for (round = 0; round < 300000; round++) {\n"
+            + "        unsigned char *p = (unsigned char *)malloc((size_t)(16 + (round * 7919) % 4000));\n"
+            + "        if (p == NULL) { printf(\"ran out at %ld\\n\", round); return 1; }\n"
+            + "        p[0] = 1; total += p[0];\n"
+            + "        k = (int)(round % 16); free(keep[k]); keep[k] = p;\n"
+            + "    }\n"
+            + "    printf(\"%ld\\n\", total);\n"
+            + "    return 0;\n}\n",
+            stdout="300000\n",
+        )
+
+    def test_what_was_not_handed_out_is_left_alone(self) -> None:
+        # A second free, a pointer to the stack, and one into the middle of a
+        # block: none of them is a block's start, and each is ignored rather
+        # than put on a list.
+        self.run_c(
+            _STDIO
+            + "#include <stdlib.h>\n"
+            + "int main(void) {\n"
+            + "    char *s = (char *)malloc(10); int on_stack = 3;\n"
+            + "    free(s); free(s); free(&on_stack); free(s + 3);\n"
+            + "    char *t = (char *)malloc(10); char *u = (char *)malloc(10);\n"
+            + "    printf(\"%d %d\\n\", t != u, t != 0);\n"
+            + "    return 0;\n}\n",
+            stdout="1 1\n",
+        )
+
+    def test_realloc_keeps_what_was_there_and_calloc_clears_a_reused_block(self) -> None:
+        self.run_c(
+            _STDIO
+            + "#include <stdlib.h>\n#include <string.h>\n"
+            + "int main(void) {\n"
+            + "    char *s = (char *)malloc(8); unsigned char *d; int i, dirty = 0;\n"
+            + "    strcpy(s, \"abc\");\n"
+            + "    s = (char *)realloc(s, 5000); strcat(s, \"def\");\n"
+            + "    d = (unsigned char *)malloc(64); for (i = 0; i < 64; i++) d[i] = 0xff;\n"
+            + "    free(d);\n"
+            + "    d = (unsigned char *)calloc(64, 1); for (i = 0; i < 64; i++) dirty += d[i];\n"
+            + "    printf(\"%s %d\\n\", s, dirty);\n"
+            + "    return 0;\n}\n",
+            stdout="abcdef 0\n",
+        )
+
+
+class TheStandardStreams(CProgramTestCase):
+    """stdout and stderr as `FILE *`s, and what writes to them.
+
+    <stdio.h> had nothing but EOF and NULL: `puts`, `putchar`, `fputs`,
+    `fprintf` and `fflush` were each a call to a function declared nowhere.
+    """
+
+    def test_each_writer_in_the_order_written(self) -> None:
+        self.run_c(
+            _STDIO
+            + "int main(void) {\n"
+            + "    puts(\"hello\"); putchar('x'); putchar('\\n');\n"
+            + "    fputs(\"to out\\n\", stdout); fputc('y', stdout); putc('\\n', stdout);\n"
+            + "    fprintf(stdout, \"%d %s\\n\", 42, \"done\"); fflush(stdout);\n"
+            + "    return 0;\n}\n",
+            stdout="hello\nx\nto out\ny\n42 done\n",
+        )
+
+    def test_stderr_is_another_descriptor(self) -> None:
+        artifact = self.build(
+            _STDIO
+            + "int main(void) {\n"
+            + "    FILE *chosen = stderr;\n"
+            + "    printf(\"out\\n\"); fprintf(stderr, \"err %d\\n\", 7); fputs(\"more\\n\", chosen);\n"
+            + "    chosen = stdout; fprintf(chosen, \"back %d\\n\", 8);\n"
+            + "    return 0;\n}\n"
+        )
+        if not _HOST_IS_DARWIN_ARM64:
+            return
+        result = subprocess.run([str(artifact)], capture_output=True, text=True)
+        self.assertEqual(result.stdout, "out\nback 8\n")
+        self.assertEqual(result.stderr, "err 7\nmore\n")

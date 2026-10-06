@@ -676,6 +676,12 @@ _MACROS_HERE: "dict[str, str]" = {}
 #: declaration follows it.
 _MACRO_NAMES: "set[str]" = set()
 
+#: The macros that stand for a number, and the type of that number - however
+#: many times and under whatever condition each is defined, as long as every
+#: definition is a number of the same type. A name stands for a value in an
+#: argument list, and what type the value has is all an overload asks.
+_MACRO_NUMBERS: "dict[str, str]" = {}
+
 
 def _read_macros(text: str) -> None:
     """Note what this file's `#define` lines say, without running them.
@@ -693,6 +699,8 @@ def _read_macros(text: str) -> None:
 
     _MACROS_HERE.clear()
     _MACRO_NAMES.clear()
+    _MACRO_NUMBERS.clear()
+    numbers: "dict[str, set[str | None]]" = {}
     stands: "dict[str, str]" = {}
     unsettled: "set[str]" = set()
     #: How deep inside `#if`/`#endif` the reader stands. A `#define` under one
@@ -727,6 +735,15 @@ def _read_macros(text: str) -> None:
         if name in _MACRO_NAMES:
             unsettled.add(name)
         _MACRO_NAMES.add(name)
+        if not written.group(2) and "\\" not in part:
+            value = written.group(3).strip()
+            while value.startswith("(") and value.endswith(")"):
+                value = value[1:-1].strip()
+            numbers.setdefault(name, set()).add(
+                _deduced_type_read(value, "", -1)
+                if re.fullmatch(r"[+-]?(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*", value)
+                else None
+            )
         if written.group(2) or "\\" in part:
             # Arguments, or a body carried on the lines below it. Either one
             # needs the preprocessor proper, which this is not.
@@ -737,6 +754,9 @@ def _read_macros(text: str) -> None:
             unsettled.add(name)
             continue
         stands[name] = written.group(3).strip()
+    for name, kinds in numbers.items():
+        if len(kinds) == 1 and None not in kinds:
+            _MACRO_NUMBERS[name] = next(iter(kinds))
     for name, body in stands.items():
         if name in unsettled:
             continue
@@ -2244,6 +2264,23 @@ def _without_storage(spelled: str) -> str:
 def _deduced_type(expression: str, text: str, before: int = -1) -> "str | None":
     """What type an argument has, as far as this can tell without a type system.
 
+    And, for a name nothing declares, what a macro of that name stands for
+    if it is a number: `Bytes result(EVP_MAX_MD_SIZE);` is a vector of 64,
+    and with a copy constructor beside `vector(n)` a name with no type at all
+    could have been either.
+    """
+
+    found = _deduced_type_read(expression, text, before)
+    if found is None:
+        spelled = expression.strip()
+        if spelled.isidentifier() and spelled in _MACRO_NUMBERS:
+            return _MACRO_NUMBERS[spelled]
+    return found
+
+
+def _deduced_type_read(expression: str, text: str, before: int = -1) -> "str | None":
+    """What type an argument has, as far as this can tell without a type system.
+
     Literals say what they are. A name is looked up where it was declared. An
     expression is not worked out - a call whose type cannot be read is refused
     with the spelling that would settle it, rather than compiled as whatever
@@ -2760,6 +2797,19 @@ def _deduced_from_expression(spelled: str, text: str, before: int) -> "str | Non
     # it could not say which `string` was being built.
     walked = _walked_pointer(spelled)
     if walked is not None:
+        # Unless one side is an object of a class: then the `+` is that
+        # class's operator, and `"negative: " + to_string(v)` is a string -
+        # read as a pointer moved along, it was a `const char *`, and the
+        # string an exception was built from went to the constructor taking
+        # characters.
+        right = spelled[len(walked):].lstrip()[1:].strip()
+        for side in (walked, right):
+            typed = _deduced_type(side, text, before) if side else None
+            if typed is None or "*" in typed or "&" in typed:
+                continue
+            bare = re.sub(r"\b(?:const|volatile|struct|class)\b", " ", typed).strip()
+            if bare in _CLASS_NAMES and spelled[len(walked):].lstrip().startswith("+"):
+                return bare
         held = _deduced_type(walked, text, before)
         if held is not None and "*" in held:
             return held
@@ -4017,9 +4067,24 @@ def _array_extent(text: str, name: str) -> "int | None":
     """How many elements an array has, read from where it was declared."""
 
     code = _without_literals(text)
-    counted = re.search(
-        rf"(?<![.\w>]){_A_SPELLED_TYPE}\s+{re.escape(name)}\s*\[\s*(\d+)\s*\]",
-        code,
+    # The name may stand against the star - `const char *names[]` is how an
+    # array of strings is always written - so what separates the type from
+    # it is a space or the star itself.
+    between = r"(?:\s+|(?<=[*&])\s*)"
+    # Not a statement that merely names the array: `delete all[2];` reads as
+    # a type and a declaration of two, and a walk over the three-element
+    # array it deleted from stopped one short.
+    counted = next(
+        (
+            one
+            for one in re.finditer(
+                rf"(?<![.\w>]){_A_SPELLED_TYPE}{between}{re.escape(name)}"
+                rf"\s*\[\s*(\d+)\s*\]",
+                code,
+            )
+            if one.group(0).split()[0] not in _NOT_A_TYPE
+        ),
+        None,
     )
     if counted is not None:
         return int(counted.group(1))
@@ -4028,7 +4093,8 @@ def _array_extent(text: str, name: str) -> "int | None":
     # element may be a list of its own - `{{"a", 1}, {"b", 2}}` is two
     # elements - and stopping at the first one counted them wrong.
     listed = re.search(
-        rf"(?<![.\w>]){_A_SPELLED_TYPE}\s+{re.escape(name)}\s*\[\s*\]\s*=\s*\{{",
+        rf"(?<![.\w>]){_A_SPELLED_TYPE}{between}{re.escape(name)}"
+        rf"\s*\[\s*\]\s*=\s*\{{",
         code,
     )
     if listed is None:
@@ -4038,7 +4104,9 @@ def _array_extent(text: str, name: str) -> "int | None":
     except ValueError:
         return None
     inside = text[listed.end(): closing - 1].strip()
-    return len(_split_arguments(inside)) if inside else 0
+    # A trailing comma ends the list and adds nothing to it: `{"a", "b",}`
+    # is two. Counted as three, a loop over the array read one past its end.
+    return len([one for one in _split_arguments(inside) if one.strip()])
 
 #: `for (auto it = v.rbegin(); it != v.rend(); ++it)` - a walk back from the
 #: end, written the one way C++ writes it. The same container on both sides.
@@ -7385,13 +7453,21 @@ def _constructor_copies(
 
     made: "dict[str, str]" = {}
     bare = _without_literals(text)
+    # A declaration of one, or `new` of one - and not `holder *name(...)`,
+    # which is a function answering a pointer to one: read as a construction
+    # from two arguments, `vector__int *erase(vector__int *first, vector__int
+    # *last)` asked for a range constructor taking pointers to vectors.
     for built in re.finditer(
-        rf"(?<![.\w>])(?:new\s+)?{re.escape(holder)}\s+?\*?\s*"
+        rf"(?<![.\w>])(?:new\s+)?{re.escape(holder)}\s*"
         rf"(?:[A-Za-z_]\w*)?\s*\(",
         bare,
     ):
         close = _closing_paren(text, built.end() - 1)
         if close < 0:
+            continue
+        # Nor a definition of a function answering one by value: its
+        # parameter list is followed by a body, not by what ends a statement.
+        if re.match(r"\s*(?:const\s*)?\{", bare[close + 1:]):
             continue
         given = _call_arguments(text, built.end() - 1)
         if len(given) != len(_split_arguments(declared)):
@@ -7400,6 +7476,16 @@ def _constructor_copies(
             parameters, declared, given, text, built.start()
         )
         if deduced is None:
+            continue
+        # A parameter py2bin's own headers name `__py2bin_iterator` is one the
+        # standard constrains to an iterator, which a number is not:
+        # `vector<int> row(3, 7)` is three sevens, and copying the range
+        # constructor for `int` read it as a range from 3 to 7. C++ says the
+        # same thing with a constraint this subset has no spelling for.
+        if any(
+            name == _ITERATOR_PARAMETER and _ARITHMETIC_TYPE.match(held.strip())
+            for (name, _is_type, _is_pack), held in zip(parameters, deduced)
+        ):
             continue
         copy = _substituted(pattern, parameters, deduced)
         # Keyed by what the copy takes and not by how it is spelled. `const
@@ -7420,6 +7506,18 @@ def _constructor_copies(
             continue
         made[named] = copy
     return list(made.values())
+
+
+#: The name py2bin's own headers give a template parameter the standard
+#: constrains to an iterator. See `_constructor_copies`.
+_ITERATOR_PARAMETER = "__py2bin_iterator"
+
+#: A type that is a number, which no iterator is.
+_ARITHMETIC_TYPE = re.compile(
+    r"^(?:(?:const|volatile|signed|unsigned|short|long)\s+)*"
+    r"(?:char|short|int|long|bool|_Bool|float|double|size_t|ssize_t|ptrdiff_t"
+    r"|u?int(?:8|16|32|64)_t|wchar_t|char16_t|char32_t|unsigned|signed)$"
+)
 
 
 #: Where a member template's copies are to be written, held in the text
@@ -8889,16 +8987,190 @@ _THROWN_KINDS: "dict[str, int]" = {}
 
 
 def _kind_id(named: str) -> int:
-    """The number this class is in flight under. Zero is "not a class"."""
+    """The number a type is in flight under, given as `_kind_key` spells it.
+
+    Every type has one, not only a class: `catch (int)` and `catch (char)`
+    after the same `try` are told apart by it, and with one number for every
+    value that was not a class, `throw 'c'` was caught by `catch (int x)`.
+    """
 
     return _THROWN_KINDS.setdefault(named, len(_THROWN_KINDS) + 1)
-_IN_FLIGHT = "__py2bin_in_flight"
 
-#: Declared once, at the top of any file that throws.
+
+#: The spellings C gives one integer type more than one of. A handler and a
+#: throw name the same type however each was written.
+_ONE_SPELLING = {
+    "unsigned": "unsigned int",
+    "signed": "int",
+    "signed int": "int",
+    "short int": "short",
+    "signed short": "short",
+    "signed short int": "short",
+    "unsigned short int": "unsigned short",
+    "long int": "long",
+    "signed long": "long",
+    "signed long int": "long",
+    "unsigned long int": "unsigned long",
+    "long long int": "long long",
+    "signed long long": "long long",
+    "signed long long int": "long long",
+    "unsigned long long int": "unsigned long long",
+}
+
+#: The floating types. A value of one of these is kept in a slot of its own.
+_FLOATING = frozenset({"float", "double", "long double"})
+
+
+def _kind_key(spelled: str) -> str:
+    """The type a handler is written for, or a value is thrown as, by name.
+
+    Without what C++ ignores when it matches one to the other: `const`, a
+    reference, and the keyword in front of a class.
+    """
+
+    text = re.sub(
+        r"\b(?:const|volatile|struct|class|enum|union|typename)\b", " ", spelled
+    ).replace("&", " ")
+    stars = text.count("*")
+    bare = " ".join(text.replace("*", " ").split())
+    bare = _ONE_SPELLING.get(bare, bare)
+    return bare + " *" * stars
+
+
+#: Each class's bases as written, read where the class names are. A handler
+#: for a base takes what derives from it, and by the time a body is rewritten
+#: there is no class head left to ask.
+_BASES: "dict[str, list[str]]" = {}
+#: (derived, base) for each base a class names `virtual`.
+_SHARED_STEPS: "set[tuple[str, str]]" = set()
+#: Each enumerator, and the enumeration it belongs to: `throw Big;` throws
+#: an `Err`, which is what a `catch (Err e)` is looking for.
+_ENUMERATORS: "dict[str, str]" = {}
+
+
+def _paths_down_to(base: str) -> "list[tuple[str, str | None]]":
+    """Each class that is a `base`, and the member path to that subobject.
+
+    The class itself with an empty path, then everything deriving from it.
+    The path is None where the way there crosses a shared base, which has no
+    fixed place to name.
+    """
+
+    found: "list[tuple[str, str | None]]" = [(base, "")]
+    for derived in sorted(_BASES):
+        best: "str | None" = None
+        reached = False
+        stack: "list[tuple[str, str | None]]" = [(derived, "")]
+        while stack:
+            name, path = stack.pop()
+            if name == base and name != derived:
+                reached = True
+                best = path
+                break
+            for index, above in enumerate(_BASES.get(name, ())):
+                step = "__base" if index == 0 else f"__base{index}"
+                deeper = (
+                    None
+                    if path is None or (name, above) in _SHARED_STEPS
+                    else (step if not path else f"{path}.{step}")
+                )
+                stack.append((above, deeper))
+        if reached:
+            found.append((derived, best))
+    return found
+
+
+def _catch_type(spelled: str) -> "tuple[str, str | None]":
+    """What a handler is written for, and the name it gives it, if any.
+
+    `catch (const E &)` names nothing, and neither does `catch (int)`: the
+    type is what is left once a last word that is not part of it is taken off.
+    """
+
+    words = spelled.replace("*", " * ").replace("&", " & ").split()
+    if len(words) > 1 and _A_NAME.fullmatch(words[-1]):
+        last = words[-1]
+        part_of_type = (
+            last in _CLASS_NAMES
+            or last in _TYPEDEF_NAMES
+            or last in _ENUMERATORS.values()
+            or last in _ENDS_A_TYPE
+        )
+        if not part_of_type:
+            return " ".join(words[:-1]), last
+    return " ".join(words), None
+
+
+#: Words that can end the spelling of a type, so are never a handler's name:
+#: the type words, and the qualifiers that may stand after one.
+_ENDS_A_TYPE = _TYPE_WORDS | {"const", "volatile"}
+
+
+def _catch_condition(spelled: str, filename: str, body: str, at: int) -> str:
+    """The test of what is in flight that this handler takes it on.
+
+    A class takes itself and every class deriving from it, which is what a
+    handler for a base is for - `catch (const std::exception &e)` is written
+    for every exception there is. A pointer to a class takes pointers to
+    those. Anything else takes its own type and nothing else: C++ converts
+    nothing on the way into a handler but those.
+    """
+
+    held, _named = _catch_type(spelled)
+    key = _kind_key(held)
+    bare = key.replace("*", "").strip()
+    stars = key.count("*")
+    if bare in _CLASS_NAMES and stars <= 1:
+        kinds = [
+            _kind_id(derived + " *" * stars) for derived, _ in _paths_down_to(bare)
+        ]
+    else:
+        kinds = [_kind_id(key)]
+    return " || ".join(f"{_KIND} == {kind}" for kind in kinds)
+
+
+def _caught_address(bare: str, filename: str, body: str, at: int) -> str:
+    """The address of the `bare` part of what is in flight, as a `bare *`.
+
+    The object thrown may be any class deriving from it. Where it is that
+    class's first base the two addresses are one, and where it is not the
+    path to it is chosen by what was thrown.
+    """
+
+    pointer = f"({bare} *){_IN_FLIGHT}"
+    arms: "list[str]" = []
+    for derived, path in _paths_down_to(bare):
+        if path is None:
+            raise CppTranslationError(
+                filename,
+                _line_of(body, at),
+                f"catching {bare}, which {derived} derives from through a "
+                f"virtual base. py2bin cannot yet find that part of a thrown "
+                f"{derived}; catch {derived} itself",
+            )
+        if not path or all(step == "__base" for step in path.split(".")):
+            continue
+        arms.append(
+            f"{_KIND} == {_kind_id(derived)} ? "
+            f"({bare} *)&((({derived} *){_IN_FLIGHT})->{path}) : "
+        )
+    if not arms:
+        return pointer
+    return "(" + "".join(arms) + pointer + ")"
+_IN_FLIGHT = "__py2bin_in_flight"
+#: Where a floating-point value in flight is kept. The word above holds an
+#: integer or an address; a `double` put through it was cut to its whole
+#: part, so `throw 2.5;` was caught as 2.
+_IN_FLIGHT_REAL = "__py2bin_in_flight_real"
+
+#: Declared once, at the top of any file that throws. `long long` and not
+#: `long`: an object in flight is its address, and on Windows a `long` is
+#: half of one.
 _EXCEPTION_STATE = f"""
 static int {_THROWN} = 0;
 static int {_KIND} = 0;
-static long {_IN_FLIGHT} = 0;
+static long long {_IN_FLIGHT} = 0;
+static double {_IN_FLIGHT_REAL} = 0.0;
 """
 
 
@@ -8910,7 +9182,23 @@ def _zero_for(returns: str, classes: "dict[str, Class]") -> str:
     """
 
     spelled = returns.strip()
-    if spelled in ("", "void") or _returns_object_named(spelled, classes):
+    if spelled in ("", "void"):
+        return "return;"
+    if "&" in spelled:
+        # A reference is answered with what it refers to, and the pass that
+        # makes it a pointer takes the address of that: `return 0;` came
+        # out as `return &(0);`, which is no object at all.
+        # Without `const`, which is the one word an accessor pair differs
+        # by: written here, it made the two bodies two texts, and the pair
+        # was refused for doing different things.
+        referred = re.sub(r"\bconst\b", " ", spelled.replace("&", "")).strip()
+        referred = " ".join(referred.split())
+        return f"return *({referred} *)0;"
+    # The class names the file declares, when nothing more was handed in:
+    # the exception pass runs before the classes are read, and asked of an
+    # empty table a function answering a `string` left with `return 0;` -
+    # a string built from a null pointer, on the way out.
+    if _returns_object_named(spelled, classes or dict.fromkeys(_CLASS_NAMES)):
         return "return;"
     return "return 0;"
 
@@ -8949,6 +9237,12 @@ def _every_body(text: str) -> "list[tuple[re.Match[str], int, str, str]]":
         # rewritten, while the same function without the word was.
         while head.split() and head.split()[0] in _STORAGE | _DISPATCH:
             head = head.split(None, 1)[1] if " " in head else ""
+        # Nor is `const` in front of the type it qualifies: read as the first
+        # word, it put `const char *what() const` and every `const T &at()`
+        # outside what this reads - a throw in one was never rewritten, and a
+        # call in one to a function that throws was never followed by a test.
+        while len(head.split()) > 1 and head.split()[0] in ("const", "volatile"):
+            head = head.split(None, 1)[1]
         if not head or head.split()[0] in _NOT_A_TYPE:
             continue
         words = head.replace("*", " * ").replace("&", " & ").split()
@@ -8961,7 +9255,32 @@ def _every_body(text: str) -> "list[tuple[re.Match[str], int, str, str]]":
         except ValueError:
             continue
         found.append((match, closing, name, returns))
+    # And the operators, which the pattern above cannot read: `operator()`
+    # has a parenthesis where a name ends. A lambda is a class whose body is
+    # its `operator()`, so a `throw` in a lambda was never rewritten at all.
+    for match in _OPERATOR_DEFINITION.finditer(text):
+        head = match.group(1).strip()
+        while head.split() and head.split()[0] in _STORAGE | _DISPATCH:
+            head = head.split(None, 1)[1] if " " in head else ""
+        while len(head.split()) > 1 and head.split()[0] in ("const", "volatile"):
+            head = head.split(None, 1)[1]
+        try:
+            closing = _matching(text, match.end() - 1)
+        except ValueError:
+            continue
+        name = "operator" + re.sub(r"\s+", "", match.group(2))
+        found.append((match, closing, name, head))
+    found.sort(key=lambda one: one[0].start())
     return found
+
+
+#: `int operator()(int x) const {`, `T &operator[](int i) {`, `V operator+(...)`.
+#: The return type is group 1, what the operator is is group 2.
+_OPERATOR_DEFINITION = re.compile(
+    r"(?<![\w])([A-Za-z_][\w\s*&:]*?[\s*&]|)operator\s*"
+    r"(\(\s*\)|\[\s*\]|[^\s\w(]+|[A-Za-z_][\w\s*&]*?)\s*"
+    r"\(([^;{}()]*)\)\s*(?:const\s*)?(?:noexcept\s*)?\{"
+)
 
 
 def _throwing_names(text: str) -> "set[str]":
@@ -8977,8 +9296,28 @@ def _throwing_names(text: str) -> "set[str]":
     # does not throw does not stop the base it overrides from throwing, and
     # a call through a base pointer can reach either.
     bodies: "dict[str, list[str]]" = {}
+    #: The classes a constructor builds as its members and its base. An
+    #: initialiser does not look like a call - `b(x)` is written as a marker
+    #: naming the member - and a constructor of the member that throws makes
+    #: this constructor one that throws as surely as a call to it would.
+    builds: "dict[str, set[str]]" = {}
     for match, closing, name, _returns in _every_body(text):
-        bodies.setdefault(name, []).append(text[match.end() - 1: closing])
+        body = text[match.end() - 1: closing]
+        bodies.setdefault(name, []).append(body)
+        owner = _owner_of(text, match)
+        if owner is not None and name == owner:
+            builds.setdefault(name, set()).update(_subobjects_built(owner, body))
+    #: The class each operator belongs to, by the name `_every_body` gives
+    #: it: an operator is only ever reached through an object of its class.
+    #: And each function's text with its head, where its parameters are.
+    operators: "dict[str, set[str]]" = {}
+    headed: "dict[str, list[str]]" = {}
+    for match, _closing, name, _returns in _every_body(text):
+        headed.setdefault(name, []).append(text[match.start(): _closing])
+        if name.startswith("operator"):
+            owner = _owner_of(text, match)
+            if owner is not None:
+                operators.setdefault(name, set()).add(owner)
     throwing = {
         name
         for name, written in bodies.items()
@@ -8986,6 +9325,10 @@ def _throwing_names(text: str) -> "set[str]":
     }
     while True:
         grown = set(throwing)
+        _OPERATOR_HOLDERS.clear()
+        for name in grown:
+            for owner in operators.get(name, ()):
+                _OPERATOR_HOLDERS.setdefault(owner, set()).add(name)
         for name, written in bodies.items():
             if name in grown:
                 continue
@@ -8993,11 +9336,188 @@ def _throwing_names(text: str) -> "set[str]":
             if any(
                 re.search(rf"(?<![\w>]){re.escape(other)}\s*\(", code)
                 for other in throwing
+                if not other.startswith("operator")
+            ) or builds.get(name, set()) & throwing or any(
+                _operator_uses(one, _without_literals(one))
+                for one in headed.get(name, ())
             ):
                 grown.add(name)
         if grown == throwing:
+            for name in throwing:
+                if not name.startswith("operator") or name in _OPERATORS_FOLLOWED:
+                    continue
+                # One whose own body throws. One that is on this list only
+                # because it calls something of a name that throws somewhere
+                # - `operator+=` calls `push_back`, and some class's
+                # `push_back` builds an object that can throw - is what this
+                # reading is conservative about, and is not refused for it.
+                if not any(
+                    _THROW.search(_without_literals(body))
+                    for body in bodies.get(name, ())
+                ):
+                    continue
+                raise CppTranslationError(
+                    "<c++>",
+                    0,
+                    f"{name} of {', '.join(sorted(operators.get(name, ())))} can "
+                    f"throw. py2bin tests for an exception after each call that "
+                    f"can raise one, and a use of this operator is not written "
+                    f"as a call it can find; a call operator and a subscript are "
+                    f"followed, and this one is not yet. Give it a name and call "
+                    f"that",
+                )
             return throwing
         throwing = grown
+
+
+#: The operators whose uses this follows: the call of an object, and its
+#: subscript - which are what a lambda and a checked container are.
+_OPERATORS_FOLLOWED = frozenset({"operator()", "operator[]"})
+
+#: Each class with an operator that can throw, and which of the followed
+#: ones those are. Filled where the throwing names are worked out.
+_OPERATOR_HOLDERS: "dict[str, set[str]]" = {}
+
+
+def _operator_holders(body: str) -> "tuple[set[str], set[str]]":
+    """The names this body gives objects whose call, and subscript, can throw.
+
+    Declared in it - a local or a parameter - with the class written in front.
+    """
+
+    called: "set[str]" = set()
+    indexed: "set[str]" = set()
+    if not _OPERATOR_HOLDERS:
+        return called, indexed
+    code = _without_literals(body)
+    for owner, which in _OPERATOR_HOLDERS.items():
+        for declared in re.finditer(
+            rf"(?<![\w.>]){re.escape(owner)}\s*[*&]?\s*([A-Za-z_]\w*)\s*[;=,(){{\[]",
+            code,
+        ):
+            if "operator()" in which:
+                called.add(declared.group(1))
+            if "operator[]" in which:
+                indexed.add(declared.group(1))
+    return called, indexed
+
+
+def _operator_uses(body: str, code: str) -> bool:
+    """Whether this body calls or subscripts an object whose operator throws."""
+
+    called, indexed = _operator_holders(body)
+    return any(
+        re.search(rf"(?<![\w.>]){re.escape(one)}\s*\(", code) for one in called
+    ) or any(
+        re.search(rf"(?<![\w.>]){re.escape(one)}\s*\[", code) for one in indexed
+    )
+
+
+def _owner_of(text: str, match: "re.Match[str]") -> "str | None":
+    """The class a function found by `_every_body` is a member of, if any.
+
+    Written inside the class, or outside it as `Whole::Whole(int x)`.
+    """
+
+    owner = _enclosing_class(text, match.start())
+    if owner is None:
+        qualified = re.search(
+            r"([A-Za-z_]\w*)\s*::\s*~?[A-Za-z_]\w*\s*$", match.group(1)
+        )
+        if qualified is not None:
+            owner = qualified.group(1)
+    return owner
+
+
+def _member_classes(owner: str) -> "list[tuple[str, str]]":
+    """Each data member of `owner` that is an object of a class, in order."""
+
+    found: "list[tuple[str, str]]" = []
+    for name, spelled in _CLASS_MEMBERS.get(owner, ()):
+        bare = re.sub(r"\b(?:const|volatile|struct|class|mutable)\b", " ", spelled).strip()
+        if bare in _CLASS_NAMES and "*" not in spelled and "&" not in spelled:
+            found.append((name, bare))
+    return found
+
+
+def _subobjects_built(owner: str, body: str) -> "set[str]":
+    """The classes this constructor builds subobjects of: members and base."""
+
+    built: "set[str]" = set()
+    held = dict(_member_classes(owner))
+    for marker in re.finditer(rf"{_MEMBER_INIT}\s*\(\s*([A-Za-z_]\w*)", body):
+        if marker.group(1) in held:
+            built.add(held[marker.group(1)])
+    # The members the list does not name are built as well, with their
+    # default constructors - which can throw as readily.
+    built.update(held.values())
+    bases = _BASES.get(owner) or []
+    if bases:
+        built.add(bases[0])
+    return built
+
+
+#: Where a constructor that is leaving takes apart a member it had built, and
+#: its base: written by the exception pass, which knows the order, and turned
+#: into the destructor calls where the constructor is written out, which knows
+#: the layout.
+_MEMBER_UNDO = "__py2bin_member_undo"
+_BASE_UNDO = "__py2bin_base_undo"
+
+
+def _constructor_leaving(
+    body: str, owner: str, throwing: "set[str]"
+) -> "tuple[str, str]":
+    """A constructor's body with a test after each subobject that can throw.
+
+    And what every other way out of it has to take apart first: each member
+    with its destructor, last built first, then the base. C++ unwinds a
+    constructor that throws through what it had finished - the members before
+    the one that threw, and none of its own destructor, since the object was
+    never built. Without this a member that threw was stepped over, the
+    members after it were built, the body ran, and the object was destroyed
+    on the way out as though it existed.
+    """
+
+    members = _member_classes(owner)
+    order = [name for name, _held in members]
+    bases = _BASES.get(owner) or []
+    base_undo = f"{_BASE_UNDO}(); " if bases else ""
+
+    def undo_before(index: int) -> str:
+        return "".join(
+            f"{_MEMBER_UNDO}({name}); " for name in reversed(order[:index])
+        ) + base_undo
+
+    out: "list[str]" = []
+    at = 0
+    pattern = re.compile(rf"({_BASE_INIT}|{_MEMBER_INIT})\s*\(")
+    for marker in pattern.finditer(body):
+        if marker.start() < at:
+            continue
+        close = _closing_paren(body, marker.end() - 1)
+        if close < 0:
+            continue
+        end = close + 1
+        while end < len(body) and body[end] in " \t":
+            end += 1
+        if end >= len(body) or body[end] != ";":
+            continue
+        end += 1
+        out.append(body[at:end])
+        at = end
+        if marker.group(1) == _BASE_INIT:
+            if bases and bases[0] in throwing:
+                out.append(f" if ({_THROWN}) {{ return; }} ")
+            continue
+        named = _split_arguments(body[marker.end(): close])
+        member = named[0].strip() if named else ""
+        if member in order and dict(members)[member] in throwing:
+            out.append(
+                f" if ({_THROWN}) {{ {undo_before(order.index(member))}return; }} "
+            )
+    out.append(body[at:])
+    return "".join(out), undo_before(len(order))
 
 
 def _result_types(text: str) -> "dict[str, str]":
@@ -9009,7 +9529,11 @@ def _result_types(text: str) -> "dict[str, str]":
         # A constructor writes no return type, and what it answers with is
         # the object. Read as a `long`, a lifted `T(x)` went into a temporary
         # the width of a word and the object was cut down to fit.
-        found[name] = (spelled or name).replace("&", "*")
+        # A reference stays one: the temporary is that reference, bound to
+        # what the call answered, and read and written as the call would
+        # have been. Made a pointer, `total += get(1)` added an address and
+        # `get(2) = 99` pointed the temporary somewhere else.
+        found[name] = spelled or name
     return found
 
 
@@ -9023,8 +9547,19 @@ def _rewrite_exceptions_early(text: str, filename: str) -> str:
     """
 
     throwing = _throwing_names(text)
-    global _CALL_RESULT_TYPES
+    global _CALL_RESULT_TYPES, _BUILT_BY_CONSTRUCTOR, _METHOD_RESULT_TYPES
     _CALL_RESULT_TYPES = _result_types(text)
+    _METHOD_RESULT_TYPES = {}
+    for match, _closing, name, returns in _every_body(text):
+        owner = _enclosing_class(text, match.start())
+        spelled = re.sub(r"\b(static|inline|virtual|extern)\b", "", returns).strip()
+        if owner is not None and spelled:
+            _METHOD_RESULT_TYPES.setdefault((owner, name), spelled)
+    _BUILT_BY_CONSTRUCTOR = {
+        head.group(2)
+        for head in _CLASS_HEAD.finditer(text)
+        if _has_a_constructor(text, head)
+    }
     counter = [0]
     out: list[str] = []
     at = 0
@@ -9034,6 +9569,10 @@ def _rewrite_exceptions_early(text: str, filename: str) -> str:
         opening = match.end() - 1
         spelled = re.sub(r"\b(static|inline|virtual|extern)\b", "", returns).strip()
         out.append(text[at:opening])
+        _LIFT_SCOPE[0] = text[:closing]
+        _LIFT_OWNER[0] = _enclosing_class(text, match.start())
+        _LIFT_OPERATORS[0] = _operator_holders(text[match.start():closing])
+        owner = _owner_of(text, match)
         out.append(
             _rewrite_exceptions(
                 text[opening:closing],
@@ -9043,6 +9582,7 @@ def _rewrite_exceptions_early(text: str, filename: str) -> str:
                 filename,
                 counter,
                 uncaught=name == "main",
+                building=owner if owner is not None and name == owner else None,
             )
         )
         at = closing
@@ -9057,7 +9597,9 @@ class _Landing:
     with the flag still set so the caller's own check finds it.
     """
 
-    __slots__ = ("label", "returns", "classes", "uncaught")
+    __slots__ = (
+        "label", "returns", "classes", "uncaught", "filename", "braced", "undo",
+    )
 
     def __init__(
         self,
@@ -9065,10 +9607,18 @@ class _Landing:
         returns: str,
         classes,
         uncaught: bool = False,
+        filename: str = "<c++>",
     ) -> None:
         self.label = label
         self.returns = returns
         self.classes = classes
+        self.filename = filename
+        #: How many brace-built objects this landing has thrown, which names
+        #: the local each is built in.
+        self.braced = 0
+        #: What a constructor takes apart on its way out: the members and the
+        #: base it had built. Empty for anything that is not a constructor.
+        self.undo = ""
         #: Set on `main`, where there is nothing left to propagate to. C++
         #: calls terminate here, which aborts; py2bin has no way to raise a
         #: signal, so the program stops with a status of its own instead of
@@ -9080,13 +9630,15 @@ class _Landing:
             return f"goto {self.label};"
         if self.uncaught:
             return f"return {UNCAUGHT_STATUS};"
+        if self.undo:
+            return f"{{ {self.undo}{_zero_for(self.returns, self.classes)} }}"
         return _zero_for(self.returns, self.classes)
 
 
 #: What a program exits with when an exception reaches the end of `main`.
 #: C++ aborts there; this is the nearest thing a translation to C can do, and
 #: it is a status a caller can test rather than a silent success.
-UNCAUGHT_STATUS = 3
+UNCAUGHT_STATUS = 134
 
 #: Operators whose right side runs only sometimes. A call split out of one of
 #: these would run when C++ says it must not.
@@ -9101,19 +9653,23 @@ def _rewrite_exceptions(
     filename: str,
     counter: "list[int]",
     uncaught: bool = False,
+    building: "str | None" = None,
 ) -> str:
-    """Turn `throw`, `try` and `catch` into flags, checks and labels."""
+    """Turn `throw`, `try` and `catch` into flags, checks and labels.
 
-    if not throwing and not _THROW.search(_without_literals(body)):
+    `building` names the class when this is one of its constructors.
+    """
+
+    if (
+        not throwing
+        and not _THROW.search(_without_literals(body))
+        and not _TRY.search(_without_literals(body))
+    ):
         return body
-    return _guarded(
-        body,
-        _Landing(None, returns, classes, uncaught),
-        throwing,
-        classes,
-        filename,
-        counter,
-    )
+    landing = _Landing(None, returns, classes, uncaught, filename)
+    if building is not None:
+        body, landing.undo = _constructor_leaving(body, building, throwing)
+    return _guarded(body, landing, throwing, classes, filename, counter)
 
 
 #: Stands in for a try that has been dealt with, while the rest is. The `;`
@@ -9218,7 +9774,7 @@ def _extract_tries(
 
         guarded = _guarded(
             body[opening + 1: closing - 1],
-            _Landing(label, landing.returns, landing.classes),
+            _Landing(label, landing.returns, landing.classes, False, filename),
             throwing,
             classes,
             filename,
@@ -9236,16 +9792,16 @@ def _extract_tries(
                 counter,
             )
             caught = _catch_binding(spelled, filename, body, open_at, classes)
-            # One handler is not a choice, and asking what is in flight would
-            # be a new way to be wrong: where the thrown type could not be
-            # read it is nothing in particular, and a lone handler has always
-            # taken whatever arrived. More than one has to be told apart.
-            if len(clauses) == 1 or spelled in ("...", ""):
+            if spelled in ("...", ""):
                 anything = True
                 pieces.append(f"{{ {caught}{handled} }} goto {after};")
                 break
+            # A lone handler is a test like any other. Taken as matching
+            # whatever arrived, `try { throw B(4); } catch (const A &a)`
+            # inside a try for B ran A's handler and carried on, and the
+            # handler for B never ran.
             pieces.append(
-                f"if ({_KIND} == {_catch_kind(spelled)}) "
+                f"if ({_catch_condition(spelled, filename, body, open_at)}) "
                 f"{{ {caught}{handled} goto {after}; }}"
             )
         # Nothing matched, so this try is not where it is handled: the flag
@@ -9263,16 +9819,6 @@ def _extract_tries(
         )
 
 
-def _catch_kind(spelled: str) -> int:
-    """The number a handler is looking for. Zero for anything not a class."""
-
-    bare = re.sub(
-        r"\b(?:const|volatile|struct|class)\b|[*&]", " ", spelled
-    ).split()
-    named = bare[0] if bare else ""
-    return _kind_id(named) if named in _CLASS_NAMES else 0
-
-
 def _catch_binding(
     spelled: str,
     filename: str,
@@ -9285,47 +9831,34 @@ def _catch_binding(
     if spelled in ("...", ""):
         return ""
     by_reference = "&" in spelled
-    words = spelled.replace("*", " * ").replace("&", " ").split()
-    if len(words) < 2:
-        raise CppTranslationError(
-            filename, _line_of(body, at),
-            f"cannot read the catch parameter {spelled!r}; py2bin catches by "
-            f"value, so write it as `catch (int e)` or `catch (...)`",
-        )
-    named = words[-1]
-    held = " ".join(words[:-1])
+    held, named = _catch_type(spelled.replace("&", " "))
+    if named is None:
+        # `catch (const E &)`: the handler takes it and names nothing.
+        return ""
+    held = held.strip()
     # `catch (const Bad &b)` is the form C++ asks for, and the qualifier is
     # part of what was written. Read the class out from under it: looked up
     # whole, `const Bad` was not a class this file declares and the handler
     # was built as though it had caught a number.
     bare = re.sub(r"\b(?:const|volatile|struct|class)\b", " ", held).strip()
     if bare in _CLASS_NAMES or bare in classes:
+        address = _caught_address(bare, filename, body, at)
         if by_reference:
             # A reference to what is in flight, not a copy of it - which is
             # what `catch (std::exception &e)` is for. Written as a C++
             # reference so the pass that turns those into pointers does it,
             # and `e.what()` reaches the object that was actually thrown
             # rather than the base it was sliced to.
-            return f"{held} &{named} = *({held} *){_IN_FLIGHT}; "
-        if bare in _POLYMORPHIC and bare in _INHERITED_FROM:
-            raise CppTranslationError(
-                filename,
-                _line_of(body, at),
-                f"catching {bare} by value, and something in this "
-                f"file derives from it. C++ slices the object to that class "
-                f"here, so a virtual function called on it answers as the "
-                f"base rather than as what was thrown - py2bin's copy keeps "
-                f"the object it was made from and would answer differently. "
-                f"Write `catch ({bare} &{named})`, which is what the "
-                f"slicing is a reason to write anyway",
-            )
-        # Declared and then assigned, not initialised: py2bin's C takes
-        # `o = *p;` and not `struct V o = *p;`.
-        # Without the qualifier: the copy is assigned to on the next
-        # statement, and a `const` one cannot be.
-        return (
-            f"{bare} {named}; {named} = *({bare} *){_IN_FLIGHT}; "
-        )
+            return f"{held} &{named} = *{address}; "
+        # A copy of the part of it that is a `bare`, made by `bare`'s own
+        # copy - so a handler for a base taking a derived object by value
+        # has a base, with the base's table, as C++ slices it to. Built, not
+        # assigned over a default one: a class with no default constructor
+        # was refused, and one with a counting constructor counted twice.
+        return f"{bare} {named} = *{address}; "
+    key = _kind_key(held)
+    if key in _FLOATING:
+        return f"{held} {named} = ({held}){_IN_FLIGHT_REAL}; "
     return f"{held} {named} = ({held}){_IN_FLIGHT}; "
 
 
@@ -9344,31 +9877,112 @@ def _thrown(match: "re.Match[str]", landing: "_Landing", body: str) -> str:
         # A bare `throw;` inside a handler: what is in flight stays in flight.
         return f"{{ {_THROWN} = 1; {landing.leave()} }}"
     made = _CONSTRUCTED.match(spelled)
-    if made is not None and made.group(1) in _CLASS_NAMES:
+    if (
+        made is not None
+        and made.group(1) in _CLASS_NAMES
+        and _closing_paren(spelled, made.end() - 1) == len(spelled) - 1
+    ):
         # A temporary built in the throw itself, which is how the standard
         # exception types are always thrown. `new` allocates and runs the
         # constructor, which is exactly the copy that has to outlive the
         # frame - so this is written as `new` and goes through that path.
         return (
-            f"{{ {_THROWN} = 1; {_KIND} = {_kind_id(made.group(1))}; "
-            f"{made.group(1)} *__py2bin_raised = new {spelled}; "
-            f"{_IN_FLIGHT} = (long)__py2bin_raised; {landing.leave()} }}"
+            f"{{ {made.group(1)} *__py2bin_raised = new {spelled}; "
+            f"{_THROWN} = 1; {_KIND} = {_kind_id(made.group(1))}; "
+            f"{_IN_FLIGHT} = (long long)__py2bin_raised; {landing.leave()} }}"
+        )
+    braced = _A_BRACED_THROW.match(spelled)
+    if (
+        braced is not None
+        and braced.group(1) in _CLASS_NAMES
+        and _matching(spelled, braced.end() - 1) == len(spelled)
+    ):
+        # `throw E{7, 8};` - read as a value of no class, it was cast to a
+        # word. A class with a constructor is given the braces as its
+        # arguments, which is what they are to one; an aggregate is built
+        # from them as a declaration is, then copied to where it outlives
+        # the frame.
+        named = braced.group(1)
+        if named in _BUILT_BY_CONSTRUCTOR:
+            arguments = spelled[braced.end(): -1]
+            return (
+                f"{{ {named} *__py2bin_raised = new {named}({arguments}); "
+                f"{_THROWN} = 1; {_KIND} = {_kind_id(named)}; "
+                f"{_IN_FLIGHT} = (long long)__py2bin_raised; {landing.leave()} }}"
+            )
+        landing.braced += 1
+        local = f"__py2bin_throwing_{landing.braced}"
+        # One member at a time where a member is an object of a class, as a
+        # declaration of the same shape is: written as a C initialiser list,
+        # `{"unexpected token at " + std::to_string(line), line}` handed a
+        # string's own struct the pieces of an expression.
+        declared = _built_one_member_at_a_time(
+            named, local, spelled[braced.end(): -1], _LIFT_SCOPE[0]
+        ) or f"{named} {local} = {spelled[braced.end() - 1:]};"
+        return (
+            f"{{ {declared} "
+            f"{named} *__py2bin_raised = ({named} *)malloc(sizeof({named})); "
+            f"__py2bin_copy_into(__py2bin_raised, &{local}); "
+            f"{_THROWN} = 1; {_KIND} = {_kind_id(named)}; "
+            f"{_IN_FLIGHT} = (long long)__py2bin_raised; {landing.leave()} }}"
         )
     held = _deduced_type(spelled, body, match.start())
-    if held is not None and held.replace("*", "").strip() in _CLASS_NAMES:
+    if held is not None and held.replace("*", "").strip() in _CLASS_NAMES and "*" not in held:
         named = held.replace("*", "").strip()
         return (
-            f"{{ {_THROWN} = 1; {_KIND} = {_kind_id(named)}; "
-            f"{named} *__py2bin_raised = ({named} *)malloc(sizeof({named})); "
-            f"*__py2bin_raised = {spelled}; "
-            f"{_IN_FLIGHT} = (long)__py2bin_raised; {landing.leave()} }}"
+            f"{{ {named} *__py2bin_raised = ({named} *)malloc(sizeof({named})); "
+            f"__py2bin_copy_into(__py2bin_raised, &({spelled})); "
+            f"{_THROWN} = 1; {_KIND} = {_kind_id(named)}; "
+            f"{_IN_FLIGHT} = (long long)__py2bin_raised; {landing.leave()} }}"
         )
-    # Not a class, so nothing to tell apart by: a number in flight goes under
-    # the kind every non-class value shares.
+    key = _thrown_key(spelled, held)
+    if key is None:
+        raise CppTranslationError(
+            landing.filename,
+            _line_of(body, match.start()),
+            f"cannot tell what type `throw {spelled}` throws, and a handler "
+            f"is chosen by it; give it a type py2bin can read - a variable, "
+            f"a cast, or a literal",
+        )
+    if key in _FLOATING:
+        return (
+            f"{{ {_IN_FLIGHT_REAL} = (double)({spelled}); "
+            f"{_THROWN} = 1; {_KIND} = {_kind_id(key)}; {landing.leave()} }}"
+        )
     return (
-        f"{{ {_THROWN} = 1; {_KIND} = 0; "
-        f"{_IN_FLIGHT} = (long)({spelled}); {landing.leave()} }}"
+        f"{{ {_IN_FLIGHT} = (long long)({spelled}); "
+        f"{_THROWN} = 1; {_KIND} = {_kind_id(key)}; {landing.leave()} }}"
     )
+
+
+#: The classes that have a constructor of their own, read where the throws
+#: are rewritten: braces given to one of these are its arguments, and given to
+#: anything else they are its members' values.
+_BUILT_BY_CONSTRUCTOR: "set[str]" = set()
+
+#: `E{7, 8}` - a temporary built from braces where it is thrown. Named for
+#: itself: called `_BRACED_TEMPORARY`, it replaced the pattern of that name
+#: the pass for `string{}` reads, and every empty object written where a
+#: value goes was left as braces.
+_A_BRACED_THROW = re.compile(r"^([A-Za-z_]\w*)\s*\{")
+
+#: A floating-point literal written with the suffix that makes it a float.
+_FLOAT_LITERAL = re.compile(r"^[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?[fF]$")
+
+
+def _thrown_key(spelled: str, held: "str | None") -> "str | None":
+    """The type of a value that is not an object of a class, as a kind key."""
+
+    if _FLOAT_LITERAL.match(spelled.strip()):
+        return "float"
+    if held is not None:
+        return _kind_key(held)
+    if spelled.strip() in _ENUMERATORS:
+        return _ENUMERATORS[spelled.strip()]
+    created = re.match(r"^new\s+([A-Za-z_]\w*)\b", spelled.strip())
+    if created is not None:
+        return _kind_key(created.group(1) + " *")
+    return None
 
 
 #: `Err(1, 2)` - a temporary built where it is thrown.
@@ -9479,6 +10093,78 @@ _POLYMORPHIC: "set[str]" = set()
 _INHERITED_FROM: "set[str]" = set()
 
 
+#: `enum Err { None, Small = 2, Big }` and `enum class Err : int { ... }`.
+_ENUM_BODY = re.compile(
+    r"\benum\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)\s*(?::\s*[\w\s]+?)?\{([^{}]*)\}"
+)
+
+
+#: `void __py2bin_throw_out_of_range(const char *w) { throw std::out_of_range(w); }`
+#: - a place in py2bin's own headers where the library throws. After the
+#: namespaces are gone, which takes the `std::` off what it throws.
+_THROW_POINT = re.compile(
+    r"\bvoid\s+(__py2bin_throw_\w+)\s*\(([^()]*)\)\s*\{\s*"
+    r"throw\s+([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*;\s*\}"
+)
+
+
+def _settle_library_throws(text: str) -> str:
+    """Each place the library throws, as a throw only where it can be caught.
+
+    `v.at(9)` throws `std::out_of_range`, and in a program with no handler
+    that could catch one - none for it, for a class it derives from, and no
+    `catch (...)` - what C++ does next is terminate. Written as that, the
+    throw is a call that does not come back, and nothing that calls `at` is a
+    function that can throw: no flag is tested after every `at`, and none of
+    them is refused for standing in a loop's condition. Where a handler could
+    catch it, it is thrown, and the program goes where C++ goes.
+    """
+
+    found = list(_THROW_POINT.finditer(text))
+    if not found:
+        return text
+    code = _without_literals(text)
+    catchers = [m.group(1).strip() for m in _CATCH.finditer(code)]
+
+    def catchable(named: str) -> bool:
+        for spelled in catchers:
+            if spelled in ("...", ""):
+                return True
+            held, _name = _catch_type(spelled.replace("&", " "))
+            bare = _kind_key(held).replace("*", "").strip()
+            if bare == named or (
+                bare in _CLASS_NAMES
+                and any(one == named for one, _ in _paths_down_to(bare))
+            ):
+                return True
+        return False
+
+    def settle(match: "re.Match[str]") -> str:
+        thrown = match.group(3)
+        if catchable(thrown):
+            return match.group(0)
+        named = _protect_one_literal(f'"std::{thrown}"')
+        return (
+            f"void {match.group(1)}({match.group(2)}) {{ "
+            f"{thrown} __py2bin_unthrown({match.group(4)}); "
+            f"__py2bin_uncaught({named}, __py2bin_unthrown.what()); }}"
+        )
+
+    return _THROW_POINT.sub(settle, text)
+
+
+def _enumerators_of(text: str) -> "dict[str, str]":
+    """Each enumerator the text declares, and its enumeration's name."""
+
+    found: "dict[str, str]" = {}
+    for match in _ENUM_BODY.finditer(text):
+        for entry in match.group(2).split(","):
+            name = entry.split("=")[0].strip()
+            if _A_NAME.fullmatch(name):
+                found[name] = match.group(1)
+    return found
+
+
 def _polymorphic_names(text: str) -> "set[str]":
     """Class names that have a virtual function, their own or inherited."""
 
@@ -9549,26 +10235,65 @@ def _split_statements(
             # and C++ does not destroy what was never built.
             out.append(statement)
             out.append(f" if ({_THROWN}) {{ {landing.leave()} }} ")
+            out.append(f" {_BUILT_MARK}({built.group(2)}); ")
             continue
         calls = _throwing_calls(statement, throwing)
         if not calls:
             out.append(statement)
             continue
+        # `return f(x);` where the exception leaves the function anyway: the
+        # caller tests the flag before it reads what came back, and the way
+        # out is the same with or without one in flight. Lifted, a call
+        # answering an object was moved into a temporary of its own and lost
+        # the caller's room it is written to write into.
+        whole = re.fullmatch(r"\s*return\s+(.*?)\s*;\s*", statement, re.S)
+        if (
+            whole is not None
+            and landing.label is None
+            and not landing.uncaught
+            and len(calls) == 1
+            and whole.group(1).strip() == calls[0].strip()
+            and len(_throwing_calls(calls[0][calls[0].find("(") + 1: -1], throwing)) == 0
+        ):
+            out.append(statement)
+            continue
         _refuse_where_splitting_would_change_it(statement, calls, body, filename)
         lifted: list[str] = []
-        for call in calls:
+        # Innermost first. An argument is worked out before the call it is
+        # handed to, so a call inside another's arguments that throws has to
+        # be checked before that call runs: lifted whole, `v.push_back(R(-1))`
+        # ran `push_back` with R's exception already in flight, and the
+        # half-built R went into the vector.
+        calls = _innermost_first(calls, throwing)
+        for index, call in enumerate(calls):
             counter[0] += 1
             held = f"__py2bin_call_{counter[0]}"
             spelled = _call_result_type(call, throwing)
             statement = statement.replace(call, held, 1)
+            # The calls still to come that held this one in their arguments
+            # hold its temporary from now on, as the statement does.
+            for later in range(index + 1, len(calls)):
+                if call in calls[later]:
+                    calls[later] = calls[later].replace(call, held, 1)
             if spelled in ("void", ""):
                 # Nothing to hold; the call is the whole of what it does.
                 lifted.append(f" {call}; if ({_THROWN}) {{ {landing.leave()} }} ")
                 statement = statement.replace(held, "0", 1)
                 continue
+            # Storage `new` took for an object whose constructor threw is
+            # given back: C++ does, and the object was never built.
+            freed = f"free({held}); " if call.lstrip().startswith("new") else ""
             lifted.append(
                 f" {spelled} {held} = {call}; "
-                f"if ({_THROWN}) {{ {landing.leave()} }} "
+                f"if ({_THROWN}) {{ {freed}{landing.leave()} }} "
+                # Built only now, if what was called is the constructor: the
+                # temporary it built is not taken apart on that way out.
+                + (
+                    f"{_BUILT_MARK}({held}); "
+                    if spelled.replace("*", "").strip() in _CLASS_NAMES
+                    and "*" not in spelled
+                    else ""
+                )
             )
         out.append("".join(lifted))
         out.append(statement)
@@ -9667,19 +10392,169 @@ def _throwing_calls(statement: str, throwing: "set[str]") -> "list[str]":
         close = _closing_paren(statement, match.end() - 1)
         if close < 0:
             continue
+        begins = match.start()
+        # `new R(1)` is lifted whole: the constructor runs on storage `new`
+        # takes, and lifted alone `R(1)` left `new __py2bin_call_2` behind.
+        created = re.search(r"\bnew\s*$", code[:begins])
+        if created is not None and not match.group(1):
+            begins = created.start()
+        found.append(statement[begins: close + 1])
+        at = close + 1
+    return _with_operator_calls(statement, code, found)
+
+
+def _with_operator_calls(statement: str, code: str, named: "list[str]") -> "list[str]":
+    """The calls found by name, and the operator uses, outermost first in order.
+
+    A use of an object's call operator or subscript is a call that can throw
+    like any other: `got += check(3) + f(2)` has two.
+    """
+
+    called, indexed = _LIFT_OPERATORS[0]
+    if not (called or indexed):
+        return named
+    spans: "list[tuple[int, int, str]]" = []
+    at = 0
+    for call in named:
+        start = statement.find(call, at)
+        spans.append((start, start + len(call), call))
+        at = start + len(call)
+    at = 0
+    for call in _operator_calls(statement, code, called, indexed):
+        start = statement.find(call, at)
+        spans.append((start, start + len(call), call))
+        at = start + len(call)
+    spans.sort()
+    kept: "list[str]" = []
+    reach = -1
+    for start, end, call in spans:
+        if start < reach:
+            continue
+        kept.append(call)
+        reach = end
+    return kept
+
+
+#: The objects in the function being rewritten whose call operator, and
+#: whose subscript, can throw - read once per function.
+_LIFT_OPERATORS: "list[tuple[set[str], set[str]]]" = [(set(), set())]
+
+
+def _operator_calls(
+    statement: str, code: str, called: "set[str]", indexed: "set[str]"
+) -> "list[str]":
+    """`check(9)` and `a[7]` in a statement, where those operators can throw.
+
+    Outermost first, left to right, as calls are. A subscript is lifted with
+    what it subscripts, so its temporary is the element it answers.
+    """
+
+    found: "list[str]" = []
+    at = 0
+    names = sorted(called | indexed, key=len, reverse=True)
+    pattern = re.compile(
+        r"(?<![\w.>])(" + "|".join(re.escape(one) for one in names) + r")\s*([(\[])"
+    )
+    for match in pattern.finditer(code):
+        if match.start() < at:
+            continue
+        name, opener = match.group(1), match.group(2)
+        if (opener == "(" and name not in called) or (opener == "[" and name not in indexed):
+            continue
+        if opener == "(":
+            close = _closing_paren(statement, match.end() - 1)
+        else:
+            close = _closing_bracket(statement, match.end() - 1)
+        if close < 0:
+            continue
         found.append(statement[match.start(): close + 1])
         at = close + 1
     return found
+
+
+def _closing_bracket(text: str, opening: int) -> int:
+    """The index of the `]` closing the `[` at `opening`, or -1."""
+
+    depth = 0
+    for index in range(opening, len(text)):
+        if text[index] == "[":
+            depth += 1
+        elif text[index] == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _innermost_first(calls: "list[str]", throwing: "set[str]") -> "list[str]":
+    """Each outermost call, preceded by the throwing calls in its arguments.
+
+    Every one of them is text the statement holds, and each is replaced by
+    its temporary as it is lifted - so the outer call is named here in the
+    form it will have by then, its inner calls already replaced by theirs.
+    That is done where it is lifted; this only puts them in the order they
+    run in: the inner ones first, left to right, then the call they feed.
+    """
+
+    ordered: "list[str]" = []
+    for call in calls:
+        opening = call.find("(")
+        inside = call[opening + 1: -1] if opening >= 0 else ""
+        nested = _throwing_calls(inside, throwing) if inside.strip() else []
+        ordered.extend(_innermost_first(nested, throwing))
+        ordered.append(call)
+    return ordered
 
 
 #: What a lifted call's temporary is declared as. The value is never read when
 #: the flag is set, so this only has to be a type the call's result fits.
 _CALL_RESULT_TYPES: "dict[str, str]" = {}
 
+#: What each class's method of a name answers, by (class, name). A name alone
+#: does not say: `at` answers `int &` on a `vector<int>` and `wchar_t &` on a
+#: `wstring`, and typed by whichever was written last, the temporary for
+#: `v.at(5)` was a `wchar_t *` given an `int *`.
+_METHOD_RESULT_TYPES: "dict[tuple[str, str], str]" = {}
+
+#: The function being rewritten, up to its end - where a lifted call's
+#: receiver is declared. A `try` block is handed on alone, and the object it
+#: calls a method on is almost always declared above it. And the class it is
+#: a method of, if it is one: a call with no receiver is a call on `this`.
+_LIFT_SCOPE: "list[str]" = [""]
+_LIFT_OWNER: "list[str | None]" = [None]
+
 
 def _call_result_type(call: str, throwing: "set[str]") -> str:
-    name = call.split("(", 1)[0].strip().replace("->", ".").split(".")[-1]
-    name = name.split("::")[-1].strip()
+    created = re.match(r"\s*new\s+([A-Za-z_]\w*)\s*\(", call)
+    if created is not None:
+        return f"{created.group(1)} *"
+    called, indexed = _LIFT_OPERATORS[0]
+    named = re.match(r"\s*([A-Za-z_]\w*)\s*([(\[])", call)
+    if named is not None and (named.group(1) in called or named.group(1) in indexed):
+        scope = _LIFT_SCOPE[0]
+        typed = _deduced_type(named.group(1), scope, len(scope))
+        if typed is not None:
+            held = re.sub(r"\b(?:const|volatile|struct|class)\b|[*&]", " ", typed).strip()
+            operator = "operator()" if named.group(2) == "(" else "operator[]"
+            answered = _METHOD_RESULT_TYPES.get((held, operator))
+            if answered is not None:
+                return answered
+    head = call.split("(", 1)[0].strip()
+    name = head.replace("->", ".").split(".")[-1].split("::")[-1].strip()
+    flat = head.replace("->", ".")
+    if "." in flat:
+        receiver = head[: max(head.rfind("."), head.rfind("->"))].strip()
+        scope = _LIFT_SCOPE[0]
+        typed = _deduced_type(receiver, scope, len(scope)) if receiver else None
+        if typed is not None:
+            held = re.sub(r"\b(?:const|volatile|struct|class)\b|[*&]", " ", typed).strip()
+            answered = _METHOD_RESULT_TYPES.get((held, name))
+            if answered is not None:
+                return answered
+    elif _LIFT_OWNER[0] is not None and "::" not in head:
+        answered = _METHOD_RESULT_TYPES.get((_LIFT_OWNER[0], name))
+        if answered is not None:
+            return answered
     return _CALL_RESULT_TYPES.get(name, "long")
 def _mangle_overloaded_functions(text: str, filename: str) -> str:
     """Give each free function of a shared name a name of its own.
@@ -11623,7 +12498,13 @@ def _refuse_unsupported(text: str, filename: str) -> None:
 
 
 #: `int x;`, `int x = 1;`, `Vec v(1, 2);` - something declared in this body.
-_DECLARED_HERE = re.compile(r"\b([A-Za-z_]\w*)\s*\**\s*([A-Za-z_]\w*)\s*[=;(\[]")
+#: The two words are two: a space or a star stands between them. With both
+#: optional the pattern split one word to make two, so `count = 0;` declared a
+#: `t` - and a method holding `__py2bin_thrown = 1;`, which every method that
+#: throws does, hid its class's member `n` from itself.
+_DECLARED_HERE = re.compile(
+    r"\b([A-Za-z_]\w*)(?:\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*[=;(\[]"
+)
 
 #: Words that are not a type, however much `return v;` looks like `int v;`.
 #: Without this, `return v` hid the member `v` from its own method and the
@@ -12400,25 +13281,17 @@ def _by_value_objects(
 
 
 def _copy_constructor(held: str, classes: "dict[str, Class]") -> "str | None":
-    """The class that provides a copy constructor for this one, if any.
+    """The class itself, where its author wrote it a copy constructor.
 
     A copy constructor is the one-argument constructor whose argument is the
-    class itself. C++ writes one for every class; what matters here is
-    whether the *author* wrote one, because a bitwise copy is what the
-    implicit one does and is already what happens.
+    class itself. It is never inherited: a class deriving from one that wrote
+    a copy constructor gets the one C++ writes, which copies the base with
+    the base's and then every member of its own. Answered with the base, the
+    derived object was copied as though it were the base - its own members
+    left as whatever was there.
     """
 
-    seen = held
-    while seen and seen in classes:
-        for method in classes[seen].methods:
-            if method.name != "" or _arity(method.parameters) != 1:
-                continue
-            spelled = method.parameters.replace("&", " ").replace("*", " ")
-            words = [w for w in spelled.replace("const", " ").split()]
-            if words and words[0] == seen:
-                return seen
-        seen = classes[seen].base
-    return None
+    return held if _user_copy_constructor(held, classes) is not None else None
 
 
 def _copied_in(held: str, into: str, source: str, classes) -> str:
@@ -12428,22 +13301,341 @@ def _copied_in(held: str, into: str, source: str, classes) -> str:
     that owns something - a buffer, a handle - is written on the assumption
     that it will be. A bitwise copy of one is two objects believing they own
     the same thing.
+
+    Where the author wrote none, the copy is `__py2bin_copy_into`, which the
+    C stage makes with the copy C++ writes for the class: its bytes where
+    that is all a copy of one is, and the class's own copy members where the
+    class holds something that copies by code of its own. Not an assignment,
+    because nothing has been built where the copy goes - and an assignment
+    over nothing tears down whatever was lying there first.
     """
 
     owner = _copy_constructor(held, classes)
     if owner is None:
-        return f"{into} = *{source};"
+        return f"__py2bin_copy_into(&{into}, {source});"
     return f"{_c_name(owner, '', _copy_suffix(owner, classes))}(&{into}, {source});"
 
 
 def _copy_suffix(owner: str, classes: "dict[str, Class]") -> "str | None":
-    for method in classes[owner].methods:
-        if method.name == "" and _arity(method.parameters) == 1:
-            spelled = method.parameters.replace("&", " ").replace("*", " ")
-            words = spelled.replace("const", " ").split()
-            if words and words[0] == owner:
-                return _suffix_of(owner, method, classes)
+    found = _user_copy_constructor(owner, classes)
+    return None if found is None else _suffix_of(owner, found, classes)
+
+
+def _copy_parameter_class(parameters: str) -> "str | None":
+    """The class a one-parameter member takes by reference or by value.
+
+    `const C &o`, `C &o` and `C o` all name C; `C *p` names nothing, since a
+    pointer is not an object of the class.
+    """
+
+    parts = [part for part in _split_arguments(parameters) if part.strip()]
+    if len(parts) != 1 or "*" in parts[0]:
+        return None
+    words = re.sub(
+        r"\b(?:const|volatile|struct|class)\b", " ", parts[0].replace("&", " ")
+    ).split()
+    return words[0] if words else None
+
+
+def _user_copy_constructor(name: str, classes: "dict[str, Class]") -> "Method | None":
+    """The copy constructor the class's author wrote, if one was."""
+
+    found = classes.get(name)
+    if found is None:
+        return None
+    for method in found.methods:
+        if method.name == "" and _copy_parameter_class(method.parameters) == name:
+            return method
     return None
+
+
+def _user_copy_assignment(name: str, classes: "dict[str, Class]") -> "Method | None":
+    """The copy assignment the class's author wrote, if one was.
+
+    One taking the class by value counts: `T &operator=(T other)` is how the
+    copy-and-swap idiom is written, and it is the assignment C++ calls.
+    """
+
+    found = classes.get(name)
+    if found is None:
+        return None
+    for method in found.methods:
+        if (
+            method.name == "op_assign"
+            and _copy_parameter_class(method.parameters) == name
+        ):
+            return method
+    return None
+
+
+def _member_class(member: "Member", classes: "dict[str, Class]") -> "str | None":
+    """The class a member holds by value, if it holds one."""
+
+    if member.reference or "*" in member.ctype or member.ctype.endswith("\x00fn"):
+        return None
+    held = re.sub(
+        r"\b(?:const|volatile|struct|class)\b", " ", member.ctype
+    ).strip()
+    return held if held in classes else None
+
+
+#: The classes whose objects copy by code of their own, for the translation
+#: unit being written. See `_owning_classes`.
+_OWNING: "set[str]" = set()
+
+
+def _owning_classes(classes: "dict[str, Class]") -> "set[str]":
+    """The classes a copy of whose bytes is not a copy of the object.
+
+    One whose author wrote a copy constructor or a copy assignment: what C++
+    calls is that code, and whatever it does - take a buffer of its own, count
+    a reference, print a line - is what a copy is. One with a table pointer:
+    a copy is an object of its own class whatever it was copied from, and
+    copying the pointer made a `Base` that answered virtual calls as the
+    `Derived` it was sliced from. And one holding or deriving from either,
+    because the copy C++ writes for it copies those parts by their code.
+    """
+
+    memo: "dict[str, bool]" = {}
+
+    def needs(name: str) -> bool:
+        if name in memo:
+            return memo[name]
+        memo[name] = False
+        found = classes.get(name)
+        if found is None:
+            return False
+        result = (
+            _user_copy_constructor(name, classes) is not None
+            or _user_copy_assignment(name, classes) is not None
+            or _declares_its_copy(name, _COPIES_ITSELF, classes)
+            or _declares_its_copy(name, _ASSIGNS_ITSELF, classes)
+            or _is_polymorphic(name, classes)
+        )
+        if not result:
+            result = any(
+                needs(base) for base, _step, _shared in _base_steps(found, classes)
+            )
+        if not result:
+            result = any(
+                needs(held)
+                for held in (_member_class(one, classes) for one in found.members)
+                if held is not None
+            )
+        memo[name] = result
+        return result
+
+    return {name for name in classes if needs(name)}
+
+
+def _implicit_copy_name(name: str) -> str:
+    """The copy constructor C++ writes for a class that needs one.
+
+    Named so that no member of a program's own can be: a method called
+    `copy` is already `C__copy`.
+    """
+
+    return f"{name}__py2bin_copy"
+
+
+def _implicit_assign_name(name: str) -> str:
+    """And the copy assignment it writes."""
+
+    return f"{name}__py2bin_assign"
+
+
+#: What py2bin's own headers name a class's copy constructor and its copy
+#: assignment where the class keeps them out of its overload sets. A
+#: `string` taking `const string &` as a constructor would join the
+#: one-argument constructors, and every call that relied on there being one
+#: would become a question of types; named like this, nothing calls them but
+#: the copies the translator and the C stage make.
+_COPIES_ITSELF = "__py2bin_copy_from"
+_ASSIGNS_ITSELF = "__py2bin_assign_from"
+
+
+def _declares_its_copy(name: str, member: str, classes: "dict[str, Class]") -> bool:
+    found = classes.get(name)
+    return found is not None and any(one.name == member for one in found.methods)
+
+
+def _copy_function_name(name: str, classes: "dict[str, Class]") -> str:
+    """What copy-constructs one of this class: its author's, or C++'s."""
+
+    written = _user_copy_constructor(name, classes)
+    if written is not None:
+        return _c_name(name, "", _suffix_of(name, written, classes))
+    if _declares_its_copy(name, _COPIES_ITSELF, classes):
+        return _c_name(name, _COPIES_ITSELF)
+    return _implicit_copy_name(name)
+
+
+def _assign_function_name(name: str, classes: "dict[str, Class]") -> str:
+    """What copy-assigns one of this class: its author's, or C++'s."""
+
+    written = _user_copy_assignment(name, classes)
+    if written is not None:
+        return _c_name(name, "op_assign", _suffix_of(name, written, classes))
+    if _declares_its_copy(name, _ASSIGNS_ITSELF, classes):
+        return _c_name(name, _ASSIGNS_ITSELF)
+    return _implicit_assign_name(name)
+
+
+def _emit_implicit_copies(found: "Class", classes: "dict[str, Class]") -> str:
+    """The copy constructor and copy assignment C++ writes, where it writes one.
+
+    Only for a class whose objects copy by code of their own, and only the
+    one of the two its author did not write. Written as C, from the layout
+    `_emit_class` gives the struct, because what they do is fixed by it:
+
+    The copy constructor copies the bytes first - which is the whole of the
+    copy for every member that is copied as bytes, bitfields, unions and
+    arrays included - and then builds each part that copies by code of its
+    own over its share of them, the base first, then the members in the
+    order they are declared, as C++ builds them. Then the table pointers,
+    because the copy is an object of this class whatever it was copied from.
+
+    The copy assignment goes member by member, in the same order, because the
+    object it writes over already holds things: each part that copies by code
+    of its own is handed to its own assignment, which lets go of what it held.
+    The table pointers are left alone - an object keeps its class when it is
+    assigned to, which is what slicing assignment means.
+
+    A class with a base shared through `virtual` is not given one. Its share
+    of that base is reached through a pointer the copy would have to point at
+    its own storage, along every path that reaches it; a copy of one is
+    refused where it is made, by the C stage finding no copy here to call.
+    """
+
+    name = found.name
+    if _shared_bases(name, classes):
+        return ""
+    out: "list[str]" = []
+    bases = [
+        (base, step) for base, step, shared in _base_steps(found, classes)
+        if not shared
+    ]
+    if _user_copy_constructor(name, classes) is None and not _declares_its_copy(
+        name, _COPIES_ITSELF, classes
+    ):
+        lines = [
+            f"static void {_implicit_copy_name(name)}"
+            f"(struct {name} *this, struct {name} *__from) {{",
+            "    unsigned long __i;",
+            f"    for (__i = 0; __i < sizeof(struct {name}); __i++) "
+            "((unsigned char *)this)[__i] = ((unsigned char *)__from)[__i];",
+        ]
+        for base, step in bases:
+            if base in _OWNING:
+                lines.append(
+                    f"    {_copy_function_name(base, classes)}"
+                    f"(&this->{step}, &__from->{step});"
+                )
+        for member in found.members:
+            held = _member_class(member, classes)
+            if held is None or held not in _OWNING:
+                continue
+            copies = _copy_function_name(held, classes)
+            if member.array.strip():
+                lines.append(
+                    f"    for (__i = 0; __i < sizeof(this->{member.name}) / "
+                    f"sizeof(struct {held}); __i++) {copies}("
+                    f"((struct {held} *)this->{member.name}) + __i, "
+                    f"((struct {held} *)__from->{member.name}) + __i);"
+                )
+            else:
+                lines.append(
+                    f"    {copies}(&this->{member.name}, &__from->{member.name});"
+                )
+        lines.extend("    " + one for one in _table_pointer_lines(found, classes))
+        lines.append("}")
+        out.append("\n".join(lines))
+    if _user_copy_assignment(name, classes) is None and not _declares_its_copy(
+        name, _ASSIGNS_ITSELF, classes
+    ):
+        lines = [
+            f"static struct {name} *{_implicit_assign_name(name)}"
+            f"(struct {name} *this, struct {name} *__from) {{",
+            "    unsigned long __i;",
+        ]
+        for base, step in bases:
+            if base in _OWNING:
+                lines.append(
+                    f"    {_assign_function_name(base, classes)}"
+                    f"(&this->{step}, &__from->{step});"
+                )
+            else:
+                lines.append(f"    this->{step} = __from->{step};")
+        for member in found.members:
+            held = _member_class(member, classes)
+            if held is not None and held in _OWNING:
+                assigns = _assign_function_name(held, classes)
+                if member.array.strip():
+                    lines.append(
+                        f"    for (__i = 0; __i < sizeof(this->{member.name}) / "
+                        f"sizeof(struct {held}); __i++) {assigns}("
+                        f"((struct {held} *)this->{member.name}) + __i, "
+                        f"((struct {held} *)__from->{member.name}) + __i);"
+                    )
+                else:
+                    lines.append(
+                        f"    {assigns}(&this->{member.name}, &__from->{member.name});"
+                    )
+                continue
+            if member.array.strip():
+                lines.append(
+                    f"    for (__i = 0; __i < sizeof(this->{member.name}); __i++) "
+                    f"((unsigned char *)this->{member.name})[__i] = "
+                    f"((unsigned char *)__from->{member.name})[__i];"
+                )
+            else:
+                lines.append(f"    this->{member.name} = __from->{member.name};")
+        lines.append("    return this;")
+        lines.append("}")
+        out.append("\n".join(lines))
+    return "\n".join(out)
+
+
+def _table_pointer_lines(found: "Class", classes: "dict[str, Class]") -> "list[str]":
+    """The statements that point an object's tables at its own class's.
+
+    A constructor writes them after its bases are built, which is what C++
+    means by the object becoming its own type as construction proceeds, and
+    a copy constructor writes them for the same reason: the copy is an
+    object of this class, whatever it was copied from.
+    """
+
+    calls: "list[str]" = []
+    if _is_polymorphic(found.name, classes):
+        carrier = _vptr_carrier(found.name, classes)
+        calls.append(
+            f"this->{_vptr_path(found.name, classes)} = "
+            # Where the pointer lives in a base everything shares, what goes
+            # in it is the table whose entries move the pointer back here.
+            + (
+                f"{_mixin_vtable_name(found.name, carrier)};"
+                if carrier in _shared_bases(found.name, classes)
+                else f"{_vtable_name(found.name)};"
+            )
+        )
+    # And one for each base after the first that has a table of its own. A
+    # pointer to that subobject is what a call through it is given, so what
+    # it reads has to be the table written for this class.
+    for index, mixin in enumerate(found.mixins):
+        if mixin in found.virtual_bases:
+            continue
+        # And not one whose pointer lives in a base everything shares: that
+        # is the one set above, and writing this class's table for the mixin
+        # into it would say the object is a mixin.
+        if _vptr_carrier(mixin, classes) in _shared_bases(found.name, classes):
+            continue
+        if _is_polymorphic(mixin, classes):
+            calls.append(
+                f"this->__base{index + 1}."
+                f"{_vptr_path(mixin, classes)} = "
+                f"{_mixin_vtable_name(found.name, mixin)};"
+            )
+    return calls
 
 def _emit_one(
     found: Class, method: Method, classes: "dict[str, Class]", unit: str = ""
@@ -12654,7 +13846,13 @@ def _emit_one(
         body = _open_with_subobjects(
             body, found, classes, base_arguments, member_arguments, scope,
             prepared,
+            {
+                name
+                for name, held in references.items()
+                if _class_named(held or "") in classes
+            },
         )
+        body = _undone_subobjects(body, found, classes)
     elif method.name == "~":
         body = _close_with_subobjects(body, found, classes)
     if copied:
@@ -12867,6 +14065,7 @@ def _return_through_pointer(body: str, held: str = "") -> str:
     # an expression in C, and left alone this reached the C as `*__ret = {};`.
     if held:
         body = _EMPTY_RETURN.sub(f"return {held}();", body)
+    counter = [0]
 
     def replace_from(match: "re.Match[str]", whole: str) -> "str | None":
         # Sliced out of the real text: the match is against a copy with the
@@ -12874,7 +14073,27 @@ def _return_through_pointer(body: str, held: str = "") -> str:
         value = whole[match.start(1): match.end(1)].strip()
         if not value:
             return None
-        return f"{{ *__ret = {value}; return; }}"
+        # What the answer is made from, where that is something else: `return
+        # "fallback";` in a function answering a `string` builds the string
+        # from the characters, which is a constructor and not a copy. Built
+        # as an object of the class first - an initialisation every pass
+        # already knows - and that object is what is copied into the room.
+        made = _deduced_type(value, whole, match.start()) if held else None
+        if made is not None and _class_named(
+            made.replace("&", " ").replace("const", " ")
+        ) != held:
+            counter[0] += 1
+            answer = f"__py2bin_answer_{counter[0]}"
+            return (
+                f"{{ {held} {answer} = {value}; "
+                f"__py2bin_copy_into(__ret, &{answer}); return; }}"
+            )
+        # A copy built in the room, not an assignment over it: nothing has
+        # been built there, and the caller is handed a new object. Written as
+        # `*__ret = value`, a class with an assignment of its own was handed
+        # to it over storage holding nothing, and one whose assignment lets
+        # go of what it held let go of whatever was lying there.
+        return f"{{ __py2bin_copy_into(__ret, &({value})); return; }}"
 
     # Against the whole body, not fragment by fragment: `_map_code` splits at
     # every literal, so `return p / L"web";` was handed over as `return p / L`
@@ -13425,6 +14644,35 @@ _AFTER_STATIC = re.compile(r"\bstatic\b[\w\s]*$")
 _BUILT_SUFFIX = "__py2bin_built"
 
 
+def _undone_subobjects(body: str, found: Class, classes: "dict[str, Class]") -> str:
+    """The exception pass's markers for what a constructor takes apart, as calls.
+
+    A member's own destructor and the base's, through the path that reaches
+    each - or nothing, for one that has none.
+    """
+
+    def member(match: "re.Match[str]") -> str:
+        named = match.group(1).strip()
+        if named.startswith("this->"):
+            named = named[len("this->"):].strip()
+        held = next((one.ctype for one in found.members if one.name == named), "")
+        spelled = re.sub(r"\b(?:const|volatile|struct|class|mutable)\b", " ", held).strip()
+        if spelled not in classes:
+            return ""
+        return _destructor_call(spelled, f"this->{named}", classes)
+
+    def base(match: "re.Match[str]") -> str:
+        if not found.base or found.base not in classes:
+            return ""
+        path = _subobject_path(found.name, found.base, classes)
+        if path is None:
+            return ""
+        return _destructor_call(found.base, f"this->{path}", classes)
+
+    body = re.sub(rf"{_MEMBER_UNDO}\s*\(([^()]*)\)\s*;", member, body)
+    return re.sub(rf"{_BASE_UNDO}\s*\(\s*\)\s*;", base, body)
+
+
 def _open_with_subobjects(
     body: str,
     found: Class,
@@ -13433,6 +14681,7 @@ def _open_with_subobjects(
     member_arguments: "dict[str, str] | None" = None,
     scope: str = "",
     prepared: "dict[str, str] | None" = None,
+    class_references: "set[str] | frozenset[str]" = frozenset(),
 ) -> str:
     named = dict(member_arguments or {})
     #: What was written in front of each initialiser, put back in front of
@@ -13522,8 +14771,16 @@ def _open_with_subobjects(
                 # the class has no constructor of that shape either: there
                 # is nothing else this could mean, and calling one that does
                 # not exist says so about the wrong line.
+                # A reference parameter to a class is carried as the pointer
+                # to what it names, so that pointer is the address of the
+                # source - and `&x` of it was the address of the pointer.
+                source = (
+                    given[0]
+                    if given[0] in class_references
+                    else f"&{given[0]}"
+                )
                 calls.append(
-                    _copied_in(held, address.lstrip("&"), f"&{given[0]}", classes)
+                    _copied_in(held, address.lstrip("&"), source, classes)
                 )
                 continue
             calls.extend(built(held, address, given, arguments))
@@ -13539,39 +14796,11 @@ def _open_with_subobjects(
                 f"constructor taking nothing, or hold a pointer",
             )
         calls.extend(built(held, address, [], ""))
-    if _is_polymorphic(found.name, classes):
-        # After the base constructor, which set the pointer to *its* table.
-        # Overwriting it here is what C++ means by the object becoming its own
-        # type as construction proceeds, and it is why a virtual call made
-        # from a base constructor reaches the base's version.
-        carrier = _vptr_carrier(found.name, classes)
-        calls.append(
-            f"this->{_vptr_path(found.name, classes)} = "
-            # Where the pointer lives in a base everything shares, what goes
-            # in it is the table whose entries move the pointer back here.
-            + (
-                f"{_mixin_vtable_name(found.name, carrier)};"
-                if carrier in _shared_bases(found.name, classes)
-                else f"{_vtable_name(found.name)};"
-            )
-        )
-    # And one for each base after the first that has a table of its own. A
-    # pointer to that subobject is what a call through it is given, so what
-    # it reads has to be the table written for this class.
-    for index, mixin in enumerate(found.mixins):
-        if mixin in found.virtual_bases:
-            continue
-        # And not one whose pointer lives in a base everything shares: that
-        # is the one set above, and writing this class's table for the mixin
-        # into it would say the object is a mixin.
-        if _vptr_carrier(mixin, classes) in _shared_bases(found.name, classes):
-            continue
-        if _is_polymorphic(mixin, classes):
-            calls.append(
-                f"this->__base{index + 1}."
-                f"{_vptr_path(mixin, classes)} = "
-                f"{_mixin_vtable_name(found.name, mixin)};"
-            )
+    # After the base constructor, which set the pointer to *its* table.
+    # Overwriting it here is what C++ means by the object becoming its own
+    # type as construction proceeds, and it is why a virtual call made from a
+    # base constructor reaches the base's version.
+    calls.extend(_table_pointer_lines(found, classes))
     # Whatever the list named that is not a subobject is an ordinary member,
     # and an ordinary member is assigned to. After the constructions, because
     # one of them may be what it is assigned from.
@@ -14255,6 +15484,9 @@ def _call_suffix(
         or _deduced_type(value, text, before)
         for value in given
     ]
+    plausible = _without_objects_for_foreign_names(set_of, given, wanted, text, classes)
+    if plausible is not None:
+        return _suffix_of(owner, plausible, classes)
     if all(item is not None for item in wanted):
         # The types were read; it is the overloads that have no answer for
         # them. Saying so - and what they take - is the difference between
@@ -14279,6 +15511,55 @@ def _call_suffix(
         f"type of a literal and of a variable it can see declared; cast the "
         f"argument to the type of the one you want",
     )
+
+
+def _without_objects_for_foreign_names(
+    set_of: "list[Method]",
+    given: "list[str]",
+    wanted: "list[str | None]",
+    text: str,
+    classes: "dict[str, Class]",
+) -> "Method | None":
+    """The one overload left once a name the C++ never declares is placed.
+
+    A name nothing in this text declares, and no `#define` it holds names,
+    comes from a C header the C stage reads after this one -
+    `EVP_MAX_MD_SIZE` from OpenSSL's <evp.h>. Whatever it stands for, it is
+    not an object of a class this text defines, so an overload taking one
+    there is not the one meant: `Bytes result(EVP_MAX_MD_SIZE)` is `vector(n)`
+    and not the copy constructor beside it.
+    """
+
+    foreign = [
+        index
+        for index, (value, typed) in enumerate(zip(given, wanted))
+        if typed is None
+        and value.strip().isidentifier()
+        and value.strip() not in _MACRO_NAMES
+        and _deduced_type(value.strip(), text, -1) is None
+    ]
+    if not foreign:
+        return None
+    left: "list[Method]" = []
+    for method in set_of:
+        if _arity(method.parameters) != len(given):
+            continue
+        parts = [one for one in _split_arguments(method.parameters) if one.strip()]
+        takes_an_object = False
+        for index in foreign:
+            if index >= len(parts):
+                continue
+            words = parts[index].replace("&", " ").split()
+            if len(words) > 1 and re.fullmatch(r"[A-Za-z_]\w*", words[-1]):
+                words = words[:-1]
+            spelled = " ".join(
+                word for word in words if word not in ("const", "volatile", "struct", "class")
+            )
+            if "*" not in spelled and spelled in classes:
+                takes_an_object = True
+        if not takes_an_object:
+            left.append(method)
+    return left[0] if len(left) == 1 else None
 
 
 def _find_method(name: str, method: str, classes: "dict[str, Class]") -> str | None:
@@ -14706,7 +15987,50 @@ def _upcast_assignments(
         head, call = match.group(0).split("=", 1)
         return f"{head}= (struct {wanted} *){call.lstrip()}"
 
-    return _map_code(body, lambda part: _ASSIGNED_FROM_NEW.sub(assigned, part))
+    body = _map_code(body, lambda part: _ASSIGNED_FROM_NEW.sub(assigned, part))
+
+    # `Shape *all[] = {&g, &b, new Box()};` - an array of base pointers given
+    # derived ones in its list, each of which C wants cast as a single one
+    # is. Left alone, the list was refused element by element.
+    def listed(match: "re.Match[str]") -> str:
+        wanted = match.group(1)
+        if wanted not in classes:
+            return match.group(0)
+        items = _split_arguments(match.group(4))
+        cast: "list[str]" = []
+        changed = False
+        for item in items:
+            spelled = item.strip()
+            source = spelled.lstrip("&").strip()
+            while source.startswith("(") and source.endswith(")"):
+                source = source[1:-1].strip()
+            held = known.get(source) or _allocated_class(spelled) or None
+            if (
+                held
+                and held != wanted
+                and not spelled.startswith("(struct")
+                and _derives_from(held, wanted, classes)
+            ):
+                cast.append(f"(struct {wanted} *){spelled}")
+                changed = True
+            else:
+                cast.append(spelled)
+        if not changed:
+            return match.group(0)
+        return (
+            f"struct {wanted} *{match.group(2)}[{match.group(3)}] = "
+            f"{{{', '.join(cast)}}};"
+        )
+
+    return _map_code(
+        body,
+        lambda part: re.sub(
+            r"\bstruct\s+([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*\[([^\]]*)\]\s*="
+            r"\s*\{([^{};]*)\}\s*;",
+            listed,
+            part,
+        ),
+    )
 
 
 #: `Sub__new(...)` standing on its own, as an argument rather than as the
@@ -15679,7 +17003,12 @@ def _statement_start(body: str, at: int) -> int:
             # hoisted is written inside another one - `printf(..., f.x().y())`
             # - and the statement starts further back still. Stopping here put
             # the declaration inside the argument list.
-        elif depth == 0 and piece in ";{}":
+        elif depth == 0 and piece in ";{}\x00":
+            # A NUL closes the mark a lifted block leaves, and a statement
+            # after a block starts after it, as one after a `}` does. Read
+            # past, `if (k < 0) { k = 0; } return Name(k);` in a method built
+            # the `Name` at the top of the method - before the `if`, from the
+            # `k` it had not yet changed.
             return index + 1
     return 0
 
@@ -16202,7 +17531,11 @@ def _rewrite_temporaries(
         counter[0] = max(counter[0], max(written))
     for _round in range(_TEMPORARY_ROUNDS):
         found = None
-        for match in _TEMPORARY.finditer(body):
+        # Over a copy with the literals blanked, which keeps every offset.
+        # `printf("Point(%d)\n", p.x)` names the class inside a string, and
+        # read raw that was a temporary to build: the string printed the
+        # name py2bin gave it, and the class was constructed for nothing.
+        for match in _TEMPORARY.finditer(_without_literals(body)):
             name = match.group(1)
             if name not in classes:
                 continue
@@ -17062,6 +18395,15 @@ def _rewrite_body(
         return f"struct {type_name} *{variable}[{count}];"
 
     body = _POINTER_ARRAY.sub(declare_pointer_array, body)
+    # And one given its pointers in a list, which the pattern above leaves
+    # as written - `Shape *all[] = {&a, new Sq(5)};` - but is the same kind
+    # of array: what `delete all[1]` destroys is one of these.
+    for listed in re.finditer(
+        r"\b(?:struct\s+)?([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*\[[^\]]*\]\s*=\s*\{",
+        _without_literals(body),
+    ):
+        if listed.group(1) in classes:
+            pointer_arrays.setdefault(listed.group(2), listed.group(1))
     body = _OBJECT_POINTER.sub(declare_pointer, body)
 
     # C++ converts a pointer-to-derived into a pointer-to-base wherever one is
@@ -17072,7 +18414,7 @@ def _rewrite_body(
 
     # After the pointer declarations, which are what say the type of the thing
     # being deleted, and so which destructor runs.
-    body = _rewrite_delete(body, classes, known)
+    body = _rewrite_delete(body, classes, known, pointer_arrays)
 
     # After the declarations, because it has to know what the receiver is, and
     # before the ordinary call rewriting, which would otherwise turn
@@ -17409,7 +18751,18 @@ def _rewrite_body(
                 # the loop read as empty afterwards. The marker carries what
                 # kind of body it stands for: a switch stops a `break` and
                 # not a `continue`, which goes on out to the loop around it.
-                *([("", "", frozenset(), leaves)] if leaves else []),
+                # It also carries the handlers written at this level, and is
+                # there whenever there are any: a jump to one stops here.
+                # Carried only by the objects of the scope, a scope that
+                # declared none - a loop body holding a `try` - had nothing
+                # to stop at, and the jump to its handler took apart what
+                # the function had built before the loop: a vector filled in
+                # the loop read as empty, then was destroyed twice.
+                *(
+                    [("", "", _handlers_written(body), leaves)]
+                    if leaves or _handlers_written(body)
+                    else []
+                ),
                 *(
                     # And which handlers are written at this level, so that a
                     # jump to one of them knows where to stop unwinding: past
@@ -17599,6 +18952,14 @@ def _built_before(body: str, name: str, block: int) -> bool:
     mark = bare.find(_BLOCK_MARK % block)
     if mark < 0:
         return True
+    # Built where the exception pass says it finished building, if it did:
+    # the block right after a constructor that can throw is the way out when
+    # it threw, and the object is not there to take apart.
+    marked = re.search(
+        rf"{_BUILT_MARK}\s*\(\s*&?\s*{re.escape(name)}\s*\)", bare
+    )
+    if marked is not None:
+        return marked.end() < mark
     where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", bare)
     return where is not None and where.start() < mark
 
@@ -18393,6 +19754,13 @@ def _rewrite_operators(
                 return match.group(0)
             if match.group(1):
                 a = v
+            elif v in pointers:
+                # `items = fresh;` where `items` is a `T *`: the pointer is
+                # what is assigned, and what it points at is not touched.
+                # Read as an assignment of the object, a vector moving its
+                # elements into new storage handed the old storage to the
+                # element's `operator=` as though it were an element.
+                return match.group(0)
             source = match.group(2)
             spelled = known.get(source) or _deduced_type(source, scope or body)
             if spelled is None:
@@ -20070,7 +21438,7 @@ def _rewrite_pointer_indexed(
         chosen = (
             function
             if isinstance(function, str)
-            else function(_call_arguments(body, found.end() - 1))
+            else _chooser_at(function, _call_arguments(body, found.end() - 1), found.start())
         )
         # The chooser may answer with a receiver of its own, where a virtual
         # call needs the whole object and a direct one needs a subobject.
@@ -20105,7 +21473,7 @@ def _rewrite_indexed(body: str, pattern: str, function, variable: str) -> str:
         chosen = (
             function
             if isinstance(function, str)
-            else function(_call_arguments(body, found.end() - 1))
+            else _chooser_at(function, _call_arguments(body, found.end() - 1), found.start())
         )
         # A virtual call reads the table out of the element, so it needs the
         # index too - which is only known here, one match at a time.
@@ -20170,6 +21538,19 @@ def _call_arguments(body: str, opening: int) -> "list[str]":
     return [part.strip() for part in _split_arguments(inside)]
 
 
+def _chooser_at(function, arguments: "list[str]", at: int):
+    """Ask a chooser which overload a call means, telling it where the call is.
+
+    One built by `_name_for` reads its arguments' types off the declarations
+    above that position; any other is asked as it always was.
+    """
+
+    try:
+        return function(arguments, at)
+    except TypeError:
+        return function(arguments)
+
+
 def _rewrite_calls(body: str, pattern: str, function, receiver: str) -> str:
     """Turn each match into `function(receiver` plus a comma only if needed.
 
@@ -20191,7 +21572,7 @@ def _rewrite_calls(body: str, pattern: str, function, receiver: str) -> str:
         chosen = (
             function
             if isinstance(function, str)
-            else function(_call_arguments(body, found.end() - 1))
+            else _chooser_at(function, _call_arguments(body, found.end() - 1), found.start())
         )
         # A virtual call may need a different receiver from the direct one: it
         # dispatches on the whole object, where a direct call to an inherited
@@ -20228,7 +21609,12 @@ def _name_for(
 
     if not _overloaded(owner, method, classes):
         return _c_name(owner, method)
-    return lambda given: _c_name(
+    # Told where the call is, where the caller knows: an argument's type is
+    # read off the declaration nearest above it, and asked with no position
+    # the reader took the last one anywhere - `out.text.assign(buffer)` in
+    # <filesystem>, beside its own `char buffer[260]`, was typed by a
+    # `wchar_t buffer[8]` the program declared in another function.
+    return lambda given, at=-1: _c_name(
         owner,
         method,
         _call_suffix(
@@ -20237,7 +21623,7 @@ def _name_for(
             classes,
             [_asked_as(one, known, given_as, classes) for one in given],
             text,
-            before,
+            at if at >= 0 else before,
         ),
     )
 
@@ -20324,7 +21710,7 @@ def _dispatched(
     if virtual is None:
         return named
 
-    def chosen(given: "list[str]"):
+    def chosen(given: "list[str]", at: int = -1):
         through = virtual(given)
         if through:
             # A virtual call reads the table out of the whole object, and
@@ -20333,17 +21719,27 @@ def _dispatched(
             # the receiver differs too, and applying the base adjustment to
             # both counted it twice.
             return through, _dispatch_receiver(holds, classes, receiver)
-        spelled = named if isinstance(named, str) else named(given)
+        spelled = named if isinstance(named, str) else named(given, at)
         return (spelled, direct) if direct is not None else spelled
 
     return chosen
 
 
 def _reachable_methods(name: str, classes: "dict[str, Class]") -> "list[str]":
+    """The names of the members a call on this class can reach.
+
+    Not the destructor: it is stored as `~`, and every caller builds a
+    pattern of `name(` - so `x & ~(unsigned long)15` inside a method was
+    read as a call to the class's own destructor, given the cast as its
+    argument.
+    """
+
     found: list[str] = []
     for seen in [name, *_every_base(name, classes)]:
         if seen in classes:
-            found.extend(m.name for m in classes[seen].methods if m.name)
+            found.extend(
+                m.name for m in classes[seen].methods if m.name and m.name != "~"
+            )
     return found
 
 
@@ -20620,6 +22016,31 @@ def _destructor_call(
     return f"{_c_name(owner, '~')}({reached});"
 
 
+#: Written by the exception pass after the check that follows building an
+#: object whose constructor can throw: the object exists from here, and not
+#: from where it is declared. A jump taken because its constructor threw
+#: leaves before it was ever built, and C++ does not take apart what it never
+#: finished building. Taken out of the C once the destructors are placed.
+_BUILT_MARK = "__py2bin_built"
+
+
+def _built_at(name: str, body: str) -> int:
+    """Where an object of this body comes into existence.
+
+    Its first mention, which is its declaration - unless the exception pass
+    marked where its constructor finished, which is after the check of
+    whether that constructor threw.
+    """
+
+    marked = re.search(
+        rf"{_BUILT_MARK}\s*\(\s*&?\s*{re.escape(name)}\s*\)", body
+    )
+    if marked is not None:
+        return marked.end()
+    where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", body)
+    return where.start() if where is not None else 0
+
+
 def _close_with_destructors(
     body: str,
     destroyed: "list[str]",
@@ -20661,10 +22082,7 @@ def _close_with_destructors(
     # leaves before that object was ever built, and C++ destroys only what
     # has been constructed - so running its destructor there took apart
     # something that is not there yet, under a name nothing has declared.
-    built: "dict[str, int]" = {}
-    for name in destroyed:
-        where = re.search(rf"(?<![.\w>]){re.escape(name)}\b", body)
-        built[name] = where.start() if where is not None else 0
+    built: "dict[str, int]" = {name: _built_at(name, body) for name in destroyed}
 
     out = []
     at = 0
@@ -20715,9 +22133,21 @@ def _close_with_destructors(
             counter = counter if counter is not None else [0]
             counter[0] += 1
             spelled = f"{_ANSWER_PREFIX}{counter[0]}"
-            out.append(
-                f"{{ {written} {spelled} = {value};{leaving} return {spelled}; }}"
-            )
+            if "&" in written:
+                # A reference answered: what is kept across the destructors
+                # is where the answer is, and what is returned is that
+                # object again - the pass that makes a reference return an
+                # address turns `return *p` into `return &(*p)`. Kept as the
+                # reference itself, C was handed `int &answer = ...`.
+                pointed = written.replace("&", "").strip()
+                out.append(
+                    f"{{ {pointed} *{spelled} = &({value});{leaving} "
+                    f"return *{spelled}; }}"
+                )
+            else:
+                out.append(
+                    f"{{ {written} {spelled} = {value};{leaving} return {spelled}; }}"
+                )
         else:
             out.append(leaving.strip() + " " + found.group(0))
         at = found.end()
@@ -20790,14 +22220,7 @@ def _destroy_before_leaving(
     if not destroyed and not enclosing:
         return body
     here = _handlers_written(body)
-    built = {
-        name: (
-            where.start()
-            if (where := re.search(rf"(?<![.\w>]){re.escape(name)}\b", body))
-            else 0
-        )
-        for name in destroyed
-    }
+    built = {name: _built_at(name, body) for name in destroyed}
     out: "list[str]" = []
     at = 0
     leaving_here = "".join(
@@ -20809,8 +22232,7 @@ def _destroy_before_leaving(
         already = [
             name
             for name in destroyed
-            if (where := re.search(rf"(?<![.\w>]){re.escape(name)}\b", body))
-            and where.start() < found.start()
+            if _built_at(name, body) < found.start()
         ]
         leaving = "".join(
             f" {_destructor_call(known[name], name, classes)}"
@@ -21510,12 +22932,142 @@ def _resolve_class_aliases(
     return text
 
 
+#: What a string literal's body is while the passes run: see
+#: `_protect_literals`. A name nothing else in the text can be.
+_LITERAL_KEEP = "__py2bin_lit_"
+
+#: The bodies put aside for the translation running now, by number.
+_PROTECTED_LITERALS: "list[str]" = []
+
+
 def _translate(source: str, filename: str = "<c++>") -> str:
     """Translate the C++ subset in `source` into C.
 
     The result is ordinary C: structs where the classes were, free functions
     where the methods were, and calls rewritten to pass the object.
+
+    Every string literal's body is put aside while the passes run, and put
+    back in what they leave: see `_protect_literals`.
     """
+
+    global _PROTECTED_LITERALS
+    saved = _PROTECTED_LITERALS
+    _PROTECTED_LITERALS = []
+    try:
+        try:
+            written = _translate_text(source, filename)
+        except CppTranslationError as refused:
+            # A refusal quotes the code it is about, and the code it read
+            # held the names a literal was given while the passes ran.
+            raise CppTranslationError(
+                refused.filename,
+                refused.line,
+                _restore_literals(refused.message, _PROTECTED_LITERALS),
+            ) from None
+        return _restore_literals(written, _PROTECTED_LITERALS)
+    finally:
+        _PROTECTED_LITERALS = saved
+
+
+def _protect_literals(text: str) -> str:
+    """Each string literal's body put aside, and a name of py2bin's own left in it.
+
+    The passes that turn C++ into C read the text as code, and nearly every
+    one of them read a string as readily as anything else: `"p.twice()"`
+    printed `Point__twice(&p)`, `"new Point(1)"` printed `Point__new__1(1)`,
+    `"class A { };"` printed nothing at all, and `"template<typename T>"`
+    was refused as a template written in the wrong place. A program's text -
+    a help message, a fragment of JSON, a script it hands to a browser - came
+    out as something else, and nothing said so.
+
+    So once the few passes that read what a literal holds have run - the
+    linkage `extern "C"` names, the interface ID a COM spelling carries -
+    every string literal keeps its quotes and its prefix and loses its body,
+    which is put back when the C is written. It is still a literal of the
+    same kind wherever a pass asks what type something is.
+
+    A character literal is not set aside: its type and its value are what
+    choose an overload. One that is a single bracket or quote or other
+    punctuation is written as its escape instead - the same character, and
+    nothing a pass counting braces can read as one.
+
+    Strings inside a directive are set aside as well, except in an
+    `#include` or a `#pragma`, which name a file and say something to the
+    preprocessor; a macro's body is text a pass may still read.
+    """
+
+    out: "list[str]" = []
+    for kind, part in _split_literals(text):
+        if kind == "code":
+            out.append(part)
+            continue
+        if part.lstrip().startswith("#"):
+            out.append(_protect_directive_literals(part))
+            continue
+        # `extern "C"` - the linkage, which a pass below still has to read.
+        ahead = "".join(out).rstrip()
+        if re.search(r"\bextern$", ahead):
+            out.append(part)
+            continue
+        out.append(_protect_one_literal(part))
+    return "".join(out)
+
+
+def _protect_one_literal(part: str) -> str:
+    """One literal, as `_protect_literals` leaves it."""
+
+    opened = re.match(r"(u8|L|u|U)?([\"'])", part)
+    if opened is None:
+        return part
+    prefix, quote = opened.group(1) or "", opened.group(2)
+    rest = part[len(prefix) + 1:]
+    if len(rest) < 1 or not rest.endswith(quote):
+        # Not closed on its line: a stray quote, which is read as one
+        # character wide and left alone.
+        return part
+    inner = rest[:-1]
+    if quote == '"':
+        _PROTECTED_LITERALS.append(inner)
+        return f'{prefix}"{_LITERAL_KEEP}{len(_PROTECTED_LITERALS) - 1}"'
+    if (
+        len(inner) == 1
+        and ord(inner) < 128
+        and not (inner.isalnum() or inner in "_ ")
+    ):
+        return f"{prefix}'\\x{ord(inner):02x}'"
+    return part
+
+
+def _protect_directive_literals(directive: str) -> str:
+    """The string literals inside a directive, as `_protect_literals` leaves them."""
+
+    if re.match(r"\s*#\s*(?:include|import|pragma)\b", directive):
+        return directive
+    return re.sub(
+        r'(?<![\w])(u8|L|u|U)?"((?:[^"\\\n]|\\.)*)"',
+        lambda found: _protect_one_literal(found.group(0)),
+        directive,
+    )
+
+
+def _restore_literals(text: str, bodies: "list[str]") -> str:
+    """Put each literal's body back where `_protect_literals` left its name."""
+
+    if not bodies or _LITERAL_KEEP not in text:
+        return text
+    return re.sub(
+        rf"{_LITERAL_KEEP}(\d+)",
+        lambda found: (
+            bodies[int(found.group(1))]
+            if int(found.group(1)) < len(bodies)
+            else found.group(0)
+        ),
+        text,
+    )
+
+
+def _translate_text(source: str, filename: str = "<c++>") -> str:
+    """The translation itself; `_translate` puts the literals back after it."""
 
     # Before the comments go, and before anything at all reads the text:
     # raw strings as ordinary literals, and the arms no build takes emptied,
@@ -21537,6 +23089,12 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # refuses was refused out of code nobody compiles, and a `#define` in one
     # was noted as a name the file defines.
     text = _blank_dead_arms(text)
+    # Every literal's body set aside from here on, so that no pass below can
+    # read a string as code - the namespaces are flattened next, and a string
+    # holding `namespace n { }` was flattened with them. Not before the dead
+    # arms are emptied: those are told apart by what a directive says. See
+    # `_protect_literals`.
+    text = _protect_literals(text)
     # Before any pass that writes a declaration out: C++ lets a loop or a
     # branch take one statement without braces, and that statement is still
     # a scope. A declaration written in front of an unbraced body lands
@@ -21793,6 +23351,20 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     _INHERITED_FROM = {
         one for m in _CLASS_HEAD.finditer(text) for one in _bases_of(m)
     }
+    global _BASES, _SHARED_STEPS, _ENUMERATORS
+    _BASES = {}
+    _SHARED_STEPS = set()
+    for head in _CLASS_HEAD.finditer(text):
+        _BASES[head.group(2)] = _bases_of(head)
+        for part in (head.group(3) or "").split(","):
+            words = part.split()
+            if "virtual" in words and words:
+                _SHARED_STEPS.add((head.group(2), _base_named(words[-1])))
+    _ENUMERATORS = _enumerators_of(text)
+    # Before the throws are read: what the library throws, nothing in this
+    # program may be there to catch, and then it does not throw at all.
+    text = _settle_library_throws(text)
+    throws = _THROWS.search(text) is not None
     # After the names are known, because telling `T &&o` from `a && b` is
     # exactly the question of whether the first word names a type.
     text = _rvalue_references_to_references(text)
@@ -22338,8 +23910,39 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # nowhere the file can see, so without this `cout << v[0]` had no way to
     # find out what `v[0]` - a call to `vector__int__op_index` - returns.
     scope = remainder + "\n" + _method_declarations(order, classes)
+    # Which classes copy by code of their own, read once every member and
+    # every base is known - before anything is written, because the copies
+    # written below are told which of their parts to copy that way.
+    global _OWNING
+    _OWNING = _owning_classes(classes)
     definitions = "\n".join(
         _emit_methods(classes[name], classes, scope) for name in order
+    )
+    # The copy members C++ writes for those classes, and the line that tells
+    # the C stage what copies each one: from there on every copy of one -
+    # however the translation came to write it - is a call to them.
+    implicit_copies = [
+        _emit_implicit_copies(classes[name], classes)
+        for name in order
+        if name in _OWNING
+    ]
+    definitions += "\n" + "\n".join(one for one in implicit_copies if one)
+    owning_lines = "".join(
+        f"#pragma py2bin owning {name} {_copy_function_name(name, classes)} "
+        f"{_assign_function_name(name, classes)}\n"
+        for name in order
+        if name in _OWNING
+    )
+    # And which constructor builds each class from nothing, for the
+    # containers' `__py2bin_default_into`: a place a vector has made room
+    # for is filled the way `T()` fills one.
+    owning_lines += "".join(
+        f"#pragma py2bin builds {name} {_c_name(name, '', _call_suffix(name, '', classes, []))}\n"
+        for name in order
+        if any(
+            method.name == "" and _arity(method.parameters) == 0
+            for method in classes[name].methods
+        )
     )
     # Before the arguments are given their addresses: a temporary is an
     # object, and an object passed by value is passed by address - but only
@@ -22417,6 +24020,7 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         )
     if tagged_after:
         definitions += "\n" + "\n".join(tagged_after)
+    head = owning_lines + head
     whole = f"{head}\n{typedefs}\n{declarations}\n\n{definitions}\n\n{rewritten}\n"
     # A call made through a variable, here rather than while each body was
     # rewritten: the variable's type is a typedef that instantiating a
@@ -22428,6 +24032,21 @@ def _translate(source: str, filename: str = "<c++>") -> str:
     # is not spelled with the name its call is written under until now.
     positions, held_by = _reference_literal_parameters(classes)
     whole = _bind_reference_literals(whole, positions, held_by)
+    # And a method taking a reference to a pointer - `push_back(const T &)` of
+    # a vector of pointers - given a pointer, which is an object to bind to
+    # or a value to hold in one.
+    pointer_positions: "dict[str, list[int]]" = {}
+    pointer_held: "dict[tuple[str, int], str]" = {}
+    for owner, holder in classes.items():
+        for method in holder.methods:
+            spelled = _c_name(owner, method.name, _suffix_of(owner, method, classes))
+            for index, part in enumerate(_split_arguments(method.parameters)):
+                held = _pointer_held_by_reference(part)
+                if held is None:
+                    continue
+                pointer_positions.setdefault(spelled, []).append(index + 1)
+                pointer_held[(spelled, index + 1)] = held
+    whole = _bind_pointer_references(whole, pointer_positions, pointer_held, True)
     whole = _fold_constant_definitions(whole)
     whole = _ask_a_class_whether_it_is_true(whole, classes)
     through, through_types = _pointer_call_signatures(whole, classes)
@@ -22435,6 +24054,9 @@ def _translate(source: str, filename: str = "<c++>") -> str:
         whole = _address_reference_arguments(
             whole, through, classes, "", frozenset(), through_types
         )
+    # The marks of where an object comes into existence have done their work:
+    # every destructor that reads them has been placed.
+    whole = re.sub(rf"\s*{_BUILT_MARK}\s*\([^()]*\)\s*;", " ", whole)
     # Last, on the C itself, because that is where every type is written out
     # and a pointer to a base can be told from a pointer to what holds it.
     return _move_to_second_base(whole, classes)
@@ -23038,7 +24660,10 @@ def _rewrite_explicit_destructors(
 
 
 def _rewrite_delete(
-    body: str, classes: "dict[str, Class]", known: "dict[str, str]"
+    body: str,
+    classes: "dict[str, Class]",
+    known: "dict[str, str]",
+    pointer_arrays: "dict[str, str] | None" = None,
 ) -> str:
     """`delete p` becomes `T__delete(p)`, using what `p` was declared as.
 
@@ -23050,6 +24675,12 @@ def _rewrite_delete(
     def one(match: "re.Match[str]") -> str:
         array, expression = match.group(1), match.group(2).strip()
         held = known.get(expression)
+        # An element of an array of pointers is one of what the array holds:
+        # `delete all[2]` in a `Shape *all[3]` ran no destructor at all, and
+        # with a virtual one that was every derived destructor skipped.
+        element = re.fullmatch(r"([A-Za-z_]\w*)\s*\[[^\]]*\]", expression)
+        if held is None and element is not None and pointer_arrays:
+            held = pointer_arrays.get(element.group(1))
         if held is None or held not in classes:
             return f"free((void *){expression});"
         suffix = "delete_array" if array else "delete"
@@ -23228,10 +24859,16 @@ def _deref_references(
             # `&r` on a reference is the address of what it names, which is
             # what the pointer already holds. Taking one of the pointer gave
             # a `T **` - which is what `this == &other` compared against.
+            # Not where something is reached on it: `&r.items[i]` is the
+            # address of the element, `&(r.items[i])`, and dropping the `&`
+            # left the element itself where its address was asked for.
             body = _map_code(
                 body,
                 lambda part, n=name: re.sub(
-                    rf"&\s*(?<![.\w>])\b{re.escape(n)}\b(?!\s*[\w(])", n, part
+                    rf"&\s*(?<![.\w>])\b{re.escape(n)}\b"
+                    rf"(?!\s*(?:[\w(\[.]|->))",
+                    n,
+                    part,
                 ),
             )
             body = _map_code(
@@ -23596,6 +25233,123 @@ def _pointer_call_signatures(
     return positions, types
 
 
+def _pointer_held_by_reference(part: str) -> "str | None":
+    """The pointer type a parameter is a reference to, if it is one.
+
+    `T *const &v`, `T *&v` and `const T *&v` - which is what `const T &`
+    becomes when a template is copied for a pointer: `vector<Shape *>`'s
+    `push_back(const T &value)`. A reference is carried as a pointer here, so
+    what is passed is the address of a pointer.
+    """
+
+    if "&" not in part or "*" not in part:
+        return None
+    if part.rfind("&") < part.rfind("*"):
+        return None
+    spelled = part[: part.rfind("&")]
+    spelled = re.sub(r"\bconst\b", " ", spelled)
+    spelled = " ".join(spelled.replace("*", " * ").split())
+    if not spelled.endswith("*") or len(spelled.split()) < 2:
+        return None
+    return spelled
+
+
+def _same_pointer_type(one: str, other: str) -> bool:
+    """Whether two spellings name the same pointer type, qualifiers aside."""
+
+    def plain(spelled: str) -> str:
+        spelled = re.sub(r"\b(?:const|volatile|struct|class)\b", " ", spelled)
+        return " ".join(spelled.replace("*", " * ").split())
+
+    return plain(one) == plain(other)
+
+
+#: What an argument this pass has already bound reads as until the pass is
+#: done, so a later round does not bind it again. Taken off at the end.
+_POINTER_BOUND = "\x00pointer-bound\x00"
+
+
+def _bind_pointer_references(
+    text: str,
+    signatures: "dict[str, list[int]]",
+    held_types: "dict[tuple[str, int], str]",
+    address_names: bool,
+) -> str:
+    """A reference to a pointer, given a pointer: bind it to an object.
+
+    `all.push_back(p)` where the parameter is a `Shape *const &` hands over
+    the address of `p`, as a reference to it does; `all.push_back(new
+    Square())` or `take(&s)` hands over an expression that is no object, and
+    C++ binds the reference to a temporary holding its value. Nothing did
+    either, so the pointer itself went where its address was wanted.
+
+    `address_names` is false where another pass already takes the address of
+    an argument that is a name - a free function's - and true for a method,
+    where nothing did.
+    """
+
+    if not held_types:
+        return text
+    for _round in range(_HOIST_ROUNDS):
+        changed = False
+        for name, positions in signatures.items():
+            bare = _without_literals(text)
+            for found in re.finditer(rf"(?<![.\w>]){re.escape(name)}\s*\(", bare):
+                close = _closing_paren(bare, found.end() - 1)
+                if close < 0 or _is_a_definition(bare, close):
+                    continue
+                inside = text[found.end(): close]
+                parts = _split_arguments(inside) if inside.strip() else []
+                for index in positions:
+                    held = held_types.get((name, index))
+                    if held is None or index >= len(parts):
+                        continue
+                    argument = parts[index].strip()
+                    if not argument or argument.startswith(_POINTER_BOUND):
+                        continue
+                    # Bound already, by this pass on an earlier reading.
+                    if re.match(rf"&\s*{re.escape(_BOUND_PREFIX)}", argument):
+                        continue
+                    # `&p` where `p` is a pointer of the type bound to is the
+                    # address of that pointer - another pass took it. `&s`
+                    # where `s` is the object is a pointer value, no object,
+                    # and is bound below.
+                    if argument.startswith("&") and _has_an_address(argument[1:].strip()):
+                        named = _deduced_type(argument[1:].strip(), text, found.start())
+                        if named is not None and _same_pointer_type(named, held):
+                            continue
+                    if _has_an_address(argument) and not argument.startswith("&"):
+                        if not address_names:
+                            continue
+                        parts[index] = f"{_POINTER_BOUND}&{argument}"
+                        text = (
+                            text[: found.end()]
+                            + ", ".join(one.strip() for one in parts)
+                            + text[close:]
+                        )
+                        changed = True
+                        break
+                    made = f"{_BOUND_PREFIX}p{abs(hash((found.start(), index, argument))) % 100000}"
+                    parts[index] = f"{_POINTER_BOUND}&{made}"
+                    begins = _statement_start(text, found.start())
+                    text = (
+                        text[:begins]
+                        + f" {held} {made} = {argument}; "
+                        + text[begins: found.end()]
+                        + ", ".join(one.strip() for one in parts)
+                        + text[close:]
+                    )
+                    changed = True
+                    break
+                if changed:
+                    break
+            if changed:
+                break
+        if not changed:
+            break
+    return text.replace(_POINTER_BOUND, "")
+
+
 def _reference_literal_parameters(
     classes: "dict[str, Class]",
 ) -> "tuple[dict[str, list[int]], dict[tuple[str, int], str]]":
@@ -23753,6 +25507,18 @@ def _address_reference_arguments(
     # A reference to something that is not a class, given something with no
     # address: C++ makes a temporary and binds to that.
     text = _bind_reference_literals(text, signatures, bound_types)
+    # And a reference to a pointer given an expression - `take(&s)`, `take(new
+    # T())` - which the pass below leaves alone, having only a name's address
+    # to take.
+    pointer_held: "dict[tuple[str, int], str]" = {}
+    for match in _DEFINITION.finditer(reading):
+        if _depth_at(reading, match.end() - 1) != 0:
+            continue
+        for index, part in enumerate(_split_arguments(match.group(3))):
+            held = _pointer_held_by_reference(part)
+            if held is not None:
+                pointer_held[(match.group(2), index)] = held
+    text = _bind_pointer_references(text, signatures, pointer_held, False)
     for name, positions in signatures.items():
         pattern = re.compile(rf"(?<![.\w>]){re.escape(name)}\s*\(")
         out: list[str] = []
@@ -24514,507 +26280,978 @@ def translate_file(path: Path) -> str:
 #: readme. What it buys is that `#include <string>` and `std::string` stop
 #: being a wall: the class is declared in `namespace std`, and namespaces are
 #: flattened, so `std::string` resolves to it exactly as the qualifier says.
-_STRING_HEADER = r"""
+_STRING_HEADER = r'''
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 namespace std {
+/* A string owns its characters: storage of its own, as much as it needs,
+   given back when it goes, and copied when it is copied. It was a fixed
+   array of 256 and every operation stopped at the 255th character -
+   without a word, which for a program building JSON or reading a file
+   was its whole output cut short. The wide one is the same class a
+   character wider, written from the same text so the two cannot drift. */
 class string {
 public:
-    char buf[256];
-    int len;
-    string() { buf[0] = 0; len = 0; }
-    string(const char *s) {
-        int i; i = 0;
-        while (s[i] != 0 && i < 255) { buf[i] = s[i]; i = i + 1; }
-        buf[i] = 0; len = i;
+    char *__data;
+    unsigned long __size;
+    unsigned long __room;
+    static const unsigned long npos = (unsigned long)-1;
+
+    /* How much room libc++ takes for `wanted` characters: twenty-two at
+       least, which is what it holds without asking for storage at all, and
+       otherwise one short of a multiple of eight. Matched so `capacity()`
+       says what it says there. */
+    static unsigned long __recommend(unsigned long __s_wanted) {
+        if (__s_wanted < 23) { return 22; }
+        return ((__s_wanted + 8) / 8) * 8 - 1;
     }
+    static unsigned long __length(const char *__s_text) {
+        unsigned long __s_n;
+        __s_n = 0;
+        while (__s_text[__s_n] != 0) { __s_n = __s_n + 1; }
+        return __s_n;
+    }
+    /* Room for `wanted` characters and the zero after them, keeping what is
+       here: twice what there was, or what is wanted if that is more. */
+    void __need(unsigned long __s_wanted) {
+        char *__s_fresh;
+        unsigned long __s_i;
+        unsigned long __s_grown;
+        if (__data != 0 && __s_wanted <= __room) { return; }
+        __s_grown = capacity() * 2;
+        if (__s_grown < __s_wanted) { __s_grown = __s_wanted; }
+        __s_grown = __recommend(__s_grown);
+        if (__data == 0 && __s_wanted <= 22) { __s_grown = 22; }
+        __s_fresh = (char *)malloc(sizeof(char) * (__s_grown + 1));
+        __s_i = 0;
+        while (__s_i < __size) { __s_fresh[__s_i] = __data[__s_i]; __s_i = __s_i + 1; }
+        __s_fresh[__size] = 0;
+        free(__data);
+        __data = __s_fresh;
+        __room = __s_grown;
+    }
+    /* What this holds, replaced by `many` characters from `from` - which may
+       be inside this very string, so nothing is let go of before they are
+       read. */
+    void __set(const char *__s_from, unsigned long __s_many) {
+        char *__s_fresh;
+        unsigned long __s_i;
+        if (__s_many == 0) {
+            if (__data != 0) { __data[0] = 0; }
+            __size = 0;
+            return;
+        }
+        if (__data != 0 && __s_many <= __room) {
+            __s_i = 0;
+            while (__s_i < __s_many) { __data[__s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+            __data[__s_many] = 0;
+            __size = __s_many;
+            return;
+        }
+        __s_fresh = (char *)malloc(sizeof(char) * (__recommend(__s_many) + 1));
+        __s_i = 0;
+        while (__s_i < __s_many) { __s_fresh[__s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+        __s_fresh[__s_many] = 0;
+        free(__data);
+        __data = __s_fresh;
+        __size = __s_many;
+        __room = __recommend(__s_many);
+    }
+    /* What `at` holds, with `count` of it taken out and `many` characters
+       from `with` put in its place. Built in new storage, so `with` may be
+       inside this string. */
+    string &__replace(unsigned long __s_at, unsigned long __s_count, const char *__s_with, unsigned long __s_many) {
+        unsigned long __s_tail;
+        unsigned long __s_size;
+        unsigned long __s_i;
+        char *__s_fresh;
+        if (__s_at > __size) { __s_at = __size; }
+        if (__s_count > __size - __s_at) { __s_count = __size - __s_at; }
+        __s_tail = __size - __s_at - __s_count;
+        __s_size = __s_at + __s_many + __s_tail;
+        __s_fresh = (char *)malloc(sizeof(char) * (__recommend(__s_size) + 1));
+        __s_i = 0;
+        while (__s_i < __s_at) { __s_fresh[__s_i] = __data[__s_i]; __s_i = __s_i + 1; }
+        __s_i = 0;
+        while (__s_i < __s_many) { __s_fresh[__s_at + __s_i] = __s_with[__s_i]; __s_i = __s_i + 1; }
+        __s_i = 0;
+        while (__s_i < __s_tail) { __s_fresh[__s_at + __s_many + __s_i] = __data[__s_at + __s_count + __s_i]; __s_i = __s_i + 1; }
+        __s_fresh[__s_size] = 0;
+        free(__data);
+        __data = __s_fresh;
+        __size = __s_size;
+        __room = __recommend(__s_size);
+        return *this;
+    }
+    int __compare(const char *__s_other, unsigned long __s_many) {
+        unsigned long __s_i;
+        unsigned long __s_shorter;
+        __s_shorter = __size < __s_many ? __size : __s_many;
+        __s_i = 0;
+        while (__s_i < __s_shorter) {
+            if (__data[__s_i] != __s_other[__s_i]) { return (int)(unsigned char)__data[__s_i] - (int)(unsigned char)__s_other[__s_i]; }
+            __s_i = __s_i + 1;
+        }
+        if (__size < __s_many) { return -1; }
+        if (__size > __s_many) { return 1; }
+        return 0;
+    }
+    unsigned long __find(const char *__s_needle, unsigned long __s_many, unsigned long __s_from) {
+        unsigned long __s_i;
+        unsigned long __s_j;
+        if (__s_from > __size) { return npos; }
+        if (__s_many == 0) { return __s_from; }
+        __s_i = __s_from;
+        while (__s_i + __s_many <= __size) {
+            __s_j = 0;
+            while (__s_j < __s_many && __data[__s_i + __s_j] == __s_needle[__s_j]) { __s_j = __s_j + 1; }
+            if (__s_j == __s_many) { return __s_i; }
+            __s_i = __s_i + 1;
+        }
+        return npos;
+    }
+    unsigned long __rfind(const char *__s_needle, unsigned long __s_many, unsigned long __s_from) {
+        unsigned long __s_i;
+        unsigned long __s_j;
+        if (__s_many > __size) { return npos; }
+        __s_i = __size - __s_many;
+        if (__s_from < __s_i) { __s_i = __s_from; }
+        while (1) {
+            __s_j = 0;
+            while (__s_j < __s_many && __data[__s_i + __s_j] == __s_needle[__s_j]) { __s_j = __s_j + 1; }
+            if (__s_j == __s_many) { return __s_i; }
+            if (__s_i == 0) { return npos; }
+            __s_i = __s_i - 1;
+        }
+    }
+    static int __holds(const char *__s_set, unsigned long __s_many, char __s_c) {
+        unsigned long __s_i;
+        __s_i = 0;
+        while (__s_i < __s_many) { if (__s_set[__s_i] == __s_c) { return 1; } __s_i = __s_i + 1; }
+        return 0;
+    }
+    unsigned long __first_of(const char *__s_set, unsigned long __s_many, unsigned long __s_from, int __s_wanted) {
+        while (__s_from < __size) {
+            if (__holds(__s_set, __s_many, __data[__s_from]) == __s_wanted) { return __s_from; }
+            __s_from = __s_from + 1;
+        }
+        return npos;
+    }
+    unsigned long __last_of(const char *__s_set, unsigned long __s_many, unsigned long __s_from, int __s_wanted) {
+        unsigned long __s_i;
+        if (__size == 0) { return npos; }
+        __s_i = __size - 1;
+        if (__s_from < __s_i) { __s_i = __s_from; }
+        while (1) {
+            if (__holds(__s_set, __s_many, __data[__s_i]) == __s_wanted) { return __s_i; }
+            if (__s_i == 0) { return npos; }
+            __s_i = __s_i - 1;
+        }
+    }
+
+    string() { __data = 0; __size = 0; __room = 0; }
+    string(const char *__s_text) { __data = 0; __size = 0; __room = 0; __set(__s_text, __length(__s_text)); }
+    string(const char *__s_text, unsigned long __s_many) { __data = 0; __size = 0; __room = 0; __set(__s_text, __s_many); }
     /* `string held(n, 0);` - room made up front, which is how a program
        gives a C interface somewhere to write. */
-    string(int count, char fill) {
-        int i; i = 0;
-        while (i < count && i < 255) { buf[i] = fill; i = i + 1; }
-        buf[i] = 0; len = i;
+    string(unsigned long __s_count, char __s_fill) {
+        unsigned long __s_i;
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        if (__s_count == 0) { return; }
+        __need(__s_count);
+        __s_i = 0;
+        while (__s_i < __s_count) { __data[__s_i] = __s_fill; __s_i = __s_i + 1; }
+        __data[__s_count] = 0;
+        __size = __s_count;
     }
     /* `string(first, last)` - the characters between two iterators, which
-       are pointers here. From a range of its own width, and from a range of
-       the other: `std::wstring(s.begin(), s.end())` is how a program widens
-       a narrow string, and the narrow one back is how it returns. */
-    string(const char *first, const char *last) {
-        int i; i = 0;
-        while (first + i < last && i < 255) { buf[i] = first[i]; i = i + 1; }
-        buf[i] = 0; len = i;
+       are pointers here. */
+    string(const char *__s_first, const char *__s_last) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        __set(__s_first, (unsigned long)(__s_last - __s_first));
     }
     /* Bytes, which is what a program reading a socket or a file has: a
        `vector<uint8_t>` hands back `unsigned char *`, and a string built
-       from that range is how the text inside a frame is read out. Without
-       this form the range had to be `char *` exactly, and nothing that
-       arrives over a wire is. */
-    string(unsigned char *first, unsigned char *last) {
-        len = 0; buf[0] = 0;
-        while (first != last) { push_back((char)*first); first = first + 1; }
+       from that range is how the text inside a frame is read out. */
+    string(unsigned char *__s_first, unsigned char *__s_last) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        __set((const char *)__s_first, (unsigned long)(__s_last - __s_first));
     }
-    string(const wchar_t *first, const wchar_t *last) {
-        int i; i = 0;
-        while (first + i < last && i < 255) { buf[i] = (char)first[i]; i = i + 1; }
-        buf[i] = 0; len = i;
+    /* From a range of the other width: `std::string(w.begin(), w.end())`
+       narrows each character, which is what a program writes to get ASCII
+       out of a wide string. */
+    string(const wchar_t *__s_first, const wchar_t *__s_last) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        while (__s_first < __s_last) { push_back((char)*__s_first); __s_first = __s_first + 1; }
     }
+    ~string() { free(__data); }
+    /* What C++ calls this class's copy constructor and its assignment, under
+       names no call can reach by overloading: written as members, a copy
+       constructor joined the one-argument constructors and every call that
+       relied on there being one became a question of types. The translator
+       sees these and has every copy of a string made with them. */
+    void __py2bin_copy_from(const string &__s_other) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        if (__s_other.__size > 0) { __set(__s_other.__data, __s_other.__size); }
+    }
+    void __py2bin_assign_from(const string &__s_other) {
+        if (this == &__s_other) { return; }
+        __set(__s_other.__data, __s_other.__size);
+    }
+
     typedef char *iterator;
     typedef char *const_iterator;
-    char *begin() { return buf; }
-    char *end() { return buf + len; }
+    typedef char value_type;
+    typedef unsigned long size_type;
+    char *begin() { return __data; }
+    char *end() { return __data + __size; }
     /* Writable, which is the point: a C interface handed this fills it in,
        and `resize` afterwards says how much of it was filled. */
-    char *data() { return buf; }
-    void resize(int count) {
-        int i;
-        if (count > 255) { count = 255; }
-        i = len;
-        while (i < count) { buf[i] = 0; i = i + 1; }
-        buf[count] = 0;
-        len = count;
+    char *data() { if (__data == 0) { __need(0); } return __data; }
+    const char *c_str() { if (__data == 0) { __need(0); } return __data; }
+    unsigned long size() { return __size; }
+    unsigned long length() { return __size; }
+    unsigned long capacity() { return __room < 22 ? 22 : __room; }
+    int empty() { return __size == 0; }
+    char &operator[](unsigned long __s_i) { if (__data == 0) { __need(0); } return __data[__s_i]; }
+    char &at(unsigned long __s_i) {
+        if (__s_i >= __size) { __py2bin_throw_out_of_range("basic_string"); }
+        return __data[__s_i];
     }
-    void reserve(int count) { }
-    void assign(const char *s) {
-        int i; i = 0;
-        while (s[i] != 0 && i < 255) { buf[i] = s[i]; i = i + 1; }
-        buf[i] = 0; len = i;
+    /* A position past the end, which the members taking one throw for. */
+    void __check(unsigned long __s_at) {
+        if (__s_at > __size) { __py2bin_throw_out_of_range("basic_string"); }
     }
-    int size() { return len; }
-    int length() { return len; }
-    int empty() { return len == 0; }
-    char at(int i) { return buf[i]; }
-    const char *c_str() { return buf; }
-    void push_back(char c) {
-        if (len < 255) { buf[len] = c; len = len + 1; buf[len] = 0; }
+    char &back() { return __data[__size - 1]; }
+    char &front() { return __data[0]; }
+
+    void push_back(char __s_c) {
+        __need(__size + 1);
+        __data[__size] = __s_c;
+        __size = __size + 1;
+        __data[__size] = 0;
     }
     /* The last character, and taking it off: how a program trims a string
        from the end - `while (!s.empty() && (s.back() & 0xC0) == 0x80)
        s.pop_back();` walks back off a UTF-8 continuation byte. */
-    char back() { return buf[len - 1]; }
-    void pop_back() { if (len > 0) { len = len - 1; buf[len] = 0; } }
-    void clear() { len = 0; buf[0] = 0; }
-    int compare(const char *s) {
-        int i;
-        i = 0;
-        while (buf[i] != 0 && buf[i] == s[i]) { i = i + 1; }
-        return (int)(unsigned char)buf[i] - (int)(unsigned char)s[i];
-    }
-    int find(char c) {
-        int i;
-        i = 0;
-        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
-        return -1;
-    }
-    static const int npos = -1;
-
-    void operator+=(string o) { append(o); }
-    void operator+=(const char *s) { append(s); }
-    void operator+=(char c) { push_back(c); }
-
-    char &operator[](int i) { return buf[i]; }
-
-    int operator<(string o) { return compare(o.c_str()) < 0; }
-    int operator>(string o) { return compare(o.c_str()) > 0; }
-    int operator<=(string o) { return compare(o.c_str()) <= 0; }
-    int operator>=(string o) { return compare(o.c_str()) >= 0; }
-
-    int find(const char *needle) {
-        int i; int j;
-        if (needle[0] == 0) { return 0; }
-        i = 0;
-        while (i < len) {
-            j = 0;
-            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
-                j = j + 1;
-            }
-            if (needle[j] == 0) { return i; }
-            i = i + 1;
+    void pop_back() { if (__size > 0) { __size = __size - 1; __data[__size] = 0; } }
+    void clear() { __size = 0; if (__data != 0) { __data[0] = 0; } }
+    void resize(unsigned long __s_count, char __s_fill) {
+        unsigned long __s_i;
+        if (__s_count > __size) {
+            __need(__s_count);
+            __s_i = __size;
+            while (__s_i < __s_count) { __data[__s_i] = __s_fill; __s_i = __s_i + 1; }
         }
-        return -1;
+        __size = __s_count;
+        if (__data != 0) { __data[__size] = 0; }
+    }
+    void resize(unsigned long __s_count) { resize(__s_count, (char)0); }
+    void reserve(unsigned long __s_wanted) { if (__s_wanted > capacity()) { __need(__s_wanted); } }
+    void shrink_to_fit() { }
+    void swap(string &__s_other) {
+        char *__s_held;
+        unsigned long __s_size;
+        unsigned long __s_room;
+        __s_held = __data; __s_size = __size; __s_room = __room;
+        __data = __s_other.__data; __size = __s_other.__size; __room = __s_other.__room;
+        __s_other.__data = __s_held; __s_other.__size = __s_size; __s_other.__room = __s_room;
     }
 
-    /* The cast is what says which overload: two `find`s take one argument,
-       and the type of a call's result is what tells them apart. */
-    int find(string needle) { return find((const char *)needle.c_str()); }
-    /* The last match rather than the first, which is what `rfind` is. */
-    int rfind(const char *needle) {
-        int i; int j; int found;
-        found = -1;
-        i = 0;
-        while (i < len) {
-            j = 0;
-            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) { j = j + 1; }
-            if (needle[j] == 0) { found = i; }
-            i = i + 1;
+    string &assign(const char *__s_text) { __set(__s_text, __length(__s_text)); return *this; }
+    string &assign(const string &__s_other) { __set(__s_other.__data, __s_other.__size); return *this; }
+    string &assign(const char *__s_text, unsigned long __s_many) { __set(__s_text, __s_many); return *this; }
+    /* Added at the end, from wherever it comes - this string included. */
+    string &append(const char *__s_from, unsigned long __s_many) {
+        char *__s_fresh;
+        unsigned long __s_i;
+        unsigned long __s_wanted;
+        unsigned long __s_grown;
+        __s_wanted = __size + __s_many;
+        if (__data == 0 || __s_wanted > __room) {
+            __s_grown = capacity() * 2;
+            if (__s_grown < __s_wanted) { __s_grown = __s_wanted; }
+            __s_grown = __recommend(__s_grown);
+            __s_fresh = (char *)malloc(sizeof(char) * (__s_grown + 1));
+            __s_i = 0;
+            while (__s_i < __size) { __s_fresh[__s_i] = __data[__s_i]; __s_i = __s_i + 1; }
+            __s_i = 0;
+            while (__s_i < __s_many) { __s_fresh[__size + __s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+            free(__data);
+            __data = __s_fresh;
+            __room = __s_grown;
+        } else {
+            __s_i = 0;
+            while (__s_i < __s_many) { __data[__size + __s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
         }
-        return found;
+        __size = __s_wanted;
+        __data[__size] = 0;
+        return *this;
     }
-    int rfind(string needle) { return rfind((const char *)needle.c_str()); }
+    string &append(const char *__s_text) { return append(__s_text, __length(__s_text)); }
+    string &append(const string &__s_other) { return append(__s_other.__data, __s_other.__size); }
+    string &append(unsigned long __s_count, char __s_c) {
+        unsigned long __s_i;
+        __s_i = 0;
+        while (__s_i < __s_count) { push_back(__s_c); __s_i = __s_i + 1; }
+        return *this;
+    }
+    string &operator+=(const string &__s_other) { return append(__s_other.__data, __s_other.__size); }
+    string &operator+=(const char *__s_text) { return append(__s_text, __length(__s_text)); }
+    string &operator+=(char __s_c) { push_back(__s_c); return *this; }
+    string operator+(const string &__s_other) {
+        string __s_made;
+        __s_made.__set(__data, __size);
+        __s_made.append(__s_other.__data, __s_other.__size);
+        return __s_made;
+    }
+    string operator+(const char *__s_text) {
+        string __s_made;
+        __s_made.__set(__data, __size);
+        __s_made.append(__s_text, __length(__s_text));
+        return __s_made;
+    }
+    string operator+(char __s_c) {
+        string __s_made;
+        __s_made.__set(__data, __size);
+        __s_made.push_back(__s_c);
+        return __s_made;
+    }
 
-    /* And each of them from a position, which is how a program walks a
-       string looking for the next one of something. */
-    int find(char c, int from) {
-        int i;
-        i = from;
-        if (i < 0) { i = 0; }
-        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
-        return -1;
+    string &insert(unsigned long __s_at, const char *__s_text) { __check(__s_at); return __replace(__s_at, 0, __s_text, __length(__s_text)); }
+    string &insert(unsigned long __s_at, const string &__s_other) { __check(__s_at); return __replace(__s_at, 0, __s_other.__data, __s_other.__size); }
+    string &insert(unsigned long __s_at, unsigned long __s_count, char __s_c) {
+        __check(__s_at);
+        string __s_filled(__s_count, __s_c);
+        return __replace(__s_at, 0, __s_filled.__data, __s_filled.__size);
     }
-    int find(const char *needle, int from) {
-        int i; int j;
-        i = from;
-        if (i < 0) { i = 0; }
-        if (needle[0] == 0) { return i <= len ? i : -1; }
-        while (i < len) {
-            j = 0;
-            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
-                j = j + 1;
-            }
-            if (needle[j] == 0) { return i; }
-            i = i + 1;
+    string &erase(unsigned long __s_at, unsigned long __s_count) { __check(__s_at); return __replace(__s_at, __s_count, __data, 0); }
+    string &erase(unsigned long __s_at) { __check(__s_at); return __replace(__s_at, npos, __data, 0); }
+    string &replace(unsigned long __s_at, unsigned long __s_count, const string &__s_with) {
+        __check(__s_at);
+        return __replace(__s_at, __s_count, __s_with.__data, __s_with.__size);
+    }
+    string &replace(unsigned long __s_at, unsigned long __s_count, const char *__s_with) {
+        __check(__s_at);
+        return __replace(__s_at, __s_count, __s_with, __length(__s_with));
+    }
+    string substr(unsigned long __s_from, unsigned long __s_count) {
+        __check(__s_from);
+        string __s_out;
+        unsigned long __s_take;
+        if (__s_from > __size) { __s_from = __size; }
+        __s_take = __size - __s_from;
+        if (__s_count < __s_take) { __s_take = __s_count; }
+        __s_out.__set(__data + __s_from, __s_take);
+        return __s_out;
+    }
+    string substr(unsigned long __s_from) { return substr(__s_from, npos); }
+
+    int compare(const string &__s_other) { return __compare(__s_other.__data, __s_other.__size); }
+    int compare(const char *__s_text) { return __compare(__s_text, __length(__s_text)); }
+    int operator==(const string &__s_other) { return __size == __s_other.__size && __compare(__s_other.__data, __s_other.__size) == 0; }
+    int operator==(const char *__s_text) { return __compare(__s_text, __length(__s_text)) == 0; }
+    int operator!=(const string &__s_other) { return !(__size == __s_other.__size && __compare(__s_other.__data, __s_other.__size) == 0); }
+    int operator!=(const char *__s_text) { return __compare(__s_text, __length(__s_text)) != 0; }
+    int operator<(const string &__s_other) { return __compare(__s_other.__data, __s_other.__size) < 0; }
+    int operator<(const char *__s_text) { return __compare(__s_text, __length(__s_text)) < 0; }
+    int operator>(const string &__s_other) { return __compare(__s_other.__data, __s_other.__size) > 0; }
+    int operator>(const char *__s_text) { return __compare(__s_text, __length(__s_text)) > 0; }
+    int operator<=(const string &__s_other) { return __compare(__s_other.__data, __s_other.__size) <= 0; }
+    int operator<=(const char *__s_text) { return __compare(__s_text, __length(__s_text)) <= 0; }
+    int operator>=(const string &__s_other) { return __compare(__s_other.__data, __s_other.__size) >= 0; }
+    int operator>=(const char *__s_text) { return __compare(__s_text, __length(__s_text)) >= 0; }
+
+    unsigned long find(char __s_c) { return __find(&__s_c, 1, 0); }
+    unsigned long find(char __s_c, unsigned long __s_from) { return __find(&__s_c, 1, __s_from); }
+    unsigned long find(const char *__s_needle) { return __find(__s_needle, __length(__s_needle), 0); }
+    unsigned long find(const char *__s_needle, unsigned long __s_from) { return __find(__s_needle, __length(__s_needle), __s_from); }
+    unsigned long find(const string &__s_needle) { return __find(__s_needle.__data, __s_needle.__size, 0); }
+    unsigned long find(const string &__s_needle, unsigned long __s_from) { return __find(__s_needle.__data, __s_needle.__size, __s_from); }
+    unsigned long rfind(char __s_c) { return __rfind(&__s_c, 1, npos); }
+    unsigned long rfind(char __s_c, unsigned long __s_from) { return __rfind(&__s_c, 1, __s_from); }
+    unsigned long rfind(const char *__s_needle) { return __rfind(__s_needle, __length(__s_needle), npos); }
+    unsigned long rfind(const char *__s_needle, unsigned long __s_from) { return __rfind(__s_needle, __length(__s_needle), __s_from); }
+    unsigned long rfind(const string &__s_needle) { return __rfind(__s_needle.__data, __s_needle.__size, npos); }
+    unsigned long find_first_of(const char *__s_set) { return __first_of(__s_set, __length(__s_set), 0, 1); }
+    unsigned long find_first_of(const char *__s_set, unsigned long __s_from) { return __first_of(__s_set, __length(__s_set), __s_from, 1); }
+    unsigned long find_first_of(char __s_c) { return __first_of(&__s_c, 1, 0, 1); }
+    unsigned long find_first_of(const string &__s_set) { return __first_of(__s_set.__data, __s_set.__size, 0, 1); }
+    unsigned long find_last_of(const char *__s_set) { return __last_of(__s_set, __length(__s_set), npos, 1); }
+    unsigned long find_last_of(const char *__s_set, unsigned long __s_from) { return __last_of(__s_set, __length(__s_set), __s_from, 1); }
+    unsigned long find_last_of(char __s_c) { return __last_of(&__s_c, 1, npos, 1); }
+    unsigned long find_last_of(const string &__s_set) { return __last_of(__s_set.__data, __s_set.__size, npos, 1); }
+    unsigned long find_first_not_of(const char *__s_set) { return __first_of(__s_set, __length(__s_set), 0, 0); }
+    unsigned long find_first_not_of(const char *__s_set, unsigned long __s_from) { return __first_of(__s_set, __length(__s_set), __s_from, 0); }
+    unsigned long find_first_not_of(char __s_c) { return __first_of(&__s_c, 1, 0, 0); }
+    unsigned long find_first_not_of(const string &__s_set) { return __first_of(__s_set.__data, __s_set.__size, 0, 0); }
+    unsigned long find_last_not_of(const char *__s_set) { return __last_of(__s_set, __length(__s_set), npos, 0); }
+    unsigned long find_last_not_of(const char *__s_set, unsigned long __s_from) { return __last_of(__s_set, __length(__s_set), __s_from, 0); }
+    unsigned long find_last_not_of(char __s_c) { return __last_of(&__s_c, 1, npos, 0); }
+    unsigned long find_last_not_of(const string &__s_set) { return __last_of(__s_set.__data, __s_set.__size, npos, 0); }
+};
+
+class wstring {
+public:
+    wchar_t *__data;
+    unsigned long __size;
+    unsigned long __room;
+    static const unsigned long npos = (unsigned long)-1;
+
+    /* How much room libc++ takes for `wanted` characters: twenty-two at
+       least, which is what it holds without asking for storage at all, and
+       otherwise one short of a multiple of eight. Matched so `capacity()`
+       says what it says there. */
+    static unsigned long __recommend(unsigned long __s_wanted) {
+        if (__s_wanted < 23) { return 22; }
+        return ((__s_wanted + 8) / 8) * 8 - 1;
+    }
+    static unsigned long __length(const wchar_t *__s_text) {
+        unsigned long __s_n;
+        __s_n = 0;
+        while (__s_text[__s_n] != 0) { __s_n = __s_n + 1; }
+        return __s_n;
+    }
+    /* Room for `wanted` characters and the zero after them, keeping what is
+       here: twice what there was, or what is wanted if that is more. */
+    void __need(unsigned long __s_wanted) {
+        wchar_t *__s_fresh;
+        unsigned long __s_i;
+        unsigned long __s_grown;
+        if (__data != 0 && __s_wanted <= __room) { return; }
+        __s_grown = capacity() * 2;
+        if (__s_grown < __s_wanted) { __s_grown = __s_wanted; }
+        __s_grown = __recommend(__s_grown);
+        if (__data == 0 && __s_wanted <= 22) { __s_grown = 22; }
+        __s_fresh = (wchar_t *)malloc(sizeof(wchar_t) * (__s_grown + 1));
+        __s_i = 0;
+        while (__s_i < __size) { __s_fresh[__s_i] = __data[__s_i]; __s_i = __s_i + 1; }
+        __s_fresh[__size] = 0;
+        free(__data);
+        __data = __s_fresh;
+        __room = __s_grown;
+    }
+    /* What this holds, replaced by `many` characters from `from` - which may
+       be inside this very string, so nothing is let go of before they are
+       read. */
+    void __set(const wchar_t *__s_from, unsigned long __s_many) {
+        wchar_t *__s_fresh;
+        unsigned long __s_i;
+        if (__s_many == 0) {
+            if (__data != 0) { __data[0] = 0; }
+            __size = 0;
+            return;
         }
-        return -1;
-    }
-    int find(string needle, int from) {
-        return find((const char *)needle.c_str(), from);
-    }
-
-    string substr(int from, int count) {
-        string out;
-        int i;
-        i = 0;
-        while (i < count && from + i < len) {
-            out.push_back(buf[from + i]);
-            i = i + 1;
+        if (__data != 0 && __s_many <= __room) {
+            __s_i = 0;
+            while (__s_i < __s_many) { __data[__s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+            __data[__s_many] = 0;
+            __size = __s_many;
+            return;
         }
-        return out;
+        __s_fresh = (wchar_t *)malloc(sizeof(wchar_t) * (__recommend(__s_many) + 1));
+        __s_i = 0;
+        while (__s_i < __s_many) { __s_fresh[__s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+        __s_fresh[__s_many] = 0;
+        free(__data);
+        __data = __s_fresh;
+        __size = __s_many;
+        __room = __recommend(__s_many);
     }
-
-    string substr(int from) { return substr(from, len - from); }
-
-    void append(string o) {
-        int j; j = 0;
-        while (j < o.len && len + j < 255) { buf[len + j] = o.buf[j]; j = j + 1; }
-        len = len + j; buf[len] = 0;
+    /* What `at` holds, with `count` of it taken out and `many` characters
+       from `with` put in its place. Built in new storage, so `with` may be
+       inside this string. */
+    wstring &__replace(unsigned long __s_at, unsigned long __s_count, const wchar_t *__s_with, unsigned long __s_many) {
+        unsigned long __s_tail;
+        unsigned long __s_size;
+        unsigned long __s_i;
+        wchar_t *__s_fresh;
+        if (__s_at > __size) { __s_at = __size; }
+        if (__s_count > __size - __s_at) { __s_count = __size - __s_at; }
+        __s_tail = __size - __s_at - __s_count;
+        __s_size = __s_at + __s_many + __s_tail;
+        __s_fresh = (wchar_t *)malloc(sizeof(wchar_t) * (__recommend(__s_size) + 1));
+        __s_i = 0;
+        while (__s_i < __s_at) { __s_fresh[__s_i] = __data[__s_i]; __s_i = __s_i + 1; }
+        __s_i = 0;
+        while (__s_i < __s_many) { __s_fresh[__s_at + __s_i] = __s_with[__s_i]; __s_i = __s_i + 1; }
+        __s_i = 0;
+        while (__s_i < __s_tail) { __s_fresh[__s_at + __s_many + __s_i] = __data[__s_at + __s_count + __s_i]; __s_i = __s_i + 1; }
+        __s_fresh[__s_size] = 0;
+        free(__data);
+        __data = __s_fresh;
+        __size = __s_size;
+        __room = __recommend(__s_size);
+        return *this;
     }
-    void append(const char *s) {
-        int j; j = 0;
-        while (s[j] != 0 && len < 255) { buf[len] = s[j]; len = len + 1; j = j + 1; }
-        buf[len] = 0;
-    }
-    string operator+(string o) {
-        string r; int i; int j;
-        for (i = 0; i < len; i++) { r.buf[i] = buf[i]; }
-        for (j = 0; j < o.len && len + j < 255; j++) { r.buf[len + j] = o.buf[j]; }
-        r.len = len + j; r.buf[r.len] = 0;
-        return r;
-    }
-    int operator==(const char *s) { return compare(s) == 0; }
-    int operator!=(const char *s) { return compare(s) != 0; }
-    int rfind(char c) {
-        int i; int found;
-        found = -1;
-        i = 0;
-        while (i < len) { if (buf[i] == c) { found = i; } i = i + 1; }
-        return found;
-    }
-    int operator==(string o) {
-        int i;
-        if (len != o.len) { return 0; }
-        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 0; } }
-        return 1;
-    }
-    string operator+(const char *s) {
-        string r;
-        int i;
-        i = 0;
-        while (i < len) { r.push_back(buf[i]); i = i + 1; }
-        r.append(s);
-        return r;
-    }
-    int operator!=(string o) {
-        int i;
-        if (len != o.len) { return 1; }
-        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 1; } }
+    int __compare(const wchar_t *__s_other, unsigned long __s_many) {
+        unsigned long __s_i;
+        unsigned long __s_shorter;
+        __s_shorter = __size < __s_many ? __size : __s_many;
+        __s_i = 0;
+        while (__s_i < __s_shorter) {
+            if (__data[__s_i] != __s_other[__s_i]) { return __data[__s_i] < __s_other[__s_i] ? -1 : 1; }
+            __s_i = __s_i + 1;
+        }
+        if (__size < __s_many) { return -1; }
+        if (__size > __s_many) { return 1; }
         return 0;
     }
+    unsigned long __find(const wchar_t *__s_needle, unsigned long __s_many, unsigned long __s_from) {
+        unsigned long __s_i;
+        unsigned long __s_j;
+        if (__s_from > __size) { return npos; }
+        if (__s_many == 0) { return __s_from; }
+        __s_i = __s_from;
+        while (__s_i + __s_many <= __size) {
+            __s_j = 0;
+            while (__s_j < __s_many && __data[__s_i + __s_j] == __s_needle[__s_j]) { __s_j = __s_j + 1; }
+            if (__s_j == __s_many) { return __s_i; }
+            __s_i = __s_i + 1;
+        }
+        return npos;
+    }
+    unsigned long __rfind(const wchar_t *__s_needle, unsigned long __s_many, unsigned long __s_from) {
+        unsigned long __s_i;
+        unsigned long __s_j;
+        if (__s_many > __size) { return npos; }
+        __s_i = __size - __s_many;
+        if (__s_from < __s_i) { __s_i = __s_from; }
+        while (1) {
+            __s_j = 0;
+            while (__s_j < __s_many && __data[__s_i + __s_j] == __s_needle[__s_j]) { __s_j = __s_j + 1; }
+            if (__s_j == __s_many) { return __s_i; }
+            if (__s_i == 0) { return npos; }
+            __s_i = __s_i - 1;
+        }
+    }
+    static int __holds(const wchar_t *__s_set, unsigned long __s_many, wchar_t __s_c) {
+        unsigned long __s_i;
+        __s_i = 0;
+        while (__s_i < __s_many) { if (__s_set[__s_i] == __s_c) { return 1; } __s_i = __s_i + 1; }
+        return 0;
+    }
+    unsigned long __first_of(const wchar_t *__s_set, unsigned long __s_many, unsigned long __s_from, int __s_wanted) {
+        while (__s_from < __size) {
+            if (__holds(__s_set, __s_many, __data[__s_from]) == __s_wanted) { return __s_from; }
+            __s_from = __s_from + 1;
+        }
+        return npos;
+    }
+    unsigned long __last_of(const wchar_t *__s_set, unsigned long __s_many, unsigned long __s_from, int __s_wanted) {
+        unsigned long __s_i;
+        if (__size == 0) { return npos; }
+        __s_i = __size - 1;
+        if (__s_from < __s_i) { __s_i = __s_from; }
+        while (1) {
+            if (__holds(__s_set, __s_many, __data[__s_i]) == __s_wanted) { return __s_i; }
+            if (__s_i == 0) { return npos; }
+            __s_i = __s_i - 1;
+        }
+    }
+
+    wstring() { __data = 0; __size = 0; __room = 0; }
+    wstring(const wchar_t *__s_text) { __data = 0; __size = 0; __room = 0; __set(__s_text, __length(__s_text)); }
+    wstring(const wchar_t *__s_text, unsigned long __s_many) { __data = 0; __size = 0; __room = 0; __set(__s_text, __s_many); }
+    /* `string held(n, 0);` - room made up front, which is how a program
+       gives a C interface somewhere to write. */
+    wstring(unsigned long __s_count, wchar_t __s_fill) {
+        unsigned long __s_i;
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        if (__s_count == 0) { return; }
+        __need(__s_count);
+        __s_i = 0;
+        while (__s_i < __s_count) { __data[__s_i] = __s_fill; __s_i = __s_i + 1; }
+        __data[__s_count] = 0;
+        __size = __s_count;
+    }
+    /* `string(first, last)` - the characters between two iterators, which
+       are pointers here. */
+    wstring(const wchar_t *__s_first, const wchar_t *__s_last) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        __set(__s_first, (unsigned long)(__s_last - __s_first));
+    }
+    /* From a narrow range, widening each character: `std::wstring(s.begin(),
+       s.end())` is how a program widens text it has in a `std::string`. */
+    wstring(const char *__s_first, const char *__s_last) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        while (__s_first < __s_last) { push_back((wchar_t)*__s_first); __s_first = __s_first + 1; }
+    }
+    ~wstring() { free(__data); }
+    /* What C++ calls this class's copy constructor and its assignment, under
+       names no call can reach by overloading: written as members, a copy
+       constructor joined the one-argument constructors and every call that
+       relied on there being one became a question of types. The translator
+       sees these and has every copy of a string made with them. */
+    void __py2bin_copy_from(const wstring &__s_other) {
+        __data = 0;
+        __size = 0;
+        __room = 0;
+        if (__s_other.__size > 0) { __set(__s_other.__data, __s_other.__size); }
+    }
+    void __py2bin_assign_from(const wstring &__s_other) {
+        if (this == &__s_other) { return; }
+        __set(__s_other.__data, __s_other.__size);
+    }
+
+    typedef wchar_t *iterator;
+    typedef wchar_t *const_iterator;
+    typedef wchar_t value_type;
+    typedef unsigned long size_type;
+    wchar_t *begin() { return __data; }
+    wchar_t *end() { return __data + __size; }
+    /* Writable, which is the point: a C interface handed this fills it in,
+       and `resize` afterwards says how much of it was filled. */
+    wchar_t *data() { if (__data == 0) { __need(0); } return __data; }
+    const wchar_t *c_str() { if (__data == 0) { __need(0); } return __data; }
+    unsigned long size() { return __size; }
+    unsigned long length() { return __size; }
+    unsigned long capacity() { return __room < 22 ? 22 : __room; }
+    int empty() { return __size == 0; }
+    wchar_t &operator[](unsigned long __s_i) { if (__data == 0) { __need(0); } return __data[__s_i]; }
+    wchar_t &at(unsigned long __s_i) {
+        if (__s_i >= __size) { __py2bin_throw_out_of_range("basic_string"); }
+        return __data[__s_i];
+    }
+    /* A position past the end, which the members taking one throw for. */
+    void __check(unsigned long __s_at) {
+        if (__s_at > __size) { __py2bin_throw_out_of_range("basic_string"); }
+    }
+    wchar_t &back() { return __data[__size - 1]; }
+    wchar_t &front() { return __data[0]; }
+
+    void push_back(wchar_t __s_c) {
+        __need(__size + 1);
+        __data[__size] = __s_c;
+        __size = __size + 1;
+        __data[__size] = 0;
+    }
+    /* The last character, and taking it off: how a program trims a string
+       from the end - `while (!s.empty() && (s.back() & 0xC0) == 0x80)
+       s.pop_back();` walks back off a UTF-8 continuation byte. */
+    void pop_back() { if (__size > 0) { __size = __size - 1; __data[__size] = 0; } }
+    void clear() { __size = 0; if (__data != 0) { __data[0] = 0; } }
+    void resize(unsigned long __s_count, wchar_t __s_fill) {
+        unsigned long __s_i;
+        if (__s_count > __size) {
+            __need(__s_count);
+            __s_i = __size;
+            while (__s_i < __s_count) { __data[__s_i] = __s_fill; __s_i = __s_i + 1; }
+        }
+        __size = __s_count;
+        if (__data != 0) { __data[__size] = 0; }
+    }
+    void resize(unsigned long __s_count) { resize(__s_count, (wchar_t)0); }
+    void reserve(unsigned long __s_wanted) { if (__s_wanted > capacity()) { __need(__s_wanted); } }
+    void shrink_to_fit() { }
+    void swap(wstring &__s_other) {
+        wchar_t *__s_held;
+        unsigned long __s_size;
+        unsigned long __s_room;
+        __s_held = __data; __s_size = __size; __s_room = __room;
+        __data = __s_other.__data; __size = __s_other.__size; __room = __s_other.__room;
+        __s_other.__data = __s_held; __s_other.__size = __s_size; __s_other.__room = __s_room;
+    }
+
+    wstring &assign(const wchar_t *__s_text) { __set(__s_text, __length(__s_text)); return *this; }
+    wstring &assign(const wstring &__s_other) { __set(__s_other.__data, __s_other.__size); return *this; }
+    wstring &assign(const wchar_t *__s_text, unsigned long __s_many) { __set(__s_text, __s_many); return *this; }
+    /* Added at the end, from wherever it comes - this string included. */
+    wstring &append(const wchar_t *__s_from, unsigned long __s_many) {
+        wchar_t *__s_fresh;
+        unsigned long __s_i;
+        unsigned long __s_wanted;
+        unsigned long __s_grown;
+        __s_wanted = __size + __s_many;
+        if (__data == 0 || __s_wanted > __room) {
+            __s_grown = capacity() * 2;
+            if (__s_grown < __s_wanted) { __s_grown = __s_wanted; }
+            __s_grown = __recommend(__s_grown);
+            __s_fresh = (wchar_t *)malloc(sizeof(wchar_t) * (__s_grown + 1));
+            __s_i = 0;
+            while (__s_i < __size) { __s_fresh[__s_i] = __data[__s_i]; __s_i = __s_i + 1; }
+            __s_i = 0;
+            while (__s_i < __s_many) { __s_fresh[__size + __s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+            free(__data);
+            __data = __s_fresh;
+            __room = __s_grown;
+        } else {
+            __s_i = 0;
+            while (__s_i < __s_many) { __data[__size + __s_i] = __s_from[__s_i]; __s_i = __s_i + 1; }
+        }
+        __size = __s_wanted;
+        __data[__size] = 0;
+        return *this;
+    }
+    wstring &append(const wchar_t *__s_text) { return append(__s_text, __length(__s_text)); }
+    wstring &append(const wstring &__s_other) { return append(__s_other.__data, __s_other.__size); }
+    wstring &append(unsigned long __s_count, wchar_t __s_c) {
+        unsigned long __s_i;
+        __s_i = 0;
+        while (__s_i < __s_count) { push_back(__s_c); __s_i = __s_i + 1; }
+        return *this;
+    }
+    wstring &operator+=(const wstring &__s_other) { return append(__s_other.__data, __s_other.__size); }
+    wstring &operator+=(const wchar_t *__s_text) { return append(__s_text, __length(__s_text)); }
+    wstring &operator+=(wchar_t __s_c) { push_back(__s_c); return *this; }
+    wstring operator+(const wstring &__s_other) {
+        wstring __s_made;
+        __s_made.__set(__data, __size);
+        __s_made.append(__s_other.__data, __s_other.__size);
+        return __s_made;
+    }
+    wstring operator+(const wchar_t *__s_text) {
+        wstring __s_made;
+        __s_made.__set(__data, __size);
+        __s_made.append(__s_text, __length(__s_text));
+        return __s_made;
+    }
+    wstring operator+(wchar_t __s_c) {
+        wstring __s_made;
+        __s_made.__set(__data, __size);
+        __s_made.push_back(__s_c);
+        return __s_made;
+    }
+
+    wstring &insert(unsigned long __s_at, const wchar_t *__s_text) { __check(__s_at); return __replace(__s_at, 0, __s_text, __length(__s_text)); }
+    wstring &insert(unsigned long __s_at, const wstring &__s_other) { __check(__s_at); return __replace(__s_at, 0, __s_other.__data, __s_other.__size); }
+    wstring &insert(unsigned long __s_at, unsigned long __s_count, wchar_t __s_c) {
+        __check(__s_at);
+        wstring __s_filled(__s_count, __s_c);
+        return __replace(__s_at, 0, __s_filled.__data, __s_filled.__size);
+    }
+    wstring &erase(unsigned long __s_at, unsigned long __s_count) { __check(__s_at); return __replace(__s_at, __s_count, __data, 0); }
+    wstring &erase(unsigned long __s_at) { __check(__s_at); return __replace(__s_at, npos, __data, 0); }
+    wstring &replace(unsigned long __s_at, unsigned long __s_count, const wstring &__s_with) {
+        __check(__s_at);
+        return __replace(__s_at, __s_count, __s_with.__data, __s_with.__size);
+    }
+    wstring &replace(unsigned long __s_at, unsigned long __s_count, const wchar_t *__s_with) {
+        __check(__s_at);
+        return __replace(__s_at, __s_count, __s_with, __length(__s_with));
+    }
+    wstring substr(unsigned long __s_from, unsigned long __s_count) {
+        __check(__s_from);
+        wstring __s_out;
+        unsigned long __s_take;
+        if (__s_from > __size) { __s_from = __size; }
+        __s_take = __size - __s_from;
+        if (__s_count < __s_take) { __s_take = __s_count; }
+        __s_out.__set(__data + __s_from, __s_take);
+        return __s_out;
+    }
+    wstring substr(unsigned long __s_from) { return substr(__s_from, npos); }
+
+    int compare(const wstring &__s_other) { return __compare(__s_other.__data, __s_other.__size); }
+    int compare(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)); }
+    int operator==(const wstring &__s_other) { return __size == __s_other.__size && __compare(__s_other.__data, __s_other.__size) == 0; }
+    int operator==(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)) == 0; }
+    int operator!=(const wstring &__s_other) { return !(__size == __s_other.__size && __compare(__s_other.__data, __s_other.__size) == 0); }
+    int operator!=(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)) != 0; }
+    int operator<(const wstring &__s_other) { return __compare(__s_other.__data, __s_other.__size) < 0; }
+    int operator<(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)) < 0; }
+    int operator>(const wstring &__s_other) { return __compare(__s_other.__data, __s_other.__size) > 0; }
+    int operator>(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)) > 0; }
+    int operator<=(const wstring &__s_other) { return __compare(__s_other.__data, __s_other.__size) <= 0; }
+    int operator<=(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)) <= 0; }
+    int operator>=(const wstring &__s_other) { return __compare(__s_other.__data, __s_other.__size) >= 0; }
+    int operator>=(const wchar_t *__s_text) { return __compare(__s_text, __length(__s_text)) >= 0; }
+
+    unsigned long find(wchar_t __s_c) { return __find(&__s_c, 1, 0); }
+    unsigned long find(wchar_t __s_c, unsigned long __s_from) { return __find(&__s_c, 1, __s_from); }
+    unsigned long find(const wchar_t *__s_needle) { return __find(__s_needle, __length(__s_needle), 0); }
+    unsigned long find(const wchar_t *__s_needle, unsigned long __s_from) { return __find(__s_needle, __length(__s_needle), __s_from); }
+    unsigned long find(const wstring &__s_needle) { return __find(__s_needle.__data, __s_needle.__size, 0); }
+    unsigned long find(const wstring &__s_needle, unsigned long __s_from) { return __find(__s_needle.__data, __s_needle.__size, __s_from); }
+    unsigned long rfind(wchar_t __s_c) { return __rfind(&__s_c, 1, npos); }
+    unsigned long rfind(wchar_t __s_c, unsigned long __s_from) { return __rfind(&__s_c, 1, __s_from); }
+    unsigned long rfind(const wchar_t *__s_needle) { return __rfind(__s_needle, __length(__s_needle), npos); }
+    unsigned long rfind(const wchar_t *__s_needle, unsigned long __s_from) { return __rfind(__s_needle, __length(__s_needle), __s_from); }
+    unsigned long rfind(const wstring &__s_needle) { return __rfind(__s_needle.__data, __s_needle.__size, npos); }
+    unsigned long find_first_of(const wchar_t *__s_set) { return __first_of(__s_set, __length(__s_set), 0, 1); }
+    unsigned long find_first_of(const wchar_t *__s_set, unsigned long __s_from) { return __first_of(__s_set, __length(__s_set), __s_from, 1); }
+    unsigned long find_first_of(wchar_t __s_c) { return __first_of(&__s_c, 1, 0, 1); }
+    unsigned long find_first_of(const wstring &__s_set) { return __first_of(__s_set.__data, __s_set.__size, 0, 1); }
+    unsigned long find_last_of(const wchar_t *__s_set) { return __last_of(__s_set, __length(__s_set), npos, 1); }
+    unsigned long find_last_of(const wchar_t *__s_set, unsigned long __s_from) { return __last_of(__s_set, __length(__s_set), __s_from, 1); }
+    unsigned long find_last_of(wchar_t __s_c) { return __last_of(&__s_c, 1, npos, 1); }
+    unsigned long find_last_of(const wstring &__s_set) { return __last_of(__s_set.__data, __s_set.__size, npos, 1); }
+    unsigned long find_first_not_of(const wchar_t *__s_set) { return __first_of(__s_set, __length(__s_set), 0, 0); }
+    unsigned long find_first_not_of(const wchar_t *__s_set, unsigned long __s_from) { return __first_of(__s_set, __length(__s_set), __s_from, 0); }
+    unsigned long find_first_not_of(wchar_t __s_c) { return __first_of(&__s_c, 1, 0, 0); }
+    unsigned long find_first_not_of(const wstring &__s_set) { return __first_of(__s_set.__data, __s_set.__size, 0, 0); }
+    unsigned long find_last_not_of(const wchar_t *__s_set) { return __last_of(__s_set, __length(__s_set), npos, 0); }
+    unsigned long find_last_not_of(const wchar_t *__s_set, unsigned long __s_from) { return __last_of(__s_set, __length(__s_set), __s_from, 0); }
+    unsigned long find_last_not_of(wchar_t __s_c) { return __last_of(&__s_c, 1, npos, 0); }
+    unsigned long find_last_not_of(const wstring &__s_set) { return __last_of(__s_set.__data, __s_set.__size, npos, 0); }
 };
 
 /* One for each width C++ has one for, so every call matches exactly: given
    only the widest, `to_string(n)` on an `int` could reach the signed one or
    the unsigned one and neither was nearer, which is a refusal where C++ has
    an answer. Each is the same digits, written once below. */
-string to_string(int value) { return __py2bin_signed_digits((long long)value); }
-string to_string(long value) { return __py2bin_signed_digits((long long)value); }
-string to_string(long long value) { return __py2bin_signed_digits((long long)value); }
-string to_string(unsigned int value) { return __py2bin_unsigned_digits((unsigned long long)value); }
-string to_string(unsigned long value) { return __py2bin_unsigned_digits((unsigned long long)value); }
-string to_string(unsigned long long value) { return __py2bin_unsigned_digits((unsigned long long)value); }
+string to_string(int __s_value) { return __py2bin_signed_digits((long long)__s_value); }
+string to_string(long __s_value) { return __py2bin_signed_digits((long long)__s_value); }
+string to_string(long long __s_value) { return __py2bin_signed_digits((long long)__s_value); }
+string to_string(unsigned int __s_value) { return __py2bin_unsigned_digits((unsigned long long)__s_value); }
+string to_string(unsigned long __s_value) { return __py2bin_unsigned_digits((unsigned long long)__s_value); }
+string to_string(unsigned long long __s_value) { return __py2bin_unsigned_digits((unsigned long long)__s_value); }
 
-string __py2bin_signed_digits(long long value) {
-    string out;
-    char digits[24];
-    int at;
-    int negative;
-    unsigned long long left;
-    at = 0;
-    negative = value < 0;
-    left = negative ? (unsigned long long)(-value) : (unsigned long long)value;
-    if (left == 0) { digits[at] = '0'; at = at + 1; }
-    while (left > 0) { digits[at] = (char)('0' + (left % 10)); left = left / 10; at = at + 1; }
-    if (negative) { out.push_back('-'); }
-    while (at > 0) { at = at - 1; out.push_back(digits[at]); }
-    return out;
+string __py2bin_signed_digits(long long __s_value) {
+    string __s_out;
+    char __s_digits[24];
+    int __s_at;
+    int __s_negative;
+    unsigned long long __s_left;
+    __s_at = 0;
+    __s_negative = __s_value < 0;
+    __s_left = __s_negative ? (unsigned long long)(-__s_value) : (unsigned long long)__s_value;
+    if (__s_left == 0) { __s_digits[__s_at] = '0'; __s_at = __s_at + 1; }
+    while (__s_left > 0) { __s_digits[__s_at] = (char)('0' + (__s_left % 10)); __s_left = __s_left / 10; __s_at = __s_at + 1; }
+    if (__s_negative) { __s_out.push_back('-'); }
+    while (__s_at > 0) { __s_at = __s_at - 1; __s_out.push_back(__s_digits[__s_at]); }
+    return __s_out;
 }
 
-string __py2bin_unsigned_digits(unsigned long long value) {
-    string out;
-    char digits[24];
-    int at;
-    at = 0;
-    if (value == 0) { digits[at] = '0'; at = at + 1; }
-    while (value > 0) { digits[at] = (char)('0' + (value % 10)); value = value / 10; at = at + 1; }
-    while (at > 0) { at = at - 1; out.push_back(digits[at]); }
-    return out;
+string __py2bin_unsigned_digits(unsigned long long __s_value) {
+    string __s_out;
+    char __s_digits[24];
+    int __s_at;
+    __s_at = 0;
+    if (__s_value == 0) { __s_digits[__s_at] = '0'; __s_at = __s_at + 1; }
+    while (__s_value > 0) { __s_digits[__s_at] = (char)('0' + (__s_value % 10)); __s_value = __s_value / 10; __s_at = __s_at + 1; }
+    while (__s_at > 0) { __s_at = __s_at - 1; __s_out.push_back(__s_digits[__s_at]); }
+    return __s_out;
 }
 
 /* The same digits as a wide string, which is what a program on Windows
-   passes to the platform: `title + to_wstring(n)`. Without it the call named
-   a function nothing declared, and what it answered could not be told - so
-   the `+` beside it had no form to choose either. */
-wstring to_wstring(long long value) {
-    string narrow = __py2bin_signed_digits(value);
-    wstring out;
-    int i;
-    i = 0;
-    while (i < narrow.size()) { out.push_back((wchar_t)narrow.at(i)); i = i + 1; }
-    return out;
+   passes to the platform: `title + to_wstring(n)`. */
+wstring to_wstring(long long __s_value) {
+    string __s_narrow = __py2bin_signed_digits(__s_value);
+    wstring __s_out;
+    unsigned long __s_i;
+    __s_i = 0;
+    while (__s_i < __s_narrow.size()) { __s_out.push_back((wchar_t)__s_narrow.at(__s_i)); __s_i = __s_i + 1; }
+    return __s_out;
 }
 
-wstring to_wstring(unsigned long long value) {
-    string narrow = __py2bin_unsigned_digits(value);
-    wstring out;
-    int i;
-    i = 0;
-    while (i < narrow.size()) { out.push_back((wchar_t)narrow.at(i)); i = i + 1; }
-    return out;
+wstring to_wstring(unsigned long long __s_value) {
+    string __s_narrow = __py2bin_unsigned_digits(__s_value);
+    wstring __s_out;
+    unsigned long __s_i;
+    __s_i = 0;
+    while (__s_i < __s_narrow.size()) { __s_out.push_back((wchar_t)__s_narrow.at(__s_i)); __s_i = __s_i + 1; }
+    return __s_out;
 }
 
-wstring to_wstring(int value) { return to_wstring((long long)value); }
-wstring to_wstring(long value) { return to_wstring((long long)value); }
-wstring to_wstring(unsigned int value) { return to_wstring((unsigned long long)value); }
-wstring to_wstring(unsigned long value) { return to_wstring((unsigned long long)value); }
+wstring to_wstring(int __s_value) { return to_wstring((long long)__s_value); }
+wstring to_wstring(long __s_value) { return to_wstring((long long)__s_value); }
+wstring to_wstring(unsigned int __s_value) { return to_wstring((unsigned long long)__s_value); }
+wstring to_wstring(unsigned long __s_value) { return to_wstring((unsigned long long)__s_value); }
 
-int stoi(string text) {
-    int i; int sign; int value;
-    i = 0; sign = 1; value = 0;
-    if (text.at(0) == '-') { sign = -1; i = 1; }
-    while (i < text.size()) {
-        if (text.at(i) < '0') { return value * sign; }
-        if (text.at(i) > '9') { return value * sign; }
-        value = value * 10 + (int)(text.at(i) - '0');
-        i = i + 1;
+/* The digits off the front of a string, as strtol reads them: leading space
+   skipped, a sign, and digits as far as they go. Answers their magnitude;
+   says through the pointers whether there were any, which sign they had,
+   and whether the magnitude was more than an unsigned long long holds. */
+unsigned long long __py2bin_leading_digits(const string &__s_text, int *__s_negative, int *__s_found, int *__s_over) {
+    unsigned long __s_i;
+    unsigned long long __s_value;
+    unsigned long long __s_digit;
+    const char *__s_at;
+    __s_at = __s_text.__data;
+    __s_i = 0;
+    __s_value = 0;
+    *__s_negative = 0;
+    *__s_found = 0;
+    *__s_over = 0;
+    while (__s_i < __s_text.__size && (__s_at[__s_i] == ' ' || (__s_at[__s_i] >= 9 && __s_at[__s_i] <= 13))) {
+        __s_i = __s_i + 1;
     }
-    return value * sign;
+    if (__s_i < __s_text.__size && (__s_at[__s_i] == '-' || __s_at[__s_i] == '+')) {
+        *__s_negative = __s_at[__s_i] == '-';
+        __s_i = __s_i + 1;
+    }
+    while (__s_i < __s_text.__size && __s_at[__s_i] >= '0' && __s_at[__s_i] <= '9') {
+        __s_digit = (unsigned long long)(__s_at[__s_i] - '0');
+        if (__s_value > (18446744073709551615ULL - __s_digit) / 10ULL) { *__s_over = 1; }
+        __s_value = __s_value * 10ULL + __s_digit;
+        *__s_found = 1;
+        __s_i = __s_i + 1;
+    }
+    return __s_value;
 }
-
-/* The same class over wchar_t. Windows is wide throughout - every `W` entry
-   point takes one - so a program that talks to it holds its strings this
-   way, and `std::wstring` is what it calls them. Written out rather than
-   made a template of the narrow one: `string` here is a fixed buffer and a
-   length, and two of those are two classes, which is what they are in the
-   standard too. */
-class wstring {
-public:
-    wchar_t buf[256];
-    int len;
-    wstring() { buf[0] = 0; len = 0; }
-    wstring(const wchar_t *s) {
-        int i; i = 0;
-        while (s[i] != 0 && i < 255) { buf[i] = s[i]; i = i + 1; }
-        buf[i] = 0; len = i;
-    }
-    wstring(int count, wchar_t fill) {
-        int i; i = 0;
-        while (i < count && i < 255) { buf[i] = fill; i = i + 1; }
-        buf[i] = 0; len = i;
-    }
-    /* `wstring(first, last)` - the characters between two iterators, which
-       are pointers here. From a range of its own width, and from a range of
-       the other: `std::wstring(s.begin(), s.end())` is how a program widens
-       a narrow string, and the narrow one back is how it returns. */
-    wstring(const wchar_t *first, const wchar_t *last) {
-        int i; i = 0;
-        while (first + i < last && i < 255) { buf[i] = first[i]; i = i + 1; }
-        buf[i] = 0; len = i;
-    }
-    wstring(const char *first, const char *last) {
-        int i; i = 0;
-        while (first + i < last && i < 255) { buf[i] = (wchar_t)first[i]; i = i + 1; }
-        buf[i] = 0; len = i;
-    }
-    typedef wchar_t *iterator;
-    typedef wchar_t *const_iterator;
-    wchar_t *begin() { return buf; }
-    wchar_t *end() { return buf + len; }
-    void assign(const wchar_t *s) {
-        int i; i = 0;
-        while (s[i] != 0 && i < 255) { buf[i] = s[i]; i = i + 1; }
-        buf[i] = 0; len = i;
-    }
-    int size() { return len; }
-    int length() { return len; }
-    int empty() { return len == 0; }
-    wchar_t at(int i) { return buf[i]; }
-    const wchar_t *c_str() { return buf; }
-    wchar_t *data() { return buf; }
-    void push_back(wchar_t c) {
-        if (len < 255) { buf[len] = c; len = len + 1; buf[len] = 0; }
-    }
-    /* The last character, and taking it off: how a program trims a string
-       from the end - `while (!s.empty() && (s.back() & 0xC0) == 0x80)
-       s.pop_back();` walks back off a UTF-8 continuation byte. */
-    wchar_t back() { return buf[len - 1]; }
-    void pop_back() { if (len > 0) { len = len - 1; buf[len] = 0; } }
-    void clear() { len = 0; buf[0] = 0; }
-    /* `resize` shortens or lengthens; what it grows into is zero, which is
-       what the standard says a default-inserted wchar_t is. */
-    void resize(int count) {
-        int i;
-        if (count > 255) { count = 255; }
-        i = len;
-        while (i < count) { buf[i] = 0; i = i + 1; }
-        len = count;
-        buf[len] = 0;
-    }
-    void reserve(int count) { }
-    void append(const wchar_t *s) {
-        int i; i = 0;
-        while (s[i] != 0 && len < 255) { buf[len] = s[i]; len = len + 1; i = i + 1; }
-        buf[len] = 0;
-    }
-    void operator+=(const wchar_t *s) { append(s); }
-    void operator+=(wstring o) { append(o.buf); }
-    void operator+=(wchar_t c) { push_back(c); }
-    wstring operator+(const wchar_t *s) {
-        wstring made; made.assign(buf); made.append(s); return made;
-    }
-    wstring operator+(wstring o) {
-        wstring made; made.assign(buf); made.append(o.buf); return made;
-    }
-    /* What `string` has and this did not, the same bodies a character
-       wider: `w[i]` on a wide string reached the C as a subscript on a
-       struct, and a program narrowing one character at a time was refused. */
-    static const int npos = -1;
-    wchar_t &operator[](int i) { return buf[i]; }
-    int compare(const wchar_t *s) {
-        int i;
-        i = 0;
-        while (buf[i] != 0 && buf[i] == s[i]) { i = i + 1; }
-        return (int)buf[i] - (int)s[i];
-    }
-    int operator==(const wchar_t *s) { return compare(s) == 0; }
-    int operator!=(const wchar_t *s) { return compare(s) != 0; }
-    int operator==(wstring o) {
-        int i;
-        if (len != o.len) { return 0; }
-        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 0; } }
-        return 1;
-    }
-    int operator!=(wstring o) {
-        int i;
-        if (len != o.len) { return 1; }
-        for (i = 0; i < len; i++) { if (buf[i] != o.buf[i]) { return 1; } }
-        return 0;
-    }
-    int operator<(wstring o) { return compare(o.c_str()) < 0; }
-    int operator>(wstring o) { return compare(o.c_str()) > 0; }
-    int operator<=(wstring o) { return compare(o.c_str()) <= 0; }
-    int operator>=(wstring o) { return compare(o.c_str()) >= 0; }
-    int find(wchar_t c) {
-        int i;
-        i = 0;
-        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
-        return -1;
-    }
-    int find(wchar_t c, int from) {
-        int i;
-        i = from;
-        if (i < 0) { i = 0; }
-        while (i < len) { if (buf[i] == c) { return i; } i = i + 1; }
-        return -1;
-    }
-    int find(const wchar_t *needle) {
-        int i; int j;
-        if (needle[0] == 0) { return 0; }
-        i = 0;
-        while (i < len) {
-            j = 0;
-            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
-                j = j + 1;
-            }
-            if (needle[j] == 0) { return i; }
-            i = i + 1;
-        }
-        return -1;
-    }
-    int find(const wchar_t *needle, int from) {
-        int i; int j;
-        i = from;
-        if (i < 0) { i = 0; }
-        if (needle[0] == 0) { return i <= len ? i : -1; }
-        while (i < len) {
-            j = 0;
-            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) {
-                j = j + 1;
-            }
-            if (needle[j] == 0) { return i; }
-            i = i + 1;
-        }
-        return -1;
-    }
-    int find(wstring needle) { return find((const wchar_t *)needle.c_str()); }
-    int find(wstring needle, int from) {
-        return find((const wchar_t *)needle.c_str(), from);
-    }
-    int rfind(wchar_t c) {
-        int i; int found;
-        found = -1;
-        i = 0;
-        while (i < len) { if (buf[i] == c) { found = i; } i = i + 1; }
-        return found;
-    }
-    int rfind(const wchar_t *needle) {
-        int i; int j; int found;
-        found = -1;
-        i = 0;
-        while (i < len) {
-            j = 0;
-            while (needle[j] != 0 && i + j < len && buf[i + j] == needle[j]) { j = j + 1; }
-            if (needle[j] == 0) { found = i; }
-            i = i + 1;
-        }
-        return found;
-    }
-    int rfind(wstring needle) { return rfind((const wchar_t *)needle.c_str()); }
-    wstring substr(int from, int count) {
-        wstring out;
-        int i;
-        i = 0;
-        while (i < count && from + i < len) {
-            out.push_back(buf[from + i]);
-            i = i + 1;
-        }
-        return out;
-    }
-    wstring substr(int from) { return substr(from, len - from); }
-    void append(wstring o) {
-        int j; j = 0;
-        while (j < o.len && len + j < 255) { buf[len + j] = o.buf[j]; j = j + 1; }
-        len = len + j; buf[len] = 0;
-    }
-};
-
+/* A signed number no bigger than `__s_most` either way (one more, negative),
+   or the exception libc++ throws, naming the function that was asked. */
+long long __py2bin_signed_number(const string &__s_text, unsigned long long __s_most, const char *__s_none, const char *__s_range) {
+    int __s_negative;
+    int __s_found;
+    int __s_over;
+    unsigned long long __s_magnitude;
+    __s_magnitude = __py2bin_leading_digits(__s_text, &__s_negative, &__s_found, &__s_over);
+    if (!__s_found) { __py2bin_throw_invalid_argument(__s_none); }
+    if (__s_over || __s_magnitude > __s_most + (unsigned long long)__s_negative) { __py2bin_throw_out_of_range(__s_range); }
+    if (__s_negative) { return (long long)(0ULL - __s_magnitude); }
+    return (long long)__s_magnitude;
 }
-"""
+/* An unsigned one, which strtoul reads with a minus sign too: `-1` is the
+   largest there is. */
+unsigned long long __py2bin_unsigned_number(const string &__s_text, unsigned long long __s_most, const char *__s_none, const char *__s_range) {
+    int __s_negative;
+    int __s_found;
+    int __s_over;
+    unsigned long long __s_magnitude;
+    __s_magnitude = __py2bin_leading_digits(__s_text, &__s_negative, &__s_found, &__s_over);
+    if (!__s_found) { __py2bin_throw_invalid_argument(__s_none); }
+    if (__s_over || __s_magnitude > __s_most) { __py2bin_throw_out_of_range(__s_range); }
+    if (__s_negative) { return 0ULL - __s_magnitude; }
+    return __s_magnitude;
+}
+int stoi(const string &__s_text) { return (int)__py2bin_signed_number(__s_text, 2147483647ULL, "stoi: no conversion", "stoi: out of range"); }
+long stol(const string &__s_text) {
+    return (long)__py2bin_signed_number(__s_text, sizeof(long) == 8 ? 9223372036854775807ULL : 2147483647ULL, "stol: no conversion", "stol: out of range");
+}
+long long stoll(const string &__s_text) { return __py2bin_signed_number(__s_text, 9223372036854775807ULL, "stoll: no conversion", "stoll: out of range"); }
+unsigned long stoul(const string &__s_text) {
+    return (unsigned long)__py2bin_unsigned_number(__s_text, sizeof(long) == 8 ? 18446744073709551615ULL : 4294967295ULL, "stoul: no conversion", "stoul: out of range");
+}
+unsigned long long stoull(const string &__s_text) { return __py2bin_unsigned_number(__s_text, 18446744073709551615ULL, "stoull: no conversion", "stoull: out of range"); }
+double stod(const string &__s_text) {
+    char *__s_end;
+    double __s_value;
+    __s_value = strtod(__s_text.c_str(), &__s_end);
+    if (__s_end == __s_text.__data) { __py2bin_throw_invalid_argument("stod: no conversion"); }
+    return __s_value;
+}
+float stof(const string &__s_text) {
+    char *__s_end;
+    double __s_value;
+    __s_value = strtod(__s_text.c_str(), &__s_end);
+    if (__s_end == __s_text.__data) { __py2bin_throw_invalid_argument("stof: no conversion"); }
+    return (float)__s_value;
+}
+}
+#include <stdexcept>
+'''
 
 #: Angled includes py2bin answers itself. Anything else angled is left for the
 #: C preprocessor, which has py2bin's own C headers behind it.
@@ -25024,8 +27261,24 @@ public:
 #: the heap under it is an arena that does not reclaim (see <stdlib.h>) and
 #: pretending otherwise would be the dishonest part, not the leak.
 _VECTOR_HEADER = r"""
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 namespace std {
 
+/* A vector owns its elements: it builds each one where it stands, copies one
+   with the element's own copy, takes it apart when it goes, and gives its
+   storage back. What it does and in what order is what libc++ does - which
+   is the vector a program on this machine is compiled against - so a class
+   that says something as it is copied says the same things here.
+
+   Storage is taken with malloc and holds no objects until one is built in
+   it: `__py2bin_copy_into` builds a copy of an element, `__py2bin_default_into`
+   builds one from nothing, and neither assumes anything was there before.
+   `~T()` takes one apart and leaves storage again. */
 template<typename T>
 class vector {
 public:
@@ -25038,72 +27291,200 @@ public:
        istreambuf_iterator<char>());`. Written over `!=` and `++` and
        nothing else, which is all an input iterator promises - so a pair of
        pointers works here as readily as a pair of stream readers. */
-    template<typename It>
-    vector(It first, It last) {
+    template<typename __py2bin_iterator>
+    vector(__py2bin_iterator __v_first, __py2bin_iterator __v_last) {
         items = 0;
         count = 0;
         room = 0;
-        while (first != last) { push_back((T)(*first)); ++first; }
+        while (__v_first != __v_last) { push_back((T)(*__v_first)); ++__v_first; }
     }
     /* `vector<uint8_t> result(n);` - n elements, each value-initialised,
        which is what a program writes when it is about to fill a buffer.
-       Written as a default-built element copied into each place: `reserve`
-       takes storage and builds nothing, so without this the elements were
-       whatever was last left where they sit. */
-    vector(unsigned long many) {
-        unsigned long i;
-        T __py2bin_each{};
+       Exactly that much room, and each element built on its own, as libc++
+       builds them. */
+    vector(unsigned long __v_many) {
+        unsigned long __v_i;
         items = 0;
         count = 0;
         room = 0;
-        reserve(many);
-        i = 0;
-        while (i < many) { items[i] = __py2bin_each; i = i + 1; }
-        count = many;
+        if (__v_many > 0) { items = (T *)malloc(sizeof(T) * __v_many); room = __v_many; }
+        __v_i = 0;
+        while (__v_i < __v_many) { __py2bin_default_into(&items[__v_i]); __v_i = __v_i + 1; }
+        count = __v_many;
     }
+    /* `vector<int> row(n, 7);` - n copies of one value. */
+    vector(unsigned long __v_many, const T &__v_value) {
+        unsigned long __v_i;
+        items = 0;
+        count = 0;
+        room = 0;
+        if (__v_many > 0) { items = (T *)malloc(sizeof(T) * __v_many); room = __v_many; }
+        __v_i = 0;
+        while (__v_i < __v_many) { __py2bin_copy_into(&items[__v_i], &__v_value); __v_i = __v_i + 1; }
+        count = __v_many;
+    }
+    /* A copy is a vector of its own: storage of its own, exactly as much as
+       it holds, and each element copied by the element's copy. Without this
+       a copy shared the original's storage, and writing to one wrote to
+       both. */
+    vector(const vector &__v_other) {
+        unsigned long __v_i;
+        items = 0;
+        count = 0;
+        room = 0;
+        if (__v_other.count > 0) {
+            items = (T *)malloc(sizeof(T) * __v_other.count);
+            room = __v_other.count;
+        }
+        __v_i = 0;
+        while (__v_i < __v_other.count) {
+            __py2bin_copy_into(&items[__v_i], &__v_other.items[__v_i]);
+            __v_i = __v_i + 1;
+        }
+        count = __v_other.count;
+    }
+    /* Assigned, the elements that are already here are assigned to, the rest
+       built or taken apart - unless there is not room, in which case all of
+       them go and new storage is taken, as much as is needed. */
+    vector &operator=(const vector &__v_other) {
+        unsigned long __v_i;
+        if (this == &__v_other) { return *this; }
+        if (__v_other.count > room) {
+            __destroy_all();
+            free(items);
+            items = (T *)malloc(sizeof(T) * __v_other.count);
+            room = __v_other.count;
+            __v_i = 0;
+            while (__v_i < __v_other.count) {
+                __py2bin_copy_into(&items[__v_i], &__v_other.items[__v_i]);
+                __v_i = __v_i + 1;
+            }
+            count = __v_other.count;
+            return *this;
+        }
+        __v_i = 0;
+        while (__v_i < count && __v_i < __v_other.count) { items[__v_i] = __v_other.items[__v_i]; __v_i = __v_i + 1; }
+        while (__v_i < __v_other.count) {
+            __py2bin_copy_into(&items[__v_i], &__v_other.items[__v_i]);
+            __v_i = __v_i + 1;
+        }
+        while (count > __v_other.count) { count = count - 1; items[count].~T(); }
+        count = __v_other.count;
+        return *this;
+    }
+    ~vector() { __destroy_all(); free(items); }
     unsigned long size() { return count; }
     int empty() { return count == 0; }
-    /* Every element taken apart, which is what letting go of them means.
-       C++ destroys them when the vector goes and when it is cleared; this
-       had done neither, so a `vector<T>` of objects with a destructor let
-       them all go without running one - a leak with nothing to say so. The
-       element's type is a template parameter, so the only way to name its
-       destructor is to write the call the language provides. */
-    void clear() {
-        unsigned long i;
-        i = 0;
-        while (i < count) { items[i].~T(); i = i + 1; }
-        count = 0;
+    /* Last first, which is the order libc++ takes them apart in. */
+    void __destroy_all() {
+        while (count > 0) { count = count - 1; items[count].~T(); }
     }
-    ~vector() { clear(); }
-    void reserve(unsigned long want) {
-        unsigned long i;
-        T *fresh;
-        if (want <= room) { return; }
-        /* Storage, not objects: `new T[want]` would run a constructor for
-           every element, which a vector holding fewer than that does not
-           want - and which a class with no default constructor cannot do.
-           This is what a real vector's allocator hands back too. */
-        fresh = (T *)malloc(sizeof(T) * want);
-        i = 0;
-        while (i < count) { fresh[i] = items[i]; i = i + 1; }
-        items = fresh;
-        room = want;
+    void clear() { __destroy_all(); }
+    /* How much room to take when there is not enough: twice what there is,
+       or what is asked for if that is more - libc++'s rule, so a program
+       asking `capacity()` is told what it would be told there. */
+    unsigned long __grown(unsigned long __v_want) {
+        unsigned long __v_twice;
+        __v_twice = room * 2;
+        if (__v_twice > __v_want) { return __v_twice; }
+        return __v_want;
     }
-    void push_back(T value) {
+    /* What is here, moved into new storage: each element copied in order,
+       then each taken apart, then the old storage given back. */
+    void __relocate(T *__v_fresh) {
+        unsigned long __v_i;
+        __v_i = 0;
+        while (__v_i < count) { __py2bin_copy_into(&__v_fresh[__v_i], &items[__v_i]); __v_i = __v_i + 1; }
+        __v_i = 0;
+        while (__v_i < count) { items[__v_i].~T(); __v_i = __v_i + 1; }
+        free(items);
+        items = __v_fresh;
+    }
+    void reserve(unsigned long __v_want) {
+        T *__v_fresh;
+        if (__v_want <= room) { return; }
+        __v_fresh = (T *)malloc(sizeof(T) * __v_want);
+        __relocate(__v_fresh);
+        room = __v_want;
+    }
+    /* Taken by reference, as C++ takes it. Where the vector has to grow, the
+       new element is built in the new storage before anything is moved,
+       which is libc++'s order and is also what keeps `v.push_back(v[0])`
+       right: the old storage is still there when the copy is made. */
+    void push_back(const T &__v_value) {
+        T *__v_fresh;
+        unsigned long __v_want;
         if (count == room) {
-            if (room == 0) { reserve(8); } else { reserve(room * 2); }
+            __v_want = __grown(count + 1);
+            __v_fresh = (T *)malloc(sizeof(T) * __v_want);
+            __py2bin_copy_into(&__v_fresh[count], &__v_value);
+            __relocate(__v_fresh);
+            room = __v_want;
+        } else {
+            __py2bin_copy_into(&items[count], &__v_value);
         }
-        items[count] = value;
         count = count + 1;
     }
-    void pop_back() { if (count > 0) { count = count - 1; } }
-    void resize(unsigned long want) {
-        reserve(want);
-        count = want;
+    void pop_back() { if (count > 0) { count = count - 1; items[count].~T(); } }
+    /* Smaller: the elements past the new end are taken apart, last first.
+       Larger: the new ones are built from nothing - in the new storage
+       first, where the vector has to grow. */
+    void resize(unsigned long __v_want) {
+        T *__v_fresh;
+        unsigned long __v_i;
+        unsigned long __v_grown;
+        if (__v_want <= count) {
+            while (count > __v_want) { count = count - 1; items[count].~T(); }
+            return;
+        }
+        if (__v_want > room) {
+            __v_grown = __grown(__v_want);
+            __v_fresh = (T *)malloc(sizeof(T) * __v_grown);
+            __v_i = count;
+            while (__v_i < __v_want) { __py2bin_default_into(&__v_fresh[__v_i]); __v_i = __v_i + 1; }
+            __relocate(__v_fresh);
+            room = __v_grown;
+        } else {
+            __v_i = count;
+            while (__v_i < __v_want) { __py2bin_default_into(&items[__v_i]); __v_i = __v_i + 1; }
+        }
+        count = __v_want;
     }
-    T &at(unsigned long i) { return items[i]; }
-    T &operator[](unsigned long i) { return items[i]; }
+    void resize(unsigned long __v_want, const T &__v_value) {
+        T *__v_fresh;
+        unsigned long __v_i;
+        unsigned long __v_grown;
+        if (__v_want <= count) {
+            while (count > __v_want) { count = count - 1; items[count].~T(); }
+            return;
+        }
+        if (__v_want > room) {
+            __v_grown = __grown(__v_want);
+            __v_fresh = (T *)malloc(sizeof(T) * __v_grown);
+            __v_i = count;
+            while (__v_i < __v_want) { __py2bin_copy_into(&__v_fresh[__v_i], &__v_value); __v_i = __v_i + 1; }
+            __relocate(__v_fresh);
+            room = __v_grown;
+        } else {
+            __v_i = count;
+            while (__v_i < __v_want) { __py2bin_copy_into(&items[__v_i], &__v_value); __v_i = __v_i + 1; }
+        }
+        count = __v_want;
+    }
+    /* Smaller storage, exactly as much as is held. */
+    void shrink_to_fit() {
+        T *__v_fresh;
+        if (count == room) { return; }
+        __v_fresh = 0;
+        if (count > 0) { __v_fresh = (T *)malloc(sizeof(T) * count); }
+        __relocate(__v_fresh);
+        room = count;
+    }
+    T &at(unsigned long __v_i) {
+        if (__v_i >= count) { __py2bin_throw_out_of_range("vector"); }
+        return items[__v_i];
+    }
+    T &operator[](unsigned long __v_i) { return items[__v_i]; }
     T &back() { return items[count - 1]; }
     T &front() { return items[0]; }
     typedef T *iterator;
@@ -25115,74 +27496,116 @@ public:
     T *data() { return items; }
     unsigned long capacity() { return room; }
     /* `erase` is written against the pointer an iterator is here: everything
-       after the hole moves down one, which is what a vector does. */
-    T *erase(T *where) {
-        unsigned long at;
-        at = (unsigned long)(where - items);
-        while (at + 1 < count) { items[at] = items[at + 1]; at = at + 1; }
-        if (count > 0) { count = count - 1; }
-        return where;
+       after the hole is assigned down one, and the last element, a copy of
+       the one before it now, is taken apart. */
+    T *erase(T *__v_where) {
+        unsigned long __v_at;
+        __v_at = (unsigned long)(__v_where - items);
+        while (__v_at + 1 < count) { items[__v_at] = items[__v_at + 1]; __v_at = __v_at + 1; }
+        if (count > 0) { count = count - 1; items[count].~T(); }
+        return __v_where;
     }
-    T *insert(T *where, T value) {
-        unsigned long at;
-        unsigned long j;
-        at = (unsigned long)(where - items);
-        if (count == room) {
-            if (room == 0) { reserve(8); } else { reserve(room * 2); }
+    T *erase(T *__v_first, T *__v_last) {
+        unsigned long __v_from;
+        unsigned long __v_to;
+        __v_from = (unsigned long)(__v_first - items);
+        __v_to = (unsigned long)(__v_last - items);
+        if (__v_from == __v_to) { return __v_first; }
+        while (__v_to < count) { items[__v_from] = items[__v_to]; __v_from = __v_from + 1; __v_to = __v_to + 1; }
+        while (count > __v_from) { count = count - 1; items[count].~T(); }
+        return __v_first;
+    }
+    /* With room to spare, libc++ builds a new last element from the last
+       one, assigns each one up a place from the end, and assigns the value
+       into the hole - reading it one place further along if it was inside
+       the part that moved. Without room, the value is built in new storage
+       first, then what follows its place is moved, then what comes before. */
+    T *insert(T *__v_where, const T &__v_value) { return __insert_one(__v_where, __v_value); }
+    /* The body of the one-element insert, under a name of its own: the range
+       insert below calls it, and called as `insert` from inside that
+       template, the call was taken for the template itself. */
+    T *__insert_one(T *__v_where, const T &__v_value) {
+        unsigned long __v_at;
+        unsigned long __v_j;
+        unsigned long __v_want;
+        T *__v_fresh;
+        const T *__v_source;
+        __v_at = (unsigned long)(__v_where - items);
+        if (count < room) {
+            if (__v_at == count) {
+                __py2bin_copy_into(&items[count], &__v_value);
+            } else {
+                __v_source = &__v_value;
+                if (__v_source >= items + __v_at && __v_source < items + count) {
+                    __v_source = __v_source + 1;
+                }
+                __py2bin_copy_into(&items[count], &items[count - 1]);
+                __v_j = count - 1;
+                while (__v_j > __v_at) { items[__v_j] = items[__v_j - 1]; __v_j = __v_j - 1; }
+                items[__v_at] = *__v_source;
+            }
+            count = count + 1;
+            return items + __v_at;
         }
-        j = count;
-        while (j > at) { items[j] = items[j - 1]; j = j - 1; }
-        items[at] = value;
+        __v_want = __grown(count + 1);
+        __v_fresh = (T *)malloc(sizeof(T) * __v_want);
+        __py2bin_copy_into(&__v_fresh[__v_at], &__v_value);
+        __v_j = __v_at;
+        while (__v_j < count) { __py2bin_copy_into(&__v_fresh[__v_j + 1], &items[__v_j]); __v_j = __v_j + 1; }
+        __v_j = __v_at;
+        while (__v_j < count) { items[__v_j].~T(); __v_j = __v_j + 1; }
+        __v_j = 0;
+        while (__v_j < __v_at) { __py2bin_copy_into(&__v_fresh[__v_j], &items[__v_j]); __v_j = __v_j + 1; }
+        __v_j = 0;
+        while (__v_j < __v_at) { items[__v_j].~T(); __v_j = __v_j + 1; }
+        free(items);
+        items = __v_fresh;
+        room = __v_want;
         count = count + 1;
-        return items + at;
+        return items + __v_at;
     }
     /* A range put in at a position, which is how a program joins two of
        these: `frame.insert(frame.end(), payload.begin(), payload.end());`.
        Written over `!=` and `++` like the range constructor above, so a pair
        of pointers works as readily as a pair of stream readers. The position
-       is kept as an offset and not as the pointer it came in as: reserving
+       is kept as an offset and not as the pointer it came in as: growing
        moves the storage, and the pointer handed in points into the old. */
     template<typename It>
-    T *insert(T *where, It first, It last) {
-        unsigned long start;
-        unsigned long at;
-        unsigned long j;
-        start = (unsigned long)(where - items);
-        at = start;
-        while (first != last) {
-            if (count == room) {
-                if (room == 0) { reserve(8); } else { reserve(room * 2); }
-            }
-            j = count;
-            while (j > at) { items[j] = items[j - 1]; j = j - 1; }
-            items[at] = (T)(*first);
-            count = count + 1;
-            at = at + 1;
-            ++first;
+    T *insert(T *__v_where, It __v_first, It __v_last) {
+        unsigned long __v_start;
+        unsigned long __v_at;
+        __v_start = (unsigned long)(__v_where - items);
+        __v_at = __v_start;
+        while (__v_first != __v_last) {
+            __insert_one(items + __v_at, (T)(*__v_first));
+            __v_at = __v_at + 1;
+            ++__v_first;
         }
-        return items + start;
+        return items + __v_start;
     }
-    void assign(unsigned long many, T value) {
-        unsigned long i;
-        reserve(many);
-        i = 0;
-        while (i < many) { items[i] = value; i = i + 1; }
-        count = many;
+    void assign(unsigned long __v_many, const T &__v_value) {
+        unsigned long __v_i;
+        __destroy_all();
+        reserve(__v_many);
+        __v_i = 0;
+        while (__v_i < __v_many) { __py2bin_copy_into(&items[__v_i], &__v_value); __v_i = __v_i + 1; }
+        count = __v_many;
     }
     /* Two of these exchange what they hold. It is how a program takes a
        container's contents away without copying them - `held.swap(shared);`
        under a lock, and then the work is done outside it - and there is
        nothing else here that says "and leave the other one empty". */
-    void swap(vector &other) {
+    void swap(vector &__v_other) {
         T *__held;
         unsigned long __count;
         unsigned long __room;
         __held = items; __count = count; __room = room;
-        items = other.items; count = other.count; room = other.room;
-        other.items = __held; other.count = __count; other.room = __room;
+        items = __v_other.items; count = __v_other.count; room = __v_other.room;
+        __v_other.items = __held; __v_other.count = __count; __v_other.room = __room;
     }
 };
 }
+#include <stdexcept>
 """
 
 #: py2bin's own <iostream>. `cout` is an object with one `operator<<` per
@@ -26393,6 +28816,12 @@ public:
 #: <string_view>, which is a pointer and a length and nothing else - it does
 #: not own what it looks at, which is the whole of what it is for.
 _STRING_VIEW_HEADER = r"""
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 namespace std {
 class string_view {
 public:
@@ -26411,14 +28840,20 @@ public:
     int empty() const { return __len == 0; }
     const char *data() const { return __at; }
     char operator[](unsigned long i) const { return __at[i]; }
-    char at(unsigned long i) const { return __at[i]; }
+    char at(unsigned long i) const {
+        if (i >= __len) { __py2bin_throw_out_of_range("string_view::at"); }
+        return __at[i];
+    }
     char front() const { return __at[0]; }
     char back() const { return __at[__len - 1]; }
     string_view substr(unsigned long from, unsigned long n) const {
+        if (from > __len) { __py2bin_throw_out_of_range("string_view::substr"); }
+        if (n > __len - from) { n = __len - from; }
         string_view made(__at + from, n);
         return made;
     }
     string_view substr(unsigned long from) const {
+        if (from > __len) { __py2bin_throw_out_of_range("string_view::substr"); }
         string_view made(__at + from, __len - from);
         return made;
     }
@@ -26435,6 +28870,7 @@ public:
     int operator!=(string_view o) const { return compare(o) != 0; }
 };
 }
+#include <stdexcept>
 """
 
 #: <new>. What the header itself carries is small: `new (room) T(...)` is
@@ -26442,9 +28878,13 @@ public:
 #: it would otherwise declare has nothing left to do. What is here is the two
 #: names a program including it actually writes.
 _NEW_HEADER = r"""
+#include <exception>
 namespace std {
 struct nothrow_t { int __unused; };
-struct bad_alloc { const char *what() const { return "bad_alloc"; } };
+class bad_alloc : public exception {
+public:
+    const char *what() const { return "std::bad_alloc"; }
+};
 }
 """
 
@@ -26452,9 +28892,16 @@ struct bad_alloc { const char *what() const { return "bad_alloc"; } };
 #: which compares and has a name - so the header itself has nothing to hold,
 #: and the two spellings a program writes are rewritten where they stand.
 _TYPEINFO_HEADER = r"""
+#include <exception>
 namespace std {
-struct bad_typeid { const char *what() const { return "bad_typeid"; } };
-struct bad_cast { const char *what() const { return "bad_cast"; } };
+class bad_typeid : public exception {
+public:
+    const char *what() const { return "std::bad_typeid"; }
+};
+class bad_cast : public exception {
+public:
+    const char *what() const { return "std::bad_cast"; }
+};
 }
 """
 
@@ -26543,6 +28990,12 @@ public:
 #: a template argument - which is what makes a bitset one and not a vector.
 _BITSET_HEADER = r"""
 #include <string>
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 namespace std {
 template<int N>
 class bitset {
@@ -26551,11 +29004,23 @@ public:
     bitset() { __bits = 0; }
     bitset(unsigned long value) { __bits = value & ((N >= 64) ? ~0UL : ((1UL << N) - 1UL)); }
     int size() const { return N; }
-    int test(int at) const { return (int)((__bits >> at) & 1UL); }
+    int test(int at) const {
+        if (at < 0 || at >= N) { __py2bin_throw_out_of_range("bitset test argument out of range"); }
+        return (int)((__bits >> at) & 1UL);
+    }
     int operator[](int at) const { return (int)((__bits >> at) & 1UL); }
-    void set(int at) { __bits = __bits | (1UL << at); }
-    void reset(int at) { __bits = __bits & ~(1UL << at); }
-    void flip(int at) { __bits = __bits ^ (1UL << at); }
+    void set(int at) {
+        if (at < 0 || at >= N) { __py2bin_throw_out_of_range("bitset set argument out of range"); }
+        __bits = __bits | (1UL << at);
+    }
+    void reset(int at) {
+        if (at < 0 || at >= N) { __py2bin_throw_out_of_range("bitset reset argument out of range"); }
+        __bits = __bits & ~(1UL << at);
+    }
+    void flip(int at) {
+        if (at < 0 || at >= N) { __py2bin_throw_out_of_range("bitset flip argument out of range"); }
+        __bits = __bits ^ (1UL << at);
+    }
     void reset() { __bits = 0; }
     unsigned long to_ulong() const { return __bits; }
     int count() const {
@@ -26578,6 +29043,7 @@ public:
     }
 };
 }
+#include <stdexcept>
 """
 
 #: <list>, a doubly linked list. Written as one rather than as a vector under
@@ -26649,6 +29115,12 @@ public:
 #: over the same storage a vector uses with a moving start, so an index costs
 #: what an index should and neither end has to move the other.
 _DEQUE_HEADER = r"""
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 namespace std {
 template<typename T>
 class deque {
@@ -26703,11 +29175,15 @@ public:
     void pop_front() { if (count > 0) { first = first + 1; count = count - 1; } }
     void pop_back() { if (count > 0) { count = count - 1; } }
     T &operator[](unsigned long i) { return items[first + i]; }
-    T &at(unsigned long i) { return items[first + i]; }
+    T &at(unsigned long i) {
+        if (i >= count) { __py2bin_throw_out_of_range("deque"); }
+        return items[first + i];
+    }
     T &front() { return items[first]; }
     T &back() { return items[first + count - 1]; }
 };
 }
+#include <stdexcept>
 """
 
 #: <optional>, which is a value and whether there is one. Written as the two
@@ -26716,8 +29192,17 @@ public:
 #: means anything. The difference shows only for a type whose constructor has
 #: an effect, and is stated here rather than left to be found.
 _OPTIONAL_HEADER = r"""
+#include <exception>
 namespace std {
 struct nullopt_t { int __unused; };
+class bad_optional_access : public exception {
+public:
+    const char *what() const { return "bad_optional_access"; }
+};
+}
+/* Where `value()` of an empty one throws, settled as the others are. */
+void __py2bin_throw_bad_optional_access(void) { throw std::bad_optional_access(); }
+namespace std {
 
 template<typename T>
 class optional {
@@ -26727,7 +29212,10 @@ public:
     optional() { __present = 0; }
     optional(T value) { __held = value; __present = 1; }
     int has_value() const { return __present; }
-    T value() const { return __held; }
+    T value() const {
+        if (!__present) { __py2bin_throw_bad_optional_access(); }
+        return __held;
+    }
     T value_or(T other) const { if (__present) { return __held; } return other; }
     T operator*() const { return __held; }
     T *operator->() { return &__held; }
@@ -26806,48 +29294,92 @@ T accumulate(T *first, T *last, T start) {
 }
 """
 
-#: <stdexcept>. The standard ones carry a message and answer `what()`; that
-#: is the whole of what code catching them uses, and it is what these do.
-#: There is no hierarchy - py2bin catches by the type written, and a `catch
-#: (std::exception &)` that means "any of them" would need one.
-_STDEXCEPT_HEADER = r"""
+#: <exception>: the class every standard exception derives from, and what
+#: happens to one nothing catches. `what()` is virtual and answers with the
+#: class's own name, as libc++'s does - so one caught by value, sliced to
+#: this, says "std::exception" whatever it was.
+_EXCEPTION_HEADER = r"""
+#include <cstdio>
 namespace std {
 class exception {
 public:
-    const char *message;
-    exception() { message = ""; }
-    exception(const char *text) { message = text; }
-    // Virtual, and answering with the class's own name rather than the
-    // message, because that is what the standard one does: an exception
-    // caught by value is sliced to this, and what it says then should not
-    // depend on what it was before it was sliced.
-    virtual const char *what() { return "std::exception"; }
+    exception() { }
+    virtual ~exception() { }
+    virtual const char *what() const { return "std::exception"; }
+};
+class bad_exception : public exception {
+public:
+    const char *what() const { return "std::bad_exception"; }
+};
+}
+/* An exception nothing catches: C++ calls terminate, which says so on
+   stderr - in libc++'s words - and aborts. */
+void __py2bin_uncaught(const char *__type, const char *__what_arg) {
+    fprintf(stderr, "libc++abi: terminating due to uncaught exception of type %s: %s\n", __type, __what_arg);
+    abort();
+}
+"""
+
+#: <stdexcept>: the two families, each holding its message as a string of its
+#: own, as libc++'s do - a message built from a temporary outlives it. And the
+#: places the rest of the library throws, which are defined here because this
+#: is where what they throw is.
+_STDEXCEPT_HEADER = r"""
+#include <exception>
+#include <string>
+namespace std {
+class logic_error : public exception {
+public:
+    string __what;
+    logic_error(const string &__what_arg) : __what(__what_arg) { }
+    logic_error(const char *__what_arg) : __what(__what_arg) { }
+    const char *what() const { return __what.c_str(); }
+};
+class domain_error : public logic_error {
+public:
+    domain_error(const string &__what_arg) : logic_error(__what_arg) { }
+    domain_error(const char *__what_arg) : logic_error(__what_arg) { }
+};
+class invalid_argument : public logic_error {
+public:
+    invalid_argument(const string &__what_arg) : logic_error(__what_arg) { }
+    invalid_argument(const char *__what_arg) : logic_error(__what_arg) { }
+};
+class length_error : public logic_error {
+public:
+    length_error(const string &__what_arg) : logic_error(__what_arg) { }
+    length_error(const char *__what_arg) : logic_error(__what_arg) { }
+};
+class out_of_range : public logic_error {
+public:
+    out_of_range(const string &__what_arg) : logic_error(__what_arg) { }
+    out_of_range(const char *__what_arg) : logic_error(__what_arg) { }
 };
 class runtime_error : public exception {
 public:
-    runtime_error() { message = ""; }
-    runtime_error(const char *text) { message = text; }
-    const char *what() { return message; }
+    string __what;
+    runtime_error(const string &__what_arg) : __what(__what_arg) { }
+    runtime_error(const char *__what_arg) : __what(__what_arg) { }
+    const char *what() const { return __what.c_str(); }
 };
-class logic_error : public exception {
+class range_error : public runtime_error {
 public:
-    logic_error() { message = ""; }
-    logic_error(const char *text) { message = text; }
-    const char *what() { return message; }
+    range_error(const string &__what_arg) : runtime_error(__what_arg) { }
+    range_error(const char *__what_arg) : runtime_error(__what_arg) { }
 };
-class out_of_range : public exception {
+class overflow_error : public runtime_error {
 public:
-    out_of_range() { message = ""; }
-    out_of_range(const char *text) { message = text; }
-    const char *what() { return message; }
+    overflow_error(const string &__what_arg) : runtime_error(__what_arg) { }
+    overflow_error(const char *__what_arg) : runtime_error(__what_arg) { }
 };
-class invalid_argument : public exception {
+class underflow_error : public runtime_error {
 public:
-    invalid_argument() { message = ""; }
-    invalid_argument(const char *text) { message = text; }
-    const char *what() { return message; }
+    underflow_error(const string &__what_arg) : runtime_error(__what_arg) { }
+    underflow_error(const char *__what_arg) : runtime_error(__what_arg) { }
 };
 }
+void __py2bin_throw_out_of_range(const char *__what_arg) { throw std::out_of_range(__what_arg); }
+void __py2bin_throw_invalid_argument(const char *__what_arg) { throw std::invalid_argument(__what_arg); }
 """
 
 #: py2bin's own <filesystem>. `path` is string work and nothing else, which
@@ -27283,7 +29815,12 @@ public:
 
 
 _MAP_HEADER = r"""
-
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 namespace std {
 /* `<map>` carries this itself: the headers here are separate texts and none
    of them includes another, so a program that includes only `<map>` would
@@ -27404,7 +29941,12 @@ public:
         if (found != entries + used) { return; }
         __slot(entry.first) = entry.second;
     }
-    V &at(K key) { return find(key)->second; }
+    V &at(K key) {
+        map_entry<K, V> *__found;
+        __found = find(key);
+        if (__found == entries + used) { __py2bin_throw_out_of_range("map::at:  key not found"); }
+        return __found->second;
+    }
     void erase(K key) {
         map_entry<K, V> *found;
         unsigned long i;
@@ -27416,6 +29958,7 @@ public:
     }
 };
 }
+#include <stdexcept>
 """
 
 _SET_HEADER = r"""
@@ -27665,7 +30208,7 @@ public:
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
     }
     void __skip() {
-        while (__cursor < (unsigned long)held.size() && __spacing(held.at((int)__cursor))) {
+        while (__cursor < (unsigned long)held.size() && __spacing(held[(int)__cursor])) {
             __cursor = __cursor + 1;
         }
     }
@@ -27678,7 +30221,7 @@ public:
         int negative;
         negative = 0;
         if (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (c == '-') { negative = 1; __cursor = __cursor + 1; }
             else if (c == '+') { __cursor = __cursor + 1; }
         }
@@ -27689,7 +30232,7 @@ public:
         char c;
         got = 0;
         while (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (c < '0' || c > '9') { break; }
             got = got * 10 + (long)(c - '0');
             __cursor = __cursor + 1;
@@ -27734,11 +30277,11 @@ public:
         negative = __sign();
         whole = __digits(&any);
         got = (double)whole;
-        if (__cursor < (unsigned long)held.size() && held.at((int)__cursor) == '.') {
+        if (__cursor < (unsigned long)held.size() && held[(int)__cursor] == '.') {
             __cursor = __cursor + 1;
             scale = 0.1;
             while (__cursor < (unsigned long)held.size()) {
-                c = held.at((int)__cursor);
+                c = held[(int)__cursor];
                 if (c < '0' || c > '9') { break; }
                 got = got + scale * (double)(c - '0');
                 scale = scale * 0.1;
@@ -27747,7 +30290,7 @@ public:
             }
         }
         if (any && __cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (c == 'e' || c == 'E') {
                 __cursor = __cursor + 1;
                 negative_exponent = __sign();
@@ -27763,7 +30306,7 @@ public:
     @NAME@ &operator>>(char &v) {
         __skip();
         if (__cursor >= (unsigned long)held.size()) { failed = 1; return *this; }
-        v = held.at((int)__cursor);
+        v = held[(int)__cursor];
         __cursor = __cursor + 1;
         return *this;
     }
@@ -27773,7 +30316,7 @@ public:
         v.clear();
         __skip();
         while (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (__spacing(c)) { break; }
             v.push_back(c);
             __cursor = __cursor + 1;
@@ -27787,7 +30330,7 @@ public:
         out.clear();
         if (__cursor >= (unsigned long)held.size()) { failed = 1; return 0; }
         while (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             __cursor = __cursor + 1;
             if (c == stop) { return 1; }
             out.push_back(c);
@@ -27827,7 +30370,7 @@ public:
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
     }
     void __skip() {
-        while (__cursor < (unsigned long)held.size() && __spacing(held.at((int)__cursor))) {
+        while (__cursor < (unsigned long)held.size() && __spacing(held[(int)__cursor])) {
             __cursor = __cursor + 1;
         }
     }
@@ -27859,7 +30402,7 @@ public:
         int negative;
         negative = 0;
         if (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (c == '-') { negative = 1; __cursor = __cursor + 1; }
             else if (c == '+') { __cursor = __cursor + 1; }
         }
@@ -27870,7 +30413,7 @@ public:
         char c;
         got = 0;
         while (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (c < '0' || c > '9') { break; }
             got = got * 10 + (long)(c - '0');
             __cursor = __cursor + 1;
@@ -27915,11 +30458,11 @@ public:
         negative = __sign();
         whole = __digits(&any);
         got = (double)whole;
-        if (__cursor < (unsigned long)held.size() && held.at((int)__cursor) == '.') {
+        if (__cursor < (unsigned long)held.size() && held[(int)__cursor] == '.') {
             __cursor = __cursor + 1;
             scale = 0.1;
             while (__cursor < (unsigned long)held.size()) {
-                c = held.at((int)__cursor);
+                c = held[(int)__cursor];
                 if (c < '0' || c > '9') { break; }
                 got = got + scale * (double)(c - '0');
                 scale = scale * 0.1;
@@ -27928,7 +30471,7 @@ public:
             }
         }
         if (any && __cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (c == 'e' || c == 'E') {
                 __cursor = __cursor + 1;
                 negative_exponent = __sign();
@@ -27944,7 +30487,7 @@ public:
     @NAME@ &operator>>(char &v) {
         __skip();
         if (__cursor >= (unsigned long)held.size()) { failed = 1; return *this; }
-        v = held.at((int)__cursor);
+        v = held[(int)__cursor];
         __cursor = __cursor + 1;
         return *this;
     }
@@ -27954,7 +30497,7 @@ public:
         v.clear();
         __skip();
         while (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             if (__spacing(c)) { break; }
             v.push_back(c);
             __cursor = __cursor + 1;
@@ -27968,7 +30511,7 @@ public:
         out.clear();
         if (__cursor >= (unsigned long)held.size()) { failed = 1; return 0; }
         while (__cursor < (unsigned long)held.size()) {
-            c = held.at((int)__cursor);
+            c = held[(int)__cursor];
             __cursor = __cursor + 1;
             if (c == stop) { return 1; }
             out.push_back(c);
@@ -28060,6 +30603,12 @@ typedef error_code error_condition;
 
 
 _ARRAY_HEADER = r"""
+/* Where the library throws. Defined at the end of <stdexcept>: as a throw of
+   the standard class where the program has a handler that could catch it,
+   and otherwise as what an exception nothing catches does - which the
+   translator settles, having the whole program in front of it. */
+void __py2bin_throw_out_of_range(const char *__what_arg);
+void __py2bin_throw_invalid_argument(const char *__what_arg);
 
 namespace std {
 /* `array<T, N>` is N elements and nothing else - no pointer, no count, and
@@ -28090,8 +30639,13 @@ public:
     int empty() const { return N == 0; }
     T &operator[](unsigned long i) { return items[i]; }
     const T &operator[](unsigned long i) const { return items[i]; }
-    T &at(unsigned long i) { return items[i]; }
-    const T &at(unsigned long i) const { return items[i]; }
+    /* Written once and called from both: the two `at`s have to be the same
+       text, and two copies of a string are two different strings here. */
+    void __check(unsigned long i) const {
+        if (i >= N) { __py2bin_throw_out_of_range("array::at"); }
+    }
+    T &at(unsigned long i) { __check(i); return items[i]; }
+    const T &at(unsigned long i) const { __check(i); return items[i]; }
     T &front() { return items[0]; }
     T &back() { return items[N - 1]; }
     T *begin() { return items; }
@@ -28107,6 +30661,7 @@ public:
     }
 };
 }
+#include <stdexcept>
 """
 
 
@@ -28458,6 +31013,7 @@ _BUILTIN_CPP_HEADERS = {
     "numeric": _NUMERIC_HEADER,
     "iterator": _ITERATOR_HEADER,
     "stdexcept": _STDEXCEPT_HEADER,
+    "exception": _EXCEPTION_HEADER,
     "filesystem": _FILESYSTEM_HEADER,
     "system_error": _SYSTEM_ERROR_HEADER,
     "functional": _FUNCTIONAL_HEADER,

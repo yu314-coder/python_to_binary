@@ -251,7 +251,9 @@ class Translating(unittest.TestCase):
         head = out.index("T__ctor(struct T *this")
         body = out[head: out.index("}", out.index("{", head))]
         declared = body.find("__py2bin_value_1;")
-        used = body.find("this->macID_ = ")
+        # A member built as a copy of a value is built by
+        # `__py2bin_copy_into`, which makes the copy C++ makes.
+        used = body.find("__py2bin_copy_into(&this->macID_")
         self.assertGreaterEqual(declared, 0, body)
         self.assertGreaterEqual(used, 0, body)
         self.assertLess(declared, used, body)
@@ -2461,7 +2463,9 @@ class Exceptions(unittest.TestCase):
             "t.cpp",
         )
         self.assertIn("__py2bin_thrown = 1", out)
-        self.assertIn("__py2bin_in_flight = (long)(7)", out)
+        # A word wide enough for an address on every target: `long` is half
+        # of one on Windows.
+        self.assertIn("__py2bin_in_flight = (long long)(7)", out)
         # And the caller looks, immediately after the call.
         self.assertIn("if (__py2bin_thrown)", out)
 
@@ -2827,10 +2831,9 @@ class ThrownObjects(unittest.TestCase):
             "t.cpp",
         )
         self.assertIn("malloc(sizeof(struct Err))", out)
-        self.assertIn("__py2bin_in_flight = (long)__py2bin_raised", out)
-        # And the handler gets the copy back, declared then assigned because
-        # py2bin's C takes `o = *p;` and not `struct V o = *p;`.
-        self.assertIn("__py2bin_in_flight;", out)
+        self.assertIn("__py2bin_in_flight = (long long)__py2bin_raised", out)
+        # And the handler gets a copy of it, built from what is in flight.
+        self.assertIn("Err e = *(Err *)__py2bin_in_flight;", out)
 
     def test_a_number_still_goes_in_the_word_itself(self) -> None:
         out = translate(
@@ -2838,7 +2841,7 @@ class ThrownObjects(unittest.TestCase):
             "int main(void){ try { f(); } catch (int e) { return e; } return 0; }",
             "t.cpp",
         )
-        self.assertIn("__py2bin_in_flight = (long)(7)", out)
+        self.assertIn("__py2bin_in_flight = (long long)(7)", out)
         self.assertNotIn("malloc", out)
 
 
@@ -2943,7 +2946,7 @@ class ThrownTemporaries(unittest.TestCase):
             "{ return e.what()[0]; } return 0; }",
         )
         self.assertIn("runtime_error__new", out)
-        self.assertIn("__py2bin_in_flight = (long)__py2bin_raised", out)
+        self.assertIn("__py2bin_in_flight = (long long)__py2bin_raised", out)
 
     def test_catching_by_reference_binds_rather_than_copies(self) -> None:
         out = with_headers(
@@ -2955,17 +2958,23 @@ class ThrownTemporaries(unittest.TestCase):
         # A pointer to what is in flight, and the virtual call through it.
         self.assertIn("struct exception *e = &(*(exception *)__py2bin_in_flight)", out)
 
-    def test_catching_a_base_by_value_is_refused(self) -> None:
-        """C++ slices it; py2bin's copy would not. Say so rather than differ."""
+    def test_catching_a_base_by_value_slices_it(self) -> None:
+        """C++ slices it, and so does py2bin now.
 
-        with self.assertRaises(CppTranslationError) as caught:
-            with_headers(
-                "#include <stdexcept>\n"
-                "int f(void){ throw std::runtime_error(\"bad\"); }\n"
-                "int main(void){ try { f(); } catch (std::exception e) "
-                "{ return 1; } return 0; }",
-            )
-        self.assertIn("&e", str(caught.exception))
+        The copy is the base's own, which writes the base's table: what the
+        handler holds answers `what()` as a `std::exception`, as clang++'s
+        does. It used to be refused, when a copy kept the table of what it
+        was made from.
+        """
+
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <stdexcept>\n"
+            "int f(void){ throw std::runtime_error(\"bad\"); }\n"
+            "int main(void){ try { f(); } catch (std::exception e) "
+            "{ printf(\"%s\\n\", e.what()); } return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "std::exception\n")
 
     def test_a_class_nothing_derives_from_may_be_caught_by_value(self) -> None:
         # Slicing a T to a T loses nothing, so the refusal above must not
@@ -2976,7 +2985,7 @@ class ThrownTemporaries(unittest.TestCase):
             "int main(void){ try { f(); } catch (std::out_of_range e) "
             "{ return 1; } return 0; }",
         )
-        self.assertIn("out_of_range e;", out)
+        self.assertIn("out_of_range e = *", out)
 
 
 class StatementOrder(unittest.TestCase):
@@ -3049,7 +3058,9 @@ class ByValueFreeFunctions(unittest.TestCase):
             "t.cpp",
         )
         self.assertIn("int twice(struct V *__by_value_v)", out)
-        self.assertIn("v = *__by_value_v;", out)
+        # Built as a copy of what arrived, not assigned over nothing: the C
+        # stage makes it with the class's own copy where it has one.
+        self.assertIn("__py2bin_copy_into(&v, __by_value_v);", out)
         self.assertIn("twice(&a)", out)
 
 
@@ -4290,3 +4301,809 @@ class AnIncludeGuardHoldingCode(unittest.TestCase):
         self.assertLess(out.index("# include <time.h>"), out.index("Kdf__made"))
         if printed is not None:
             self.assertEqual(printed, "2 8\n")
+
+
+def _built_and_run(source: str) -> "str | None":
+    """Build a C++ program for darwin-arm64, and run it where that is the host."""
+
+    import platform
+    import subprocess
+    import sys
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        entry = root / "program.cpp"
+        entry.write_text(source, encoding="utf-8")
+        artifact = root / "program"
+        compile_c_native(entry, artifact, target="darwin-arm64", clean=True)
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            return None
+        return subprocess.run(
+            [str(artifact)], capture_output=True, text=True, timeout=120
+        ).stdout
+
+
+_A_POINT = (
+    "#include <cstdio>\n"
+    "struct Point {\n"
+    "    int x;\n"
+    "    Point() : x(0) { printf(\"Point()\\n\"); }\n"
+    "    Point(int x) : x(x) {}\n"
+    "    int twice() const { return x * 2; }\n"
+    "};\n"
+)
+
+
+class TextThatReadsLikeCode(unittest.TestCase):
+    """A string literal is printed as it was written, whatever it holds.
+
+    Nearly every pass that turns C++ into C read a string as readily as code,
+    so a program's text came out as something else: `"p.twice()"` printed
+    `Point__twice(&p)`, and `"Point(1)"` was a Point built for nothing whose
+    name was printed instead.
+    """
+
+    def test_strings_keep_what_they_hold(self) -> None:
+        shapes = [
+            "p.twice()", "new Point(1)", "Point(1)", "class A { };",
+            "namespace n { }", "template<typename T>", "delete p;",
+            "static_cast<int>(x)", "[&](int a) { return a; }",
+        ]
+        listed = ", ".join(f'"{one}"' for one in shapes)
+        out = translate(
+            _A_POINT
+            + "int main() {\n"
+            + f"    const char *shapes[] = {{ {listed} }};\n"
+            + "    Point p(3);\n"
+            + "    for (const char *s : shapes) printf(\"%s\\n\", s);\n"
+            + "    return p.twice();\n}\n",
+            "t.cpp",
+        )
+        for one in shapes:
+            self.assertIn(f'"{one}"', out)
+        self.assertNotIn("__py2bin_lit_", out)
+
+    def test_a_class_named_in_its_own_constructors_text_builds_nothing(self) -> None:
+        # Read as a temporary, this was a constructor building another of its
+        # own class every time it ran - and printing the temporary's name.
+        out = translate(_A_POINT + "int main() { Point p; return p.x; }\n", "t.cpp")
+        self.assertIn('printf("Point()\\n");', out)
+        self.assertNotIn("__py2bin_temp", out)
+
+    def test_a_character_that_is_punctuation_is_written_as_its_escape(self) -> None:
+        out = translate(
+            "#include <cstdio>\n"
+            "struct S { char open() const { return '{'; } };\n"
+            "int main() { S s; return s.open() == '{'; }\n",
+            "t.cpp",
+        )
+        self.assertIn("'\\x7b'", out)
+
+    def test_the_program_prints_its_text(self) -> None:
+        printed = _built_and_run(
+            _A_POINT
+            + "int main() {\n"
+            + "    Point p(3);\n"
+            + "    printf(\"%s|%s|%s\\n\", \"Point(1) and Point()\", \"p.twice()\",\n"
+            + "           \"namespace n { }\");\n"
+            + "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "Point(1) and Point()|p.twice()|namespace n { }\n")
+
+
+_COUNTED = (
+    "#include <cstdio>\n"
+    "#include <vector>\n"
+    "struct C {\n"
+    "    int v;\n"
+    "    C() : v(0) {}\n"
+    "    C(int v) : v(v) {}\n"
+    "    C(const C &o) : v(o.v) { printf(\"copy %d\\n\", o.v); }\n"
+    "    C &operator=(const C &o) { v = o.v; printf(\"assign %d\\n\", o.v); return *this; }\n"
+    "};\n"
+)
+
+
+class CopiesThatCopy(unittest.TestCase):
+    """An object is copied by its class's own code wherever C++ copies one.
+
+    A class that wrote a copy constructor or an assignment, one with a table
+    pointer, and one holding or deriving from either - which is every class
+    holding a vector - is copied by calls, which the C stage makes for any
+    copy of its struct however the translation came to write it. Copied as
+    bytes, two objects shared what the first owned, and a `Base` copied from
+    a `Derived` answered virtual calls as the `Derived`.
+    """
+
+    def test_the_c_stage_is_told_what_copies_each_class(self) -> None:
+        out = with_headers(
+            _COUNTED
+            + "struct Holder { std::vector<int> items; };\n"
+            + "int main() { C a(1); C b = a; Holder h; Holder g = h; return b.v; }\n"
+        )
+        self.assertRegex(out, r"#pragma py2bin owning C C__ctor__\w+ C__op_assign")
+        # Holder wrote nothing, and is copied by the copy C++ writes for it.
+        self.assertIn(
+            "#pragma py2bin owning Holder Holder__py2bin_copy Holder__py2bin_assign",
+            out,
+        )
+        self.assertIn("static void Holder__py2bin_copy(struct Holder *this", out)
+
+    def test_a_struct_holding_a_vector_is_a_vector_of_its_own(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <vector>\n"
+            "struct Bag { std::vector<int> items; int n; };\n"
+            "int main() {\n"
+            "    Bag b; b.items.push_back(1); b.n = 1;\n"
+            "    Bag c = b; c.items[0] = 5; c.items.push_back(6);\n"
+            "    Bag d; d = b; d.items[0] = 9;\n"
+            "    printf(\"%d %d %d %d\\n\", b.items[0], (int)b.items.size(), c.items[0], d.items[0]);\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "1 1 5 9\n")
+
+    def test_a_returned_parameter_is_copied_into_the_answer(self) -> None:
+        # Once into the parameter and once into the answer, both by the copy
+        # constructor: the answer is a new object, not one assigned over.
+        printed = _built_and_run(
+            _COUNTED
+            + "C pass(C p) { return p; }\n"
+            + "int main() { C a(1); C r = pass(a); printf(\"%d\\n\", r.v); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "copy 1\ncopy 1\n1\n")
+
+    def test_a_derived_class_is_copied_whole(self) -> None:
+        printed = _built_and_run(
+            _COUNTED
+            + "struct D : C { int extra; };\n"
+            + "int main() { D d; d.v = 5; d.extra = 6; D e = d;\n"
+            + "    printf(\"%d %d\\n\", e.v, e.extra); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "copy 5\n5 6\n")
+
+    def test_a_base_copied_from_a_derived_is_a_base(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Base { virtual const char *name() const { return \"base\"; } };\n"
+            "struct Derived : Base { const char *name() const override { return \"derived\"; } };\n"
+            "int main() {\n"
+            "    Derived d; const Base &r = d;\n"
+            "    Base sliced = r; Base assigned; assigned = r;\n"
+            "    printf(\"%s %s %s\\n\", r.name(), sliced.name(), assigned.name());\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "derived base base\n")
+
+    def test_a_member_built_from_a_reference_is_built_from_what_it_names(self) -> None:
+        out = translate(
+            _COUNTED
+            + "struct W { C c; W(const C &x) : c(x) {} };\n"
+            + "int main() { C a(1); W w(a); return w.c.v; }\n",
+            "t.cpp",
+        )
+        # The reference is carried as the pointer to what it names, so that
+        # pointer is the source - and `&x` was the address of the pointer.
+        self.assertRegex(out, r"C__ctor__\w+\(&this->c, x\);")
+
+
+class AVectorOwnsItsElements(unittest.TestCase):
+    """A vector builds, copies and takes apart its elements as libc++ does.
+
+    Each element is built where it stands, copied by its own copy, assigned
+    where one is already there, and taken apart when it goes; growing builds
+    the new element first and then moves the old ones. The order is libc++'s
+    because that is the vector a program on this machine is compiled
+    against, and a class that says something as it is copied says the same
+    things here.
+    """
+
+    def test_the_order_libcxx_does_it_in(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <vector>\n"
+            "struct C {\n    int v;\n"
+            "    C() : v(0) { printf(\"default\\n\"); }\n"
+            "    C(int v) : v(v) {}\n"
+            "    C(const C &o) : v(o.v) { printf(\"copy %d\\n\", o.v); }\n"
+            "    C &operator=(const C &o) { v = o.v; printf(\"assign %d\\n\", o.v); return *this; }\n"
+            "    ~C() { printf(\"drop %d\\n\", v); }\n};\n"
+            "int main() {\n"
+            "    std::vector<C> v; C a(1), b(2);\n"
+            "    v.push_back(a); v.push_back(b);\n"
+            "    printf(\"-- insert\\n\"); v.insert(v.begin(), a);\n"
+            "    printf(\"-- erase\\n\"); v.erase(v.begin());\n"
+            "    printf(\"-- resize\\n\"); v.resize(3);\n"
+            "    printf(\"-- %d %d\\n\", (int)v.size(), (int)v.capacity());\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            # What clang++ and libc++ print for the same program.
+            self.assertEqual(
+                printed,
+                "copy 1\ncopy 2\ncopy 1\ndrop 1\n"
+                "-- insert\ncopy 1\ncopy 1\ncopy 2\ndrop 1\ndrop 2\n"
+                "-- erase\nassign 1\nassign 2\ndrop 2\n"
+                "-- resize\ndefault\n-- 3 4\n"
+                "drop 2\ndrop 1\ndrop 0\ndrop 2\ndrop 1\n",
+            )
+
+    def test_n_copies_of_a_number_is_not_a_range(self) -> None:
+        # The range constructor is a template the standard constrains to
+        # iterators, and copying it for `int` read `(3, 7)` as a range.
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <vector>\n"
+            "int main() { std::vector<int> r(3, 7); std::vector<std::vector<int>> g(2, r);\n"
+            "    g[1][0] = 1; printf(\"%d %d %d %d\\n\", (int)r.size(), r[2], g[0][0], g[1][0]);\n"
+            "    return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "3 7 7 1\n")
+
+    def test_a_pointer_assigned_is_not_an_object_assigned(self) -> None:
+        # `items = fresh;` with `items` a `T *` of a class with an assignment
+        # of its own: read as an object assignment, the old storage was
+        # handed to `T::operator=` as though it were an element.
+        out = translate(
+            _COUNTED
+            + "struct Keep { C *items; void put(C *fresh) { items = fresh; } };\n"
+            + "int main() { Keep k; C c(1); k.put(&c); return k.items->v; }\n",
+            "t.cpp",
+        )
+        self.assertIn("this->items = fresh;", out)
+
+    def test_the_address_of_a_member_reached_through_a_reference(self) -> None:
+        out = translate(
+            "struct S { int items[4]; };\n"
+            "int *second(S &s) { return &s.items[1]; }\n"
+            "int main() { S s; s.items[1] = 3; return *second(s); }\n",
+            "t.cpp",
+        )
+        self.assertIn("&s->items[1]", out)
+
+
+class AnArrayOfStringsWalked(unittest.TestCase):
+    """`for (const char *s : names)` over an array, however it is spelled."""
+
+    def test_the_extent_is_read_with_the_star_against_the_name(self) -> None:
+        out = translate(
+            "#include <cstdio>\n"
+            "int main() { const char *names[] = { \"a\", \"b\", };\n"
+            "    for (const char *s : names) printf(\"%s\", s); return 0; }\n",
+            "t.cpp",
+        )
+        # Two, not three: the trailing comma ends the list.
+        self.assertRegex(out, r"__py2bin_each_\d+ < 2;")
+        self.assertNotIn("names.size()", out)
+
+
+class StringsThatGrow(unittest.TestCase):
+    """A string owns its characters and holds as many as it is given.
+
+    It was `char buf[256]`, and every operation stopped at the 255th
+    character without a word - a program building JSON or reading a file was
+    handed its output cut short.
+    """
+
+    def test_no_fixed_buffer_is_left(self) -> None:
+        from py2bin.cpp_frontend import _BUILTIN_CPP_HEADERS
+
+        header = _BUILTIN_CPP_HEADERS["string"]
+        self.assertNotRegex(header, r"\[\s*256\s*\]")
+        self.assertIn("char *__data;", header)
+
+    def test_a_long_string_keeps_every_character(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <string>\n"
+            "int main() {\n"
+            "    std::string s; for (int i = 0; i < 1000; i++) s += (char)('a' + i % 26);\n"
+            "    std::wstring w(600, L'x');\n"
+            "    std::string u = s + std::string(600, 'y');\n"
+            "    printf(\"%zu %zu %zu %c %c\\n\", s.size(), w.size(), u.size(), s[999], u[1599]);\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "1000 600 1600 l y\n")
+
+    def test_a_copy_is_a_string_of_its_own(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <string>\n"
+            "std::string shout(std::string s) { s += \"!\"; return s; }\n"
+            "int main() {\n"
+            "    std::string a = \"hello\"; std::string b = a; b[0] = 'J';\n"
+            "    std::string c; c = a; c += \" world\";\n"
+            "    printf(\"%s|%s|%s|%s\\n\", a.c_str(), b.c_str(), c.c_str(), shout(a).c_str());\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "hello|Jello|hello world|hello!\n")
+
+    def test_what_find_and_compare_answer(self) -> None:
+        # npos is the largest size_t, and compare answers the difference of
+        # the first bytes that differ, read unsigned - libc++'s answers.
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <string>\n"
+            "int main() {\n"
+            "    std::string s = \"abc\";\n"
+            "    printf(\"%zu %d %d %d %zu\\n\", s.find('z'), s.compare(\"abz\"),\n"
+            "           s.compare(\"ab\"), std::string(\"\\xff\").compare(\"a\"), s.capacity());\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "18446744073709551615 -23 1 158 22\n")
+
+    def test_an_answer_made_from_something_else(self) -> None:
+        # `return "fallback";` in a function answering a string builds the
+        # string from the characters; copied as though it were one, the C
+        # stage was handed the address of a literal.
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <string>\n"
+            "std::string fallback() { return \"fallback\"; }\n"
+            "int main() { printf(\"%s\\n\", fallback().c_str()); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "fallback\n")
+
+
+class ExceptionsFromConstructorsAndArguments(unittest.TestCase):
+    """What a constructor that threw did not build is not taken apart, and an
+    argument that throws is worked out before the call it is handed to."""
+
+    def test_an_object_whose_constructor_threw_is_not_destroyed(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "static int live = 0;\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct R { int v; R(int x) : v(x) { if (x < 0) throw E(x); ++live; } ~R() { --live; } };\n"
+            "int take(const R &r) { return r.v; }\n"
+            "int main() {\n"
+            "    int got = 0;\n"
+            "    try { R a(1); R b(-2); printf(\"not reached\\n\"); } catch (const E &e) { got += e.c; }\n"
+            "    try { int t = take(R(-4)); printf(\"not reached %d\\n\", t); } catch (const E &e) { got += e.c; }\n"
+            "    printf(\"%d %d\\n\", got, live);\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "-6 0\n")
+
+    def test_the_marks_of_where_objects_begin_are_gone_from_the_c(self) -> None:
+        out = translate(
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct R { int v; R(int x) : v(x) { if (x < 0) throw E(x); } ~R() {} };\n"
+            "int main() { try { R b(-2); } catch (const E &e) { return e.c; } return 0; }\n",
+            "t.cpp",
+        )
+        self.assertNotIn("__py2bin_built", out)
+
+    def test_an_argument_that_throws_stops_the_call(self) -> None:
+        # Both can throw, so both are lifted out of the statement - and the
+        # one inside the other's arguments has to be lifted, and checked,
+        # first. Lifted outermost first, g ran with f(-4) already thrown.
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "static int calls = 0;\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "int f(int x) { calls++; if (x < 0) throw E(x); return x * 10; }\n"
+            "int g(int a, int b) { calls++; if (a + b < 0) throw E(a + b); return a + b; }\n"
+            "int main() {\n"
+            "    int got = 0, r = 0;\n"
+            "    try { r = g(f(1), f(2)); r += g(f(3), f(-4)); } catch (const E &e) { got = e.c; }\n"
+            "    printf(\"%d %d %d\\n\", r, got, calls);\n"
+            "    return 0;\n}\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "30 -4 5\n")
+
+
+class ReferencesToPointers(unittest.TestCase):
+    """`T *const &` given a pointer, an address or a new object.
+
+    What `push_back(const T &)` becomes in a vector of pointers. The
+    reference binds to the pointer where one is named, and to a temporary
+    holding the value where it is an expression; neither was done, and the
+    pointer itself went where its address was wanted.
+    """
+
+    def test_a_vector_of_pointers_is_pushed_to(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <vector>\n"
+            "struct Shape { int n; };\n"
+            "int main() { Shape s{3}; std::vector<Shape *> b; Shape *p = &s;\n"
+            "    b.push_back(p); b.push_back(&s); b.push_back(new Shape());\n"
+            "    printf(\"%d %d %d\\n\", (int)b.size(), b[1]->n, b[2]->n); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "3 3 0\n")
+
+    def test_a_method_taking_one_is_handed_each_kind(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Shape { int n; };\n"
+            "struct Bag { Shape *items[4]; int count; Bag() : count(0) {}\n"
+            "    void add(Shape *const &p) { items[count++] = p; } };\n"
+            "int main() { Shape s{3}; Shape t{4}; Bag b; Shape *p = &s;\n"
+            "    b.add(p); b.add(&t); b.add(new Shape());\n"
+            "    printf(\"%d %d %d %d\\n\", b.count, b.items[0]->n, b.items[1]->n, b.items[2]->n); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "3 3 4 0\n")
+
+    def test_a_function_taking_one_is_handed_an_expression(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Shape { int n; };\n"
+            "int take(Shape *const &p) { return p->n; }\n"
+            "int main() { Shape s{7}; Shape *p = &s;\n"
+            "    printf(\"%d %d\\n\", take(p), take(&s)); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "7 7\n")
+
+
+class CallsTypedWhereTheyStand(unittest.TestCase):
+    """An overloaded member chosen by the declaration nearest above the call.
+
+    `out.text.assign(buffer)` in <filesystem>, beside its own `char
+    buffer[260]`, was typed by a `wchar_t buffer[8]` the program declared in
+    another function, and no `assign` takes one.
+    """
+
+    def test_the_local_of_the_same_name_is_the_one_read(self) -> None:
+        out = with_headers(
+            "#include <string>\n"
+            "struct Holder { std::string text; };\n"
+            "static Holder narrow() { Holder out; char buffer[8] = \"ab\"; out.text.assign(buffer); return out; }\n"
+            "int main() { wchar_t buffer[8] = L\"w\"; Holder h = narrow(); return (int)h.text.size() + (int)buffer[0]; }\n"
+        )
+        self.assertIn("string__assign__1__char_p(&out.text, buffer)", out)
+
+    def test_a_reference_answered_past_a_destructor(self) -> None:
+        # A function answering `int &` with an object to destroy on the way
+        # out keeps where the answer is across the destructor - as a pointer:
+        # kept as the reference, C was handed `int &answer = ...`.
+        source = (
+            "#include <cstdio>\n"
+            "static int gone = 0;\n"
+            "struct Guard { ~Guard() { gone++; } };\n"
+            "struct Table { int cells[4]; int &at(int k) { Guard g; return cells[k]; } };\n"
+            "int main() { Table t; t.cells[2] = 5; t.at(2) += 1;\n"
+            "    printf(\"%d %d\\n\", t.cells[2], gone); return 0; }\n"
+        )
+        self.assertNotRegex(translate(source, "t.cpp"), r"int\s*&\s*__py2bin_answer")
+        printed = _built_and_run(source)
+        if printed is not None:
+            self.assertEqual(printed, "6 1\n")
+
+
+class ABitwiseNotIsNotADestructor(unittest.TestCase):
+    """`~(unsigned long)15` in a method of a class with a destructor.
+
+    The destructor is stored under the name `~`, and every reader of the
+    members a call can reach builds a pattern of `name(` from them - so the
+    complement of a cast was read as the class calling its own destructor,
+    handed the cast as its argument.
+    """
+
+    def test_the_complement_of_a_cast(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "static int gone = 0;\n"
+            "struct Room { unsigned long size; ~Room() { gone++; }\n"
+            "    unsigned long rounded() const { return (size + 15) & ~(unsigned long)15; }\n"
+            "    unsigned long low() const { return size & ~(unsigned long)(7); } };\n"
+            "int main() { { Room r{37}; printf(\"%lu %lu\\n\", r.rounded(), r.low()); }\n"
+            "    printf(\"%d\\n\", gone); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "48 32\n1\n")
+
+
+class HandlersChosenByType(unittest.TestCase):
+    """A handler takes what it is written for, and nothing else.
+
+    A lone handler took whatever arrived - `catch (const A &)` inside a try
+    for B ran A's handler and carried on - and every value that was not an
+    object shared one kind, so `throw 'c'` was caught by `catch (int x)`.
+    """
+
+    def test_a_lone_handler_lets_another_type_past(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct A { int v; A(int x) : v(x) {} };\n"
+            "struct B { int v; B(int x) : v(x) {} };\n"
+            "int main() { int trace = 0;\n"
+            "    try { try { throw B(4); } catch (const A &a) { trace += 1; } trace += 10; }\n"
+            "    catch (const B &b) { trace += 100 * b.v; }\n"
+            "    printf(\"%d\\n\", trace); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "400\n")
+
+    def test_values_are_told_apart_by_their_type(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "enum class Err { None, Big };\n"
+            "int main() { int got = 0; double half = 0;\n"
+            "    try { throw 42; } catch (int x) { got = x; }\n"
+            "    try { throw 'c'; } catch (int x) { got += 1000; } catch (char c) { got += c; }\n"
+            "    try { throw 2.5; } catch (int x) { got += 7; } catch (double d) { half = d; }\n"
+            "    try { throw \"oops\"; } catch (const char *m) { got += m[1]; }\n"
+            "    try { throw Err::Big; } catch (Err e) { got += e == Err::Big ? 5 : 6; }\n"
+            "    printf(\"%d %.2f\\n\", got, half); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "257 2.50\n")
+
+    def test_a_handler_for_a_base_takes_what_derives_from_it(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Base { int k; Base(int v) : k(v) {} virtual ~Base() {} virtual int code() const { return k; } };\n"
+            "struct Mid : Base { Mid(int v) : Base(v) {} int code() const override { return k * 10; } };\n"
+            "struct Leaf : Mid { Leaf(int v) : Mid(v) {} };\n"
+            "int f(int which) {\n"
+            "    try { if (which == 0) throw Leaf(1); if (which == 1) throw Base(2); return 0; }\n"
+            "    catch (const Mid &m) { return 100 + m.code(); }\n"
+            "    catch (const Base &b) { return 200 + b.code(); }\n"
+            "}\n"
+            "int main() { printf(\"%d %d\\n\", f(0), f(1)); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "110 202\n")
+
+    def test_unnamed_and_by_value(self) -> None:
+        # `catch (const E &)` names nothing, and `catch (E e)` copies what
+        # is in flight with E's own copy - E has no default constructor,
+        # which building one and assigning over it needed.
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct F { int d; };\n"
+            "int main() { int n = 0;\n"
+            "    try { throw F{2}; } catch (const E &) { n = 1; } catch (const F &) { n = 2; }\n"
+            "    try { throw E(5); } catch (E e) { e.c += 1; n += e.c * 10; }\n"
+            "    printf(\"%d\\n\", n); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "62\n")
+
+
+class ThrowsWrittenWithBraces(unittest.TestCase):
+    def test_an_aggregate_and_a_class_thrown_from_braces(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <string>\n"
+            "struct ParseError { std::string message; int line; };\n"
+            "struct Code { int c; Code(int v) : c(v * 2) {} };\n"
+            "void parse(int line) { if (line == 3) throw ParseError{\"unexpected token at \" + std::to_string(line), line}; }\n"
+            "int main() {\n"
+            "    try { for (int i = 1; i < 5; i++) parse(i); } catch (const ParseError &e) { printf(\"%s (%d)\\n\", e.message.c_str(), e.line); }\n"
+            "    try { throw Code{21}; } catch (const Code &k) { printf(\"%d\\n\", k.c); }\n"
+            "    return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "unexpected token at 3 (3)\n42\n")
+
+
+class TheStandardExceptions(unittest.TestCase):
+    """<stdexcept> as libc++ has it: two families under std::exception, each
+    holding its message as a string of its own."""
+
+    def test_the_hierarchy_and_what_each_says(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <stdexcept>\n#include <string>\n"
+            "struct ConfigError : std::runtime_error { int code; ConfigError(const std::string &m, int c) : std::runtime_error(m), code(c) {} };\n"
+            "struct Mine : std::exception { const char *what() const noexcept override { return \"mine\"; } };\n"
+            "int parse(int v) { if (v < 0) throw std::runtime_error(\"negative: \" + std::to_string(v)); return v; }\n"
+            "int main() {\n"
+            "    try { parse(-3); } catch (const std::exception &e) { printf(\"%s\\n\", e.what()); }\n"
+            "    try { throw std::out_of_range(\"x\"); } catch (const std::logic_error &e) { printf(\"logic %s\\n\", e.what()); }\n"
+            "    try { throw std::overflow_error(\"over\"); } catch (const std::runtime_error &e) { printf(\"%s\\n\", e.what()); }\n"
+            "    try { throw ConfigError(\"missing key\", 7); } catch (const ConfigError &e) { printf(\"%s %d\\n\", e.what(), e.code); }\n"
+            "    try { throw Mine(); } catch (const std::exception &e) { printf(\"%s\\n\", e.what()); }\n"
+            "    try { throw std::exception(); } catch (const std::exception &e) { printf(\"%s\\n\", e.what()); }\n"
+            "    std::runtime_error r(\"one\"); std::runtime_error r2 = r; r = std::runtime_error(\"two\");\n"
+            "    printf(\"%s %s\\n\", r.what(), r2.what());\n"
+            "    return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(
+                printed,
+                "negative: -3\nlogic x\nover\nmissing key 7\nmine\nstd::exception\ntwo one\n",
+            )
+
+
+class TheLibraryThrows(unittest.TestCase):
+    """`at`, `substr`, `stoi` and the rest throw what libc++ throws, saying
+    what libc++ says - where something can catch it."""
+
+    def test_caught_with_libcxx_messages(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <stdexcept>\n#include <string>\n#include <vector>\n#include <map>\n"
+            "int main() {\n"
+            "    std::vector<int> v(2); std::string s = \"ab\"; std::map<int, int> m;\n"
+            "    try { v.at(5); } catch (const std::out_of_range &e) { printf(\"[%s]\\n\", e.what()); }\n"
+            "    try { s.substr(5); } catch (const std::out_of_range &e) { printf(\"[%s]\\n\", e.what()); }\n"
+            "    try { m.at(3); } catch (const std::exception &e) { printf(\"[%s]\\n\", e.what()); }\n"
+            "    try { std::stoi(\"x9\"); } catch (const std::invalid_argument &e) { printf(\"[%s]\\n\", e.what()); }\n"
+            "    try { std::stoi(\"99999999999\"); } catch (const std::out_of_range &e) { printf(\"[%s]\\n\", e.what()); }\n"
+            "    printf(\"%d %lu\\n\", std::stoi(\"-12abc\"), std::stoul(\"-1\"));\n"
+            "    return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(
+                printed,
+                "[vector]\n[basic_string]\n[map::at:  key not found]\n"
+                "[stoi: no conversion]\n[stoi: out of range]\n-12 18446744073709551615\n",
+            )
+
+    def test_nothing_to_catch_it_is_a_terminate_not_a_flag(self) -> None:
+        # With no handler that could catch it, the throw is what C++ does
+        # next - terminate - and nothing calling `at` is a function that can
+        # throw: no flag tested after it, and none in the C at all.
+        out = with_headers(
+            "#include <vector>\n#include <cstdio>\n"
+            "int main() { std::vector<int> v(2); while (v.at(0) < 3) { v.at(0) += 1; } printf(\"%d\\n\", v.at(0)); return 0; }\n"
+        )
+        self.assertNotIn("__py2bin_thrown", out)
+        self.assertIn("__py2bin_uncaught", out)
+
+
+class WhereAHandlerIsReached(unittest.TestCase):
+    def test_a_try_in_a_loop_leaves_the_function_s_objects_alone(self) -> None:
+        # The jump to a handler written in a loop body that declares nothing
+        # took apart what the function had built before the loop: the vector
+        # filled in the loop read as empty.
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <string>\n#include <vector>\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "int main() { std::vector<std::string> log;\n"
+            "    for (int i = 0; i < 4; i++) {\n"
+            "        try { std::string s = \"item\" + std::to_string(i); if (i == 2) throw E(i); log.push_back(s); }\n"
+            "        catch (const E &e) { log.push_back(\"error\" + std::to_string(e.c)); }\n"
+            "    }\n"
+            "    for (auto &s : log) printf(\"%s \", s.c_str()); printf(\"\\n\"); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "item0 item1 error2 item3 \n")
+
+    def test_a_try_with_nothing_that_throws(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Noisy { int id; Noisy(int i) : id(i) {} ~Noisy() { printf(\"drop %d\\n\", id); } };\n"
+            "int f(int x) { Noisy outer(1); try { Noisy inner(2); if (x > 0) return x * 10; } catch (...) { return -1; } return 0; }\n"
+            "int main() { printf(\"%d\\n\", f(3)); printf(\"%d\\n\", f(0)); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "drop 2\ndrop 1\n30\ndrop 2\ndrop 1\n0\n")
+
+
+class ConstructorsThatThrow(unittest.TestCase):
+    def test_what_was_built_is_taken_apart_and_nothing_else(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct Part { int id; Part(int i) : id(i) { if (i < 0) throw E(i); printf(\"part %d\\n\", id); } ~Part() { printf(\"unpart %d\\n\", id); } };\n"
+            "struct Base { Base() { printf(\"base\\n\"); } ~Base() { printf(\"unbase\\n\"); } };\n"
+            "struct Whole : Base { Part a; Part b; Part c; Whole(int x, int y) : a(1), b(x), c(3) { if (y < 0) throw E(y); printf(\"whole\\n\"); } ~Whole() { printf(\"unwhole\\n\"); } };\n"
+            "int main() {\n"
+            "    try { Whole w(-2, 1); printf(\"not reached\\n\"); } catch (const E &e) { printf(\"caught %d\\n\", e.c); }\n"
+            "    try { Whole w(2, -9); printf(\"not reached\\n\"); } catch (const E &e) { printf(\"caught %d\\n\", e.c); }\n"
+            "    return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(
+                printed,
+                "base\npart 1\nunpart 1\nunbase\ncaught -2\n"
+                "base\npart 1\npart 2\npart 3\nunpart 3\nunpart 2\nunpart 1\nunbase\ncaught -9\n",
+            )
+
+    def test_new_of_one_that_throws_assigns_nothing(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct R { int v; R(int x) : v(x) { if (x < 0) throw E(x); } };\n"
+            "int main() { R *ok = nullptr, *bad = nullptr;\n"
+            "    try { ok = new R(1); bad = new R(-5); } catch (const E &e) { printf(\"caught %d\\n\", e.c); }\n"
+            "    printf(\"%d %d\\n\", ok != nullptr, bad == nullptr); delete ok; return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "caught -5\n1 1\n")
+
+
+class ThrowsThroughOperators(unittest.TestCase):
+    """A lambda's body is its class's `operator()`, and a checked container's
+    is an `operator[]`: a throw in either was never rewritten."""
+
+    def test_lambdas_functors_and_subscripts(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n#include <vector>\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct Checked { int d[3]; int &operator[](int i) { if (i < 0 || i >= 3) throw E(i); return d[i]; } };\n"
+            "struct Limit { int most; int operator()(int x) const { if (x > most) throw E(x); return x * 2; } };\n"
+            "int sum_of(Checked &c, int n) { int s = 0; for (int i = 0; i < n; i++) { s += c[i]; } return s; }\n"
+            "int apply(const Limit &f, int x) { return f(x) + 1; }\n"
+            "template <typename F> void each(std::vector<int> &v, F f) { for (int x : v) f(x); }\n"
+            "int main() { Checked c; c.d[0] = 1; c.d[1] = 2; c.d[2] = 3; Limit lim{10}; int got = 0;\n"
+            "    try { got += sum_of(c, 3); got += apply(lim, 4); got += sum_of(c, 5); } catch (const E &e) { got += e.c * 100; }\n"
+            "    auto safe = [](int x) { try { if (x < 0) throw E(x); return x; } catch (const E &e) { return -e.c * 1000; } };\n"
+            "    std::vector<int> v = {1, 2, 30, 4}; int seen = 0;\n"
+            "    try { each(v, [&seen](int x) { if (x > 10) throw E(x); seen += x; }); } catch (const E &e) { got += e.c; }\n"
+            "    printf(\"%d %d %d\\n\", got, seen, safe(-2)); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "345 3 2000\n")
+
+    def test_another_operator_that_throws_is_refused_by_name(self) -> None:
+        with self.assertRaises(CppTranslationError) as caught:
+            translate(
+                "struct E { int c; };\n"
+                "struct V { int x; V operator+(const V &o) const { if (o.x < 0) throw E{o.x}; V r; r.x = x + o.x; return r; } };\n"
+                "int main() { V a; a.x = 1; V b; b.x = 2; V c = a + b; return c.x; }\n",
+                "t.cpp",
+            )
+        self.assertIn("operator+", str(caught.exception))
+
+
+class MethodsThatThrow(unittest.TestCase):
+    def test_a_method_that_throws_reads_its_members(self) -> None:
+        # `__py2bin_thrown = 1;` read as a declaration of a local `n` hid the
+        # member `n` from every method that throws.
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct E { int c; E(int v) : c(v) {} };\n"
+            "struct A { int d[4]; int get(int i) { if (i > 3) throw E(i); return d[i]; } };\n"
+            "struct B { int n; int &at(int i) { if (i > 3) throw E(i); return n; } };\n"
+            "struct C { const char *names[2]; const char *name(int i) const { if (i > 1) throw E(i); return names[i]; } };\n"
+            "int main() { A a; a.d[1] = 3; B b; b.n = 4; C c; c.names[0] = \"zero\"; c.names[1] = \"one\"; int t = 0;\n"
+            "    try { b.at(0) += 1; t = a.get(1) + b.at(2); printf(\"%s \", c.name(1)); t += a.get(9); } catch (const E &e) { t += e.c * 100; }\n"
+            "    try { c.name(5); } catch (const E &e) { t += e.c * 10000; }\n"
+            "    printf(\"%d\\n\", t); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "one 50908\n")
+
+
+class ATemporaryBuiltWhereItIsWritten(unittest.TestCase):
+    def test_a_return_after_an_if_in_a_method(self) -> None:
+        # A block lifted out of a method stood in its text as a mark the
+        # statement reader stepped over: the `Name` was built at the top of
+        # the method, before the `if`, from the `k` it had not yet changed.
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Name { int n; Name(int v) : n(v) { printf(\"make %d\\n\", v); } };\n"
+            "struct Maker { int base; Name make(int k) { if (k < 0) { k = 0; } return Name(base + k); } };\n"
+            "int main() { Maker m; m.base = 100; Name a = m.make(-5); printf(\"%d\\n\", a.n); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "make 100\n100\n")
+
+
+class PointersToABaseInAList(unittest.TestCase):
+    def test_an_array_of_base_pointers_given_derived_ones(self) -> None:
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Shape { virtual ~Shape() {} virtual int area() const = 0; };\n"
+            "struct Sq : Shape { int s; Sq(int v) : s(v) {} int area() const override { return s * s; } };\n"
+            "struct Tri : Shape { int area() const override { return 3; } };\n"
+            "int main() { Sq a(2); Tri t; Shape *all[] = {&a, &t, new Sq(5)}; int sum = 0;\n"
+            "    for (Shape *s : all) sum += s->area(); printf(\"%d\\n\", sum); delete all[2]; return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "32\n")
+
+    def test_deleting_through_an_element_runs_the_destructor(self) -> None:
+        # The walk read `delete all[2];` as a declaration of two, and the
+        # `delete` itself freed the storage without a destructor - the type
+        # of an element of a listed array was not known.
+        printed = _built_and_run(
+            "#include <cstdio>\n"
+            "struct Shape { virtual ~Shape() { printf(\"~Shape\\n\"); } };\n"
+            "struct Sq : Shape { int s; Sq(int v) : s(v) {} ~Sq() { printf(\"~Sq %d\\n\", s); } };\n"
+            "int main() { Shape *all[] = {new Sq(5), new Sq(6), new Sq(7)}; int n = 0;\n"
+            "    for (Shape *s : all) { n++; } delete all[0]; Shape *p = all[1]; delete p;\n"
+            "    printf(\"%d\\n\", n); return 0; }\n"
+        )
+        if printed is not None:
+            self.assertEqual(printed, "~Sq 5\n~Shape\n~Sq 6\n~Shape\n3\n")
